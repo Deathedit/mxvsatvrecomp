@@ -1589,22 +1589,32 @@ memcpy = 0x82BFBB10
 0x82CF4EF0 = { size = 0xC0 }
 0x82CF4FB0 = { size = 0xF4 }
 
-# All mid-ASM hooks disabled for GPU plugin mode.
-# Re-enable individually when working on the native (no-plugin) renderer.
-# Active in native mode: #2 #5 #6 #7 #8 (NOT #1, NOT #3, NOT #4)
+# Mid-ASM hooks. NOTE: these are UNCONDITIONAL — they fire in plugin mode too
+# (g_plugin_mode gates only the C++ REX_FUNC hooks). One binary = one profile.
+#
+# Active: #5 #6 #7.  Disabled: #1 #2 #3 #4 #8.
 #   #1 disabled — eng+8 self-ref workaround handles MainLoop vt[36] crash
+#   #2 disabled 2026-08-01 — SetupRenderer vt[6] CREATES the scene manager at
+#      eng+52. Skipping it left eng+52 NULL, which null-deref'd both at
+#      0x82B71570 and in LoaderTick's entity block. Was misdiagnosed as a
+#      GPU/"circular dependency" problem for a long time; it was neither.
 #   #3 disabled — vt[8] is harmless 4-byte alloc + vtable install at eng+0x38
 #   #4 disabled — vt[17] writes eng+8 = AssetDB + registers subsystems
+#   #8 disabled 2026-08-01 — it deleted LoaderTick's whole body including the
+#      vt[6] gate (sub_8253AA40 = AssetDB_LoadStateMachine), so the asset
+#      loader was never called even once.
 
 # [[midasm_hook]]
 # address = 0x82B70854
 # name = "NativeGameTickSkip"
 # jump_address = 0x82B70874
 
-[[midasm_hook]]
-address = 0x82B71290
-name = "NativeSetupDeviceSkip"
-jump_address = 0x82B712A4
+# #2 disabled (test) — skips SetupRenderer vt[6]; prime suspect for creating
+# the scene manager at eng+52, which is NULL and null-derefs at 0x82B71570.
+# [[midasm_hook]]
+# address = 0x82B71290
+# name = "NativeSetupDeviceSkip"
+# jump_address = 0x82B712A4
 
 # [[midasm_hook]]
 # address = 0x82B712C4
@@ -1616,22 +1626,57 @@ jump_address = 0x82B712A4
 # name = "NativeSkipVtable17"
 # jump_address = 0x82B71314
 
-[[midasm_hook]]
-address = 0x82B71324
-name = "NativeSkipRendererInit"
-jump_address = 0x82B71690
+# #5 — THE root blocker for native asset loading (established 2026-08-01).
+# Its 876-byte band (0x82B71324..0x82B71690) is what builds the scene manager
+# into eng+52 and initializes the transition renderer at 0x830EC248. Skipping
+# it leaves eng+52 NULL, so LoaderTick's entity block null-derefs on
+# ->vt[32] (logs/mx_012.log), and leaves 0x830EC248+20 = FLT_MAX, which is the
+# timing busy-wait (logs/mx_011.log).
+# But it CANNOT simply be removed: disabling it crashes inside the band itself,
+# right after the 2nd TexManager/BindTexture and before the Transition thread
+# starts (logs/mx_016.log) — the band also does GPU device init.
+# That is the real circular dependency. Next step is to bisect INSIDE the band
+# for the split point between scene-manager creation and GPU device init; the
+# scene manager is not stored directly here, it happens inside one of ~14
+# REX_CALL_INDIRECT_FUNC dispatches, so this is multi-iteration work.
+# Moving #5's fire address is an established technique — see
+# docs/loader_render_block.md:33 (0x82B71324 -> 0x82B71314).
+# [[midasm_hook]]
+# address = 0x82B71520
+# name = "NativeSkipRendererInit"
+# jump_address = 0x82B71690
 
 [[midasm_hook]]
 address = 0x82B70EC8
 name = "NativeSkipLoaderRenderer"
 jump_address = 0x82B710BC
 
-[[midasm_hook]]
-address = 0x82B70E18
-name = "NativeSkipLoaderEarly"
-jump_address = 0x82B70EC8
+# #7 — its band (0x82B70E18..0x82B70EC8) holds the engine vtable /
+# scene-manager / entity block and, at its end, the vt[6] gate that dispatches
+# AssetDB_LoadStateMachine. Skipping it keeps the asset loader from running,
+# but disabling it access-violates inside that block (verified 2026-08-01,
+# logs/mx_012.log): crash lands after `Timing #1 STUBBED` and before
+# `LoaderTick #1`. Candidates, in order: engine->vt[2](), sceneMgr->vt[32](dt),
+# sub_82373660, sub_82B6D230(dt), then the entity loops at 0x82B70E54.
+# Bisect with the unused NativePostLazyInitLog / NativePreDispatchLog stubs
+# (already exported, see midasm_stubs.cpp:37-53) before disabling this again.
+# #7 — its band (0x82B70E18..0x82B70EC8) holds the engine/scene-manager/entity
+# block and, at its end, the vt[6] gate that dispatches AssetDB_LoadStateMachine.
+# STATUS 2026-08-01: with #2 off the scene manager is live, and disabling #7 now
+# gets PAST both indirect vtable calls — engine->vt[2]() and sceneMgr->vt[32](dt)
+# both succeed and TexManager @0x82B70E44 fires (logs/mx_024.log). The crash has
+# moved to the next call: sub_82B6D230 @0x82B70E4C or the entity loops
+# @0x82B70E54. Resume the bisect there; this is the current frontier.
+# [[midasm_hook]]
+# address = 0x82B70E18
+# name = "NativeSkipLoaderEarly"
+# jump_address = 0x82B70EC8
 
-[[midasm_hook]]
-address = 0x82B70DFC
-name = "NativeSkipLoaderAll"
-jump_address = 0x82B70EC8
+# #8 disabled — it deleted LoaderTick's whole body including the vt[6] gate
+# (sub_8253AA40 = AssetDB_LoadStateMachine), so the asset loader was never
+# called. #6 still skips the GPU-dependent renderer block; the native D3D12
+# backend covers that. Re-enable to return to the pre-2026-08-01 baseline.
+# [[midasm_hook]]
+# address = 0x82B70DFC
+# name = "NativeSkipLoaderAll"
+# jump_address = 0x82B70EC8

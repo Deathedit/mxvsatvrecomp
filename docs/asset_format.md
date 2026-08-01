@@ -304,7 +304,13 @@ Generated unified asset catalog by scanning **all 130 `.xenon.database` files** 
 
 ### Implications & strategic next steps
 
-1. **Mid-ASM hook #5 is the gatekeeper** — it skips the `AssetDB_InnerCtor_VtableInstall` call site in SetupRenderer @ 0x82B712EC, which means `DatabaseAndPackageIndexLoader` never runs at boot under our profile. Options to populate the runtime package index:
+1. ~~**Mid-ASM hook #5 is the gatekeeper**~~ — **WRONG, corrected 2026-08-01.** Hook #5 fired at
+   **0x82B71324**, which is *after* 0x82B712EC, so it never skipped that call site. Hooks #3
+   (0x82B712C4→0x82B712D8) and #4 (0x82B71304→0x82B71314) are both disabled and also don't cover it.
+   **Nothing skips `AssetDB_InnerCtor_VtableInstall`**, so `DatabaseAndPackageIndexLoader` may well be
+   running at boot — this needs a runtime log to confirm before any of the options below are worth
+   pursuing. (#5 has since been moved to 0x82B71520; see the hook table in AGENTS.md.)
+   Original options, retained for reference:
    - Disable hook #5 entirely (risky — SetupRenderer's other init code was earlier tagged "skip crash points")
    - Pre-call `DatabaseAndPackageIndexLoader` from a C++ hook in `EngineInit` (Path-1-style pre-population)
    - **Skip the guest loader entirely** — use `bxml_full_decoder.py` to build an equivalent host-side index offline, then hook `AssetFile_Open` to redirect reads to host-side decoded content

@@ -12,7 +12,45 @@ std::unique_ptr<rex::ui::WindowedApp> MxApp::Create(
   return std::unique_ptr<MxApp>(new MxApp(ctx, "mx", PPCImageConfig));
 }
 
+namespace {
+
+// Crash reporter. The log loses its last lines on a hard fault, which made
+// bisecting the native LoaderTick path unreliable — a probe would appear to
+// die before a log line that had actually already executed. This catches the
+// fault, records exactly what address was touched, and flushes before the
+// process dies. Registered first (last arg 1) so it runs before anything else.
+LONG CALLBACK CrashReporter(EXCEPTION_POINTERS* info) {
+  const auto* rec = info->ExceptionRecord;
+  if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+    const char* op = rec->ExceptionInformation[0] == 0   ? "read"
+                     : rec->ExceptionInformation[0] == 1 ? "write"
+                                                         : "execute";
+    uint64_t fault = static_cast<uint64_t>(rec->ExceptionInformation[1]);
+    uint64_t gbase = reinterpret_cast<uint64_t>(
+        mx::native::NativeGraphics::Get().GetGuestMemory());
+    uint64_t modbase = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+    uint64_t rip = reinterpret_cast<uint64_t>(rec->ExceptionAddress);
+    REXLOG_ERROR("*** ACCESS VIOLATION: {} at 0x{:016X}, host RIP=0x{:016X} (RVA 0x{:X})", op,
+                 fault, rip, rip - modbase);
+    if (gbase && fault >= gbase && fault < gbase + 0x100000000ull) {
+      REXLOG_ERROR("***   -> guest address 0x{:08X} (base 0x{:016X})",
+                   static_cast<uint32_t>(fault - gbase), gbase);
+    } else {
+      REXLOG_ERROR("***   -> NOT in guest range (base 0x{:016X}) — host-side pointer", gbase);
+    }
+    rex::FlushLogging();
+  }
+  return EXCEPTION_CONTINUE_SEARCH;
+}
+
+}  // namespace
+
 void MxApp::OnPreSetup(rex::RuntimeConfig& config) {
+  static bool s_handlerInstalled = false;
+  if (!s_handlerInstalled) {
+    AddVectoredExceptionHandler(1, CrashReporter);
+    s_handlerInstalled = true;
+  }
   REXLOG_INFO("MxApp::OnPreSetup");
 
   if (!config.gpu_plugin.empty()) {

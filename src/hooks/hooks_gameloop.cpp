@@ -74,7 +74,14 @@ extern "C" REX_FUNC(sub_82B70760) {
     uint32_t tr_assetdb_vt = tr_assetdb ? REX_LOAD_U32(tr_assetdb) : 0;
     uint32_t tr_assetdb_f0 = tr_assetdb_vt ? REX_LOAD_U32(tr_assetdb_vt) : 0;
     uint32_t tr_assetdb_f6 = tr_assetdb_vt ? REX_LOAD_U32(tr_assetdb_vt + 24) : 0;
-    REX_STORE_U32(eng + 8, eng);  // keep self-ref workaround active
+    // SELF-REF WORKAROUND DISABLED 2026-08-02. `REX_STORE_U32(eng + 8, eng)`
+    // was needed when hooks #2/#5 skipped the engine init: eng+8 held junk and
+    // MainLoop's eng+8->vt[36] had to be forced onto Bootstrap's nullsub_1.
+    // Now that the real init runs, vt[17] populates eng+8 with the genuine
+    // AssetDB (logged as "eng+8 already populated") and overwriting it sends
+    // vt[36] into garbage — the AV at guest 0x4D5854F1 inside orig_MainLoop.
+    REXLOG_INFO("native: eng+8=0x{:08X} (self-ref override disabled)",
+                REX_LOAD_U32(eng + 8));
     REXLOG_INFO("native: eng+12=0x{:08X} vt=0x{:08X} vt[0]=0x{:08X} vt[36]=0x{:08X}",
       sub, sub_vt, sub_f0, sub_f36);
     REXLOG_INFO("native: assetdb=0x{:08X} vt=0x{:08X} vt[0]=0x{:08X} vt[36]=0x{:08X}",
@@ -83,9 +90,35 @@ extern "C" REX_FUNC(sub_82B70760) {
       tr_assetdb, tr_assetdb_vt, tr_assetdb_f0, tr_assetdb_f6);
   }
 
+  // Drive the loader. LoaderTick's first instruction is Wait(*(tr+0x194), -1):
+  // a per-frame handshake the guest renderer thread would satisfy. Hook #6
+  // skips that renderer because our D3D12 backend replaces it, so nothing
+  // ticks the loader and the Transition thread parks forever. Signal it here,
+  // once per frame, which is the cadence the renderer would have used.
+  {
+    uint32_t loader_evt = REX_LOAD_U32(0x830EC248 + 0x194);
+    if (loader_evt) {
+      uint32_t s3 = ctx.r3.u32, s4 = ctx.r4.u32;
+      ctx.r3.u32 = loader_evt;
+      ctx.r4.u32 = 0;                      // NtSetEvent(handle, prev_state=NULL)
+      REX_CALL_INDIRECT_FUNC(0x82BFB748);  // sub_82BFB748 — NtSetEvent
+      ctx.r3.u32 = s3;
+      ctx.r4.u32 = s4;
+    }
+  }
+
   orig_MainLoop(ctx, base);
   ctx.r3.u32 = 1;
-  if ((ml % 60) == 1) REXLOG_INFO("native: MainLoop #{}", ml);
+  if ((ml % 60) == 1) {
+    REXLOG_INFO("native: MainLoop #{}", ml);
+    // Stage 1 diagnostic: is the AssetDB alive in native mode, and what state
+    // does its load machine sit in? state offset +110796 per pm4_pipeline.md.
+    // tr+8 (0x830EC250) is the slot LoaderTick's (a1+8)->vt[6] actually reads.
+    uint32_t adb = REX_LOAD_U32(0x830577C0);
+    uint32_t tr8 = REX_LOAD_U32(0x830EC250);
+    REXLOG_INFO("native: assetdb=0x{:08X} state={} tr+8=0x{:08X}",
+                adb, adb ? REX_LOAD_U32(adb + 110796) : 0xFFFFFFFF, tr8);
+  }
   ::Sleep(16);
 }
 

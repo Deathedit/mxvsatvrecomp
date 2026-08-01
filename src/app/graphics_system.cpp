@@ -17,11 +17,23 @@ namespace system {
 bool D3D12GraphicsSystem::InitializeRenderer(HWND hwnd) {
   m_hwnd = hwnd;
   m_renderer = std::make_unique<D3D12Renderer>();
-  if (!m_renderer->Initialize(hwnd)) return false;
+  if (!m_renderer->Initialize(hwnd)) {
+    m_renderer.reset();
+    return false;
+  }
   mx::native::SetRenderer(m_renderer.get());
   m_running = true;
   m_renderThread = std::thread([this]() { RenderThreadFunc(); });
   return true;
+}
+
+void D3D12GraphicsSystem::Shutdown() {
+  m_running = false;
+  if (m_renderThread.joinable()) m_renderThread.join();
+  // Drop the bridge's non-owning alias before the renderer dies.
+  mx::native::NativeGraphics::Get().Shutdown();
+  m_renderer.reset();
+  m_initialized = false;
 }
 
 void D3D12GraphicsSystem::RenderThreadFunc() {

@@ -137,6 +137,43 @@ extern "C" REX_FUNC(sub_82B710D0) {
     return;
   }
   REXLOG_INFO("native: Transition (0x82B710D0)");
+  // Bisect aid for the LoaderTick entity block (0x82B70E18..0x82B70EC8), which
+  // access-violates when mid-ASM hook #7 is disabled. The two candidates are
+  // the indirect calls at 0x82B70E28 (engine->vt[2]() -> scene manager) and
+  // 0x82B70E3C (sceneMgr->vt[32](dt)). Log the slots read-only — do NOT call
+  // them — so we can see which resolves to garbage. Sane targets are 0x82XXXXXX.
+  {
+    uint32_t eng = REX_LOAD_U32(0x830BE400);
+    uint32_t eng_vt = eng ? REX_LOAD_U32(eng) : 0;
+    uint32_t vt2 = eng_vt ? REX_LOAD_U32(eng_vt + 8) : 0;
+    REXLOG_INFO("native: [bisect] eng=0x{:08X} eng_vt=0x{:08X} vt[2]=0x{:08X}",
+                eng, eng_vt, vt2);
+    // vt[2] (sub_82ABB448) is just `return *(this+52)` — it cannot fault. So
+    // the crash is the next call, sceneMgr->vt[32](dt) at 0x82B70E3C. Resolve
+    // that chain read-only.
+    uint32_t sm = eng ? REX_LOAD_U32(eng + 52) : 0;
+    uint32_t sm_vt = sm ? REX_LOAD_U32(sm) : 0;
+    uint32_t vt32 = sm_vt ? REX_LOAD_U32(sm_vt + 128) : 0;
+    REXLOG_INFO("native: [bisect] sceneMgr=0x{:08X} sm_vt=0x{:08X} vt[32]=0x{:08X}",
+                sm, sm_vt, vt32);
+    // dword_830B03EC is the GPU physical base; it stays 0 because our
+    // SetupGuestGpu is a no-op stub. Entity/scene code may derive from it.
+    REXLOG_INFO("native: [bisect] gpu_phys=0x{:08X} tr+24(dt)=0x{:08X}",
+                REX_LOAD_U32(0x830B03EC), REX_LOAD_U32(0x830EC248 + 24));
+    // LoaderTick's first instruction is Wait(*(tr+0x194), -1). Now that the
+    // fake INFINITE-wait success is gone, that wait is real and the Transition
+    // thread parks in it. Log the handle so it can be matched against the
+    // NtSetEvent handles actually being signalled.
+    REXLOG_INFO("native: [bisect] tr+0x194(LoaderTick wait handle)=0x{:08X} tr+0x2DC=0x{:08X}",
+                REX_LOAD_U32(0x830EC248 + 0x194), REX_LOAD_U32(0x830EC248 + 0x2DC));
+    // LoaderTick's entity loops @0x82B70E54 walk engine sub-entities at
+    // eng+0x1C..0x24 and dereference *(sub+0x3C). A NULL sub-entity faults.
+    for (uint32_t off = 0x1C; off <= 0x24; off += 4) {
+      uint32_t sub = eng ? REX_LOAD_U32(eng + off) : 0;
+      REXLOG_INFO("native: [bisect] eng+0x{:X}=0x{:08X} +0x3C=0x{:08X}", off, sub,
+                  sub ? REX_LOAD_U32(sub + 0x3C) : 0xDEADDEAD);
+    }
+  }
   orig_Transition(ctx, base);
   REXLOG_INFO("native: Transition returned");
 }
@@ -158,13 +195,11 @@ REX_HOOK_RAW(sub_82B70DE8) {
   static int lt = 0;
   ++lt;
   __imp__sub_82B70DE8(ctx, base);
-  // Per IDA decompile of sub_82B70DE8 tail: `if (result) { renderer block; }`
-  // gate is bare `if(result)` — ANY nonzero r3 triggers the renderer. The
-  // previous `r3 == 1` cap only matched one code path and would miss other
-  // nonzero returns (e.g. wait timeouts, pointer values from vtable[6]).
-  if (ctx.r3.u32 != 0 && lt > 100) {
-    ctx.r3.u32 = 0;
-  }
-  if (lt <= 5 || lt == 101 || lt % 1000 == 0)
+  // The `if (r3 != 0 && lt > 100) r3 = 0` cap is REMOVED (2026-08-02). It was a
+  // FABRICATED completion from when LoaderTick's body was deleted by mid-ASM
+  // hooks #7/#8 and the loop had to be broken artificially — nothing was ever
+  // loaded. The body now runs for real and AssetDB_LoadStateMachine ticks each
+  // iteration, so forcing r3=0 would kill the Transition loop mid-load.
+  if (lt <= 5 || lt % 500 == 0)
     REXLOG_INFO("native: LoaderTick #{} r3={}", lt, ctx.r3.u32);
 }

@@ -220,18 +220,76 @@ Inject at PPC instruction addresses. Replace instruction with C++ call + goto ju
 
 | # | Address | Name | Jump To | Skips |
 |---|---------|------|---------|-------|
-| 1 | 0x82B70854 | NativeGameTickSkip | 0x82B70874 | MainLoop vtable[36] crash (DISABLED — commented out, eng+8 self-ref workaround handles it) |
-| 2 | 0x82B71290 | NativeSetupDeviceSkip | 0x82B712A4 | SetupRenderer vtable[6] block |
-| 3 | 0x82B712C4 | NativeSkipVtable8 | 0x82B712D8 | SetupRenderer vtable[8] (DISABLED — vt[8] is harmless 4-byte alloc + vtable install at eng+0x38) |
-| 4 | 0x82B71304 | NativeSkipVtable17 | 0x82B71314 | SetupRenderer vtable[17] (DISABLED — let vt[17] run naturally so eng+8 = AssetDB_block is populated) |
-| 5 | 0x82B71324 | NativeSkipRendererInit | 0x82B71690 | Renderer init -> Transition thread |
-| 6 | 0x82B70EC8 | NativeSkipLoaderRenderer | 0x82B710BC | LoaderTick renderer block |
-| 7 | 0x82B70E18 | NativeSkipLoaderEarly | 0x82B70EC8 | LoaderTick vtable+entities |
-| 8 | 0x82B70DFC | NativeSkipLoaderAll | 0x82B70EC8 | LoaderTick everything |
+| 1 | 0x82B70854 | NativeGameTickSkip | 0x82B70874 | DISABLED — MainLoop vt[36]; eng+8 now holds the real AssetDB, no workaround needed |
+| 2 | 0x82B71290 | NativeSetupDeviceSkip | 0x82B712A4 | **DISABLED 2026-08-01** — vt[6] CREATES the scene manager at eng+52. Skipping it caused null derefs in TWO places and was misread as a GPU problem for a long time |
+| 3 | 0x82B712C4 | NativeSkipVtable8 | 0x82B712D8 | DISABLED — harmless 4-byte alloc + vtable install at eng+0x38 |
+| 4 | 0x82B71304 | NativeSkipVtable17 | 0x82B71314 | DISABLED — vt[17] populates eng+8 = AssetDB_block |
+| 5 | 0x82B71324 | NativeSkipRendererInit | 0x82B71690 | **DISABLED 2026-08-02** — this 876-byte band runs the real renderer init that creates the engine sub-entities at eng+0x1C/0x20/0x24 and spawns the guest worker threads |
+| 6 | 0x82B70EC8 | NativeSkipLoaderRenderer | 0x82B710BC | **ACTIVE — the only one left.** LoaderTick's GPU renderer block; the native D3D12 backend replaces it |
+| 7 | 0x82B70E18 | NativeSkipLoaderEarly | 0x82B70EC8 | **DISABLED 2026-08-02** — holds the engine/scene/entity block and the vt[6] gate into the asset loader |
+| 8 | 0x82B70DFC | NativeSkipLoaderAll | 0x82B70EC8 | **DISABLED 2026-08-01** — it deleted the asset-loader call site entirely |
 
-**Hooks #2, #5, #6, #7, #8 active** (5 hooks in config). Hooks #1, #3, #4 disabled. All 8 export symbols remain in CMakeLists.txt.
+**Only hook #6 is active.** All others disabled. All 8 export symbols remain in CMakeLists.txt.
+
+### Native asset loading WORKS (2026-08-02)
+
+`AssetDB_LoadStateMachine` runs, `LoaderTick` ticks past #500 returning r3=1, and the guest
+issues real asset I/O (`game:\Cameras\*.bxml`). No GPU plugin. `gpu_phys` is still 0x00000000.
+The `0xC000000F` failures on PROTruck/Buggy/UTV/PRO2Truck cameras are **normal** — those files
+are absent from the dump and the same failures occur under the GPU plugin.
+
+Five host-side fakes had to be REMOVED, not added — each was a workaround for a problem our own
+hooks created, and each actively blocked real loading:
+
+| Removed | Why it blocked loading |
+|---|---|
+| `eng+8 = eng` self-ref (`hooks_gameloop.cpp`) | Overwrote the real AssetDB (0x40BCF740); MainLoop's vt[36] then read garbage → AV at guest 0x4D5854F1 |
+| Blanket INFINITE-wait success (`hooks_wait.cpp`) | A single process-wide 3s timer made EVERY infinite wait a no-op, releasing threads into a half-built registry → racy AV inside `sub_82AFF560` (a RtlEnterCriticalSection-guarded registry walk). Flaky: 2 of 3 runs |
+| `LoaderTick` r3=0 cap at iter 101 (`hooks_loading.cpp`) | Fabricated "loading complete" and killed the Transition loop mid-load |
+| `byte_82D57994` forcing | Fabricated completion flag |
+| mid-ASM hooks #2/#5/#7/#8 | See table above |
+
+One host-side fake had to be ADDED — `sub_82B70370` (timing) is stubbed in native mode because
+it busy-waits on `*(0x830EC248+20)`, which reads 0x7F7FFFFF (`FLT_MAX`), and stores through an
+unbounded ring index at `+32`. The stub writes a fixed 1/60 dt to `+24`.
+
+And one genuine host responsibility: **MainLoop signals the loader's frame event.** `LoaderTick`
+opens with `Wait(*(tr+0x194), -1)` — handle 0xF80001F0 — a per-frame handshake the guest renderer
+thread would satisfy. Hook #6 skips that renderer, so `hooks_gameloop.cpp` now calls guest
+`NtSetEvent` (0x82BFB748) on that handle once per frame. Without it the Transition thread parks
+forever after tick 1.
+
+### Debugging aids added
+
+- **Crash reporter** (`src/app/mx_app.cpp`): `AddVectoredExceptionHandler` logs the faulting
+  address, host RIP, RVA, and the translated guest address, then `rex::FlushLogging()`. The log
+  silently drops its last lines on a hard fault, which made earlier bisects misleading — probes
+  looked like they died before code that had actually already run.
+- **Symbolizing a crash**: build with `-DCMAKE_CXX_FLAGS_DEBUG="-O0 -gline-tables-only"` and
+  `-DCMAKE_EXE_LINKER_FLAGS="-Wl,/MAP:mx.map"`, then look the logged RVA up in `mx.map`
+  (llvm-symbolizer does NOT resolve these; the map file does).
 
 **IMPORTANT**: Mid-ASM hooks are unconditional. Always fire, always jump. No conditional behavior.
+They fire in **plugin mode too** — `g_plugin_mode` gates only the C++ `REX_FUNC` hooks, never these.
+Any plugin-mode result recorded in `docs/` came from a build with these commented out, which is a
+different binary, not "the plugin fixing it".
+
+### Hook #5 fire address (moved 2026-08-01)
+
+#5 originally fired at 0x82B71324 and jumped 876 bytes to 0x82B71690, skipping renderer creation
+*and* everything downstream. Bisect results (each = one codegen + build + run):
+
+| Fire addr | Result |
+|-----------|--------|
+| disabled | crashes inside the band (GPU device init) |
+| 0x82B713E0 | survives |
+| 0x82B714AC | survives |
+| **0x82B71520** | survives ← **current** |
+| 0x82B71570 | crashes: `engine->vt[2]()` returns NULL, then `lwz r7,0(r3)` |
+| 0x82B715D4 | crashes |
+
+The 0x82B71570 crash was a **null scene manager**, not GPU state — same signature as the LoaderTick
+crash. Disabling hook #2 fixed both: `sceneMgr=0x408929D0 sm_vt=0x8214207C vt[32]=0x82B6E298`.
 
 ---
 
@@ -349,7 +407,16 @@ Type-0: [31:30]=0, [29:0]=register base
 2. `cmake --build ... --target mx` (~10s)
 3. Copy the fresh binary to the project root before running:
    `Copy-Item out\build\win-amd64-debug\mx.exe mx.exe -Force`
-   (the build outputs to the build dir; the root `mx.exe` is what `Start-Process` launches against the assets at this directory)
+   (the build outputs to the build dir; the root `mx.exe` is what runs against the assets in this directory)
+
+## Run
+
+```
+./mx.exe --game_data_root=assets --user_data_root=userdata
+```
+
+Both arguments are required — without them the process exits immediately with
+code 1 and writes no useful log. Each run appends a new `logs/mx_NNN.log`.
 
 ---
 
@@ -365,7 +432,7 @@ Type-0: [31:30]=0, [29:0]=register base
 - **PM4 parser**: 15055 packets decoded from first 5 VdSwaps, ring wrap handled, big-endian byteswap, validated
 - **GPU state tracking**: 66 Xenos registers shadowed, 32 regs captured from first VdSwap, diff dumped to file
 - **Input**: SDL gamepad init + Xbox 360 Controller, ReXGlue handles XamInput natively
-- **LoaderTick**: orig runs 100 iterations (pre-entity code: Wait, timing, vtable calls), forces completion at iter 101
+- **LoaderTick**: body now runs (hook #8 disabled). `sub_82B70370` (timing) is stubbed in native mode — it busy-waited on `*(0x830EC248+20)` which reads 0x7F7FFFFF (`FLT_MAX`, uninitialized) and stored through an unbounded ring index at `+32`. The stub writes a fixed 1/60 dt to `+24`. The C++ cap at iter 101 (`hooks_loading.cpp:166`) is a FABRICATED completion, not a real one.
 - **eng+8 populated** — vt[17] (`sub_82B43AC8`) runs naturally (mid-ASM hook #4 disabled), writes `*(eng+8) = AssetDB_block`. Self-ref override `eng+8 = eng` at MainLoop #1 still fires (lands MainLoop's vt[36] on Bootstrap's nullsub_1, NOT AssetDB's vt[36] = "SP_EVENT" string data → would crash).
 - EngineInit sleep loop keeps process alive
 - 5 mid-ASM hooks active (#2, #5, #6, #7, #8; #1, #3, #4 disabled) + ~25 C++ hooks
@@ -379,10 +446,34 @@ Type-0: [31:30]=0, [29:0]=register base
 - **No menu/gameplay state**: LoaderTick completes but entities never loaded, game stays in MainLoop with triangle
 
 ### Blocked
-- Entity loading needs working GPU render state (circular dependency). Entity code skipped by mid-ASM hooks #6-8.
+- **Current frontier**: LoaderTick's entity block. With #2 and #8 off and #5 at 0x82B71520,
+  disabling #7 gets past *both* indirect vtable calls — `engine->vt[2]()` and `sceneMgr->vt[32](dt)`
+  succeed and `TexManager` @0x82B70E44 fires — then crashes at `sub_82B6D230` @0x82B70E4C or the
+  entity loops @0x82B70E54 (`logs/mx_024.log`). Resume the bisect there.
 - Binary `.xenon.package` heaps encrypted (entropy ≈7.98, unknown decryption routine; OpenSSL AES bundle is TLS-only).
 - FATAL crash at 0x82327CF0 during gameplay (separate known issue).
-- LoaderTick renderer block (`sub_82B34998`) structurally cannot complete without GPU plugin — vtable `off_8213F70C` dispatches to `sub_82BDB190` fatal terminators, `*(a1+1288)` uninitialized. See `docs/loader_render_block.md` for full analysis. Baseline caps LoaderTick at 101 iterations with r3=0.
+
+### CORRECTED 2026-08-01 — claims that were wrong
+
+- ~~"Entity loading needs working GPU render state (circular dependency)"~~ — **wrong**. The two
+  entity-block crashes were **null-pointer derefs on `eng+52`** (the scene manager), caused by our
+  own hook #2 skipping the SetupRenderer `vt[6]` that creates it. Not GPU state. `gpu_phys` is still
+  0x00000000 and the block now runs past both vtable calls anyway.
+- ~~"LoaderTick renderer block structurally cannot complete without GPU plugin — `off_8213F70C`
+  fatal terminators"~~ — already retracted in `docs/loader_render_block.md:226` and
+  `docs/pm4_pipeline.md:308`: the real vtable is `0x8213F7A4` (no terminators). The terminator vtable
+  was only reached because our hooks skipped the constructor `sub_82B38558` that installs the real one.
+- ~~"LoaderTick: orig runs 100 iterations then forces completion at iter 101"~~ — that cap
+  (`hooks_loading.cpp:166`) is a **fabricated** completion, as is `byte_82D57994 = 0` at
+  `hooks_gameloop.cpp:52`. Nothing was ever loaded. `AssetDB_LoadStateMachine` (`sub_8253AA40`,
+  AssetDB vt[6]) was **never called even once** in native mode — hooks #7/#8 deleted its call site.
+- ~~"LoadStateMachine state is at AssetDB+110796"~~ (`docs/pm4_pipeline.md:202`) — that offset holds a
+  **guest heap pointer** (observed 0x40B76720), not a 0–11 state enum. It sits 4 bytes before
+  +110800, which `docs/asset_format.md:155` identifies as an event handle, so that region is
+  handles/pointers. The plugin-run conclusion "never advances state" was reading the wrong word.
+- ~~"Mid-ASM hook #5 is the package-index gatekeeper, it skips 0x82B712EC"~~
+  (`docs/asset_format.md:307`) — **wrong**: #5 fired at 0x82B71324, *after* 0x82B712EC, and #3/#4 are
+  disabled. Nothing skips that call site.
 
 ### PATH 1 EXPERIMENT — cascade of hang points discovered (2026-07-31)
 

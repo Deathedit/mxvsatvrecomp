@@ -20,12 +20,18 @@ extern "C" REX_FUNC(sub_82BFB740) {
     return;
   }
   if (ctx.r4.u32 == 0xFFFFFFFF) {
-    static auto t0 = std::chrono::steady_clock::now();
-    auto now = std::chrono::steady_clock::now();
-    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count() > 3000) {
-      ctx.r3.u32 = 0;
-      return;
-    }
+    static int inf = 0;
+    ++inf;
+    if (inf <= 5)
+      REXLOG_INFO("native: Wait(INFINITE) #{} handle=0x{:08X}", inf, ctx.r3.u32);
+    // The blanket "after 3s, every INFINITE wait returns SUCCESS" fallback is
+    // DISABLED 2026-08-02. It existed because SetupRenderer's NtSetEvent band
+    // was skipped by hook #5 so nothing was ever signalled. With #5 off the
+    // real events fire, and faking success releases threads to walk
+    // structures that are not populated yet — the racy null deref inside
+    // sub_82AFF560 (a RtlEnterCriticalSection-guarded registry walk).
+    // Note the old timer was a single process-wide `static t0`, not per-wait,
+    // so 3s after the FIRST wait every wait in the process became a no-op.
   }
   orig_Wait(ctx, base);
 }
@@ -37,7 +43,14 @@ extern "C" REX_FUNC(sub_82BFB740) {
 REX_IMPORT(__imp__sub_82BFB748, orig_SetEvent, void());
 extern "C" REX_FUNC(sub_82BFB748) {
   if (mx::native::g_plugin_mode) { orig_SetEvent(ctx, base); return; }
+  // Frontier probe: Transition's loop calls NtSetEvent(tr+0x2DC) after each
+  // LoaderTick. The crash lands between LoaderTick #1 returning and Timing #2.
+  static int se = 0;
+  ++se;
+  bool loud = se <= 8;
+  if (loud) REXLOG_INFO("native: NtSetEvent #{} ENTER handle=0x{:08X}", se, ctx.r3.u32);
   orig_SetEvent(ctx, base);
+  if (loud) REXLOG_INFO("native: NtSetEvent #{} RETURNED r3=0x{:08X}", se, ctx.r3.u32);
 }
 
 //=============================================================================

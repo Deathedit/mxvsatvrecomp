@@ -42,12 +42,7 @@ class D3D12GraphicsSystem final : public IGraphicsSystem {
     return X_STATUS_SUCCESS;
   }
   bool has_presentation() const override { return m_initialized; }
-  void Shutdown() override {
-    m_running = false;
-    if (m_renderThread.joinable()) m_renderThread.join();
-    m_renderer.reset();
-    m_initialized = false;
-  }
+  void Shutdown() override;
 
   bool InitializeRenderer(HWND hwnd);
   void RenderThreadFunc();

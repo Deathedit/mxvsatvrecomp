@@ -199,7 +199,12 @@ Plugin uses a different high-address pool (`0xFD..`/`0xFE..`) for runtime caches
 Captured over 3000 LoaderTick iterations (gameplay):
 
 - **LoaderTick** returns `r3=1` every iteration — never capped. Plugin processes ~1000 LoaderTicks/45s gameplay.
-- **LoadStateMachine** (`sub_8253AA40`) always returns `r3=1`, never advances state (stays in active state — single state at offset 110796 bytes into AssetDB).
+- **LoadStateMachine** (`sub_8253AA40`) always returns `r3=1`, never advances state.
+  > **CORRECTION 2026-08-01**: "state at offset 110796" is **wrong**. That offset holds a guest heap
+  > pointer (observed 0x40B76720 in native mode), not a 0–11 state enum. It sits 4 bytes before
+  > +110800, which `docs/asset_format.md:155` identifies as an event handle, so the region is
+  > handles/pointers. The real switch variable's offset has not been derived yet. Treat "never
+  > advances state" as unproven — it was reading the wrong word.
 - **RendererDispatch** (`sub_82B34998`) called twice per LoaderTick, executes cleanly, returns the `dword_830BE190` object ptr. Never fatal — `off_8213F7A4` vtable dispatches all complete normally.
 - **Timing** (`sub_82B70370`) called once per LoaderTick — completes in <1ms.
 - **LazyInit** (`sub_82B3C7D0`) called exactly once during SetupRenderer (boot), then never again — block is cached.
