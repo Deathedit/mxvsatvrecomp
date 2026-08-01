@@ -1589,17 +1589,17 @@ memcpy = 0x82BFBB10
 0x82CF4EF0 = { size = 0xC0 }
 0x82CF4FB0 = { size = 0xF4 }
 
-# [[midasm_hook]]
-# address = 0x82B70854
-# name = "NativeGameTickSkip"
-# jump_address = 0x82B70874
-
 # All mid-ASM hooks disabled for GPU plugin mode.
 # Re-enable individually when working on the native (no-plugin) renderer.
 # Active in native mode: #2 #5 #6 #7 #8 (NOT #1, NOT #3, NOT #4)
 #   #1 disabled — eng+8 self-ref workaround handles MainLoop vt[36] crash
 #   #3 disabled — vt[8] is harmless 4-byte alloc + vtable install at eng+0x38
 #   #4 disabled — vt[17] writes eng+8 = AssetDB + registers subsystems
+
+# [[midasm_hook]]
+# address = 0x82B70854
+# name = "NativeGameTickSkip"
+# jump_address = 0x82B70874
 
 [[midasm_hook]]
 address = 0x82B71290
