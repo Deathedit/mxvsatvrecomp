@@ -1,5 +1,9 @@
 #pragma once
 
+// Host-side bridge between the guest hooks (hooks_*.cpp) and the D3D12
+// renderer. Owns the guest memory base, the renderer pointer, and the queue of
+// PM4-translated draw calls handed from the VdSwap hook to the render thread.
+
 #include <Windows.h>
 #include <atomic>
 #include <mutex>
@@ -8,8 +12,8 @@
 #include <rex/hook.h>
 #include <rex/logging.h>
 
-#include "d3d12_renderer.h"
-#include "pm4_translator.h"
+#include "gfx/d3d12_renderer.h"
+#include "gpu/pm4_translator.h"
 
 namespace mx::native {
 
@@ -50,14 +54,5 @@ class NativeGraphics {
   std::mutex m_drawMutex;
   std::vector<mx::pm4::DrawCall> m_drawCalls;
 };
-
-//=============================================================================
-// Hook declarations — replace guest render functions with native implementations
-//=============================================================================
-
-// Phase 1: Frame lifecycle
-void Hook_RenderInit(PPCContext& ctx, uint8_t* base, u32 arg);
-void Hook_BeginFrame(PPCContext& ctx, uint8_t* base, u32 arg);
-void Hook_VdSwap(PPCContext& ctx, uint8_t* base);
 
 }  // namespace mx::native

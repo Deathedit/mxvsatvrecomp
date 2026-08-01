@@ -35,20 +35,47 @@ $env:PATH = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\Llvm
 ## Architecture
 
 ### Files
+
+`src/` is grouped by layer: `app/` (ReXGlue application), `gfx/` (host D3D12 +
+video), `gpu/` (Xenos PM4 understanding), `hooks/` (guest function hooks).
+`src/` is on the include path, so cross-layer includes name their layer —
+`#include "gpu/pm4_parser.h"`, `#include "gfx/d3d12_renderer.h"`.
+
 | File | Role |
 |---|---|
-| `src/main.cpp` | Entry point |
-| `src/mx_app.h` | App class + D3D12GraphicsSystem + Bink render thread + gamepad init |
-| `src/d3d12_renderer.h/.cpp` | D3D12 renderer: swapchain, video pipeline, game pipeline (triangle PSO), game RT+depth, PresentGameFrame copy |
-| `src/bink_player.h` | FFmpeg Bink video + audio decoder |
-| `src/native_graphics.h` | NativeGraphics class: guest mem base, game frame buffer, CaptureGameFrame (legacy readback) |
-| `src/native_graphics.cpp` | All guest function hooks (~25 C++ hooks, 8 mid-ASM stubs) |
-| `src/native_input.h/.cpp` | GamepadState singleton (XInput-compatible struct, SDL gamepad init in renderer) |
-| `src/native_heap.h/.cpp` | Guest heap management |
-| `src/pm4_parser.h/.cpp` | PM4 command buffer parser: Type-0/2/3 decode, 30 opcodes, 65 reg names, ring wrap, dump |
-| `src/xenos_gpu_state.h/.cpp` | Xenos GPU register shadow: 66 named registers, ApplyType0Write, ApplyType3Packet, Snapshot/DumpDiff |
+| `src/main.cpp` | Entry point (`REX_DEFINE_APP`) |
+| **app** | |
+| `src/app/mx_app.h/.cpp` | `MxApp`: OnPreSetup installs the graphics system (or sets plugin mode), OnPostSetup hands it the HWND |
+| `src/app/graphics_system.h/.cpp` | `D3D12GraphicsSystem` + the host render thread (Bink playlist -> game frames) |
+| **gfx** | |
+| `src/gfx/d3d12_renderer.h` | `D3D12Renderer` interface — implemented across the three `.cpp` below |
+| `src/gfx/d3d12_device.cpp` | Device, adapter, swapchain, RTVs, command list/allocators, fence, BeginFrame/EndFrame |
+| `src/gfx/d3d12_video.cpp` | Video pipeline: fullscreen quad + texture sample, Bink frame upload |
+| `src/gfx/d3d12_game.cpp` | Game pipeline (triangle PSO / translated draws), game RT + depth, PresentGameFrame copy |
+| `src/gfx/d3d12_shaders.h` | HLSL source for both pipelines |
+| `src/gfx/d3d12_internal.h` | LogError/LogInfo/CompileShader shared by the three gfx TUs (internal) |
+| `src/gfx/bink_player.h/.cpp` | FFmpeg Bink video + audio decoder |
+| **gpu** | |
+| `src/gpu/pm4_parser.h/.cpp` | PM4 command buffer parser: Type-0/2/3 decode, 30 opcodes, 65 reg names, ring wrap, dump |
+| `src/gpu/pm4_translator.h/.cpp` | PM4 -> `DrawCall` translation (draw opcodes, vertex fetch consts, shader constants) |
+| `src/gpu/xenos_gpu_state.h/.cpp` | Xenos GPU register shadow: 66 named registers, ApplyType0Write, ApplyType3Packet, Snapshot/DumpDiff |
+| **hooks** | |
+| `src/hooks/native_bridge.h/.cpp` | `NativeGraphics` singleton (guest mem base, renderer ptr, draw-call queue) + `g_plugin_mode` |
+| `src/hooks/hook_common.h` | Shared hook internals: `LogEngSlot8`, `IsBinkPlaying` (internal) |
+| `src/hooks/midasm_stubs.cpp` | All 11 exported mid-ASM hook targets (must stay at global namespace — see file header) |
+| `src/hooks/hooks_frame.cpp` | VdSwap (PM4 parse/translate), XenosWait, Begin/EndFrame, GpuState, FramePendingPoll |
+| `src/hooks/hooks_wait.cpp` | Wait, NtSetEvent, ErrorRecovery |
+| `src/hooks/hooks_gameloop.cpp` | MainLoop, RenderPipeline |
+| `src/hooks/hooks_loading.cpp` | SetupRenderer, Transition, LoaderTick |
+| `src/hooks/hooks_boot.cpp` | Bootstrap, GraphicsInit, EngineInit, PostGfxInit, TexManager, BindTexture, GpuAlloc, Cleanup1/2 |
+| `src/hooks/hooks_plugin_diag.cpp` | Plugin-mode-only diagnostics: RendererDispatch, LazyInit, Timing, LoadStateMachine, VtableCtor |
+| **build** | |
 | `mx_config.toml` | Function sizes + `[[midasm_hook]]` definitions |
-| `CMakeLists.txt` | Linker exports for mid-ASM hooks |
+| `CMakeLists.txt` | Source list by layer, `src/` include dir, linker exports for mid-ASM hooks |
+
+Input is handled entirely by ReXGlue's built-in `SDLInputDriver`
+(`XamInputGetState` / `XamInputGetCapabilities` at kernel level) — there is no
+`src/native_input.*` and no manual `REX_FUNC` input hook.
 
 ### Host Pipeline
 ```
@@ -266,7 +293,7 @@ Inject at PPC instruction addresses. Replace instruction with C++ call + goto ju
 
 ## GPU Pipeline (PM4 Analysis)
 
-### PM4 Parser (`src/pm4_parser.h/.cpp`)
+### PM4 Parser (`src/gpu/pm4_parser.h/.cpp`)
 - Decodes Type-0 (16-bit reg base + 14-bit count), Type-2 (NOP), Type-3 (14-bit opcode)
 - **Big-endian byteswap**: all guest dwords must be `_byteswap_ulong()` before parsing
 - 30 named opcodes (NOP, INDIRECT_BUFFER, WAIT_REG_MEM, DRAW_INDEX*, SET_CONFIG_REG, SET_CONTEXT_REG, SET_ALU_CONST, SET_RESOURCE, SET_SAMPLER, etc.)
@@ -293,7 +320,7 @@ Type-0: [31:30]=0, [29:0]=register base
 - 0x77777777: Fill
 - 0x80000000: Type-2 NOP
 
-### Xenos GPU State (`src/xenos_gpu_state.h/.cpp`)
+### Xenos GPU State (`src/gpu/xenos_gpu_state.h/.cpp`)
 - Tracks 66 named Xenos registers in `regs_` map
 - `ApplyType0Write(reg_base, data, count)`: writes count consecutive registers
 - `ApplyType3Packet(pkt)`: handles SET_CONFIG_REG, SET_CONTEXT_REG, SET_ALU_CONST, etc.
@@ -304,8 +331,6 @@ Type-0: [31:30]=0, [29:0]=register base
 
 ## Input
 
-- `GamepadState` singleton in `src/native_input.h/.cpp` holds XInput-compatible gamepad struct
-- SDL gamepad subsystem initialized in `InitializeRenderer` (SDL_InitSubSystem + SDL_GetGamepads)
 - ReXGlue SDLInputDriver handles `XamInputGetState`/`XamInputGetCapabilities` natively at kernel level
 - No manual `REX_FUNC` hooks for input (removed, redundant with ReXGlue built-in driver)
 

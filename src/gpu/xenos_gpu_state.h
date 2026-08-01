@@ -1,6 +1,6 @@
 #pragma once
 
-#include "pm4_parser.h"
+#include "gpu/pm4_parser.h"
 
 #include <cstdint>
 #include <string>

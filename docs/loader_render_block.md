@@ -1,4 +1,4 @@
-# LoaderTick & Render Block — Why Natural Entity Loading Cannot Work
+﻿# LoaderTick & Render Block — Why Natural Entity Loading Cannot Work
 
 Deep technical analysis of the LoaderTick renderer block, the `sub_82B34998` dispatch, the eng+8 writer trace, and the EndFrame #2 hang. Investigation notes preserved here; AGENTS.md holds the operational summary.
 
@@ -193,7 +193,7 @@ int RendererDispatchBlock(int a1, ..., float a22)
 
 9 of 20 slots are fatal (`vt[3,6,7,14-19]`); the dispatch path reaches only 3 (`vt[7,15,16]`), but all 9 are replaced defensively.
 
-### Shim hooks installed in `src/native_graphics.cpp`
+### Shim hooks installed in `src/hooks/hooks_loading.cpp`
 
 Three REX_FUNC hooks added under the `// GPU renderer shim (Path 2)` section. **Inert in baseline** (mid-ASM hook #6 skips sub_82B34998 entirely so these never fire until Path 1 is enabled):
 
@@ -213,10 +213,10 @@ To activate the shim with Path 1 cascade:
    - Comment out the `NativeSkipLoaderRenderer` mid-ASM hook (#6) — lines ~1641-1646
    - Move `NativeSkipRendererInit` (#5) fire-address from `0x82B71324` → `0x82B71314`
    - Comment out `NativeSkipLoaderAll` (#8) — lines ~1651-1654
-2. Edit `src/native_graphics.cpp`:
-   - In the `sub_82B71148` (SetupRenderer) hook, after `orig_SetupRenderer` returns, restore registers r0/r3-r12/lr/ctr around a `REX_CALL_INDIRECT_FUNC(0x82B3C7D0)` to pre-populate `dword_830BE190` from main-thread context (avoids the lazy-init Transition-thread hang)
-   - In the `sub_82BFB740` (Wait) hook, always return SUCCESS
-   - Add a hook for `sub_82B70370` (timing) that no-op returns (avoids the busy-wait spin)
+2. Edit the hook TUs under `src/hooks/`:
+   - In `hooks_loading.cpp`, in the `sub_82B71148` (SetupRenderer) hook, after `orig_SetupRenderer` returns, restore registers r0/r3-r12/lr/ctr around a `REX_CALL_INDIRECT_FUNC(0x82B3C7D0)` to pre-populate `dword_830BE190` from main-thread context (avoids the lazy-init Transition-thread hang)
+   - In `hooks_wait.cpp`, in the `sub_82BFB740` (Wait) hook, always return SUCCESS
+   - In `hooks_plugin_diag.cpp`, make the `sub_82B70370` (timing) hook no-op return (avoids the busy-wait spin)
 3. `rexglue codegen --force mx_manifest.toml` (~75s)
 4. `cmake --build out/build/win-amd64-debug --target mx`
 5. Copy `mx.exe` to root, run, watch log for `shim vtable installed @0x...` then `LoaderTick #N r3=...`

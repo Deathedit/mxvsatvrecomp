@@ -14,15 +14,34 @@ set(FFMPEG_ROOT "${CMAKE_SOURCE_DIR}/ffmpeg")
 
 include(generated/rexglue.cmake)
 
-# Sources
+# Sources, grouped by layer (see src/ layout in AGENTS.md).
 set(MX_SOURCES
     src/main.cpp
-    src/d3d12_renderer.cpp
-    src/native_graphics.cpp
-    src/native_heap.cpp
-    src/pm4_parser.cpp
-    src/pm4_translator.cpp
-    src/xenos_gpu_state.cpp
+
+    # app — ReXGlue application + graphics system / render thread
+    src/app/mx_app.cpp
+    src/app/graphics_system.cpp
+
+    # gfx — D3D12 renderer and Bink video decode
+    src/gfx/d3d12_device.cpp
+    src/gfx/d3d12_video.cpp
+    src/gfx/d3d12_game.cpp
+    src/gfx/bink_player.cpp
+
+    # gpu — Xenos PM4 parse / translate / register shadow
+    src/gpu/pm4_parser.cpp
+    src/gpu/pm4_translator.cpp
+    src/gpu/xenos_gpu_state.cpp
+
+    # hooks — guest function hooks and mid-ASM stubs
+    src/hooks/native_bridge.cpp
+    src/hooks/midasm_stubs.cpp
+    src/hooks/hooks_frame.cpp
+    src/hooks/hooks_wait.cpp
+    src/hooks/hooks_gameloop.cpp
+    src/hooks/hooks_loading.cpp
+    src/hooks/hooks_boot.cpp
+    src/hooks/hooks_plugin_diag.cpp
 )
 
 if(WIN32)
@@ -44,4 +63,6 @@ target_link_libraries(mx PRIVATE d3d12 dxgi dxguid d3dcompiler winmm
     "${FFMPEG_ROOT}/lib/swresample.lib"
 )
 
-target_include_directories(mx PRIVATE "${FFMPEG_ROOT}/include")
+# src/ on the include path so cross-layer includes name their layer:
+#   #include "gpu/pm4_parser.h", #include "gfx/d3d12_renderer.h"
+target_include_directories(mx PRIVATE "${FFMPEG_ROOT}/include" "${CMAKE_SOURCE_DIR}/src")

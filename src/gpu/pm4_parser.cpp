@@ -1,10 +1,10 @@
-#include "pm4_parser.h"
+#include "gpu/pm4_parser.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <Windows.h>
 
-#include "xenos_gpu_state.h"  // shared register-name catalog (single source of truth)
+#include "gpu/xenos_gpu_state.h"  // shared register-name catalog (single source of truth)
 
 namespace mx::pm4 {
 

@@ -1,4 +1,4 @@
-#include "xenos_gpu_state.h"
+#include "gpu/xenos_gpu_state.h"
 
 #include <cstdio>
 #include <algorithm>

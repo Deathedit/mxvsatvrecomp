@@ -1,6 +1,6 @@
-# PM4 Pipeline & Plugin-Mode Data Capture
+﻿# PM4 Pipeline & Plugin-Mode Data Capture
 
-Deep technical analysis of the PM4 packet parser, translator, plugin-mode runtime state capture, GPU cvars, and the SDK/Xenia reference files. Operationally, the parser lives in `src/pm4_parser.{h,cpp}` and the translator in `src/pm4_translator.{h,cpp}`.
+Deep technical analysis of the PM4 packet parser, translator, plugin-mode runtime state capture, GPU cvars, and the SDK/Xenia reference files. Operationally, the parser lives in `src/gpu/pm4_parser.{h,cpp}` and the translator in `src/gpu/pm4_translator.{h,cpp}`.
 
 Reference: AGENTS.md (operational hub), docs/ida_notes.md (IDA bookmarks).
 
@@ -8,7 +8,7 @@ Reference: AGENTS.md (operational hub), docs/ida_notes.md (IDA bookmarks).
 
 ## GPU Pipeline (PM4 Analysis)
 
-### PM4 Parser (`src/pm4_parser.h/.cpp`)
+### PM4 Parser (`src/gpu/pm4_parser.h/.cpp`)
 - Decodes Type-0 (16-bit reg base + 14-bit count), Type-2 (NOP), Type-3 (14-bit opcode)
 - **Big-endian byteswap**: all guest dwords must be `_byteswap_ulong()` before parsing
 - 30 named opcodes (NOP, INDIRECT_BUFFER, WAIT_REG_MEM, DRAW_INDEX*, SET_CONFIG_REG, SET_CONTEXT_REG, SET_ALU_CONST, SET_RESOURCE, SET_SAMPLER, etc.)
@@ -35,7 +35,7 @@ Type-0: [31:30]=0, [29:0]=register base
 - 0x77777777: Fill
 - 0x80000000: Type-2 NOP
 
-### Xenos GPU State (`src/xenos_gpu_state.h/.cpp`)
+### Xenos GPU State (`src/gpu/xenos_gpu_state.h/.cpp`)
 - Tracks 66 named Xenos registers in `regs_` map
 - `ApplyType0Write(reg_base, data, count)`: writes count consecutive registers
 - `ApplyType3Packet(pkt)`: handles SET_CONFIG_REG, SET_CONTEXT_REG, SET_ALU_CONST, etc.
@@ -367,7 +367,7 @@ Branch `canary_experimental` of `https://github.com/xenia-canary/xenia-canary`:
 
 ### Status
 
-The PM4 translator in `src/pm4_translator.{h,cpp}` is **fully working** for structure extraction. Verified by running with `gpu_plugin = "xenos"` and parsing every 100th swap from swap 1200+ during real 3D gameplay.
+The PM4 translator in `src/gpu/pm4_translator.{h,cpp}` is **fully working** for structure extraction. Verified by running with `gpu_plugin = "xenos"` and parsing every 100th swap from swap 1200+ during real 3D gameplay.
 
 ### What works
 
@@ -434,3 +434,21 @@ Sampled from swap 1200+ during 3D gameplay:
 - `0x3F800000` appears occasionally (garbage — float `1.0` misinterpreted as address)
 
 All real IB addresses fall above `0x20000000` (512MB main RAM), in the plugin's `SharedMemory::kBufferSize=512MB` range.
+---
+
+## Deferred: GPU upload-buffer pooling
+
+`D3D12Renderer::SetGameDrawData` creates two `ID3D12Resource`s per call (VB + IB)
+on the UPLOAD heap, and `UploadVideoFrame` recreates `m_videoUploadBuffer` every
+frame. Correctness is fine — old COM refs are dropped via `Reset()` and D3D12's
+command-list tracking keeps the underlying memory alive until the GPU finishes
+with it — but at 60fps that is ~120 `CreateCommittedResource` calls/sec.
+
+The intended fix is a ring of N upload buffers (one per `kFrameCount` slot in
+flight), recycled after `MoveToNextFrame`'s fence sync: a single `ID3D12Heap`
+plus `CreatePlacedResource`, instead of one `CreateCommittedResource` per call.
+
+A scaffolded `GpuMemoryHeap` class (`src/native_heap.h/.cpp`) existed for this
+but was never instantiated by any caller; it was deleted in the `src/`
+restructure. Recover it from git history if picking this up:
+`git log --diff-filter=D -- src/native_heap.cpp`.
