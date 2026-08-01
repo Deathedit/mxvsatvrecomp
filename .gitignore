@@ -1,0 +1,11 @@
+assets/*
+ffmpeg/*
+generated/*
+out/*
+logs/*
+userdata/*
+old_logs/*
+backup/*
+tools/__pycache__
+*.dll
+*.exe

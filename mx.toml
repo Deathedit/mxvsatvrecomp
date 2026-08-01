@@ -1,0 +1,22 @@
+# mx.toml — ReXGlue runtime configuration
+# Loaded automatically from next to mx.exe
+
+# GPU plugin (xenos = Xenia-derived D3D12 backend)
+# Native mode: comment out or set to "none" to disable plugin
+# gpu_plugin = "xenos"
+
+# Allow invalid texture fetch constants (fixes missing textures)
+gpu_allow_invalid_fetch_constants = true
+
+# Full readback resolve (fixes black screen in gameplay at performance cost)
+readback_resolve = "full"
+
+# Occlusion query settings (fixes brightness)
+occlusion_query_enable = true
+query_occlusion_fake_sample_count = -1
+
+# VSync
+vsync = false
+
+# Resolution scale (1 = native 1280x720)
+resolution_scale = 1
