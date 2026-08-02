@@ -195,7 +195,8 @@ zero access violations:
 
 `2 -> 3` (by the API) `-> 4` (~390 ticks of real work) `-> 5 -> 6`, then **parks
 in state 6 `PlayerSetup`**. Entity counts stay `pass0=1 pass1=0 pass2=1`, still
-zero `DRAW_*`, and no file I/O for the requested scene — but states 7/8 are where
+zero `DRAW_*` (**void — see "The draws were always there" below**), and no file
+I/O for the requested scene — but states 7/8 are where
 the async content load happens and we park before them, so that last point does
 not yet indict the name. (Pairing this with `registry_override=ReadyToLaunch=1`
 gets past 6 — see "The registry chokepoint" below.)
@@ -276,6 +277,35 @@ and stay there; **`DRAW_*` and `INDIRECT_BUFFER` are still zero**.
 
 `--force_load=UI_World` completes too but spends 1 tick in state 4 against ~380
 for `NAT_Farm`, so it loads nothing of substance.
+
+### The draws were always there (2026-08-02)
+
+**The "zero `DRAW_*`" line above is void**, as is every other one in this file.
+It was never a measurement of the guest's command stream. The `VdSwap` hook
+parsed `[write_before, write_after)` — the range VdSwap *itself* writes, i.e. the
+present sequence — and in native mode only for the first 5 swaps, while the load
+completes around swap ~600. The guest's actual frame lives in the gap between
+swaps: `0x2D20` = 11552 bytes at boot, ~10168 packets after a load.
+
+Re-measuring the identical configuration
+(`--skip_intro=true --force_load=NAT_Farm --registry_override=ReadyToLaunch=1`,
+3/3, zero access violations, logs `mx_041/042/043`):
+
+| | boot, no forcing | after the load |
+|---|---|---|
+| frame packets | 305 | ~10168 |
+| draw calls / frame | 3–7 | **350–363** |
+| `DRAW_INDX` | 1 | **453** |
+| `DRAW_INDX_2` | 2 | **62** |
+| `INDIRECT_BUFFER` | 6 | 20 |
+
+So the completed load **does** produce geometry, roughly 50x the boot level, and
+it is inline rather than hidden behind indirect buffers. Nothing still reaches
+the screen, but for a different and much more specific reason: every draw is an
+auto-draw (`src_sel == 2`) whose vertex fetch constant the translator never
+resolves, so `DrawCall::vertices` is empty and `graphics_system.cpp:93` skips it.
+See AGENTS.md, "The PM4 was never present-only", for the ring layout and the
+frame-vs-swap range split.
 
 **Superseded**: an earlier `force_launch` cvar wrote `*(AssetDB+28)` directly.
 Forcing `2 -> 9` access-violates — `sub_82541F80 +0xE4` is `lwzx r29,r3,0x20768`

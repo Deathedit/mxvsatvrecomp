@@ -9,6 +9,7 @@ backup/*
 tools/__pycache__
 *.dll
 *.exe
+gamecontrollerdb.txt
 
 # Runtime dumps written next to the executable by the VdSwap hook
 pm4_dump_*.txt

@@ -5,6 +5,18 @@
 // for the D3D12 renderer. The rest are the guest's Begin/End frame entry
 // points, which the native path stubs out because there is no Xenos GPU behind
 // them.
+//
+// Two ranges, and the distinction matters more than anything else in this file:
+//
+//   frame range  [prev_after, write_before)  — everything the guest wrote since
+//                                              the last swap. This is the frame.
+//   swap range   [write_before, write_after) — what VdSwap itself emits.
+//
+// Until 2026-08-02 only the swap range was parsed, so every "zero DRAW_*"
+// result in this effort was measured over a present sequence: DISPLAY_TIMING,
+// DISP_TG_CTL, EVENT_WRITE_SHD, and a SET_LOOP_CONST whose first data word is
+// 0x53574150 — ASCII "SWAP". A draw could not have appeared there. The frame
+// range ran ~11552 bytes per frame at boot and was never looked at.
 
 #include "hooks/hook_common.h"
 
@@ -14,6 +26,33 @@
 //=============================================================================
 // sub_82566B58 — VdSwap
 //=============================================================================
+
+namespace {
+
+// Type3 opcode histogram for a parsed range. This is what says whether draws
+// are inline (0x22/0x34/0x35/0x36), hidden behind INDIRECT_BUFFER (0x3F/0x37),
+// or simply absent — the translator ignores IB dispatches today, so a range
+// full of them would read as "no draws" without this.
+void LogOpcodeHistogram(const char* tag, const char* range, int swap_count,
+                        const std::vector<mx::pm4::Pm4Packet>& packets) {
+  uint32_t counts[128] = {};
+  uint32_t type0 = 0, type2 = 0;
+  for (const auto& p : packets) {
+    if (p.type == mx::pm4::PacketType::Type3) counts[p.opcode & 0x7F]++;
+    else if (p.type == mx::pm4::PacketType::Type0) ++type0;
+    else if (p.type == mx::pm4::PacketType::Type2) ++type2;
+  }
+  REXLOG_INFO("{}: hist #{} {} — Type0={} Type2={}", tag, swap_count, range,
+              type0, type2);
+  for (uint32_t op = 0; op < 128; ++op) {
+    if (!counts[op]) continue;
+    const char* name = mx::pm4::Pm4Parser::OpcodeName(op);
+    REXLOG_INFO("{}: hist #{} {} — Type3 0x{:02X} {} x{}", tag, swap_count,
+                range, op, name ? name : "???", counts[op]);
+  }
+}
+
+}  // namespace
 
 REX_IMPORT(__imp__sub_82566B58, orig_VdSwap, void());
 extern "C" REX_FUNC(sub_82566B58) {
@@ -25,49 +64,86 @@ extern "C" REX_FUNC(sub_82566B58) {
   uint32_t a1 = ctx.r3.u32;
 
   uint32_t pm4_write_before = REX_LOAD_U32(a1 + 48);
-  uint32_t pm4_end = REX_LOAD_U32(a1 + 52);
-  uint32_t pm4_base = REX_LOAD_U32(a1 + 44);
 
   bool is_plugin = mx::native::g_plugin_mode;
   const char* tag = is_plugin ? "plugin" : "native";
 
+  // Ring bounds are not established. The fields this code used to read as base
+  // and end (+44 and +52) logged 0x00000000 and 0xBEBA0000 at swap #1, but
+  // packets parse at 0xBEBB3260 and later swaps write at 0xBED0653C — so
+  // neither means what was assumed, and the old wrap arithmetic
+  // (ring_size = end - base) was garbage. Dump the struct once so the real
+  // fields can be identified by matching them against the observed span, and
+  // until then refuse to parse a wrapped range rather than fabricate packets
+  // from wrong bounds.
   if (swap_count == 1) {
-    REXLOG_INFO("{}: PM4 ring dev+40=0x{:08X} +44=0x{:08X} +48=0x{:08X} +52=0x{:08X}",
-      tag, REX_LOAD_U32(a1 + 40), pm4_base, pm4_write_before, pm4_end);
+    for (uint32_t off = 0; off <= 96; off += 16) {
+      REXLOG_INFO("{}: VdSwap dev+{:3} = 0x{:08X} 0x{:08X} 0x{:08X} 0x{:08X}",
+                  tag, off, REX_LOAD_U32(a1 + off), REX_LOAD_U32(a1 + off + 4),
+                  REX_LOAD_U32(a1 + off + 8), REX_LOAD_U32(a1 + off + 12));
+    }
   }
 
   orig_VdSwap(ctx, base);
 
   uint32_t pm4_write_after = REX_LOAD_U32(a1 + 48);
 
-  // Log VdSwap only at sparse checkpoints to avoid flooding during gameplay.
-  bool log_this_swap = (swap_count <= 20) || (swap_count % 100 == 0);
+  static uint32_t s_prev_after = 0;
+  static uint32_t s_ptr_min = 0xFFFFFFFFu;
+  static uint32_t s_ptr_max = 0;
+  if (pm4_write_before < s_ptr_min) s_ptr_min = pm4_write_before;
+  if (pm4_write_after > s_ptr_max) s_ptr_max = pm4_write_after;
+
+  // The frame range is only usable when the write pointer moved forward across
+  // the whole inter-swap span. A wrap is reported and skipped, not guessed at.
+  const bool frame_wrapped = s_prev_after != 0 && pm4_write_before < s_prev_after;
+  uint32_t frame_start = s_prev_after;
+  uint32_t frame_size =
+      (!frame_wrapped && s_prev_after != 0 && pm4_write_before > s_prev_after)
+          ? pm4_write_before - s_prev_after
+          : 0;
+  if (frame_size >= 1024 * 1024) frame_size = 0;
+
+  // Log VdSwap at sparse checkpoints, plus the first 40 swaps and every wrap
+  // (either range) so the ring span can be pinned down from one run.
+  bool log_this_swap = (swap_count <= 40) || (swap_count % 100 == 0) ||
+                       frame_wrapped || (pm4_write_after < pm4_write_before);
   if (log_this_swap) {
     if (pm4_write_after >= pm4_write_before) {
-      uint32_t sz = pm4_write_after - pm4_write_before;
-      REXLOG_INFO("{}: VdSwap #{} wrote {} bytes at guest 0x{:08X}",
-                  tag, swap_count, sz, pm4_write_before);
+      REXLOG_INFO("{}: VdSwap #{} frame [0x{:08X}+{}]{} swap [0x{:08X}+{}] "
+                  "ptr span 0x{:08X}..0x{:08X}",
+                  tag, swap_count, frame_start, frame_size,
+                  frame_wrapped ? " WRAPPED-SKIPPED" : "", pm4_write_before,
+                  pm4_write_after - pm4_write_before, s_ptr_min, s_ptr_max);
     } else {
-      REXLOG_INFO("{}: VdSwap #{} ring WRAP (before=0x{:08X} after=0x{:08X})",
-                  tag, swap_count, pm4_write_before, pm4_write_after);
+      REXLOG_INFO("{}: VdSwap #{} ring WRAP (before=0x{:08X} after=0x{:08X}) "
+                  "ptr span 0x{:08X}..0x{:08X}",
+                  tag, swap_count, pm4_write_before, pm4_write_after, s_ptr_min,
+                  s_ptr_max);
     }
   }
 
-// In plugin mode, parse boot swaps (1-20) + spot checks (300/600/1000) +
-// every 100th swap after 1200 (sparse to avoid overload) — game may reach
-// 3D gameplay at any time and we want to catch indexed draws.
-int parse_limit = is_plugin ? 20 : 5;
-bool should_parse = (swap_count <= parse_limit) ||
-                    (is_plugin && (swap_count == 300 || swap_count == 600 ||
-                                   swap_count == 1000)) ||
-                    (is_plugin && swap_count >= 1200 && (swap_count % 100 == 0));
+  // Native mode now parses every swap: the load completes around swap ~600 and
+  // the old native limit of 5 meant nothing after boot was ever examined. The
+  // expensive extras below (gpu_state, file dumps) stay on their sparse
+  // schedules. Plugin mode keeps its original cadence.
+  bool should_parse = !is_plugin || (swap_count <= 20) ||
+                      (swap_count == 300 || swap_count == 600 ||
+                       swap_count == 1000) ||
+                      (swap_count >= 1200 && (swap_count % 100 == 0));
 
   if (should_parse) {
-    mx::pm4::Pm4Parser parser;
+    mx::pm4::Pm4Parser frame_parser;
+    if (frame_size > 0) {
+      frame_parser.ParseRange(
+          reinterpret_cast<const uint32_t*>(base + frame_start),
+          frame_size / 4, frame_start);
+    }
 
-    if (pm4_write_after >= pm4_write_before) {
+    mx::pm4::Pm4Parser swap_parser;
+    if (pm4_write_after > pm4_write_before) {
       uint32_t sz = pm4_write_after - pm4_write_before;
-      if (sz > 0 && sz < 1024 * 1024) {
+      if (sz < 1024 * 1024) {
         if (swap_count == 1) {
           const uint32_t* raw = reinterpret_cast<const uint32_t*>(base + pm4_write_before);
           uint32_t dump_count = (sz / 4) < 16 ? (sz / 4) : 16;
@@ -75,90 +151,84 @@ bool should_parse = (swap_count <= parse_limit) ||
             REXLOG_INFO("{}: PM4 raw[{}] = 0x{:08X}  (guest: 0x{:08X})", tag, i, raw[i], _byteswap_ulong(raw[i]));
           }
         }
-        parser.ParseRange(
+        swap_parser.ParseRange(
             reinterpret_cast<const uint32_t*>(base + pm4_write_before),
             sz / 4, pm4_write_before);
       }
-    } else {
-      uint32_t ring_size = pm4_end - pm4_base;
-      uint32_t sz1 = pm4_end - pm4_write_before;
-      if (sz1 > 0 && sz1 <= ring_size) {
-        parser.ParseRange(
-            reinterpret_cast<const uint32_t*>(base + pm4_write_before),
-            sz1 / 4, pm4_write_before);
-      }
-      uint32_t sz2 = pm4_write_after - pm4_base;
-      if (sz2 > 0 && sz2 <= ring_size) {
-        parser.ParseRange(
-            reinterpret_cast<const uint32_t*>(base + pm4_base),
-            sz2 / 4, pm4_base);
-      }
     }
 
-    auto& packets = parser.Packets();
-    REXLOG_INFO("{}: PM4 #{}: {} packets", tag, swap_count, packets.size());
+    auto& frame_packets = frame_parser.Packets();
+    auto& swap_packets = swap_parser.Packets();
 
     // Only write dump files for spot-check swaps — keeps the disk clean when
-    // we're parsing every swap >= 1200 looking for indexed draws.
+    // we're parsing every swap looking for indexed draws.
     bool should_dump_file = (swap_count <= 20) ||
                             swap_count == 300 || swap_count == 600 ||
                             swap_count == 1000 ||
                             (swap_count >= 1200 && (swap_count % 500 == 0));
     if (should_dump_file) {
       char dumpfname[64];
-      snprintf(dumpfname, sizeof(dumpfname), "pm4_dump_%s_%02d.txt", tag, swap_count);
-      mx::pm4::Pm4Parser::DumpPackets(packets, dumpfname);
+      snprintf(dumpfname, sizeof(dumpfname), "pm4_dump_%s_frame_%02d.txt", tag, swap_count);
+      mx::pm4::Pm4Parser::DumpPackets(frame_packets, dumpfname);
+      snprintf(dumpfname, sizeof(dumpfname), "pm4_dump_%s_swap_%02d.txt", tag, swap_count);
+      mx::pm4::Pm4Parser::DumpPackets(swap_packets, dumpfname);
+      LogOpcodeHistogram(tag, "frame", swap_count, frame_packets);
+      LogOpcodeHistogram(tag, "swap", swap_count, swap_packets);
     }
 
     // Skip ApplyPackets gpu_state tracking + per-packet logging for high swap
     // counts (too noisy) — only the translator needs to run.
     if (swap_count <= 20 || swap_count == 300 || swap_count == 600 ||
         swap_count == 1000) {
-      REXLOG_INFO("{}: starting ApplyPackets for {} packets", tag, packets.size());
       static mx::gpu::XenosGpuState gpu_state;
-      size_t n = packets.size();
-      for (size_t i = 0; i < n; ++i) {
-        if ((i & 0x3FF) == 0) REXLOG_INFO("{}: packet {}/{}", tag, i, n);
-        const auto& p = packets[i];
-        if (p.type == mx::pm4::PacketType::Type0) {
-          uint32_t cnt = p.reg_count;
-          if (cnt > p.body.size()) cnt = (uint32_t)p.body.size();
-          if (cnt > 0) {
-            gpu_state.ApplyType0Write(p.reg_base, p.body.data(), cnt);
+      for (const auto* list : {&frame_packets, &swap_packets}) {
+        for (const auto& p : *list) {
+          if (p.type == mx::pm4::PacketType::Type0) {
+            uint32_t cnt = p.reg_count;
+            if (cnt > p.body.size()) cnt = (uint32_t)p.body.size();
+            if (cnt > 0) gpu_state.ApplyType0Write(p.reg_base, p.body.data(), cnt);
+          } else if (p.type == mx::pm4::PacketType::Type3) {
+            gpu_state.ApplyType3Packet(p);
           }
-        } else if (p.type == mx::pm4::PacketType::Type3) {
-          gpu_state.ApplyType3Packet(p);
         }
       }
       REXLOG_INFO("{}: ApplyPackets done, {} regs", tag, gpu_state.Registers().size());
     }
 
+    // One translator, both ranges, frame first — that is the order the guest
+    // wrote them, and state-setting packets in the frame must be seen before
+    // the swap's.
     static mx::pm4::Pm4Translator translator;
     translator.Clear();
-    translator.TranslatePackets(packets, base, 0xBEDA0000);
+    translator.TranslatePackets(frame_packets, base, 0xBEDA0000);
+    translator.TranslatePackets(swap_packets, base, 0xBEDA0000);
     auto& draws = translator.DrawCalls();
-    REXLOG_INFO("{}: translator produced {} draw calls", tag, draws.size());
+
+    // The first swap that produces a draw is the whole point of this round, so
+    // it is logged unconditionally however sparse the schedule is.
+    static bool s_loggedFirstDraw = false;
+    if (!draws.empty() && !s_loggedFirstDraw) {
+      s_loggedFirstDraw = true;
+      REXLOG_INFO("{}: FIRST DRAWS at swap #{} — {} draw calls "
+                  "(frame {} packets, swap {} packets)",
+                  tag, swap_count, draws.size(), frame_packets.size(),
+                  swap_packets.size());
+      LogOpcodeHistogram(tag, "frame", swap_count, frame_packets);
+    }
+    if (log_this_swap) {
+      REXLOG_INFO("{}: PM4 #{}: frame {} packets, swap {} packets, {} draw calls",
+                  tag, swap_count, frame_packets.size(), swap_packets.size(),
+                  draws.size());
+    }
+
     // Always propagate, even when empty: empty list clears the renderer's stale
     // draw data so frames without a VdSwap don't replay the last captured draws.
     if (!is_plugin) {
       mx::native::NativeGraphics::Get().SetDrawCalls(draws);
     }
-
-    // (gpu_state dump only ran for swap_count <= 1000 above — diff disabled for
-    // high swap counts to avoid noise.)
-    if (swap_count <= 20) {
-      char diffpath[MAX_PATH];
-      GetModuleFileNameA(nullptr, diffpath, sizeof(diffpath));
-      char* difflast = strrchr(diffpath, '\\');
-      if (difflast) *(difflast + 1) = '\0';
-      char diffname[64];
-      snprintf(diffname, sizeof(diffname), "gpu_state_diff_%s_%02d.txt", tag, swap_count);
-      strcat_s(diffpath, diffname);
-      FILE* df = nullptr;
-      fopen_s(&df, diffpath, "w");
-      if (df) { fclose(df); }
-    }
   }
+
+  s_prev_after = pm4_write_after;
 }
 
 //=============================================================================

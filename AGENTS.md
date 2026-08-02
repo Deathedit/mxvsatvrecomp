@@ -355,37 +355,106 @@ pass `--skip_intro=true`.
 With that flag, per 30s run: RenderPipeline reaches #600, VdSwap #900, ~17728
 bytes of PM4 per swap, 0 access violations, 3/3 clean.
 
-### The PM4 is present-only
+### The PM4 was never present-only — we were reading the wrong bytes (2026-08-02)
 
-Steady-state swaps decode to **10 Type-3 + 12 Type-0 packets, ~13500 Type-2
-filler**. The content is display and scanout state:
+**Every "zero `DRAW_*`" result recorded before 2026-08-02 in this file is void.**
+They were not measurements of the guest's command stream. Two defects in the
+`VdSwap` hook meant no run had ever parsed a range that could contain a draw:
 
-- `SET_LOOP_CONST` carrying `0x53574150` — ASCII **"SWAP"**
-- `DISPLAY_TIMING`, `DISP_TG_CTL`, `DISP_DITHER`, `HW_MODE_TABLE`
-- `MC_CTL` / `MC_BASE_ADDR` + `WAIT_REG_MEM` triplets, `EVENT_WRITE_SHD`
+1. **The wrong range.** The hook captured `write_before` at VdSwap entry and
+   `write_after` at exit and parsed `[before, after)` — which by construction is
+   only what VdSwap itself emits. That is why every dump showed
+   `SET_LOOP_CONST` carrying `0x53574150` (ASCII **"SWAP"**), `DISPLAY_TIMING`,
+   `DISP_TG_CTL`, `MC_BASE_ADDR` + `WAIT_REG_MEM`, and ~13500 Type-2 filler. It
+   is a present sequence. A draw could not have appeared there.
+2. **Five swaps.** `parse_limit` was 5 in native mode; every later checkpoint
+   (300 / 600 / 1000, `>= 1200`) was `is_plugin`-gated. The load completes around
+   swap ~600, so native mode stopped looking long before anything loaded.
 
-**No `DRAW_*` opcodes and no `INDIRECT_BUFFER`** in any captured swap. The
-translator correctly reports 0 draw calls; it is not the problem, and the draws
-are not hiding in an indirect buffer the parser fails to follow (it does not
-follow them — opcode 0x3F is named but never chased — but none are emitted).
+The bytes being skipped were visible in the logs all along. Swap #3 started at
+`0xBEBB325C` and wrote 54624 bytes, ending at `0xBEBC07BC` — but swap #4 started
+at `0xBEBC34DC`. **`0x2D20` = 11552 bytes per frame**, written by the guest
+between swaps, identical for #2→#3, #3→#4 and #4→#5, never parsed.
 
-Entity counts are `pass0=1 pass1=0 pass2=1`, i.e. a near-empty scene.
-`RenderPipeline` iterates those entities every frame and emits nothing
-drawable.
+#### The two ranges
 
-**Cause identified 2026-08-02: the loader is idle, not stuck.** It reaches state
-2 (`IdleClearRenderBusy`) and parks there — see "Not working / unverified". The
-scene is empty because nothing ever asks it to load anything, so `RenderPipeline`
-has nothing to draw. The next step is finding what should drive the state into 9
-(`LaunchActivity`) or 10 (`SeriesAdvance`), which is front-end/game-flow work,
-not loader or GPU work.
+`hooks_frame.cpp` now parses both, labels them separately, and feeds both to one
+translator in write order:
+
+| Range | Span | Content |
+|---|---|---|
+| **frame** | `[prev_after, write_before)` | everything the guest wrote since the last swap — the actual frame |
+| **swap** | `[write_before, write_after)` | what VdSwap emits — the present sequence, all that was ever parsed before |
+
+Native mode parses **every** swap. `ApplyPackets`/`XenosGpuState`, the
+`pm4_dump_*` files, and the opcode histograms stay on the old sparse schedule;
+the first swap that yields a non-zero draw count logs unconditionally.
+
+#### Ring layout, established empirically
+
+The struct fields the old wrap arithmetic used are not what it assumed —
+`dev+44` reads `0x00000000` and `dev+52` reads `0xBEBA0000`, but packets parse at
+`0xBEBB3260` and the pointer runs to `0xBED7FD7C`, so `ring_size = end - base`
+was garbage. Measured from the pointer itself over an 841-swap run:
+
+| | |
+|---|---|
+| base | ~`0xBEB90000` (post-wrap `write_after` is `0xBEB9003C`) |
+| end | ~`0xBED80000` (last pre-wrap `write_before` is `0xBED7FD7C`) |
+| size | ~`0x1F0000` (1.875 MB) |
+| wrap cadence | every ~30 swaps |
+
+These are inferred from observation, not read from a field. The hook therefore
+**skips the frame range on a wrap** rather than parse from guessed bounds — one
+frame in thirty, which changes nothing about the result. Do not hardcode the
+numbers above into wrap arithmetic without finding the real fields first.
+
+#### What is actually in the frame range
+
+Measured with `--skip_intro=true --force_load=NAT_Farm
+--registry_override=ReadyToLaunch=1`, identical 3/3 (logs `mx_041/042/043`),
+zero access violations:
+
+| | boot, no forcing (`mx_040`) | after the load completes |
+|---|---|---|
+| frame packets | 305 | ~10168 |
+| draw calls / frame | 3–7 | **350–363** |
+| `DRAW_INDX` (0x22) | 1 | **453** |
+| `DRAW_INDX_2` (0x36) | 2 | **62** |
+| `INDIRECT_BUFFER` (0x3F) | 6 | 20 |
+
+So geometry is emitted, it scales ~50x with the load, and it is **inline, not
+behind indirect buffers** — the translator's refusal to chase opcode 0x3F is not
+what is hiding it. Draws appear from swap #2 even with the loader parked, which
+is why this needed a control run to separate "the load produced geometry" from
+"the ring always had geometry."
+
+#### The real blocker: no vertex data
+
+**Every one of those draws is `src_sel == 2`, an auto-draw.** The translator
+synthesizes sequential indices and leaves `DrawCall::vertices` empty, and
+`graphics_system.cpp:93` skips any draw with no vertices — so
+`RenderThread: first translated draw` has still never fired. Vertex counts are
+real mesh sizes (24, 36, 40, 48, 52, 56, 60, 64, 68 at `prim=13`, plus `prim=8
+vtcs=3` triangles that are probably UI), and `m_vtxStride` is falling back to the
+hardcoded 32.
+
+The next question is therefore **resolving the vertex fetch constant**, not the
+loader, not the front end, and not mid-ASM hook #6. Only 4 draws in a whole run
+carried an index-buffer address, and all 4 were rejected as out-of-range.
+
+Cost: the forced runs reach `MainLoop #601` in 35s versus `#841` for the
+boot-only control. Most of that is the load succeeding — the frame range grows
+from 305 to ~10168 packets, 33x the parse work — not instrumentation overhead
+per se, but if it becomes a problem the parse cadence is the dial.
 
 ### Parser caveat
 
 `Pm4Parser` accepts any Type-3 with `body_word_count <= 0x4000`. A misparsed
 header at `0xBEBE0B80` (opcode 0x5D, count 8449) swallows the rest of the ring.
-This does not currently hide draws — the swap ring genuinely has none — but it
-will need tightening once real command streams are parsed.
+Now that real command streams are being parsed this matters: a post-load frame
+also logs 70 `DRAW_INDX invalid header` and 42 `DRAW_INDX_2 body too small`
+warnings, which is the same desync showing up as lost draws.
 
 ### Draw-call plumbing
 
@@ -423,7 +492,7 @@ behavior.
 ### Frame Lifecycle
 | Hook | Behavior |
 |------|----------|
-| sub_82566B58 (VdSwap) | Counter sync 0x82D21818 → 0x83144208. PM4 parse + XenosGpuState update for the first 5 swaps; logs swap size / ring wrap at sparse checkpoints |
+| sub_82566B58 (VdSwap) | Counter sync 0x82D21818 → 0x83144208. Parses the frame range `[prev_after, write_before)` and the swap range `[write_before, write_after)` on **every** swap in native mode; XenosGpuState + file dumps + histograms stay sparse |
 | sub_82BFBF30 (XenosWait) | Counter sync only |
 | sub_8255D430 (BeginFrameXenos) | Stubbed |
 | sub_8255D470 (EndFrameXenos) | Stubbed |
@@ -521,7 +590,8 @@ Type-0: [31:30]=0, [29:0]=register base
 - **Guest render path runs**: RenderPipeline every frame, VdSwap climbing to #900
   in a 30s run (~17.7KB of PM4 per swap). Requires `skip_intro` — see below
 - **3D game pipeline**: colored triangle via game PSO, game RT + depth, PresentGameFrame copy to swapchain
-- **PM4 parser**: 15055 packets decoded from the first 5 VdSwaps, ring wrap handled, big-endian byteswap, validated
+- **PM4 parser**: every swap parsed in native mode, both the frame and swap
+  ranges, big-endian byteswap; **350–363 draw calls per frame after a load**
 - **GPU state tracking**: 66 Xenos registers shadowed, 32 captured from the first VdSwap
 - **Input**: SDL gamepad + Xbox 360 Controller, ReXGlue handles XamInput natively
 - **Asset loading**: LoadStateMachine ticks every LoaderTick, real file I/O reaching the VFS
@@ -529,8 +599,10 @@ Type-0: [31:30]=0, [29:0]=register base
 - EngineInit sleep loop keeps the process alive
 
 ### Not working / unverified
-- **Game rendering**: no guest draws reach the screen. The guest emits PM4 every
-  frame but it is **present-only** — see "The guest render path" below
+- **Game rendering**: no guest draws reach the screen — but **not** because none
+  are emitted. The guest emits 350–363 draws per frame after a load; they are all
+  auto-draws with no vertex data resolved, so the renderer skips them. See "The
+  PM4 was never present-only" below
 - **The loader is idle, not stuck.** The state is `*(AssetDB + 28)` (derived from
   `mx_recomp.31.cpp:36836`; the old `+110796` was a heap pointer). It runs
   `0 -> 1` on call #1, `1 -> 2` at call #59, then parks in **state 2
@@ -593,7 +665,9 @@ The ordered sequence works: **3 `DatabaseLoad` → 4 `SubsceneCreate` → 5
 (~6.5s) is the first evidence of the loader doing sustained real work.
 
 Still unmoved at state 6: entity counts `pass0=1 pass1=0 pass2=1`, zero `DRAW_*`,
-zero `INDIRECT_BUFFER`, and no file I/O for the requested scene. That last point
+zero `INDIRECT_BUFFER` (**void — that was the swap range only, and only swaps
+1-5; see "The PM4 was never present-only"**), and no file I/O for the requested
+scene. That last point
 matters — states 7/8 are where the async content load happens, and we park before
 reaching them, so "no NAT_Farm files opened" does **not** yet mean the name is
 wrong.
@@ -710,6 +784,11 @@ gate returning 0 and `ReadyToLaunch` reading 0, so the causation is isolated.
 `pass0=0 pass1=1 pass2=1` about one second after the load completes, and stays.
 Still **zero `DRAW_*` and zero `INDIRECT_BUFFER`** — the entity block advanced a
 pass, it did not produce geometry.
+
+> **Void.** Re-measuring this same configuration with the frame range parsed
+> gives **350-363 draw calls per frame**, 453 `DRAW_INDX` and 62 `DRAW_INDX_2`,
+> against 3-7 draws pre-load. The load did produce geometry; the hook was
+> reading the present sequence. See "The PM4 was never present-only".
 
 `--force_load=UI_World` also completes but spends **1 tick** in state 4 against
 ~380 for `NAT_Farm`: it loads essentially nothing. `NAT_Farm` is the right
