@@ -6,17 +6,17 @@
 # gpu_plugin = "xenos"
 
 # Allow invalid texture fetch constants (fixes missing textures)
-gpu_allow_invalid_fetch_constants = true
+# gpu_allow_invalid_fetch_constants = true
 
 # Full readback resolve (fixes black screen in gameplay at performance cost)
-readback_resolve = "full"
+# readback_resolve = "full"
 
 # Occlusion query settings (fixes brightness)
-occlusion_query_enable = true
-query_occlusion_fake_sample_count = -1
+# occlusion_query_enable = true
+# query_occlusion_fake_sample_count = -1
 
 # VSync
-vsync = false
+# vsync = false
 
 # Resolution scale (1 = native 1280x720)
-resolution_scale = 1
+# resolution_scale = 1

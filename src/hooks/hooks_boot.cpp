@@ -90,7 +90,7 @@ extern "C" REX_FUNC(sub_82373660) {
     orig_TexManager(ctx, base);
     return;
   }
-  REXLOG_INFO("native: TexManager (0x82373660)");
+  /*REXLOG_INFO("native: TexManager (0x82373660)");*/
   orig_TexManager(ctx, base);
 }
 
