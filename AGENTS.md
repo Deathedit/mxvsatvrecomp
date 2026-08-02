@@ -76,7 +76,7 @@ video), `gpu/` (Xenos PM4 understanding), `hooks/` (guest function hooks).
 | `src/gfx/bink_player.h/.cpp` | FFmpeg Bink video + audio decoder |
 | **gpu** | |
 | `src/gpu/pm4_parser.h/.cpp` | PM4 command buffer parser: Type-0/2/3 decode, 30 opcodes, 65 reg names, ring wrap, dump |
-| `src/gpu/pm4_translator.h/.cpp` | PM4 -> `DrawCall` translation (draw opcodes, vertex fetch consts, shader constants) |
+| `src/gpu/pm4_translator.h/.cpp` | PM4 -> `DrawCall` translation. Shadows the fetch constant file (0x4800..0x48BF) from Type0 writes, infers vertex stride, reads buffers through the physical-address aliasing windows |
 | `src/gpu/xenos_gpu_state.h/.cpp` | Xenos GPU register shadow: 66 named registers, ApplyType0Write, ApplyType3Packet, Snapshot/DumpDiff |
 | **hooks** | |
 | `src/hooks/native_bridge.h/.cpp` | `NativeGraphics` singleton (guest mem base, renderer ptr, draw-call queue) + `g_plugin_mode` |
@@ -429,19 +429,109 @@ what is hiding it. Draws appear from swap #2 even with the loader parked, which
 is why this needed a control run to separate "the load produced geometry" from
 "the ring always had geometry."
 
-#### The real blocker: no vertex data
+#### The vertex fetch constants, and where they actually live (2026-08-02)
 
-**Every one of those draws is `src_sel == 2`, an auto-draw.** The translator
-synthesizes sequential indices and leaves `DrawCall::vertices` empty, and
-`graphics_system.cpp:93` skips any draw with no vertices — so
-`RenderThread: first translated draw` has still never fired. Vertex counts are
-real mesh sizes (24, 36, 40, 48, 52, 56, 60, 64, 68 at `prim=13`, plus `prim=8
-vtcs=3` triangles that are probably UI), and `m_vtxStride` is falling back to the
-hardcoded 32.
+Resolved. Two separate defects, both in `pm4_translator.cpp`, and the second was
+not visible until the first was fixed.
 
-The next question is therefore **resolving the vertex fetch constant**, not the
-loader, not the front end, and not mid-ASM hook #6. Only 4 draws in a whole run
-carried an index-buffer address, and all 4 were rejected as out-of-range.
+**1. The constants arrive as Type0 writes, and the translator threw them away.**
+`TranslatePackets` opened with `if (pkt.type != PacketType::Type3) continue;`,
+and the only place `m_vtxBufAddr`/`m_vtxStride` were ever set was
+`HandleSetConstant` for `SET_CONSTANT` (0x2D) type=1 — **which this game never
+emits**. The post-load Type3 histogram is `0x22 0x27 0x2B 0x2F 0x36 0x3B 0x3C
+0x3F 0x46 0x58 0x60`, no 0x2D anywhere. The translator now shadows registers
+`0x4800..0x48BF`, the 192-dword shader fetch constant file, from Type0 writes
+(241 writes to `0x4800` and 200 to `0x48BA` per post-load frame).
+
+Layout, per `xe_gpu_vertex_fetch_t` — two dwords, `type` distinguishing them
+from the 6-dword texture fetches sharing the file:
+
+| dword | fields |
+|---|---|
+| 0 | `type [1:0]` (3 = vertex, 2 = texture), `address [31:2]` |
+| 1 | `endian [1:0]`, `size [25:2]` in dwords |
+
+`XenosGpuState`'s register table called `0x4800` **`HW_MODE_TABLE`**, which made
+every vertex fetch in every dump look like display state. Corrected to
+`SHADER_FETCH_CONST`.
+
+**2. GPU addresses are physical; the committed pages are in the aliasing
+window.** With the constants decoding correctly, all 27199 vertex reads in a run
+still failed the page-commit probe. The fetch constants name `0x1EBB02BC`, but
+what ReXGlue has committed is `0xBEBB02BC` — exactly `phys | 0xA0000000`, and
+inside the same span the PM4 ring itself occupies. The bare physical page is
+reserved-but-uncommitted. `ReadGuestRange` now tries the bare address, then the
+`0xA0000000` / `0xC0000000` / `0xE0000000` windows (with
+`PhysicalHostOffset`'s `+0x1000` above `0xE0000000`), and logs which one
+resolved. **Every buffer in every run resolved via `0xA0000000`.**
+
+This also applied to the index-buffer path, whose comment asserted
+"host_ptr = guest_mem_base + addr (no masking)". That was wrong for anything the
+GPU points at. Both paths now share `ReadGuestRange`, including the commit probe
+— which must never `VirtualAlloc`, see its comment.
+
+**Stride is not in the fetch constant.** On Xenos it lives in the shader's
+`vfetch` instruction. It is inferred as `size_bytes / vertex_count`, accepted
+only on an exact division landing in **8..64 bytes**. Slot choice is the
+lowest-indexed slot that validates, and an ambiguous pick is logged (6 per run).
+
+#### What came out
+
+`--skip_intro=true --force_load=NAT_Farm --registry_override=ReadyToLaunch=1`,
+3/3 identical, zero access violations (logs `mx_048/049/050`; `mx_051` is the
+boot-only control):
+
+| | control | forced |
+|---|---|---|
+| draws carrying vertex data | 6244 / 6244 (100%) | 28652 / 46364 (**61%**) |
+| stride distribution | 28, 8, 12 | 8 (7164), 28 (3339), 16 (3259), 38, 12, 64, 44 |
+| topology | — | `prim=8` rect (10914), `prim=13` (3837), `prim=6` fan (107) |
+
+The first accepted buffer decodes exactly as it should — slot 0,
+`0x1EBB02BC`, stride 28, `prim=8` RectangleList:
+
+```
+v[0] -0.500  -0.500  1.000 | 0.504 0.504 0.504 1.000
+v[1] 639.500 -0.500  1.000 | 0.504 0.504 0.504 1.000
+v[2] 639.500 359.500 1.000 | 0.504 0.504 0.504 1.000
+```
+
+Screen-space positions at 640x360 with a grey RGBA — `pos.xyz` (12 B) +
+`color.rgba` (16 B) = the inferred 28. The stride inference, the endian swap, the
+slot choice and the window resolution are all confirmed by that one dump.
+
+**`RenderThread: first translated draw` fires** — "3 verts (84 B, stride 28), 3
+indices". The draw-call bridge and the `DrawCall::mvp` path, both untested since
+they were written, have now carried real data.
+
+Open, and deliberately not chased in that round:
+
+- **The 39% with no vertex data have no recorded reason.** The candidate logging
+  is capped at the first 20 draws, so the rejection breakdown past that is not
+  instrumented. Only 26 `stride out of range` were logged.
+- **Stride inference is a heuristic.** A buffer shared across draws yields a
+  multiple of the true stride. The 84-byte dump validates one case, not the
+  7164 draws at stride 8.
+- **Cost.** Forced runs reach `MainLoop #421` against `#601` before the change;
+  the control reaches `#721` against `#841`. ~30% post-load, ~15% at boot, from
+  the per-draw `VirtualQuery` and copy.
+- The real fix for stride and vertex format is the shader microcode — `IM_LOAD`
+  (0x27, 363/frame) and `IM_LOAD_IMMEDIATE` (0x2B, 70/frame) carry the `vfetch`
+  instructions. That is a disassembler and a round of its own.
+
+#### The former blocker: no vertex data (resolved above)
+
+**Every one of those draws is `src_sel == 2`, an auto-draw** — still true, and
+still the reason indices are synthesized. What has changed is that the translator
+now resolves the vertex fetch constant, so `DrawCall::vertices` is populated for
+61% of them and `RenderThread: first translated draw` fires. Vertex counts are
+real mesh sizes (24, 36, 40, 48, 52, 56, 60, 64, 68 at `prim=13`, plus `prim=8`
+rectangles that are UI), and `m_vtxStride`'s hardcoded 32 fallback is no longer
+what feeds the renderer.
+
+Only 4 draws in a whole run carried an index-buffer address, and all 4 were
+rejected as out-of-range — by the same wrong physical-address assumption that
+blocked the vertex path, since fixed.
 
 Cost: the forced runs reach `MainLoop #601` in 35s versus `#841` for the
 boot-only control. Most of that is the load succeeding — the frame range grows
@@ -599,10 +689,10 @@ Type-0: [31:30]=0, [29:0]=register base
 - EngineInit sleep loop keeps the process alive
 
 ### Not working / unverified
-- **Game rendering**: no guest draws reach the screen — but **not** because none
-  are emitted. The guest emits 350–363 draws per frame after a load; they are all
-  auto-draws with no vertex data resolved, so the renderer skips them. See "The
-  PM4 was never present-only" below
+- **Game rendering**: draws now reach the renderer with real vertex data — 61% of
+  ~350 per frame after a load, `first translated draw` fires. Whether anything
+  correct appears on screen is **untested**: the MVP guess, topology mapping and
+  vertex format have never been judged. See "The vertex fetch constants" below
 - **The loader is idle, not stuck.** The state is `*(AssetDB + 28)` (derived from
   `mx_recomp.31.cpp:36836`; the old `+110796` was a heap pointer). It runs
   `0 -> 1` on call #1, `1 -> 2` at call #59, then parks in **state 2

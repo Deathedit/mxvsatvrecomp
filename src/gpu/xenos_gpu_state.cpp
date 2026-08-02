@@ -86,7 +86,10 @@ constexpr RegName kRegNames[] = {
   {0x2908, "PA_CL_CLIP_CNTL"},
   {0x2910, "PA_CL_VS_OUT_CNTL"},
   {0x2914, "PA_CL_VS_OUT_CLIP_CNTL"},
-  {0x4800, "HW_MODE_TABLE"},
+  // 0x4800..0x48BF is the 192-dword shader fetch constant file, not
+  // HW_MODE_TABLE — the old name made every dump of a vertex fetch look like
+  // display state. See Pm4Translator's fetch shadow.
+  {0x4800, "SHADER_FETCH_CONST"},
 };
 
 }  // namespace

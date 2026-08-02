@@ -43,6 +43,7 @@ class Pm4Translator {
   const std::vector<DrawCall>& DrawCalls() const { return m_drawCalls; }
   void Clear() {
     m_drawCalls.clear();
+    std::memset(m_fetchConsts, 0, sizeof(m_fetchConsts));
     m_vtxBufAddr = 0;
     m_vtxStride = 0;
     m_indexType16 = true;
@@ -58,7 +59,7 @@ class Pm4Translator {
   // DRAW_INDX_2_BIN and DRAW_INDX_2 share the same dword0 layout:
   //   bits[31:16]=index_count, [11]=index_32bit, [10:6]=src_sel,
   //   [5:0]=prim_type. Inline indices start at body[1].
-  void HandleDrawIndx2(const Pm4Packet& pkt, bool binned);
+  void HandleDrawIndx2(const Pm4Packet& pkt, uint8_t* guest_base, bool binned);
   // DRAW_INDX uses body[0]=viz_query_info, body[1]=dword0 (draw header),
   // then body[2]=guest_base + body[3]=index_size|endianness for src_sel==0.
   void HandleDrawIndx(const Pm4Packet& pkt, uint8_t* guest_base, bool binned);
@@ -76,11 +77,56 @@ class Pm4Translator {
   // body[0] = base index (16-bit), body[1..] = float4 constants.
   void HandleSetShaderConstants(const Pm4Packet& pkt);
 
+  // Type0 writes into 0x4800..0x48BF — the 192-dword shader fetch constant
+  // file. This game sets its vertex fetch constants here and never emits a
+  // SET_CONSTANT (0x2D) at all, so without this the translator never learns a
+  // vertex buffer address and every draw comes out with no vertices.
+  void ApplyType0Write(uint32_t reg_base, const std::vector<uint32_t>& body);
+
+  // One vertex fetch slot, decoded from a dword pair in the fetch file.
+  struct VertexFetch {
+    uint32_t slot = 0;
+    uint32_t address = 0;   // guest physical byte address
+    uint32_t size_bytes = 0;
+    uint32_t endian = 0;
+    uint32_t stride = 0;    // inferred, 0 if it failed validation
+    const char* reject = nullptr;  // nullptr when accepted
+  };
+
+  // Walk the fetch file and decode every live vertex fetch (type == 3),
+  // inferring a stride for `vertex_count` vertices. Stride is NOT in the fetch
+  // constant — on Xenos it lives in the shader's vfetch instruction — so it is
+  // derived as size_bytes / vertex_count and only accepted when that divides
+  // exactly and lands in kStrideMin..kStrideMax.
+  std::vector<VertexFetch> CollectVertexFetches(uint32_t vertex_count) const;
+
+  // Raw-copy `bytes` from guest physical `addr` into `out` — no byteswap, the
+  // caller knows its element width. Returns false (and logs why) when the
+  // address is out of range or the host page is not committed. Shared by the
+  // index-buffer and vertex-buffer paths — the commit probe is the reason
+  // neither hangs on an uncommitted page.
+  static bool ReadGuestRange(uint8_t* guest_base, uint32_t addr, uint32_t bytes,
+                             std::vector<uint8_t>& out, const char* what);
+
+  // Fill dc.vertices from the best candidate slot, or leave it empty. Logs the
+  // candidate field for the first draws so the selection rule can be judged
+  // against what the game actually writes.
+  void AttachVertices(DrawCall& dc, uint8_t* guest_base);
+
   // Empty stubs for state-tracking opcodes we want to log/skip:
   void HandleBinMaskLo(const Pm4Packet& pkt);
   void HandleBinMaskHi(const Pm4Packet& pkt);
   void HandleBinSelectLo(const Pm4Packet& pkt);
   void HandleBinSelectHi(const Pm4Packet& pkt);
+
+  // Shader fetch constant file, registers 0x4800..0x48BF. Vertex fetches
+  // occupy 2 dwords, texture fetches 6; the type field in dword0[1:0]
+  // distinguishes them (3 = vertex, 2 = texture).
+  static constexpr uint32_t kFetchConstBase = 0x4800;
+  static constexpr uint32_t kFetchConstCount = 192;
+  static constexpr uint32_t kStrideMin = 8;
+  static constexpr uint32_t kStrideMax = 64;
+  uint32_t m_fetchConsts[kFetchConstCount] = {};
 
   uint32_t m_vtxBufAddr = 0;
   uint32_t m_vtxStride = 0;

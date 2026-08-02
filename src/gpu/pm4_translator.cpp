@@ -68,7 +68,198 @@ DrawIndx2Header ParseDrawIndx2Header(uint32_t dword0) {
 
 }  // namespace
 
-void Pm4Translator::HandleDrawIndx2(const Pm4Packet& pkt, bool binned) {
+void Pm4Translator::ApplyType0Write(uint32_t reg_base,
+                                    const std::vector<uint32_t>& body) {
+  // Clip the write to the fetch constant file. Writes arrive with counts of 6
+  // (a single fetch slot) and 186 (the whole texture block), so a write that
+  // only partly overlaps is normal, not an error.
+  const uint32_t file_end = kFetchConstBase + kFetchConstCount;
+  if (reg_base >= file_end) return;
+  const uint32_t write_end = reg_base + static_cast<uint32_t>(body.size());
+  if (write_end <= kFetchConstBase) return;
+
+  const uint32_t first = reg_base < kFetchConstBase ? kFetchConstBase : reg_base;
+  const uint32_t last = write_end < file_end ? write_end : file_end;
+  for (uint32_t reg = first; reg < last; ++reg)
+    m_fetchConsts[reg - kFetchConstBase] = body[reg - reg_base];
+}
+
+std::vector<Pm4Translator::VertexFetch> Pm4Translator::CollectVertexFetches(
+    uint32_t vertex_count) const {
+  // Xenos xe_gpu_vertex_fetch_t, two dwords:
+  //   dword0: type [1:0] (3 = vertex, 2 = texture), address [31:2] in dwords
+  //   dword1: endian [1:0], size [25:2] in dwords
+  std::vector<VertexFetch> out;
+  if (vertex_count == 0) return out;
+  for (uint32_t i = 0; i + 1 < kFetchConstCount; i += 2) {
+    const uint32_t d0 = m_fetchConsts[i];
+    const uint32_t d1 = m_fetchConsts[i + 1];
+    if ((d0 & 0x3) != 0x3 || d0 == 0) continue;  // not a live vertex fetch
+
+    VertexFetch vf;
+    vf.slot = i / 2;
+    vf.address = d0 & ~0x3u;
+    vf.endian = d1 & 0x3;
+    vf.size_bytes = ((d1 >> 2) & 0xFFFFFF) * 4;
+    if (vf.address == 0 || vf.size_bytes == 0) continue;
+
+    // Stride is not in the constant — infer it, and only trust an exact
+    // division landing in a plausible range. A buffer shared by several draws
+    // yields a multiple of the true stride, which is why the hex dump of the
+    // resulting vertices is the real verdict and not this arithmetic.
+    if (vf.size_bytes % vertex_count != 0) {
+      vf.reject = "not divisible";
+    } else {
+      const uint32_t stride = vf.size_bytes / vertex_count;
+      if (stride < kStrideMin || stride > kStrideMax) vf.reject = "stride out of range";
+      else vf.stride = stride;
+    }
+    out.push_back(vf);
+  }
+  return out;
+}
+
+bool Pm4Translator::ReadGuestRange(uint8_t* guest_base, uint32_t addr,
+                                    uint32_t bytes, std::vector<uint8_t>& out,
+                                    const char* what) {
+  if (!guest_base || bytes == 0) return false;
+  const uint32_t phys = addr & (kGuestPhysMax - 1);
+  if (phys + bytes > kGuestPhysMax) {
+    REXLOG_WARN("translator: {} addr=0x{:08X} size={} out of guest RAM", what,
+                addr, bytes);
+    return false;
+  }
+
+  // GPU-side addresses are *physical*. The guest allocates through the Xbox 360
+  // physical-aliasing windows (0xA0000000 / 0xC0000000 / 0xE0000000), and it is
+  // the windowed address that ReXGlue actually commits — the bare physical page
+  // is reserved-but-uncommitted, so reading `guest_base + phys` fails for every
+  // buffer the GPU is pointed at. Measured: fetch constants name 0x1EBB02BC
+  // while the committed region holding it is 0xBEBB02BC, exactly
+  // phys | 0xA0000000, and the same span the PM4 ring itself lives in.
+  //
+  // Try the bare address first (it is right for anything the CPU allocated),
+  // then each window. Above 0xE0000000 ReXGlue applies a +0x1000 offset — see
+  // rex/system/xmemory.h PhysicalHostOffset.
+  const uint32_t candidates[] = {phys, phys | 0xA0000000u, phys | 0xC0000000u,
+                                 phys | 0xE0000000u};
+  for (uint32_t i = 0; i < 4; ++i) {
+    const uint32_t host_addr =
+        candidates[i] + (candidates[i] >= 0xE0000000u ? 0x1000u : 0u);
+#if defined(_WIN32)
+    // Probe the host-side page state — ReXGlue's guest memory view reserves the
+    // address space up front but only commits what was allocated. A memcpy from
+    // an uncommitted page is silently swallowed by REX_FUNC's SEH frame,
+    // leaving the host thread stuck indefinitely. We CANNOT VirtualAlloc-commit
+    // pages ourselves: that breaks the plugin's SharedMemory page tracking,
+    // which keeps its own commit state. Probe and move to the next window.
+    MemoryBasicInformationLite mbi{};
+    if (VirtualQuery(guest_base + host_addr, &mbi, sizeof(mbi)) == 0 ||
+        !(mbi.state & 0x1000 /* MEM_COMMIT */) ||
+        !(mbi.protect & 0x06 /* PAGE_READONLY|PAGE_READWRITE */)) {
+      continue;
+    }
+#endif
+    static int s_loggedWindow[4] = {};
+    if (s_loggedWindow[i]++ == 0) {
+      REXLOG_INFO("translator: {} phys=0x{:08X} resolved via window 0x{:08X}",
+                  what, phys, candidates[i] & 0xE0000000u);
+    }
+    out.resize(bytes);
+    std::memcpy(out.data(), guest_base + host_addr, bytes);
+    return true;
+  }
+
+  static int s_loggedMiss = 0;
+  if (s_loggedMiss++ < 8) {
+    REXLOG_INFO("translator: {} phys=0x{:08X} skip — uncommitted in every "
+                "aliasing window", what, phys);
+  }
+  return false;
+}
+
+void Pm4Translator::AttachVertices(DrawCall& dc, uint8_t* guest_base) {
+  auto fetches = CollectVertexFetches(dc.vertex_count);
+
+  // Log the whole candidate field for the first draws. The selection rule below
+  // is only defensible if what it is choosing between is on the record.
+  static int s_logged = 0;
+  const bool log_this = s_logged < 20;
+  if (log_this) {
+    ++s_logged;
+    if (fetches.empty()) {
+      REXLOG_INFO("translator: vfetch — no live vertex fetch for vtcs={}",
+                  dc.vertex_count);
+    }
+    for (const auto& vf : fetches) {
+      REXLOG_INFO("translator: vfetch slot {} addr=0x{:08X} size={} B endian={} "
+                  "-> stride {} for vtcs={} [{}]",
+                  vf.slot, vf.address, vf.size_bytes, vf.endian, vf.stride,
+                  dc.vertex_count, vf.reject ? vf.reject : "ok");
+    }
+  }
+
+  // Lowest-indexed slot that validated. Name the losers so an ambiguous pick is
+  // visible rather than silent.
+  const VertexFetch* pick = nullptr;
+  uint32_t accepted = 0;
+  for (const auto& vf : fetches) {
+    if (vf.reject) continue;
+    ++accepted;
+    if (!pick) pick = &vf;
+  }
+  if (!pick) return;  // leave vertices empty — the renderer will skip this draw
+  if (accepted > 1 && log_this) {
+    REXLOG_INFO("translator: vfetch AMBIGUOUS — {} slots validated, took slot {}",
+                accepted, pick->slot);
+  }
+
+  const uint32_t bytes = dc.vertex_count * pick->stride;
+  if (bytes > pick->size_bytes) return;
+  if (!ReadGuestRange(guest_base, pick->address, bytes, dc.vertices, "vertex buffer")) {
+    dc.vertices.clear();
+    return;
+  }
+  dc.vertex_stride = pick->stride;
+
+  // Guest memory is big-endian. endian == 2 is the usual 8-in-32 swap; treat
+  // anything non-zero as a 32-bit swap, which is right for float and packed
+  // 4-byte attributes and wrong only for 16-bit ones we cannot identify without
+  // the shader's vfetch format anyway.
+  if (pick->endian != 0) {
+    const size_t words = dc.vertices.size() / 4;
+    auto* p = reinterpret_cast<uint32_t*>(dc.vertices.data());
+    for (size_t i = 0; i < words; ++i) p[i] = __builtin_bswap32(p[i]);
+  }
+
+  // Hex dump the first accepted buffer. This is the verdict for the round:
+  // plausible float positions mean the fetch path works, noise means the slot
+  // or the stride is wrong however good the counts look.
+  static bool s_dumped = false;
+  if (!s_dumped) {
+    s_dumped = true;
+    REXLOG_INFO("translator: FIRST VERTEX BUFFER slot {} addr=0x{:08X} "
+                "stride={} vtcs={} ({} B of {} B)",
+                pick->slot, pick->address, pick->stride, dc.vertex_count, bytes,
+                pick->size_bytes);
+    const uint32_t show = dc.vertex_count < 4 ? dc.vertex_count : 4;
+    for (uint32_t v = 0; v < show; ++v) {
+      std::string hex, flt;
+      for (uint32_t b = 0; b < pick->stride && b + 3 < pick->stride; b += 4) {
+        uint32_t w;
+        std::memcpy(&w, dc.vertices.data() + v * pick->stride + b, 4);
+        float f;
+        std::memcpy(&f, &w, 4);
+        hex += fmt::format("{:08X} ", w);
+        flt += fmt::format("{:.3f} ", f);
+      }
+      REXLOG_INFO("translator:   v[{}] {}| {}", v, hex, flt);
+    }
+  }
+}
+
+void Pm4Translator::HandleDrawIndx2(const Pm4Packet& pkt, uint8_t* guest_base,
+                                    bool binned) {
   if (pkt.body.empty()) {
     REXLOG_WARN("translator: DRAW_INDX_2{} empty body", binned ? "_BIN" : "");
     return;
@@ -106,9 +297,10 @@ void Pm4Translator::HandleDrawIndx2(const Pm4Packet& pkt, bool binned) {
       for (uint32_t i = 0; i < h.index_count; ++i) p[i] = uint16_t(i);
     }
     dc.valid = true;
-    REXLOG_INFO("translator: DRAW_INDX_2{} auto draw idx={} prim={} vtcs={} stride={}",
+    AttachVertices(dc, guest_base);
+    REXLOG_INFO("translator: DRAW_INDX_2{} auto draw idx={} prim={} vtcs={} stride={} verts={} B",
                 binned ? "_BIN" : "", h.index_count, h.prim_type,
-                dc.vertex_count, dc.vertex_stride);
+                dc.vertex_count, dc.vertex_stride, dc.vertices.size());
     m_drawCalls.push_back(std::move(dc));
     return;
   }
@@ -210,9 +402,10 @@ void Pm4Translator::HandleDrawIndx(const Pm4Packet& pkt, uint8_t* guest_base,
       for (uint32_t i = 0; i < h.index_count; ++i) p[i] = uint16_t(i);
     }
     dc.valid = true;
-    REXLOG_INFO("translator: DRAW_INDX{} auto draw idx={} prim={} vtcs={} stride={}",
+    AttachVertices(dc, guest_base);
+    REXLOG_INFO("translator: DRAW_INDX{} auto draw idx={} prim={} vtcs={} stride={} verts={} B",
                 binned ? "_BIN" : "", h.index_count, h.prim_type,
-                dc.vertex_count, dc.vertex_stride);
+                dc.vertex_count, dc.vertex_stride, dc.vertices.size());
     m_drawCalls.push_back(std::move(dc));
     return;
   }
@@ -232,44 +425,6 @@ void Pm4Translator::HandleDrawIndx(const Pm4Packet& pkt, uint8_t* guest_base,
                 binned ? "_BIN" : "");
     return;
   }
-  // body[2] is a guest physical address (NOT masked) — game placed the
-  // index buffer anywhere in main RAM (typical IXB addrs: 0x13_xxx_xxx).
-  // Translation: host_ptr = guest_mem_base + ib_guest_base (no offset for
-  // addrs < 0xE0000000 — see REX_LOAD macros / PhysicalHostOffset).
-  if (ib_guest_base >= kGuestPhysMax) {
-    REXLOG_WARN("translator: DRAW_INDX{} ib_guest_base=0x{:08X} out-of-range",
-                binned ? "_BIN" : "", ib_guest_base);
-    return;
-  }
-  // Conservative bounds: ensure the entire IB read stays within guest RAM.
-  if (ib_guest_base + ib_size > kGuestPhysMax) {
-    REXLOG_WARN("translator: DRAW_INDX{} IB read overruns guest RAM "
-                "(ib_addr=0x{:08X} ib_size={})", binned ? "_BIN" : "",
-                ib_guest_base, ib_size);
-    return;
-  }
-#if defined(_WIN32)
-  // Probe the host-side page state — ReXGlue's guest memory view reserves
-  // 512MB but may not commit every page. A memcpy into an uncommitted page
-  // is silently swallowed by REX_FUNC's SEH frame, leaving the host thread
-  // indefinitely stuck. We CAN'T VirtualAlloc-commit pages ourselves — that
-  // breaks the plugin's SharedMemory page tracking (it has its own commit
-  // state and becomes inconsistent if we mutate the underlying pages). Just
-  // probe + skip memcpy if the page is uncommitted (the IB data lives in
-  // the plugin's host GPU memory copy, not accessible from here).
-  MemoryBasicInformationLite mbi{};
-  const void* probe = guest_base + ib_guest_base;
-  if (VirtualQuery(probe, &mbi, sizeof(mbi)) == 0 ||
-      !(mbi.state & 0x1000 /* MEM_COMMIT */) ||
-      !(mbi.protect & 0x06 /* PAGE_READONLY|PAGE_READWRITE */)) {
-    // Page not accessible from host — bail. Don't touch VirtualAlloc.
-    REXLOG_INFO("translator: DRAW_INDX{} ib_addr=0x{:08X} skip (page not committed "
-                "in host view — lives in plugin's own GPU memory copy)",
-                binned ? "_BIN" : "", ib_guest_base);
-    return;
-  }
-#endif
-
   DrawCall dc;
   dc.prim_type   = h.prim_type;
   dc.index_count = h.index_count;
@@ -278,11 +433,16 @@ void Pm4Translator::HandleDrawIndx(const Pm4Packet& pkt, uint8_t* guest_base,
   dc.vertex_stride = m_vtxStride > 0 ? m_vtxStride : 32;
   std::memcpy(dc.mvp, m_mvp, sizeof(m_mvp));
 
-  // Copy raw bytes (big-endian) from guest memory into dc.indices, then
-  // byteswap each u16/u32 to host LE so the host renderer can use them
-  // directly.
-  dc.indices.resize(ib_size);
-  std::memcpy(dc.indices.data(), guest_base + ib_guest_base, ib_size);
+  // body[2] is a guest physical address (NOT masked) — the game places the
+  // index buffer anywhere in main RAM (typical IXB addrs: 0x13_xxx_xxx).
+  // Translation: host_ptr = guest_mem_base + ib_guest_base (no offset for
+  // addrs < 0xE0000000 — see REX_LOAD macros / PhysicalHostOffset).
+  // ReadGuestRange carries the bounds check and the page-commit probe.
+  if (!ReadGuestRange(guest_base, ib_guest_base, ib_size, dc.indices,
+                      binned ? "DRAW_INDX_BIN IB" : "DRAW_INDX IB")) {
+    return;
+  }
+  // Guest memory is big-endian — byteswap each index to host LE.
   if (h.index_32bit) {
     auto* p = reinterpret_cast<uint32_t*>(dc.indices.data());
     for (uint32_t i = 0; i < h.index_count; ++i)
@@ -323,11 +483,13 @@ void Pm4Translator::HandleDrawIndx(const Pm4Packet& pkt, uint8_t* guest_base,
   }
 
   dc.valid = true;
+  AttachVertices(dc, guest_base);
 
   REXLOG_INFO("translator: DRAW_INDX{} ib_addr=0x{:08X} ib_size={} idx={} "
-              "prim={} vtcs={} endian={}",
+              "prim={} vtcs={} endian={} verts={} B",
               binned ? "_BIN" : "", ib_guest_base, ib_size,
-              h.index_count, h.prim_type, dc.vertex_count, ib_endianness);
+              h.index_count, h.prim_type, dc.vertex_count, ib_endianness,
+              dc.vertices.size());
   m_drawCalls.push_back(std::move(dc));
 }
 
@@ -409,6 +571,13 @@ void Pm4Translator::TranslatePackets(const std::vector<Pm4Packet>& packets,
   if (!guest_base) return;
 
   for (const auto& pkt : packets) {
+    // Type0 register writes carry this game's vertex fetch constants. It emits
+    // no SET_CONSTANT (0x2D) at all, so discarding Type0 — as this loop used to
+    // — meant no vertex buffer address was ever learned.
+    if (pkt.type == PacketType::Type0) {
+      ApplyType0Write(pkt.reg_base, pkt.body);
+      continue;
+    }
     if (pkt.type != PacketType::Type3) continue;
 
     // Debug: log only indexed draws (skipping the auto-draw spam from Bink quads).
@@ -422,8 +591,8 @@ void Pm4Translator::TranslatePackets(const std::vector<Pm4Packet>& packets,
       // ---- Draw opcodes ----
       case 0x22: HandleDrawIndx(pkt, guest_base, false); break;       // DRAW_INDX
       case 0x34: HandleDrawIndx(pkt, guest_base, true);  break;        // DRAW_INDX_BIN
-      case 0x35: HandleDrawIndx2(pkt, true);  break;                   // DRAW_INDX_2_BIN ← gameplay
-      case 0x36: HandleDrawIndx2(pkt, false); break;                   // DRAW_INDX_2
+      case 0x35: HandleDrawIndx2(pkt, guest_base, true);  break;        // DRAW_INDX_2_BIN ← gameplay
+      case 0x36: HandleDrawIndx2(pkt, guest_base, false); break;        // DRAW_INDX_2
 
       // ---- State-setting opcodes (vertex & shader constants) ----
       case 0x2D: HandleSetConstant(pkt);            break;            // SET_CONSTANT
