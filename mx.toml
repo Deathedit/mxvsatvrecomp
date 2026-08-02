@@ -20,3 +20,11 @@
 
 # Resolution scale (1 = native 1280x720)
 # resolution_scale = 1
+
+# --- Native-mode options (the settings above are GPU-plugin only) ---
+
+# Skip the Bink intro videos and go straight to game frames. The playlist runs
+# 47.4s (THQ 9.5s + Attract 37.9s) and the RenderPipeline hook stands down for
+# its whole duration, so the guest render path cannot run until it finishes.
+# Set this while iterating on rendering. Also available as --skip_intro=true.
+# skip_intro = true

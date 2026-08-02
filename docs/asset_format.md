@@ -147,6 +147,22 @@ Guest implementation: `sub_82B64400` (0x82B64400, 9204 bytes, 390 basic blocks) 
 `AssetDB_LoadStateMachine` = `sub_8253AA40` @ 0x8253AA40 (4204 bytes, 139 blocks, 12-case switch).
 This is **LoaderTick's gating call** (AssetDB vt[6], called from `unk_830EC248+8 → AssetDB → vt[6]()`).
 
+**The state is `*(uint32_t*)(AssetDB + 28)`** — a plain 0..11 selector. Derived
+from the recompiled body: `generated/default/mx_recomp.31.cpp:36836`
+(`lwz r11,28(r31)`, where `r31 = r3 = a1` and is never reassigned) feeding the
+12-entry jump table at `:36862` (`cmplwi cr6,r11,11` / `bgt` → default). The
+`+110796` previously circulated in `docs/pm4_pipeline.md` is a **guest heap
+pointer**, not this enum — every "state=" value logged before 2026-08-02 was
+meaningless.
+
+**Observed in native mode (2026-08-02, 3/3 runs, `logs/mx_015..017.log`)**:
+`0 -> 1` on call #1, holds at 1 for ~58 calls, `1 -> 2` at call #59, then
+**parks in state 2 for the remaining ~750 calls**. State 1's
+`SceneTransition_Kickoff` does fire. State 2's body is only
+`*(a1+110328) = 0` followed by a jump to the common tail — it never writes
+`*(a1+28)`, so it cannot self-advance. Something external must request the next
+load; nothing does. The loader is idle and healthy, not stuck or broken.
+
 **KEY FINDING**: The state machine is **pure orchestration** — it does NOT load file content itself. It polls flags set by a separate background **LoadingThread** (synchronized via `LoadingThreadEvent` / `LoadingThreadEarlyOutEvent` events created by AssetDB's constructor `AssetDB_Ctor_LoadingThreadEvents` @ 0x8253CB38).
 
 | State | Addr | Name | Role |

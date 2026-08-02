@@ -203,8 +203,13 @@ Captured over 3000 LoaderTick iterations (gameplay):
   > **CORRECTION 2026-08-01**: "state at offset 110796" is **wrong**. That offset holds a guest heap
   > pointer (observed 0x40B76720 in native mode), not a 0–11 state enum. It sits 4 bytes before
   > +110800, which `docs/asset_format.md:155` identifies as an event handle, so the region is
-  > handles/pointers. The real switch variable's offset has not been derived yet. Treat "never
-  > advances state" as unproven — it was reading the wrong word.
+  > handles/pointers.
+  >
+  > **RESOLVED 2026-08-02**: the state is **`*(AssetDB + 28)`** — see
+  > `docs/asset_format.md:145` for the derivation from `mx_recomp.31.cpp:36836`. In native mode it
+  > runs `0 -> 1 -> 2` and then parks in 2 (`IdleClearRenderBusy`), which is an **idle** state, not
+  > a stall. The claim above that it "never advances state" was made while reading the wrong word;
+  > it does advance, twice, and then legitimately waits for a load request that never arrives.
 - **RendererDispatch** (`sub_82B34998`) called twice per LoaderTick, executes cleanly, returns the `dword_830BE190` object ptr. Never fatal — `off_8213F7A4` vtable dispatches all complete normally.
 - **Timing** (`sub_82B70370`) called once per LoaderTick — completes in <1ms.
 - **LazyInit** (`sub_82B3C7D0`) called exactly once during SetupRenderer (boot), then never again — block is cached.

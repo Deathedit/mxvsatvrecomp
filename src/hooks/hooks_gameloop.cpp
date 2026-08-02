@@ -48,8 +48,28 @@ extern "C" REX_FUNC(sub_82B70760) {
   }
   static int ml = 0;
   ++ml;
-  REX_STORE_U8(0x82D57994, 1);
-  if (ml > 600) REX_STORE_U8(0x82D57994, 0);
+
+  // byte_82D57994 gates MainLoop's call to RenderPipeline: at 0x82B707B0 and
+  // again at 0x82B7080C a zero here jumps straight to the vt[36] tail, so the
+  // guest render path never runs. The only guest write to this byte is in
+  // Transition (mx_recomp.82.cpp:67620), and it writes 0 on loader exit —
+  // nothing in the guest sets it, so forcing it is load-bearing.
+  //
+  // The old code also cleared it at frame 600, a leftover fabricated
+  // "loading complete" signal. That closed the render window ~20s in, entirely
+  // inside the 47.4s Bink intro, so RenderPipeline was skipped every time it
+  // was reached. The clear is REMOVED 2026-08-02; log when the guest clears it
+  // underneath us so the tug-of-war with Transition stays visible.
+  {
+    uint8_t before = REX_LOAD_U8(0x82D57994);
+    static uint8_t s_last = 1;
+    if (before != s_last) {
+      REXLOG_INFO("native: byte_82D57994 changed {} -> {} by guest at MainLoop #{}",
+                  s_last, before, ml);
+      s_last = before;
+    }
+    REX_STORE_U8(0x82D57994, 1);
+  }
 
   if (ml == 1) {
     uint32_t eng = REX_LOAD_U32(0x830BE400);
@@ -111,13 +131,21 @@ extern "C" REX_FUNC(sub_82B70760) {
   ctx.r3.u32 = 1;
   if ((ml % 60) == 1) {
     REXLOG_INFO("native: MainLoop #{}", ml);
-    // Stage 1 diagnostic: is the AssetDB alive in native mode, and what state
-    // does its load machine sit in? state offset +110796 per pm4_pipeline.md.
-    // tr+8 (0x830EC250) is the slot LoaderTick's (a1+8)->vt[6] actually reads.
+    // Is the AssetDB alive, and what state does its load machine sit in?
+    // State is *(AssetDB+28), the 0..11 selector of sub_8253AA40's jump table
+    // (mx_recomp.31.cpp:36836). tr+8 (0x830EC250) is the slot LoaderTick's
+    // (a1+8)->vt[6] actually reads.
     uint32_t adb = REX_LOAD_U32(0x830577C0);
     uint32_t tr8 = REX_LOAD_U32(0x830EC250);
     REXLOG_INFO("native: assetdb=0x{:08X} state={} tr+8=0x{:08X}",
-                adb, adb ? REX_LOAD_U32(adb + 110796) : 0xFFFFFFFF, tr8);
+                adb, adb ? REX_LOAD_U32(adb + 28) : 0xFFFFFFFF, tr8);
+    // RenderPipeline now runs every frame and its PM4 is present-only: no
+    // DRAW_* and no INDIRECT_BUFFER, just SWAP/scanout registers. If these
+    // three per-pass entity counts are zero, the scene really is empty and the
+    // missing draws are a guest-side content problem, not a translator one.
+    REXLOG_INFO("native: entities pass0={} pass1={} pass2={} gpu_phys=0x{:08X}",
+                REX_LOAD_U32(0x830C2150), REX_LOAD_U32(0x830C4560),
+                REX_LOAD_U32(0x830C6970), REX_LOAD_U32(0x830B03EC));
   }
   ::Sleep(16);
 }

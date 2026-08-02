@@ -98,13 +98,23 @@ extern "C" REX_FUNC(sub_8253AA40) {
   static int sm = 0;
   ++sm;
   uint32_t a1 = ctx.r3.u32;
-  uint32_t state = a1 ? REX_LOAD_U32(a1 + 110796) : 0;
-  if (sm <= 50 || (sm % 200) == 0)
-    REXLOG_INFO("{}: LoadStateMachine #{} a1=0x{:08X} state={}", tag, sm, a1, state);
+  // The state is *(a1+28) — a 0..11 selector. Derived from the recompiled body:
+  // mx_recomp.31.cpp:36836 `lwz r11,28(r31)` (r31 = a1, never reassigned) feeds
+  // the 12-entry jump table at :36862. The `+110796` this used to read came
+  // from pm4_pipeline.md and is a guest heap pointer, not the enum, so every
+  // "state=" line logged before 2026-08-02 was meaningless.
+  uint32_t state_in = a1 ? REX_LOAD_U32(a1 + 28) : 0xFFFFFFFF;
   orig_LoadStateMachine(ctx, base);
-  if (sm <= 50 || (sm % 200) == 0)
-    REXLOG_INFO("{}: LoadStateMachine #{} returned r3=0x{:08X} state={}", tag, sm,
-                ctx.r3.u32, a1 ? REX_LOAD_U32(a1 + 110796) : 0);
+  uint32_t state_out = a1 ? REX_LOAD_U32(a1 + 28) : 0xFFFFFFFF;
+  // Log every transition, plus a periodic heartbeat — a stuck machine should be
+  // visible without diffing consecutive lines.
+  static uint32_t s_last = 0xFFFFFFFE;
+  bool changed = state_out != s_last;
+  s_last = state_out;
+  if (changed || sm <= 10 || (sm % 200) == 0) {
+    REXLOG_INFO("{}: LoadStateMachine #{} state {} -> {} r3=0x{:08X}{}", tag, sm,
+                state_in, state_out, ctx.r3.u32, changed ? "  <-- CHANGED" : "");
+  }
 }
 
 // sub_82B38558 — TerminatorVtableCtor (installs off_8213F70C vtable)

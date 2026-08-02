@@ -339,6 +339,66 @@ pre-populated by hand from the main thread via `sub_82B3C7D0`. The naturally
 constructed one is not. The dispatch is still skipped and still unproven, but the
 structural argument against it does not hold as written.
 
+## The guest render path
+
+`MainLoop` calls `RenderPipeline` (`sub_82B70578`) only while
+`byte_82D57994 != 0` — checked twice, at `0x82B707B0` and `0x82B7080C`; a zero
+jumps straight to the vt[36] tail. The only guest write to that byte is in
+`Transition`, which writes **0** on loader exit, so our forcing it to 1 in
+`hooks_gameloop.cpp` is load-bearing.
+
+**The `skip_intro` cvar is required to see any of this.** The host Bink playlist
+is 47.4s (THQ 9.5s + Attract 37.9s, per ffprobe) and the RenderPipeline hook
+returns early for its whole duration. Set `skip_intro = true` in `mx.toml` or
+pass `--skip_intro=true`.
+
+With that flag, per 30s run: RenderPipeline reaches #600, VdSwap #900, ~17728
+bytes of PM4 per swap, 0 access violations, 3/3 clean.
+
+### The PM4 is present-only
+
+Steady-state swaps decode to **10 Type-3 + 12 Type-0 packets, ~13500 Type-2
+filler**. The content is display and scanout state:
+
+- `SET_LOOP_CONST` carrying `0x53574150` — ASCII **"SWAP"**
+- `DISPLAY_TIMING`, `DISP_TG_CTL`, `DISP_DITHER`, `HW_MODE_TABLE`
+- `MC_CTL` / `MC_BASE_ADDR` + `WAIT_REG_MEM` triplets, `EVENT_WRITE_SHD`
+
+**No `DRAW_*` opcodes and no `INDIRECT_BUFFER`** in any captured swap. The
+translator correctly reports 0 draw calls; it is not the problem, and the draws
+are not hiding in an indirect buffer the parser fails to follow (it does not
+follow them — opcode 0x3F is named but never chased — but none are emitted).
+
+Entity counts are `pass0=1 pass1=0 pass2=1`, i.e. a near-empty scene.
+`RenderPipeline` iterates those entities every frame and emits nothing
+drawable.
+
+**Cause identified 2026-08-02: the loader is idle, not stuck.** It reaches state
+2 (`IdleClearRenderBusy`) and parks there — see "Not working / unverified". The
+scene is empty because nothing ever asks it to load anything, so `RenderPipeline`
+has nothing to draw. The next step is finding what should drive the state into 9
+(`LaunchActivity`) or 10 (`SeriesAdvance`), which is front-end/game-flow work,
+not loader or GPU work.
+
+### Parser caveat
+
+`Pm4Parser` accepts any Type-3 with `body_word_count <= 0x4000`. A misparsed
+header at `0xBEBE0B80` (opcode 0x5D, count 8449) swallows the rest of the ring.
+This does not currently hide draws — the swap ring genuinely has none — but it
+will need tightening once real command streams are parsed.
+
+### Draw-call plumbing
+
+`VdSwap` → `Pm4Translator` → `NativeGraphics::SetDrawCalls` →
+`RenderThreadFunc` → `D3D12Renderer::SetGameDrawData` → `RenderGameFrame`'s
+`m_hasGameDrawData` branch. The consumer half was connected 2026-08-02 and is
+**untested against real data** — no draw has ever reached it.
+
+`DrawCall::mvp[16]` has **no path into the renderer**. `SetGameDrawData` takes
+no matrix, so the first real geometry will render with the placeholder
+transform — which looks identical to a broken translator. Fix that before
+judging what appears on screen.
+
 ### Debugging aids
 
 - **Crash reporter** (`src/app/mx_app.cpp`): `AddVectoredExceptionHandler` logs the
@@ -458,7 +518,8 @@ Type-0: [31:30]=0, [29:0]=register base
 - 60fps game loop (MainLoop `Sleep(16)`, r3 forced 1)
 - Bink intros (THQ Logo → Attract) via FFmpeg + SDL audio, host-side
 - SetupRenderer completes with **no** mid-ASM hooks skipping any of it
-- RenderPipeline + EndFrame run every frame; VdSwap fires every frame, no caps
+- **Guest render path runs**: RenderPipeline every frame, VdSwap climbing to #900
+  in a 30s run (~17.7KB of PM4 per swap). Requires `skip_intro` — see below
 - **3D game pipeline**: colored triangle via game PSO, game RT + depth, PresentGameFrame copy to swapchain
 - **PM4 parser**: 15055 packets decoded from the first 5 VdSwaps, ring wrap handled, big-endian byteswap, validated
 - **GPU state tracking**: 66 Xenos registers shadowed, 32 captured from the first VdSwap
@@ -468,8 +529,16 @@ Type-0: [31:30]=0, [29:0]=register base
 - EngineInit sleep loop keeps the process alive
 
 ### Not working / unverified
-- **Game rendering**: no guest draws reach the screen — the triangle is a placeholder. `sub_82B34998` is skipped and the PM4 translator has no texture path
-- **LoadStateMachine progression**: it is called ~850 times per run, but whether it **advances through its 12 states** is unconfirmed. The state offset is unknown; `+110796` is a guest heap pointer, not the state enum. Derive the real offset from `sub_8253AA40`'s switch dispatch
+- **Game rendering**: no guest draws reach the screen. The guest emits PM4 every
+  frame but it is **present-only** — see "The guest render path" below
+- **The loader is idle, not stuck.** The state is `*(AssetDB + 28)` (derived from
+  `mx_recomp.31.cpp:36836`; the old `+110796` was a heap pointer). It runs
+  `0 -> 1` on call #1, `1 -> 2` at call #59, then parks in **state 2
+  `IdleClearRenderBusy`** for the remaining ~750 calls — identical across 3/3
+  runs. State 2's body is `*(a1+110328) = 0` then the common tail; it never
+  writes the state, so it cannot self-advance. State 1's `SceneTransition_Kickoff`
+  (`0x82538618`) does fire. **Nothing ever requests the next load** — that is the
+  open question, and it is game-flow, not loader machinery
 - **`byte_82D57994` forcing** (`hooks_gameloop.cpp:51-52`) is still a fabricated completion flag on a 600-frame timer. Now that the loader runs for real, check whether the guest sets it and drop the forcing
 - **Entity population**: the entity loops execute, but the pass 0/1/2 count globals have not been checked since
 - **Game input consumption**: guest never calls `XamInputGetState`
