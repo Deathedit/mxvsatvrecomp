@@ -17,9 +17,29 @@
 #include <dxgidebug.h>
 #pragma comment(lib, "dxguid.lib")
 
+#include <rex/cvar.h>
+
+// The game render target is cleared to this every frame. Magenta is available
+// because the two failure modes a screenshot has to tell apart look identical
+// against the dark blue default: "nothing was drawn at all" and "something was
+// drawn over the whole target in black". Against magenta they do not.
+REXCVAR_DEFINE_BOOL(clear_magenta, false, "Debug",
+                    "Clear the game render target to magenta instead of the "
+                    "default dark blue, to make undrawn areas obvious");
+
 using mx::gfx::kAdapterNamePrefix;
 using mx::gfx::LogError;
 using mx::gfx::LogInfo;
+
+namespace {
+const float* GameClearColor() {
+  static const float kDarkBlue[4] = {0.05f, 0.08f, 0.18f, 1.0f};
+  static const float kMagenta[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+  static const float* const kChosen =
+      REXCVAR_GET(clear_magenta) ? kMagenta : kDarkBlue;
+  return kChosen;
+}
+}  // namespace
 
 D3D12Renderer::~D3D12Renderer() {
   Shutdown();
@@ -123,6 +143,7 @@ void D3D12Renderer::Shutdown() {
   m_hasGamePipeline = false;
 
   m_gameDraws.clear();
+  m_hasEverDrawnGame = false;
 
   m_gameRT.Reset();
   m_gameDepth.Reset();
@@ -197,14 +218,29 @@ void D3D12Renderer::BeginFrame() {
   m_commandList->RSSetViewports(1, &m_viewport);
   m_commandList->RSSetScissorRects(1, &m_scissorRect);
 
+  // Clear the colour target every frame, unconditionally.
+  //
+  // This call used to sit in the final else of a three-way chain whose middle
+  // arm tested `!m_gameDraws.empty() || m_hasGamePipeline`. CreateGamePipeline
+  // sets m_hasGamePipeline true and Initialize hard-fails if it does not, so in
+  // any renderer that started successfully the middle arm always won and the
+  // clear was dead code. m_gameRT had therefore been accumulating every frame
+  // ever drawn — which is what the control screenshot was showing when it
+  // displayed the placeholder triangle and a guest quad from different frames
+  // at the same time. No screenshot before 2026-08-02 showed a single frame.
+  //
+  // This cannot fight the guest's own clear. That arrives as a RectangleList
+  // *draw*, lands in m_gameDraws, and is replayed inside RenderGameFrame — so
+  // it runs after this clear, not instead of it.
+  // rtvHandle is m_gameRT when it exists and the backbuffer otherwise; both
+  // want clearing, so this is not conditioned on which one it is.
+  m_commandList->ClearRenderTargetView(rtvHandle, GameClearColor(), 0, nullptr);
+
   if (m_hasVideoFrame) {
     RenderVideoFrame();
     m_hasVideoFrame = false;
-  } else if (!m_gameDraws.empty() || m_hasGamePipeline) {
-    RenderGameFrame();
   } else {
-    const float clearColor[4] = {0.05f, 0.08f, 0.18f, 1.0f};
-    m_commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+    RenderGameFrame();
   }
 }
 

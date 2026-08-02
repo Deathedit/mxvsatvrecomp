@@ -49,6 +49,12 @@ struct DrawCall {
   bool binned = false;                // true for DRAW_INDX_*_BIN variants
   float mvp[16] = {};
   bool valid = false;                 // set once index buffer is populated
+  // Which guest colour surface this draw targeted, from RB_COLOR_INFO /
+  // RB_SURFACE_INFO at the time it was translated. A frame touches ~16 distinct
+  // surfaces and the renderer has exactly one target, so without this every
+  // off-screen pass overpaints the main scene. See LogSurface.
+  uint32_t surface_base = 0;          // RB_COLOR_INFO[11:0], in 4KB tiles
+  uint32_t surface_pitch = 0;         // RB_SURFACE_INFO[13:0]
 };
 
 class Pm4Translator {
@@ -150,6 +156,9 @@ class Pm4Translator {
   // wrong": positions inside [-1,1] mean the matrix is right whatever the
   // screen shows.
   void LogNdc(const DrawCall& dc) const;
+  // Read-only: counts the distinct guest colour surfaces draws target. Nothing
+  // downstream consumes it — see the definition.
+  void LogSurface(DrawCall& dc);
 
   // One vertex fetch slot, decoded from a dword pair in the fetch file.
   struct VertexFetch {

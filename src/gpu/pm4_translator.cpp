@@ -1,6 +1,8 @@
 #include "gpu/pm4_translator.h"
 
 #include <cstring>
+#include <map>
+#include <string>
 #include <system_error>
 
 #include <rex/logging.h>
@@ -438,7 +440,52 @@ void Pm4Translator::FinalizeDraw(DrawCall& dc) {
     }
   }
 
+  LogSurface(dc);
   LogNdc(dc);
+}
+
+// Read-only probe. Nothing about which guest surface a draw targets reaches the
+// renderer — every translated draw is submitted into the one host render target
+// — so if the guest renders several passes per frame (shadow map, reflection,
+// the main scene, post chains) they are all being flattened into one image and
+// whichever pass paints last wins. The per-pass viewport sizes already recorded
+// in AGENTS.md (1280x720 down to 1x1) say it does. This counts the distinct
+// colour surfaces actually seen so that stops being an inference.
+//
+// RB_SURFACE_INFO (0x2000) low 14 bits are the surface pitch; RB_COLOR_INFO
+// (0x2001) low 12 bits are the colour base in 4KB tiles and bits [15:12] the
+// format. Both are already in the wholesale 0x2000..0x2FFF shadow.
+void Pm4Translator::LogSurface(DrawCall& dc) {
+  if (!m_ctxWritten) return;
+  const uint32_t surface_info = m_ctxRegs[0x2000 - kCtxRegBase];
+  const uint32_t color_info   = m_ctxRegs[0x2001 - kCtxRegBase];
+  const uint32_t pitch = surface_info & 0x3FFF;
+  const uint32_t base  = color_info & 0xFFF;
+  const uint32_t fmt   = (color_info >> 12) & 0xF;
+  dc.surface_base = base;
+  dc.surface_pitch = pitch;
+
+  // One entry per distinct (base, pitch, format) triple, so the count is the
+  // number of colour surfaces the frame actually touched.
+  const uint64_t key = (uint64_t(base) << 32) | (uint64_t(pitch) << 8) | fmt;
+  static std::map<uint64_t, uint32_t> s_surfaces;
+  const bool is_new = s_surfaces.find(key) == s_surfaces.end();
+  ++s_surfaces[key];
+
+  if (is_new) {
+    REXLOG_INFO("translator: NEW colour surface base=0x{:03X} pitch={} fmt={} "
+                "(prim={} verts={}) — {} distinct surfaces so far",
+                base, pitch, fmt, dc.prim_type, dc.vertex_count,
+                s_surfaces.size());
+  }
+  static uint32_t s_calls = 0;
+  if ((++s_calls % 20000) == 0) {
+    std::string hist;
+    for (const auto& [k, n] : s_surfaces)
+      hist += fmt::format("{:03X}/{}:{} ", uint32_t(k >> 32),
+                          uint32_t((k >> 8) & 0xFFFFFF), n);
+    REXLOG_INFO("translator: colour surfaces (base/pitch:draws) {}", hist);
+  }
 }
 
 void Pm4Translator::HandleDrawIndx2(const Pm4Packet& pkt, uint8_t* guest_base,

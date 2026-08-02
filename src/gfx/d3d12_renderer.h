@@ -151,6 +151,12 @@ bool CreateGamePipeline();
   static constexpr size_t kMaxGameDraws = 256;
   std::vector<GameDraw> m_gameDraws;
 
+  // Latched true by the first AddGameDraw and never cleared until Shutdown.
+  // Once the guest has produced real geometry the placeholder triangle is
+  // retired for good: a later frame that translates nothing (or whose draws are
+  // all skipped for stride) must show an empty scene, not the placeholder.
+  bool m_hasEverDrawnGame = false;
+
   Microsoft::WRL::ComPtr<ID3D12Resource> m_gameRT;
   Microsoft::WRL::ComPtr<ID3D12Resource> m_gameDepth;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_gameRtvHeap;

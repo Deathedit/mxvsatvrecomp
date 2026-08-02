@@ -628,6 +628,11 @@ Open, and deliberately not chased in that round:
   `m_hasGamePipeline` is true, so content accumulates across frames. This is
   visible in the control screenshot as the placeholder triangle and the guest
   quad both present at once, from different frames.
+  *(Fixed 2026-08-02 — see "The black screen is drawn, not absent". The reading
+  of the control screenshot above was itself wrong: the two were not from
+  different frames of one animation but from alternating frames, one of which
+  drew only the placeholder. See "The placeholder triangle was drawn on 1 host
+  frame in 5".)*
 - **Only stride 28 is submitted** — the one layout the game PSO's input layout
   (`POSITION` float3 @0, `COLOR` float4 @12) describes and the only one the
   vertex dump validated. Everything else is counted, not drawn. Stride 36 is the
@@ -658,6 +663,112 @@ boot-only control. Most of that is the load succeeding — the frame range grows
 from 305 to ~10168 packets, 33x the parse work — not instrumentation overhead
 per se, but if it becomes a problem the parse cadence is the dial.
 
+#### The black screen is drawn, not absent (2026-08-02)
+
+`BeginFrame`'s `ClearRenderTargetView` sat in the final `else` of a three-way
+chain whose middle arm tested `!m_gameDraws.empty() || m_hasGamePipeline`.
+`CreateGamePipeline` sets `m_hasGamePipeline` true and `Initialize` hard-fails
+if it does not, so in any renderer that started successfully the middle arm
+always won and **the clear was dead code**. `m_gameRT` had been accumulating
+every frame ever drawn.
+
+This voids the interpretation of every screenshot taken before this date. The
+boot-only control that appeared to show the placeholder triangle and a guest
+quad simultaneously was showing two different frames at once; with the clear
+restored it shows the dark-blue clear and the quad, and no triangle.
+
+The clear is now unconditional, and `--clear_magenta=true` swaps it for magenta.
+That flag immediately settled the open question of why the screen goes black
+after ~30s:
+
+| | t+8s | t+25s |
+|---|---|---|
+| forced, magenta clear | magenta background, grey quad top-left | **entirely black** |
+
+The magenta clear demonstrably works at t+8. At t+25 nothing of it survives —
+while the log shows 85–95 draws still being submitted every frame. **The guest
+is actively painting the whole target black; the black screen is drawn, not
+absent.** It was never accumulation and never a missing clear. What is on screen
+is the guest's own clear geometry, with the content that should follow it landing
+in the ~230 draws/frame the stride-28 gate rejects.
+
+#### The placeholder triangle was drawn on 1 host frame in 5 (2026-08-02)
+
+Reported by the user immediately after the clear landed: the placeholder
+triangle still appears, flashing. A screenshot samples one frame, so stills had
+shown it gone; only the eye catches a strobe. Two independent mechanisms:
+
+`RenderThreadFunc` (`src/app/graphics_system.cpp`) ticks on a fixed 16ms sleep
+while the guest swaps at its own rate, and `GetDrawCalls` moves-and-clears. A
+tick that lands between two guest swaps therefore got an empty list, called
+`ClearGameDraws` anyway, and `RenderGameFrame` fell back to the placeholder
+triangle — by design, per the old comment on `ClearGameDraws`, "rather than
+replaying stale geometry". Second, a tick whose draws were *all* rejected by the
+stride-28 gate blanked the list just as effectively.
+
+**Measured: 501 host ticks with new draws to 120 without, consistent across
+3 runs (120 / 102 / 98).** So roughly one host frame in five had no geometry —
+enough to read as a flash, and it had been happening all along. It was invisible
+only because the render target accumulated: the triangle piled onto geometry
+that never went away, which is exactly what made the pre-fix control screenshot
+look like "two frames of one animation at once". That earlier reading was wrong.
+
+Both are fixed. `ClearGameDraws` is now called only when the new frame has at
+least one submittable draw, so an empty or fully-skipped tick re-presents the
+last good frame; and `m_hasEverDrawnGame` latches on the first `AddGameDraw`,
+retiring the placeholder permanently once the guest has drawn anything. Draw
+counts are unchanged (85–89 submitted / 231–232 skipped, `MainLoop` #601,
+`LoaderTick` #500, 0 AVs across 3 runs).
+
+Two lessons, both general: **a still cannot disprove a strobe**, and this render
+thread is decoupled from the guest's frame rate, so anything keyed to "this
+frame" must tolerate ticks with no guest frame in them.
+
+#### Every render pass is flattened into one target (2026-08-02)
+
+Reported by the user right after the flashing was fixed: the window no longer
+flashes, but now cycles through different colours in sequence.
+
+Nothing about which guest surface a draw targets ever reached the renderer.
+`Pm4Translator` reads only the `PA_CL_VPORT_*` registers; `RB_COLOR_INFO`
+(0x2001) and `RB_SURFACE_INFO` (0x2000) sat unused in the wholesale
+0x2000..0x2FFF shadow. So every draw went into the same D3D12 target regardless
+of the pass it belonged to, and whichever pass painted last decided the image.
+
+`LogSurface` now counts them. **A run touches 16 distinct colour surfaces**
+across three base addresses:
+
+```
+2D0/1280 : 62884 draws      000/160 : 4181     000/640 : 560
+2D0/800  : 34071            000/80  : 2582     000/400 : 606
+2D0/160  : 27001            000/0   : 1025     000/320 : 552
+2D0/640  :  3384            5A0/640 :   40     000/800 : 606
+2D0/80   :  2490            2D0/320 :   16     000/1280, 000/2609 : 1 each
+```
+(base in 4KB tiles from `RB_COLOR_INFO[11:0]`, pitch from
+`RB_SURFACE_INFO[13:0]`; format was 0 for all 16.)
+
+This is very likely also the real mechanism behind "the guest paints the target
+black": an auxiliary buffer that clears to black overpaints the main scene,
+rather than the scene itself being black.
+
+**A pitch-1280 gate was tried and made things worse — do not retry it.**
+Submitting only draws whose surface pitch matched the 1280x720 output dropped
+submitted draws from 85-89/frame to **5**, because the stride-28 draws we can
+actually render mostly do *not* live on the pitch-1280 surface — its 62884 draws
+are overwhelmingly strides the stride gate rejects anyway. It also destabilised
+the run: **2 of 4 gated runs took an access violation on the translator thread
+during load, against 0 of 4 ungated**, most plausibly because a render thread
+doing 5 draws instead of 85 (each costing three `CreateCommittedResource`) spins
+far faster and shifts the timing of a known race. The cvar `main_surface_only`
+is kept, defaulted **false**, with that note attached.
+
+The mechanism is right and the selector was wrong. The real fix is to honour the
+surface binding — render passes into separate targets and present the one the
+guest actually swaps — which is a considerably larger job than a filter, and
+needs the shader/vertex-format work first so that the main pass has more than 5
+drawable draws in it.
+
 ### Parser caveat
 
 `Pm4Parser` accepts any Type-3 with `body_word_count <= 0x4000`. A misparsed
@@ -665,6 +776,56 @@ header at `0xBEBE0B80` (opcode 0x5D, count 8449) swallows the rest of the ring.
 Now that real command streams are being parsed this matters: a post-load frame
 also logs 70 `DRAW_INDX invalid header` and 42 `DRAW_INDX_2 body too small`
 warnings, which is the same desync showing up as lost draws.
+
+Since the register and opcode tables were replaced with the SDK's (below), this
+desync is now the *only* thing left unnamed in a dump, which makes it easy to
+find: post-load frame 600 has 11 unresolved Type0 register indices out of 4258
+and 4 unresolved Type3 opcodes out of 1426. Every one is an artifact — register
+indices past the 0x5002 top of the file (`0x8271`, `0xAAAB`, `0x8770`) and
+opcodes that do not exist (`0x00`, `0x38`). Nothing legitimate is unnamed.
+
+### The SDK ships Xenia's GPU layer, header-only (2026-08-02)
+
+`C:\rexglue-sdk\include\rex\graphics\` is Xenia's GPU code rebranded to
+`rex::graphics`. **The bit layouts and tables are header-only and free** — no
+linking, since `rexgpu-xenos.lib` is a 2-symbol plugin import stub and the
+plugin is `LoadLibrary`'d, never linked. Usable today:
+
+- `format/ucode.h` — `VertexFetchInstruction` (every accessor: fetch constant
+  index, format, stride, offset, signedness), `ControlFlowInstruction`,
+  `UnpackControlFlowInstructions`, `IsControlFlowOpcodeExec`
+- `xenos.h` — `VertexFormat`, `PrimitiveType` (**`kQuadList = 0x0D`**), `Endian`,
+  `GetVertexFormatComponentCount`, and the full `PM4_*` opcode list
+- `register_table.inc` — 3434 dword-indexed register names as an X-macro
+
+Sealed inside the plugin DLL and **not** usable: `PacketDisassembler`,
+`RegisterFile::GetRegisterInfo`, `Shader::AnalyzeUcode`,
+`ParseVertexFetchInstruction`, `PrimitiveProcessor`, `CommandProcessor`,
+`SharedMemory`. So the decoding tables come free; the drivers that walk them
+have to be written here.
+
+Two tables were replaced with the SDK's as a result:
+
+- **`kRegNames`** in `xenos_gpu_state.cpp`. All ten names previously confirmed
+  one at a time against observed values — `RB_SURFACE_INFO`, the
+  `PA_SC_WINDOW_*` scissor trio, the `PA_CL_VPORT_*` block — **matched the SDK
+  exactly**, which independently corroborates the viewport transform derived
+  from them. Note the SDK table is *not* sorted (two out-of-order pairs), so a
+  binary search would silently miss entries; the lookup is a direct-indexed
+  table of `0x5003` pointers built once.
+- **`kOpcodeNames`** in `pm4_parser.cpp`. Its trailing "legacy aliases (AMD R600
+  naming)" block for `0x60`–`0x6F` was **wrong for this hardware**. Xenos reuses
+  that range for the binning registers and the swap packet: `0x60` was printing
+  as `SET_CONFIG_REG` when it is `SET_BIN_MASK_LO`, and `0x64` as
+  `SET_LOOP_CONST` when it is `XE_SWAP` — which is why exactly one `0x64` shows
+  up per frame in every dump. `0x65`–`0x6F` are not Xenos opcodes at all.
+
+Related, and still uncorrected because neither opcode occurs in any capture:
+`XenosGpuState::ApplyType3Packet` has cases labelled `SET_CONTEXT_REG` (0x21)
+and `SET_CONFIG_REG` (0x20). Xenos has neither. `0x21` is `REG_RMW`, whose body
+is a (mask, or-value) pair rather than a base plus a run, and `0x20` is not an
+opcode. Register writes arrive as Type0 packets, which `ApplyType0Write` already
+handles correctly.
 
 ### Draw-call plumbing
 
@@ -815,10 +976,22 @@ Type-0: [31:30]=0, [29:0]=register base
 - **Game rendering**: guest geometry renders. A 640x360 grey rect lands in the
   top-left quadrant of the 1280x720 target, exactly where the viewport
   arithmetic predicts, 3/3 runs plus control. What is **not** working: only
-  stride-28 draws are submitted (85-95 of ~320 per frame), QuadList — the
-  plurality topology — is dropped, the game RT is never cleared so frames
-  accumulate, and the window is black at t+32s onward. See "The zero matrix,
-  and the guest's own viewport" below
+  stride-28 draws are submitted (85-95 of ~320 per frame) and QuadList — the
+  plurality topology — is dropped. Both have the same cause: the vertex stride
+  is inferred by division rather than read, and the guest's shader microcode,
+  which carries the real stride and formats, is not decoded. See "The zero
+  matrix, and the guest's own viewport" below.
+  The other two items formerly listed here are resolved: the game RT **is** now
+  cleared every frame (it never was, so no screenshot before 2026-08-02 showed a
+  single frame), and the black window is **the guest painting black**, not an
+  absence of drawing — see "The black screen is drawn, not absent". The
+  placeholder triangle's flashing, which the clear fix exposed rather than
+  caused, is also fixed — see "The placeholder triangle was drawn on 1 host
+  frame in 5"
+- **Every guest render pass is flattened into one host target.** 16 distinct
+  colour surfaces per run, all overpainting each other; the last one to paint
+  wins, which is why the window cycles colours. Filtering by surface pitch was
+  tried and made it worse — see "Every render pass is flattened into one target"
 - **The loader is idle, not stuck.** The state is `*(AssetDB + 28)` (derived from
   `mx_recomp.31.cpp:36836`; the old `+110796` was a heap pointer). It runs
   `0 -> 1` on call #1, `1 -> 2` at call #59, then parks in **state 2

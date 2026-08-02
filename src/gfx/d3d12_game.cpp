@@ -216,8 +216,13 @@ void D3D12Renderer::RenderGameFrame() {
   ID3D12DescriptorHeap* heaps[] = {m_gameCbvHeap.Get()};
   m_commandList->SetDescriptorHeaps(1, heaps);
 
-  if (m_gameDraws.empty()) {
-    // Placeholder triangle, under the identity matrix in m_gameCB.
+  if (m_gameDraws.empty() && !m_hasEverDrawnGame) {
+    // Placeholder triangle, under the identity matrix in m_gameCB. Only until
+    // the guest has drawn something once — see m_hasEverDrawnGame. This branch
+    // used to be taken on every host tick that fell between two guest swaps,
+    // which is most of them, so the triangle was being drawn at roughly half
+    // the frames even in the post-load state. That was invisible while the
+    // render target accumulated; with the clear fixed it reads as a flash.
     m_commandList->SetGraphicsRootConstantBufferView(
         0, m_gameCB->GetGPUVirtualAddress());
     m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -320,6 +325,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   }
 
   m_gameDraws.push_back(std::move(d));
+  m_hasEverDrawnGame = true;
 }
 
 bool D3D12Renderer::CreateGameRenderTargets() {
