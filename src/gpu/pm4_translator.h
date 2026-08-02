@@ -196,6 +196,7 @@ class Pm4Translator {
   void LogStrideComparison(const DrawCall& dc, uint32_t heuristic_stride,
                            uint32_t heuristic_slot);
 
+
   // LOAD_ALU_CONSTANT (0x2F) — 271/frame post-load, 0 at boot. Every one is a
   // 16-dword (4x4 matrix) load from guest memory into the ALU constant file.
   //   body[0] = physical address
@@ -230,6 +231,13 @@ class Pm4Translator {
     uint32_t stride = 0;    // inferred, 0 if it failed validation
     const char* reject = nullptr;  // nullptr when accepted
   };
+
+  // Rewrite a draw's vertices from the guest's own layout into the single
+  // layout the game PSO declares — POSITION float3 @0, COLOR float4 @12,
+  // stride 28 — using the layout decoded from the shader. Falls back to leaving
+  // the guest layout in place, and counts why, whenever it cannot. Declared
+  // after VertexFetch because a parameter type must already be visible.
+  void TranscodeVertices(DrawCall& dc, const VertexFetch& fetch);
 
   // Walk the fetch file and decode every live vertex fetch (type == 3),
   // inferring a stride for `vertex_count` vertices. Stride is NOT in the fetch

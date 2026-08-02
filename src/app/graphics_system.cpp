@@ -132,11 +132,19 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       if (draws.empty()) ++s_ticksEmpty; else ++s_ticksWithDraws;
 
       uint32_t submitted = 0, skipped = 0;
-      // Only stride 28 matches the input layout the game PSO declares
-      // (POSITION float3 @0, COLOR float4 @12), and it is the only stride the
-      // vertex dump has actually validated. Anything else would be reinterpreted
-      // as position+colour and drawn as noise, so it is counted, not drawn.
-      // The histogram is the input to the vertex-format work.
+      // Stride 28 is the input layout the game PSO declares — POSITION float3
+      // @0, COLOR float4 @12 — and anything else would be reinterpreted as
+      // position+colour and drawn as noise, so it is still counted rather than
+      // drawn.
+      //
+      // What changed is what reaches here: the translator now transcodes guest
+      // vertices into this layout using the shader's own declared formats, so a
+      // draw arriving at stride 28 is one that was *converted* to it, not one
+      // that happened to be it. A draw still arriving at some other stride is
+      // one the transcode could not handle — no shader bound, no identifiable
+      // position attribute, or a vertex format not implemented — and the
+      // histogram below is now a list of those gaps rather than of the guest's
+      // strides.
       static std::map<uint32_t, uint32_t> s_skippedStrides;
       static std::map<uint64_t, uint32_t> s_skippedSurfaces;
       // Filter first, bind second. The renderer's list is only replaced once we

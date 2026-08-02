@@ -56,4 +56,36 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
 // out of a malformed blob can hold any of 64 values.
 uint32_t VertexFormatSizeBytes(uint32_t format, uint32_t* out_components);
 
+// IEEE half -> float.
+float HalfToFloat(uint16_t h);
+
+// Apply the vertex fetch constant's endian swap in place, turning guest bytes
+// into GPU-native little-endian — which is what the hardware does, and what
+// makes every later read a plain little-endian read at its natural offset.
+//   0 = none, 1 = 8in16 (swap within each u16), 2 = 8in32 (within each u32)
+// Doing this per mode matters: the translator used to apply a 32-bit swap for
+// any non-zero mode, which is wrong for the 8in16 buffers this game also uses.
+void ApplyFetchEndian(uint8_t* data, size_t bytes, uint32_t endian);
+
+// Decode one attribute of one vertex to up to 4 floats. `vertex_base` points at
+// the start of the vertex, already endian-corrected. Unwritten components are
+// left as (0,0,0,1). Returns false for a format not handled, leaving `out`
+// untouched, so callers can count the gap instead of rendering a guess.
+bool ReadVertexAttribute(const uint8_t* vertex_base, uint32_t vertex_bytes,
+                         const VertexAttribute& attr, float out[4]);
+
+// Pick the attribute most likely to be position: the lowest-offset attribute
+// carrying at least two components in a format that can hold coordinates.
+// Returns null if none qualifies.
+//
+// Explicitly NOT by destination register — both ground-truth shaders put
+// position in dest_reg 1 and the second attribute in dest_reg 0, so keying on
+// dest_reg 0 would pick colour every time.
+const VertexAttribute* PickPositionAttribute(
+    const std::vector<VertexAttribute>& attrs);
+
+// Pick an attribute usable as vertex colour, or null. Prefers a packed 8888.
+const VertexAttribute* PickColorAttribute(
+    const std::vector<VertexAttribute>& attrs);
+
 }  // namespace mx::pm4

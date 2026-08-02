@@ -11,6 +11,26 @@
 // Pick the vertex fetch slot the bound shader names, instead of the lowest
 // validated one. Off restores the pre-2026-08-02 tie-break, so the two can be
 // compared on the same build.
+// Rewrite guest vertices into the PSO's fixed pos3+color4 layout. Off leaves
+// the guest layout alone, so the renderer's stride-28 gate keeps rejecting
+// everything else, as it did before.
+REXCVAR_DEFINE_BOOL(vertex_transcode, true, "Debug",
+                    "Convert guest vertices into the POSITION float3 + COLOR "
+                    "float4 layout the game PSO declares");
+
+// Default ON, and the measurement says it must be. Transcoding every format the
+// "lowest-offset attribute that could hold coordinates" rule accepts raises
+// submitted draws from 97 to 282 — and turns the window entirely white, because
+// the rule is wrong for the formats it was never confirmed on. Restricted to
+// k_32_32_32_FLOAT the screen is unchanged and 100 draws are submitted.
+//
+// The transcode itself is not what is wrong here; identifying which attribute
+// is the position is. Until that is read out of the shader rather than guessed
+// from offset, the doubtful formats stay out.
+REXCVAR_DEFINE_BOOL(transcode_confirmed_formats_only, true, "Debug",
+                    "Transcode only draws whose position is k_32_32_32_FLOAT, "
+                    "the one format confirmed against a real vertex dump");
+
 REXCVAR_DEFINE_BOOL(vfetch_use_shader_slot, true, "Debug",
                     "Choose the vertex fetch slot from the shader's vfetch "
                     "instruction rather than taking the lowest one that "
@@ -720,6 +740,92 @@ void Pm4Translator::LogStrideComparison(const DrawCall& dc,
   }
 }
 
+void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
+  static uint64_t s_done = 0, s_noShader = 0, s_noPos = 0, s_readFail = 0;
+  static uint64_t s_passthrough = 0;
+  static std::map<uint32_t, uint32_t> s_posFormatsUsed, s_unhandled;
+
+  // Leave the guest layout and the stride the caller already set alone. The
+  // renderer's stride-28 gate then decides, exactly as before this existed.
+  auto passthrough = [&] { ++s_passthrough; };
+  (void)fetch;
+
+  if (!REXCVAR_GET(vertex_transcode)) { passthrough(); return; }
+  if (!m_currentVs || !m_currentVs->ok || m_currentVs->attrs.empty()) {
+    ++s_noShader; passthrough(); return;
+  }
+
+  const VertexAttribute* pos = PickPositionAttribute(m_currentVs->attrs);
+  if (!pos) { ++s_noPos; passthrough(); return; }
+  // k_32_32_32_FLOAT is the only position format confirmed against a real
+  // vertex dump. Everything else is inferred from "lowest-offset attribute that
+  // could hold coordinates", and for k_16_16_16_16_FLOAT that inference is
+  // actively doubtful — the ALU probe found those decode to w=0 and a range of
+  // about +-1.75, which may not be a position. This flag restricts the
+  // transcode to the confirmed format so the doubtful ones can be isolated.
+  if (REXCVAR_GET(transcode_confirmed_formats_only) && pos->format != 57) {
+    ++s_noPos; passthrough(); return;
+  }
+  const VertexAttribute* col = PickColorAttribute(m_currentVs->attrs);
+
+  // The shader's stride is authoritative; the division guess is not. Where they
+  // disagree the shader wins, but only if the buffer actually holds that many
+  // vertices — a wrong stride here reads off the end.
+  // dc.vertex_stride is what the buffer was actually read with — the caller
+  // already prefers the shader's stride where it fits. Never read past what was
+  // read, whatever the shader claims.
+  const uint32_t src_stride = dc.vertex_stride;
+  if (src_stride == 0) { ++s_noPos; passthrough(); return; }
+  if (uint64_t(dc.vertex_count) * src_stride > dc.vertices.size()) {
+    ++s_readFail; passthrough(); return;
+  }
+
+  static constexpr uint32_t kOutStride = 28;  // float3 position + float4 colour
+  std::vector<uint8_t> out(size_t(dc.vertex_count) * kOutStride);
+  bool any_read_failed = false;
+
+  for (uint32_t v = 0; v < dc.vertex_count; ++v) {
+    const uint8_t* src = dc.vertices.data() + size_t(v) * src_stride;
+    float p[4] = {0, 0, 0, 1};
+    if (!ReadVertexAttribute(src, src_stride, *pos, p)) {
+      any_read_failed = true;
+      ++s_unhandled[pos->format];
+      break;
+    }
+    // A position carrying its own w is already projected; divide through so the
+    // downstream transform sees a consistent object-space point. w == 0 is left
+    // alone rather than producing an infinity.
+    if (pos->components >= 4 && p[3] != 0.0f && p[3] != 1.0f) {
+      p[0] /= p[3]; p[1] /= p[3]; p[2] /= p[3];
+    }
+
+    float c[4] = {1, 1, 1, 1};
+    if (col) ReadVertexAttribute(src, src_stride, *col, c);
+
+    uint8_t* dst = out.data() + size_t(v) * kOutStride;
+    std::memcpy(dst + 0, p, 12);
+    std::memcpy(dst + 12, c, 16);
+  }
+
+  if (any_read_failed) { ++s_readFail; passthrough(); return; }
+
+  dc.vertices = std::move(out);
+  dc.vertex_stride = kOutStride;
+  ++s_done;
+  ++s_posFormatsUsed[pos->format];
+
+  static uint64_t s_total = 0;
+  if ((++s_total % 5000) == 0) {
+    std::string pf, uh;
+    for (const auto& [f, n] : s_posFormatsUsed) pf += fmt::format("{}:{} ", f, n);
+    for (const auto& [f, n] : s_unhandled) uh += fmt::format("{}:{} ", f, n);
+    REXLOG_INFO("transcode: done {} passthrough {} (no shader {}, no position "
+                "{}, read failed {}) — position formats {}— unhandled {}",
+                s_done, s_passthrough, s_noShader, s_noPos, s_readFail, pf,
+                uh.empty() ? "none " : uh);
+  }
+}
+
 void Pm4Translator::AttachVertices(DrawCall& dc, uint8_t* guest_base) {
   auto fetches = CollectVertexFetches(dc.vertex_count);
 
@@ -818,23 +924,47 @@ void Pm4Translator::AttachVertices(DrawCall& dc, uint8_t* guest_base) {
   // sees exactly what it saw before. That is the point: this round measures.
   LogStrideComparison(dc, pick->stride, pick->slot);
 
-  const uint32_t bytes = dc.vertex_count * pick->stride;
-  if (bytes > pick->size_bytes) return;
+  // Read using the stride the shader declares when we have it. The division
+  // guess is what sized this read before, and where the two disagree — 2600
+  // draws a run, nearly all of them the guess saying 8 where the shader says
+  // 16 — sizing by the guess reads only half the buffer and the transcode then
+  // has to fall back. Clamped to what the fetch constant says is there.
+  uint32_t read_stride = pick->stride;
+  if (REXCVAR_GET(vertex_transcode) && m_currentVs && m_currentVs->ok) {
+    for (const auto& a : m_currentVs->attrs) {
+      if (a.fetch_slot == pick->slot && a.stride_bytes) {
+        read_stride = a.stride_bytes;
+        break;
+      }
+    }
+  }
+  if (read_stride == 0) return;
+  uint32_t bytes = dc.vertex_count * read_stride;
+  if (bytes > pick->size_bytes) {
+    // The declared stride overruns the buffer the fetch constant describes.
+    // Prefer the guess in that case rather than reading short or over.
+    read_stride = pick->stride;
+    bytes = dc.vertex_count * read_stride;
+    if (read_stride == 0 || bytes > pick->size_bytes) return;
+  }
   if (!ReadGuestRange(guest_base, pick->address, bytes, dc.vertices, "vertex buffer")) {
     dc.vertices.clear();
     return;
   }
-  dc.vertex_stride = pick->stride;
+  dc.vertex_stride = read_stride;
 
-  // Guest memory is big-endian. endian == 2 is the usual 8-in-32 swap; treat
-  // anything non-zero as a 32-bit swap, which is right for float and packed
-  // 4-byte attributes and wrong only for 16-bit ones we cannot identify without
-  // the shader's vfetch format anyway.
-  if (pick->endian != 0) {
-    const size_t words = dc.vertices.size() / 4;
-    auto* p = reinterpret_cast<uint32_t*>(dc.vertices.data());
-    for (size_t i = 0; i < words; ++i) p[i] = __builtin_bswap32(p[i]);
-  }
+  // Apply the fetch constant's endian swap, per mode. This used to apply a
+  // 32-bit swap for any non-zero mode, on the grounds that the 16-bit formats
+  // could not be identified without the shader — which is no longer true, and
+  // the assumption was wrong anyway: both 8in16 (1) and 8in32 (2) occur in this
+  // game's fetch constants, 13 and 26 of the first 52 logged.
+  ApplyFetchEndian(dc.vertices.data(), dc.vertices.size(), pick->endian);
+
+  // Transcode into the one layout the game PSO describes: POSITION float3 at 0,
+  // COLOR float4 at 12, stride 28. Everything above this point produced the
+  // guest's own layout, whatever it happens to be, and the renderer then threw
+  // away every draw that was not already 28 bytes — 230 of ~320 per frame.
+  TranscodeVertices(dc, *pick);
 
   // Hex dump the first accepted buffer. This is the verdict for the round:
   // plausible float positions mean the fetch path works, noise means the slot

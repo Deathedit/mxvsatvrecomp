@@ -954,6 +954,63 @@ Cost: `MainLoop` #541 against #601 with the cvar off on the same build. 0 access
 violations across the four runs. **The screen is still black** — that is the
 guest painting it black, which no amount of correct vertex fetching addresses.
 
+#### The transcode works; identifying position does not (2026-08-03)
+
+Guest vertices are now rewritten into the one layout the game PSO declares —
+POSITION float3 @0, COLOR float4 @12, stride 28 — using the formats decoded from
+the shader. `ReadVertexAttribute` handles k_32_FLOAT, k_32_32_FLOAT,
+k_32_32_32_FLOAT, k_32_32_32_32_FLOAT, k_16_16_FLOAT, k_16_16_16_16_FLOAT,
+k_16_16, k_16_16_16_16, k_8_8_8_8, k_2_10_10_10, k_10_11_11 and k_11_11_10;
+anything else reports failure rather than rendering a guess, and is counted.
+
+**The endian bug found on the way.** `AttachVertices` applied a 32-bit byteswap
+for any non-zero fetch endian, justified in a comment on the grounds that
+16-bit formats could not be identified without the shader. Both modes occur —
+13 of the first 52 logged fetches are 8in16 (1) and 26 are 8in32 (2) — so every
+8in16 buffer was being swapped wrongly. `ApplyFetchEndian` now applies the swap
+the mode actually calls for.
+
+**The result, and it is not a win.**
+
+|  | transcode off | confirmed formats only | all formats |
+|---|---|---|---|
+| submitted / frame | 97 | **100** | 282 |
+| skipped | 220 | 215-217 | 47 |
+| screen | black | black | **entirely white** |
+
+Transcoding everything triples the draws that reach the screen and turns the
+window white. That is not the transcode being wrong — it is the rule for
+choosing *which attribute is the position* being wrong. `PickPositionAttribute`
+takes the lowest-offset attribute in a format that could hold coordinates, and
+the only format that rule has ever been confirmed on is k_32_32_32_FLOAT, from a
+real vertex hex dump. For k_16_16_16_16_FLOAT — 34387 of 65000 transcoded draws
+— the ALU probe had already shown those decode to w=0 and a range of about
+±1.75, and this is that doubt cashing out: fed through as positions they produce
+screen-covering geometry.
+
+`transcode_confirmed_formats_only` therefore defaults **on**, which leaves the
+screen unchanged and submitted at 100. The machinery is built, tested and
+measured; it is gated on a fact we do not have yet.
+
+**The fact we need, and where it is.** The vertex shader exports its position
+through a specific export register, and that export is in the microcode we
+already decode. Fixture 1 contains `C80F803E ... E2010100` — `0x3E` is 62, the
+Xenos position export — alongside `C80F8000`, an export to 0. Decoding ALU
+export instructions far enough to learn which GPR feeds export 62, then matching
+that GPR against the `dest_reg` each vfetch writes, replaces the offset guess
+with the shader's own answer. That is a bounded piece of work on data already in
+hand, and it is the thing standing between this transcode and every stride and
+format rendering. It also settles the `dest_reg` question the ground-truth
+fixtures raised: position is at `dest_reg` 1 in both, colour at 0.
+
+Remaining gaps at the safe default: ~15000 draws a run still skipped for
+topology (QuadList `prim=13` and TriangleFan have no host equivalent and are
+dropped), and ~2000 transcode read failures where the declared attribute does
+not fit the stride actually read.
+
+0 access violations across 3 forced runs plus control; `MainLoop` #541,
+`LoaderTick` #500.
+
 ### Parser caveat
 
 `Pm4Parser` accepts any Type-3 with `body_word_count <= 0x4000`. A misparsed

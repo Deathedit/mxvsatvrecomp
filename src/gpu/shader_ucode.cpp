@@ -111,6 +111,162 @@ uint32_t VertexFormatSizeBytes(uint32_t format, uint32_t* out_components) {
   return bytes;
 }
 
+float HalfToFloat(uint16_t h) {
+  const uint32_t sign = uint32_t(h & 0x8000) << 16;
+  uint32_t exp = (h >> 10) & 0x1F;
+  uint32_t man = h & 0x3FF;
+  uint32_t bits;
+  if (exp == 0) {
+    if (man == 0) {
+      bits = sign;  // +-0
+    } else {
+      exp = 1;      // subnormal: renormalise
+      while (!(man & 0x400)) { man <<= 1; --exp; }
+      man &= 0x3FF;
+      bits = sign | ((exp + 112) << 23) | (man << 13);
+    }
+  } else if (exp == 0x1F) {
+    bits = sign | 0x7F800000u | (man << 13);  // inf / nan
+  } else {
+    bits = sign | ((exp + 112) << 23) | (man << 13);
+  }
+  float f;
+  std::memcpy(&f, &bits, 4);
+  return f;
+}
+
+void ApplyFetchEndian(uint8_t* data, size_t bytes, uint32_t endian) {
+  if (!data) return;
+  if (endian == 1) {
+    for (size_t i = 0; i + 1 < bytes; i += 2) std::swap(data[i], data[i + 1]);
+  } else if (endian == 2) {
+    for (size_t i = 0; i + 3 < bytes; i += 4) {
+      std::swap(data[i], data[i + 3]);
+      std::swap(data[i + 1], data[i + 2]);
+    }
+  }
+}
+
+namespace {
+
+inline uint16_t Rd16(const uint8_t* p) {
+  uint16_t v; std::memcpy(&v, p, 2); return v;
+}
+inline uint32_t Rd32(const uint8_t* p) {
+  uint32_t v; std::memcpy(&v, p, 4); return v;
+}
+inline float RdF32(const uint8_t* p) {
+  float v; std::memcpy(&v, p, 4); return v;
+}
+// Signed normalised 16-bit. Xenos clamps the -32768 case to -1.
+inline float Snorm16(uint16_t u) {
+  const int16_t s = int16_t(u);
+  return s <= -32767 ? -1.0f : float(s) / 32767.0f;
+}
+
+}  // namespace
+
+bool ReadVertexAttribute(const uint8_t* vertex_base, uint32_t vertex_bytes,
+                         const VertexAttribute& attr, float out[4]) {
+  if (!vertex_base) return false;
+  const uint32_t size = attr.size_bytes;
+  if (size == 0) return false;
+  if (attr.offset_bytes + size > vertex_bytes) return false;
+  const uint8_t* p = vertex_base + attr.offset_bytes;
+
+  out[0] = out[1] = out[2] = 0.0f;
+  out[3] = 1.0f;
+
+  switch (attr.format) {
+    case 36:  // k_32_FLOAT
+      out[0] = RdF32(p);
+      return true;
+    case 37:  // k_32_32_FLOAT
+      out[0] = RdF32(p); out[1] = RdF32(p + 4);
+      return true;
+    case 57:  // k_32_32_32_FLOAT
+      out[0] = RdF32(p); out[1] = RdF32(p + 4); out[2] = RdF32(p + 8);
+      return true;
+    case 38:  // k_32_32_32_32_FLOAT
+      for (int i = 0; i < 4; ++i) out[i] = RdF32(p + i * 4);
+      return true;
+    case 31:  // k_16_16_FLOAT
+      out[0] = HalfToFloat(Rd16(p)); out[1] = HalfToFloat(Rd16(p + 2));
+      return true;
+    case 32:  // k_16_16_16_16_FLOAT
+      for (int i = 0; i < 4; ++i) out[i] = HalfToFloat(Rd16(p + i * 2));
+      return true;
+    case 25:  // k_16_16 — signed normalised
+      out[0] = Snorm16(Rd16(p)); out[1] = Snorm16(Rd16(p + 2));
+      return true;
+    case 26:  // k_16_16_16_16
+      for (int i = 0; i < 4; ++i) out[i] = Snorm16(Rd16(p + i * 2));
+      return true;
+    case 6: {  // k_8_8_8_8 — unsigned normalised, low byte is component 0
+      const uint32_t v = Rd32(p);
+      for (int i = 0; i < 4; ++i)
+        out[i] = float((v >> (i * 8)) & 0xFF) / 255.0f;
+      return true;
+    }
+    case 7: {  // k_2_10_10_10 — 10/10/10 then 2
+      const uint32_t v = Rd32(p);
+      out[0] = float(v & 0x3FF) / 1023.0f;
+      out[1] = float((v >> 10) & 0x3FF) / 1023.0f;
+      out[2] = float((v >> 20) & 0x3FF) / 1023.0f;
+      out[3] = float((v >> 30) & 0x3) / 3.0f;
+      return true;
+    }
+    case 16: {  // k_10_11_11 — x:11 y:11 z:10, low to high
+      const uint32_t v = Rd32(p);
+      out[0] = float(v & 0x7FF) / 2047.0f;
+      out[1] = float((v >> 11) & 0x7FF) / 2047.0f;
+      out[2] = float((v >> 22) & 0x3FF) / 1023.0f;
+      return true;
+    }
+    case 17: {  // k_11_11_10 — x:10 y:11 z:11
+      const uint32_t v = Rd32(p);
+      out[0] = float(v & 0x3FF) / 1023.0f;
+      out[1] = float((v >> 10) & 0x7FF) / 2047.0f;
+      out[2] = float((v >> 21) & 0x7FF) / 2047.0f;
+      return true;
+    }
+    default:
+      // 33/34/35 (integer k_32 family) and anything unrecognised. Reporting
+      // false lets the caller count what it cannot handle rather than draw a
+      // plausible-looking guess.
+      return false;
+  }
+}
+
+const VertexAttribute* PickPositionAttribute(
+    const std::vector<VertexAttribute>& attrs) {
+  const VertexAttribute* best = nullptr;
+  for (const auto& a : attrs) {
+    if (a.components < 2) continue;
+    switch (a.format) {
+      case 57: case 38: case 32: case 37: case 31:
+      case 16: case 17: case 7: case 25: case 26:
+        break;
+      default:
+        continue;
+    }
+    if (!best || a.offset_bytes < best->offset_bytes) best = &a;
+  }
+  return best;
+}
+
+const VertexAttribute* PickColorAttribute(
+    const std::vector<VertexAttribute>& attrs) {
+  const VertexAttribute* pos = PickPositionAttribute(attrs);
+  const VertexAttribute* fallback = nullptr;
+  for (const auto& a : attrs) {
+    if (&a == pos) continue;
+    if (a.format == 6 || a.format == 7) return &a;  // packed 8888 / 2_10_10_10
+    if (a.components == 4 && !fallback) fallback = &a;
+  }
+  return fallback;
+}
+
 bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
                                std::vector<VertexAttribute>& out,
                                const char** fail) {
