@@ -216,8 +216,18 @@ class Pm4Translator {
   void ProbeAluMatrices(const DrawCall& dc);
 
   static constexpr uint32_t kAluConstDwords = 2048;  // 512 vec4
+  static constexpr uint32_t kAluConstBase = 0x4000;
   uint32_t m_aluConsts[kAluConstDwords] = {};
   bool m_aluWritten = false;
+
+  // Which door an ALU constant write came through. There are three and until
+  // now only one was watched, which is why the file looked empty.
+  enum : int {
+    kAluSourceType0 = 0,
+    kAluSourceSetConstant = 1,
+    kAluSourceLoad = 2,
+  };
+  void NoteAluConstWrite(int source, uint32_t reg_base, uint32_t dwords);
 
   std::map<uint64_t, ShaderLayout> m_shaderCache;
   // The last vertex shader loaded before the current draw. That is how the

@@ -133,6 +133,48 @@ void Pm4Translator::ApplyType0Write(uint32_t reg_base,
   ClipWriteInto(m_fetchConsts, kFetchConstBase, kFetchConstCount, reg_base, body);
   if (ClipWriteInto(m_ctxRegs, kCtxRegBase, kCtxRegCount, reg_base, body))
     m_ctxWritten = true;
+  // The ALU constant file, 0x4000..0x47FF. This used to be dropped on the
+  // floor, and AGENTS.md's "the game never writes the ALU constant file" was
+  // partly an artifact of that: the check behind it covered 0x4000..0x41FF —
+  // the first 128 vec4 of 512 — so a write anywhere above vec4 127 was invisible
+  // to it *and* discarded here. Type0 is how this game delivers its vertex fetch
+  // constants, so it is the most likely door for these too.
+  if (ClipWriteInto(m_aluConsts, kAluConstBase, kAluConstDwords, reg_base, body))
+    NoteAluConstWrite(kAluSourceType0, reg_base,
+                      static_cast<uint32_t>(body.size()));
+}
+
+// One place to count what actually lands in the ALU constant file, from each of
+// the three doors into it, so "the file is empty" can be told apart from "we
+// were not watching the door it comes through".
+void Pm4Translator::NoteAluConstWrite(int source, uint32_t reg_base,
+                                      uint32_t dwords) {
+  static const char* kNames[] = {"Type0", "SET_CONSTANT", "LOAD_ALU_CONSTANT"};
+  static uint64_t s_writes[3] = {};
+  static uint64_t s_nonzero[3] = {};
+  ++s_writes[source];
+  m_aluWritten = true;
+
+  // Count the vec4 slots that currently hold anything non-zero. A file written
+  // 54000 times that still reads as zeros is a broken read, not a quiet game.
+  uint32_t live = 0;
+  for (uint32_t v = 0; v < kAluConstDwords / 4; ++v) {
+    if (m_aluConsts[v * 4 + 0] || m_aluConsts[v * 4 + 1] ||
+        m_aluConsts[v * 4 + 2] || m_aluConsts[v * 4 + 3]) {
+      ++live;
+    }
+  }
+  if (live) ++s_nonzero[source];
+
+  static uint64_t s_total = 0;
+  if (++s_total <= 8 || (s_total % 4000) == 0) {
+    REXLOG_INFO("aluconst: {} write reg=0x{:X} dwords={} — live vec4 slots {} of "
+                "{} — writes by door Type0 {}/{} SET_CONSTANT {}/{} "
+                "LOAD_ALU_CONSTANT {}/{} (non-zero-after/total)",
+                kNames[source], reg_base, dwords, live, kAluConstDwords / 4,
+                s_nonzero[0], s_writes[0], s_nonzero[1], s_writes[1],
+                s_nonzero[2], s_writes[2]);
+  }
 }
 
 float Pm4Translator::CtxFloat(uint32_t reg, float fallback) const {
@@ -508,7 +550,24 @@ void Pm4Translator::HandleLoadAluConstant(const Pm4Packet& pkt,
     std::memcpy(&w, bytes.data() + i * 4, 4);
     m_aluConsts[index + i] = __builtin_bswap32(w);
   }
-  m_aluWritten = true;
+  NoteAluConstWrite(kAluSourceLoad, kAluConstBase + index, size_dwords);
+
+  // Is the source blank, or is our read of it blank? Every one of 54000 loads
+  // logged row0 = (0,0,0,0) from many distinct addresses, which is a suspicious
+  // shape for real data. Count the loads whose payload was entirely zero.
+  {
+    bool any = false;
+    for (uint32_t i = 0; i < size_dwords && !any; ++i)
+      any = m_aluConsts[index + i] != 0;
+    static uint64_t s_zero = 0, s_any = 0;
+    if (any) ++s_any; else ++s_zero;
+    static uint64_t s_n = 0;
+    if ((++s_n % 4000) == 0) {
+      REXLOG_INFO("alu: loads with any non-zero payload {} / all-zero {} — if "
+                  "all-zero dominates the guest read is blank, not the game",
+                  s_any, s_zero);
+    }
+  }
 
   static uint32_t s_calls = 0;
   if (++s_calls <= 6 || (s_calls % 2000) == 0) {
@@ -1392,6 +1451,19 @@ void Pm4Translator::HandleSetConstant(const Pm4Packet& pkt) {
     case 3: reg_index = 0x4908 + index; break;  // LOOP
     case 4: reg_index = 0x2000 + index; break;  // REGISTERS (context)
     default: return;  // unknown type — ignore
+  }
+
+  // Type 0 is the ALU float constant file. This was computing reg_index and
+  // then never using it for anything but fetch constants, so a SET_CONSTANT
+  // carrying real ALU constants would have been counted as "the game emits no
+  // SET_CONSTANT at all" — true of the packet count, but it would have gone
+  // nowhere even if it were not.
+  if (type == 0 && pkt.body.size() > 1) {
+    const uint32_t n = static_cast<uint32_t>(pkt.body.size()) - 1;
+    if (index + n <= kAluConstDwords) {
+      for (uint32_t i = 0; i < n; ++i) m_aluConsts[index + i] = pkt.body[i + 1];
+      NoteAluConstWrite(kAluSourceSetConstant, reg_index, n);
+    }
   }
 
   // Vertex fetch constants (type=1). Each fetch constant is a 3-dword

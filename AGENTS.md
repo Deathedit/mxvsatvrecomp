@@ -1089,6 +1089,38 @@ the same signature appears in mx_018, mx_070, mx_073 and mx_079, all predating
 this work, so it is the known race rather than a new fault — but it is 1 in 7
 runs of this build against a recorded 1 in 9, which does not separate the two.
 
+#### The ALU constant file is not empty — we were dropping it (2026-08-03)
+
+> **Voids, for the second and final time, "the game never writes the ALU
+> constant file."** The previous annotation narrowed that claim to "true of
+> `SET_CONSTANT` and of Type0 writes to `0x4000..0x41FF`". The narrowing was the
+> bug: the ALU constant file is `0x4000..0x47FF`, 512 vec4, and the check covered
+> the first 128. Worse, `ApplyType0Write` clipped incoming Type0 writes into the
+> fetch-constant and context-register files only, so anything landing in the ALU
+> range was discarded whatever its address.
+
+Measured in one forced run, with all three doors instrumented:
+
+| Door | Writes / run | Status before |
+|---|---|---|
+| Type0 into `0x4000..0x47FF` | **78697** | **discarded — no shadow existed** |
+| `SET_CONSTANT` type 0 | 0 | computed `reg_index`, then ignored it |
+| `LOAD_ALU_CONSTANT` (0x2F) | 57303 | shadowed, and working |
+
+**Live vec4 slots once all three are honoured: 224-239 of 512.** Observed Type0
+writes include `reg=0x4000 dwords=16` and `reg=0x4400 dwords=80`.
+
+**A misreading to not repeat.** The `alu: load ... row0=(0,0,0,0)` line — every
+one of 54000 loads — was read as "the constant file is empty". It logs the first
+four dwords of each sixteen-dword load, not the load. 51712 of 57303 loads carry
+a non-zero payload; the guest read through `ReadGuestRange` was never broken.
+The instrument answered a narrower question than the one being asked of it.
+
+This unblocks the shader ALU translator, which needs `c[n]` to be real. The
+Stage 3 conclusion that the world transform is computed in-shader rather than
+supplied as a readable matrix still stands — but the shader computing it now has
+constants to compute it from.
+
 ### Parser caveat
 
 `Pm4Parser` accepts any Type-3 with `body_word_count <= 0x4000`. A misparsed
