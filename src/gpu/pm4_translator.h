@@ -1,9 +1,11 @@
 #pragma once
 
 #include "gpu/pm4_parser.h"
+#include "gpu/shader_ucode.h"
 
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <vector>
 
 namespace mx::pm4 {
@@ -159,6 +161,65 @@ class Pm4Translator {
   // Read-only: counts the distinct guest colour surfaces draws target. Nothing
   // downstream consumes it — see the definition.
   void LogSurface(DrawCall& dc);
+
+  // ---- Shader microcode capture (read-only this round) --------------------
+  //
+  // The decoded vertex layout of one shader. Cached because the same shader is
+  // reloaded many times per frame — guest address 0x1D5FF040 alone recurs ~40
+  // times — and the CF walk should run once per distinct shader, not per load.
+  struct ShaderLayout {
+    std::vector<VertexAttribute> attrs;
+    bool ok = false;
+    const char* fail = nullptr;
+  };
+
+  // IM_LOAD_IMMEDIATE (0x2B) — microcode inline in the ring, 68/frame.
+  //   body[0] = shader type (0 vertex, 1 pixel)
+  //   body[1] = size in dwords; the high half is a start offset into
+  //             instruction memory, 0 in every packet observed so far
+  //   body[2..] = microcode, already host-endian after the parser's byteswap
+  void HandleImLoadImmediate(const Pm4Packet& pkt);
+
+  // IM_LOAD (0x27) — microcode in guest memory, 357/frame.
+  //   body[0] = physical address | type in [1:0]
+  //   body[1] = size in dwords
+  void HandleImLoad(const Pm4Packet& pkt, uint8_t* guest_base);
+
+  // Decode once per distinct shader and remember it. `key` is the guest address
+  // for IM_LOAD and a content hash for IM_LOAD_IMMEDIATE.
+  const ShaderLayout* DecodeAndCacheShader(uint64_t key, const uint32_t* dwords,
+                                           uint32_t count, const char* origin);
+
+  // The heart of this round: report the stride the shader actually declares
+  // beside the one AttachVertices guessed by division. Logs only — nothing
+  // downstream reads the decoded value yet.
+  void LogStrideComparison(const DrawCall& dc, uint32_t heuristic_stride,
+                           uint32_t heuristic_slot);
+
+  // LOAD_ALU_CONSTANT (0x2F) — 271/frame post-load, 0 at boot. Every one is a
+  // 16-dword (4x4 matrix) load from guest memory into the ALU constant file.
+  //   body[0] = physical address
+  //   body[1] = (type << 16) | dword index into the constant file
+  //   body[2] = size in dwords (0x10 for almost all; a couple carry 0x20)
+  // This is the third door: AGENTS.md's "the game never writes the ALU constant
+  // file" is true of SET_CONSTANT and of Type0 writes to 0x4000..0x41FF, and
+  // wrong about the game. Read-only this round — shadow, probe, decide next.
+  void HandleLoadAluConstant(const Pm4Packet& pkt, uint8_t* guest_base);
+
+  // Transform a draw's first vertices by each candidate matrix in each layout
+  // and report which, if any, lands in clip space. Logs only.
+  void ProbeAluMatrices(const DrawCall& dc);
+
+  static constexpr uint32_t kAluConstDwords = 2048;  // 512 vec4
+  uint32_t m_aluConsts[kAluConstDwords] = {};
+  bool m_aluWritten = false;
+
+  std::map<uint64_t, ShaderLayout> m_shaderCache;
+  // The last vertex shader loaded before the current draw. That is how the
+  // hardware binds, and the dump agrees: every 0x2B/0x27 is followed by an
+  // SQ_PROGRAM_CNTL write and then draw state. Pointers into a std::map stay
+  // valid across later inserts, so holding one is safe.
+  const ShaderLayout* m_currentVs = nullptr;
 
   // One vertex fetch slot, decoded from a dword pair in the fetch file.
   struct VertexFetch {

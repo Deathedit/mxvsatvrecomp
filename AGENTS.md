@@ -536,6 +536,15 @@ Every earlier note reading "geometry is off-screen, the MVP guess is the first
 suspect" is **void** on that basis — the matrix was not a guess that happened to
 be wrong, it was zero.
 
+> **Amended 2026-08-02.** The two facts above are correct — no `SET_CONSTANT`,
+> no `SET_SHADER_CONSTANTS`, no Type0 write to `0x4000..0x41FF` — but the
+> conclusion drawn from them, that the game never writes the ALU constant file
+> at all, is **wrong**. It writes it through a third door: `LOAD_ALU_CONSTANT`
+> (0x2F), ~44000 times a run, from guest memory. That does not rescue `m_mvp` —
+> what arrives is per-shader scalar constants, not a transform, and only eight
+> vec4 registers of the file are ever touched. See "The ALU constants are not
+> the world matrix".
+
 **The replacement is read from the guest, not inferred.** The viewport registers
 arrive in every frame as the tail of a cnt=21 Type0 write to `0x2100`:
 
@@ -769,6 +778,143 @@ guest actually swaps — which is a considerably larger job than a filter, and
 needs the shader/vertex-format work first so that the main pass has more than 5
 drawable draws in it.
 
+#### The stride is readable, and the heuristic is 96% right (2026-08-02)
+
+The vertex layout is now read out of the shader instead of guessed.
+`src/gpu/shader_ucode.cpp` walks the control flow of a vertex shader blob and
+enumerates its vertex fetches; `tools/ucode_test.cpp` pins it to two real
+captured shaders. Both microcode doors are handled: `IM_LOAD_IMMEDIATE` (0x2B,
+inline in the ring) and `IM_LOAD` (0x27, from guest memory — its addresses
+resolve through the existing `ReadGuestRange` window search, which had been
+flagged as a risk and was not one).
+
+**Binding model confirmed.** The last vertex shader loaded before a draw is the
+one it uses. Over 85000 draws per run, `no shader` was **1** — every draw but
+one had a decoded shader bound.
+
+**The headline, 2 clean runs:**
+
+|  | run A | run B |
+|---|---|---|
+| agree / disagree (raw) | 70592 / 14408 | 70584 / 14416 |
+| **slot matched** | **70332 / 2598** | **70327 / 2605** |
+| slot missed | 260 / 11810 | 257 / 11811 |
+
+Raw agreement is 83%, but that number is misleading and should not be quoted.
+When the heuristic picks a fetch slot the shader never fetches from, the
+comparison falls back to `attrs[0]` — some other slot's stride — so those
+"disagreements" are an artifact of the comparison, not evidence about the
+decoder. Among the draws where both name the same slot, **agreement is 96.4%**.
+
+The disagreements are concentrated in one pattern, slot-matched only:
+
+```
+h8/v16 : 2560     heuristic says 8, shader says 16   <- 98% of all disagreement
+h8/v28 :   20
+h28/v36:   18
+```
+
+A factor of two, which is exactly the failure the existing comment in
+`CollectVertexFetches` predicts: a buffer shared between draws divides to a
+multiple or a fraction of the true stride. The shader is right and the division
+is wrong.
+
+**The slot miss is a bug, not noise.** 12000 draws per run — 14% — have the
+heuristic reading from a fetch slot the bound shader does not use at all. Those
+draws are being read out of the wrong buffer. The shader names its slot
+(`fetch_constant_index`), so this is fixable, and it is probably worth more than
+the stride correction.
+
+**Strides and position formats the skip histogram never showed.** The renderer's
+skipped-stride histogram only counts draws that got as far as being rejected;
+the vfetch histogram covers every draw:
+
+```
+strides       8:23264  12:869  16:9768  20:283  28:27591  36:22689  48:510  52:26
+pos formats  32:43609  37:23264  38:10278  57:7490  31:359
+```
+
+Format 32 is `k_16_16_16_16_FLOAT` — **half-float positions are the plurality**,
+at 43609 against 7490 for the `k_32_32_32_FLOAT` (float3) the PSO's input layout
+declares. Any transcode round has to handle 16-bit floats first, not last.
+
+Nothing downstream consumes any of this yet: `dc.vertex_stride` is still the
+division guess and submitted/skipped stayed at 85/230-232, unchanged.
+
+##### Correction to the previous entry's crash claim
+
+The entry above on the surface gate says "2 of 4 gated runs took an access
+violation against 0 of 4 ungated". The second half has not held up: run mx_079,
+with the gate off, crashed the same way (3 AVs, dead at `LoaderTick #5`).
+Across ungated runs mx_074-082 the rate is **1 in 9**, not 0. The gate may still
+aggravate it — 2 in 4 against 1 in 9 — but it does not cause it, and this is the
+pre-existing intermittent crash class AGENTS.md already warns about rather than
+something that round introduced. The reason for keeping the gate off stands on
+the draw count alone (85-89/frame to 5).
+
+#### The ALU constants are not the world matrix (2026-08-02)
+
+`LOAD_ALU_CONSTANT` (0x2F) is now handled and shadowed into a 512-vec4 file.
+The claim it was chased for — that the world transform is one of the matrices
+the game loads through it — **is wrong**, and the probe that tested it is the
+evidence.
+
+**What the game actually loads.** ~44000 loads per run, into only *three*
+constant-file indices:
+
+```
+0x3F0 : 19400 loads (size 16)
+0x7F0 : 24310 loads (size 16)
+0x3E0 :   290 loads (size 32)
+```
+
+Eight vec4 registers out of 512. A world matrix does not live in a slot that is
+rewritten 44000 times a run.
+
+**What is in them.** Dumped raw, every sample has two or three rows identically
+zero, and the live values are shader math constants rather than matrix elements:
+
+```
+c0x3F0 row0 = 0 0 0 0            c0x7F0 row0 = 0 0 0 0
+c0x3F0 row1 = 0 0 0 0            c0x7F0 row1 = 0 1.0000 -0.3333 0.3333
+c0x3F0 row2 = 4.0000 0.1592 0 0  c0x7F0 row2 = 0.1100 0.3000 0.5900 0.6667
+c0x3F0 row3 = 0.2500 1.0000 0 0  c0x7F0 row3 = 0.2500 0 0 0
+```
+
+`0.1592` is 1/(2π). Alongside 4.0, 0.25, 0.75, 1/3, 2/3, 1.5 and an
+0.11/0.30/0.59 triple that is a luminance weight vector. These are a per-shader
+scalar constant block written into two rolling scratch slots, and the contents
+change from draw to draw.
+
+**The probe.** Each draw's first vertices transformed by both candidates in both
+layouts, with the viewport inverse as control, sampled across `prim` 8, 6 and 13
+after the post-load state is reached. Nothing lands in clip space. The best
+showing is 2 of 3 vertices, and those are degenerate — x and y come out
+identically 0 because the matrix rows that would produce them are zero.
+
+So: **the world transform is computed in the shader from these constants, not
+supplied whole.** The plan anticipated this outcome and it caps the next round
+correctly — reaching world geometry needs real shader ALU translation, not a
+matrix lookup. The viewport inverse remains the only transform we have, and it
+is right only for the window-space UI rects it was derived from.
+
+**A caveat on the QuadList sample.** The probe reads "the attribute at offset 0"
+as position. For `prim=13` that is a `k_16_16_16_16_FLOAT` decoding to values
+like `(0, 1.750, 0, 1.875)` and `(0, -1.750, 0, 0)` — a w of 0 on some vertices,
+and a range of about ±1.75. That may not be a position at all; it is equally
+consistent with two half2 pairs, or corner offsets. Picking position by offset
+alone is not yet justified for these shaders, and no conclusion about QuadList
+world coordinates should be drawn from it.
+
+**Cost, and where it actually is.** `MainLoop` reaches #481 rather than #601,
+consistently across 3 runs, with draw counts and the stride verdict unchanged.
+That is *not* the probe's logging, which is capped at 24 blocks for the whole
+run: Stage 2 (mx_078, microcode decode wired up, no 0x2F handling) still reached
+#601, and the drop appears only once `HandleLoadAluConstant` lands. The cost is
+its ~44000 `ReadGuestRange` calls per run — a `VirtualQuery` plus a 64-byte
+memcpy each. If the ALU shadow is kept, caching by (address, size) is the
+obvious dial, since the same three indices are reloaded constantly.
+
 ### Parser caveat
 
 `Pm4Parser` accepts any Type-3 with `body_word_count <= 0x4000`. A misparsed
@@ -977,10 +1123,14 @@ Type-0: [31:30]=0, [29:0]=register base
   top-left quadrant of the 1280x720 target, exactly where the viewport
   arithmetic predicts, 3/3 runs plus control. What is **not** working: only
   stride-28 draws are submitted (85-95 of ~320 per frame) and QuadList — the
-  plurality topology — is dropped. Both have the same cause: the vertex stride
-  is inferred by division rather than read, and the guest's shader microcode,
-  which carries the real stride and formats, is not decoded. See "The zero
-  matrix, and the guest's own viewport" below.
+  plurality topology — is dropped. See "The zero matrix, and the guest's own
+  viewport" below.
+  The cause is no longer unknown: as of 2026-08-02 the microcode **is** decoded
+  and the real stride, slot and formats are read from the shader — but nothing
+  downstream consumes them yet, so the division heuristic still drives the draw
+  path. See "The stride is readable, and the heuristic is 96% right", which also
+  records that 14% of draws read from the wrong fetch slot entirely and that
+  half-float positions outnumber float3 six to one.
   The other two items formerly listed here are resolved: the game RT **is** now
   cleared every frame (it never was, so no screenshot before 2026-08-02 showed a
   single frame), and the black window is **the guest painting black**, not an

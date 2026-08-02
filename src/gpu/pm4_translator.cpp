@@ -310,6 +310,407 @@ bool Pm4Translator::ReadGuestRange(uint8_t* guest_base, uint32_t addr,
   return false;
 }
 
+const Pm4Translator::ShaderLayout* Pm4Translator::DecodeAndCacheShader(
+    uint64_t key, const uint32_t* dwords, uint32_t count, const char* origin) {
+  auto it = m_shaderCache.find(key);
+  if (it != m_shaderCache.end()) return &it->second;
+
+  ShaderLayout layout;
+  layout.ok = DecodeVertexShaderFetches(dwords, count, layout.attrs,
+                                        &layout.fail);
+  if (!layout.ok) layout.attrs.clear();
+
+  auto [pos, inserted] = m_shaderCache.emplace(key, std::move(layout));
+  const ShaderLayout& sl = pos->second;
+
+  // Dump the first shaders in full, then only count. Log rotation is at 5MB
+  // and this fires 68+357 times a frame, so an uncapped line would bury the
+  // measurement it exists to produce.
+  static uint32_t s_logged = 0, s_ok = 0, s_failed = 0;
+  if (sl.ok) ++s_ok; else ++s_failed;
+  if (s_logged < 20) {
+    ++s_logged;
+    if (!sl.ok) {
+      REXLOG_INFO("ucode: {} key=0x{:X} decode FAILED — {}", origin, key,
+                  sl.fail ? sl.fail : "(no reason)");
+    } else {
+      REXLOG_INFO("ucode: {} key=0x{:X} decoded {} attribute(s)", origin, key,
+                  sl.attrs.size());
+      for (size_t i = 0; i < sl.attrs.size(); ++i) {
+        const auto& a = sl.attrs[i];
+        REXLOG_INFO("ucode:   attr[{}] slot={} off={} stride={} fmt={} comps={} "
+                    "size={} dest=r{} {}",
+                    i, a.fetch_slot, a.offset_bytes, a.stride_bytes, a.format,
+                    a.components, a.size_bytes, a.dest_reg,
+                    a.from_mini ? "(mini)" : "(full)");
+      }
+    }
+  }
+  static uint32_t s_calls = 0;
+  if ((++s_calls % 2000) == 0) {
+    REXLOG_INFO("ucode: {} distinct shaders cached, {} decoded, {} failed",
+                m_shaderCache.size(), s_ok, s_failed);
+  }
+  return &sl;
+}
+
+void Pm4Translator::HandleImLoadImmediate(const Pm4Packet& pkt) {
+  if (pkt.body.size() < 2) return;
+  const uint32_t type = pkt.body[0];
+  const uint32_t size_dwords = pkt.body[1] & 0xFFFF;
+  const uint32_t start = pkt.body[1] >> 16;
+
+  // The high half of body[1] is a start offset into instruction memory. It is 0
+  // in every packet captured; if it ever is not, this is a partial patch of an
+  // existing shader and decoding the fragment alone would be wrong. Say so
+  // loudly rather than producing a confident wrong layout.
+  if (start != 0) {
+    static int s_warned = 0;
+    if (s_warned++ < 4) {
+      REXLOG_WARN("ucode: IM_LOAD_IMMEDIATE start offset {} != 0 — partial "
+                  "shader patch, not decoding", start);
+    }
+    return;
+  }
+  if (type != 0) return;  // 1 = pixel shader, carries no vertex layout
+  if (size_dwords == 0 || pkt.body.size() < size_dwords + 2) return;
+
+  const uint32_t* code = pkt.body.data() + 2;
+
+  // Content hash — an immediate load has no address to key on. FNV-1a; the
+  // cache is a correctness-neutral optimisation, so a collision would cost a
+  // wrong log line, not a wrong render.
+  uint64_t key = 1469598103934665603ull;
+  for (uint32_t i = 0; i < size_dwords; ++i) {
+    key ^= code[i];
+    key *= 1099511628211ull;
+  }
+
+  m_currentVs = DecodeAndCacheShader(key, code, size_dwords, "IM_LOAD_IMMEDIATE");
+}
+
+void Pm4Translator::HandleImLoad(const Pm4Packet& pkt, uint8_t* guest_base) {
+  if (pkt.body.size() < 2) return;
+  const uint32_t addr = pkt.body[0] & ~0x3u;
+  const uint32_t type = pkt.body[0] & 0x3;
+  const uint32_t size_dwords = pkt.body[1];
+  if (type != 0) return;  // vertex shaders only
+  if (addr == 0 || size_dwords == 0 || size_dwords > 4096) return;
+
+  // Reuse by address before touching guest memory — 0x1D5FF040 alone recurs
+  // ~40 times a frame, and ReadGuestRange is the expensive part.
+  auto it = m_shaderCache.find(addr);
+  if (it != m_shaderCache.end()) {
+    m_currentVs = &it->second;
+    return;
+  }
+
+  std::vector<uint8_t> bytes;
+  if (!ReadGuestRange(guest_base, addr, size_dwords * 4, bytes, "shader ucode"))
+    return;
+
+  // Guest memory is big-endian; the ring came pre-swapped by the parser but
+  // this did not.
+  std::vector<uint32_t> code(size_dwords);
+  std::memcpy(code.data(), bytes.data(), size_dwords * 4);
+  for (auto& w : code) w = __builtin_bswap32(w);
+
+  m_currentVs = DecodeAndCacheShader(addr, code.data(), size_dwords, "IM_LOAD");
+}
+
+void Pm4Translator::HandleLoadAluConstant(const Pm4Packet& pkt,
+                                          uint8_t* guest_base) {
+  if (pkt.body.size() < 3) return;
+  const uint32_t addr = pkt.body[0];
+  const uint32_t index = pkt.body[1] & 0xFFFF;   // dword index into the file
+  const uint32_t type = pkt.body[1] >> 16;
+  const uint32_t size_dwords = pkt.body[2];
+
+  static std::map<uint32_t, uint32_t> s_indices;
+  static std::map<uint32_t, uint32_t> s_sizes;
+  ++s_indices[index];
+  ++s_sizes[size_dwords];
+
+  // Do not hardcode 16 — a couple of packets per frame carry 0x20.
+  if (size_dwords == 0 || index >= kAluConstDwords ||
+      index + size_dwords > kAluConstDwords) {
+    static int s_warned = 0;
+    if (s_warned++ < 4) {
+      REXLOG_WARN("alu: LOAD_ALU_CONSTANT index={} size={} type={} out of the "
+                  "512-vec4 file — ignoring", index, size_dwords, type);
+    }
+    return;
+  }
+
+  std::vector<uint8_t> bytes;
+  if (!ReadGuestRange(guest_base, addr, size_dwords * 4, bytes, "alu constants"))
+    return;
+
+  // Guest memory is big-endian and this did not come through the parser's
+  // byteswap.
+  for (uint32_t i = 0; i < size_dwords; ++i) {
+    uint32_t w;
+    std::memcpy(&w, bytes.data() + i * 4, 4);
+    m_aluConsts[index + i] = __builtin_bswap32(w);
+  }
+  m_aluWritten = true;
+
+  static uint32_t s_calls = 0;
+  if (++s_calls <= 6 || (s_calls % 2000) == 0) {
+    std::string ih, sh;
+    for (const auto& [k, n] : s_indices) ih += fmt::format("0x{:X}:{} ", k, n);
+    for (const auto& [k, n] : s_sizes) sh += fmt::format("{}:{} ", k, n);
+    float f[4];
+    for (int i = 0; i < 4; ++i) std::memcpy(&f[i], &m_aluConsts[index + i], 4);
+    REXLOG_INFO("alu: load #{} addr=0x{:08X} index=0x{:X} size={} type={} "
+                "row0=({:.4f} {:.4f} {:.4f} {:.4f}) — indices {}— sizes {}",
+                s_calls, addr, index, size_dwords, type, f[0], f[1], f[2], f[3],
+                ih, sh);
+  }
+}
+
+void Pm4Translator::ProbeAluMatrices(const DrawCall& dc) {
+  // Read-only. The viewport inverse below is the control: it is the transform
+  // the renderer actually uses today, and it is known right for window-space UI
+  // rects and expected wrong for world geometry. If one of the ALU matrices
+  // puts world vertices in [-1,1] where the viewport transform does not, that
+  // identifies both the matrix and its layout in one run.
+  if (!m_aluWritten) return;
+
+  // Wait for the post-load state before sampling. The first version of this
+  // probed the first 10 draws and every candidate matrix read as zeros — the
+  // draws it caught were from the first moments of the run, long before the
+  // game had loaded anything into the constant file. The interesting state
+  // starts around t+40s, so hold off until the ALU file has been written a few
+  // thousand times.
+  static uint32_t s_aluLoads = 0;
+  if (++s_aluLoads < 5000) return;
+
+  if (!m_currentVs || !m_currentVs->ok) return;
+  const VertexAttribute* pos = nullptr;
+  for (const auto& a : m_currentVs->attrs) {
+    if (a.offset_bytes == 0) { pos = &a; break; }
+  }
+  if (!pos) return;
+  // Position is read according to the format the shader declares, not assumed.
+  // The first version only accepted k_32_32_32_FLOAT, which meant every probed
+  // draw was a RectangleList UI quad — the geometry already handled correctly
+  // by the viewport transform, and precisely not the geometry the world matrix
+  // would be for. Half-float positions outnumber float3 six to one here.
+  const bool is_f32 = pos->format == 57;  // k_32_32_32_FLOAT
+  const bool is_f16 = pos->format == 32;  // k_16_16_16_16_FLOAT
+  if (!is_f32 && !is_f16) return;
+  const uint32_t need = is_f32 ? 12u : 8u;
+  if (dc.vertices.empty() || dc.vertex_stride < need || dc.vertex_count == 0)
+    return;
+
+  // Sample a spread of primitive types rather than 10 of whatever comes first,
+  // so a verdict for QuadList is not inferred from RectangleList.
+  static std::map<uint32_t, int> s_perPrim;
+  if (s_perPrim[dc.prim_type] >= 3) return;
+  ++s_perPrim[dc.prim_type];
+  static int s_logged = 0;
+  if (s_logged >= 24) return;
+  ++s_logged;
+
+  // IEEE half -> float. Only needed for the k_16_16_16_16_FLOAT case.
+  auto half_to_float = [](uint16_t h) -> float {
+    const uint32_t sign = uint32_t(h & 0x8000) << 16;
+    uint32_t exp = (h >> 10) & 0x1F;
+    uint32_t man = h & 0x3FF;
+    uint32_t bits;
+    if (exp == 0) {
+      if (man == 0) {
+        bits = sign;  // +-0
+      } else {
+        // Subnormal: renormalise.
+        exp = 1;
+        while (!(man & 0x400)) { man <<= 1; --exp; }
+        man &= 0x3FF;
+        bits = sign | ((exp + 112) << 23) | (man << 13);
+      }
+    } else if (exp == 0x1F) {
+      bits = sign | 0x7F800000u | (man << 13);  // inf / nan
+    } else {
+      bits = sign | ((exp + 112) << 23) | (man << 13);
+    }
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+  };
+
+  auto read_pos = [&](uint32_t v, float out[4]) {
+    const uint8_t* p = dc.vertices.data() + size_t(v) * dc.vertex_stride;
+    out[0] = out[1] = out[2] = 0.0f;
+    out[3] = 1.0f;
+    if (is_f32) {
+      for (uint32_t c = 0; c < 3; ++c) std::memcpy(&out[c], p + c * 4, 4);
+    } else {
+      // 4 halves: x, y, z, w. w is genuinely present in this format, so use it
+      // rather than forcing 1.0 — a pre-projected position would carry it.
+      for (uint32_t c = 0; c < 4; ++c) {
+        uint16_t h;
+        std::memcpy(&h, p + c * 2, 2);
+        out[c] = half_to_float(h);
+      }
+    }
+  };
+
+  // The two constant-file offsets every LOAD_ALU_CONSTANT targets.
+  const uint32_t kCandidates[] = {0x3F0, 0x7F0};
+
+  auto probe = [&](const char* label, const float m[16]) {
+    const uint32_t show = dc.vertex_count < 3 ? dc.vertex_count : 3;
+    uint32_t in_range = 0;
+    std::string line;
+    for (uint32_t v = 0; v < show; ++v) {
+      float in[4];
+      read_pos(v, in);
+      float o[4];
+      for (uint32_t r = 0; r < 4; ++r) {
+        o[r] = m[r * 4 + 0] * in[0] + m[r * 4 + 1] * in[1] +
+               m[r * 4 + 2] * in[2] + m[r * 4 + 3] * in[3];
+      }
+      const bool ok = o[3] > 0.0f && o[0] >= -o[3] && o[0] <= o[3] &&
+                      o[1] >= -o[3] && o[1] <= o[3];
+      if (ok) ++in_range;
+      line += fmt::format("({:.3f} {:.3f} {:.3f} {:.3f}){} ", o[0], o[1], o[2],
+                          o[3], ok ? "*" : "");
+    }
+    REXLOG_INFO("alu probe [{}] prim={} {}-> {}/{} in clip", label, dc.prim_type,
+                line, in_range, show);
+  };
+
+  // Show the source vertices and the raw matrices. Without these a null result
+  // is uninterpretable — "nothing landed in clip" could equally mean the
+  // matrices are zeros, the positions are garbage, or the layout is wrong, and
+  // those want different next steps.
+  {
+    std::string vs;
+    const uint32_t show = dc.vertex_count < 3 ? dc.vertex_count : 3;
+    for (uint32_t v = 0; v < show; ++v) {
+      float in[4];
+      read_pos(v, in);
+      vs += fmt::format("({:.3f} {:.3f} {:.3f} {:.3f}) ", in[0], in[1], in[2],
+                        in[3]);
+    }
+    REXLOG_INFO("alu probe: prim={} stride={} posfmt={} ({}) vtcs={} src {}",
+                dc.prim_type, dc.vertex_stride, pos->format,
+                is_f32 ? "float3" : "half4", dc.vertex_count, vs);
+  }
+
+  for (uint32_t base : kCandidates) {
+    float raw[16];
+    for (int i = 0; i < 16; ++i) std::memcpy(&raw[i], &m_aluConsts[base + i], 4);
+
+    for (int r = 0; r < 4; ++r) {
+      REXLOG_INFO("alu probe:   c0x{:X} row{} = {:.4f} {:.4f} {:.4f} {:.4f}",
+                  base, r, raw[r * 4 + 0], raw[r * 4 + 1], raw[r * 4 + 2],
+                  raw[r * 4 + 3]);
+    }
+
+    // Row-major: constant register N is row N — the layout BuildViewportMvp
+    // already produces, so this is the like-for-like reading.
+    probe(fmt::format("c0x{:X} row-major", base).c_str(), raw);
+
+    // Column-major: constant register N is column N, which is how a D3D-era
+    // shader compiler usually packs a matrix into 4 constants.
+    float t[16];
+    for (int r = 0; r < 4; ++r)
+      for (int c = 0; c < 4; ++c) t[r * 4 + c] = raw[c * 4 + r];
+    probe(fmt::format("c0x{:X} col-major", base).c_str(), t);
+  }
+
+  probe("viewport inverse (control)", dc.mvp);
+}
+
+void Pm4Translator::LogStrideComparison(const DrawCall& dc,
+                                        uint32_t heuristic_stride,
+                                        uint32_t heuristic_slot) {
+  // Counters are cumulative across the run and dumped periodically; the
+  // per-draw lines are capped. ~46000 draws per run go through here.
+  static uint64_t s_agree = 0, s_disagree = 0, s_noShader = 0, s_noAttrs = 0;
+  static uint64_t s_slotMiss = 0;
+  static std::map<uint32_t, uint32_t> s_vfetchStrides;
+  static std::map<uint32_t, uint32_t> s_posFormats;
+  static int s_logged = 0;
+
+  if (!m_currentVs || !m_currentVs->ok) { ++s_noShader; return; }
+  if (m_currentVs->attrs.empty()) { ++s_noAttrs; return; }
+
+  // Prefer the attribute group the heuristic actually picked a slot for; a
+  // shader can fetch from several slots with different strides, and comparing
+  // against the wrong one would manufacture disagreement.
+  const VertexAttribute* match = nullptr;
+  for (const auto& a : m_currentVs->attrs) {
+    if (a.fetch_slot == heuristic_slot) { match = &a; break; }
+  }
+  const bool slot_matched = match != nullptr;
+  if (!match) {
+    ++s_slotMiss;
+    match = &m_currentVs->attrs[0];
+  }
+
+  const uint32_t vfetch_stride = match->stride_bytes;
+  ++s_vfetchStrides[vfetch_stride];
+
+  // Position is the attribute at offset 0 with a float format — NOT the one in
+  // dest_reg 0. Both ground-truth shaders put position in dest_reg 1 and the
+  // second attribute in dest_reg 0.
+  for (const auto& a : m_currentVs->attrs) {
+    if (a.offset_bytes == 0) { ++s_posFormats[a.format]; break; }
+  }
+
+  const bool agree = vfetch_stride == heuristic_stride;
+  if (agree) ++s_agree; else ++s_disagree;
+
+  // Split the verdict by whether the slot matched. A slot miss means we are
+  // comparing the heuristic against attrs[0] — some other slot's stride — so
+  // those disagreements are an artifact of the comparison, not evidence the
+  // decoder is wrong. Reporting one number over both would overstate the
+  // disagreement.
+  static uint64_t s_agreeMatched = 0, s_disagreeMatched = 0;
+  static uint64_t s_agreeMissed = 0, s_disagreeMissed = 0;
+  if (slot_matched) {
+    if (agree) ++s_agreeMatched; else ++s_disagreeMatched;
+  } else {
+    if (agree) ++s_agreeMissed; else ++s_disagreeMissed;
+  }
+  // Which (heuristic, vfetch) pairs actually disagree, for the slot-matched
+  // cases only — that is the population that says something about the decoder.
+  static std::map<uint64_t, uint32_t> s_disagreePairs;
+  if (!agree && slot_matched)
+    ++s_disagreePairs[(uint64_t(heuristic_stride) << 32) | vfetch_stride];
+
+  if (s_logged < 30) {
+    ++s_logged;
+    REXLOG_INFO("translator: stride heuristic={} vfetch={} slot h={} v={}{} "
+                "prim={} fmt={} vtcs={} {}",
+                heuristic_stride, vfetch_stride, heuristic_slot,
+                match->fetch_slot, slot_matched ? "" : " (SLOT MISS)",
+                dc.prim_type, match->format, dc.vertex_count,
+                agree ? "AGREE" : "DISAGREE");
+  }
+
+  static uint64_t s_total = 0;
+  if ((++s_total % 5000) == 0) {
+    std::string sh;
+    for (const auto& [s, n] : s_vfetchStrides) sh += fmt::format("{}:{} ", s, n);
+    std::string pf;
+    for (const auto& [f, n] : s_posFormats) pf += fmt::format("{}:{} ", f, n);
+    std::string dp;
+    for (const auto& [k, n] : s_disagreePairs)
+      dp += fmt::format("h{}/v{}:{} ", uint32_t(k >> 32), uint32_t(k), n);
+    REXLOG_INFO("translator: STRIDE agree={} disagree={} (no shader {}, no "
+                "attrs {}) — slot MATCHED agree={} disagree={} — slot MISSED "
+                "agree={} disagree={} — vfetch strides {}— pos formats {}— "
+                "disagreeing pairs (slot-matched only) {}",
+                s_agree, s_disagree, s_noShader, s_noAttrs,
+                s_agreeMatched, s_disagreeMatched, s_agreeMissed,
+                s_disagreeMissed, sh, pf, dp.empty() ? "none " : dp);
+  }
+}
+
 void Pm4Translator::AttachVertices(DrawCall& dc, uint8_t* guest_base) {
   auto fetches = CollectVertexFetches(dc.vertex_count);
 
@@ -345,6 +746,16 @@ void Pm4Translator::AttachVertices(DrawCall& dc, uint8_t* guest_base) {
     REXLOG_INFO("translator: vfetch AMBIGUOUS — {} slots validated, took slot {}",
                 accepted, pick->slot);
   }
+
+  // Measure the guess against the shader's own answer. Deliberately placed
+  // before the size check and the read below, so draws that go on to be
+  // rejected still contribute to the histogram — those are exactly the
+  // populations (strides 12, 16, 20, 36) the heuristic never gets validated on.
+  //
+  // Nothing below this line consumes the decoded stride. dc.vertex_stride is
+  // still pick->stride, the division guess, and the renderer's stride-28 gate
+  // sees exactly what it saw before. That is the point: this round measures.
+  LogStrideComparison(dc, pick->stride, pick->slot);
 
   const uint32_t bytes = dc.vertex_count * pick->stride;
   if (bytes > pick->size_bytes) return;
@@ -442,6 +853,7 @@ void Pm4Translator::FinalizeDraw(DrawCall& dc) {
 
   LogSurface(dc);
   LogNdc(dc);
+  ProbeAluMatrices(dc);
 }
 
 // Read-only probe. Nothing about which guest surface a draw targets reaches the
@@ -844,6 +1256,20 @@ void Pm4Translator::TranslatePackets(const std::vector<Pm4Packet>& packets,
       // ---- State-setting opcodes (vertex & shader constants) ----
       case 0x2D: HandleSetConstant(pkt);            break;            // SET_CONSTANT
       case 0x56: HandleSetShaderConstants(pkt);      break;            // SET_SHADER_CONSTANTS
+
+      // ---- Shader microcode ----
+      // Both carry the vertex layout — the stride and formats the fetch
+      // constant does not hold. Read-only this round: they update m_currentVs
+      // and nothing else. Until now 0x2B was not even named and 0x27 fell
+      // through the default below.
+      case 0x2B: HandleImLoadImmediate(pkt);          break;           // IM_LOAD_IMMEDIATE
+      case 0x27: HandleImLoad(pkt, guest_base);        break;           // IM_LOAD
+
+      // ---- ALU constants ----
+      // The door this game actually uses. 271/frame post-load, 0 at boot; it
+      // emits no SET_CONSTANT at all, which is why the ALU file looked empty
+      // and the MVP was zero. Shadowed and probed, not yet consumed.
+      case 0x2F: HandleLoadAluConstant(pkt, guest_base); break;         // LOAD_ALU_CONSTANT
 
       // ---- Binning control opcodes (legacy-alias opcode names fixed) ----
       case 0x60: HandleBinMaskLo(pkt);    break;                       // SET_BIN_MASK_LO
