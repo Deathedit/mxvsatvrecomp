@@ -2,17 +2,37 @@
 //
 // The game PSO takes a position+color vertex layout with an MVP constant
 // buffer. It draws either the placeholder triangle baked in by
-// CreateGamePipeline, or, once SetGameDrawData has been fed a translated PM4
-// draw, the guest's own vertex/index data. Geometry renders into a dedicated
-// 1280x720 render target + D32 depth buffer, which PresentGameFrame copies to
-// the current swapchain backbuffer.
+// CreateGamePipeline, or, once AddGameDraw has been fed translated PM4 draws,
+// the guest's own vertex/index data — every draw the frame produced, each with
+// its own transform and topology. Geometry renders into a dedicated 1280x720
+// render target + D32 depth buffer, which PresentGameFrame copies to the
+// current swapchain backbuffer.
+//
+// Note the PSO leaves DepthStencilState zeroed and DSVFormat unset, so depth
+// test is off. Guest geometry at z = 1.0 is not rejected.
 
 #include "gfx/d3d12_renderer.h"
 
 #include "gfx/d3d12_internal.h"
 #include "gfx/d3d12_shaders.h"
+#include "gpu/pm4_translator.h"
 
 #include <cstring>
+#include <utility>
+
+// mx::pm4::HostTopology carries D3D_PRIMITIVE_TOPOLOGY values so the translator
+// need not include <d3dcommon.h>. That only holds while these agree.
+static_assert(static_cast<int>(mx::pm4::HostTopology::kPointList) ==
+                  D3D_PRIMITIVE_TOPOLOGY_POINTLIST &&
+              static_cast<int>(mx::pm4::HostTopology::kLineList) ==
+                  D3D_PRIMITIVE_TOPOLOGY_LINELIST &&
+              static_cast<int>(mx::pm4::HostTopology::kLineStrip) ==
+                  D3D_PRIMITIVE_TOPOLOGY_LINESTRIP &&
+              static_cast<int>(mx::pm4::HostTopology::kTriangleList) ==
+                  D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST &&
+              static_cast<int>(mx::pm4::HostTopology::kTriangleStrip) ==
+                  D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
+              "HostTopology has drifted from D3D_PRIMITIVE_TOPOLOGY");
 
 using mx::gfx::CompileShader;
 using mx::gfx::LogError;
@@ -195,39 +215,54 @@ void D3D12Renderer::RenderGameFrame() {
 
   ID3D12DescriptorHeap* heaps[] = {m_gameCbvHeap.Get()};
   m_commandList->SetDescriptorHeaps(1, heaps);
-  // A translated draw brings its own transform in m_gameDrawCB; the placeholder
-  // triangle uses the identity matrix in m_gameCB.
-  ID3D12Resource* cb = (m_hasGameDrawData && m_gameDrawCB) ? m_gameDrawCB.Get()
-                                                           : m_gameCB.Get();
-  m_commandList->SetGraphicsRootConstantBufferView(0, cb->GetGPUVirtualAddress());
 
-  m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-
-  if (m_hasGameDrawData) {
-    m_commandList->IASetVertexBuffers(0, 1, &m_gameDrawVbv);
-    m_commandList->IASetIndexBuffer(&m_gameDrawIbv);
-    m_commandList->DrawIndexedInstanced(m_gameDrawIndexCount, 1, 0, 0, 0);
-  } else {
+  if (m_gameDraws.empty()) {
+    // Placeholder triangle, under the identity matrix in m_gameCB.
+    m_commandList->SetGraphicsRootConstantBufferView(
+        0, m_gameCB->GetGPUVirtualAddress());
+    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     m_commandList->IASetVertexBuffers(0, 1, &m_gameVbv);
     m_commandList->IASetIndexBuffer(&m_gameIbv);
     m_commandList->DrawIndexedInstanced(m_gameIndexCount, 1, 0, 0, 0);
+    return;
+  }
+
+  for (const auto& d : m_gameDraws) {
+    // Each translated draw brings its own transform; a draw whose cb failed to
+    // allocate falls back to the identity matrix rather than being dropped.
+    ID3D12Resource* cb = d.cb ? d.cb.Get() : m_gameCB.Get();
+    m_commandList->SetGraphicsRootConstantBufferView(0,
+                                                     cb->GetGPUVirtualAddress());
+    m_commandList->IASetPrimitiveTopology(d.topology);
+    m_commandList->IASetVertexBuffers(0, 1, &d.vbv);
+    m_commandList->IASetIndexBuffer(&d.ibv);
+    m_commandList->DrawIndexedInstanced(d.indexCount, 1, 0, 0, 0);
   }
 }
 
-void D3D12Renderer::SetGameDrawData(const uint8_t* vertices, uint32_t vtxBytes,
-                                     uint32_t vtxStride, const uint8_t* indices,
-                                     uint32_t idxBytes, bool idx16,
-                                     uint32_t idxCount, const float* mvp) {
-  // PERF(per-frame-allocs): this currently creates two ID3D12Resource's per
-  // call (VB + IB) on the UPLOAD heap. Correctness is fine — old COM refs are
-  // dropped via Reset() and D3D12's internal command-list tracking keeps the
-  // underlying memory alive until the GPU finishes the last command using it
-  // — but at 60fps this is ~120 CreateCommittedResource calls/sec. The proper
-  // fix is a ring of N upload buffers (one per kFrameCount slot in flight),
-  // recycled after MoveToNextFrame's fence sync. Deferred until the perf
-  // budget matters; same TODO applies to UploadVideoFrame's m_videoUploadBuffer.
-  if (!vertices || !indices || vtxBytes == 0 || idxBytes == 0) {
-    m_hasGameDrawData = false;
+void D3D12Renderer::ClearGameDraws() { m_gameDraws.clear(); }
+
+void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
+                                 uint32_t vtxStride, const uint8_t* indices,
+                                 uint32_t idxBytes, bool idx16,
+                                 uint32_t idxCount, const float* mvp,
+                                 uint32_t topology) {
+  // PERF(per-frame-allocs): this creates three ID3D12Resource's per call (VB +
+  // IB + CB) on the UPLOAD heap, and is now called once per submitted draw
+  // rather than once per frame. Correctness is fine — the ComPtrs live in
+  // m_gameDraws until ClearGameDraws, and D3D12's internal command-list
+  // tracking keeps the underlying memory alive until the GPU finishes the last
+  // command using it — but the allocation rate now scales with the draw count,
+  // which is why kMaxGameDraws caps it. The proper fix is a ring of upload
+  // buffers recycled after MoveToNextFrame's fence sync. Same TODO applies to
+  // UploadVideoFrame's m_videoUploadBuffer.
+  if (!vertices || !indices || vtxBytes == 0 || idxBytes == 0) return;
+  if (m_gameDraws.size() >= kMaxGameDraws) {
+    static bool s_logged = false;
+    if (!s_logged) {
+      s_logged = true;
+      LogInfo("AddGameDraw: hit the per-frame draw cap, dropping the rest");
+    }
     return;
   }
 
@@ -246,53 +281,45 @@ void D3D12Renderer::SetGameDrawData(const uint8_t* vertices, uint32_t vtxBytes,
         nullptr, IID_PPV_ARGS(&buf)));
   };
 
-  if (!createBuffer(m_gameDrawVB, vtxBytes)) {
-    m_hasGameDrawData = false;
-    return;
-  }
-  void* vtxMap = nullptr;
-  if (FAILED(m_gameDrawVB->Map(0, nullptr, &vtxMap))) {
-    m_hasGameDrawData = false;
-    return;
-  }
-  memcpy(vtxMap, vertices, vtxBytes);
-  m_gameDrawVB->Unmap(0, nullptr);
-  m_gameDrawVbv.BufferLocation = m_gameDrawVB->GetGPUVirtualAddress();
-  m_gameDrawVbv.StrideInBytes = vtxStride;
-  m_gameDrawVbv.SizeInBytes = vtxBytes;
+  // Built locally and only appended once complete, so a partial failure leaves
+  // the frame's list untouched rather than half-populated.
+  GameDraw d;
 
-  if (!createBuffer(m_gameDrawIB, idxBytes)) {
-    m_hasGameDrawData = false;
-    return;
-  }
+  if (!createBuffer(d.vb, vtxBytes)) return;
+  void* vtxMap = nullptr;
+  if (FAILED(d.vb->Map(0, nullptr, &vtxMap))) return;
+  memcpy(vtxMap, vertices, vtxBytes);
+  d.vb->Unmap(0, nullptr);
+  d.vbv.BufferLocation = d.vb->GetGPUVirtualAddress();
+  d.vbv.StrideInBytes = vtxStride;
+  d.vbv.SizeInBytes = vtxBytes;
+
+  if (!createBuffer(d.ib, idxBytes)) return;
   void* idxMap = nullptr;
-  if (FAILED(m_gameDrawIB->Map(0, nullptr, &idxMap))) {
-    m_hasGameDrawData = false;
-    return;
-  }
+  if (FAILED(d.ib->Map(0, nullptr, &idxMap))) return;
   memcpy(idxMap, indices, idxBytes);
-  m_gameDrawIB->Unmap(0, nullptr);
-  m_gameDrawIbv.BufferLocation = m_gameDrawIB->GetGPUVirtualAddress();
-  m_gameDrawIbv.Format = idx16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
-  m_gameDrawIbv.SizeInBytes = idxBytes;
-  m_gameDrawIndexCount = idxCount;
+  d.ib->Unmap(0, nullptr);
+  d.ibv.BufferLocation = d.ib->GetGPUVirtualAddress();
+  d.ibv.Format = idx16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
+  d.ibv.SizeInBytes = idxBytes;
+  d.indexCount = idxCount;
+  d.topology = static_cast<D3D12_PRIMITIVE_TOPOLOGY>(topology);
 
   // Carry the translator's transform. Without this the draw renders under the
-  // identity matrix baked into m_gameCB, which makes a correct translation and
-  // a broken one look identical on screen. A fresh 256B buffer per call for the
-  // same in-flight reason as the VB/IB above; a null mvp falls back to m_gameCB.
-  m_gameDrawCB.Reset();
-  if (mvp && createBuffer(m_gameDrawCB, 256)) {
+  // identity matrix baked into m_gameCB, which makes a correct transform and a
+  // broken one look identical on screen. A null mvp, or a CB that fails to
+  // allocate, falls back to that identity rather than dropping the draw.
+  if (mvp && createBuffer(d.cb, 256)) {
     void* cbMap = nullptr;
-    if (SUCCEEDED(m_gameDrawCB->Map(0, nullptr, &cbMap))) {
+    if (SUCCEEDED(d.cb->Map(0, nullptr, &cbMap))) {
       memcpy(cbMap, mvp, 16 * sizeof(float));
-      m_gameDrawCB->Unmap(0, nullptr);
+      d.cb->Unmap(0, nullptr);
     } else {
-      m_gameDrawCB.Reset();
+      d.cb.Reset();
     }
   }
 
-  m_hasGameDrawData = true;
+  m_gameDraws.push_back(std::move(d));
 }
 
 bool D3D12Renderer::CreateGameRenderTargets() {

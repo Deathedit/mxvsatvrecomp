@@ -9,15 +9,32 @@
 namespace mx::pm4 {
 
 // Mimics PrimitiveType from xenos.h (subset — only values seen in MX vs ATV).
+// Fan is 5 and strip is 6, per Xenia's xenos::PrimitiveType. This enum had them
+// the other way round until 2026-08-02, which would have drawn every fan as a
+// strip once topology started being honoured.
 enum class PrimitiveType : uint8_t {
   kPointList        = 0x01,
   kLineList         = 0x02,
   kLineStrip        = 0x03,
   kTriangleList    = 0x04,
-  kTriangleStrip   = 0x05,
-  kTriangleFan     = 0x06,
+  kTriangleFan     = 0x05,
+  kTriangleStrip   = 0x06,
   kRectangleList   = 0x08,
   kUnknown         = 0xFF,
+};
+
+// Host topology, carried on DrawCall so the renderer stays a dumb consumer.
+// The values are deliberately the D3D_PRIMITIVE_TOPOLOGY ones so the renderer
+// can cast rather than translate; d3d12_game.cpp static_asserts that they still
+// match. Declaring them here rather than including <d3dcommon.h> keeps this
+// header usable from translator_test.cpp.
+enum class HostTopology : uint32_t {
+  kUndefined     = 0,
+  kPointList     = 1,
+  kLineList      = 2,
+  kLineStrip     = 3,
+  kTriangleList  = 4,
+  kTriangleStrip = 5,
 };
 
 struct DrawCall {
@@ -27,6 +44,7 @@ struct DrawCall {
   uint32_t index_count = 0;
   uint32_t vertex_stride = 0;
   uint32_t prim_type = 0;            // xenos::PrimitiveType (raw 6-bit value)
+  HostTopology topology = HostTopology::kUndefined;  // mapped from prim_type
   bool index_16bit = true;
   bool binned = false;                // true for DRAW_INDX_*_BIN variants
   float mvp[16] = {};
@@ -44,6 +62,8 @@ class Pm4Translator {
   void Clear() {
     m_drawCalls.clear();
     std::memset(m_fetchConsts, 0, sizeof(m_fetchConsts));
+    std::memset(m_ctxRegs, 0, sizeof(m_ctxRegs));
+    m_ctxWritten = false;
     m_vtxBufAddr = 0;
     m_vtxStride = 0;
     m_indexType16 = true;
@@ -77,11 +97,59 @@ class Pm4Translator {
   // body[0] = base index (16-bit), body[1..] = float4 constants.
   void HandleSetShaderConstants(const Pm4Packet& pkt);
 
-  // Type0 writes into 0x4800..0x48BF — the 192-dword shader fetch constant
-  // file. This game sets its vertex fetch constants here and never emits a
+  // Type0 writes feed two shadows: the shader fetch constant file at
+  // 0x4800..0x48BF, and the context register block at 0x2000..0x2FFF. This game
+  // sets its vertex fetch constants in the former and never emits a
   // SET_CONSTANT (0x2D) at all, so without this the translator never learns a
-  // vertex buffer address and every draw comes out with no vertices.
+  // vertex buffer address and every draw comes out with no vertices. The latter
+  // carries the viewport registers BuildViewportMvp reads. A write is clipped
+  // independently against each file.
   void ApplyType0Write(uint32_t reg_base, const std::vector<uint32_t>& body);
+
+  // Read a shadowed context register as a float. Returns `fallback` when the
+  // block has never been written.
+  float CtxFloat(uint32_t reg, float fallback) const;
+
+  // Build the window-space -> NDC matrix from PA_CL_VPORT_*. The guest's
+  // vertices are already in window coordinates, so what we want is the inverse
+  // of the hardware viewport transform `window = ndc * SCALE + OFFSET`:
+  //
+  //   row0 = [1/XSCALE, 0,        0,        -XOFFSET/XSCALE]
+  //   row1 = [0,        1/YSCALE, 0,        -YOFFSET/YSCALE]
+  //   row2 = [0,        0,        1/ZSCALE, -ZOFFSET/ZSCALE]
+  //   row3 = [0,        0,        0,        1              ]
+  //
+  // YSCALE is negative in every frame observed, and that negation is what flips
+  // window-y-down to NDC-y-up — there is no second flip anywhere. Falls back to
+  // identity (and logs once) when a scale is zero or the block is unwritten,
+  // rather than emitting NaNs into a constant buffer.
+  //
+  // Row-major. kGameVS declares its cbuffer matrix `row_major` to match; HLSL
+  // would otherwise pack a float4x4 column-major and silently transpose this.
+  void BuildViewportMvp(float out[16]) const;
+
+  // Map the raw 6-bit prim_type to a host topology. kUndefined means the
+  // renderer must drop the draw — RectangleList maps to kUndefined here because
+  // it is not a topology but an expansion, handled by ExpandRectangleList.
+  static HostTopology MapTopology(uint32_t prim_type);
+
+  // Rewrite a RectangleList draw into a triangle list in place. D3D12 has no
+  // rectangle topology. Each group of 3 vertices is a rectangle whose implied
+  // 4th corner is v3 = v0 + v2 - v1; the synthesized vertex takes that
+  // arithmetic on the leading 3 floats and copies its remaining bytes from v2.
+  // Returns the number of rectangles expanded, 0 if the draw could not be.
+  uint32_t ExpandRectangleList(DrawCall& dc) const;
+
+  // Everything a draw needs once its vertices and indices are in place:
+  // topology, the viewport transform, RectangleList expansion, and the NDC log.
+  // Called by all three draw paths so none of them can drift.
+  void FinalizeDraw(DrawCall& dc);
+
+  // Transform the first few vertices by dc.mvp and log the result. This is the
+  // instrument that separates "the transform is wrong" from "the D3D12 state is
+  // wrong": positions inside [-1,1] mean the matrix is right whatever the
+  // screen shows.
+  void LogNdc(const DrawCall& dc) const;
 
   // One vertex fetch slot, decoded from a dword pair in the fetch file.
   struct VertexFetch {
@@ -127,6 +195,21 @@ class Pm4Translator {
   static constexpr uint32_t kStrideMin = 8;
   static constexpr uint32_t kStrideMax = 64;
   uint32_t m_fetchConsts[kFetchConstCount] = {};
+
+  // Context register block 0x2000..0x2FFF. 16KB, shadowed wholesale rather than
+  // cherry-picked because the interesting registers keep turning out to be ones
+  // we had not thought to keep.
+  static constexpr uint32_t kCtxRegBase = 0x2000;
+  static constexpr uint32_t kCtxRegCount = 0x1000;
+  // PA_CL_VPORT_* — the tail of the cnt=21 Type0 write to 0x2100.
+  static constexpr uint32_t kRegVportXScale  = 0x210F;
+  static constexpr uint32_t kRegVportXOffset = 0x2110;
+  static constexpr uint32_t kRegVportYScale  = 0x2111;
+  static constexpr uint32_t kRegVportYOffset = 0x2112;
+  static constexpr uint32_t kRegVportZScale  = 0x2113;
+  static constexpr uint32_t kRegVportZOffset = 0x2114;
+  uint32_t m_ctxRegs[kCtxRegCount] = {};
+  bool m_ctxWritten = false;
 
   uint32_t m_vtxBufAddr = 0;
   uint32_t m_vtxStride = 0;

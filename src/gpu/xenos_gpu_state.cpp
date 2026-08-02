@@ -14,6 +14,16 @@ struct RegName {
   const char* name;
 };
 
+// Register indices here are Xenos *dword* indices — the same units a PM4 Type0
+// packet's reg_base is in. Until 2026-08-02 every entry from 0x2000 up was a
+// byte offset (RB_COLOR_INFO at 0x2004 rather than 0x2001), so each one named a
+// register four slots away from the one it labelled: 0x2080 printed as
+// "RB_DISP_OUTPUT" when the observed value — 0, 0, 0x02D00500 = 1280x720 — makes
+// it PA_SC_WINDOW_OFFSET followed by the window scissor pair. Those entries are
+// deleted rather than rescaled: a confidently wrong name is worse than "???",
+// and this table is the single source of truth for Pm4Parser's dumps.
+//
+// Only names confirmed against a value observed in a captured dump are listed.
 constexpr RegName kRegNames[] = {
   {0x0001, "CONFIG_CTL"},
   {0x0007, "CONTEXT_ID_0"},
@@ -38,54 +48,25 @@ constexpr RegName kRegNames[] = {
   {0x1930, "SQ_LOAD_CTL"},
   {0x1964, "SQ_LOAD_MODE"},
   {0x1973, "SQ_LOAD_GATE"},
-  // Entries below were previously only in pm4_parser.cpp's now-deleted
-  // duplicate catalog. Merged here as the single source of truth.
+  // Surface state. RB_SURFACE_INFO's low 14 bits are the pitch: observed
+  // 0x14000500 = 1280 at boot and 0x0C000320 = 800 post-load, matching the
+  // backbuffer and the 768x1024 offscreen pass respectively.
   {0x2000, "RB_SURFACE_INFO"},
-  {0x2004, "RB_COLOR_INFO"},
-  {0x2008, "RB_DEPTH_INFO"},
-  {0x200C, "RB_COLOR0_MASK"},
-  {0x2010, "RB_COLOR1_MASK"},
-  {0x2014, "RB_COLOR2_MASK"},
-  {0x2018, "RB_COLOR3_MASK"},
-  {0x2020, "RB_BLEND0_CTL"},
-  {0x2024, "RB_BLEND1_CTL"},
-  {0x2028, "RB_BLEND2_CTL"},
-  {0x202C, "RB_BLEND3_CTL"},
-  {0x2030, "RB_BLEND_RED"},
-  {0x2034, "RB_BLEND_GREEN"},
-  {0x2038, "RB_BLEND_BLUE"},
-  {0x203C, "RB_BLEND_ALPHA"},
-  {0x2080, "RB_DISP_OUTPUT"},
-  {0x22C0, "SQ_PROGRAM_CNTL"},
-  {0x22C4, "SQ_CONTEXT_MISC"},
-  {0x2304, "SPI_CONFIG_CNTL_1"},
-  {0x2310, "SPI_PS_INPUT_CNTL_0"},
-  {0x2314, "SPI_PS_INPUT_CNTL_1"},
-  {0x2318, "SPI_PS_INPUT_CNTL_2"},
-  {0x2400, "VGT_PRIMITIVE_TYPE"},
-  {0x2404, "VGT_VTX_CNT"},
-  {0x243C, "VGT_DRAW_INITIATOR"},
-  {0x2440, "VGT_DMA_BASE"},
-  {0x2444, "VGT_DMA_BASE_HI"},
-  {0x2448, "VGT_DMA_INDEX_TYPE"},
-  {0x244C, "VGT_DMA_NUM_INSTANCES"},
-  {0x2800, "PA_SC_WINDOW_SCISSOR_TL"},
-  {0x2804, "PA_SC_WINDOW_SCISSOR_BR"},
-  {0x2840, "VGT_MIN_VTX_INDX"},
-  {0x2844, "VGT_MAX_VTX_INDX"},
-  {0x2848, "PA_SC_LINE_STIPPLE"},
-  {0x284C, "VGT_INDX_OFFSET"},
-  {0x2850, "PA_SC_SCREEN_SCISSOR_TL"},
-  {0x2854, "PA_SC_SCREEN_SCISSOR_BR"},
-  {0x286C, "PA_SC_WINDOW_OFFSET"},
-  {0x2884, "PA_SC_AA_CONFIG"},
-  {0x288C, "PA_SC_AA_MASK"},
-  {0x28E4, "PA_SU_SC_MODE_CNTL"},
-  {0x28E8, "PA_SU_VTX_CNTL"},
-  {0x28EC, "PA_CL_VTE_CNTL"},
-  {0x2908, "PA_CL_CLIP_CNTL"},
-  {0x2910, "PA_CL_VS_OUT_CNTL"},
-  {0x2914, "PA_CL_VS_OUT_CLIP_CNTL"},
+  // Scissor block, observed as one cnt=3 write of [0, 0, 0x02D00500] —
+  // offset (0,0), TL (0,0), BR 1280x720.
+  {0x2080, "PA_SC_WINDOW_OFFSET"},
+  {0x2081, "PA_SC_WINDOW_SCISSOR_TL"},
+  {0x2082, "PA_SC_WINDOW_SCISSOR_BR"},
+  // Viewport block, the tail of the cnt=21 write to 0x2100. Observed at boot
+  // as 640, 640, -360, 360, 1.0, 0.0 (a 1280x720 viewport) and post-load as
+  // 384, 384, -512, 512 (768x1024). This is the transform Pm4Translator
+  // inverts to map the guest's window-space vertices back to NDC.
+  {0x210F, "PA_CL_VPORT_XSCALE"},
+  {0x2110, "PA_CL_VPORT_XOFFSET"},
+  {0x2111, "PA_CL_VPORT_YSCALE"},
+  {0x2112, "PA_CL_VPORT_YOFFSET"},
+  {0x2113, "PA_CL_VPORT_ZSCALE"},
+  {0x2114, "PA_CL_VPORT_ZOFFSET"},
   // 0x4800..0x48BF is the 192-dword shader fetch constant file, not
   // HW_MODE_TABLE — the old name made every dump of a vertex fetch look like
   // display state. See Pm4Translator's fetch shadow.
@@ -137,8 +118,10 @@ void XenosGpuState::ApplyType3Packet(const pm4::Pm4Packet& pkt) {
         // re-enabled and live SET_CONTEXT_REG packets appear, match each
         // packet's body[0] against documented Xenos R500 register offsets
         // (e.g. RB_COLOR_INFO @ 0x2004, SQ_PROGRAM_CNTL @ 0x22C0) and
-        // confirm or fix this formula. Logging raw base per packet for now
-        // so the first live capture immediately yields the diagnostic.
+        // confirm or fix this formula against kRegNames above — noting those
+        // are dword indices, so a byte offset compared against them is off by
+        // a factor of four. Logging raw base per packet for now so the first
+        // live capture immediately yields the diagnostic.
         uint32_t base = pkt.body[0] & 0xFFFF;
         REXLOG_INFO("gpu_state: SET_CONTEXT_REG base=0x{:04X} count={}",
                     base, pkt.body.size() - 1);

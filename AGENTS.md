@@ -70,13 +70,13 @@ video), `gpu/` (Xenos PM4 understanding), `hooks/` (guest function hooks).
 | `src/gfx/d3d12_renderer.h` | `D3D12Renderer` interface — implemented across the three `.cpp` below |
 | `src/gfx/d3d12_device.cpp` | Device, adapter, swapchain, RTVs, command list/allocators, fence, BeginFrame/EndFrame |
 | `src/gfx/d3d12_video.cpp` | Video pipeline: fullscreen quad + texture sample, Bink frame upload |
-| `src/gfx/d3d12_game.cpp` | Game pipeline (triangle PSO / translated draws), game RT + depth, PresentGameFrame copy |
+| `src/gfx/d3d12_game.cpp` | Game pipeline (triangle PSO / translated draws), the per-frame `m_gameDraws` list, game RT + depth, PresentGameFrame copy |
 | `src/gfx/d3d12_shaders.h` | HLSL source for both pipelines |
 | `src/gfx/d3d12_internal.h` | LogError/LogInfo/CompileShader shared by the three gfx TUs (internal) |
 | `src/gfx/bink_player.h/.cpp` | FFmpeg Bink video + audio decoder |
 | **gpu** | |
 | `src/gpu/pm4_parser.h/.cpp` | PM4 command buffer parser: Type-0/2/3 decode, 30 opcodes, 65 reg names, ring wrap, dump |
-| `src/gpu/pm4_translator.h/.cpp` | PM4 -> `DrawCall` translation. Shadows the fetch constant file (0x4800..0x48BF) from Type0 writes, infers vertex stride, reads buffers through the physical-address aliasing windows |
+| `src/gpu/pm4_translator.h/.cpp` | PM4 -> `DrawCall` translation. Shadows the fetch constant file (0x4800..0x48BF) and the context registers (0x2000..0x2FFF) from Type0 writes, infers vertex stride, reads buffers through the physical-address aliasing windows, builds the viewport transform, expands RectangleList |
 | `src/gpu/xenos_gpu_state.h/.cpp` | Xenos GPU register shadow: 66 named registers, ApplyType0Write, ApplyType3Packet, Snapshot/DumpDiff |
 | **hooks** | |
 | `src/hooks/native_bridge.h/.cpp` | `NativeGraphics` singleton (guest mem base, renderer ptr, draw-call queue) + `g_plugin_mode` |
@@ -519,6 +519,126 @@ Open, and deliberately not chased in that round:
   (0x27, 363/frame) and `IM_LOAD_IMMEDIATE` (0x2B, 70/frame) carry the `vfetch`
   instructions. That is a disassembler and a round of its own.
 
+#### The zero matrix, and the guest's own viewport (2026-08-02)
+
+With vertex data resolved, nothing still reached the screen. The cause was not
+the vertex data and not a bad guess about the transform — **there was no
+transform**. `Pm4Translator::m_mvp` was written in exactly two places,
+`HandleSetConstant` (`SET_CONSTANT` 0x2D type=0) and `HandleSetShaderConstants`
+(0x56). Neither opcode occurs in any captured frame, and no Type0 write anywhere
+in the dumps touches `0x4000..0x41FF`, the ALU float constant file. So `m_mvp`
+was **identically zero**, memcpy'd into every `DrawCall`, bound in preference to
+the identity fallback, and multiplied into every vertex by `kGameVS`. Every
+translated vertex collapsed to the origin. No vertex data, however correct, could
+have produced a pixel.
+
+Every earlier note reading "geometry is off-screen, the MVP guess is the first
+suspect" is **void** on that basis — the matrix was not a guess that happened to
+be wrong, it was zero.
+
+**The replacement is read from the guest, not inferred.** The viewport registers
+arrive in every frame as the tail of a cnt=21 Type0 write to `0x2100`:
+
+| index | register | boot | post-load |
+|---|---|---|---|
+| `0x210F` | `PA_CL_VPORT_XSCALE` | 640 | 384 |
+| `0x2110` | `PA_CL_VPORT_XOFFSET` | 640 | 384 |
+| `0x2111` | `PA_CL_VPORT_YSCALE` | -360 | -512 |
+| `0x2112` | `PA_CL_VPORT_YOFFSET` | 360 | 512 |
+| `0x2113` | `PA_CL_VPORT_ZSCALE` | 1.0 | 1.0 |
+| `0x2114` | `PA_CL_VPORT_ZOFFSET` | 0.0 | 0.0 |
+
+1280x720 and a 768x1024 offscreen pass. `PA_SC_WINDOW_SCISSOR_BR` at `0x2082`
+independently reads `0x02D00500` = 1280x720, and `RB_SURFACE_INFO` at `0x2000`
+carries pitch 1280 / 800. Three registers agree.
+
+The guest's vertices are already in window coordinates, so the transform is the
+**inverse** of `window = ndc * SCALE + OFFSET`. `BuildViewportMvp` builds it
+row-major; `kGameVS` declares its cbuffer matrix `row_major` to match, because
+HLSL packs a cbuffer `float4x4` column-major by default and would otherwise
+transpose it silently. `YSCALE` is negative and that negation is the only thing
+flipping window-y-down to NDC-y-up — there is no second flip.
+
+`Pm4Translator` now shadows the whole context register block `0x2000..0x2FFF`
+alongside the fetch constant file, both fed from Type0 writes.
+
+**The register name table was scaled wrong.** `xenos_gpu_state.cpp`'s `kRegNames`
+used byte offsets from `0x2000` up where PM4 Type0 `reg_base` is a *dword* index,
+so every entry named a register four slots from the one it labelled — `0x2080`
+printed as `RB_DISP_OUTPUT` when its observed value makes it
+`PA_SC_WINDOW_OFFSET`. This is why almost every Type0 line in every dump read
+`???`. Those entries are deleted rather than rescaled; only names confirmed
+against an observed value remain.
+
+**Topology.** `prim_type` was parsed and then discarded — the renderer hardcoded
+`TRIANGLELIST`. `DrawCall::topology` now carries a `HostTopology` (deliberately
+the `D3D_PRIMITIVE_TOPOLOGY` values, `static_assert`ed in `d3d12_game.cpp`).
+`PrimitiveType` in `pm4_translator.h` had **fan and strip swapped** against
+Xenia's ordering — fan is 5, strip is 6 — which would have drawn every fan as a
+strip. RectangleList (`prim=8`) has no D3D12 equivalent and is expanded in the
+translator: each group of 3 vertices is a rect whose implied 4th corner is
+`v3 = v0 + v2 - v1`, emitted as 6 indices.
+
+**Batching.** `SetGameDrawData` held exactly one draw, and `graphics_system.cpp`
+`break`'d after the first — so however many draws a frame produced, at most one
+could ever be submitted. Replaced by `AddGameDraw`/`ClearGameDraws` over a
+`std::vector<GameDraw>`, capped at 256/frame.
+
+#### What came out — geometry on screen
+
+3/3 forced runs (`mx_052`, `mx_056`, `mx_057`) plus a boot-only control
+(`mx_055`), zero access violations in all four.
+
+The NDC instrument is byte-identical across all three runs and the control:
+
+```
+window(  0.00,   0.00, 1.00) -> clip(-1.0000, 1.0000, 1.0000, 1.0000)
+window(640.00,   0.00, 1.00) -> clip( 0.0000, 1.0000, 1.0000, 1.0000)
+window(640.00, 360.00, 1.00) -> clip( 0.0000, 0.0000, 1.0000, 1.0000)
+```
+
+A 640x360 rect occupying the top-left quadrant of a 1280x720 target — exactly
+what the viewport arithmetic predicts. **And that is what appears on screen**: a
+solid grey quad in the top-left quarter of the window. This is the first native
+guest geometry MX has rendered.
+
+| | control | forced |
+|---|---|---|
+| submitted / skipped per frame | 5 / 3 | 85-95 / 231-234 |
+| draws carrying vertex data | — | 57067-88754 of 96629-148054 (~59%) |
+| skipped strides (cumulative) | none | 36: ~12500, 16: ~4000, 12: ~420, 20: ~25 |
+| `MainLoop` reached | #661 | #601, #601, #661 |
+
+`prim_type` distribution post-load: **13 (QuadList) 47607**, 6 (TriangleStrip)
+31271, 8 (RectangleList) 17654. QuadList is the plurality and currently has no
+host topology, so it is counted and dropped.
+
+Viewports change per render pass within a frame — 1280x720, 768x1024, 640x720,
+320x360, 256x256, 129x129, 64x64, 1x1 — so a draw's transform is only right if
+the register shadow is current when that draw is translated. It is, because both
+are fed in ring order.
+
+Open, and deliberately not chased in that round:
+
+- **The screen is only correct early.** Screenshots at t+22s show the grey quad;
+  at t+32s and t+70s the window is black. Later draws almost certainly overpaint
+  it, but that is not proven.
+- **The game render target is never cleared.** `BeginFrame`'s
+  `ClearRenderTargetView` sits in an `else` branch that stops firing once
+  `m_hasGamePipeline` is true, so content accumulates across frames. This is
+  visible in the control screenshot as the placeholder triangle and the guest
+  quad both present at once, from different frames.
+- **Only stride 28 is submitted** — the one layout the game PSO's input layout
+  (`POSITION` float3 @0, `COLOR` float4 @12) describes and the only one the
+  vertex dump validated. Everything else is counted, not drawn. Stride 36 is the
+  largest skipped group at ~12500 per run.
+- **The stride heuristic produces garbage for some draws.** `prim=13` vertices
+  log window positions around `1e20` and NaN. They are gated out by the stride
+  check, not by anything that understands them.
+- QuadList, the plurality topology, is dropped. Expanding it is 6 indices per 4
+  vertices with no synthesized vertex — cheap, but it belongs with the vertex
+  format work, since its stride is not 28.
+
 #### The former blocker: no vertex data (resolved above)
 
 **Every one of those draws is `src_sel == 2`, an auto-draw** — still true, and
@@ -549,14 +669,17 @@ warnings, which is the same desync showing up as lost draws.
 ### Draw-call plumbing
 
 `VdSwap` → `Pm4Translator` → `NativeGraphics::SetDrawCalls` →
-`RenderThreadFunc` → `D3D12Renderer::SetGameDrawData` → `RenderGameFrame`'s
-`m_hasGameDrawData` branch. The consumer half was connected 2026-08-02 and is
-**untested against real data** — no draw has ever reached it.
+`RenderThreadFunc` → `D3D12Renderer::AddGameDraw` → `RenderGameFrame`'s loop
+over `m_gameDraws`. End to end and carrying real geometry as of 2026-08-02.
 
-`DrawCall::mvp[16]` has **no path into the renderer**. `SetGameDrawData` takes
-no matrix, so the first real geometry will render with the placeholder
-transform — which looks identical to a broken translator. Fix that before
-judging what appears on screen.
+Both of the old caveats here are **void**: the chain is no longer untested, and
+`DrawCall::mvp[16]` reaches the renderer's constant buffer. The matrix itself is
+now built from the guest's viewport registers rather than the ALU constant file
+— see "The zero matrix, and the guest's own viewport".
+
+`RenderThreadFunc` gates submission on `vertex_stride == 28`, the only layout
+the game PSO's input layout describes. Everything else is counted into a
+per-stride histogram and skipped.
 
 ### Debugging aids
 
@@ -689,10 +812,13 @@ Type-0: [31:30]=0, [29:0]=register base
 - EngineInit sleep loop keeps the process alive
 
 ### Not working / unverified
-- **Game rendering**: draws now reach the renderer with real vertex data — 61% of
-  ~350 per frame after a load, `first translated draw` fires. Whether anything
-  correct appears on screen is **untested**: the MVP guess, topology mapping and
-  vertex format have never been judged. See "The vertex fetch constants" below
+- **Game rendering**: guest geometry renders. A 640x360 grey rect lands in the
+  top-left quadrant of the 1280x720 target, exactly where the viewport
+  arithmetic predicts, 3/3 runs plus control. What is **not** working: only
+  stride-28 draws are submitted (85-95 of ~320 per frame), QuadList — the
+  plurality topology — is dropped, the game RT is never cleared so frames
+  accumulate, and the window is black at t+32s onward. See "The zero matrix,
+  and the guest's own viewport" below
 - **The loader is idle, not stuck.** The state is `*(AssetDB + 28)` (derived from
   `mx_recomp.31.cpp:36836`; the old `+110796` was a heap pointer). It runs
   `0 -> 1` on call #1, `1 -> 2` at call #59, then parks in **state 2

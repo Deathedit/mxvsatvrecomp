@@ -68,20 +68,150 @@ DrawIndx2Header ParseDrawIndx2Header(uint32_t dword0) {
 
 }  // namespace
 
-void Pm4Translator::ApplyType0Write(uint32_t reg_base,
-                                    const std::vector<uint32_t>& body) {
-  // Clip the write to the fetch constant file. Writes arrive with counts of 6
-  // (a single fetch slot) and 186 (the whole texture block), so a write that
-  // only partly overlaps is normal, not an error.
-  const uint32_t file_end = kFetchConstBase + kFetchConstCount;
-  if (reg_base >= file_end) return;
-  const uint32_t write_end = reg_base + static_cast<uint32_t>(body.size());
-  if (write_end <= kFetchConstBase) return;
+namespace {
 
-  const uint32_t first = reg_base < kFetchConstBase ? kFetchConstBase : reg_base;
+// Copy the overlap of a Type0 write [reg_base, reg_base+len) with a shadowed
+// register file [file_base, file_base+file_len). Writes arrive with counts of
+// 6 (a single fetch slot), 21 (the viewport block) and 186 (the whole texture
+// block), so a write that only partly overlaps a file is normal, not an error.
+// Returns true if anything was copied.
+bool ClipWriteInto(uint32_t* file, uint32_t file_base, uint32_t file_len,
+                   uint32_t reg_base, const std::vector<uint32_t>& body) {
+  const uint32_t file_end = file_base + file_len;
+  if (reg_base >= file_end) return false;
+  const uint32_t write_end = reg_base + static_cast<uint32_t>(body.size());
+  if (write_end <= file_base) return false;
+
+  const uint32_t first = reg_base < file_base ? file_base : reg_base;
   const uint32_t last = write_end < file_end ? write_end : file_end;
   for (uint32_t reg = first; reg < last; ++reg)
-    m_fetchConsts[reg - kFetchConstBase] = body[reg - reg_base];
+    file[reg - file_base] = body[reg - reg_base];
+  return true;
+}
+
+}  // namespace
+
+void Pm4Translator::ApplyType0Write(uint32_t reg_base,
+                                    const std::vector<uint32_t>& body) {
+  ClipWriteInto(m_fetchConsts, kFetchConstBase, kFetchConstCount, reg_base, body);
+  if (ClipWriteInto(m_ctxRegs, kCtxRegBase, kCtxRegCount, reg_base, body))
+    m_ctxWritten = true;
+}
+
+float Pm4Translator::CtxFloat(uint32_t reg, float fallback) const {
+  if (!m_ctxWritten || reg < kCtxRegBase || reg >= kCtxRegBase + kCtxRegCount)
+    return fallback;
+  float f;
+  std::memcpy(&f, &m_ctxRegs[reg - kCtxRegBase], 4);
+  return f;
+}
+
+void Pm4Translator::BuildViewportMvp(float out[16]) const {
+  static const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0,
+                                      0, 0, 1, 0, 0, 0, 0, 1};
+  std::memcpy(out, kIdentity, sizeof(kIdentity));
+
+  const float xs = CtxFloat(kRegVportXScale, 0.0f);
+  const float xo = CtxFloat(kRegVportXOffset, 0.0f);
+  const float ys = CtxFloat(kRegVportYScale, 0.0f);
+  const float yo = CtxFloat(kRegVportYOffset, 0.0f);
+  float zs = CtxFloat(kRegVportZScale, 1.0f);
+  const float zo = CtxFloat(kRegVportZOffset, 0.0f);
+  if (zs == 0.0f) zs = 1.0f;  // z is commonly left at scale 1 / offset 0
+
+  if (!m_ctxWritten || xs == 0.0f || ys == 0.0f) {
+    static bool s_logged = false;
+    if (!s_logged) {
+      s_logged = true;
+      REXLOG_WARN("translator: no usable viewport (written={} xs={} ys={}) — "
+                  "falling back to identity, geometry will be in NDC units",
+                  m_ctxWritten, xs, ys);
+    }
+    return;
+  }
+
+  out[0]  = 1.0f / xs;  out[3]  = -xo / xs;
+  out[5]  = 1.0f / ys;  out[7]  = -yo / ys;
+  out[10] = 1.0f / zs;  out[11] = -zo / zs;
+
+  static float s_lastXs = 0.0f, s_lastYs = 0.0f;
+  if (xs != s_lastXs || ys != s_lastYs) {
+    s_lastXs = xs;
+    s_lastYs = ys;
+    REXLOG_INFO("translator: viewport xs={} xo={} ys={} yo={} zs={} zo={} "
+                "-> {}x{} target", xs, xo, ys, yo, zs, zo,
+                xs * 2.0f, ys < 0 ? -ys * 2.0f : ys * 2.0f);
+  }
+}
+
+HostTopology Pm4Translator::MapTopology(uint32_t prim_type) {
+  switch (static_cast<PrimitiveType>(prim_type)) {
+    case PrimitiveType::kPointList:     return HostTopology::kPointList;
+    case PrimitiveType::kLineList:      return HostTopology::kLineList;
+    case PrimitiveType::kLineStrip:     return HostTopology::kLineStrip;
+    case PrimitiveType::kTriangleList:  return HostTopology::kTriangleList;
+    case PrimitiveType::kTriangleStrip: return HostTopology::kTriangleStrip;
+    // RectangleList is not a topology, it is an expansion — ExpandRectangleList
+    // rewrites it to a triangle list and sets the topology itself.
+    // TriangleFan has no D3D12 equivalent either, but unlike rectangles it is
+    // not handled this round: it is dropped and counted.
+    default:                            return HostTopology::kUndefined;
+  }
+}
+
+uint32_t Pm4Translator::ExpandRectangleList(DrawCall& dc) const {
+  const uint32_t stride = dc.vertex_stride;
+  if (stride < 12 || dc.vertices.size() < size_t(dc.vertex_count) * stride)
+    return 0;
+  const uint32_t rects = dc.vertex_count / 3;
+  if (rects == 0) return 0;
+
+  // One extra vertex per rect, six indices per rect. Indices are rewritten
+  // wholesale — a rectangle list is always an auto-draw in this game, so the
+  // incoming indices are the sequential ones we synthesized.
+  std::vector<uint8_t> verts;
+  verts.reserve(size_t(rects) * 4 * stride);
+  std::vector<uint32_t> idx;
+  idx.reserve(size_t(rects) * 6);
+
+  for (uint32_t r = 0; r < rects; ++r) {
+    const uint8_t* src = dc.vertices.data() + size_t(r) * 3 * stride;
+    const uint32_t base = r * 4;
+    verts.insert(verts.end(), src, src + size_t(3) * stride);
+
+    // v3 = v0 + v2 - v1, on position only; everything else comes from v2, which
+    // is the corner v3 shares an edge with in both directions.
+    verts.insert(verts.end(), src + size_t(2) * stride,
+                 src + size_t(3) * stride);
+    uint8_t* v3 = verts.data() + (size_t(base) + 3) * stride;
+    for (uint32_t c = 0; c < 3; ++c) {
+      float p0, p1, p2;
+      std::memcpy(&p0, src + c * 4, 4);
+      std::memcpy(&p1, src + stride + c * 4, 4);
+      std::memcpy(&p2, src + size_t(2) * stride + c * 4, 4);
+      const float p3 = p0 + p2 - p1;
+      std::memcpy(v3 + c * 4, &p3, 4);
+    }
+
+    const uint32_t order[6] = {0, 1, 2, 0, 2, 3};
+    for (uint32_t i = 0; i < 6; ++i) idx.push_back(base + order[i]);
+  }
+
+  dc.vertices = std::move(verts);
+  dc.vertex_count = rects * 4;
+  dc.index_count = rects * 6;
+  // Stay 16-bit while the counts allow it; the renderer reads index_16bit.
+  dc.index_16bit = dc.vertex_count <= 0xFFFF;
+  dc.indices.resize(size_t(idx.size()) * (dc.index_16bit ? 2 : 4));
+  if (dc.index_16bit) {
+    auto* p = reinterpret_cast<uint16_t*>(dc.indices.data());
+    for (size_t i = 0; i < idx.size(); ++i) p[i] = uint16_t(idx[i]);
+  } else {
+    auto* p = reinterpret_cast<uint32_t*>(dc.indices.data());
+    for (size_t i = 0; i < idx.size(); ++i) p[i] = idx[i];
+  }
+  dc.topology = HostTopology::kTriangleList;
+  return rects;
 }
 
 std::vector<Pm4Translator::VertexFetch> Pm4Translator::CollectVertexFetches(
@@ -258,6 +388,59 @@ void Pm4Translator::AttachVertices(DrawCall& dc, uint8_t* guest_base) {
   }
 }
 
+void Pm4Translator::LogNdc(const DrawCall& dc) const {
+  static int s_logged = 0;
+  if (s_logged >= 10 || dc.vertices.empty() || dc.vertex_stride < 12) return;
+  ++s_logged;
+
+  const uint32_t show = dc.vertex_count < 3 ? dc.vertex_count : 3;
+  for (uint32_t v = 0; v < show; ++v) {
+    const uint8_t* p = dc.vertices.data() + size_t(v) * dc.vertex_stride;
+    float in[4] = {0, 0, 0, 1};
+    for (uint32_t c = 0; c < 3; ++c) std::memcpy(&in[c], p + c * 4, 4);
+    float o[4];
+    for (uint32_t r = 0; r < 4; ++r) {
+      o[r] = dc.mvp[r * 4 + 0] * in[0] + dc.mvp[r * 4 + 1] * in[1] +
+             dc.mvp[r * 4 + 2] * in[2] + dc.mvp[r * 4 + 3] * in[3];
+    }
+    const bool on_screen = o[3] != 0.0f && o[0] >= -o[3] && o[0] <= o[3] &&
+                           o[1] >= -o[3] && o[1] <= o[3];
+    REXLOG_INFO("translator: NDC prim={} v[{}] window({:.2f} {:.2f} {:.2f}) "
+                "-> clip({:.4f} {:.4f} {:.4f} {:.4f}) [{}]",
+                dc.prim_type, v, in[0], in[1], in[2], o[0], o[1], o[2], o[3],
+                on_screen ? "on screen" : "OFF SCREEN");
+  }
+}
+
+void Pm4Translator::FinalizeDraw(DrawCall& dc) {
+  BuildViewportMvp(dc.mvp);
+  dc.topology = MapTopology(dc.prim_type);
+
+  if (static_cast<PrimitiveType>(dc.prim_type) == PrimitiveType::kRectangleList) {
+    const uint32_t rects = ExpandRectangleList(dc);
+    static uint32_t s_rects = 0, s_failed = 0;
+    if (rects) s_rects += rects; else ++s_failed;
+    static int s_logged = 0;
+    if (s_logged < 10) {
+      ++s_logged;
+      REXLOG_INFO("translator: RectangleList expanded {} rects -> {} verts, {} "
+                  "indices (running total {} rects, {} unexpandable)",
+                  rects, dc.vertex_count, dc.index_count, s_rects, s_failed);
+    }
+  } else if (dc.topology == HostTopology::kUndefined) {
+    // Nothing maps this — TriangleFan and the exotic quad/polygon types. The
+    // renderer drops it; count them so the next round knows the size of it.
+    static uint32_t s_dropped[64] = {};
+    const uint32_t t = dc.prim_type & 0x3F;
+    if (s_dropped[t]++ == 0) {
+      REXLOG_INFO("translator: no host topology for prim_type={} — dropping "
+                  "these (first occurrence)", dc.prim_type);
+    }
+  }
+
+  LogNdc(dc);
+}
+
 void Pm4Translator::HandleDrawIndx2(const Pm4Packet& pkt, uint8_t* guest_base,
                                     bool binned) {
   if (pkt.body.empty()) {
@@ -280,7 +463,7 @@ void Pm4Translator::HandleDrawIndx2(const Pm4Packet& pkt, uint8_t* guest_base,
   dc.index_16bit = !h.index_32bit;
   dc.binned      = binned;
   dc.vertex_stride = m_vtxStride > 0 ? m_vtxStride : 32;
-  std::memcpy(dc.mvp, m_mvp, sizeof(m_mvp));
+  // dc.mvp is filled by FinalizeDraw, not from m_mvp — see the note there.
 
   if (h.src_sel == 0x2) {
     // Auto draw — GPU generates sequential indices 0..N-1. No inline index
@@ -298,6 +481,7 @@ void Pm4Translator::HandleDrawIndx2(const Pm4Packet& pkt, uint8_t* guest_base,
     }
     dc.valid = true;
     AttachVertices(dc, guest_base);
+    FinalizeDraw(dc);
     REXLOG_INFO("translator: DRAW_INDX_2{} auto draw idx={} prim={} vtcs={} stride={} verts={} B",
                 binned ? "_BIN" : "", h.index_count, h.prim_type,
                 dc.vertex_count, dc.vertex_stride, dc.vertices.size());
@@ -352,21 +536,17 @@ void Pm4Translator::HandleDrawIndx2(const Pm4Packet& pkt, uint8_t* guest_base,
   }
   dc.vertex_count = max_idx + 1;
 
-  // Vertex buffer fetch (optional — if we have a known VTG fetch constant).
-  if (m_vtxBufAddr != 0) {
-    uint32_t va = m_vtxBufAddr;
-    if (va < kGuestPhysMax) {
-      uint32_t vb_bytes = dc.vertex_count * dc.vertex_stride;
-      // (Vertex copy is deferred; the translator needs the guest base.)
-      (void)vb_bytes;
-    }
-  }
   dc.valid = true;
+  // This path used to stop here with a dead m_vtxBufAddr bounds check and a
+  // deferred copy that never landed. AttachVertices does the real work now, and
+  // it is the same call the two auto-draw paths make.
+  AttachVertices(dc, guest_base);
+  FinalizeDraw(dc);
 
-  REXLOG_INFO("translator: DRAW_INDX_2{} idx={} prim={} i32={} vtcs={} stride={} binMsLo=0x{:08X}",
+  REXLOG_INFO("translator: DRAW_INDX_2{} idx={} prim={} i32={} vtcs={} stride={} verts={} B binMsLo=0x{:08X}",
               binned ? "_BIN" : "", h.index_count, h.prim_type,
               h.index_32bit ? 1 : 0, dc.vertex_count, dc.vertex_stride,
-              m_binSelectLo);
+              dc.vertices.size(), m_binSelectLo);
   m_drawCalls.push_back(std::move(dc));
 }
 
@@ -390,7 +570,6 @@ void Pm4Translator::HandleDrawIndx(const Pm4Packet& pkt, uint8_t* guest_base,
     dc.index_16bit = !h.index_32bit;
     dc.binned      = binned;
     dc.vertex_stride = m_vtxStride > 0 ? m_vtxStride : 32;
-    std::memcpy(dc.mvp, m_mvp, sizeof(m_mvp));
     dc.vertex_count = h.index_count;
     uint32_t idx_size = h.index_32bit ? 4 : 2;
     dc.indices.resize(h.index_count * idx_size);
@@ -403,6 +582,7 @@ void Pm4Translator::HandleDrawIndx(const Pm4Packet& pkt, uint8_t* guest_base,
     }
     dc.valid = true;
     AttachVertices(dc, guest_base);
+    FinalizeDraw(dc);
     REXLOG_INFO("translator: DRAW_INDX{} auto draw idx={} prim={} vtcs={} stride={} verts={} B",
                 binned ? "_BIN" : "", h.index_count, h.prim_type,
                 dc.vertex_count, dc.vertex_stride, dc.vertices.size());
@@ -431,7 +611,6 @@ void Pm4Translator::HandleDrawIndx(const Pm4Packet& pkt, uint8_t* guest_base,
   dc.index_16bit = !h.index_32bit;
   dc.binned      = binned;
   dc.vertex_stride = m_vtxStride > 0 ? m_vtxStride : 32;
-  std::memcpy(dc.mvp, m_mvp, sizeof(m_mvp));
 
   // body[2] is a guest physical address (NOT masked) — the game places the
   // index buffer anywhere in main RAM (typical IXB addrs: 0x13_xxx_xxx).
@@ -484,6 +663,7 @@ void Pm4Translator::HandleDrawIndx(const Pm4Packet& pkt, uint8_t* guest_base,
 
   dc.valid = true;
   AttachVertices(dc, guest_base);
+  FinalizeDraw(dc);
 
   REXLOG_INFO("translator: DRAW_INDX{} ib_addr=0x{:08X} ib_size={} idx={} "
               "prim={} vtcs={} endian={} verts={} B",
@@ -529,7 +709,19 @@ void Pm4Translator::HandleSetConstant(const Pm4Packet& pkt) {
 
   // ALU float constants (type=0). Track hfloat index 0..15 as MVP.
   // Per Xenia, ALU consts are 16 float4 registers; first 4 vec4s ~~ MVP.
+  //
+  // Nothing reads m_mvp any more — DrawCall::mvp comes from the viewport
+  // registers (BuildViewportMvp), because this game emits neither SET_CONSTANT
+  // nor SET_SHADER_CONSTANTS and so left m_mvp identically zero, which silently
+  // collapsed every translated vertex to the origin. If this ever fires, the
+  // premise has changed and the transform source is worth revisiting.
   if (type == 0 && index < 16) {
+    static bool s_logged = false;
+    if (!s_logged) {
+      s_logged = true;
+      REXLOG_WARN("translator: SET_CONSTANT type=0 seen — the game DOES emit "
+                  "ALU constants; reconsider the viewport-only transform");
+    }
     for (size_t i = 1; i < pkt.body.size() && index + (i - 1) < 16; ++i) {
       float val;
       std::memcpy(&val, &pkt.body[i], 4);
@@ -544,6 +736,14 @@ void Pm4Translator::HandleSetShaderConstants(const Pm4Packet& pkt) {
   if (pkt.body.empty()) return;
   uint32_t base_idx = pkt.body[0] & 0xFFFF;
   if (base_idx < 16 && pkt.body.size() > 1) {
+    // As in HandleSetConstant: nothing reads m_mvp any more. This opcode does
+    // not occur in any captured frame; if it starts to, say so.
+    static bool s_logged = false;
+    if (!s_logged) {
+      s_logged = true;
+      REXLOG_WARN("translator: SET_SHADER_CONSTANTS seen — reconsider the "
+                  "viewport-only transform");
+    }
     for (size_t i = 1; i < pkt.body.size() && base_idx + (i - 1) < 16; ++i) {
       float val;
       std::memcpy(&val, &pkt.body[i], 4);

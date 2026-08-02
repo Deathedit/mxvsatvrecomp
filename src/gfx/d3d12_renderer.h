@@ -17,6 +17,7 @@
 
 #include <array>
 #include <cstdint>
+#include <vector>
 
 class D3D12Renderer {
  public:
@@ -36,11 +37,21 @@ class D3D12Renderer {
 
 void UploadVideoFrame(const uint8_t* rgba, uint32_t width, uint32_t height);
 
-// `mvp` is the 16-float row-major transform the PM4 translator recovered for
-// this draw (DrawCall::mvp). Pass nullptr to keep the identity placeholder.
-void SetGameDrawData(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
-                     const uint8_t* indices, uint32_t idxBytes, bool idx16,
-                     uint32_t idxCount, const float* mvp);
+// Append one translated draw to this frame's list. `mvp` is the 16-float
+// row-major transform the PM4 translator recovered (DrawCall::mvp); pass
+// nullptr to fall back to the identity placeholder. `topology` is a
+// D3D_PRIMITIVE_TOPOLOGY value, matching mx::pm4::HostTopology.
+//
+// This replaced SetGameDrawData, which held exactly one draw — so however many
+// draws a frame translated, at most one could ever be submitted.
+void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
+                 const uint8_t* indices, uint32_t idxBytes, bool idx16,
+                 uint32_t idxCount, const float* mvp, uint32_t topology);
+
+// Drop the previous frame's draws. Called once per render-thread iteration
+// before any AddGameDraw, so a frame that translated nothing falls back to the
+// placeholder triangle rather than replaying stale geometry.
+void ClearGameDraws();
 
   [[nodiscard]] ID3D12Device* GetDevice() const noexcept { return m_device.Get(); }
   [[nodiscard]] ID3D12GraphicsCommandList* GetCommandList() const noexcept {
@@ -122,16 +133,23 @@ bool CreateGamePipeline();
   uint32_t m_gameIndexCount = 0;
   bool m_hasGamePipeline = false;
 
-  Microsoft::WRL::ComPtr<ID3D12Resource> m_gameDrawVB;
-  Microsoft::WRL::ComPtr<ID3D12Resource> m_gameDrawIB;
-  // Separate from m_gameCB so the translated draw's transform never overwrites
-  // the placeholder triangle's identity matrix, and so a per-call buffer is not
-  // rewritten while the GPU may still be reading the previous frame's value.
-  Microsoft::WRL::ComPtr<ID3D12Resource> m_gameDrawCB;
-  D3D12_VERTEX_BUFFER_VIEW m_gameDrawVbv = {};
-  D3D12_INDEX_BUFFER_VIEW m_gameDrawIbv = {};
-  uint32_t m_gameDrawIndexCount = 0;
-  bool m_hasGameDrawData = false;
+  // One translated draw. The CB is separate from m_gameCB so a translated
+  // transform never overwrites the placeholder triangle's identity matrix, and
+  // so a per-draw buffer is not rewritten while the GPU may still be reading
+  // the previous frame's value.
+  struct GameDraw {
+    Microsoft::WRL::ComPtr<ID3D12Resource> vb;
+    Microsoft::WRL::ComPtr<ID3D12Resource> ib;
+    Microsoft::WRL::ComPtr<ID3D12Resource> cb;
+    D3D12_VERTEX_BUFFER_VIEW vbv = {};
+    D3D12_INDEX_BUFFER_VIEW ibv = {};
+    uint32_t indexCount = 0;
+    D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+  };
+  // Bounded because each entry costs three CreateCommittedResource calls — see
+  // the PERF(per-frame-allocs) note in d3d12_game.cpp.
+  static constexpr size_t kMaxGameDraws = 256;
+  std::vector<GameDraw> m_gameDraws;
 
   Microsoft::WRL::ComPtr<ID3D12Resource> m_gameRT;
   Microsoft::WRL::ComPtr<ID3D12Resource> m_gameDepth;

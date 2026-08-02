@@ -39,7 +39,10 @@ struct VSOutput {
   float4 col : COLOR;
 };
 cbuffer GameCB : register(b0) {
-  float4x4 mvp;
+  // row_major is load-bearing. Pm4Translator builds this matrix row-major and
+  // the renderer memcpy's the 16 floats straight in; HLSL packs a cbuffer
+  // float4x4 column-major by default, which would silently transpose it.
+  row_major float4x4 mvp;
 };
 VSOutput main(VSInput input) {
   VSOutput o;

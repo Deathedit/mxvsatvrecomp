@@ -122,9 +122,7 @@ void D3D12Renderer::Shutdown() {
   m_gameCbvHeap.Reset();
   m_hasGamePipeline = false;
 
-  m_gameDrawVB.Reset();
-  m_gameDrawIB.Reset();
-  m_hasGameDrawData = false;
+  m_gameDraws.clear();
 
   m_gameRT.Reset();
   m_gameDepth.Reset();
@@ -202,7 +200,7 @@ void D3D12Renderer::BeginFrame() {
   if (m_hasVideoFrame) {
     RenderVideoFrame();
     m_hasVideoFrame = false;
-  } else if (m_hasGameDrawData || m_hasGamePipeline) {
+  } else if (!m_gameDraws.empty() || m_hasGamePipeline) {
     RenderGameFrame();
   } else {
     const float clearColor[4] = {0.05f, 0.08f, 0.18f, 1.0f};
