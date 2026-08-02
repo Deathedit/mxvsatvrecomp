@@ -82,11 +82,10 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       // an empty list and RenderGameFrame falls back to the placeholder
       // triangle rather than replaying stale geometry.
       //
-      // NOTE: nothing carries DrawCall::mvp into the renderer — SetGameDrawData
-      // takes no matrix and the game pipeline's constant buffer keeps its
-      // placeholder transform. Real geometry will therefore appear with the
-      // wrong transform, which looks exactly like a broken translator. Fix the
-      // transform before drawing conclusions from what shows up on screen.
+      // DrawCall::mvp now reaches the game pipeline's constant buffer. Note it
+      // is whatever constant-register block Pm4Translator guessed is the
+      // transform — if geometry lands off-screen, that guess is the first
+      // suspect, ahead of the vertex data.
       auto draws = native::NativeGraphics::Get().GetDrawCalls();
       for (const auto& d : draws) {
         // vertices are only populated when the translator resolved a vertex
@@ -96,7 +95,7 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                     static_cast<uint32_t>(d.vertices.size()),
                                     d.vertex_stride, d.indices.data(),
                                     static_cast<uint32_t>(d.indices.size()),
-                                    d.index_16bit, d.index_count);
+                                    d.index_16bit, d.index_count, d.mvp);
         static bool s_loggedFirst = false;
         if (!s_loggedFirst) {
           s_loggedFirst = true;

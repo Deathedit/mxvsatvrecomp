@@ -195,8 +195,11 @@ void D3D12Renderer::RenderGameFrame() {
 
   ID3D12DescriptorHeap* heaps[] = {m_gameCbvHeap.Get()};
   m_commandList->SetDescriptorHeaps(1, heaps);
-  m_commandList->SetGraphicsRootConstantBufferView(
-      0, m_gameCB->GetGPUVirtualAddress());
+  // A translated draw brings its own transform in m_gameDrawCB; the placeholder
+  // triangle uses the identity matrix in m_gameCB.
+  ID3D12Resource* cb = (m_hasGameDrawData && m_gameDrawCB) ? m_gameDrawCB.Get()
+                                                           : m_gameCB.Get();
+  m_commandList->SetGraphicsRootConstantBufferView(0, cb->GetGPUVirtualAddress());
 
   m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
@@ -214,7 +217,7 @@ void D3D12Renderer::RenderGameFrame() {
 void D3D12Renderer::SetGameDrawData(const uint8_t* vertices, uint32_t vtxBytes,
                                      uint32_t vtxStride, const uint8_t* indices,
                                      uint32_t idxBytes, bool idx16,
-                                     uint32_t idxCount) {
+                                     uint32_t idxCount, const float* mvp) {
   // PERF(per-frame-allocs): this currently creates two ID3D12Resource's per
   // call (VB + IB) on the UPLOAD heap. Correctness is fine — old COM refs are
   // dropped via Reset() and D3D12's internal command-list tracking keeps the
@@ -273,6 +276,22 @@ void D3D12Renderer::SetGameDrawData(const uint8_t* vertices, uint32_t vtxBytes,
   m_gameDrawIbv.Format = idx16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
   m_gameDrawIbv.SizeInBytes = idxBytes;
   m_gameDrawIndexCount = idxCount;
+
+  // Carry the translator's transform. Without this the draw renders under the
+  // identity matrix baked into m_gameCB, which makes a correct translation and
+  // a broken one look identical on screen. A fresh 256B buffer per call for the
+  // same in-flight reason as the VB/IB above; a null mvp falls back to m_gameCB.
+  m_gameDrawCB.Reset();
+  if (mvp && createBuffer(m_gameDrawCB, 256)) {
+    void* cbMap = nullptr;
+    if (SUCCEEDED(m_gameDrawCB->Map(0, nullptr, &cbMap))) {
+      memcpy(cbMap, mvp, 16 * sizeof(float));
+      m_gameDrawCB->Unmap(0, nullptr);
+    } else {
+      m_gameDrawCB.Reset();
+    }
+  }
+
   m_hasGameDrawData = true;
 }
 

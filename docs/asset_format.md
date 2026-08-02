@@ -163,6 +163,22 @@ meaningless.
 `*(a1+28)`, so it cannot self-advance. Something external must request the next
 load; nothing does. The loader is idle and healthy, not stuck or broken.
 
+**Confirmed 2026-08-02** by bracketing the hook with a check for changes to
+`*(a1+28)` between one return and the next entry: across a full run the selector
+is never written from outside `sub_8253AA40`.
+
+**Forcing the state (`--force_launch=true`, diagnostic only)**:
+- `2 -> 9` **crashes**. `sub_82541F80 +0xE4` is `lwzx r29,r3,0x20768` with
+  `r3 = *(a1+23132)`, which is null — that slot is written only by
+  `sub_825372C0`, the "Subscene Creation" callback state 4 registers. State 9 is
+  unreachable until 4 has run; both of its branches call `sub_82541F80`.
+- `2 -> 3` runs clean but yields `3 -> 4 -> 2` and parks again (3/3 runs, no
+  access violations, entity counts unmoved). State 4 sets `*(a1+110328) = 1`
+  after `eng+8->vt[2]()` returns non-zero, then immediately reads that flag back
+  at `loc_8253B2EC` and diverts to `sub_825378F0`, which resets the selector.
+  The `state = 5` path at `loc_8253B388` needs `*(a1+110328) == 0` and cannot be
+  reached this way.
+
 **KEY FINDING**: The state machine is **pure orchestration** — it does NOT load file content itself. It polls flags set by a separate background **LoadingThread** (synchronized via `LoadingThreadEvent` / `LoadingThreadEarlyOutEvent` events created by AssetDB's constructor `AssetDB_Ctor_LoadingThreadEvents` @ 0x8253CB38).
 
 | State | Addr | Name | Role |

@@ -8,7 +8,17 @@
 
 #include "hooks/hook_common.h"
 
+#include <rex/cvar.h>
+
 #include <bit>
+
+// The loader reaches state 2 (IdleClearRenderBusy) and parks there — it is idle,
+// not stuck, and nothing in the game ever asks it for the next load. Set
+// `force_launch = true` in mx.toml (or pass --force_launch=true) to fabricate
+// that request once, so the content/entity/draw path downstream of a load can be
+// exercised at all. Diagnostic only; it is not how the game is supposed to work.
+REXCVAR_DEFINE_BOOL(force_launch, false, "Debug",
+                    "Force the AssetDB load state machine from idle into LaunchActivity");
 
 // sub_82B34998 — RendererDispatchBlock (fatal vtable dispatches in native)
 REX_IMPORT(__imp__sub_82B34998, orig_RendererDispatch, void());
@@ -104,8 +114,18 @@ extern "C" REX_FUNC(sub_8253AA40) {
   // from pm4_pipeline.md and is a guest heap pointer, not the enum, so every
   // "state=" line logged before 2026-08-02 was meaningless.
   uint32_t state_in = a1 ? REX_LOAD_U32(a1 + 28) : 0xFFFFFFFF;
+  // Every store to *(a1+28) I could find is inside this function, but that was
+  // a grep of mx_recomp.31.cpp only and would miss a write through a computed
+  // pointer regardless. Settle it with data: if the state changed between our
+  // last return and this entry, something outside sub_8253AA40 wrote it.
+  static uint32_t s_prev_out = 0xFFFFFFFE;
+  if (s_prev_out != 0xFFFFFFFE && state_in != s_prev_out) {
+    REXLOG_INFO("{}: EXTERNAL WRITE to AssetDB+28: {} -> {} between calls #{} and #{}",
+                tag, s_prev_out, state_in, sm - 1, sm);
+  }
   orig_LoadStateMachine(ctx, base);
   uint32_t state_out = a1 ? REX_LOAD_U32(a1 + 28) : 0xFFFFFFFF;
+  s_prev_out = state_out;
   // Log every transition, plus a periodic heartbeat — a stuck machine should be
   // visible without diffing consecutive lines.
   static uint32_t s_last = 0xFFFFFFFE;
@@ -114,6 +134,43 @@ extern "C" REX_FUNC(sub_8253AA40) {
   if (changed || sm <= 10 || (sm % 200) == 0) {
     REXLOG_INFO("{}: LoadStateMachine #{} state {} -> {} r3=0x{:08X}{}", tag, sm,
                 state_in, state_out, ctx.r3.u32, changed ? "  <-- CHANGED" : "");
+  }
+
+  // --force_launch=true: fabricate the load request the front end never makes.
+  //
+  // The machine reaches state 2 (IdleClearRenderBusy) and parks. State 2's body
+  // is `*(a1+110328) = 0` then the common tail (mx_recomp.31.cpp:37093) — it
+  // never writes *(a1+28), so it cannot self-advance and only an external write
+  // gets it moving.
+  //
+  // Target state 3 (DatabaseLoad), the head of the ordered load sequence
+  // 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 11 -> 2.
+  //
+  // Do NOT jump straight to 9 (LaunchActivity). Measured 2026-08-02 (mx_018.log):
+  // it access-violates reading guest 0x00020768 inside sub_82541F80 +0xE4, whose
+  // first instruction is `lwzx r29,r3,0x20768` with r3 = *(a1+23132). That slot
+  // is written only by sub_825372C0 (mx_recomp.31.cpp:28616,29130), which is the
+  // "Subscene Creation" callback state 4 registers — so 9 is only reachable once
+  // 4 has run, and forcing it from idle skips exactly that setup. Both of state
+  // 9's branches call sub_82541F80, so neither is safe.
+  //
+  // Wait for 30 consecutive ticks in state 2 so this cannot race the 0->1->2
+  // boot sequence, and fire exactly once.
+  if (!mx::native::g_plugin_mode && a1 && REXCVAR_GET(force_launch)) {
+    static int s_idle = 0;
+    static bool s_fired = false;
+    if (!s_fired) {
+      s_idle = (state_out == 2) ? s_idle + 1 : 0;
+      if (s_idle >= 30) {
+        s_fired = true;
+        REXLOG_INFO("native: force_launch — kicking AssetDB 0x{:08X} from state 2 "
+                    "into 3 (DatabaseLoad) at call #{}; a1+23132=0x{:08X} "
+                    "a1+110328=0x{:08X} a1+110260=0x{:08X}",
+                    a1, sm, REX_LOAD_U32(a1 + 23132), REX_LOAD_U32(a1 + 110328),
+                    REX_LOAD_U32(a1 + 110260));
+        REX_STORE_U32(a1 + 28, 3);
+      }
+    }
   }
 }
 

@@ -36,9 +36,11 @@ class D3D12Renderer {
 
 void UploadVideoFrame(const uint8_t* rgba, uint32_t width, uint32_t height);
 
+// `mvp` is the 16-float row-major transform the PM4 translator recovered for
+// this draw (DrawCall::mvp). Pass nullptr to keep the identity placeholder.
 void SetGameDrawData(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                      const uint8_t* indices, uint32_t idxBytes, bool idx16,
-                     uint32_t idxCount);
+                     uint32_t idxCount, const float* mvp);
 
   [[nodiscard]] ID3D12Device* GetDevice() const noexcept { return m_device.Get(); }
   [[nodiscard]] ID3D12GraphicsCommandList* GetCommandList() const noexcept {
@@ -122,6 +124,10 @@ bool CreateGamePipeline();
 
   Microsoft::WRL::ComPtr<ID3D12Resource> m_gameDrawVB;
   Microsoft::WRL::ComPtr<ID3D12Resource> m_gameDrawIB;
+  // Separate from m_gameCB so the translated draw's transform never overwrites
+  // the placeholder triangle's identity matrix, and so a per-call buffer is not
+  // rewritten while the GPU may still be reading the previous frame's value.
+  Microsoft::WRL::ComPtr<ID3D12Resource> m_gameDrawCB;
   D3D12_VERTEX_BUFFER_VIEW m_gameDrawVbv = {};
   D3D12_INDEX_BUFFER_VIEW m_gameDrawIbv = {};
   uint32_t m_gameDrawIndexCount = 0;
