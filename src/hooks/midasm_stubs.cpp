@@ -24,15 +24,21 @@ void NativeSetupDeviceSkip() {}
 void NativeSkipVtable8() { REXLOG_INFO("native: skip vtable[8]"); }
 void NativeSkipVtable17() { REXLOG_INFO("native: skip vtable[17]"); }
 void NativeSkipRendererInit() { REXLOG_INFO("native: skip renderer init -> Transition thread"); }
+// Superseded 2026-08-02 by NativeSkipRendererDispatch below — this one deleted
+// LoaderTick's whole renderer block (0x82B70EC8..0x82B710BC) to avoid a single
+// GPU-bound call. Kept exported so mx_config.toml can restore that baseline.
 void NativeSkipLoaderRenderer() {}
 
-// Bisection stubs (2026-07-31) — currently UNUSED (mid-ASM hooks for these
-// were commented out in mx_config.toml when the LoaderTick bisection was
-// reverted and hook #6 (NativeSkipLoaderRenderer) was restored). Stubs
-// remain exported (CMakeLists) for future re-use without a codegen round.
-// Finding they produced: when hook #6 is disabled, NONE of these three
-// stubs fire, proving execution stalls in `bctrl sub_82B3C7D0` at 0x82B70EE8
-// (the lazy-init alloc) — see AGENTS.md "Hook #6 hang point CONFIRMED".
+// Bisection stubs (2026-07-31). NativeSkipRendererDispatch is now hook #6 and
+// fires every LoaderTick; the other two remain unused but exported.
+//
+// Their 2026-07-31 finding — "when hook #6 is disabled, NONE of these three
+// stubs fire, so execution stalls in `bctrl sub_82B3C7D0` at 0x82B70EE8 (the
+// lazy-init alloc)" — DID NOT REPRODUCE on 2026-08-02. dword_830BE190 is
+// already populated by the time LoaderTick runs, so the `bne` at 0x82B70EE0
+// branches past that bctrl and it never executes. The original stall belonged
+// to the era when hooks #2/#5 were active and had to pre-populate the slot by
+// hand from the main thread.
 
 static int g_post_lazy_init_reaches = 0;
 void NativePostLazyInitLog() {

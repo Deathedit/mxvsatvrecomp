@@ -1,9 +1,9 @@
 // Loading-path hooks — SetupRenderer, Transition, LoaderTick.
 //
-// This is the part of the boot sequence that mid-ASM hooks #2, #5, #6, #7 and
-// #8 carve into: the C++ hooks here run around the guest originals while the
-// mid-ASM hooks skip the interior blocks that cannot complete without a GPU.
-// See the mid-ASM hook table in AGENTS.md.
+// This is the part of the boot sequence mid-ASM hooks used to carve into. Only
+// hook #6 is left, and since 2026-08-02 it skips exactly one instruction — the
+// `bl sub_82B34998` renderer dispatch at 0x82B70EF4, which our D3D12 backend
+// replaces. Everything else in LoaderTick runs. See the hook table in AGENTS.md.
 
 #include "hooks/hook_common.h"
 
@@ -67,24 +67,19 @@ extern "C" REX_FUNC(sub_82B71148) {
   orig_SetupRenderer(ctx, base);
   REXLOG_INFO("native: SetupRenderer RETURNED");
 
-  // Native backend fix: SetupRenderer's vt[17] call (sub_82B43AC8 @ 0x82B71310)
-  // is skipped by mid-ASM hook #4. That call writes `*(eng+8) = assetdb_block`
-  // (the 545KB block allocated at 0x82B712D8 by sub_82AB73C0(0x85280) and
-  // initialized by AssetDB_InnerCtor_VtableInstall at 0x82B712EC). The
-  // allocation + ctor themselves actually run in native mode (hook #3 only
-  // skips the vt[8] call before them; hook #4 skips vt[17] AFTER them).
-  // However, since hook #4 prevents vt[17] from running, eng+8 stays NULL.
+  // DORMANT fallback. SetupRenderer's vt[17] (sub_82B43AC8 @ 0x82B71310) writes
+  // `*(eng+8) = assetdb_block` — the 545KB block allocated at 0x82B712D8 by
+  // sub_82AB73C0(0x85280) and initialized by AssetDB_InnerCtor_VtableInstall at
+  // 0x82B712EC. This block existed because mid-ASM hook #4 used to skip vt[17],
+  // leaving eng+8 NULL.
   //
-  // We replicate vt[17]'s `*(eng+8) = assetdb_block` write here from C++.
-  // The 545KB block allocated during orig_SetupRenderer is gone (no global
-  // references it unless vt[17] ran to write eng+8). So we re-allocate it
-  // ourselves and call AssetDB_InnerCtor_VtableInstall to set up the same
-  // vtable its natural code would, then write eng+8.
+  // Hook #4 is disabled, so vt[17] runs and eng+8 is populated for real — the
+  // branch below is not taken (log line: "eng+8 already populated"). Kept as a
+  // fallback in case #4 is ever re-enabled.
   //
-  // We SKIP the secondary sub_82526D10 (18-subsystem AssetDB registration)
-  // call that vt[17] would have made — those subsystems depend on plugin-
-  // provided state we don't have, and registering them risks crashes for
-  // unclear benefit (assets are loaded host-side in our native path).
+  // If it does run it re-allocates the block and calls the inner ctor to install
+  // the same vtable, but SKIPS vt[17]'s secondary sub_82526D10 call (18-subsystem
+  // AssetDB registration) — so it is not a faithful substitute.
   uint32_t eng = REX_LOAD_U32(0x830BE400);
   if (eng && !REX_LOAD_U32(eng + 8)) {
     REXLOG_INFO("native: eng+8 is NULL — replicating vt[17] write from C++");
@@ -173,6 +168,36 @@ extern "C" REX_FUNC(sub_82B710D0) {
       REXLOG_INFO("native: [bisect] eng+0x{:X}=0x{:08X} +0x3C=0x{:08X}", off, sub,
                   sub ? REX_LOAD_U32(sub + 0x3C) : 0xDEADDEAD);
     }
+
+    // --- Renderer-block probe -----------------------------------------------
+    // Describes 0x82B70EC8..0x82B710BC. Hook #6 used to delete this band
+    // wholesale; since 2026-08-02 it skips only the `bl sub_82B34998` dispatch
+    // at 0x82B70EF4 and the rest runs. These reads established that the band's
+    // inputs were real before the narrowing; they stay as a regression check.
+
+    // Lazy-init at 0x82B70EE8 is `bctrl` through dword_82D5648C. When #6 was
+    // last disabled execution stalled right here (midasm_stubs.cpp:33) — but
+    // be190 is already populated by then, so the bne branches past it.
+    uint32_t lazy_fn = REX_LOAD_U32(0x82D5648C);
+    uint32_t be190 = REX_LOAD_U32(0x830BE190);
+    uint32_t be190_vt = be190 ? REX_LOAD_U32(be190) : 0;
+    // 0x8213F7A4 = the real vtable (all functions). 0x8213F70C = the stub
+    // vtable whose slots dispatch to sub_82BDB190 (fatal exit). Which one the
+    // object carries decides whether sub_82B34998 could ever run natively.
+    REXLOG_INFO("native: [bisect] lazyinit_fn(0x82D5648C)=0x{:08X} be190=0x{:08X} vt=0x{:08X}",
+                lazy_fn, be190, be190_vt);
+
+    // Final call of the band, at 0x82B710A4: engine[0xC]->vt[3]().
+    uint32_t scene = eng ? REX_LOAD_U32(eng + 0xC) : 0;
+    uint32_t scene_vt = scene ? REX_LOAD_U32(scene) : 0;
+    uint32_t scene_vt3 = scene_vt ? REX_LOAD_U32(scene_vt + 12) : 0;
+    REXLOG_INFO("native: [bisect] eng+0xC(scene)=0x{:08X} vt=0x{:08X} vt[3]=0x{:08X}",
+                scene, scene_vt, scene_vt3);
+
+    // The band's own event handshake: Wait on tr+0x2E0 at 0x82B70FA8, then
+    // NtSetEvent(tr+0x190) at 0x82B70FF4. Distinct from tr+0x194/tr+0x2DC.
+    REXLOG_INFO("native: [bisect] tr+0x190(band signals)=0x{:08X} tr+0x2E0(band waits)=0x{:08X}",
+                REX_LOAD_U32(0x830EC248 + 0x190), REX_LOAD_U32(0x830EC248 + 0x2E0));
   }
   orig_Transition(ctx, base);
   REXLOG_INFO("native: Transition returned");

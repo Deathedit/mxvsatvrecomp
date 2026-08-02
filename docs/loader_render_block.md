@@ -60,6 +60,17 @@ Attempted Path 1 (pre-populate `dword_830BE190` from main-thread context) and bi
 
 The current baseline (option b essentially — hook #6 skips the entire renderer block) remains the best of the working options.
 
+> **SUPERSEDED 2026-08-02.** Hook #6 now fires at `0x82B70EF4 → 0x82B70EF8`, skipping only
+> `bl sub_82B34998`. The entire post-dispatch body — every "untested" callee in the table above,
+> plus the closing `engine[0xC]->vt[3]()` — runs cleanly, first attempt, 3/3 runs, no stubs
+> required. The cascade of six hangs documented in this section was **not** a property of the
+> block. It was a property of running the block against an engine that hooks #2 and #5 had left
+> half-built (NULL scene manager at `eng+52`, uninitialized transition renderer at `0x830EC248`,
+> `FLT_MAX` in the timing threshold), compounded by pre-populating `dword_830BE190` by hand.
+> With #2/#5/#7/#8 all disabled and the timing function stubbed, none of it reproduces.
+> Stage 4 above ("Wait hook — always return SUCCESS") is also obsolete and was itself the cause
+> of a separate racy AV; see AGENTS.md.
+
 ---
 
 ## sub_82B34998 structural post-mortem — vtable dispatches are FATAL terminators by design (2026-07-31)
@@ -112,6 +123,21 @@ sub_82BDB190 (76 bytes, __noreturn)
   - Calls `sub_82B2C498(a1)` — wraps `(*(int(*)())((*(int*)a1) + 68))()` if non-NULL. Constructor set `*(a1+68)=0`, so this is a no-op returning `a1`.
 - If gating fails: `sub_82B36298(a1, 2, ...)` — calls `sub_82B35340()` if `*(a1+61036)` is 0 (likely 0 — uninitialized). `sub_82B35340` is a recursive depth-4 graph that eventually reaches even more terminators + `sub_82BFBF30` (XenosWait).
 
+> **SCOPE CORRECTION 2026-08-02.** Everything below applies to `sub_82B34998` **alone**, not to
+> the renderer block that contains it — that block now runs natively (see the note at the end of
+> the PATH 1 EXPERIMENT section).
+>
+> More importantly, the premise is unsound as written. This analysis decodes `off_8213F70C`,
+> the vtable on an object **pre-populated by hand** from the main thread via `sub_82B3C7D0`.
+> Probed in native mode with the natural construction path (`logs/mx_002.log`),
+> `*(dword_830BE190)` is **`0x8213F7A4`** — the real vtable, all functions, no terminators.
+> `loader_render_block.md:226` already says as much. So reasons 1 and 2 below, which are entirely
+> about terminator slots in `off_8213F70C`, do not describe the object the guest actually builds.
+> Reason 3 (`*(a1+1288)` uninitialized) has not been re-checked.
+>
+> `sub_82B34998` remains skipped and remains unproven — but it is no longer accurate to call it
+> structurally impossible. Re-testing it is a live option, not a closed question.
+
 **Final structural verdict**: `sub_82B34998` CANNOT be made to complete naturally in our no-GPU-plugin profile. It is a GPU-plugin-only code path by design. Three independent reasons:
 
 1. **vt[8] → vt[15]/vt[16] terminators**: `sub_82B2C4C8` iterates entity slots and dispatches the terminator regardless of state — fatal.
@@ -123,8 +149,8 @@ These would only be replaced by GPU plugin's real vtable slots in the original X
 ### Implications for future work
 
 - **No more bisection inside `sub_82B34998` will help** — the vtable dispatches are designed fatal. Stubs would have to replace the vtable itself (`*a1 = &our_custom_vtable`), then implement each vt slot with our D3D12 game-RT renderer. That's a wholesale rewrite of the renderer block as a guest-callable surface — equivalent to writing a Xenos GPU plugin.
-- The current baseline (hook #6 skips the entire renderer block at 0x82B70EC8 → 0x82B710BC, our C++ LoaderTick cap ends at iter 101 with r3=0) remains the best working approach.
-- The post-dispatch body (0x82B70EF8..0x82B710BC, 0x82B70EF4 onwards after SkipRendererDispatch) is a separate code path with its own entity loops using different globals (`dword_830BE400+0x1C..+0x24` — engine sub-entities, NOT the 60KB block) — its calls do not hit the terminator vtable. Whether the post-dispatch body itself can complete natural execution (or hangs at one of its own sub_xxx callees identified earlier: `sub_82B237B0`, `sub_82B67D98`, `sub_82BDC040`, `sub_82B676B8`, `sub_82AFF120`, `sub_82B0A0D0`, `sub_82B6FF78`, `sub_823EDD40`, `sub_82B1F410`, engine->vt[3]) is still an OPEN question — the Path 1 experiment with SkipRendererDispatch showed `SkipRendererDispatch #1` fired but `#2` never did, suggesting the post-dispatch body itself hung on first pass too. That bisection is deferred.
+- ~~The current baseline (hook #6 skips the entire renderer block at 0x82B70EC8 → 0x82B710BC, our C++ LoaderTick cap ends at iter 101 with r3=0) remains the best working approach.~~ **OBSOLETE 2026-08-02** — both halves of that sentence are gone. The r3=0 cap was removed on 2026-08-02 (it fabricated completion), and hook #6 now skips one instruction, not the block.
+- ~~Whether the post-dispatch body can complete natural execution is still an OPEN question.~~ **ANSWERED 2026-08-02: yes.** With hook #6 narrowed to `0x82B70EF4 → 0x82B70EF8`, the post-dispatch body (`0x82B70EF8..0x82B710BC`) runs to completion on every `LoaderTick` iteration — `SkipRendererDispatch` reaches #800-900 in a 30s run, 3/3 clean, zero access violations. **None** of `sub_82B237B0`, `sub_82B67D98`, `sub_82BDC040`, `sub_82B676B8`, `sub_82AFF120`, `sub_82B0A0D0`, `sub_82B6FF78`, `sub_823EDD40`, `sub_82B1F410` or the closing `engine[0xC]->vt[3]()` needed a stub. The Path 1 observation that `SkipRendererDispatch #2` never fired was a consequence of hooks #2/#5 leaving the engine half-built, not of the body itself.
 
 ---
 

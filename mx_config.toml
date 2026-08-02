@@ -1592,7 +1592,8 @@ memcpy = 0x82BFBB10
 # Mid-ASM hooks. NOTE: these are UNCONDITIONAL — they fire in plugin mode too
 # (g_plugin_mode gates only the C++ REX_FUNC hooks). One binary = one profile.
 #
-# Active: #5 #6 #7.  Disabled: #1 #2 #3 #4 #8.
+# Active: #6 ONLY, and since 2026-08-02 it is narrowed to a single instruction
+# (see below). Disabled: #1 #2 #3 #4 #5 #7 #8.
 #   #1 disabled — eng+8 self-ref workaround handles MainLoop vt[36] crash
 #   #2 disabled 2026-08-01 — SetupRenderer vt[6] CREATES the scene manager at
 #      eng+52. Skipping it left eng+52 NULL, which null-deref'd both at
@@ -1646,10 +1647,26 @@ memcpy = 0x82BFBB10
 # name = "NativeSkipRendererInit"
 # jump_address = 0x82B71690
 
+# #6 NARROWED 2026-08-02. It used to fire at 0x82B70EC8 and jump to 0x82B710BC,
+# deleting LoaderTick's whole renderer block (~500 bytes). Only one instruction
+# in that band actually needs the Xenos GPU: `bl sub_82B34998` at 0x82B70EF4.
+# Everything around it is CPU work — the delta-time load, the dword_830BE190
+# lazy-init, the entity loops over eng+0x1C..0x24, the tr+0x2E0/tr+0x190 event
+# handshake, and the closing engine[0xC]->vt[3]() scene-manager call. Probed
+# read-only first (logs/mx_002.log): scene manager, sub-entities and both event
+# handles are all live, and dword_830BE190 is already populated before
+# LoaderTick runs, so the lazy-init bctrl at 0x82B70EE8 is branched past.
+#
+# To restore the old baseline (commit cc6c760), swap the two entries below.
+# [[midasm_hook]]
+# address = 0x82B70EC8
+# name = "NativeSkipLoaderRenderer"
+# jump_address = 0x82B710BC
+
 [[midasm_hook]]
-address = 0x82B70EC8
-name = "NativeSkipLoaderRenderer"
-jump_address = 0x82B710BC
+address = 0x82B70EF4
+name = "NativeSkipRendererDispatch"
+jump_address = 0x82B70EF8
 
 # #7 — its band (0x82B70E18..0x82B70EC8) holds the engine vtable /
 # scene-manager / entity block and, at its end, the vt[6] gate that dispatches
