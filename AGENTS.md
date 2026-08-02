@@ -538,41 +538,75 @@ Type-0: [31:30]=0, [29:0]=register base
   runs. State 2's body is `*(a1+110328) = 0` then the common tail; it never
   writes the state, so it cannot self-advance. State 1's `SceneTransition_Kickoff`
   (`0x82538618`) does fire. **Nothing ever requests the next load** — confirmed
-  at runtime, see `force_launch` below
+  at runtime, see `force_load` below
 - **Entity population**: `pass0=1 pass1=0 pass2=1` for the whole run, in every
   configuration measured so far including the forced load
 - **Game input consumption**: guest never calls `XamInputGetState`
-- **No menu/gameplay state** reached
+- **No menu/gameplay state** reached — and the entire front-end call chain that
+  would request a load is silent, see below
 
-#### `force_launch` — what forcing the loader proved (2026-08-02)
+#### The load-request chain, and `force_load` (2026-08-02)
 
-`REXCVAR_DEFINE_BOOL(force_launch)` in `src/hooks/hooks_plugin_diag.cpp` waits for
-30 consecutive ticks parked in state 2, then writes `*(AssetDB+28)` once. The same
-hook also flags any change to the selector that appears between its own return and
-its next entry. Measured, `--skip_intro=true --force_launch=true`:
+**`sub_82534980(AssetDB, name, flags)` is the guest's load-request API.** It
+`strncpy`s up to **260 bytes** of `name` into `AssetDB+29540`
+(`sub_82AB4AB0(a1+29540, r4, 260)`, `mx_recomp.31.cpp:22377`), stores `flags` at
+`+29800`, and **if `*(AssetDB+28) == 2`** sets the selector to **3** and notifies
+the listener at `*(a1+110788)`.
 
-- **No external writer exists.** Across a full run the only "EXTERNAL WRITE" line
-  is our own kick. Nothing outside `sub_8253AA40` touches the selector, which is
-  what the static read of the recompiled body predicted.
-- **State 9 `LaunchActivity` is not reachable from idle.** Forcing it
-  access-violates reading guest `0x00020768` in `sub_82541F80 +0xE4`
-  (`mx_018.log`), whose first instruction is `lwzx r29,r3,0x20768` with
-  `r3 = *(AssetDB+23132)` — and that slot is **null**. It is written only by
-  `sub_825372C0` (`mx_recomp.31.cpp:28616,29130`), the "Subscene Creation"
-  callback that state 4 registers. Both of state 9's branches call
-  `sub_82541F80`, so neither is safe before 4 has run.
-- **State 3 `DatabaseLoad` runs clean but aborts at state 4.** Forcing 3 gives
-  `3 -> 4 -> 2` and then parks again — identical across 3/3 runs, zero access
-  violations, entity counts unmoved, still zero `DRAW_*`. In state 4
-  (`loc_8253B2A8`) `eng+8->vt[2]()` returns non-zero, so it calls `vt[3]()` and
-  sets `*(a1+110328) = 1`; the very next check at `loc_8253B2EC` reads that same
-  flag, finds it non-zero, and diverts to `loc_8253B3FC` →`sub_825378F0`, which
-  resets the selector. The `state = 5` path at `loc_8253B388` requires
-  `*(a1+110328) == 0` and is therefore unreachable by that route.
+So `AssetDB+29540` is a `MAX_PATH` **string buffer, not a flag** — the five places
+that appear to test a boolean are testing `name[0] != 0`, "is a load pending", and
+all of them pick state 2 when it is empty. The only other writer is the
+constructor `sub_8253CB38` (`:41615`), zeroing it.
 
-So the load sequence is gated on engine state that idle-mode boot never builds,
-not on the loader. `force_launch` is diagnostic only — it is off by default and
-is not a step toward correct behaviour.
+**Correction to `8b396bf`**: that commit described state 4 as aborting via
+`sub_825378F0`. It does not. `sub_825378F0` (`:29489`) is state 4's *normal*
+completion — it clears `+110328`, then routes to state **3** if a name is pending
+or **2** if not. The `4 -> 2` measured there was the machine correctly handling an
+empty queue.
+
+**The chain never runs.** `sub_82534980` has exactly one caller, `sub_82352AE0`
+(`mx_recomp.15.cpp:76710`), which resolves the scene name from a registry lookup
+and is a method with five callers (`sub_82367A50`, `sub_8236B470`, `sub_8236B660`,
+`sub_824FB1F0`, `sub_824FC9A0`). All seven are hooked in
+`src/hooks/hooks_plugin_diag.cpp`. In a 40s native run **not one of them fires** —
+not even the five top-level callers. The front-end code that would ask for a load
+is never entered at all.
+
+**`force_load = "<scene>"`** (`mx.toml` or `--force_load=<scene>`, empty = off)
+calls that API once, 30 ticks after the loader settles into state 2, with the name
+placed in a scratch buffer carved from the guest stack. Measured with
+`--skip_intro=true --force_load=NAT_Farm`, identical across 3/3 runs, zero access
+violations:
+
+```
+force_load "NAT_Farm" at call #89  a1=0x407F2190 state=2
+RequestLoad(sub_82534980) name="NAT_Farm" flags=0x00000000 state=2
+RequestLoad returned — state 2 -> 3
+LoadStateMachine #90   state 3 -> 4    (state 4 runs ~390 ticks)
+LoadStateMachine #479  state 4 -> 5
+LoadStateMachine #528  state 5 -> 6
+                       parks in 6
+```
+
+The ordered sequence works: **3 `DatabaseLoad` → 4 `SubsceneCreate` → 5
+`LoadingProgress` → 6 `PlayerSetup`**, then parks. State 4 occupying ~390 ticks
+(~6.5s) is the first evidence of the loader doing sustained real work.
+
+Still unmoved at state 6: entity counts `pass0=1 pass1=0 pass2=1`, zero `DRAW_*`,
+zero `INDIRECT_BUFFER`, and no file I/O for the requested scene. That last point
+matters — states 7/8 are where the async content load happens, and we park before
+reaching them, so "no NAT_Farm files opened" does **not** yet mean the name is
+wrong.
+
+State 6 (`loc_8253B504`) takes the `*(a1+110328) == 0` branch to `loc_8253B560`,
+reads the listener at `*(a1+110788)`, and polls through `loc_8253B58C`. Which
+condition it is waiting on is **not yet determined**. `docs/asset_format.md`
+describes state 6 as per-player UniqueId assignment with a "NetworkNoPlayers"
+check, which would fit a signed-in-player gate, but that is an inference from the
+RE'd summary and has not been measured.
+
+`force_load` is diagnostic. It substitutes for a front end that never runs; it is
+not a step toward correct behaviour.
 
 ### Known external blockers
 - Binary `.xenon.package` heaps are encrypted (entropy ≈7.98, unknown routine; the OpenSSL AES bundle in the guest is TLS-only)

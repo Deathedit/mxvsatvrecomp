@@ -29,9 +29,8 @@
 # Set this while iterating on rendering. Also available as --skip_intro=true.
 # skip_intro = true
 
-# Force the AssetDB load state machine out of its idle park. It reaches state 2
-# (IdleClearRenderBusy) and stays there because nothing in the game requests the
-# next load; this fabricates that request once, 30 ticks after it settles.
-# Diagnostic only — it does not produce content. Measured result: state 3 runs,
-# state 4 aborts back to 2, entity counts unmoved. See AGENTS.md "force_launch".
-# force_launch = true
+# Request a scene load from the AssetDB once it goes idle. The loader reaches
+# state 2 and stays there because nothing in the game calls the load-request API
+# (sub_82534980); this calls it once, 30 ticks after it settles, with the name
+# below. Empty means off. Diagnostic only. See AGENTS.md "force_load".
+# force_load = "NAT_Farm"

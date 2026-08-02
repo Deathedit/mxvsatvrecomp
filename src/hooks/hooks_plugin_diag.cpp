@@ -10,15 +10,23 @@
 
 #include <rex/cvar.h>
 
+#include <algorithm>
 #include <bit>
+#include <string>
 
 // The loader reaches state 2 (IdleClearRenderBusy) and parks there — it is idle,
-// not stuck, and nothing in the game ever asks it for the next load. Set
-// `force_launch = true` in mx.toml (or pass --force_launch=true) to fabricate
-// that request once, so the content/entity/draw path downstream of a load can be
-// exercised at all. Diagnostic only; it is not how the game is supposed to work.
-REXCVAR_DEFINE_BOOL(force_launch, false, "Debug",
-                    "Force the AssetDB load state machine from idle into LaunchActivity");
+// not stuck, and nothing in the game ever asks it for the next load.
+//
+// `sub_82534980(AssetDB, name, flags)` is the guest's own load-request API: it
+// copies up to 260 bytes of `name` into AssetDB+29540 and, if the selector is
+// sitting at 2, moves it to 3. Set `force_load = "<scene>"` in mx.toml (or pass
+// --force_load=<scene>) to make that call once from idle, so the content/entity/
+// draw path downstream of a load can be exercised at all. Empty means off.
+//
+// This supersedes the earlier force_launch, which wrote AssetDB+28 directly.
+// That was the wrong lever — see AGENTS.md — and is gone.
+REXCVAR_DEFINE_STRING(force_load, "", "Debug",
+                      "Scene name to request from the AssetDB loader once it goes idle");
 
 // sub_82B34998 — RendererDispatchBlock (fatal vtable dispatches in native)
 REX_IMPORT(__imp__sub_82B34998, orig_RendererDispatch, void());
@@ -136,43 +144,137 @@ extern "C" REX_FUNC(sub_8253AA40) {
                 state_in, state_out, ctx.r3.u32, changed ? "  <-- CHANGED" : "");
   }
 
-  // --force_launch=true: fabricate the load request the front end never makes.
+  // --force_load=<scene>: make the load request the front end never makes, using
+  // the guest's own API rather than writing engine state.
   //
-  // The machine reaches state 2 (IdleClearRenderBusy) and parks. State 2's body
-  // is `*(a1+110328) = 0` then the common tail (mx_recomp.31.cpp:37093) — it
-  // never writes *(a1+28), so it cannot self-advance and only an external write
-  // gets it moving.
-  //
-  // Target state 3 (DatabaseLoad), the head of the ordered load sequence
-  // 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 11 -> 2.
-  //
-  // Do NOT jump straight to 9 (LaunchActivity). Measured 2026-08-02 (mx_018.log):
-  // it access-violates reading guest 0x00020768 inside sub_82541F80 +0xE4, whose
-  // first instruction is `lwzx r29,r3,0x20768` with r3 = *(a1+23132). That slot
-  // is written only by sub_825372C0 (mx_recomp.31.cpp:28616,29130), which is the
-  // "Subscene Creation" callback state 4 registers — so 9 is only reachable once
-  // 4 has run, and forcing it from idle skips exactly that setup. Both of state
-  // 9's branches call sub_82541F80, so neither is safe.
+  // sub_82534980(AssetDB, name, flags) copies up to 260 bytes of `name` into
+  // AssetDB+29540 and, when the selector is at 2, sets it to 3 and notifies the
+  // listener at *(a1+110788). Everything downstream reads AssetDB+29540 as
+  // "is a load pending" (name[0] != 0), which is why an empty name parks at 2.
   //
   // Wait for 30 consecutive ticks in state 2 so this cannot race the 0->1->2
   // boot sequence, and fire exactly once.
-  if (!mx::native::g_plugin_mode && a1 && REXCVAR_GET(force_launch)) {
+  if (!mx::native::g_plugin_mode && a1) {
     static int s_idle = 0;
     static bool s_fired = false;
-    if (!s_fired) {
+    const std::string& scene = REXCVAR_GET(force_load);
+    if (!s_fired && !scene.empty()) {
       s_idle = (state_out == 2) ? s_idle + 1 : 0;
       if (s_idle >= 30) {
         s_fired = true;
-        REXLOG_INFO("native: force_launch — kicking AssetDB 0x{:08X} from state 2 "
-                    "into 3 (DatabaseLoad) at call #{}; a1+23132=0x{:08X} "
-                    "a1+110328=0x{:08X} a1+110260=0x{:08X}",
-                    a1, sm, REX_LOAD_U32(a1 + 23132), REX_LOAD_U32(a1 + 110328),
-                    REX_LOAD_U32(a1 + 110260));
-        REX_STORE_U32(a1 + 28, 3);
+        // sub_82352AE0 reads its AssetDB from a different global than our hooks
+        // do. Log both so the assumption that they are the same object is
+        // visible in the log rather than buried here.
+        REXLOG_INFO("native: force_load \"{}\" at call #{} — a1=0x{:08X} "
+                    "*(0x830577C0)=0x{:08X} *(0x830A77C0)=0x{:08X} state={}",
+                    scene, sm, a1, REX_LOAD_U32(0x830577C0),
+                    REX_LOAD_U32(0x830A77C0), state_out);
+
+        // Carve a scratch buffer out of the guest stack for the name. PPC frames
+        // grow down and callees do `stwu r1,-N(r1)`, so parking r1 below the
+        // buffer keeps the callee's frames clear of it and our caller's frame
+        // above it. Restore r1 and the argument registers afterwards.
+        const uint32_t saved_r1 = ctx.r1.u32;
+        const uint32_t saved_r3 = ctx.r3.u32;
+        const uint32_t saved_r4 = ctx.r4.u32;
+        const uint32_t saved_r5 = ctx.r5.u32;
+        const uint32_t buf = (saved_r1 - 1024) & ~15u;
+        const size_t n = std::min<size_t>(scene.size(), 259);
+        for (size_t i = 0; i < n; ++i)
+          REX_STORE_U8(buf + static_cast<uint32_t>(i),
+                       static_cast<uint8_t>(scene[i]));
+        REX_STORE_U8(buf + static_cast<uint32_t>(n), 0);
+
+        ctx.r1.u32 = buf - 256;
+        ctx.r3.u32 = a1;
+        ctx.r4.u32 = buf;
+        ctx.r5.u32 = 0;
+        REX_CALL_INDIRECT_FUNC(0x82534980);
+        ctx.r1.u32 = saved_r1;
+        ctx.r3.u32 = saved_r3;
+        ctx.r4.u32 = saved_r4;
+        ctx.r5.u32 = saved_r5;
+
+        REXLOG_INFO("native: force_load returned — state now {}, name[0]=0x{:02X}",
+                    REX_LOAD_U32(a1 + 28), REX_LOAD_U8(a1 + 29540));
       }
     }
   }
 }
+
+//=============================================================================
+// The load-request chain
+//
+// sub_82534980 is the guest's load-request API. It has exactly one caller,
+// sub_82352AE0 (mx_recomp.15.cpp:76710), which builds the scene name from a
+// registry lookup and is itself a method with five callers. Nothing in this
+// chain has ever been observed to run in native mode — the point of these hooks
+// is to find out how far up it execution actually reaches, so entry-only logging
+// is enough for everything except sub_82534980 itself.
+//=============================================================================
+
+namespace {
+
+// Read a NUL-terminated guest string for logging. Bounded at 260 because that is
+// the buffer size sub_82534980 copies into.
+std::string GuestString(uint8_t* base, uint32_t addr, size_t max = 260) {
+  std::string s;
+  if (!addr) return s;
+  for (size_t i = 0; i < max; ++i) {
+    uint8_t c = REX_LOAD_U8(addr + static_cast<uint32_t>(i));
+    if (!c) break;
+    s.push_back(static_cast<char>(c));
+  }
+  return s;
+}
+
+}  // namespace
+
+// sub_82534980 — AssetDB_RequestLoad(AssetDB, name, flags). Copies up to 260
+// bytes of `name` to AssetDB+29540, stores flags at +29800, and moves the
+// selector 2 -> 3.
+REX_IMPORT(__imp__sub_82534980, orig_RequestLoad, void());
+extern "C" REX_FUNC(sub_82534980) {
+  const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
+  uint32_t a1 = ctx.r3.u32;
+  std::string name = GuestString(base, ctx.r4.u32);
+  uint32_t state_in = a1 ? REX_LOAD_U32(a1 + 28) : 0xFFFFFFFF;
+  REXLOG_INFO("{}: RequestLoad(sub_82534980) a1=0x{:08X} name=\"{}\" flags=0x{:08X} state={}",
+              tag, a1, name, ctx.r5.u32, state_in);
+  orig_RequestLoad(ctx, base);
+  REXLOG_INFO("{}: RequestLoad returned — state {} -> {}", tag, state_in,
+              a1 ? REX_LOAD_U32(a1 + 28) : 0xFFFFFFFF);
+}
+
+// sub_82352AE0 — the sole caller of RequestLoad; resolves the scene name from
+// the registry. Takes a `this` pointer in r3.
+REX_IMPORT(__imp__sub_82352AE0, orig_RequestLoadCaller, void());
+extern "C" REX_FUNC(sub_82352AE0) {
+  REXLOG_INFO("{}: sub_82352AE0 (RequestLoad caller) ENTER this=0x{:08X}",
+              mx::native::g_plugin_mode ? "plugin" : "native", ctx.r3.u32);
+  orig_RequestLoadCaller(ctx, base);
+}
+
+// The five callers of sub_82352AE0. Entry-only — one line each is enough to see
+// where the chain stops.
+#define MX_CHAIN_PROBE(addr, sym)                                             \
+  REX_IMPORT(__imp__sub_##addr, orig_chain_##addr, void());                   \
+  extern "C" REX_FUNC(sub_##addr) {                                           \
+    static int n = 0;                                                         \
+    if (++n <= 5)                                                             \
+      REXLOG_INFO("{}: chain " sym " ENTER #{} r3=0x{:08X}",                  \
+                  mx::native::g_plugin_mode ? "plugin" : "native", n,         \
+                  ctx.r3.u32);                                                \
+    orig_chain_##addr(ctx, base);                                             \
+  }
+
+MX_CHAIN_PROBE(82367A50, "sub_82367A50")
+MX_CHAIN_PROBE(8236B470, "sub_8236B470")
+MX_CHAIN_PROBE(8236B660, "sub_8236B660")
+MX_CHAIN_PROBE(824FB1F0, "sub_824FB1F0")
+MX_CHAIN_PROBE(824FC9A0, "sub_824FC9A0")
+
+#undef MX_CHAIN_PROBE
 
 // sub_82B38558 — TerminatorVtableCtor (installs off_8213F70C vtable)
 REX_IMPORT(__imp__sub_82B38558, orig_VtableCtor, void());

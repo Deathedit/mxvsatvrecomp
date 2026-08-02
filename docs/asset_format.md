@@ -167,17 +167,48 @@ load; nothing does. The loader is idle and healthy, not stuck or broken.
 `*(a1+28)` between one return and the next entry: across a full run the selector
 is never written from outside `sub_8253AA40`.
 
-**Forcing the state (`--force_launch=true`, diagnostic only)**:
-- `2 -> 9` **crashes**. `sub_82541F80 +0xE4` is `lwzx r29,r3,0x20768` with
-  `r3 = *(a1+23132)`, which is null — that slot is written only by
-  `sub_825372C0`, the "Subscene Creation" callback state 4 registers. State 9 is
-  unreachable until 4 has run; both of its branches call `sub_82541F80`.
-- `2 -> 3` runs clean but yields `3 -> 4 -> 2` and parks again (3/3 runs, no
-  access violations, entity counts unmoved). State 4 sets `*(a1+110328) = 1`
-  after `eng+8->vt[2]()` returns non-zero, then immediately reads that flag back
-  at `loc_8253B2EC` and diverts to `sub_825378F0`, which resets the selector.
-  The `state = 5` path at `loc_8253B388` needs `*(a1+110328) == 0` and cannot be
-  reached this way.
+### The load-request API — `sub_82534980`
+
+`sub_82534980(AssetDB, name, flags)` `strncpy`s up to **260 bytes** of `name` into
+`AssetDB+29540` (`sub_82AB4AB0(a1+29540, r4, 260)`,
+`generated/default/mx_recomp.31.cpp:22377`), stores `flags` at `+29800`, and — only
+if `*(AssetDB+28) == 2` — sets the selector to **3** and notifies the listener at
+`*(a1+110788)`. This is the external write the machine waits for.
+
+`AssetDB+29540` is therefore a `MAX_PATH` **string buffer**, and the five sites
+that look like they read a flag are testing `name[0] != 0` — "is a load pending".
+Every one picks state 2 when it is empty. The only other writer is the constructor
+`sub_8253CB38` (`:41615`), zeroing it.
+
+Its **only caller is `sub_82352AE0`** (`mx_recomp.15.cpp:76710`), which resolves the
+name from a registry lookup and is a method with five callers (`sub_82367A50`,
+`sub_8236B470`, `sub_8236B660`, `sub_824FB1F0`, `sub_824FC9A0`). With all seven
+hooked, **none fires in a 40s native run** — the front end that would request a
+load is never entered.
+
+**Correction**: `sub_825378F0` (`:29489`) is not an abort, as previously recorded
+here and in commit `8b396bf`. It is state 4's normal completion — clears
+`+110328`, then routes to state **3** if a name is pending or **2** if not.
+
+**Driving it (`--force_load=NAT_Farm`, diagnostic only)** — identical 3/3 runs,
+zero access violations:
+
+`2 -> 3` (by the API) `-> 4` (~390 ticks of real work) `-> 5 -> 6`, then **parks
+in state 6 `PlayerSetup`**. Entity counts stay `pass0=1 pass1=0 pass2=1`, still
+zero `DRAW_*`, and no file I/O for the requested scene — but states 7/8 are where
+the async content load happens and we park before them, so that last point does
+not yet indict the name.
+
+State 6 takes the `*(a1+110328) == 0` branch to `loc_8253B560`, reads the listener
+at `*(a1+110788)`, and polls through `loc_8253B58C`. **What it waits on is not yet
+determined.** The "NetworkNoPlayers" / per-player UniqueId description in the table
+below would fit a signed-in-player gate, but that is an inference from the RE'd
+summary, not a measurement.
+
+**Superseded**: an earlier `force_launch` cvar wrote `*(AssetDB+28)` directly.
+Forcing `2 -> 9` access-violates — `sub_82541F80 +0xE4` is `lwzx r29,r3,0x20768`
+with `r3 = *(a1+23132)`, null until `sub_825372C0` (the "Subscene Creation"
+callback state 4 registers) has run. That cvar is gone; use `force_load`.
 
 **KEY FINDING**: The state machine is **pure orchestration** — it does NOT load file content itself. It polls flags set by a separate background **LoadingThread** (synchronized via `LoadingThreadEvent` / `LoadingThreadEarlyOutEvent` events created by AssetDB's constructor `AssetDB_Ctor_LoadingThreadEvents` @ 0x8253CB38).
 
