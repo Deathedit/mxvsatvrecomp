@@ -32,6 +32,7 @@ set(MX_SOURCES
     src/gpu/pm4_parser.cpp
     src/gpu/pm4_translator.cpp
     src/gpu/shader_ucode.cpp
+    src/gpu/shader_alu.cpp
     src/gpu/xenos_gpu_state.cpp
 
     # hooks — guest function hooks and mid-ASM stubs

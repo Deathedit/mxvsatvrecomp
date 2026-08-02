@@ -1121,6 +1121,56 @@ Stage 3 conclusion that the world transform is computed in-shader rather than
 supplied as a readable matrix still stands — but the shader computing it now has
 constants to compute it from.
 
+#### The shader ALU interpreter: built, measured, not yet trusted (2026-08-03)
+
+`src/gpu/shader_alu.{h,cpp}` executes a vertex shader's ALU on the CPU and
+returns the clip-space position it exports to register 62. An interpreter
+rather than an HLSL translation because everything needed is already CPU-side —
+microcode, fetched attributes, constant file — and the transcode already walks
+every vertex; emitting HLSL would mean a runtime compiler, a PSO per shader and
+a rewritten draw path to answer the same question.
+
+Implements the vector set (add/mul/max/min/set*/frc/trunc/floor/mad/cnd*/dp4/
+dp3/dp2add/max4/dst/maxa) and the scalar set (adds/muls/subs/max/min/set*/
+frcs/truncs/floors/exp/log*/rcp*/rsq*/sqrt/sin/cos/*_prev/retain_prev), the
+component-relative swizzle rule, source negate and absolute, co-issue, the
+export write-mask scheme (v=1 s=1 is constant 1, v=0 s=0 with scalar_dest_rel
+is constant 0) and clamps. Refuses jumps, calls and loops outright: the decoder
+can over-approximate an attribute set safely, but taking a branch the shader
+would not, or running a loop body once when it runs eight times, yields a
+confidently wrong position.
+
+**Measured on 4000 sampled executions from a forced run:**
+
+| Outcome | Count |
+|---|---|
+| executed ok | 2452 |
+| **relative addressing** (`c[a0 + n]`) | **1012** |
+| unsupported scalar op | 536 — opcodes 42/44/46, the `mulsc`/`addsc`/`subsc` family |
+
+Of those that executed: 1135 land inside the clip volume, 1315 outside, 2
+non-finite. By position format, in/out: `32:212/649  37:756/363  57:167/303`.
+
+**`alu_execute` therefore defaults off.** 46% in-range is not a result to render
+on — and note that out-of-range is not automatically wrong, since off-screen and
+culled geometry legitimately lands there, which is exactly why this number
+cannot settle the question on its own.
+
+**A placement bug worth remembering.** The probe was first written inside
+`TranscodeVertices` after the `transcode_confirmed_formats_only` gate, so it
+only ever saw the k_32_32_32_FLOAT draws that already worked — the format-32
+majority the interpreter exists for was filtered out before measurement. The
+first histogram was 100% `posfmt=57` and looked encouraging. An instrument
+placed downstream of the filter it is meant to justify removing measures
+nothing. `ProbeAluExecution` now runs before the gate.
+
+**The two remaining gaps are named and counted**, which is the point of the
+histogram: implement `a0`-relative constant addressing (the `MaxA`/`MovA` side
+effect plus `c[a0+n]` reads, 25% of failures) and the constant-operand scalar
+family. Both were left out deliberately — the `sc` operand encoding is a
+special case, and guessing at it produces exactly the confidently-wrong
+positions this whole line of work keeps running into.
+
 ### Parser caveat
 
 `Pm4Parser` accepts any Type-3 with `body_word_count <= 0x4000`. A misparsed

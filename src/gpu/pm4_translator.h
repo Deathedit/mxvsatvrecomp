@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gpu/pm4_parser.h"
+#include "gpu/shader_alu.h"
 #include "gpu/shader_ucode.h"
 
 #include <cstdint>
@@ -169,6 +170,10 @@ class Pm4Translator {
   // times — and the CF walk should run once per distinct shader, not per load.
   struct ShaderLayout {
     std::vector<VertexAttribute> attrs;
+    // The microcode itself, kept so the ALU interpreter can run it. Cached per
+    // distinct shader alongside the decode, so this costs one copy per shader
+    // rather than one per draw.
+    std::vector<uint32_t> code;
     bool ok = false;
     const char* fail = nullptr;
     // Whether the shader exported to register 62 at all. Distinguishes a
@@ -228,6 +233,11 @@ class Pm4Translator {
     kAluSourceLoad = 2,
   };
   void NoteAluConstWrite(int source, uint32_t reg_base, uint32_t dwords);
+
+  // Histogram of what the ALU interpreter managed on real draws — status,
+  // blocking opcodes, and whether the clip coordinates land inside the volume.
+  void NoteAluExecution(const AluResult& r, uint32_t pos_format);
+  void ProbeAluExecution(const DrawCall& dc, const VertexAttribute& pos);
 
   std::map<uint64_t, ShaderLayout> m_shaderCache;
   // The last vertex shader loaded before the current draw. That is how the

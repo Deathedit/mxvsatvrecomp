@@ -15,11 +15,13 @@
 // the pre-gpu/ file layout and it does not build.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <iterator>
 #include <vector>
 
+#include "gpu/shader_alu.h"
 #include "gpu/shader_ucode.h"
 
 namespace {
@@ -241,6 +243,90 @@ void TestNoPositionExport() {
   CheckPickedPosition(attrs, 0, /*want_from_export=*/false);
 }
 
+// Executes fixture 1's ALU on the CPU and checks the position it exports.
+//
+// That shader's export to 62 is `C80F803E 00000000 E2010100`: vector opcode 2
+// (kMax) with src1 and src2 both naming temp register 1 and both swizzles zero
+// — max(r1, r1), the idiomatic Xenos move. Its vector write mask is 0xF and its
+// scalar write mask is 0, so all four exported components come from the vector
+// half. So whatever is seeded into r1 must come back out unchanged, which is a
+// weak-looking assertion that in fact exercises the whole chain: CF bounding,
+// sequence decoding, operand swizzling, the co-issue evaluation and the export
+// write-mask scheme.
+void TestAluPassthrough() {
+  std::printf("fixture 1 executes: export 62 = max(r1,r1) = the fetched pos\n");
+  std::vector<mx::pm4::VertexAttribute> attrs;
+  const char* fail = nullptr;
+  if (!mx::pm4::DecodeVertexShaderFetches(kFixturePosColor28,
+                                          std::size(kFixturePosColor28), attrs,
+                                          &fail)) {
+    std::printf("  FAIL decode returned false: %s\n", fail ? fail : "(none)");
+    ++g_failures;
+    return;
+  }
+  // attrs[0] is the float3 position in r1, attrs[1] the colour in r0.
+  std::vector<std::array<float, 4>> values = {{1.0f, 2.0f, 3.0f, 1.0f},
+                                              {0.25f, 0.5f, 0.75f, 1.0f}};
+  uint32_t consts[2048] = {};
+  mx::pm4::AluInputs in;
+  in.alu_consts = consts;
+  in.alu_const_dwords = 2048;
+
+  mx::pm4::AluResult r = mx::pm4::ExecuteVertexShader(
+      kFixturePosColor28, std::size(kFixturePosColor28), attrs, values, in);
+  std::printf("  status=%s position=(%.3f %.3f %.3f %.3f)\n",
+              mx::pm4::AluStatusName(r.status), r.position[0], r.position[1],
+              r.position[2], r.position[3]);
+  if (r.status != mx::pm4::AluStatus::kOk) {
+    std::printf("  FAIL expected ok, got %s (opcode %u)\n",
+                mx::pm4::AluStatusName(r.status), r.blocking_opcode);
+    ++g_failures;
+    return;
+  }
+  const float want[4] = {1.0f, 2.0f, 3.0f, 1.0f};
+  for (int c = 0; c < 4; ++c) {
+    if (std::fabs(r.position[c] - want[c]) > 1e-6f) {
+      std::printf("  FAIL position[%d] got %.6f, want %.6f\n", c, r.position[c],
+                  want[c]);
+      ++g_failures;
+    }
+  }
+}
+
+// The interpreter must refuse a blob it cannot execute rather than return a
+// confident zero. Fixture 1 with its position export destination changed to an
+// interpolator has no export to 62 at all.
+void TestAluNoPosition() {
+  std::printf("a shader with no export to 62 is refused, not answered\n");
+  uint32_t blob[std::size(kFixturePosColor28)];
+  std::copy(std::begin(kFixturePosColor28), std::end(kFixturePosColor28), blob);
+  blob[18] = 0xC80F8001;
+
+  std::vector<mx::pm4::VertexAttribute> attrs;
+  const char* fail = nullptr;
+  mx::pm4::DecodeVertexShaderFetches(blob, std::size(blob), attrs, &fail);
+  std::vector<std::array<float, 4>> values = {{1, 2, 3, 1}, {0, 0, 0, 1}};
+  uint32_t consts[2048] = {};
+  mx::pm4::AluInputs in;
+  in.alu_consts = consts;
+  in.alu_const_dwords = 2048;
+
+  mx::pm4::AluResult r =
+      mx::pm4::ExecuteVertexShader(blob, std::size(blob), attrs, values, in);
+  std::printf("  status=%s\n", mx::pm4::AluStatusName(r.status));
+  CheckBool("refused with no-position-export",
+            r.status == mx::pm4::AluStatus::kNoPositionExport, true);
+
+  // And it must not crash or hang on the malformed blobs either.
+  const uint32_t garbage[] = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+                              0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
+  mx::pm4::AluResult g =
+      mx::pm4::ExecuteVertexShader(garbage, std::size(garbage), attrs, values, in);
+  std::printf("  garbage blob -> %s\n", mx::pm4::AluStatusName(g.status));
+  CheckBool("garbage is not reported ok", g.status == mx::pm4::AluStatus::kOk,
+            false);
+}
+
 // Malformed input must be rejected, not crash and not spin. Each case is a
 // blob the decoder could plausibly be handed by a desynced parser.
 void TestMalformed() {
@@ -293,6 +379,8 @@ int main() {
   TestPosColor28();
   TestPosUv20();
   TestNoPositionExport();
+  TestAluPassthrough();
+  TestAluNoPosition();
   TestMalformed();
   if (g_failures) {
     std::printf("\n%d check(s) FAILED\n", g_failures);

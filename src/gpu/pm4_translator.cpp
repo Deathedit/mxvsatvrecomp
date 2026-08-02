@@ -1,5 +1,6 @@
 #include "gpu/pm4_translator.h"
 
+#include <cmath>
 #include <cstring>
 #include <map>
 #include <string>
@@ -30,6 +31,16 @@ REXCVAR_DEFINE_BOOL(vertex_transcode, true, "Debug",
 REXCVAR_DEFINE_BOOL(transcode_confirmed_formats_only, true, "Debug",
                     "For guessed positions only, transcode only k_32_32_32_FLOAT "
                     "— the one format confirmed against a real vertex dump");
+
+// Default OFF until the probe histogram says the interpreter handles the
+// shaders this game actually submits. With it off the interpreter still runs on
+// a 1-in-64 sample of draws, read-only, purely to produce that histogram — so
+// one run answers "can it execute these shaders" and "what would it draw"
+// without the second question contaminating the first.
+REXCVAR_DEFINE_BOOL(alu_execute, false, "Debug",
+                    "Compute the vertex position by executing the shader's ALU "
+                    "instead of passing the fetched attribute through the "
+                    "viewport inverse");
 
 // The A/B knob for the export decode. Off reverts to the pure guess, so the
 // two can be compared on one build rather than across two.
@@ -393,6 +404,7 @@ const Pm4Translator::ShaderLayout* Pm4Translator::DecodeAndCacheShader(
   if (it != m_shaderCache.end()) return &it->second;
 
   ShaderLayout layout;
+  layout.code.assign(dwords, dwords + count);
   layout.ok = DecodeVertexShaderFetches(dwords, count, layout.attrs,
                                         &layout.fail,
                                         &layout.saw_position_export);
@@ -825,6 +837,94 @@ void Pm4Translator::LogStrideComparison(const DrawCall& dc,
   }
 }
 
+// Records what the ALU interpreter did with one vertex. The question this has
+// to answer before anything trusts it: does it execute these shaders at all,
+// and when it does, are the coordinates inside the clip volume? Positions in
+// [-1,1] after the perspective divide mean the interpreter and the constants
+// are both right — the same instrument that made the viewport transform
+// unambiguous two rounds ago.
+void Pm4Translator::NoteAluExecution(const AluResult& r, uint32_t pos_format) {
+  static std::map<int, uint64_t> s_status;
+  static std::map<uint32_t, uint64_t> s_blocking;
+  static uint64_t s_inRange = 0, s_outOfRange = 0, s_nonFinite = 0;
+  static std::map<uint32_t, uint64_t> s_inByFormat, s_outByFormat;
+
+  ++s_status[int(r.status)];
+  if (r.status != AluStatus::kOk) {
+    ++s_blocking[r.blocking_opcode];
+  } else {
+    const float w = r.position[3];
+    float x = r.position[0], y = r.position[1], z = r.position[2];
+    if (w != 0.0f) { x /= w; y /= w; z /= w; }
+    if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z)) {
+      ++s_nonFinite;
+    } else if (x >= -1.05f && x <= 1.05f && y >= -1.05f && y <= 1.05f &&
+               z >= -1.05f && z <= 1.05f) {
+      ++s_inRange;
+      ++s_inByFormat[pos_format];
+    } else {
+      ++s_outOfRange;
+      ++s_outByFormat[pos_format];
+    }
+  }
+
+  static uint64_t s_n = 0;
+  if (++s_n <= 10 || (s_n % 4000) == 0) {
+    if (s_n <= 10) {
+      REXLOG_INFO("alu: exec #{} status={} pos=({:.4f} {:.4f} {:.4f} w={:.4f}) "
+                  "posfmt={}",
+                  s_n, AluStatusName(r.status), r.position[0], r.position[1],
+                  r.position[2], r.position[3], pos_format);
+      return;
+    }
+    std::string st, bl, inf, outf;
+    for (const auto& [k, n] : s_status)
+      st += fmt::format("{}:{} ", AluStatusName(AluStatus(k)), n);
+    for (const auto& [k, n] : s_blocking) bl += fmt::format("{}:{} ", k, n);
+    for (const auto& [k, n] : s_inByFormat) inf += fmt::format("{}:{} ", k, n);
+    for (const auto& [k, n] : s_outByFormat) outf += fmt::format("{}:{} ", k, n);
+    REXLOG_INFO("alu: exec {} — status {}— blocking opcodes {}— clip in-range "
+                "{} out-of-range {} non-finite {} — in-range by pos format {}— "
+                "out-of-range by pos format {}",
+                s_n, st, bl.empty() ? "none " : bl, s_inRange, s_outOfRange,
+                s_nonFinite, inf.empty() ? "none " : inf,
+                outf.empty() ? "none " : outf);
+  }
+}
+
+// Runs the interpreter on a sample of vertices, read-only, and feeds
+// NoteAluExecution. Called before the format gate so it sees every draw the
+// transcode could ever handle, not just the ones it already does.
+void Pm4Translator::ProbeAluExecution(const DrawCall& dc,
+                                      const VertexAttribute& pos) {
+  if (!m_currentVs || m_currentVs->code.empty()) return;
+  static uint64_t s_draws = 0;
+  if ((++s_draws % 16) != 1) return;
+  const uint32_t src_stride = dc.vertex_stride;
+  if (src_stride == 0 || dc.vertex_count == 0) return;
+  if (uint64_t(dc.vertex_count) * src_stride > dc.vertices.size()) return;
+
+  AluInputs in;
+  in.alu_consts = m_aluConsts;
+  in.alu_const_dwords = kAluConstDwords;
+  std::vector<std::array<float, 4>> values(m_currentVs->attrs.size());
+
+  const uint32_t n = dc.vertex_count < 2 ? dc.vertex_count : 2;
+  for (uint32_t v = 0; v < n; ++v) {
+    const uint8_t* src = dc.vertices.data() + size_t(v) * src_stride;
+    for (size_t i = 0; i < m_currentVs->attrs.size(); ++i) {
+      float f[4] = {0, 0, 0, 1};
+      ReadVertexAttribute(src, src_stride, m_currentVs->attrs[i], f);
+      for (int c = 0; c < 4; ++c) values[i][c] = f[c];
+    }
+    NoteAluExecution(ExecuteVertexShader(
+                         m_currentVs->code.data(),
+                         static_cast<uint32_t>(m_currentVs->code.size()),
+                         m_currentVs->attrs, values, in),
+                     pos.format);
+  }
+}
+
 void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
   static uint64_t s_done = 0, s_noShader = 0, s_noPos = 0, s_readFail = 0;
   static uint64_t s_passthrough = 0;
@@ -872,6 +972,13 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
   // remaining blocker is "in what space" — a shader ALU translation, not
   // another identification heuristic. Until then only k_32_32_32_FLOAT, which
   // needs no expansion, is transcoded.
+  // The ALU probe runs BEFORE this gate, deliberately. Placed after it, the
+  // probe only ever saw the k_32_32_32_FLOAT draws that already work — the
+  // format-32 majority, which is the entire reason the interpreter exists,
+  // was filtered out before it could be measured. An instrument downstream of
+  // the filter it is meant to justify removing measures nothing.
+  ProbeAluExecution(dc, *pos);
+
   if (REXCVAR_GET(transcode_confirmed_formats_only) && pos->format != 57) {
     ++s_noPos; passthrough(); return;
   }
@@ -892,6 +999,17 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
   static constexpr uint32_t kOutStride = 28;  // float3 position + float4 colour
   std::vector<uint8_t> out(size_t(dc.vertex_count) * kOutStride);
   bool any_read_failed = false;
+  bool used_alu = false;
+
+  // The ALU interpreter. When `alu_execute` is on it replaces the raw attribute
+  // as the position; either way the first vertices of sampled draws are run
+  // through it read-only so the status histogram says what it can and cannot
+  // handle before anything depends on it.
+  const bool alu_on = REXCVAR_GET(alu_execute);
+  AluInputs alu_in;
+  alu_in.alu_consts = m_aluConsts;
+  alu_in.alu_const_dwords = kAluConstDwords;
+  std::vector<std::array<float, 4>> attr_values(m_currentVs->attrs.size());
 
   for (uint32_t v = 0; v < dc.vertex_count; ++v) {
     const uint8_t* src = dc.vertices.data() + size_t(v) * src_stride;
@@ -900,6 +1018,36 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
       any_read_failed = true;
       ++s_unhandled[pos->format];
       break;
+    }
+
+    if (alu_on) {
+      // Every attribute the shader fetches, not just the position: the ALU
+      // reads whichever registers it likes, and an attribute we skipped reads
+      // as zero rather than as what the shader would have seen.
+      for (size_t i = 0; i < m_currentVs->attrs.size(); ++i) {
+        float f[4] = {0, 0, 0, 1};
+        ReadVertexAttribute(src, src_stride, m_currentVs->attrs[i], f);
+        for (int c = 0; c < 4; ++c) attr_values[i][c] = f[c];
+      }
+      const AluResult r = ExecuteVertexShader(
+          m_currentVs->code.data(),
+          static_cast<uint32_t>(m_currentVs->code.size()),
+          m_currentVs->attrs, attr_values, alu_in);
+      if (alu_on && r.status == AluStatus::kOk) {
+        // The interpreter's answer is already clip space, so it must not then
+        // be run through the viewport inverse. Perspective-divide it here and
+        // hand the renderer an identity transform for this draw.
+        const float w = r.position[3];
+        if (w != 0.0f) {
+          p[0] = r.position[0] / w;
+          p[1] = r.position[1] / w;
+          p[2] = r.position[2] / w;
+        } else {
+          p[0] = r.position[0]; p[1] = r.position[1]; p[2] = r.position[2];
+        }
+        p[3] = 1.0f;
+        used_alu = true;
+      }
     }
     // A position carrying its own w is already projected; divide through so the
     // downstream transform sees a consistent object-space point. w == 0 is left
@@ -920,6 +1068,12 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
 
   dc.vertices = std::move(out);
   dc.vertex_stride = kOutStride;
+  // The ALU already produced clip space, so the viewport inverse must not be
+  // applied on top of it. Identity, row-major, matching kGameVS's cbuffer.
+  if (used_alu) {
+    std::memset(dc.mvp, 0, sizeof(dc.mvp));
+    dc.mvp[0] = dc.mvp[5] = dc.mvp[10] = dc.mvp[15] = 1.0f;
+  }
   ++s_done;
   ++s_posFormatsUsed[pos->format];
   if (from_export) ++s_exportFormats[pos->format];
