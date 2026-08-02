@@ -915,6 +915,45 @@ its ~44000 `ReadGuestRange` calls per run — a `VirtualQuery` plus a 64-byte
 memcpy each. If the ALU shadow is kept, caching by (address, size) is the
 obvious dial, since the same three indices are reloaded constantly.
 
+#### The fetch slot comes from the shader now (2026-08-03)
+
+`AttachVertices` chose its vertex buffer with "lowest-indexed slot that
+validated" — a tie-break with nothing behind it. Measured against the decoded
+microcode, it read a buffer the bound shader never fetches from on 14% of draws.
+The vfetch instruction names its fetch constant index, so the tie-break is
+replaced by the answer. Cvar `vfetch_use_shader_slot`, default on; off restores
+the old rule so the two can be compared on one build.
+
+Matching is against the **set** of slots the shader uses, not "the position
+attribute's slot". Identifying position needs a rule for picking it out of the
+attribute list, and the only candidate — "the attribute at offset 0" — is not
+justified yet (see the QuadList caveat in the ALU entry). Slot membership needs
+no such rule.
+
+**A/B on one build, same command line, at frame #501:**
+
+|  | shader slot (on) | lowest validated (off) |
+|---|---|---|
+| submitted | **108** | 85 |
+| skipped | 219 | 232 |
+| skipped strides | `12:301 20:178 36:13505` | `12:443 16:4248 20:26 36:13169` |
+
+Reproduced at 97 / 97 / 108 submitted over three runs against a stable 85.
+**+14 to +27% more draws reach the screen**, and the entire stride-16 skipped
+population — 4248 draws — **disappears** (to 1 and 10 in the confirming runs).
+That is the Stage 2 prediction landing: `h8/v16` was 98% of all slot-matched
+disagreement, and those bogus stride-16 readings simply do not exist once the
+right buffer is read. Slot-missed disagreement fell from 11810 to ~2200.
+
+~7560 draws a run are corrected. About 2200 remain where the shader names a slot
+that no *validated* fetch carries; those still fall back to the old rule rather
+than being dropped, to keep this change to one variable, but they are counted
+and their pixels are not to be trusted.
+
+Cost: `MainLoop` #541 against #601 with the cvar off on the same build. 0 access
+violations across the four runs. **The screen is still black** — that is the
+guest painting it black, which no amount of correct vertex fetching addresses.
+
 ### Parser caveat
 
 `Pm4Parser` accepts any Type-3 with `body_word_count <= 0x4000`. A misparsed

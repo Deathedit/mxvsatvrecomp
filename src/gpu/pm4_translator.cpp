@@ -5,7 +5,16 @@
 #include <string>
 #include <system_error>
 
+#include <rex/cvar.h>
 #include <rex/logging.h>
+
+// Pick the vertex fetch slot the bound shader names, instead of the lowest
+// validated one. Off restores the pre-2026-08-02 tie-break, so the two can be
+// compared on the same build.
+REXCVAR_DEFINE_BOOL(vfetch_use_shader_slot, true, "Debug",
+                    "Choose the vertex fetch slot from the shader's vfetch "
+                    "instruction rather than taking the lowest one that "
+                    "validated");
 
 namespace mx::pm4 {
 
@@ -745,6 +754,58 @@ void Pm4Translator::AttachVertices(DrawCall& dc, uint8_t* guest_base) {
   if (accepted > 1 && log_this) {
     REXLOG_INFO("translator: vfetch AMBIGUOUS — {} slots validated, took slot {}",
                 accepted, pick->slot);
+  }
+
+  // Ask the shader which slot it actually fetches from.
+  //
+  // "Lowest-indexed slot that validated" is a tie-break with nothing behind it,
+  // and it was measurably wrong: 14% of draws — ~12000 a run — were reading a
+  // buffer the bound shader never fetches. The vfetch instruction names its
+  // fetch constant index, so the tie-break can be replaced by the answer.
+  //
+  // Matching is done against the *set* of slots the shader uses rather than
+  // "the position attribute's slot", deliberately. Identifying position needs a
+  // rule for picking it out of the attribute list, and the one available —
+  // "the attribute at offset 0" — is not yet justified: for QuadList shaders
+  // that attribute decodes to values with w=0 and a range of about +-1.75,
+  // which may not be a position at all. Slot membership needs no such rule.
+  const VertexFetch* heuristic_pick = pick;
+  if (REXCVAR_GET(vfetch_use_shader_slot) && m_currentVs && m_currentVs->ok &&
+      !m_currentVs->attrs.empty()) {
+    const VertexFetch* by_shader = nullptr;
+    for (const auto& vf : fetches) {
+      if (vf.reject) continue;
+      for (const auto& a : m_currentVs->attrs) {
+        if (a.fetch_slot == vf.slot) { by_shader = &vf; break; }
+      }
+      if (by_shader) break;
+    }
+
+    static uint64_t s_agreed = 0, s_corrected = 0, s_noMatch = 0;
+    if (by_shader == heuristic_pick) {
+      ++s_agreed;
+    } else if (by_shader) {
+      ++s_corrected;
+      pick = by_shader;
+    } else {
+      // The shader names a slot, but no *validated* fetch carries it. The old
+      // behaviour reads some other slot's buffer, which is the bug. Keeping
+      // that fallback is still the lesser evil than dropping the draw — it is
+      // what shipped in every previous run, so leaving it keeps this change to
+      // one variable — but it is counted, because these draws are the ones
+      // whose pixels cannot be trusted.
+      ++s_noMatch;
+    }
+    static uint64_t s_total = 0;
+    if ((++s_total % 5000) == 0) {
+      REXLOG_INFO("translator: SLOT heuristic already right {}, corrected {}, "
+                  "shader slot not among validated fetches {}",
+                  s_agreed, s_corrected, s_noMatch);
+    }
+    if (by_shader && by_shader != heuristic_pick && log_this) {
+      REXLOG_INFO("translator: vfetch slot CORRECTED {} -> {} (shader names it)",
+                  heuristic_pick->slot, by_shader->slot);
+    }
   }
 
   // Measure the guess against the shader's own answer. Deliberately placed
