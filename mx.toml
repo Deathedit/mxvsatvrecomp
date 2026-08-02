@@ -34,3 +34,14 @@
 # (sub_82534980); this calls it once, 30 ticks after it settles, with the name
 # below. Empty means off. Diagnostic only. See AGENTS.md "force_load".
 # force_load = "NAT_Farm"
+
+# Override guest registry values as they are read, as comma-separated key=value
+# pairs. MXRegistry.bxml is the guest's settings store and tools/ has decoders
+# but no encoder, so this is the only way to change one. Applies to both the
+# string getter (sub_825487C8) and the int getter (sub_82548758).
+#
+# ReadyToLaunch=1 is the one that matters today: it is the third term of the
+# state 6 gate, and setting it takes the loader through the whole sequence
+# (2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 11 -> 2) instead of parking at 6. Pair it
+# with force_load. Diagnostic only. See AGENTS.md "the registry chokepoint".
+# registry_override = "ReadyToLaunch=1"

@@ -646,6 +646,75 @@ error on my part.
 `force_load` is diagnostic. It substitutes for a front end that never runs; it is
 not a step toward correct behaviour.
 
+#### The registry chokepoint, and `registry_override` (2026-08-02)
+
+**Correction**: the section above calls `sub_82536250` a *game-mode* gate whose
+argument is the AssetDB. Both halves are wrong. `sub_82536250` **ignores its
+argument entirely** — it reads the registry object from `*(0x82D6605C)`, fetches
+one key, and maps the string through `sub_82533D20`. And the vocabulary is
+**network mode**, not game mode. Named at runtime, not inferred:
+
+| Index | Name | |
+|---|---|---|
+| 0 | `SplitScreen` | |
+| 1 | `SinglePlayer` | |
+| 2 | `Online` | gate passes |
+| 3 | `LAN` | gate passes |
+| 4 | `None` | **measured** |
+
+(`sub_82533D20` scans the 5-entry table at `0x82D1F810` and returns 5 if nothing
+matches; `sub_82536250` returns 1 if the registry read itself fails.)
+
+All guest settings come from `MXRegistry.bxml` through a getter family that
+hashes the key with `sub_82473360` and differs only by value type:
+
+| Getter | Type | Signature |
+|---|---|---|
+| `sub_825487C8` | string | `(registry, key, out, size, 0)`, non-zero if found |
+| `sub_82548758` | int | `(registry, key, out, 0)`, written through `out` |
+| `sub_82548EA8` | int set | `(registry, key, value, 0)` |
+
+Three keys are now named, all dumped at runtime — **an earlier reading of this
+guessed `UISceneName`/`startMode` from `.rdata` spacing and the shipped
+`MXRegistry.bxml.xml`; the dump falsified it**, and none of the three keys ship
+in that file at all (they are written at runtime):
+
+| Address | Key | Read by |
+|---|---|---|
+| `0x8200C864` | `Location` | `sub_82352AE0` — the scene name it requests |
+| `0x8200C870` | `PlayerMode` | `sub_82536250` — measured `"None"` |
+| `0x8204C630` | `ReadyToLaunch` | the state 6 gate's third term |
+
+So the gate reads as *"are we Online/LAN — if not, has anything declared
+ReadyToLaunch"*. Its passing branch **writes `ReadyToLaunch = 1` back** via
+`sub_82548EA8`, which makes it sticky. Forcing `PlayerMode` to `Online` would
+assert a network session that does not exist; `ReadyToLaunch` is the launch
+confirmation a front end would set, and is the honest lever.
+
+**`registry_override = "k=v,k=v"`** (`mx.toml` or `--registry_override=...`,
+empty = off) substitutes values as they are read, in both getters. `tools/` has
+bxml decoders but no encoder, so this is the only way to change a setting.
+
+**Measured**, `--skip_intro=true --force_load=NAT_Farm
+--registry_override=ReadyToLaunch=1`, identical 3/3, zero access violations:
+
+```
+2 -> 3 -> 4 (~380 ticks) -> 5 -> 6 -> 7 -> 8 -> 11 -> 2
+```
+
+The first complete load in this effort — the sequence runs to the end and returns
+to idle. The control (same command, no `registry_override`) parks at 6 with the
+gate returning 0 and `ReadyToLaunch` reading 0, so the causation is isolated.
+
+**Entity counts moved for the first time**: `pass0=1 pass1=0 pass2=1` flips to
+`pass0=0 pass1=1 pass2=1` about one second after the load completes, and stays.
+Still **zero `DRAW_*` and zero `INDIRECT_BUFFER`** — the entity block advanced a
+pass, it did not produce geometry.
+
+`--force_load=UI_World` also completes but spends **1 tick** in state 4 against
+~380 for `NAT_Farm`: it loads essentially nothing. `NAT_Farm` is the right
+target, which fits the key being named `Location`.
+
 ### Known external blockers
 - Binary `.xenon.package` heaps are encrypted (entropy ≈7.98, unknown routine; the OpenSSL AES bundle in the guest is TLS-only)
 - FATAL crash at 0x82327CF0 during gameplay (separate known issue)

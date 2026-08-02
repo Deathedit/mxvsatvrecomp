@@ -197,7 +197,8 @@ zero access violations:
 in state 6 `PlayerSetup`**. Entity counts stay `pass0=1 pass1=0 pass2=1`, still
 zero `DRAW_*`, and no file I/O for the requested scene — but states 7/8 are where
 the async content load happens and we park before them, so that last point does
-not yet indict the name.
+not yet indict the name. (Pairing this with `registry_override=ReadyToLaunch=1`
+gets past 6 — see "The registry chokepoint" below.)
 
 ### The state 6 gate — resolved
 
@@ -225,12 +226,56 @@ Measured, identical 3/3, zero access violations: `sub_82536250` returns **4**
 registry fallback returns **0**. State 1 clears `*(0x83057900)` itself
 (`stw r25,30976(r8)`, `r25 = 0`), so boot closes that escape.
 
-It is a **game-mode** gate. The loader only proceeds in modes 2/3, and the
-registry currently reports 4.
-
 Note `lis r11,-31995` is `0x83050000` — the AssetDB global `dword_830577C0`,
 confirmed at runtime. An earlier note claiming a separate null global was an
 arithmetic error.
+
+### The registry chokepoint — and opening the gate
+
+**Correction**: this section previously called `sub_82536250` a *game-mode* gate
+taking the AssetDB. It **ignores its argument**, reading the registry object from
+`*(0x82D6605C)`, and the vocabulary is **network mode** — `sub_82533D20` scans
+the 5-entry table at `0x82D1F810` (5 if nothing matches):
+
+| 0 | 1 | 2 | 3 | 4 |
+|---|---|---|---|---|
+| `SplitScreen` | `SinglePlayer` | `Online` *(passes)* | `LAN` *(passes)* | `None` **(measured)** |
+
+Guest settings come from `MXRegistry.bxml` through one getter family — all hash
+the key with `sub_82473360`: `sub_825487C8` (string, `(reg, key, out, size, 0)`),
+`sub_82548758` (int, written through `out`), `sub_82548EA8` (int set). Three keys
+are named, all dumped at runtime after an earlier `.rdata`-spacing guess of
+`UISceneName`/`startMode` proved wrong. None of them ship in the bxml — they are
+written at runtime:
+
+| Address | Key | Read by |
+|---|---|---|
+| `0x8200C864` | `Location` | `sub_82352AE0` — the scene name it requests |
+| `0x8200C870` | `PlayerMode` | `sub_82536250` — measured `"None"` |
+| `0x8204C630` | `ReadyToLaunch` | the gate's third term |
+
+The gate is therefore *"are we Online/LAN — if not, has anything declared
+ReadyToLaunch"*, and its passing branch writes `ReadyToLaunch = 1` back through
+`sub_82548EA8`, making it sticky. `ReadyToLaunch` is the launch confirmation a
+front end sets; `PlayerMode` would be a claim of a network session that does not
+exist.
+
+**`registry_override = "k=v,k=v"`** substitutes values in both getters — `tools/`
+has bxml decoders but no encoder, so it is the only way to change a setting. With
+`--force_load=NAT_Farm --registry_override=ReadyToLaunch=1`, identical 3/3, zero
+access violations:
+
+```
+2 -> 3 -> 4 (~380 ticks) -> 5 -> 6 -> 7 -> 8 -> 11 -> 2
+```
+
+The first complete load — it runs to the end and returns to idle. The control
+without the override parks at 6 with the gate returning 0. Entity counts flip
+`pass0=1 pass1=0 pass2=1` -> `pass0=0 pass1=1 pass2=1` a second after completion
+and stay there; **`DRAW_*` and `INDIRECT_BUFFER` are still zero**.
+
+`--force_load=UI_World` completes too but spends 1 tick in state 4 against ~380
+for `NAT_Farm`, so it loads nothing of substance.
 
 **Superseded**: an earlier `force_launch` cvar wrote `*(AssetDB+28)` directly.
 Forcing `2 -> 9` access-violates — `sub_82541F80 +0xE4` is `lwzx r29,r3,0x20768`
