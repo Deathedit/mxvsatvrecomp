@@ -85,6 +85,30 @@ uint32_t ExecSequence(const uc::ControlFlowInstruction& cf) {
   }
 }
 
+// How many source operands each vector opcode actually reads. The SDK knows —
+// kAluVectorOpcodeInfos::GetOperandCount — but that table is `extern const` and
+// defined inside the sealed plugin DLL, so it cannot be linked against. This is
+// transcribed from the per-opcode signatures documented in the enum itself
+// (AluVectorOpcode in ucode.h), which give the operand list for every one.
+//
+// Reading a source the opcode does not use is not harmless here. The position
+// export in both ground-truth shaders is a two-operand op whose unused src3
+// field still names temp register 0 — the colour register — so consulting all
+// three marked colour as feeding the position. That is the exact false positive
+// this table exists to prevent.
+//
+// Opcodes 30 and 31 are undefined; 3 is the conservative answer for them.
+constexpr uint8_t kVectorOperandCount[32] = {
+    2, 2, 2, 2, 2, 2, 2, 2,  // add mul max min seq sgt sge sne
+    1, 1, 1,                 // frc trunc floor
+    3, 3, 3, 3,              // mad cndeq cndge cndgt
+    2, 2, 3, 2, 1,           // dp4 dp3 dp2add cube max4
+    2, 2, 2, 2,              // setp_{eq,ne,gt,ge}_push
+    2, 2, 2, 2,              // kill_{eq,gt,ge,ne}
+    2, 2,                    // dst maxa
+    3, 3,                    // undefined
+};
+
 }  // namespace
 
 uint32_t VertexFormatSizeBytes(uint32_t format, uint32_t* out_components) {
@@ -239,8 +263,27 @@ bool ReadVertexAttribute(const uint8_t* vertex_base, uint32_t vertex_bytes,
 }
 
 const VertexAttribute* PickPositionAttribute(
-    const std::vector<VertexAttribute>& attrs) {
+    const std::vector<VertexAttribute>& attrs, bool* out_from_export) {
+  if (out_from_export) *out_from_export = false;
+
+  // The shader's own answer, when the ALU trace produced one. Several
+  // attributes can legitimately reach the export — a skinned mesh exports a
+  // position built from bone weights and indices as well as the point — so
+  // among the contributors still prefer the one that looks most like a
+  // coordinate, lowest offset breaking the tie.
   const VertexAttribute* best = nullptr;
+  for (const auto& a : attrs) {
+    if (!a.feeds_position || a.components < 2) continue;
+    if (!best || a.offset_bytes < best->offset_bytes) best = &a;
+  }
+  if (best) {
+    if (out_from_export) *out_from_export = true;
+    return best;
+  }
+
+  // Fallback: the guess this used to make unconditionally. Kept because a
+  // shader whose ALU we could not follow is better served by a guess than by
+  // nothing, but the caller is now told which it got.
   for (const auto& a : attrs) {
     if (a.components < 2) continue;
     switch (a.format) {
@@ -269,12 +312,14 @@ const VertexAttribute* PickColorAttribute(
 
 bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
                                std::vector<VertexAttribute>& out,
-                               const char** fail) {
+                               const char** fail,
+                               bool* out_saw_position_export) {
   auto reject = [&](const char* why) {
     if (fail) *fail = why;
     return false;
   };
   if (fail) *fail = nullptr;
+  if (out_saw_position_export) *out_saw_position_export = false;
 
   if (!dwords) return reject("null blob");
   if (dword_count < 3) return reject("blob shorter than one CF pair");
@@ -317,6 +362,22 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
   bool have_full = false;
   uint32_t cf_seen = 0;
 
+  // Which fetched attributes reach the position export.
+  //
+  // taint[r] is a bitmask of indices into the attributes this call appends, one
+  // bit per attribute, recording which of them the value currently in GPR r was
+  // built from. A vfetch writing r resets it to just that attribute; an ALU
+  // instruction unions its source registers' masks into its destination; an
+  // export to register 62 unions them into pos_taint. kMaxAttributes is 32, so
+  // one uint32_t per register is exactly enough.
+  //
+  // Only the operands the opcode actually reads count — see
+  // kVectorOperandCount, and the false positive that made it necessary.
+  const size_t out_base = out.size();
+  uint32_t taint[64] = {};
+  uint32_t pos_taint = 0;
+  bool saw_position_export = false;
+
   for (uint32_t i = 0; i + 2 < max_cf_dword; i += 3) {
     uc::ControlFlowInstruction cf[2];
     uc::UnpackControlFlowInstructions(dwords + i, cf);
@@ -329,13 +390,58 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
       const uint32_t seq = ExecSequence(cf[j]);
 
       for (uint32_t n = 0; n < count; ++n) {
+        const uint64_t at = (uint64_t(addr) + n) * 3;
+        if (at + 3 > dword_count) return reject("instruction out of range");
+        const uint32_t* ins = dwords + at;
+
         // Sequence bits, 2 per instruction: bit[2n] selects fetch (1) over ALU
         // (0), bit[2n+1] is serialize, which does not concern us.
-        if (!((seq >> (n * 2)) & 0x1)) continue;
+        if (!((seq >> (n * 2)) & 0x1)) {
+          // An ALU instruction. We do not evaluate it — only follow which
+          // registers its result depends on, which is all that is needed to
+          // learn what feeds the position export.
+          uc::AluInstruction alu{};
+          std::memcpy(&alu, ins, sizeof(alu));
 
-        const uint64_t at = (uint64_t(addr) + n) * 3;
-        if (at + 3 > dword_count) return reject("fetch instruction out of range");
-        const uint32_t* ins = dwords + at;
+          // A source only contributes if it is a temp register (a constant
+          // carries no fetch) and the opcode actually reads it.
+          auto temp_taint = [&](size_t s) -> uint32_t {
+            if (!alu.src_is_temp(s)) return 0;
+            return taint[uc::AluInstruction::src_temp_reg(alu.src_reg(s)) & 63];
+          };
+          uint32_t vec_taint = 0;
+          const uint32_t operands =
+              kVectorOperandCount[uint32_t(alu.vector_opcode()) & 31];
+          for (size_t s = 1; s <= operands; ++s) vec_taint |= temp_taint(s);
+          // The scalar operand always occupies the src3 slot.
+          const uint32_t sca_taint = temp_taint(3);
+
+          if (alu.is_export()) {
+            // On an export both the vector and the scalar operation write to
+            // vector_dest, so one destination check covers the instruction —
+            // but only the halves that actually write anything contribute.
+            if (alu.vector_dest() == kPositionExportRegister) {
+              saw_position_export = true;
+              if (alu.vector_write_mask()) pos_taint |= vec_taint;
+              if (alu.scalar_write_mask()) pos_taint |= sca_taint;
+            }
+            continue;
+          }
+
+          // A full write mask replaces the register's provenance; a partial one
+          // leaves the untouched components carrying whatever they had, so it
+          // has to union. Relative destination addressing is not resolved —
+          // the index lives in a register we do not evaluate — so such a write
+          // lands on the base register and is a known imprecision.
+          if (alu.vector_write_mask()) {
+            uint32_t& t = taint[alu.vector_dest() & 63];
+            t = (alu.vector_write_mask() == 0xF) ? vec_taint : (t | vec_taint);
+          }
+          if (alu.scalar_write_mask()) {
+            taint[alu.scalar_dest() & 63] |= sca_taint;
+          }
+          continue;
+        }
 
         // FetchOpcode is the low 5 bits of word 0. Anything but kVertexFetch
         // here is a texture fetch, which carries no vertex layout.
@@ -379,10 +485,22 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
         a.is_signed = vf.is_signed();
         a.is_normalized = vf.is_normalized();
         a.exp_adjust = vf.exp_adjust();
+
+        // A fetch defines its destination outright, discarding whatever the
+        // register held. Attributes past the 32nd cannot be represented in the
+        // mask, but kMaxAttributes caps the list at 32 above, so the index is
+        // always in range.
+        const size_t index = out.size() - out_base;
+        taint[a.dest_reg & 63] = uint32_t(1) << index;
         out.push_back(a);
       }
     }
   }
+
+  for (size_t i = out_base; i < out.size(); ++i) {
+    if (pos_taint & (uint32_t(1) << (i - out_base))) out[i].feeds_position = true;
+  }
+  if (out_saw_position_export) *out_saw_position_export = saw_position_export;
 
   return true;
 }

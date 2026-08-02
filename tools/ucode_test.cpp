@@ -14,8 +14,10 @@
 // translator_test.cpp is deliberately not extended — its includes still name
 // the pre-gpu/ file layout and it does not build.
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdint>
+#include <iterator>
 #include <vector>
 
 #include "gpu/shader_ucode.h"
@@ -37,11 +39,12 @@ void Dump(const std::vector<mx::pm4::VertexAttribute>& attrs) {
     const auto& a = attrs[i];
     std::printf(
         "  attr[%zu] slot=%-2u off=%-3u stride=%-3u fmt=%-2u comps=%u "
-        "size=%-2u dest=r%u swiz=0x%03X%s%s exp=%d%s\n",
+        "size=%-2u dest=r%u swiz=0x%03X%s%s exp=%d%s%s\n",
         i, a.fetch_slot, a.offset_bytes, a.stride_bytes, a.format,
         a.components, a.size_bytes, a.dest_reg, a.dest_swizzle,
         a.is_signed ? " signed" : "", a.is_normalized ? " norm" : "",
-        a.exp_adjust, a.from_mini ? " (mini)" : " (full)");
+        a.exp_adjust, a.from_mini ? " (mini)" : " (full)",
+        a.feeds_position ? " POSITION" : "");
   }
 }
 
@@ -50,6 +53,22 @@ void CheckBool(const char* what, bool got, bool want) {
   std::printf("  FAIL %-28s got %s, want %s\n", what, got ? "true" : "false",
               want ? "true" : "false");
   ++g_failures;
+}
+
+// PickPositionAttribute must land on `want_index`, and must say it got there
+// from the shader's export trace rather than the offset/format fallback.
+void CheckPickedPosition(const std::vector<mx::pm4::VertexAttribute>& attrs,
+                         size_t want_index, bool want_from_export) {
+  bool from_export = false;
+  const mx::pm4::VertexAttribute* got =
+      mx::pm4::PickPositionAttribute(attrs, &from_export);
+  if (got != &attrs[want_index]) {
+    std::printf("  FAIL %-28s picked %s, want attr[%zu]\n", "position pick",
+                got ? "a different attribute" : "nothing", want_index);
+    ++g_failures;
+    return;
+  }
+  CheckBool("position pick from export", from_export, want_from_export);
 }
 
 // ---------------------------------------------------------------------------
@@ -109,9 +128,10 @@ void TestPosColor28() {
   std::printf("fixture 1: pos3@0 + color4@12, stride 28\n");
   std::vector<mx::pm4::VertexAttribute> attrs;
   const char* fail = nullptr;
+  bool saw_export = false;
   if (!mx::pm4::DecodeVertexShaderFetches(kFixturePosColor28,
                                           std::size(kFixturePosColor28), attrs,
-                                          &fail)) {
+                                          &fail, &saw_export)) {
     std::printf("  FAIL decode returned false: %s\n", fail ? fail : "(none)");
     ++g_failures;
     return;
@@ -137,15 +157,26 @@ void TestPosColor28() {
   CheckU32("attrs[1].size_bytes", attrs[1].size_bytes, 16);
   CheckU32("attrs[1].dest_reg", attrs[1].dest_reg, 0);
   CheckBool("attrs[1].from_mini", attrs[1].from_mini, true);
+
+  // The export trace. Instruction 6 is `C80F803E 00000000 E2010100`: bits[5:0]
+  // of word 0 are 62 (the position export) with export_data set, and word 2's
+  // src1 names temp register 1 — the register attrs[0] was fetched into. So the
+  // shader itself says attribute 0 is the position, and attribute 1 (dest_reg
+  // 0, exported to register 0 by the preceding instruction) is not.
+  CheckBool("saw position export", saw_export, true);
+  CheckBool("attrs[0].feeds_position", attrs[0].feeds_position, true);
+  CheckBool("attrs[1].feeds_position", attrs[1].feeds_position, false);
+  CheckPickedPosition(attrs, 0, /*want_from_export=*/true);
 }
 
 void TestPosUv20() {
   std::printf("fixture 2: pos3@0 + float2@12, stride 20, slot 95\n");
   std::vector<mx::pm4::VertexAttribute> attrs;
   const char* fail = nullptr;
+  bool saw_export = false;
   if (!mx::pm4::DecodeVertexShaderFetches(kFixturePosUv20,
                                           std::size(kFixturePosUv20), attrs,
-                                          &fail)) {
+                                          &fail, &saw_export)) {
     std::printf("  FAIL decode returned false: %s\n", fail ? fail : "(none)");
     ++g_failures;
     return;
@@ -169,6 +200,45 @@ void TestPosUv20() {
   CheckU32("attrs[1].size_bytes", attrs[1].size_bytes, 8);
   CheckU32("attrs[1].dest_reg", attrs[1].dest_reg, 0);
   CheckBool("attrs[1].from_mini", attrs[1].from_mini, true);
+
+  // Same export instruction as fixture 1, in a shader with a different layout:
+  // `C80F803E 00000000 E2010100` at instruction 5. Independent confirmation that
+  // the position register is not a constant of one shader.
+  CheckBool("saw position export", saw_export, true);
+  CheckBool("attrs[0].feeds_position", attrs[0].feeds_position, true);
+  CheckBool("attrs[1].feeds_position", attrs[1].feeds_position, false);
+  CheckPickedPosition(attrs, 0, /*want_from_export=*/true);
+}
+
+// A blob with fetches but no export to register 62 must leave every attribute
+// unmarked and fall back to the offset/format guess — not silently claim the
+// shader confirmed something. This is fixture 1 with the two export
+// destinations changed from 62 and 0 to interpolators 1 and 0; everything else,
+// including both fetches, is untouched.
+void TestNoPositionExport() {
+  std::printf("no export to register 62 falls back to the guess\n");
+  uint32_t blob[std::size(kFixturePosColor28)];
+  std::copy(std::begin(kFixturePosColor28), std::end(kFixturePosColor28), blob);
+  blob[18] = 0xC80F8001;  // was 0xC80F803E — export to interpolator 1
+
+  std::vector<mx::pm4::VertexAttribute> attrs;
+  const char* fail = nullptr;
+  bool saw_export = true;
+  if (!mx::pm4::DecodeVertexShaderFetches(blob, std::size(blob), attrs, &fail,
+                                          &saw_export)) {
+    std::printf("  FAIL decode returned false: %s\n", fail ? fail : "(none)");
+    ++g_failures;
+    return;
+  }
+  Dump(attrs);
+  CheckU32("attribute count", (uint32_t)attrs.size(), 2);
+  if (attrs.size() != 2) return;
+  CheckBool("saw position export", saw_export, false);
+  CheckBool("attrs[0].feeds_position", attrs[0].feeds_position, false);
+  CheckBool("attrs[1].feeds_position", attrs[1].feeds_position, false);
+  // The fallback still answers, and on this layout it answers correctly — but
+  // it must report that it guessed.
+  CheckPickedPosition(attrs, 0, /*want_from_export=*/false);
 }
 
 // Malformed input must be rejected, not crash and not spin. Each case is a
@@ -222,6 +292,7 @@ void TestMalformed() {
 int main() {
   TestPosColor28();
   TestPosUv20();
+  TestNoPositionExport();
   TestMalformed();
   if (g_failures) {
     std::printf("\n%d check(s) FAILED\n", g_failures);

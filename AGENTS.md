@@ -1011,6 +1011,84 @@ not fit the stride actually read.
 0 access violations across 3 forced runs plus control; `MainLoop` #541,
 `LoaderTick` #500.
 
+#### The export 62 decode: right attribute, wrong space (2026-08-03)
+
+> **Annotates the entry above.** Its closing claim — that decoding export 62 is
+> "the thing standing between this transcode and every stride and format
+> rendering" — is now measured, and it is **wrong**. The decode landed and works;
+> the screen did not change. What it removed was the *identification* blocker,
+> and that turned out not to be the only one.
+
+`DecodeVertexShaderFetches` now walks ALU instructions as well as fetches and
+tracks, per GPR, which fetched attributes reach the export to register 62. A
+vfetch defines its destination; an ALU instruction unions its sources' taint
+into its destination; an export to 62 unions into the answer. Branches are still
+not followed and loops not unrolled.
+
+**Ground truth, decoded by hand before the code was written.** Both fixtures end
+with `C80F803E 00000000 E2010100`. In word 0, bits[5:0] = 62 and bit 15
+(`export_data`) is set. In word 2, `src1_sel` = 1 (temp) and `src1_reg` = 1 — so
+the position export reads GPR 1, which is exactly the `dest_reg` of the
+float3 vfetch in both. `C80F8000 ... E2000000` exports GPR 0, the colour. This
+is the shader stating its own layout.
+
+**The operand-count trap, which the fixtures caught.** The first version
+consulted all three source operands because `kAluVectorOpcodeInfos` — the SDK
+table that would say how many an opcode reads — is `extern const` and lives in
+the sealed plugin DLL. That marked colour as feeding position in *both*
+fixtures: the export is a two-operand op whose unused `src3` field still names
+temp register 0. `kVectorOperandCount` in `shader_ucode.cpp` is transcribed from
+the per-opcode signatures documented in `AluVectorOpcode` itself. Over-approximating
+was not the safe direction it looked like.
+
+**What it bought, measured over 65000 transcoded draws:**
+
+- **97% of draws now have a shader-identified position** (48340 from the export
+  trace against 1468 from the fallback guess).
+- **Transcode read failures fell from ~2000 a run to 17-21.** The old guess was
+  picking attributes that did not fit the stride; the shader's answer does.
+- Every decoded shader that exported to 62 traced it back to a fetch. None
+  computed its position purely from constants.
+
+**What it did not buy: any pixels.**
+
+|  | guess, confirmed formats | export trace, all formats | export trace, confirmed formats |
+|---|---|---|---|
+| submitted / frame | 100 | 253 | **100** |
+| skipped | 215-217 | 34 | 215-217 |
+| screen | black | **white, spikes off the top-left** | black |
+
+Trusting the export in whatever format it declares does raise submitted draws to
+253 and empties the skipped-stride histogram — and whites the window out with
+degenerate triangles fanning from the corner, identical at t+80s and t+105s.
+
+**So the earlier diagnosis was half right.** k_16_16_16_16_FLOAT really is what
+the position export reads, in 35655 of 65000 draws — the doubt recorded above
+about those attributes being texcoords was wrong, and the trace refutes it. The
+remaining defect is not *which* attribute but *what space*: half-float positions
+are compressed model space that the shader expands with a per-object scale and
+bias, and the ALU probe already established this game computes that transform in
+the shader rather than supplying a matrix we can read. Raw half-floats through
+the viewport inverse land far outside the frustum, which is the corner spray.
+
+`transcode_confirmed_formats_only` therefore still defaults **on**, and now
+applies to export-traced positions too, not just guessed ones. `transcode_trust_export`
+(default on) is the A/B knob for the trace itself.
+
+**The next blocker is a shader ALU translator, not another heuristic.** That is
+a materially larger piece of work than this was, and worth saying plainly rather
+than discovering a third time.
+
+Verification: `ucode_test` passes both fixtures, a new negative fixture (export
+destination changed from 62 to an interpolator, which must fall back to the
+guess and report that it guessed), and the malformed-blob cases. 3 forced runs
+clean, 0 AVs, `RenderThread` #501 at 100/215 in two of three — the third logged
+one outlier frame at 2/37. **One earlier run did take an access violation**
+(`read at 0xFFFFFFFFFFFFFFFF`, host RIP in the plugin DLL near `0x7FFED67D5xxx`);
+the same signature appears in mx_018, mx_070, mx_073 and mx_079, all predating
+this work, so it is the known race rather than a new fault — but it is 1 in 7
+runs of this build against a recorded 1 in 9, which does not separate the two.
+
 ### Parser caveat
 
 `Pm4Parser` accepts any Type-3 with `body_word_count <= 0x4000`. A misparsed

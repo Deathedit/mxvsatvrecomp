@@ -171,6 +171,10 @@ class Pm4Translator {
     std::vector<VertexAttribute> attrs;
     bool ok = false;
     const char* fail = nullptr;
+    // Whether the shader exported to register 62 at all. Distinguishes a
+    // position built entirely from constants (export seen, nothing tainted)
+    // from a blob whose export we never reached.
+    bool saw_position_export = false;
   };
 
   // IM_LOAD_IMMEDIATE (0x2B) — microcode inline in the ring, 68/frame.

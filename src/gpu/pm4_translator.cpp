@@ -18,18 +18,24 @@ REXCVAR_DEFINE_BOOL(vertex_transcode, true, "Debug",
                     "Convert guest vertices into the POSITION float3 + COLOR "
                     "float4 layout the game PSO declares");
 
-// Default ON, and the measurement says it must be. Transcoding every format the
-// "lowest-offset attribute that could hold coordinates" rule accepts raises
-// submitted draws from 97 to 282 — and turns the window entirely white, because
-// the rule is wrong for the formats it was never confirmed on. Restricted to
-// k_32_32_32_FLOAT the screen is unchanged and 100 draws are submitted.
+// Applies only to positions picked by the offset/format *guess*. Transcoding
+// every format that rule accepts raised submitted draws from 97 to 282 and
+// turned the window entirely white: the rule is wrong for the formats it was
+// never confirmed on, and k_32_32_32_FLOAT is the only one a real vertex dump
+// ever confirmed.
 //
-// The transcode itself is not what is wrong here; identifying which attribute
-// is the position is. Until that is read out of the shader rather than guessed
-// from offset, the doubtful formats stay out.
+// A position the shader itself identified — traced from the fetch destination
+// to the register 62 export — is not a guess and is not restricted by this. That
+// is the whole point of the export decode; see the gate in TranscodeVertices.
 REXCVAR_DEFINE_BOOL(transcode_confirmed_formats_only, true, "Debug",
-                    "Transcode only draws whose position is k_32_32_32_FLOAT, "
-                    "the one format confirmed against a real vertex dump");
+                    "For guessed positions only, transcode only k_32_32_32_FLOAT "
+                    "— the one format confirmed against a real vertex dump");
+
+// The A/B knob for the export decode. Off reverts to the pure guess, so the
+// two can be compared on one build rather than across two.
+REXCVAR_DEFINE_BOOL(transcode_trust_export, true, "Debug",
+                    "Take the position attribute from the shader's register-62 "
+                    "export trace, in whatever format it declares");
 
 REXCVAR_DEFINE_BOOL(vfetch_use_shader_slot, true, "Debug",
                     "Choose the vertex fetch slot from the shader's vfetch "
@@ -346,7 +352,8 @@ const Pm4Translator::ShaderLayout* Pm4Translator::DecodeAndCacheShader(
 
   ShaderLayout layout;
   layout.ok = DecodeVertexShaderFetches(dwords, count, layout.attrs,
-                                        &layout.fail);
+                                        &layout.fail,
+                                        &layout.saw_position_export);
   if (!layout.ok) layout.attrs.clear();
 
   auto [pos, inserted] = m_shaderCache.emplace(key, std::move(layout));
@@ -356,29 +363,48 @@ const Pm4Translator::ShaderLayout* Pm4Translator::DecodeAndCacheShader(
   // and this fires 68+357 times a frame, so an uncapped line would bury the
   // measurement it exists to produce.
   static uint32_t s_logged = 0, s_ok = 0, s_failed = 0;
+  // How the position was identified, per distinct shader. s_exportTraced is the
+  // number whose position we read out of the microcode; s_exportBarren saw the
+  // export but found no fetched attribute reaching it; s_noExport never saw one.
+  // The last two both fall back to the offset/format guess.
+  static uint32_t s_exportTraced = 0, s_exportBarren = 0, s_noExport = 0;
   if (sl.ok) ++s_ok; else ++s_failed;
+  bool traced = false;
+  for (const auto& a : sl.attrs) traced = traced || a.feeds_position;
+  if (sl.ok) {
+    if (traced) ++s_exportTraced;
+    else if (sl.saw_position_export) ++s_exportBarren;
+    else ++s_noExport;
+  }
   if (s_logged < 20) {
     ++s_logged;
     if (!sl.ok) {
       REXLOG_INFO("ucode: {} key=0x{:X} decode FAILED — {}", origin, key,
                   sl.fail ? sl.fail : "(no reason)");
     } else {
-      REXLOG_INFO("ucode: {} key=0x{:X} decoded {} attribute(s)", origin, key,
-                  sl.attrs.size());
+      REXLOG_INFO("ucode: {} key=0x{:X} decoded {} attribute(s), position "
+                  "export {}", origin, key, sl.attrs.size(),
+                  traced ? "traced to a fetch"
+                         : (sl.saw_position_export ? "seen but fed by no fetch"
+                                                   : "NOT SEEN"));
       for (size_t i = 0; i < sl.attrs.size(); ++i) {
         const auto& a = sl.attrs[i];
         REXLOG_INFO("ucode:   attr[{}] slot={} off={} stride={} fmt={} comps={} "
-                    "size={} dest=r{} {}",
+                    "size={} dest=r{} {}{}",
                     i, a.fetch_slot, a.offset_bytes, a.stride_bytes, a.format,
                     a.components, a.size_bytes, a.dest_reg,
-                    a.from_mini ? "(mini)" : "(full)");
+                    a.from_mini ? "(mini)" : "(full)",
+                    a.feeds_position ? " POSITION" : "");
       }
     }
   }
   static uint32_t s_calls = 0;
   if ((++s_calls % 2000) == 0) {
-    REXLOG_INFO("ucode: {} distinct shaders cached, {} decoded, {} failed",
-                m_shaderCache.size(), s_ok, s_failed);
+    REXLOG_INFO("ucode: {} distinct shaders cached, {} decoded, {} failed — "
+                "position from export trace {}, export with no fetch {}, no "
+                "export {}",
+                m_shaderCache.size(), s_ok, s_failed, s_exportTraced,
+                s_exportBarren, s_noExport);
   }
   return &sl;
 }
@@ -743,7 +769,13 @@ void Pm4Translator::LogStrideComparison(const DrawCall& dc,
 void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
   static uint64_t s_done = 0, s_noShader = 0, s_noPos = 0, s_readFail = 0;
   static uint64_t s_passthrough = 0;
+  static uint64_t s_fromExport = 0, s_fromGuess = 0;
   static std::map<uint32_t, uint32_t> s_posFormatsUsed, s_unhandled;
+  // Split the position-format histogram by how the position was identified.
+  // Pooled they cannot answer the question the export decode exists to settle:
+  // whether the formats the guess got wrong are the ones the shader disagrees
+  // about.
+  static std::map<uint32_t, uint32_t> s_exportFormats;
 
   // Leave the guest layout and the stride the caller already set alone. The
   // renderer's stride-28 gate then decides, exactly as before this existed.
@@ -755,14 +787,32 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
     ++s_noShader; passthrough(); return;
   }
 
-  const VertexAttribute* pos = PickPositionAttribute(m_currentVs->attrs);
+  bool from_export = false;
+  const VertexAttribute* pos =
+      PickPositionAttribute(m_currentVs->attrs, &from_export);
   if (!pos) { ++s_noPos; passthrough(); return; }
-  // k_32_32_32_FLOAT is the only position format confirmed against a real
-  // vertex dump. Everything else is inferred from "lowest-offset attribute that
-  // could hold coordinates", and for k_16_16_16_16_FLOAT that inference is
-  // actively doubtful — the ALU probe found those decode to w=0 and a range of
-  // about +-1.75, which may not be a position. This flag restricts the
-  // transcode to the confirmed format so the doubtful ones can be isolated.
+  if (!REXCVAR_GET(transcode_trust_export)) from_export = false;
+  if (from_export) ++s_fromExport; else ++s_fromGuess;
+
+  // The format restriction applies to export-traced positions too, and the
+  // measurement is why.
+  //
+  // Trusting the export in whatever format it declares was tried, and it does
+  // raise submitted draws from 100 to 253 — but the window goes white with
+  // degenerate triangles fanning off the top-left corner, identical at t+80s
+  // and t+105s. That is not the wrong attribute any more: the trace says
+  // k_16_16_16_16_FLOAT genuinely is what the position export reads, in 35655
+  // of 65000 transcoded draws. It is the wrong *space*. Half-float positions
+  // are compressed model space that the shader expands with a per-object scale
+  // and bias, and Stage 3 already established this game computes that transform
+  // in the shader rather than supplying a matrix we could read. Feeding raw
+  // half-floats through the viewport inverse produces coordinates far outside
+  // the frustum, which is exactly the corner spray on screen.
+  //
+  // So the export decode buys the right answer to "which attribute", and the
+  // remaining blocker is "in what space" — a shader ALU translation, not
+  // another identification heuristic. Until then only k_32_32_32_FLOAT, which
+  // needs no expansion, is transcoded.
   if (REXCVAR_GET(transcode_confirmed_formats_only) && pos->format != 57) {
     ++s_noPos; passthrough(); return;
   }
@@ -813,15 +863,19 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
   dc.vertex_stride = kOutStride;
   ++s_done;
   ++s_posFormatsUsed[pos->format];
+  if (from_export) ++s_exportFormats[pos->format];
 
   static uint64_t s_total = 0;
   if ((++s_total % 5000) == 0) {
-    std::string pf, uh;
+    std::string pf, uh, ef;
     for (const auto& [f, n] : s_posFormatsUsed) pf += fmt::format("{}:{} ", f, n);
     for (const auto& [f, n] : s_unhandled) uh += fmt::format("{}:{} ", f, n);
+    for (const auto& [f, n] : s_exportFormats) ef += fmt::format("{}:{} ", f, n);
     REXLOG_INFO("transcode: done {} passthrough {} (no shader {}, no position "
-                "{}, read failed {}) — position formats {}— unhandled {}",
-                s_done, s_passthrough, s_noShader, s_noPos, s_readFail, pf,
+                "{}, read failed {}) — position from export {} / guess {} — "
+                "position formats {}— of those, export-traced {}— unhandled {}",
+                s_done, s_passthrough, s_noShader, s_noPos, s_readFail,
+                s_fromExport, s_fromGuess, pf, ef.empty() ? "none " : ef,
                 uh.empty() ? "none " : uh);
   }
 }
