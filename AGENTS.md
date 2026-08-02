@@ -598,12 +598,50 @@ matters — states 7/8 are where the async content load happens, and we park bef
 reaching them, so "no NAT_Farm files opened" does **not** yet mean the name is
 wrong.
 
-State 6 (`loc_8253B504`) takes the `*(a1+110328) == 0` branch to `loc_8253B560`,
-reads the listener at `*(a1+110788)`, and polls through `loc_8253B58C`. Which
-condition it is waiting on is **not yet determined**. `docs/asset_format.md`
-describes state 6 as per-player UniqueId assignment with a "NetworkNoPlayers"
-check, which would fit a signed-in-player gate, but that is an inference from the
-RE'd summary and has not been measured.
+#### What state 6 is waiting on — resolved (2026-08-02)
+
+**Correction**: an earlier note here offered the "NetworkNoPlayers" / per-player
+UniqueId reading as the likely state 6 gate. That is wrong — the per-player loop
+at `loc_8253B5F0` and the `state = 7` write at `loc_8253B694` are both
+*downstream* of the gate and are never reached.
+
+State 6 (`loc_8253B504`) reads `*(a1+110328)`, finds it zero, and goes to
+`loc_8253B560`, which calls `(*(AssetDB+110788))->vt[2]()`. A **zero return jumps
+to `loc_8253B6A4`** — an early return that leaves the selector at 6. That single
+predicate is the whole blocker.
+
+Runtime dump (identical 3/3): listener `+110788` = `0x40B76700`, vtable
+`0x8204C014`, `vt[0]=0x8253CF60 vt[1]=0x82474838 vt[2]=0x8253CF80
+vt[3]=0x8253D020` — all four in `0x82xxxxxx`, so all real code.
+
+`sub_8253CF80` is:
+
+```
+mode = sub_82536250(*(0x830577C0));   // registry string -> enum, arg is the AssetDB
+if (mode == 2 || mode == 3) return 1;
+if (*(0x83057900) != 0)     return 1;
+tmp = 0; sub_82548758(registry, <key>, &tmp, 0); return tmp;
+```
+
+All three terms measured, identical across 3/3 runs, zero access violations:
+
+| Term | Measured | Needs |
+|---|---|---|
+| `sub_82536250(AssetDB)` | **4** (stable, 1500+ calls) | 2 or 3 |
+| `*(0x83057900)` | **0** | non-zero |
+| registry fallback | **0** | non-zero |
+
+So the gate returns 0 forever. Note **state 1 clears `*(0x83057900)` itself**
+(`stw r25,30976(r8)`, `r25 = 0`), so boot closes the second escape.
+
+This is a **game-mode** gate, not a loader or player-signin one. Mode 4 is
+whatever the registry currently says; the loader will only proceed in modes 2/3.
+
+**Also corrected**: `lis r11,-31995` is `0x83050000`, not `0x830A0000` as first
+recorded — so `sub_82352AE0` and the gate both read the familiar AssetDB global
+`dword_830577C0`, confirmed at runtime by `GateMode` logging `a1=0x407F2190`.
+The earlier claim that they used a different, null global was an arithmetic
+error on my part.
 
 `force_load` is diagnostic. It substitutes for a front end that never runs; it is
 not a step toward correct behaviour.

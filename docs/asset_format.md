@@ -199,11 +199,38 @@ zero `DRAW_*`, and no file I/O for the requested scene — but states 7/8 are wh
 the async content load happens and we park before them, so that last point does
 not yet indict the name.
 
-State 6 takes the `*(a1+110328) == 0` branch to `loc_8253B560`, reads the listener
-at `*(a1+110788)`, and polls through `loc_8253B58C`. **What it waits on is not yet
-determined.** The "NetworkNoPlayers" / per-player UniqueId description in the table
-below would fit a signed-in-player gate, but that is an inference from the RE'd
-summary, not a measurement.
+### The state 6 gate — resolved
+
+**Correction**: this section previously offered the "NetworkNoPlayers" /
+per-player UniqueId description from the table below as the likely state 6 gate.
+That is wrong. The per-player loop at `loc_8253B5F0` and the `state = 7` write at
+`loc_8253B694` are *downstream* of the gate and are never reached.
+
+State 6 reads `*(a1+110328)`, finds it zero, goes to `loc_8253B560` and calls
+`(*(AssetDB+110788))->vt[2]()`. A zero return jumps to `loc_8253B6A4`, an early
+return that leaves the selector at 6. That one predicate is the blocker.
+
+The listener is `0x40B76700`, vtable `0x8204C014`, and `vt[2]` resolves to
+`sub_8253CF80` (`mx_recomp.31.cpp:42045`):
+
+```
+mode = sub_82536250(*(0x830577C0));   // registry string -> enum
+if (mode == 2 || mode == 3) return 1;
+if (*(0x83057900) != 0)     return 1;
+tmp = 0; sub_82548758(registry, <key>, &tmp, 0); return tmp;
+```
+
+Measured, identical 3/3, zero access violations: `sub_82536250` returns **4**
+(stable over 1500+ calls, needs 2 or 3), `*(0x83057900)` is **0**, and the
+registry fallback returns **0**. State 1 clears `*(0x83057900)` itself
+(`stw r25,30976(r8)`, `r25 = 0`), so boot closes that escape.
+
+It is a **game-mode** gate. The loader only proceeds in modes 2/3, and the
+registry currently reports 4.
+
+Note `lis r11,-31995` is `0x83050000` — the AssetDB global `dword_830577C0`,
+confirmed at runtime. An earlier note claiming a separate null global was an
+arithmetic error.
 
 **Superseded**: an earlier `force_launch` cvar wrote `*(AssetDB+28)` directly.
 Forcing `2 -> 9` access-violates — `sub_82541F80 +0xE4` is `lwzx r29,r3,0x20768`

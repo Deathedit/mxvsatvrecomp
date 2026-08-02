@@ -144,6 +144,38 @@ extern "C" REX_FUNC(sub_8253AA40) {
                 state_in, state_out, ctx.r3.u32, changed ? "  <-- CHANGED" : "");
   }
 
+  // State 6 parks. Exactly one predicate is responsible: loc_8253B504 reads
+  // *(a1+110328) and, finding it zero, goes to loc_8253B560, which reads the
+  // listener at *(a1+110788) and calls its vt[2]. A zero return jumps to
+  // loc_8253B6A4 — an early return that leaves the selector at 6. The per-player
+  // loop and the `state = 7` write at loc_8253B694 are both downstream of that
+  // gate, so they are not what blocks us.
+  //
+  // The listener is the same object sub_82534980 notifies via vt[0]
+  // (mx_recomp.31.cpp:22395), and it is assigned once in the AssetDB constructor
+  // sub_8253CB38 (:41688) — so it is never null, and the vt[2] branch is always
+  // the one taken. Dump it once so vt[2] can be resolved statically.
+  if (a1 && state_out == 6) {
+    static bool s_dumped = false;
+    if (!s_dumped) {
+      s_dumped = true;
+      uint32_t obj = REX_LOAD_U32(a1 + 110788);
+      uint32_t sib = REX_LOAD_U32(a1 + 110792);
+      uint32_t vt = obj ? REX_LOAD_U32(obj) : 0;
+      REXLOG_INFO("{}: state6 gate — listener(+110788)=0x{:08X} sibling(+110792)=0x{:08X} "
+                  "vt=0x{:08X} +110328=0x{:08X}",
+                  tag, obj, sib, vt, REX_LOAD_U32(a1 + 110328));
+      if (vt) {
+        // A real guest function pointer lives in 0x82xxxxxx. Anything else in a
+        // vtable slot is data — assetdb vt[36] reads 0x53505F45 ("SP_E") — so
+        // print the slots raw and judge them by range, never call them blind.
+        REXLOG_INFO("{}: state6 gate — vt[0]=0x{:08X} vt[1]=0x{:08X} vt[2]=0x{:08X} vt[3]=0x{:08X}",
+                    tag, REX_LOAD_U32(vt), REX_LOAD_U32(vt + 4),
+                    REX_LOAD_U32(vt + 8), REX_LOAD_U32(vt + 12));
+      }
+    }
+  }
+
   // --force_load=<scene>: make the load request the front end never makes, using
   // the guest's own API rather than writing engine state.
   //
@@ -162,13 +194,12 @@ extern "C" REX_FUNC(sub_8253AA40) {
       s_idle = (state_out == 2) ? s_idle + 1 : 0;
       if (s_idle >= 30) {
         s_fired = true;
-        // sub_82352AE0 reads its AssetDB from a different global than our hooks
-        // do. Log both so the assumption that they are the same object is
-        // visible in the log rather than buried here.
+        // sub_82352AE0 reads its AssetDB from dword_830577C0, the same global our
+        // hooks use — confirmed once the `lis r11,-31995` base was computed
+        // correctly (0x83050000, not 0x830A0000 as first recorded).
         REXLOG_INFO("native: force_load \"{}\" at call #{} — a1=0x{:08X} "
-                    "*(0x830577C0)=0x{:08X} *(0x830A77C0)=0x{:08X} state={}",
-                    scene, sm, a1, REX_LOAD_U32(0x830577C0),
-                    REX_LOAD_U32(0x830A77C0), state_out);
+                    "*(0x830577C0)=0x{:08X} state={}",
+                    scene, sm, a1, REX_LOAD_U32(0x830577C0), state_out);
 
         // Carve a scratch buffer out of the guest stack for the name. PPC frames
         // grow down and callees do `stwu r1,-N(r1)`, so parking r1 below the
@@ -275,6 +306,53 @@ MX_CHAIN_PROBE(824FB1F0, "sub_824FB1F0")
 MX_CHAIN_PROBE(824FC9A0, "sub_824FC9A0")
 
 #undef MX_CHAIN_PROBE
+
+//=============================================================================
+// The state 6 gate
+//
+// State 6 polls (*(AssetDB+110788))->vt[2] and takes an early return whenever it
+// answers 0, which is why the selector never reaches 7. That slot resolves to
+// sub_8253CF80 (dumped at runtime, mx_027.log), and its body is:
+//
+//   mode = sub_82536250(*(0x830577C0));   // maps a registry string to an enum
+//   if (mode == 2 || mode == 3) return 1;
+//   if (*(0x83057900) != 0)     return 1;
+//   tmp = 0; sub_82548758(registry, <key>, &tmp, 0); return tmp;
+//
+// (`lis r11,-31995` is 0x83050000 — so the first global is the familiar AssetDB
+// pointer dword_830577C0, confirmed at runtime by GateMode logging a1=0x407F2190.)
+//
+// Note state 1 clears *(0x83057900) on the way past (`stw r25,30976(r8)` with
+// r25 = 0), so boot itself closes the second escape. These hooks report which
+// term is actually deciding.
+//=============================================================================
+
+// sub_82536250 — registry-string -> mode enum, the gate's first term.
+REX_IMPORT(__imp__sub_82536250, orig_GateMode, void());
+extern "C" REX_FUNC(sub_82536250) {
+  uint32_t a1 = ctx.r3.u32;
+  orig_GateMode(ctx, base);
+  static int n = 0;
+  if (++n <= 3 || (n % 500) == 0)
+    REXLOG_INFO("{}: GateMode(sub_82536250) #{} a1=0x{:08X} -> {}",
+                mx::native::g_plugin_mode ? "plugin" : "native", n, a1, ctx.r3.u32);
+}
+
+// sub_8253CF80 — the gate itself, (*(AssetDB+110788))->vt[2].
+REX_IMPORT(__imp__sub_8253CF80, orig_Gate, void());
+extern "C" REX_FUNC(sub_8253CF80) {
+  orig_Gate(ctx, base);
+  static int n = 0;
+  static uint32_t s_last = 0xFFFFFFFF;
+  uint32_t ret = ctx.r3.u32;
+  if (++n <= 3 || ret != s_last || (n % 500) == 0) {
+    REXLOG_INFO("{}: state6 gate(sub_8253CF80) #{} -> {}  assetdb(0x830577C0)=0x{:08X} "
+                "flag(0x83057900)=0x{:08X}",
+                mx::native::g_plugin_mode ? "plugin" : "native", n, ret,
+                REX_LOAD_U32(0x830577C0), REX_LOAD_U32(0x83057900));
+    s_last = ret;
+  }
+}
 
 // sub_82B38558 — TerminatorVtableCtor (installs off_8213F70C vtable)
 REX_IMPORT(__imp__sub_82B38558, orig_VtableCtor, void());
