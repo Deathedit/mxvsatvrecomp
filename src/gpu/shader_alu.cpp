@@ -125,17 +125,42 @@ class Interpreter {
   AluStatus status = AluStatus::kOk;
   uint32_t blocking_opcode = 0;
 
-  // Reads constant vec4 `index` from the shadowed file. Vertex shaders address
-  // the low bank, c0..c255, which is dwords 0..1023 — the same indexing the
-  // translator shadows under register 0x4000 + i. Out of range reads zero
-  // rather than failing: an unwritten constant really is zero on the hardware.
+  // Every constant read in the shader passes through here — plain indexed
+  // reads, a0-relative ones, and the mulsc/addsc/subsc family alike — so it is
+  // the one place that can say what the shader asked the constant file for.
+  //
+  // The index is relative to whatever region the vertex stage is based at.
+  // SQ_VS_CONST names that base and the caller is responsible for applying it
+  // before handing `alu_consts` over; this reads from the pointer it is given.
+  // Out of range reads zero rather than failing: an unwritten constant really
+  // is zero on the hardware, and a shader that indexes past its region reads
+  // zero rather than faulting.
+  //
+  // The counters exist because a shader can execute perfectly and still export
+  // (0,0,0,w=0) — 19% of them do — and that is computing nothing *from
+  // something*. Whether the something was there is the question, and which
+  // slots it wanted is what names the gap if it was not. Counters are mutable
+  // so this stays a read accessor.
   Vec4 Const(uint32_t index) const {
     Vec4 r;
+    ++const_reads;
+    if (index < const_min_index) const_min_index = index;
+    if (index > const_max_index) const_max_index = index;
     const uint32_t base = index * 4;
-    if (!in_.alu_consts || base + 4 > in_.alu_const_dwords) return r;
+    if (!in_.alu_consts || base + 4 > in_.alu_const_dwords) {
+      ++const_zero_reads;
+      return r;
+    }
     for (int i = 0; i < 4; ++i) std::memcpy(&r[i], &in_.alu_consts[base + i], 4);
+    if (r[0] == 0.0f && r[1] == 0.0f && r[2] == 0.0f && r[3] == 0.0f)
+      ++const_zero_reads;
     return r;
   }
+
+  mutable uint32_t const_reads = 0;
+  mutable uint32_t const_zero_reads = 0;
+  mutable uint32_t const_min_index = 0xFFFFFFFF;
+  mutable uint32_t const_max_index = 0;
 
   // One source operand, swizzled, absolute-valued and negated as the
   // instruction asks. Swizzles are component-relative on Xenos — component c
@@ -490,6 +515,19 @@ AluResult ExecuteVertexShader(
 
   Interpreter in(inputs);
 
+  // Called at every exit from here on, including the failure ones, so a refused
+  // execution still reports what it managed to read before it stopped. Written
+  // as an explicit call rather than an RAII guard on purpose: without NRVO the
+  // return value is copied at the return statement, *before* local destructors
+  // run, so a destructor writing into `out` would silently lose the counters.
+  auto finish = [&in, &out]() -> AluResult& {
+    out.const_reads = in.const_reads;
+    out.const_zero_reads = in.const_zero_reads;
+    out.const_min_index = in.const_min_index;
+    out.const_max_index = in.const_max_index;
+    return out;
+  };
+
   // Seed the register file from the vertex fetches. This is what makes the
   // interpreter worth running: the shader reads its inputs from exactly the
   // registers its vfetch instructions named, and the export-62 decode already
@@ -507,7 +545,7 @@ AluResult ExecuteVertexShader(
       if (IsUnsupportedCf(cf[j].opcode())) {
         out.status = AluStatus::kUnsupportedCf;
         out.blocking_opcode = uint32_t(cf[j].opcode());
-        return out;
+        return finish();
       }
       if (!uc::IsControlFlowOpcodeExec(cf[j].opcode())) continue;
 
@@ -517,12 +555,12 @@ AluResult ExecuteVertexShader(
       for (uint32_t n = 0; n < count; ++n) {
         if (++executed > kMaxInstructions) {
           out.status = AluStatus::kInstructionCap;
-          return out;
+          return finish();
         }
         const uint64_t at = (uint64_t(addr) + n) * 3;
         if (at + 3 > dword_count) {
           out.status = AluStatus::kMalformed;
-          return out;
+          return finish();
         }
         // Fetches were already performed by the caller and seeded above.
         if ((seq >> (n * 2)) & 0x1) continue;
@@ -533,7 +571,7 @@ AluResult ExecuteVertexShader(
         if (in.status != AluStatus::kOk) {
           out.status = in.status;
           out.blocking_opcode = in.blocking_opcode;
-          return out;
+          return finish();
         }
       }
     }
@@ -541,11 +579,11 @@ AluResult ExecuteVertexShader(
 
   if (!in.wrote_position) {
     out.status = AluStatus::kNoPositionExport;
-    return out;
+    return finish();
   }
   out.status = AluStatus::kOk;
   for (int c = 0; c < 4; ++c) out.position[c] = in.position[c];
-  return out;
+  return finish();
 }
 
 }  // namespace mx::pm4

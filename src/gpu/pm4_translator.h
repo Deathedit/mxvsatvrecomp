@@ -320,6 +320,20 @@ class Pm4Translator {
   static constexpr uint32_t kRegVportXOffset = 0x2110;
   static constexpr uint32_t kRegVportYScale  = 0x2111;
   static constexpr uint32_t kRegVportYOffset = 0x2112;
+  // SQ_VS_CONST / SQ_PS_CONST — the base and size, in vec4, of the region of
+  // the 512-vec4 ALU constant file that a shader's c[n] is relative to. Both
+  // are inside the shadowed context range and nothing has ever read them;
+  // Const() in shader_alu.cpp indexes the file absolutely. If the base is
+  // non-zero every constant read in every shader is off by it.
+  static constexpr uint32_t kRegVsConst = 0x2307;
+  static constexpr uint32_t kRegPsConst = 0x2308;
+
+  // Raw shadowed context register. CtxFloat reinterprets as float, which is
+  // right for the viewport but wrong for a bitfield like SQ_VS_CONST.
+  uint32_t CtxDword(uint32_t reg, uint32_t fallback = 0) const;
+
+  // Logs SQ_VS_CONST / SQ_PS_CONST, on change only. Called per draw.
+  void LogShaderConstBases() const;
   static constexpr uint32_t kRegVportZScale  = 0x2113;
   static constexpr uint32_t kRegVportZOffset = 0x2114;
   uint32_t m_ctxRegs[kCtxRegCount] = {};

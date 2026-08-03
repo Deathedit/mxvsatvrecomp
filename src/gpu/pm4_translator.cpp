@@ -196,6 +196,40 @@ float Pm4Translator::CtxFloat(uint32_t reg, float fallback) const {
   return f;
 }
 
+uint32_t Pm4Translator::CtxDword(uint32_t reg, uint32_t fallback) const {
+  if (!m_ctxWritten || reg < kCtxRegBase || reg >= kCtxRegBase + kCtxRegCount)
+    return fallback;
+  return m_ctxRegs[reg - kCtxRegBase];
+}
+
+// Reports the region of the ALU constant file each shader stage addresses.
+//
+// Why this matters: LOAD_ALU_CONSTANT only ever writes four destinations —
+// dword 0x0, 0x3E0, 0x3F0 and 0x7F0. 0x3F0 is vec4 252 and 0x7F0 is vec4 508,
+// i.e. the last four vec4 of each 256-vec4 bank, which is where a per-object
+// matrix normally goes, and they arrive at roughly one of each per draw. The
+// interpreter meanwhile indexes the file absolutely. If the vertex stage is
+// based at 256 then a shader reading c252..255 wants vec4 508..511, and reading
+// 252 instead would hand it whatever is there — plausibly zeros, which is
+// exactly the 19% of executions exporting (0,0,0,w=0).
+//
+// The bit layout is Xenia's, not the SDK's: register_table.inc names both
+// registers but carries no bitfield for them. So this logs the raw dword too —
+// a base above 512 or a zero size means the layout is wrong, and that is the
+// finding rather than something to force a plausible value through.
+void Pm4Translator::LogShaderConstBases() const {
+  const uint32_t vs = CtxDword(kRegVsConst);
+  const uint32_t ps = CtxDword(kRegPsConst);
+  static uint32_t s_lastVs = 0xFFFFFFFF, s_lastPs = 0xFFFFFFFF;
+  if (vs == s_lastVs && ps == s_lastPs) return;
+  s_lastVs = vs;
+  s_lastPs = ps;
+  REXLOG_INFO("translator: SQ_VS_CONST raw=0x{:08X} base={} size={} | "
+              "SQ_PS_CONST raw=0x{:08X} base={} size={} (vec4 units)",
+              vs, vs & 0x1FF, (vs >> 12) & 0x1FF,
+              ps, ps & 0x1FF, (ps >> 12) & 0x1FF);
+}
+
 void Pm4Translator::BuildViewportMvp(float out[16]) const {
   static const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0,
                                       0, 0, 1, 0, 0, 0, 0, 1};
@@ -929,6 +963,14 @@ void Pm4Translator::NoteAluExecution(const AluResult& r, uint32_t pos_format) {
   static uint64_t s_clipLike = 0, s_windowLike = 0, s_neither = 0,
                   s_degenerate = 0;
 
+  // Constant-file reads, indexed [0] = produced a position, [1] = degenerate.
+  static uint64_t s_constReads[2] = {}, s_constZero[2] = {}, s_constExecs[2] = {};
+  static uint32_t s_constMin[2] = {0xFFFFFFFF, 0xFFFFFFFF}, s_constMax[2] = {};
+  // Highest index each execution touched. The distribution of this is what says
+  // whether shaders are reaching for c252..255 — the slot LOAD_ALU_CONSTANT
+  // fills — or staying in the low bank.
+  static std::map<uint32_t, uint64_t> s_topIndex;
+
   ++s_status[int(r.status)];
   if (r.status != AluStatus::kOk) {
     ++s_blocking[r.blocking_opcode];
@@ -981,6 +1023,20 @@ void Pm4Translator::NoteAluExecution(const AluResult& r, uint32_t pos_format) {
       else if (clip_like) ++s_clipLike;
       else if (win_like) ++s_windowLike;
       else ++s_neither;
+
+      // What the shader asked the constant file for, split by whether it went
+      // on to compute nothing. If the degenerate executions are exactly the
+      // ones whose constant reads came back zero, the diagnosis is closed and
+      // the index range says which slots to chase.
+      const int b = degenerate ? 1 : 0;
+      s_constReads[b] += r.const_reads;
+      s_constZero[b] += r.const_zero_reads;
+      ++s_constExecs[b];
+      if (r.const_reads) {
+        if (r.const_min_index < s_constMin[b]) s_constMin[b] = r.const_min_index;
+        if (r.const_max_index > s_constMax[b]) s_constMax[b] = r.const_max_index;
+        ++s_topIndex[r.const_max_index];
+      }
     }
   }
 
@@ -1012,6 +1068,22 @@ void Pm4Translator::NoteAluExecution(const AluResult& r, uint32_t pos_format) {
                 s_inRange, s_outOfRange, s_inRangeVp, s_outOfRangeVp,
                 s_clipLike, s_windowLike, s_neither, s_degenerate,
                 infvp.empty() ? "none " : infvp);
+
+    std::string ti;
+    for (const auto& [k, n] : s_topIndex) ti += fmt::format("{}:{} ", k, n);
+    auto per = [](uint64_t a, uint64_t b) { return b ? double(a) / double(b) : 0.0; };
+    REXLOG_INFO("alu consts: produced-a-position n={} reads/exec {:.1f} "
+                "zero-reads/exec {:.1f} index range [{}..{}] | degenerate n={} "
+                "reads/exec {:.1f} zero-reads/exec {:.1f} index range [{}..{}] "
+                "— highest index touched per exec {}",
+                s_constExecs[0], per(s_constReads[0], s_constExecs[0]),
+                per(s_constZero[0], s_constExecs[0]),
+                s_constMin[0] == 0xFFFFFFFF ? -1 : int(s_constMin[0]),
+                int(s_constMax[0]),
+                s_constExecs[1], per(s_constReads[1], s_constExecs[1]),
+                per(s_constZero[1], s_constExecs[1]),
+                s_constMin[1] == 0xFFFFFFFF ? -1 : int(s_constMin[1]),
+                int(s_constMax[1]), ti.empty() ? "none " : ti);
   }
 }
 
@@ -1495,6 +1567,7 @@ void Pm4Translator::FinalizeDraw(DrawCall& dc) {
     }
   }
 
+  LogShaderConstBases();
   LogSurface(dc);
   LogNdc(dc);
   ProbeAluMatrices(dc);

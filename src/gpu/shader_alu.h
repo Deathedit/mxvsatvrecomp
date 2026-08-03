@@ -59,6 +59,20 @@ struct AluResult {
   // caller build a histogram of exactly which instructions are missing instead
   // of a single opaque failure count.
   uint32_t blocking_opcode = 0;
+
+  // What this execution read out of the constant file. Recorded because a
+  // shader that executes perfectly and exports (0,0,0,w=0) has computed nothing
+  // from something, and the question is whether the constants it asked for were
+  // there. `const_zero_reads` counts reads that came back all-zero; the index
+  // range says *which* slots it wanted, which is what names the gap when the
+  // answer is that they were empty.
+  //
+  // Counters rather than a callback, so this header stays SDK-free and
+  // standalone-testable. min > max means no constant was read at all.
+  uint32_t const_reads = 0;
+  uint32_t const_zero_reads = 0;
+  uint32_t const_min_index = 0xFFFFFFFF;
+  uint32_t const_max_index = 0;
 };
 
 // Inputs to one execution. The register file is seeded from the decoded vertex
