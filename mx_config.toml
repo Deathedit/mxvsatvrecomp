@@ -3,10 +3,10 @@ longjmp_address = 0x82BE07F0
 
 [rexcrt]
 
-RtlAllocateHeap = 0x82BFFD48
-RtlFreeHeap = 0x82C00640
-RtlSizeHeap = 0x82BFEFC0
-RtlReAllocateHeap = 0x82C00938
+RtlAllocateHeap = 0x82BFFC08 
+RtlFreeHeap = 0x82C00500
+RtlSizeHeap = 0x82BFEE80
+RtlReAllocateHeap = 0x82C007F8 
 
 #CreateFileA = unset
 #ReadFile = unset
@@ -33,10 +33,10 @@ RtlReAllocateHeap = 0x82C00938
 #RemoveDirectoryA = unset 
 #GetFileType = unset
 
-memcpy = 0x82BFBB10
-#memmove = unset
-#memset = unset
-#memchr = unset
+memcpy = 0x82BDAAF0
+memmove = 0x82BDB020
+memset = 0x82BDB3C0
+memchr = 0x82BDEEB0
 #XMemCpy = unset
 #XMemSet = unset
 #XMemSet128 = unset

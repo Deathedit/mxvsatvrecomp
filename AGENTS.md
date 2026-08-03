@@ -2547,11 +2547,109 @@ bytes and less than half of it was searched. Rescanning `0..0x4000` against the
 known-declaration set is the same safe comparison as before — no unknown pointer
 is dereferenced — just correctly scoped.
 
+> **Resolved 2026-08-03, and the rescan was never needed.** See the next
+> section: the offset is `0x2ED8`, and it was read out of
+> `D3DDevice_SetVertexDeclaration` rather than searched for.
+
 **Instrument traps confirmed again this round.** A bare "MORE THAN ONE devices"
 flag said nothing; recording the pointers and which entry points touched each one
 turned it into a dismissal in one run. Likewise a bare count of stride failures
 would not have distinguished a wrong decode from a stale declaration — the eight
 named cases did.
+
+### The declaration is at device + 0x2ED8, and the library says so (2026-08-03)
+
+The stale-declaration blocker above is gone. Every draw now reads its own
+declaration, and the three numbers that were wrong are right.
+
+**The planned rescan was the wrong move, and it was not needed.** The plan was to
+search `device + 0..0x4000` for a field holding a known declaration. Instead:
+`D3DDevice_SetVertexDeclaration` is 20 bytes and does nothing else.
+
+```
+stw   r4, 0x2ed8(r3)      device->pVertexDeclaration = pDecl
+ld    r11, 0x10(r3)
+oris  r11, r11, 0x8       mark the lazy state dirty
+std   r11, 0x10(r3)
+blr
+```
+
+`D3DDevice_GetVertexDeclaration` reads the same field back (`lwz r31,
+0x2ed8(r3)`), so the offset is confirmed by a second function that does not
+share the first's encoding. This is the same method that decoded the `Type`
+dword: **read the field out of the code that touches it.** Two scans had already
+"proved" the declaration was not on the device — both covered `0..0x2000`, and
+`0x2ED8` is outside that. The conclusion was never sound; the scans were just
+too short.
+
+Note that `SetVertexDeclaration` was written off earlier as unlocatable — at 20
+bytes a byte-pattern match is not evidence. That is still true and did not
+matter: **the function's bytes are readable in `d3d9.lib` whether or not its
+address in the XEX is known.** The offset is a constant in the instruction
+stream, so the library answers the question by itself.
+
+**Reading `device + 0x2ED8` is safe; following its value is not.** The device
+pointer is the draw's own `r3`, D3D9 is reading the same struct on either side of
+the hook, and the offset is well inside it. The value read is only ever compared
+against declarations watched being built by `CreateVertexDeclaration` — the same
+rule that the access violation at `0x030013A0` established.
+
+**What changed, over 177,500 draws:**
+
+| | before (patch hook) | after (device + 0x2ED8) |
+|---|---|---|
+| fully described | 158,257 / 165,000 (95%) | **177,500 / 177,500 (100%)** |
+| stride TOO SMALL | 6,743 | **0** |
+| index buffer holds the range | 61,839 / 61,839 | 66,726 / 66,726 |
+
+**`null=0 unknown=0`.** Not one draw in 177,500 found the field empty, and not
+one found a pointer that `CreateVertexDeclaration` had not produced. Reproduced
+on a second run at 175,000 draws. A wrong offset would fail loudly here, because
+matching a 32-bit pointer against the known set by accident is not something that
+happens 177,500 times.
+
+**The stride failures were entirely the stale declaration, not a bad decode.**
+`STRIDE TOO SMALL` going 6,743 → 0 with no change to `d3d9_layout.cpp` settles a
+question the previous round could not: the layout decoder was always right, and
+it was being handed the wrong declaration. That instrument was worth building —
+a bare completeness percentage would have moved 95% → 100% and said nothing about
+which of the two was at fault.
+
+**How stale the old source was, measured: 143,226 of 177,500 draws (81%)** had a
+declaration bound that differed from the one
+`PatchVertexShaderToMatchVertexDeclaration` last saw. The earlier round's
+"140,000 draws attributed, 0 unattributed" was a correct count of a meaningless
+quantity.
+
+#### What is still open, stated precisely
+
+**The vertex-range check did not improve: `vb 20,125 / 210,799`.** It is not the
+declaration, and it should not be read as one problem with the vertex path. The
+named failures are a single recognisable shape:
+
+```
+VB DOES NOT HOLD RANGE: declaration id 14 stream 1 start_vertex=13748 count=108
+                        stride=16 needs 221696B, buffer is 64B
+```
+
+Declaration 14 is three `k_32_32_32_32_FLOAT` elements — `POSITION`, `TEXCOORD0`
+on stream 0, `TEXCOORD1` on stream 1 — and stream 1's whole buffer is **64 bytes,
+four float4s**, while `StartVertex` is in the thousands.
+
+**The check assumes every stream is indexed by the same vertex index. That is a
+D3D12 input-assembler assumption, and Xenos does not work that way** — the vertex
+shader issues explicit `vfetch` instructions with whatever index register it
+computes, so a four-entry stream fetched by something like `index % 4` is legal
+and normal. A 64-byte buffer being read at vertex 13,748 is not the game being
+broken; it is most likely the host model being wrong.
+
+That is a hypothesis with an obvious test — read the shader's `vfetch` for stream
+1 and see what indexes it — and it is **not** established here. What is
+established: the failure is confined to small auxiliary streams, not to stream 0
+geometry, and it does not implicate the declaration, the stride, or the fetch
+constant decode. **It does mean a stream like this cannot be modelled as a plain
+D3D12 input slot**, which matters for the PSO step and should be settled before
+it.
 
 
 ### Parser caveat

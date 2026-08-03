@@ -135,20 +135,67 @@ int RecordDeclaration(uint32_t decl, bool has_colour, uint32_t elems,
   return id;
 }
 
-// The device-struct route is a dead end, confirmed twice: scanning the whole
-// 0x2000 struct finds no offset holding a known declaration, and sub_82565550
-// (a caller of PatchVertexShaderToMatchVertexDeclaration) reaches its state
-// through an indexed relative-offset table rather than a fixed field.
+// The current declaration lives at device + 0x2ED8.
 //
-// So the declaration is taken from PatchVertexShaderToMatchVertexDeclaration
-// instead, which *receives* it as an argument on the lazy-state path. That hook
-// sets g_currentDecl; draws attribute themselves to whatever it last held.
+// **This offset is read out of the library, not searched for.**
+// D3DDevice_SetVertexDeclaration is 20 bytes and does nothing but this:
+//
+//     stw   r4, 0x2ed8(r3)      device->pVertexDeclaration = pDecl
+//     ld    r11, 0x10(r3)
+//     oris  r11, r11, 0x8       mark the lazy state dirty
+//     std   r11, 0x10(r3)
+//     blr
+//
+// D3DDevice_GetVertexDeclaration reads the same field back (`lwz r31,
+// 0x2ed8(r3)`), which settles it independently of how the store is read.
+//
+// Two earlier scans "proved" the declaration was not on the device struct. Both
+// covered device + 0..0x2000, and 0x2ED8 is outside that — the scans were
+// under-scoped, not the conclusion sound. Scoping a scan by what the struct
+// actually spans (SetStreamSource writes +0x3480) was the missing step both
+// times, and reading the offset from the code that writes it makes the scan
+// unnecessary altogether.
+constexpr uint32_t kDeviceVertexDeclaration = 0x2ED8;
+
+// Reading device + 0x2ED8 is safe in a way that dereferencing its *value* is
+// not: the device pointer arrives as the draw's own r3, D3D9 is reading the
+// same struct on either side of this hook, and the offset is well inside it.
+// The value read is only ever compared against declarations we watched
+// CreateVertexDeclaration build — never followed.
 int g_currentDecl = -1;
+
+// What PatchVertexShaderToMatchVertexDeclaration last saw. Kept only to measure
+// how far it lags: it fires on the lazy-state path, ~1 update per 66 draws, and
+// the previous round mistook attribution-to-a-stale-value for attribution.
+int g_patchDecl = -1;
+
+uint64_t g_declDeviceNull = 0;      // field is 0 — no declaration bound yet
+uint64_t g_declDeviceUnknown = 0;   // non-zero, but never seen created
+uint64_t g_declAgree = 0;           // device field == the patch hook's value
+uint64_t g_declDisagree = 0;        // it does not, i.e. the patch value is stale
 
 // Called from both draw hooks.
 void NoteDrawDeclaration(uint32_t device, uint8_t* base) {
-  (void)device;
   (void)base;
+  g_currentDecl = -1;
+  if (device) {
+    const uint32_t p = REX_LOAD_U32(device + kDeviceVertexDeclaration);
+    if (!p) {
+      ++g_declDeviceNull;
+    } else {
+      g_currentDecl = KnownDeclId(p);
+      if (g_currentDecl < 0) ++g_declDeviceUnknown;
+    }
+  }
+  if (g_currentDecl >= 0) {
+    if (g_currentDecl == g_patchDecl) {
+      ++g_declAgree;
+    } else {
+      ++g_declDisagree;
+    }
+  }
+
+  DeviceState().current_decl = g_currentDecl;
   if (g_currentDecl < 0) {
     ++g_drawsNoDecl;
     return;
@@ -468,6 +515,14 @@ void ReportDeclHistogram() {
       "d3d9: decl-draws — {} declarations known; COLOUR={} NO-COLOUR={} "
       "unattributed={} patch_calls={}",
       g_declCount, with, without, g_drawsNoDecl, g_patchCalls);
+  // The declaration now comes from device + 0x2ED8, per draw. These four say
+  // whether that source is sound and how badly the old one lagged: `unknown`
+  // must stay at 0 or the field is not what SetVertexDeclaration writes, and a
+  // large `stale` is the 2508-calls-per-165000-draws problem, measured.
+  REXLOG_INFO(
+      "d3d9: decl-source — from device+0x2ED8: null={} unknown={} | vs the "
+      "patch hook: same={} stale={}",
+      g_declDeviceNull, g_declDeviceUnknown, g_declAgree, g_declDisagree);
   for (int i = 0; i < g_declCount; ++i) {
     REXLOG_INFO("d3d9: decl-draws   id={} ptr=0x{:08X} elems={} colour={} x{}",
                 i, g_declPtr[i], g_declElems[i],
@@ -642,10 +697,7 @@ extern "C" REX_FUNC(sub_82564C50) {
                 found >= 0 ? 3 + arg_index : -1);
   }
 
-  if (found >= 0) {
-    g_currentDecl = found;
-    DeviceState().current_decl = found;
-  }
+  if (found >= 0) g_patchDecl = found;
   ++g_patchCalls;
   orig_PatchVertexShader(ctx, base);
 }
