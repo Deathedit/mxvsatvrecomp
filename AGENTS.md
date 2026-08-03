@@ -1895,6 +1895,81 @@ need. Only the name was wrong, and it is corrected in `hooks_frame.cpp`.
 PM4 is the boundary that actually exists in this binary, and it is where Xenia
 works too. Keeping it.
 
+### There are no static vertex declarations to find (2026-08-03)
+
+First use of the IDA MCP (`idalib`, headless, driving a **copy** of the database).
+The round was built on a hypothesis that turned out false, and stopped there.
+
+**The hypothesis.** `PickColorAttribute` guesses, and the stride is a heuristic.
+D3D9 vertex declarations are `D3DVERTEXELEMENT9` arrays and games usually store
+them as constant tables, terminated by `D3DDECL_END()` = `{0xFF, 0,
+D3DDECLTYPE_UNUSED, 0, 0, 0}` — big-endian `00 FF 00 00 11 00 00 00`. If those
+were in the XEX they would give stream, offset, type and semantic for every
+layout, replacing the guess with ground truth.
+
+**They are not there.** The exact sentinel returns **zero matches** binary-wide.
+A tolerant `00 FF 00 00 ?? 00 00 00` returns 57, none of which decode as element
+arrays — the two table-shaped clusters are a 16-byte record table at
+`0x82D30CE0` and colour/config data at `0x82D5A0E0`. `FF 00 00 00 11 ...` and
+`FF FF 00 00 11 ...` also return nothing.
+
+**What is there instead:** `sub_8257A1B0`, a semantic-*string* parser. It takes
+`"TEXCOORD3"`, splits the trailing digit as the usage index (rejecting >15),
+uppercases, and matches the full `D3DDECLUSAGE` list in enum order — POSITION 0,
+BLENDWEIGHT 1, BLENDINDICES 2, NORMAL 3, PSIZE 4, TEXCOORD 5, TANGENT 6,
+BINORMAL 7, TESSFACTOR 8, POSITIONT 9, COLOR 10, FOG 11, DEPTH 12, SAMPLE 13,
+VFACE 14, VPOS 15 — plus `DIFFUSE`→COLOR0 and `SPECULAR`→COLOR1, and returns
+`E_INVALIDARG` otherwise. That `DIFFUSE`/`SPECULAR` aliasing identifies it as
+**D3DX9's `D3DXDeclaratorFromSemantic`**, matching `D3DX9 v2.0.20209.0` in the
+XEX header. Its semantic name table sits at `0x82059074`–`0x82059118`.
+
+**So declarations are constructed at runtime from strings, and the XEX cannot
+hand us the layouts statically.** The PM4 and microcode inference we already
+have is the available source of truth — `PickColorAttribute` is not failing for
+want of a table that exists somewhere; there is no table.
+
+Worth being precise about the consequence: on Xenos the vertex shader's `vfetch`
+instructions carry **format and offset but not semantic** — semantics are bound
+at shader-compile time and do not survive into the microcode. That is the actual
+reason the colour attribute has to be guessed, and it will not be fixed by
+reading the binary harder.
+
+Stage 1 orientation, incidentally confirmed: D3D9's swap is `sub_82566B58` and
+this D3DX9 helper is `sub_8257A1B0`, so the graphics libraries occupy roughly
+`0x82559000`–`0x8257B000`.
+
+**Known-answer test, and it passed.** Before trusting anything, `xrefs_to
+0x82CE9F98` (the `VdSwap` thunk) was checked against the recompiled source. IDA
+reports exactly **one** xref in the whole binary, at `0x82566E18`, inside
+`sub_82566B58` (size `0x684`, so it ends at `0x825671DC` and the next function
+begins at `0x825671E0`) — matching the prediction to the byte. A single caller
+for `VdSwap` also independently confirms that function is D3D9's swap.
+
+#### Using the IDA MCP
+
+`idalib-mcp` runs headless against a `.i64` with no IDA window. Setup took three
+fixes, none of them obvious from the error message:
+
+1. **`idalib` must be activated** —
+   `python "<IDA>\idalib\python\py-activate-idalib.py" -d "<IDA>"`. Works on
+   Python 3.13 despite IDA 9 generally targeting older; no downgrade needed.
+2. **`uv`'s managed Python 3.11 was broken** — the download had landed but the
+   minor-version link directory was missing, so every launch died with
+   `Missing expected target directory`. `uv python install 3.11 --reinstall`
+   repaired it.
+3. **The plugin project had no `.venv`**, so the `idalib-mcp` console script
+   that `pyproject.toml` declares was never installed — that is the
+   `Failed to spawn: idalib-mcp / program not found` error. `uv sync` fixed it.
+
+The plugin lives under
+`AppData\Roaming\Claude\local-agent-mode-sessions\<id>\<id>\rpm\plugin_*`, **not**
+`~/.claude/plugins/` — that directory holds only an empty `ida-pro-mcp-inline`
+and looking there gives a false "plugin is not installed" reading.
+
+**Always open a copy.** `idb_open` with `mode: force_headless` on
+`assets/default.xex.probe.i64`; the original was left untouched and verified
+unchanged afterwards.
+
 ### Parser caveat
 
 `Pm4Parser` accepts any Type-3 with `body_word_count <= 0x4000`. A misparsed
