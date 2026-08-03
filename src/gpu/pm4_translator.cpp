@@ -59,6 +59,20 @@ REXCVAR_DEFINE_BOOL(skip_untransformable_draws, false, "Debug",
                     "fix: these draws are wrong and this stops them painting "
                     "over the ones that are right");
 
+// Stage 2 counted colour sources and found 95.7% of vertices carry a real
+// packed colour — but vertex count is not pixel area, and the 16523 colourless
+// draws average 13.7 vertices, which is fullscreen-quad shaped. A small vertex
+// share can still be the whole screen. The tint is the only direct measure of
+// area, which is why it exists rather than the round stopping at the counters.
+//
+// A diagnostic, not a rendering mode — same discipline as
+// skip_untransformable_draws. It deliberately destroys the real colour.
+REXCVAR_DEFINE_BOOL(tint_by_color_source, false, "Debug",
+                    "Replace vertex colour with a flat per-source tint — "
+                    "packed green, fallback blue, none magenta — so one "
+                    "screenshot says how much of the frame area has no real "
+                    "colour data. A diagnostic, not a rendering mode");
+
 // The A/B knob for the export decode. Off reverts to the pure guess, so the
 // two can be compared on one build rather than across two.
 REXCVAR_DEFINE_BOOL(transcode_trust_export, true, "Debug",
@@ -1298,6 +1312,17 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
     }
   }
 
+  // Chosen once per draw, not per vertex: col_src is a property of the shader's
+  // attribute list. Null when the diagnostic is off, which is the only state
+  // that reads the real colour.
+  static constexpr float kTints[3][4] = {
+      {0.0f, 1.0f, 0.0f, 1.0f},  // packed   — green
+      {0.0f, 0.0f, 1.0f, 1.0f},  // fallback — blue
+      {1.0f, 0.0f, 1.0f, 1.0f},  // none     — magenta
+  };
+  const float* tint =
+      REXCVAR_GET(tint_by_color_source) ? kTints[col_src] : nullptr;
+
   // The shader's stride is authoritative; the division guess is not. Where they
   // disagree the shader wins, but only if the buffer actually holds that many
   // vertices — a wrong stride here reads off the end.
@@ -1388,7 +1413,14 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
     }
 
     float c[4] = {1, 1, 1, 1};
-    if (col) ReadVertexAttribute(src, src_stride, *col, c);
+    if (tint) {
+      // Flat per-source tint, real colour discarded. Distinct hues rather than
+      // shades so the screenshot can be bucketed by channel dominance instead
+      // of eyeballed — the same reason the capture script buckets pixels.
+      std::memcpy(c, tint, sizeof(c));
+    } else if (col) {
+      ReadVertexAttribute(src, src_stride, *col, c);
+    }
 
     uint8_t* dst = out.data() + size_t(v) * kOutStride;
     std::memcpy(dst + 0, p, 12);
