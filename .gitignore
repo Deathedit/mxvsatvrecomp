@@ -13,4 +13,5 @@ gamecontrollerdb.txt
 
 # Runtime dumps written next to the executable by the VdSwap hook
 pm4_dump_*.txt
+d3d9_dump_*.txt
 gpu_state_diff_*.txt

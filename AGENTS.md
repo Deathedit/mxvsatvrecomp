@@ -1834,6 +1834,12 @@ vertex declarations directly, which is exactly what several rounds have been
 spent guessing at (`PickColorAttribute`, the stride heuristic, the format-38
 fallback).
 
+> **Superseded 2026-08-03** — see *"The D3D9 entry points are located, and the
+> draws are not inlined"* below. The header reading here is correct; the
+> conclusion drawn from it is not. Static linking removes the import table, not
+> the functions. Eight D3D9 entry points now have confirmed guest addresses and
+> the game calls them directly.
+
 It is not available as a hook point. Confirmed from the XEX header itself
 (`XexTool`), not inferred:
 
@@ -1933,6 +1939,15 @@ instructions carry **format and offset but not semantic** — semantics are boun
 at shader-compile time and do not survive into the microcode. That is the actual
 reason the colour attribute has to be guessed, and it will not be fixed by
 reading the binary harder.
+
+> **Amended 2026-08-03.** Every observation above stands, and so does the
+> reasoning — declarations really are absent from the XEX as static data. What
+> was missing is *where they are instead*: `D3DDevice_CreateVertexDeclaration`
+> builds them at runtime, and `D3D::PatchVertexShaderToMatchVertexDeclaration`
+> binds semantics to shader inputs at draw time. Semantics do not survive into
+> the microcode precisely **because that runtime function applies them**. Both
+> functions are now located — see the section below. "Reading the binary harder"
+> was the wrong instrument; reading it at the right layer is not.
 
 Stage 1 orientation, incidentally confirmed: D3D9's swap is `sub_82566B58` and
 this D3DX9 helper is `sub_8257A1B0`, so the graphics libraries occupy roughly
@@ -2054,6 +2069,340 @@ Both would have produced a confident wrong answer.
 2. **A 20000-draw reporting modulus reports nothing.** A 150s run reaches
    5000-10000 transcoded draws, so the first probe logged not one line and
    looked like the code was never reached. `NoteOutputMerger` reports every 2500.
+
+### The D3D9 entry points are located, and the draws are not inlined (2026-08-03)
+
+This supersedes *"Why not high-level D3D9 interception"* above and amends *"There
+are no static vertex declarations to find"*. Both of those read the evidence
+correctly; both drew a conclusion wider than the evidence supported.
+
+**The input.** A matching XDK `d3d9.lib`, now at `assets/d3d9/` (gitignored —
+proprietary XDK material, same class as `assets/default.xex`). It holds 43
+PowerPC objects, all machine `0x01F2` (`IMAGE_FILE_MACHINE_POWERPCBE`), and
+**2507 defined symbols** dumped to `assets/d3d9/d3d9_symbols.txt` as
+`obj⇥section⇥offset⇥mangled_name`.
+
+**FLIRT is a dead end and should not be revisited.** The `pcf.exe` in the
+IDASignMaker package is a VC6-era x86 build that rejects PowerPC objects with
+`bad coff magic` at every `-g` value (762 / 498 / 0x1F2 / 0762 / big-endian
+forms), and no official FLAIR is installed. It is also unnecessary — the COFF
+symbol tables parse directly and byte matching is more precise than signatures.
+
+**Why byte matching works here.** The library is compiled with function-level
+linking, so **every symbol sits at offset `0x0` of its own COMDAT `.text`
+section** and a function's bytes are exactly that section's raw data — no
+boundary guessing. The only bytes the linker rewrites are relocation sites, and
+density is low: `DrawIndexedVertices` is 23 relocations across 285 instructions.
+`tools/match_d3d9.py` emits an IDA pattern with all four bytes of each relocated
+instruction word wildcarded (`VirtualAddress & ~3`); `IMAGE_REL_PPC_REL24`
+(`0x06`) dominates, with `0x10`/`0x11`/`0x12` appearing at the odd `lis`/`ori`
+pair.
+
+**Known-answer test, passed before anything unknown was matched.**
+`swap.obj`'s `D3DDevice_Swap` is **1668 bytes = `0x684`**, the exact recorded
+size of `sub_82566B58` — the one function already confirmed as D3D9's swap via
+the sole binary-wide `VdSwap` xref. Its pattern matches **`0x82566B58` and
+nothing else**. Same size and same bytes, from an independently obtained
+library: the XDK build is the right one.
+
+**The addresses.** Every target matched, each to exactly one address. Renamed in
+`assets/default.xex.probe.i64`.
+
+| guest addr | function | bytes | xrefs |
+|---|---|---|---|
+| `0x8254B7C0` | `D3DDevice_SetStreamSource` | 288 | **63** |
+| `0x8254E748` | `D3DDevice_SetTexture` | 396 | **307** |
+| `0x825508A8` | `D3DDevice_SetVertexShader` | 460 | **84** |
+| `0x82550A90` | `XGSetVertexDeclaration` | 236 | 2 (D3D9-internal) |
+| `0x82550B80` | `D3DDevice_CreateVertexDeclaration` | 128 | **18** |
+| `0x825561B0` | `D3DDevice_DrawVertices` | 1044 | **34** |
+| `0x825565C8` | `D3DDevice_DrawIndexedVertices` | 1140 | **19** |
+| `0x82564C50` | `D3D::PatchVertexShaderToMatchVertexDeclaration` | 1572 | 3 (D3D9-internal) |
+| `0x82566B58` | `D3DDevice_Swap` | 1668 | 1 |
+
+**The draws are real calls.** This was the question that gated the whole route —
+XDK D3D9 inlines heavily in release builds, and had the draws been compiled into
+game code as direct command-buffer writes there would be nothing to hook. They
+were not: 53 call sites for the two draw entry points, spread across game code
+at `0x821E`, `0x8232`, `0x823E`, `0x823F`, `0x8243`, `0x8247`. **A hook point
+exists.**
+
+`PatchVertexShaderToMatchVertexDeclaration` and `XGSetVertexDeclaration` have
+only D3D9-internal callers, which is expected — they are lazy-state internals
+reached from `SetVertexShader` and `CreateVertexDeclaration`, not game-facing
+API. That is a fine hook point too; it is simply not one the game calls.
+
+**What this changes.** `SetVertexDeclaration`/`CreateVertexDeclaration` and
+`SetStreamSource` carry the stream layout, offsets, types and semantics that
+`PickColorAttribute`, the stride heuristic and the format-38 fallback have been
+guessing at for six rounds. `SetTexture`'s 307 call sites are the texture
+binding the renderer currently models not at all.
+
+**What it does not change yet.** A located address is not a hook.
+`sub_82566B58` was located rounds ago and still is not hooked. Nothing under
+`src/` was touched this round, and no measurement was taken — wiring any of this
+up is a separate round with its own before/after.
+
+**Reproducing it.** `assets/d3d9/` is gitignored and not in the repository; the
+lib is required to regenerate any pattern. `python tools/match_d3d9.py --all`
+emits every pattern, `python tools/match_d3d9.py <obj> <symbol>` emits one.
+Feed the first ~40 tokens to `find_bytes`; a pattern that returns more than one
+match is not an identification. Do not trust a match under 128 bytes — the ~100
+`D3DDevice_SetRenderState_*` leaves in `state.obj` are 20-56 bytes with zero
+relocations, and several are byte-identical to each other.
+
+### The vertex declarations, read from the guest at runtime (2026-08-03)
+
+First use of the D3D9 hooks. `src/hooks/hooks_d3d9.cpp` hooks
+`D3DDevice_CreateVertexDeclaration` (`0x82550B80`), `DrawIndexedVertices`
+(`0x825565C8`) and `DrawVertices` (`0x825561B0`). All three pass through to the
+original and change no guest state.
+
+**The hooks work and carry the whole draw load.** 170,000 draws in a 165s run —
+63,308 `DrawIndexedVertices`, 106,692 `DrawVertices`. That closes the caveat
+left by the previous round: 53 static call sites really are the game's draw
+path, and the guest runs normally with the hooks in place.
+
+**`D3DVERTEXELEMENT9` is 12 bytes on Xenon, not the 8 of the PC struct.** Both
+`CreateVertexDeclaration` and `XGSetVertexDeclaration` walk the array with
+`lhzu r9, 0xC`. This is one reason the earlier static search found nothing — it
+looked for the 8-byte sentinel. (Correcting the stride does not resurrect that
+search: four different 12-byte `D3DDECL_END` forms also return zero matches, so
+the declarations really are runtime-only.)
+
+The layout, confirmed by the decode below rather than assumed:
+
+```
+  0  Stream      u16   (0xFF terminates the array)
+  2  Offset      u16
+  4  Type        u32   Xenon packed format descriptor
+  8  Method      u8
+  9  Usage       u8    D3DDECLUSAGE
+ 10  UsageIndex  u8
+ 11  padding     u8    observed as FF/7C/78/3B/60 — the runtime never reads it
+```
+
+**23 declarations exist, and that is the whole population.** A first run hit 23
+against a cap of 24; the cap was raised to 512 and the run extended from 100s to
+140s, producing byte-identical output. Element counts 1-8, five of them
+two-stream.
+
+Example — declaration #12, a skinned mesh, stride 36:
+
+| offset | usage | type |
+|---|---|---|
+| 0 | 0 POSITION | `00 1A 23 60` |
+| 8 | 3 NORMAL | `00 2A 21 87` |
+| 12 | 2 BLENDINDICES | `00 1A 22 86` |
+| 16 | 1 BLENDWEIGHT | `00 1A 20 86` |
+| 20 | 5 TEXCOORD0 | `00 2C 23 5F` |
+| 24 | 5 TEXCOORD1 | `00 2C 23 5F` |
+| 28 | 10 COLOR | `00 18 28 86` |
+| 32 | 6 TANGENT | `00 2A 21 87` |
+
+**Why the decode is trustworthy.** Two independent confirmations, neither fitted
+to the data:
+
+1. The usage numbers land exactly on the `D3DDECLUSAGE` enum order recovered two
+   rounds ago from D3DX9's semantic-string parser (`sub_8257A1B0`) — POSITION 0,
+   BLENDWEIGHT 1, BLENDINDICES 2, NORMAL 3, TEXCOORD 5, TANGENT 6, COLOR 10.
+2. Declaration #2's offsets run 0, 8, 12, 16, 20, 24 — **stride 28**, precisely
+   the stride the PM4 translator has been special-casing since the draw-
+   submission round. Two paths built from different evidence agree.
+
+**So colour is no longer a guess.** For the stride-28 layout it is at byte
+offset 20, format `0x00182886`; for the stride-36 layout at offset 28. Compare
+against `PickColorAttribute`.
+
+**Two things this exposes.**
+
+- **Multi-stream declarations exist** — #11, #15, #16, #17, #22 have
+  `max_stream=1`, typically position alone in stream 1 and everything else in
+  stream 0. The translator's stride heuristic assumes one interleaved stream, so
+  those draws were never going to be read correctly.
+- **The `Type` dwords are undecoded.** They are Xenon packed format descriptors,
+  not `D3DDECLTYPE` enum values. Element *sizes* fall out of the offset deltas
+  (`00 18 28 86` = 4 bytes, `00 1A 23 60` = 8, `00 1A 23 A6` = 16), which is
+  enough to act on before the encoding is cracked. Do not guess the rest.
+
+**Instrument trap, hit and fixed.** The first run logged every declaration and
+lost all of them: declarations are built during load, and the rotating log
+(3 x 5MB) retained only the last ~50s of a 165s run. Anything created early must
+be written to a non-rotating file. The dump is `d3d9_dump_decls.txt` next to the
+executable, gitignored alongside `pm4_dump_*.txt`. **Check the dump exists and
+has content before reading anything into a negative result** — this is the third
+round to lose a probe's output this way.
+
+### 12 of 23 declarations have no COLOR element (2026-08-03)
+
+Decoding the captured declarations by `Usage` changes the diagnosis that six
+rounds of colour work rested on.
+
+| declarations | usages |
+|---|---|
+| #13, #14 | POSITION TEXCOORD4 TEXCOORD0 NORMAL TANGENT TEXCOORD2 |
+| #15, #16 | POSITION TEXCOORD0 TEXCOORD1 [TEXCOORD2] |
+| #9 | POSITION TEXCOORD0 |
+| #1, #3, #5, #10, #20, #21, #23 | POSITION only |
+
+**11 of 23 carry a COLOR element; 12 do not.** The ones that do not include the
+normal-mapped, multi-texcoord meshes — real scene geometry, not helpers.
+
+**So the ~12700 `kNone` draws are very likely not `PickColorAttribute`
+failing.** That geometry has no vertex colour to find; its colour comes from
+textures sampled in a pixel shader. This renderer runs no pixel shader
+(`kGamePS` is `return col;`) and binds no texture, so it writes them opaque
+white. **The missing pixel-shader and texture path is the leading explanation
+for the white frame**, and it is not something an HLE renderer would fix by
+itself.
+
+Stated as strongly as the evidence allows and no further: the correlation that
+would turn "very likely" into "measured" was attempted and did not complete —
+see below.
+
+**Strategic conclusion, so it is not re-litigated.** The D3D9 route is viable
+and its inputs are reachable; it is *not* the current bottleneck. Do not start a
+D3D9 → D3D12 renderer to fix the white frame. HLE hands over declarations, which
+a ~200-line pass-through hook already delivered; it does not hand over a pixel
+shader.
+
+#### The render states are not inlined either
+
+Eight `SetRenderState_*` leaves matched uniquely from `state.obj`. These are
+fully-literal patterns — zero relocations — so the matches are as strong as
+matching gets. Caller counts are game code, and this is the output merger the
+previous round found is modelled *not at all*:
+
+| function | address | callers |
+|---|---|---|
+| `SetRenderState_ZEnable` | `0x82549AD8` | 79 |
+| `SetRenderState_AlphaBlendEnable` | `0x82549448` | 76 |
+| `SetRenderState_SrcBlend` | `0x82549568` | 46 |
+| `SetRenderState_DestBlend` | `0x825495F8` | 45 |
+| `SetRenderState_BlendOp` | `0x825494D8` | 34 |
+| `SetRenderState_ColorWriteEnable` | `0x8254A078` | 19 |
+| `SetRenderState_SeparateAlphaBlendEnable` | `0x825497D8` | 6 |
+| `SetRenderState_BlendFactor` | `0x82549900` | **0 — never called** |
+
+#### The declaration is NOT a plain pointer on the device — two confirmations
+
+The draw entry points receive `D3DDevice*` but not the declaration, and it is
+not recoverable by reading the device:
+
+1. **Memory probe, negative.** Scanning `device + 0..0x2000` for a dword equal
+   to a declaration observed being created finds **no offset that holds across
+   8 probed draws**. `0x2000` covers the whole struct — `DrawIndexedVertices`
+   itself indexes `device + 0x1780`.
+2. **The code agrees.** `sub_82565550`, one of the two callers of
+   `PatchVertexShaderToMatchVertexDeclaration`, reaches its state through an
+   indexed relative-offset table (`r28 = (r10 + 0x70) * 8`, then
+   `lwzx r11, r28, r5; add r11, r11, r5`) rather than a fixed field.
+
+**Next attempt should hook `PatchVertexShaderToMatchVertexDeclaration`
+(`0x82564C50`) directly** — it *receives* `const CVertexDeclaration*` as an
+argument on the lazy-state path at draw time, which is precisely the binding
+wanted, with no struct spelunking. Its 3 xrefs are D3D9-internal, which is why
+it is reached at draw time rather than called by the game.
+
+#### Two instrument traps, both hit
+
+- **The guest arena is sparse.** The first probe dereferenced each device dword
+  looking for XGSetVertexDeclaration's `0x00100005` magic and crashed the guest
+  with an access violation at `0x030013A0`. **Never dereference a value read out
+  of guest memory unless its target is already known good.** The fix was to
+  compare against declarations recorded as they were created — no speculative
+  reads at all, and stronger evidence besides.
+- **A negative from an under-scoped probe is not a negative.** The second run
+  scanned only `0x400` of a `>=0x1780` struct and reported "no offset holds a
+  declaration". That conclusion was an artifact of the window, not a fact.
+  State the scanned range with any negative result.
+
+### The declaration-per-draw binding works, and the no-colour draws are position-only (2026-08-03)
+
+**Route:** hook `PatchVertexShaderToMatchVertexDeclaration` (`0x82564C50`),
+which *receives* the declaration on the lazy-state path at draw time. The
+device-struct route is a dead end — see the previous section.
+
+**The declaration is argument `r5`**, and that is established by comparing every
+argument register against declarations watched being created by
+`CreateVertexDeclaration`, not by reading the mangled signature. It agrees with
+the signature, but a misread would have been invisible in the output.
+
+**140,000 draws attributed, zero unattributed**, 2328 patch calls, no access
+violations.
+
+| | draws |
+|---|---|
+| declarations **with** COLOR | 102,500 |
+| declarations **without** COLOR | 37,500 |
+| unattributed | **0** |
+
+**The no-colour population is dominated by one position-only declaration.**
+
+| id | elements | colour | draws |
+|---|---|---|---|
+| 0 | **1 (POSITION only)** | no | **36,352** |
+| 1 | 6 | yes | 101,924 |
+| 2 | 1 (POSITION only) | no | 912 |
+| 15 | 4 | no | 176 |
+| 14 | 3 | no | 53 |
+
+**36,352 of 37,500 no-colour draws — 97% — use a declaration with a single
+POSITION element.** A position-only layout *cannot* carry vertex colour, so
+`PickColorAttribute` was never going to find one. That settles the question the
+round was asked, and by firmer evidence than the `kNone` count would have given:
+it is a property of the declaration, not a statistic.
+
+Combined with the output-merger round (colour mask `0xF`, depth write never,
+~64% non-trivial blend), position-only geometry that writes all four colour
+channels and blends is consistent with screen-space effect or particle passes
+coloured entirely by a pixel shader. **We run no pixel shader, so they come out
+opaque white.**
+
+#### The renderer drops most draws on stride alone
+
+From the same run's `RenderThread` line, cumulative skipped strides:
+
+```
+8:3943   12:354   16:4934   36:21992   38:994   44:756   64:753
+```
+
+**21,992 draws skipped for being stride 36** — which is exactly declaration #12,
+the 8-element skinned mesh (POSITION NORMAL BLENDINDICES BLENDWEIGHT TEXCOORD0
+TEXCOORD1 COLOR TANGENT). The translator submits stride-28 draws and drops
+everything else. Under a declaration-driven path stride 36 is simply another
+input layout; there is nothing special to solve.
+
+### The full D3D9 entry-point table (2026-08-03)
+
+Thirty functions located, each matching exactly one address. Method and proof in
+the earlier D3D9 section; patterns regenerate with `tools/match_d3d9.py`.
+
+| function | address | function | address |
+|---|---|---|---|
+| `DrawIndexedVertices` | `0x825565C8` | `SetRenderTarget` | `0x8254C060` |
+| `DrawVertices` | `0x825561B0` | `SetDepthStencilSurface` | `0x8254C3B0` |
+| `SetStreamSource` | `0x8254B7C0` | `SetViewport` | `0x8254BF50` |
+| `SetIndices` | `0x8254B8E0` | `SetScissorRect` | `0x8254B678` |
+| `SetVertexShader` | `0x825508A8` | `Clear` | `0x8255B258` |
+| `SetPixelShader` | `0x825506E8` | `Resolve` | `0x8255CE98` |
+| `CreateVertexShader` | `0x82552330` | `SetTexture` | `0x8254E748` |
+| `CreatePixelShader` | `0x82552148` | `CreateTexture` | `0x8254E3C8` |
+| `SetVertexShaderConstantFN` | `0x82550320` | `CreateVertexDeclaration` | `0x82550B80` |
+| `SetPixelShaderConstantFN` | `0x825503F8` | `XGSetVertexDeclaration` | `0x82550A90` |
+| `PatchVertexShaderToMatch…` | `0x82564C50` | `Swap` | `0x82566B58` |
+
+Plus the eight `SetRenderState_*` leaves in the previous section.
+
+**Not located, and why:** `SetVertexDeclaration` (20 bytes), `SetViewportF`
+(32) and `D3DDevice_Resolve`'s smaller siblings are under the 128-byte
+threshold where a byte match stops being evidence. `SetVertexDeclaration` is not
+needed — `PatchVertexShaderToMatchVertexDeclaration` supplies the same binding.
+
+`SetVertexShaderConstantFN` and `SetPixelShaderConstantFN` matched but IDA would
+not rename them: auto-analysis had not defined a function at those addresses.
+The addresses are confirmed by the match; the IDB simply has no function object
+there yet.
 
 ### Parser caveat
 

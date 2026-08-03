@@ -44,6 +44,7 @@ set(MX_SOURCES
     src/hooks/hooks_loading.cpp
     src/hooks/hooks_boot.cpp
     src/hooks/hooks_plugin_diag.cpp
+    src/hooks/hooks_d3d9.cpp
 )
 
 if(WIN32)
