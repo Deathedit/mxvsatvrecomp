@@ -34,6 +34,8 @@ set(MX_SOURCES
     src/gpu/shader_ucode.cpp
     src/gpu/shader_alu.cpp
     src/gpu/xenos_gpu_state.cpp
+    src/gpu/d3d9_layout.cpp
+    src/gpu/d3d9_state.cpp
 
     # hooks — guest function hooks and mid-ASM stubs
     src/hooks/native_bridge.cpp

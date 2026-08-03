@@ -64,6 +64,20 @@ REXCVAR_DEFINE_BOOL(hide_colored_draws, false, "Debug",
                     "the colourless ones remain. A diagnostic: it shows the "
                     "shape of the overpaint on its own, not a fix");
 
+// The D3D9 -> D3D12 high-level path, step one: describe every draw from the
+// API calls that produced it instead of reconstructing it from PM4.
+//
+// Capture only. It changes nothing that is submitted to D3D12 — no PSOs, no
+// uploads, no shader translation — so with it off a run is byte-identical to
+// one built before it existed. The state shadow behind it fills unconditionally
+// (state set before the first draw would otherwise read as unknown); this cvar
+// gates the per-draw scoring, the coverage report and the dump.
+REXCVAR_DEFINE_BOOL(hle_capture, false, "Debug",
+                    "Score every D3D9 draw against the state shadow and report "
+                    "what fraction is fully described, plus the first few "
+                    "resolved draws to d3d9_dump_decls.txt. Capture only — it "
+                    "submits nothing and renders nothing");
+
 REXCVAR_DEFINE_BOOL(main_surface_only, false, "Debug",
                     "Submit only draws targeting the guest's main colour "
                     "surface, instead of flattening every render pass into one "

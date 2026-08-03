@@ -2404,6 +2404,156 @@ not rename them: auto-analysis had not defined a function at those addresses.
 The addresses are confirmed by the match; the IDB simply has no function object
 there yet.
 
+### The Type dword is decoded, from the function that consumes it (2026-08-03)
+
+First HLE step. `src/gpu/d3d9_layout.{h,cpp}` turns a guest `D3DVERTEXELEMENT9`
+array into a host input layout; `tools/d3d9_layout_test.cpp` checks it against
+all 23 captured declarations.
+
+**None of this is inferred from the data.** An earlier attempt to guess the bit
+layout by trying rotations and swizzle positions produced nonsense. The answer
+is in `D3D::PatchVertexShaderToMatchVertexDeclaration` (`0x82564C50`), the
+function that *reads* Type and writes the matching fields of the shader's vfetch
+instruction:
+
+```c
+dword1 = (((t << 12) & 0x3F000) | (t & 0x300)) << 4 | dword1 & 0xBFC0CFFF;
+```
+
+The preserved mask clears exactly bits `[21:16]`, `[13:12]` and `[30]` of vfetch
+dword1, which by `ucode.h` are `format`, `fomat_comp_all`, `num_format_all` and
+`is_mini_fetch`. Equating the two sides gives the field layout outright:
+
+| Type bits | meaning |
+|---|---|
+| `[5:0]` | `xenos::VertexFormat` |
+| `[8]` | `fomat_comp_all` — 1 = signed |
+| `[9]` | `num_format_all` — 0 = normalized, 1 = integer |
+| `[21:10]` | vfetch destination swizzle, **x in `[12:10]`, w in `[21:19]`** |
+
+**The two bits at `[9:8]` are what make the layout correct rather than
+plausible.** `COLOR` is `0x00182886` and `BLENDINDICES` is `0x001A2286` — the
+same format 6 (`k_8_8_8_8`), differing only there. One is `R8G8B8A8_UNORM`, the
+other `R8G8B8A8_UINT`. A decode ignoring those bits would turn every blend index
+into a fraction and every byte-packed normal into an unsigned value, and the
+result would still look like geometry.
+
+**The size table is the guest's own**, lifted verbatim from `0x8204E188`.
+`PatchVertexShaderToMatchVertexDeclaration` indexes it by the vfetch format field
+to compare attribute extents. Entries are **dwords**; every format the runtime
+considers illegal is 0. This replaces a by-hand derivation from a previous round
+— that derivation happened to agree on all ten formats present in the captures,
+but this is the runtime's answer for all 64.
+
+**The swizzle's component order was not read out of that arithmetic.** The shift
+chain is dense enough that taking a direction from it is not evidence, and the
+first write-up here had x and w the wrong way round. The captures settle it,
+because only one reading makes all four component counts come out right:
+4-component formats give `0x688` = `(x,y,z,w)`, 3-component `0xA88` =
+`(x,y,z,1)`, 2-component `0xB08` = `(x,y,0,1)`, 1-component `0xB20` =
+`(x,0,0,1)`, and every 8_8_8_8 `COLOR` gives `0x60A` = `(z,y,x,w)`, which is
+D3DCOLOR's BGRA arriving as RGBA. Values are 0-3 for xyzw, 4 for constant 0, 5
+for constant 1. **The swizzle stays in the shader**, where D3D9 itself puts it;
+a DXGI format that reordered components would apply it twice.
+
+**The one format DXGI cannot hold** is signed normalized `k_2_10_10_10`, which
+this title uses for `NORMAL` and `TANGENT`. There is no `R10G10B10A2_SNORM`.
+The decoder passes the raw bits through as `R10G10B10A2_UINT` and sets
+`Unpack::kSnorm2_10_10_10` so the shader must finish the conversion. Picking
+`UNORM` instead would halve and bias every normal — and look fine.
+
+**Test result: all 23 declarations pass.** Each element's decoded size equals the
+gap to the next element's offset in the same stream, and declaration #2 lands on
+stride 28 and #12 on 36 — the two numbers the PM4 translator measured
+independently. Offsets from the game, sizes from the runtime's table, strides
+from a different pipeline: three unrelated sources agreeing. The test also
+asserts the decode *rejects* format 0, format 5, `k_11_11_10`, a normalized
+32-bit integer format, an out-of-range usage and a non-dword-aligned offset.
+
+```
+clang++ -std=c++23 -I src -I C:/rexglue-sdk/include \
+    -o d3d9_layout_test.exe tools/d3d9_layout_test.cpp src/gpu/d3d9_layout.cpp
+```
+
+### The state shadow works; the declaration binding does not (2026-08-03)
+
+`src/gpu/d3d9_state.{h,cpp}` plus fifteen more hooks in `hooks_d3d9.cpp`:
+`SetStreamSource`, `SetIndices`, `SetVertexShader`, `SetPixelShader`,
+`SetTexture`, `SetViewport`, `SetScissorRect` and the eight `SetRenderState_*`
+leaves. Behind `hle_capture`, default **off**; nothing is submitted or rendered.
+Signatures come from the typed decompilations, not the PC headers — several
+differ, and `DrawVertices(pDevice, PrimitiveType, StartVertex, VertexCount)` was
+read rather than assumed once its arguments started mattering.
+
+**Resource fields are read at Set time and never at draw time.**
+`D3DVertexBuffer` is `D3DResource` (24 bytes) then a Xenos vertex fetch constant
+at `+0x18`; `D3DIndexBuffer` is `Address` at `+0x18` and `Size` at `+0x1C`. The
+fetch constant is decoded the way `Pm4Translator::CollectVertexFetches` already
+decodes it — `address = dword0 & ~3`, `size_bytes = ((dword1 >> 2) & 0xFFFFFF) *
+4` — because that decode is the validated one. A first pass copied
+`SetStreamSource`'s own `0x1FFFFFFF` mask instead and left the two type bits in
+the address. **The index width is bit 31 of the object's `Common` dword**, not a
+separate field: `DrawIndexedVertices` branches on `if (*pIndexBuffer < 0)` and
+takes `4 * StartIndex` on that side against `2 * StartIndex` on the other.
+
+**What a 165s run says.** 165,000 draws (61,839 indexed, 103,161 not). 95% are
+"fully described" by the seen-flag criterion; the cross-checks are what matter:
+
+| check | result |
+|---|---|
+| index buffer holds the draw's index range | **61,839 / 61,839 — every indexed draw** |
+| vertex buffer holds the draw's vertex range | 19,291 / 103,482 |
+| bound stride vs the layout's own minimum | exact 37,076, padded 121,647, **too small 6,743** |
+
+The index side agreeing on every single indexed draw is strong evidence that the
+address, size and width decode is right. The vertex side is not, and the named
+failures say why:
+
+```
+STRIDE TOO SMALL: declaration id 1 stream 0 needs 28 bytes, bound stride is 8
+VB DOES NOT HOLD RANGE: declaration id 2 stream 0 start_vertex=13748 count=108
+                        stride=48 needs 665088B, buffer is 338592B
+```
+
+**The declaration attributed to each draw is stale.** It comes from
+`PatchVertexShaderToMatchVertexDeclaration`, which fires only when the lazy state
+is dirty: **2,508 calls against 165,000 draws**, about one update per 66 draws.
+The previous round reported "140,000 draws attributed, 0 unattributed" — that
+count was right, and the conclusion drawn from it was not. Attribution to a value
+that has not been refreshed is not attribution.
+
+Two competing explanations were **eliminated**, both from evidence already on
+disk rather than from new runs:
+
+- *Multiple devices.* Five distinct pointers appear in `r3`, but `0x40BC5F80`
+  takes **1,197,869** calls and the other four take **201 between them** — three
+  of them exactly 25 calls each, only from `SetTexture`, `SetScissorRect` and
+  `SetRenderState_*`, at init. 0.05% of calls cannot explain 81% of draws.
+- *Multiple threads.* Every `d3d9: draws` line within a single run carries one
+  thread id.
+
+One device, one thread, a stale declaration.
+
+**Stop condition reached, as the plan required.** The description is not yet
+trustworthy enough to render from, the reason is specific rather than diffuse,
+and nothing was built on top of it.
+
+**The next step, and why it should work.** The device struct needs rescanning for
+the current declaration — and the earlier scan that found nothing was
+under-scoped **for the second time**. It covered `device + 0..0x2000`, but
+`SetStreamSource` writes `+13440` (`0x3480`) and `DrawIndexedVertices` reads the
+bound index buffer from `+12612` (`0x3144`), so the struct is at least `0x3480`
+bytes and less than half of it was searched. Rescanning `0..0x4000` against the
+known-declaration set is the same safe comparison as before — no unknown pointer
+is dereferenced — just correctly scoped.
+
+**Instrument traps confirmed again this round.** A bare "MORE THAN ONE devices"
+flag said nothing; recording the pointers and which entry points touched each one
+turned it into a dismissal in one run. Likewise a bare count of stride failures
+would not have distinguished a wrong decode from a stale declaration — the eight
+named cases did.
+
+
 ### Parser caveat
 
 `Pm4Parser` accepts any Type-3 with `body_word_count <= 0x4000`. A misparsed
