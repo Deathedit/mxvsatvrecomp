@@ -17,6 +17,7 @@
 
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <vector>
 
 class D3D12Renderer {
@@ -62,14 +63,24 @@ void ClearGameDraws();
   }
   [[nodiscard]] uint32_t GetWidth() const noexcept { return m_width; }
   [[nodiscard]] uint32_t GetHeight() const noexcept { return m_height; }
-  void RenderGameFrame();
-  void PresentGameFrame();
-  void RenderVideoFrame();
-
 
  private:
   static constexpr uint32_t kFrameCount = 3;
   static constexpr DXGI_FORMAT kBackBufferFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+  // The offscreen game depth buffer's format. Named because it has to appear in
+  // three places that must agree — the resource, its clear value, and the PSO's
+  // DSVFormat — and the PSO's copy was the one that got left out.
+  static constexpr DXGI_FORMAT kGameDepthFormat = DXGI_FORMAT_D32_FLOAT;
+
+  // Frame internals. BeginFrame picks between the two Render* and EndFrame
+  // calls PresentGameFrame, so nothing outside this class should ever invoke
+  // them: PresentGameFrame's barriers are directional and a second call
+  // declares a StateBefore the first one already moved away from. These were
+  // public, and the render thread was calling RenderGameFrame and
+  // PresentGameFrame a second time in between BeginFrame and EndFrame.
+  void RenderGameFrame();
+  void PresentGameFrame();
+  void RenderVideoFrame();
 
   bool CreateFactory();
   bool CreateDevice();
@@ -150,6 +161,24 @@ bool CreateGamePipeline();
   // the PERF(per-frame-allocs) note in d3d12_game.cpp.
   static constexpr size_t kMaxGameDraws = 256;
   std::vector<GameDraw> m_gameDraws;
+
+  // Resources whose last GPU use was in the frame that signalled `fence`.
+  //
+  // A D3D12 command list does not reference-count the resources it references —
+  // recording a draw against a buffer keeps nothing alive. ClearGameDraws used
+  // to release every draw's vb/ib/cb directly, once per frame, while the
+  // previous frame's command list was still in flight on the queue, so the GPU
+  // could be reading UPLOAD-heap memory the CPU had already freed. Resources
+  // now move here instead and are released only once m_fence has passed the
+  // value signalled for the submission that last used them.
+  struct RetiredFrame {
+    uint64_t fence = 0;
+    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> res;
+  };
+  std::deque<RetiredFrame> m_retired;
+
+  // Release everything the GPU has finished with. Cheap and called per frame.
+  void DrainRetired();
 
   // Latched true by the first AddGameDraw and never cleared until Shutdown.
   // Once the guest has produced real geometry the placeholder triangle is

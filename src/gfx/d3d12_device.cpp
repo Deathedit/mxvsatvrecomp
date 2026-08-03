@@ -143,6 +143,9 @@ void D3D12Renderer::Shutdown() {
   m_hasGamePipeline = false;
 
   m_gameDraws.clear();
+  // WaitForGpu above has already drained the queue, so nothing here is still in
+  // flight and the retirement list can be dropped outright.
+  m_retired.clear();
   m_hasEverDrawnGame = false;
 
   m_gameRT.Reset();
@@ -551,4 +554,9 @@ void D3D12Renderer::MoveToNextFrame() {
     }
     WaitForSingleObject(m_fenceEvent, INFINITE);
   }
+
+  // Release the per-draw upload buffers the GPU has now finished with. Done
+  // here rather than in ClearGameDraws because this is the only place that
+  // knows the fence has moved.
+  DrainRetired();
 }

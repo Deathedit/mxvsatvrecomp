@@ -93,8 +93,10 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       if (!rgba.empty() && m_renderer)
         m_renderer->UploadVideoFrame(rgba.data(), bink.GetVideoWidth(), bink.GetVideoHeight());
       if (m_renderer) {
+        // BeginFrame dispatches to RenderVideoFrame itself when a video frame
+        // has been uploaded, and EndFrame does the present. Calling either
+        // again here is not idempotent — see the note in the game loop below.
         m_renderer->BeginFrame();
-        m_renderer->RenderVideoFrame();
         m_renderer->EndFrame();
       }
       // Pace to video frame rate (Bink has no internal clock sync).
@@ -217,9 +219,17 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                     s_ticksWithDraws, s_ticksEmpty,
                     surf.empty() ? "none" : surf);
       }
+      // BeginFrame and EndFrame own the whole frame: BeginFrame opens the
+      // command list, transitions and clears the targets and then calls
+      // RenderGameFrame (or RenderVideoFrame) itself; EndFrame calls
+      // PresentGameFrame and then swaps. This loop used to call
+      // RenderGameFrame and PresentGameFrame again in between, which was not a
+      // harmless repeat — PresentGameFrame's barriers are directional. Its
+      // first call leaves m_gameRT in PIXEL_SHADER_RESOURCE, so EndFrame's
+      // call then declared StateBefore = RENDER_TARGET for a resource that was
+      // not in it, an invalid transition, on top of drawing and copying the
+      // whole frame twice.
       m_renderer->BeginFrame();
-      m_renderer->RenderGameFrame();
-      m_renderer->PresentGameFrame();
       m_renderer->EndFrame();
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(16));

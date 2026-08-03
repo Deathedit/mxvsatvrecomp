@@ -8,8 +8,10 @@
 // render target + D32 depth buffer, which PresentGameFrame copies to the
 // current swapchain backbuffer.
 //
-// Note the PSO leaves DepthStencilState zeroed and DSVFormat unset, so depth
-// test is off. Guest geometry at z = 1.0 is not rejected.
+// Note the PSO leaves DepthStencilState zeroed, so depth test is off and guest
+// geometry at z = 1.0 is not rejected. DSVFormat is set anyway, to match the
+// DSV BeginFrame binds — leaving it UNKNOWN while a D32_FLOAT view is bound is
+// a debug-layer error, and the two must agree before depth can be turned on.
 
 #include "gfx/d3d12_renderer.h"
 
@@ -99,6 +101,12 @@ bool D3D12Renderer::CreateGamePipeline() {
   pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   pso.NumRenderTargets = 1;
   pso.RTVFormats[0] = kBackBufferFormat;
+  // DepthStencilState stays zeroed — DepthEnable FALSE — so nothing is tested
+  // or written. DSVFormat must still name the format of the DSV BeginFrame
+  // binds: a PSO declaring DXGI_FORMAT_UNKNOWN while a D32_FLOAT DSV is bound
+  // is a debug-layer error, and the two disagreeing is the sort of thing that
+  // becomes a real state mismatch the moment depth is turned on.
+  pso.DSVFormat = kGameDepthFormat;
   pso.SampleDesc.Count = 1;
   pso.InputLayout.NumElements = 2;
   pso.InputLayout.pInputElementDescs = inputLayout;
@@ -245,7 +253,33 @@ void D3D12Renderer::RenderGameFrame() {
   }
 }
 
-void D3D12Renderer::ClearGameDraws() { m_gameDraws.clear(); }
+void D3D12Renderer::ClearGameDraws() {
+  if (m_gameDraws.empty()) return;
+
+  // Hand the buffers to the retirement list rather than releasing them here.
+  // These draws were recorded into the command list submitted at the end of the
+  // previous frame, which signalled m_fenceValue; the GPU may still be reading
+  // them. See RetiredFrame in the header for why the command list itself is no
+  // protection.
+  RetiredFrame& r = (!m_retired.empty() && m_retired.back().fence == m_fenceValue)
+                        ? m_retired.back()
+                        : m_retired.emplace_back(RetiredFrame{m_fenceValue, {}});
+  r.res.reserve(r.res.size() + m_gameDraws.size() * 3);
+  for (auto& d : m_gameDraws) {
+    if (d.vb) r.res.push_back(std::move(d.vb));
+    if (d.ib) r.res.push_back(std::move(d.ib));
+    if (d.cb) r.res.push_back(std::move(d.cb));
+  }
+  m_gameDraws.clear();
+}
+
+void D3D12Renderer::DrainRetired() {
+  if (m_retired.empty() || !m_fence) return;
+  const uint64_t completed = m_fence->GetCompletedValue();
+  while (!m_retired.empty() && m_retired.front().fence <= completed) {
+    m_retired.pop_front();
+  }
+}
 
 void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t vtxStride, const uint8_t* indices,
@@ -253,14 +287,18 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t idxCount, const float* mvp,
                                  uint32_t topology) {
   // PERF(per-frame-allocs): this creates three ID3D12Resource's per call (VB +
-  // IB + CB) on the UPLOAD heap, and is now called once per submitted draw
-  // rather than once per frame. Correctness is fine — the ComPtrs live in
-  // m_gameDraws until ClearGameDraws, and D3D12's internal command-list
-  // tracking keeps the underlying memory alive until the GPU finishes the last
-  // command using it — but the allocation rate now scales with the draw count,
+  // IB + CB) on the UPLOAD heap, and is called once per submitted draw rather
+  // than once per frame, so the allocation rate scales with the draw count —
   // which is why kMaxGameDraws caps it. The proper fix is a ring of upload
   // buffers recycled after MoveToNextFrame's fence sync. Same TODO applies to
   // UploadVideoFrame's m_videoUploadBuffer.
+  //
+  // This comment used to claim "D3D12's internal command-list tracking keeps
+  // the underlying memory alive until the GPU finishes the last command using
+  // it". That is false — D3D12 command lists do not reference-count the
+  // resources they reference; that was a D3D11 guarantee. Lifetime is the
+  // application's job, and it is now done by ClearGameDraws handing these to
+  // the fenced retirement list rather than releasing them outright.
   if (!vertices || !indices || vtxBytes == 0 || idxBytes == 0) return;
   if (m_gameDraws.size() >= kMaxGameDraws) {
     static bool s_logged = false;
@@ -365,9 +403,9 @@ bool D3D12Renderer::CreateGameRenderTargets() {
         m_gameRtvHeap->GetCPUDescriptorHandleForHeapStart());
   }
 
-  rd.Format = DXGI_FORMAT_D32_FLOAT;
+  rd.Format = kGameDepthFormat;
   rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
-  cv.Format = DXGI_FORMAT_D32_FLOAT;
+  cv.Format = kGameDepthFormat;
   cv.DepthStencil.Depth = 1.0f;
   cv.DepthStencil.Stencil = 0;
 
