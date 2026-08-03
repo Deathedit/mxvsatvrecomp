@@ -266,12 +266,207 @@ uint64_t g_vbTooSmall = 0;
 uint64_t g_ibFits = 0;
 uint64_t g_ibTooSmall = 0;
 
+//---------------------------------------------------------------------------
+// Stage 0 — why does the vertex range check fail?
+//
+// 20,125 of 210,799 stream-checks pass, while every one of 66,726 index buffers
+// holds its range. Two candidate causes, and this probe separates them.
+//
+// (a) A second binding path. `?SetStreamSource@D3DDevice@@QAAJIPAUD3DVertexBuffer@@II@Z`
+//     exists in blocks.obj beside the `D3DDevice_SetStreamSource` hooked here,
+//     as do state-block variants of SetTexture/SetRenderState/SetVertexDeclaration
+//     plus D3DStateBlock_Apply. Binds arriving that way never reach the hook and
+//     the shadow keeps an older bind. `draws since the last bind` measures it.
+//
+// (b) Streams are not indexed by a common vertex index. Xenos vertex shaders
+//     issue their own vfetch, so a four-entry stream read by something like
+//     `index % 4` is legal — and would make the check, not the game, wrong.
+//     A per-stream split shows whether the failures are confined to small
+//     auxiliary streams.
+//
+// The device holds the answer either way, because D3D9 writes the bound fetch
+// constant into a file on the device. **The offset was meant to be read out of
+// SetStreamSource's arithmetic, as `0x2ED8` was.** That failed: the unlinked
+// object decodes to `device + StreamNumber*8` for dword0, which collides with
+// the lazy-state qword at `+0x10` that SetVertexDeclaration provably uses, so a
+// register is being misread and the result must not be built on.
+//
+// Located empirically instead, by a method that carries its own proof: at
+// SetStreamSource we know the exact dwords, so every device offset holding one
+// of them is a candidate, and intersecting the candidate sets across many
+// different binds leaves only offsets that track the binding. Comparison only —
+// no value read out of the device is ever dereferenced.
+//---------------------------------------------------------------------------
+
+// **The scan asks the OS whether a page is readable instead of guessing where
+// the struct ends.** Two guesses were tried and both faulted at guest
+// 0x1D00B000: first 0x4000, then 0x3484 — the latter chosen because
+// SetStreamSource writes +0x3480, which proves that offset is mapped for *some*
+// device and proves nothing about this one. The arena is sparse; a bound picked
+// from a different object is not a bound.
+//
+// VirtualQuery per 4 KiB page costs one call per page per sample and removes
+// the question entirely. The scan stops at the first page that is not
+// committed and readable, so it reads exactly as far as memory exists.
+constexpr uint32_t kDeviceScanBytes = 0x4000;
+constexpr uint32_t kDeviceScanDwords = kDeviceScanBytes / 4;
+constexpr uint32_t kHostPageSize = 4096;
+
+bool HostPageReadable(const void* p) {
+  MEMORY_BASIC_INFORMATION mbi = {};
+  if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
+  if (mbi.State != MEM_COMMIT) return false;
+  constexpr DWORD kNoRead = PAGE_NOACCESS | PAGE_GUARD;
+  return mbi.Protect != 0 && (mbi.Protect & kNoRead) == 0;
+}
+
+// One bit per dword offset. Starts all-set and is intersected; anything still
+// set after many samples held the just-bound value every single time.
+bool g_fcCand0[kDeviceScanDwords];
+bool g_fcCand1[kDeviceScanDwords];
+bool g_fcPrimed = false;
+uint32_t g_fcSamples = 0;
+uint32_t g_fcReached = kDeviceScanBytes;   // lowest end-of-readable across samples
+constexpr uint32_t kFcMaxSamples = 64;
+
+// What the last SetStreamSource for stream 0 bound, kept raw so the scan can
+// try the maskings D3D9 might apply rather than assuming one.
+uint32_t g_lastBindD0 = 0;
+uint32_t g_lastBindD1 = 0;
+uint32_t g_lastBindOffset = 0;
+bool g_haveBind = false;
+
+// Draws since the last SetStreamSource that touched each stream. If binds are
+// arriving through a path this file does not hook, the failing draws sit at
+// large values here while the passing ones sit near zero.
+uint64_t g_drawsSinceBind[mx::pm4::kMaxStreams] = {};
+uint64_t g_bindAgeFitSum[mx::pm4::kMaxStreams] = {};
+uint64_t g_bindAgeFailSum[mx::pm4::kMaxStreams] = {};
+uint64_t g_bindAgeFailMax[mx::pm4::kMaxStreams] = {};
+
+// The vertex range check, split by stream. A bare total cannot distinguish
+// "stream 0 geometry is wrong" from "small auxiliary streams are modelled
+// wrong", and those need completely different fixes.
+uint64_t g_vbFitStream[mx::pm4::kMaxStreams] = {};
+
+// Does the device's own fetch constant match what SetStreamSource recorded,
+// and where it does not, does the device's value explain a draw the snapshot
+// could not? `rescues` is the number that matters: it is how much of the
+// shortfall reading the device would recover.
+uint64_t g_fileAgree[mx::pm4::kMaxStreams] = {};
+uint64_t g_fileDiffer[mx::pm4::kMaxStreams] = {};
+uint64_t g_fileRescues[mx::pm4::kMaxStreams] = {};
+uint64_t g_vbFailStream[mx::pm4::kMaxStreams] = {};
+
+// Indexed draws were never range-checked on the vertex side, because the range
+// depends on the index values. Reading them looked safe — the index buffer
+// "holds its range" 66,726/66,726 — and it is **off**, because it faults.
+//
+// Three runs took an access violation at guest 0x1D00B000, and a VirtualQuery
+// guard on the device scan did not stop it, which is what identified this read
+// rather than that one as the source.
+//
+// The reason is almost certainly the address decode: SetIndices records
+// `address = REX_LOAD_U32(buffer + 0x18) & 0x1FFFFFFF`, and that mask is the
+// same one already found wrong for vertex buffers — it clears the top three
+// bits rather than the bottom two, so it silently relocates any buffer whose
+// address has them set. The 66,726/66,726 result does not contradict this: it
+// compares a count against a size and never dereferences the address, so a
+// wrong address passes it every time.
+//
+// Left in place behind this flag rather than deleted: the check is worth having
+// once the decode is read out of D3DDevice_SetIndices the way the vertex side
+// was. It is not needed for the question Stage 0 is actually asking, because
+// only non-indexed draws were ever in the 20,125/210,799 denominator.
+constexpr bool kProbeIndexRange = false;
+uint64_t g_idxRangeFits = 0;
+uint64_t g_idxRangeFails = 0;
+uint64_t g_idxRangeUnread = 0;
+
+// Scan the device for dwords matching what was last bound, intersecting into
+// the candidate sets. Read-only, bounded, and every read is inside a struct
+// D3D9 is itself using on both sides of this hook.
+void SampleFetchConstantFile(uint32_t device, uint8_t* base) {
+  if (!device || !g_haveBind || g_fcSamples >= kFcMaxSamples) return;
+
+  // The maskings D3D9 might have applied on the way in. Trying several is the
+  // point: it avoids assuming which one, and an offset only survives if it
+  // matched on every sample.
+  const uint32_t want0[4] = {g_lastBindD0, g_lastBindD0 & 0x1FFFFFFFu,
+                             g_lastBindD0 + g_lastBindOffset,
+                             (g_lastBindD0 + g_lastBindOffset) & 0x1FFFFFFFu};
+  const uint32_t want1[2] = {g_lastBindD1, g_lastBindD1 - g_lastBindOffset};
+
+  // How far the scan actually got, so the report can say whether a null result
+  // means "not there" or "the struct ended before we looked".
+  uint32_t reached = 0;
+  for (uint32_t i = 0; i < kDeviceScanDwords; ++i) {
+    const uint32_t off = i * 4;
+    if ((off & (kHostPageSize - 1)) == 0 || i == 0) {
+      if (!HostPageReadable(REX_RAW_ADDR(device + off))) break;
+    }
+    reached = off + 4;
+    const uint32_t v = REX_LOAD_U32(device + off);
+    bool hit0 = false;
+    for (uint32_t k = 0; k < 4; ++k) hit0 = hit0 || v == want0[k];
+    bool hit1 = false;
+    for (uint32_t k = 0; k < 2; ++k) hit1 = hit1 || v == want1[k];
+    if (!g_fcPrimed) {
+      g_fcCand0[i] = hit0;
+      g_fcCand1[i] = hit1;
+    } else {
+      g_fcCand0[i] = g_fcCand0[i] && hit0;
+      g_fcCand1[i] = g_fcCand1[i] && hit1;
+    }
+  }
+  // Anything past where this sample could read is not a candidate — leaving it
+  // set would let an offset survive on samples that never actually checked it.
+  for (uint32_t i = reached / 4; i < kDeviceScanDwords; ++i) {
+    g_fcCand0[i] = false;
+    g_fcCand1[i] = false;
+  }
+  if (reached < g_fcReached) g_fcReached = reached;
+
+  g_fcPrimed = true;
+  ++g_fcSamples;
+
+  // The scan pinned dword1 to exactly one offset, 0x77C, and that retro-fits
+  // SetStreamSource's own arithmetic: `subfic r11, r4, 0x11` — which a first
+  // reading dismissed as dead — gives (0x11 - stream) * 8 + 0x6F4 = 0x77C for
+  // stream 0. Two independent methods agreeing is what makes this an offset
+  // rather than a coincidence.
+  //
+  // dword0 had no survivor because D3D9 ORs a flag bit in after masking
+  // (`rlwinm r11, r11, 0, 19, 19` then `add`), which none of the candidate
+  // forms included. Dumping the neighbourhood settles the pair by inspection
+  // instead of by another round of guessing at the masking.
+  if (g_fcSamples <= 8) {
+    auto& f = DeclFile();
+    f << "FETCH FILE sample " << g_fcSamples << ": last bind d0=0x" << std::hex
+      << g_lastBindD0 << " d1=0x" << g_lastBindD1 << " offset=0x"
+      << g_lastBindOffset << "\n           device+0x760..0x790:";
+    for (uint32_t o = 0x760; o <= 0x790; o += 4) {
+      f << " [" << o << "]=0x" << REX_LOAD_U32(device + o);
+    }
+    f << std::dec << "\n";
+    f.flush();
+  }
+}
+
+// Where SetStreamSource puts each stream's fetch constant, from the scan above.
+// Only dword1 is confirmed; the dump names dword0's slot.
+uint32_t FetchFileDword1Offset(uint32_t stream) {
+  return 0x6F4 + (0x11 - stream) * 8;
+}
+
 // Records every gap this draw has, rather than stopping at the first, so the
 // report says which fields are actually missing across the population instead
 // of which one happens to be checked earliest.
-void ScoreDraw(bool indexed, uint32_t first, uint32_t count) {
+void ScoreDraw(bool indexed, uint32_t first, uint32_t count,
+               uint32_t device, uint8_t* base) {
   const auto& st = DeviceState();
   ++g_drawsChecked;
+  for (uint32_t s = 0; s < mx::pm4::kMaxStreams; ++s) ++g_drawsSinceBind[s];
   bool complete = true;
   auto gap = [&](uint32_t g) { ++g_drawGaps[g]; complete = false; };
 
@@ -321,15 +516,71 @@ void ScoreDraw(bool indexed, uint32_t first, uint32_t count) {
         ++g_strideOk;
       }
 
-      // For a non-indexed draw the vertex range is known exactly, so the
-      // buffer either holds it or the description is wrong somewhere. An
-      // indexed draw's range depends on the index values, which are not read
-      // here, so it is not checked.
-      if (!indexed && b.stride) {
-        const uint64_t need = static_cast<uint64_t>(first + count) * b.stride;
-        if (need <= b.size_bytes) {
-          ++g_vbFits;
+      // For a non-indexed draw the vertex range is known exactly. For an
+      // indexed one it depends on the index values — which are readable, since
+      // the index buffer provably holds its own range, so the real highest
+      // index is used rather than skipping the check.
+      uint32_t hi_vertex = 0;
+      bool have_range = false;
+      if (!indexed) {
+        hi_vertex = first + count;
+        have_range = true;
+      } else if (kProbeIndexRange && st.index.bound && st.index.address &&
+                 !st.index.is_32bit) {
+        // Bounded by the index buffer's own size, which the previous round
+        // verified holds for every indexed draw.
+        const uint64_t end = static_cast<uint64_t>(first + count) * 2;
+        if (end <= st.index.size_bytes) {
+          uint32_t hi = 0;
+          for (uint32_t i = 0; i < count; ++i) {
+            const uint32_t v = REX_LOAD_U16(st.index.address + (first + i) * 2);
+            if (v > hi) hi = v;
+          }
+          hi_vertex = hi + 1;
+          have_range = true;
+        }
+      }
+
+      if (indexed && !have_range) ++g_idxRangeUnread;
+
+      // **The decisive comparison.** If binds are reaching the device through a
+      // path this file does not hook, the device's own fetch constant will
+      // differ from the snapshot SetStreamSource recorded — and the size is the
+      // field the range check actually depends on.
+      {
+        const uint32_t d1 = REX_LOAD_U32(device + FetchFileDword1Offset(s));
+        const uint32_t live = ((d1 >> 2) & 0xFFFFFF) * 4;
+        if (live == b.size_bytes) {
+          ++g_fileAgree[s];
         } else {
+          ++g_fileDiffer[s];
+          // Does the device's size explain a draw the snapshot could not?
+          if (b.stride && static_cast<uint64_t>(hi_vertex) * b.stride <= live) {
+            ++g_fileRescues[s];
+          }
+        }
+      }
+
+      if (have_range && b.stride) {
+        const uint64_t need = static_cast<uint64_t>(hi_vertex) * b.stride;
+        const bool fits = need <= b.size_bytes;
+        if (indexed) {
+          (fits ? g_idxRangeFits : g_idxRangeFails) += 1;
+        }
+        // Bind age, split the same way: a stale shadow shows up as failing
+        // draws sitting far from their last bind while passing ones sit near it.
+        const uint64_t age = g_drawsSinceBind[s];
+        if (fits) {
+          g_bindAgeFitSum[s] += age;
+        } else {
+          g_bindAgeFailSum[s] += age;
+          if (age > g_bindAgeFailMax[s]) g_bindAgeFailMax[s] = age;
+        }
+        (fits ? g_vbFitStream[s] : g_vbFailStream[s]) += 1;
+
+        if (!indexed && fits) {
+          ++g_vbFits;
+        } else if (!indexed) {
           ++g_vbTooSmall;
           if (g_vbTooSmallNamed < kMaxStrideReports) {
             ++g_vbTooSmallNamed;
@@ -385,6 +636,54 @@ void ReportCoverage() {
       REXLOG_INFO("d3d9: hle   missing: {:<28} x{}", DrawGapName(g), g_drawGaps[g]);
     }
   }
+  //-------------------------------------------------------------------------
+  // Stage 0 verdict.
+  //-------------------------------------------------------------------------
+  for (uint32_t s = 0; s < mx::pm4::kMaxStreams; ++s) {
+    const uint64_t fit = g_vbFitStream[s], fail = g_vbFailStream[s];
+    if (!fit && !fail) continue;
+    REXLOG_INFO(
+        "d3d9: stage0  stream {}: holds the range {}/{} | mean draws since "
+        "bind: fits {} fails {} (worst {})",
+        s, fit, fit + fail, fit ? g_bindAgeFitSum[s] / fit : 0,
+        fail ? g_bindAgeFailSum[s] / fail : 0, g_bindAgeFailMax[s]);
+  }
+  for (uint32_t s = 0; s < mx::pm4::kMaxStreams; ++s) {
+    if (!g_fileAgree[s] && !g_fileDiffer[s]) continue;
+    REXLOG_INFO(
+        "d3d9: stage0  stream {}: device fetch constant vs our snapshot — "
+        "same {} differ {}, and the device's size explains {} of the failures",
+        s, g_fileAgree[s], g_fileDiffer[s], g_fileRescues[s]);
+  }
+  REXLOG_INFO(
+      "d3d9: stage0  indexed draws, by real max index: holds {}/{} (unread {})",
+      g_idxRangeFits, g_idxRangeFits + g_idxRangeFails, g_idxRangeUnread);
+
+  // Offsets that held the just-bound value on every one of the samples. One
+  // surviving pair is the fetch constant file; none means D3D9 does not keep
+  // the value verbatim and the snapshot is the only source available.
+  if (g_fcPrimed) {
+    uint32_t n0 = 0, n1 = 0;
+    std::string o0, o1;
+    for (uint32_t i = 0; i < kDeviceScanDwords; ++i) {
+      char buf[16];
+      if (g_fcCand0[i]) {
+        ++n0;
+        if (n0 <= 8) { std::snprintf(buf, sizeof(buf), "0x%X ", i * 4); o0 += buf; }
+      }
+      if (g_fcCand1[i]) {
+        ++n1;
+        if (n1 <= 8) { std::snprintf(buf, sizeof(buf), "0x%X ", i * 4); o1 += buf; }
+      }
+    }
+    REXLOG_INFO(
+        "d3d9: stage0  fetch constant file after {} samples (device readable to "
+        "0x{:X}): dword0 offsets={} [{}] dword1 offsets={} [{}]",
+        g_fcSamples, g_fcReached, n0, o0, n1, o1);
+  } else {
+    REXLOG_INFO("d3d9: stage0  fetch constant file: never sampled");
+  }
+
   REXLOG_INFO(
       "d3d9: hle   stride exact={} padded={} TOO SMALL={} (too small means the "
       "layout decode is wrong)",
@@ -726,7 +1025,8 @@ extern "C" REX_FUNC(sub_825565C8) {
   }
   if (REXCVAR_GET(hle_capture)) {
     DeviceState().NoteDevice(ctx.r3.u32, mx::pm4::kEpDraw);
-    ScoreDraw(/*indexed=*/true, ctx.r6.u32, ctx.r7.u32);
+    SampleFetchConstantFile(ctx.r3.u32, base);
+    ScoreDraw(/*indexed=*/true, ctx.r6.u32, ctx.r7.u32, ctx.r3.u32, base);
     DumpHleDraw(/*indexed=*/true, n, ctx.r4.u32, ctx.r5.s32, ctx.r6.u32,
                 ctx.r7.u32);
   }
@@ -755,7 +1055,8 @@ extern "C" REX_FUNC(sub_825561B0) {
   }
   if (REXCVAR_GET(hle_capture)) {
     DeviceState().NoteDevice(ctx.r3.u32, mx::pm4::kEpDraw);
-    ScoreDraw(/*indexed=*/false, ctx.r5.u32, ctx.r6.u32);
+    SampleFetchConstantFile(ctx.r3.u32, base);
+    ScoreDraw(/*indexed=*/false, ctx.r5.u32, ctx.r6.u32, ctx.r3.u32, base);
     DumpHleDraw(/*indexed=*/false, n, ctx.r4.u32, 0, ctx.r5.u32, ctx.r6.u32);
   }
   ReportDrawCounts();
@@ -823,12 +1124,22 @@ extern "C" REX_FUNC(sub_8254B7C0) {
       b.address = d0 & ~0x3u;
       b.endian = d1 & 0x3;
       b.size_bytes = ((d1 >> 2) & 0xFFFFFF) * 4;
+
+      // Stage 0: remember stream 0's raw dwords so the next draw can look for
+      // them on the device and locate the fetch constant file.
+      if (stream == 0) {
+        g_lastBindD0 = d0;
+        g_lastBindD1 = d1;
+        g_lastBindOffset = offset;
+        g_haveBind = true;
+      }
     } else {
       b.address = 0;
       b.size_bytes = 0;
       b.endian = 0;
       b.fetch_type = 0;
     }
+    g_drawsSinceBind[stream] = 0;
   }
 
   orig_SetStreamSource(ctx, base);

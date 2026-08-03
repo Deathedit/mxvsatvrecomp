@@ -2652,6 +2652,87 @@ D3D12 input slot**, which matters for the PSO step and should be settled before
 it.
 
 
+### The vertex range check was the thing that was wrong (2026-08-03)
+
+Stage 0 of HLE step 2. The open question was why only **20,125 of 210,799**
+stream checks found the vertex buffer holding the draw's range, while index
+buffers passed 66,726/66,726. Two hypotheses, and the probe separated them.
+
+**Eliminated: a second binding path.** `blocks.obj` carries
+`?SetStreamSource@D3DDevice@@QAAJIPAUD3DVertexBuffer@@II@Z` beside the
+`D3DDevice_SetStreamSource` that is hooked, along with state-block variants of
+`SetTexture`, `SetRenderState`, `SetVertexDeclaration` and `D3DStateBlock_Apply`
+— so binds could plausibly have been reaching the device unseen. They are not:
+
+```
+stream 0: device fetch constant vs our snapshot — same 172500  differ 0
+stream 1: device fetch constant vs our snapshot — same  97932  differ 0
+```
+
+**270,432 comparisons against the device's own fetch constant — the value the
+GPU actually fetches through — and not one disagreement.** Nothing bypasses the
+hook.
+
+**The bind-age correlation looked like evidence and was not.** Draws that pass
+sit a mean of 3 draws from their last bind; draws that fail sit at 36, worst 75.
+That is exactly what a stale shadow would produce, and it is not one — the
+device says so. It is simply that draws far into a batch are draws into a large
+shared buffer at a high `StartVertex`. **A correlation that survives one test
+and dies to a direct measurement is why the direct measurement was worth
+building.**
+
+**So the description was never wrong; the check was.** It computes
+`(StartVertex + count) * stride` and requires the buffer to hold it, which
+assumes every stream is indexed by one common vertex index. That is a **D3D12
+input-assembler assumption, and Xenos does not honour it** — the vertex shader
+issues its own `vfetch` with whatever index it computes, so a 64-byte four-entry
+stream read at `StartVertex` 13,748 is legal. Stream 1 fails **97,172 of
+97,172** — never once passing — which is the shape of a stream that is not
+indexed like stream 0 at all, not the shape of an intermittent bug.
+
+**Stated honestly: this is the surviving hypothesis, not a demonstrated one.**
+The direct test is to decode the bound vertex shader's `vfetch` for stream 1 and
+read how it is indexed. What *is* demonstrated is the part Stage 2 depends on —
+the address, size, endian and stride are right, confirmed against the device
+270,432 times.
+
+#### The fetch constant file is at `device + 0x6F4 + (0x11 - stream) * 8`
+
+Found by intersection, not by reading the code — and the code then confirmed it.
+At `SetStreamSource` the exact dwords are known, so every device offset holding
+one is a candidate; intersecting the candidate sets over 64 different binds left
+**exactly one offset out of 4,096: `0x77C`** for stream 0's dword1.
+
+That retro-fits `SetStreamSource`'s own arithmetic. A first reading of the
+unlinked COMDAT dismissed `subfic r11, r4, 0x11` as dead because
+`addi r11, r4, 0xde` overwrites it — but `(0x11 - stream) * 8 + 0x6F4` is
+`0x77C` exactly. **Two methods that failed separately agree completely.** The
+static read alone produced `device + stream*8`, which collides with the
+lazy-state qword at `+0x10`, and was correctly not built on.
+
+`dword0` had no surviving offset because D3D9 ORs a flag bit in after masking
+(`rlwinm r11, r11, 0, 19, 19` then `add`), which none of the four candidate
+maskings included.
+
+#### Two instrument traps, one of them self-inflicted
+
+- **A guessed scan bound is not a bound.** The probe scanned `device + 0..0x4000`
+  and faulted at guest `0x1D00B000`. It was re-bounded to `0x3484` — justified by
+  `SetStreamSource` writing `+0x3480`, which proves that offset mapped *for some
+  device* and nothing about this one — and faulted at the identical address. A
+  `VirtualQuery` guard per page then reported the struct **readable to the full
+  `0x4000`**: the scan had never been the problem, and two rounds were spent
+  "fixing" it. Bisecting by disabling the other new read found the real one in
+  one run.
+- **The real fault was the index-buffer walk**, and its cause is a mask already
+  known wrong. `SetIndices` records `address = REX_LOAD_U32(buffer + 0x18) &
+  0x1FFFFFFF` — the same mask corrected for vertex buffers a round earlier,
+  which clears the top three bits instead of the bottom two. The
+  **66,726/66,726 "index buffer holds its range" result does not contradict
+  this**: it compares a count against a size and never dereferences the address,
+  so a wrong address passes it every time. A check that cannot fail on the thing
+  it appears to validate is worth less than it looks.
+
 ### Parser caveat
 
 `Pm4Parser` accepts any Type-3 with `body_word_count <= 0x4000`. A misparsed
