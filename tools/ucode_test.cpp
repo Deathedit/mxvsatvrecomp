@@ -464,7 +464,15 @@ void TestAddressRegister() {
   exp.vector_opc = 2;  // kMax
   exp.src1_reg = 0; exp.src1_temp = false;
   exp.src2_reg = 0; exp.src2_temp = false;
-  exp.const_0_rel_abs = true;  // src1/src2 constant index is a0-relative
+  exp.const_0_rel_abs = true;  // src1/src2 constant index is relative at all
+  // ...and *which* register it is relative to. The polarity is the thing this
+  // test exists to pin, because it reads backwards: the bit is named "address
+  // register relative", and the address register is a0, so
+  //   true  = c[a0 + n]   (AddressingMode::kAbsolute = 1, ucode.h:196)
+  //   false = c[aL + n]   (AddressingMode::kRelative = 0, ucode.h:193)
+  // This test previously had both cases the wrong way round, which made it
+  // agree with an inverted condition in Src() instead of catching it.
+  exp.const_addr_reg_relative = true;
 
   Alu nop;  // scalar_opc kRetainPrev, no writes
 
@@ -479,10 +487,12 @@ void TestAddressRegister() {
   mx::pm4::AluResult n = RunSynthetic(maxa, exp, nop, consts);
   CheckPos("a0 = -3 reads c[8-3] = c[5]", n, 50, 60, 70, 80);
 
-  // aL-relative must still be refused. Same instruction, plus the bit that
-  // says "the relative register is aL, not a0".
+  // aL-relative must still be refused. Same instruction, with the selector
+  // cleared so the index is relative to the loop counter rather than to a0.
+  // Nothing in this game's shaders takes this branch — no shader contains a
+  // loop at all — but it has to stay visible if one ever does.
   exp.src1_reg = 0; exp.src2_reg = 0;
-  exp.const_addr_reg_relative = true;
+  exp.const_addr_reg_relative = false;
   mx::pm4::AluResult l = RunSynthetic(maxa, exp, nop, consts);
   std::printf("  %-34s status=%s\n", "aL-relative stays refused",
               mx::pm4::AluStatusName(l.status));

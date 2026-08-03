@@ -38,6 +38,14 @@ enum class AluStatus {
   // every exec block once rather than unrolling loops, so there is no value to
   // give it. Distinct from a0-relative addressing, which *is* modelled — keeping
   // them apart is what lets the failure histogram show whether that work landed.
+  //
+  // Expect this to be ~0 for this game. kUnsupportedCf is 0 across every sample
+  // taken, which means no shader here contains a loop, which means nothing sets
+  // aL. So the two counts are a cross-check on each other: a non-zero
+  // kLoopRelative with a zero kUnsupportedCf is not a shader that loops, it is a
+  // decode error. That combination is precisely what an inverted a0/aL selector
+  // looked like, and it went unnoticed for a round because the number was
+  // large and plausible rather than impossible.
   kLoopRelative,
   kInstructionCap,
 };

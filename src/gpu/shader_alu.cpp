@@ -161,11 +161,25 @@ class Interpreter {
     } else {
       uint32_t index = reg & 0xFF;
       if (alu.src_const_is_addressed(i)) {
-        // Relative to a0 or to aL, and the instruction says which. aL is the
-        // loop counter; we walk every exec block once instead of unrolling, so
-        // there is no honest value for it and this is refused rather than
-        // guessed. a0 we have.
-        if (alu.is_const_address_register_relative()) {
+        // Relative to a0 or to aL, and the instruction says which. The accessor
+        // name is the decoder: "address register relative" means relative to
+        // *the address register*, which is a0. AddressingMode spells the
+        // mapping out — kAbsolute = 1 = c[a0 + n], kRelative = 0 = c[aL + n]
+        // (ucode.h:191-199).
+        //
+        // This condition used to be written without the '!', which is exactly
+        // backwards: it refused every a0 read — the case this interpreter
+        // implements — and applied a0_ to every aL read, a case that never
+        // occurs in this game. The a0 arithmetic below was therefore never once
+        // executed, which is why modelling a0 measured as converting zero
+        // failures. That null was the bug, not a fact about the game.
+        //
+        // aL is the loop counter, and we walk every exec block once rather than
+        // unrolling, so there is no honest value for it. Refused, not guessed.
+        // Expect this to fire ~0 times here: kUnsupportedCf is 0 across every
+        // sample taken, meaning no shader in this game contains a loop at all.
+        // The two counts cross-check each other and should move together.
+        if (!alu.is_const_address_register_relative()) {
           status = AluStatus::kLoopRelative;
           return base;
         }
