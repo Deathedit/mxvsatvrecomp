@@ -1620,6 +1620,102 @@ timestamp order across rotated files. It briefly showed `transcode skip: 0` and
 suggested the cvar was not being parsed, when the skip had in fact engaged. Pipe
 through `sort` on the timestamp prefix, as recorded earlier in this file.
 
+### Every visible pixel comes from a draw with no colour attribute (2026-08-03)
+
+The white frame was **colour, not geometry**. Measured, not argued.
+
+`tint_by_color_source` (default off, `pm4_translator.cpp`) discards the real
+vertex colour and writes a flat hue per source — packed green, fallback blue,
+none magenta. One screenshot then reports pixel area directly instead of
+inferring it from counts. Across two runs and five captures spanning t=40s to
+t=165s, every capture read the same:
+
+    bars(black)=25.58%  GREEN(packed)=0.00%  BLUE(fallback)=0.00%  MAGENTA(none)=74.42%
+
+74.42% is the whole drawn region (2560/3440). **Magenta is 100% of it, green is
+0.00% at full resolution** — 4.95M pixels examined, not a sample grid.
+
+The counters say the opposite of the picture, and both are right:
+
+    packed 18626 draws (6809241 vtx) | fallback 9179 (130532 vtx) formats 38:9179
+    | none 12195 (174757 vtx) — 2.5% of vertices
+
+**2.5% of vertices paint 100% of pixels.** Vertex count is not pixel area, and
+here the two point as far apart as they can. Stage 2 stopped at the counters and
+read "95.7% of vertices carry real packed colour" as the colour hypothesis being
+dead; that reading was wrong, and only the tint could show it. Any future
+argument from draw or vertex share about what is *visible* is invalid for the
+same reason.
+
+So the 6.8M properly-coloured vertices exist and are submitted, and none of them
+survive to the screen — they are behind, outside, or degenerate. That does not
+retract last round's "the bulk geometry is mis-transformed"; it narrows what has
+to be fixed first. The white was `float c[4] = {1,1,1,1}` — the default in
+`TranscodeVertices` when `PickColorAttribute` returns null — covering everything,
+and opaque white is the worst possible default precisely because it is
+indistinguishable from real geometry and hides what is behind it.
+
+Note the fallback column: all 9179 fallback draws pick **format 38**
+(k_32_32_32_32_FLOAT). A four-float attribute that is not the position is at
+least as likely to be a normal or a texcoord as a colour, so a non-null colour is
+not evidence of correctness. None of them are visible either way.
+
+Changing the default colour, widening the colour search, and depth ordering were
+all deliberately left out of this round.
+
+### The host window size never reaches the guest (2026-08-03)
+
+Asked whether the 21:9 window should be 16:9, since the 360 supports 21:9. It
+does not matter to the guest and it did matter to every screenshot.
+
+The guest renders **1280x720** regardless — its own viewport registers read
+`xs=640 xo=640 ys=-360 yo=360` — and we hook **none** of `VdQueryVideoMode`,
+`XGetVideoMode` or `VdGetCurrentDisplayInformation`. They exist only in
+`generated/default/mx_init.h`. There is no path by which the host window size
+could inform the guest, so nothing about the aspect ratio can cause a
+guest-space defect.
+
+But `m_viewport` was sized from the window client rect, so clip `[-1,1]` was
+stretched across 3440x1440 — guest aspect 1.778 against window aspect 2.389.
+**Every screenshot before this was 34% too wide.** `CreateViewportAndScissor`
+now fits the largest 16:9 rect and centres it, verified by geometry rather than
+by eye: `client 3440x1440 (aspect 2.389) -> 16:9 drawn region 2560x1440 at
+(440,0)`, and independently by pixel share at 74.42%/25.58%.
+
+Do **not** resize `m_gameRT` to match. `PresentGameFrame` uses
+`CopyTextureRegion`, which requires the game RT and the backbuffer to be the same
+size; a smaller RT needs a scaled blit instead.
+
+The bars were dark blue at first, which looked like a bug and effectively was
+one: the clear ran full-window with `GameClearColor`, our *debug* colour, so it
+painted territory the guest does not own and read as image. Two clears now —
+black everywhere, then the debug colour scoped to `m_scissorRect`. Black is the
+letterbox convention because it cannot be mistaken for content. One consequence:
+the defaults control is now 100% black end to end, so bars and guest-painted
+black are no longer distinguishable in a capture. Verify the pillarbox from the
+log line, not from a defaults screenshot.
+
+### Scoring a capture: two ways to get a wrong number (2026-08-03)
+
+Both hit in one session, both cheap to avoid.
+
+**Sample grids miss thin geometry.** A 6-pixel grid reported 0% green on a frame
+described from live view as having green artifacting. Full-resolution scoring
+confirmed a true 0.00% in every capture — but the grid could not have told the
+difference, and it is the wrong instrument for anything thin. `bucket.ps1` uses
+`LockBits` and reads every pixel; 5M `GetPixel` calls are far too slow for that.
+
+**PowerShell variable names are case-insensitive.** `$B` for the blue channel
+silently clobbered `$b`, the bucket hashtable, and every increment then failed
+with "property cannot be found" — thousands of errors and no counts. The
+channels are `$cr/$cg/$cb` now. Scoring also moved out of `shot.ps1` into
+`bucket.ps1`, run against the saved PNG, so a bucketing bug costs a rescore
+rather than another 165-second game run.
+
+Also: `Get-ChildItem logs\*.log | ... | Sort-Object` over 15MB of logs does not
+finish inside a 10-minute timeout. Filter with `Select-String -Path` first, then
+sort only the matches.
+
 ### Parser caveat
 
 `Pm4Parser` accepts any Type-3 with `body_word_count <= 0x4000`. A misparsed
