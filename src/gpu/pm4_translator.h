@@ -23,6 +23,10 @@ enum class PrimitiveType : uint8_t {
   kTriangleFan     = 0x05,
   kTriangleStrip   = 0x06,
   kRectangleList   = 0x08,
+  // 0x0C kLineLoop, 0x0E kQuadStrip and 0x0F kPolygon exist in xenos.h too but
+  // are omitted here because this game emits none of them. QuadList it does
+  // emit, in greater volume than any other type.
+  kQuadList        = 0x0D,
   kUnknown         = 0xFF,
 };
 
@@ -148,6 +152,14 @@ class Pm4Translator {
   // arithmetic on the leading 3 floats and copies its remaining bytes from v2.
   // Returns the number of rectangles expanded, 0 if the draw could not be.
   uint32_t ExpandRectangleList(DrawCall& dc) const;
+
+  // Rewrite a QuadList draw into a triangle list in place. D3D12 has no quad
+  // topology either, but a quad needs no synthesized corner: all four are
+  // present, so the vertices pass through untouched and only the index buffer
+  // is rebuilt, six indices per quad on the v0-v2 diagonal. Maps through the
+  // incoming indices, so it is correct for auto-draws and real index buffers
+  // alike. Returns the number of quads expanded, 0 if the draw could not be.
+  uint32_t ExpandQuadList(DrawCall& dc) const;
 
   // Everything a draw needs once its vertices and indices are in place:
   // topology, the viewport transform, RectangleList expansion, and the NDC log.

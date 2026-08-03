@@ -241,10 +241,13 @@ HostTopology Pm4Translator::MapTopology(uint32_t prim_type) {
     case PrimitiveType::kLineStrip:     return HostTopology::kLineStrip;
     case PrimitiveType::kTriangleList:  return HostTopology::kTriangleList;
     case PrimitiveType::kTriangleStrip: return HostTopology::kTriangleStrip;
-    // RectangleList is not a topology, it is an expansion — ExpandRectangleList
-    // rewrites it to a triangle list and sets the topology itself.
-    // TriangleFan has no D3D12 equivalent either, but unlike rectangles it is
-    // not handled this round: it is dropped and counted.
+    // RectangleList and QuadList are not topologies, they are expansions —
+    // ExpandRectangleList and ExpandQuadList rewrite them to triangle lists and
+    // set the topology themselves.
+    // TriangleFan has no D3D12 equivalent either, and is still not handled: it
+    // is dropped and counted. Unlike the other two that is not a backlog item
+    // for now — it does not appear once in a prim_type histogram of a full run,
+    // so there is no measured population to justify the code.
     default:                            return HostTopology::kUndefined;
   }
 }
@@ -302,6 +305,58 @@ uint32_t Pm4Translator::ExpandRectangleList(DrawCall& dc) const {
   }
   dc.topology = HostTopology::kTriangleList;
   return rects;
+}
+
+uint32_t Pm4Translator::ExpandQuadList(DrawCall& dc) const {
+  const uint32_t istride = dc.index_16bit ? 2u : 4u;
+  const uint32_t have = uint32_t(dc.indices.size() / istride);
+  const uint32_t quads = have / 4;
+  if (quads == 0) return 0;
+
+  // Unlike a rectangle, a quad has all four of its corners present, so nothing
+  // is synthesized: the vertex buffer is untouched and only the index buffer is
+  // rewritten. That also means this maps *through* the incoming indices rather
+  // than assuming they are the sequential ones an auto-draw synthesizes, so it
+  // is correct for a real DRAW_INDX with its own index buffer as well.
+  auto read = [&](uint32_t i) -> uint32_t {
+    if (dc.index_16bit) {
+      uint16_t v;
+      std::memcpy(&v, dc.indices.data() + size_t(i) * 2, 2);
+      return v;
+    }
+    uint32_t v;
+    std::memcpy(&v, dc.indices.data() + size_t(i) * 4, 4);
+    return v;
+  };
+
+  std::vector<uint32_t> idx;
+  idx.reserve(size_t(quads) * 6);
+  for (uint32_t q = 0; q < quads; ++q) {
+    const uint32_t c[4] = {read(q * 4 + 0), read(q * 4 + 1), read(q * 4 + 2),
+                           read(q * 4 + 3)};
+    // The four corners come round the perimeter, so the two triangles share the
+    // v0-v2 diagonal. Splitting on v1-v3 instead gives the same silhouette for a
+    // planar convex quad but the wrong interpolation across it, and is visibly
+    // wrong the moment the quad is not planar — the plausible-but-wrong class,
+    // so it is written down rather than left to the reader.
+    const uint32_t order[6] = {0, 1, 2, 0, 2, 3};
+    for (uint32_t i = 0; i < 6; ++i) idx.push_back(c[order[i]]);
+  }
+
+  dc.index_count = quads * 6;
+  // Indices address the untouched vertex buffer, so the width is decided by
+  // vertex_count exactly as in the rectangle path.
+  dc.index_16bit = dc.vertex_count <= 0xFFFF;
+  dc.indices.resize(size_t(idx.size()) * (dc.index_16bit ? 2 : 4));
+  if (dc.index_16bit) {
+    auto* p = reinterpret_cast<uint16_t*>(dc.indices.data());
+    for (size_t i = 0; i < idx.size(); ++i) p[i] = uint16_t(idx[i]);
+  } else {
+    auto* p = reinterpret_cast<uint32_t*>(dc.indices.data());
+    for (size_t i = 0; i < idx.size(); ++i) p[i] = idx[i];
+  }
+  dc.topology = HostTopology::kTriangleList;
+  return quads;
 }
 
 std::vector<Pm4Translator::VertexFetch> Pm4Translator::CollectVertexFetches(
@@ -1297,6 +1352,52 @@ void Pm4Translator::FinalizeDraw(DrawCall& dc) {
       REXLOG_INFO("translator: RectangleList expanded {} rects -> {} verts, {} "
                   "indices (running total {} rects, {} unexpandable)",
                   rects, dc.vertex_count, dc.index_count, s_rects, s_failed);
+    }
+  } else if (static_cast<PrimitiveType>(dc.prim_type) ==
+             PrimitiveType::kQuadList) {
+    // The largest single population in a frame — 4786 of 9664 logged draws in
+    // mx_118, more than TriangleStrip and RectangleList combined — and all of
+    // it was being dropped on MapTopology's default case.
+    //
+    // Two things counted rather than assumed. `real_idx` is draws whose index
+    // buffer is not the sequential one an auto-draw synthesizes: the rectangle
+    // path asserts these are always auto in this game, and that claim is worth
+    // testing separately rather than inheriting. `no_verts` is draws whose
+    // vertex data did not resolve — the sampled QuadList line reads
+    // `verts=0 B`, and if that is typical then expansion produces correctly
+    // formed empty draws and the submitted count will not move. That is a real
+    // outcome, so it gets a number instead of a workaround.
+    bool sequential = true;
+    {
+      const uint32_t istride = dc.index_16bit ? 2u : 4u;
+      const uint32_t have = uint32_t(dc.indices.size() / istride);
+      for (uint32_t i = 0; i < have && sequential; ++i) {
+        uint32_t v;
+        if (dc.index_16bit) {
+          uint16_t h;
+          std::memcpy(&h, dc.indices.data() + size_t(i) * 2, 2);
+          v = h;
+        } else {
+          std::memcpy(&v, dc.indices.data() + size_t(i) * 4, 4);
+        }
+        if (v != i) sequential = false;
+      }
+    }
+    const bool had_verts = !dc.vertices.empty();
+
+    const uint32_t quads = ExpandQuadList(dc);
+    static uint32_t s_quads = 0, s_failed = 0, s_real_idx = 0, s_no_verts = 0;
+    if (quads) s_quads += quads; else ++s_failed;
+    if (!sequential) ++s_real_idx;
+    if (!had_verts) ++s_no_verts;
+    static int s_logged = 0;
+    if (s_logged < 10) {
+      ++s_logged;
+      REXLOG_INFO("translator: QuadList expanded {} quads -> {} verts, {} "
+                  "indices (running total {} quads, {} unexpandable, {} with a "
+                  "real index buffer, {} with no vertex data)",
+                  quads, dc.vertex_count, dc.index_count, s_quads, s_failed,
+                  s_real_idx, s_no_verts);
     }
   } else if (dc.topology == HostTopology::kUndefined) {
     // Nothing maps this — TriangleFan and the exotic quad/polygon types. The
