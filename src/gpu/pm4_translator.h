@@ -70,6 +70,30 @@ struct DrawCall {
   // off-screen pass overpaints the main scene. See LogSurface.
   uint32_t surface_base = 0;          // RB_COLOR_INFO[11:0], in 4KB tiles
   uint32_t surface_pitch = 0;         // RB_SURFACE_INFO[13:0]
+
+  // Where TranscodeVertices got this draw's vertex colour, so LogSurface can
+  // cross-tabulate it against the surface. Carried on the draw rather than
+  // counted in place because the two facts are established at different points:
+  // the colour during transcode, the surface in FinalizeDraw afterwards.
+  //
+  // Worth the field because draw and vertex counts proved unable to answer the
+  // question they were asked. The counters said 95.7% of vertices carry a real
+  // packed colour; the tint screenshot said colourless draws cover 100% of the
+  // pixels. Both were right. Which surface each population lives on is the next
+  // thing that can separate them.
+  enum class ColorSource : uint8_t {
+    // The default, and deliberately NOT kNone: TranscodeVertices has several
+    // early exits (no position attribute, an unconfirmed position format) that
+    // return before any colour is resolved. Folding those into kNone would
+    // inflate the population this round is trying to measure. These draws are
+    // never rewritten, so they keep the guest stride and the renderer's
+    // stride-28 gate drops them — they reach no pixels either way.
+    kNotTranscoded = 0,
+    kNone,          // no colour attribute found — written opaque white
+    kPacked,        // format 6 or 7, a real packed colour
+    kFallback,      // first 4-component non-position attribute, i.e. a guess
+  };
+  ColorSource color_source = ColorSource::kNotTranscoded;
 };
 
 class Pm4Translator {

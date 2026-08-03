@@ -1292,6 +1292,12 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
                            : (col->format == 6 || col->format == 7)
                                  ? kColPacked
                                  : kColFallback;
+  // Carry it on the draw so LogSurface can cross-tabulate colour against
+  // surface. The local enum stays because it indexes the counter arrays below;
+  // this is the same fact in the form the rest of the pipeline can read.
+  dc.color_source = col_src == kColPacked   ? DrawCall::ColorSource::kPacked
+                    : col_src == kColFallback ? DrawCall::ColorSource::kFallback
+                                              : DrawCall::ColorSource::kNone;
   {
     static uint64_t s_colDraws[3] = {}, s_colVerts[3] = {};
     static std::map<uint32_t, uint64_t> s_fallbackFormats;
@@ -1802,6 +1808,44 @@ void Pm4Translator::LogSurface(DrawCall& dc) {
                 base, pitch, fmt, dc.prim_type, dc.vertex_count,
                 s_surfaces.size());
   }
+  // Colour source against surface.
+  //
+  // The question this answers: the tint screenshot showed colourless draws
+  // covering 100% of the pixels while the counters showed 95.7% of vertices
+  // carrying a real packed colour. If the two populations live on different
+  // guest surfaces, then flattening every surface into one host target is what
+  // puts the colourless one on top, and honouring the surface binding is the
+  // fix. If they share a surface, routing cannot separate them and no gate
+  // built on it can work — which is why this is measured before anything is
+  // gated on it.
+  //
+  // Vertices as well as draws, because those two pointed opposite ways last
+  // round and neither is pixel area.
+  {
+    const uint64_t skey = (uint64_t(base) << 32) | pitch;
+    struct Tally { uint64_t draws[4] = {}; uint64_t verts[4] = {}; };
+    static std::map<uint64_t, Tally> s_bySurface;
+    const auto ci = static_cast<size_t>(dc.color_source);
+    auto& t = s_bySurface[skey];
+    ++t.draws[ci];
+    t.verts[ci] += dc.vertex_count;
+
+    static uint32_t s_xcalls = 0;
+    if ((++s_xcalls % 20000) == 0) {
+      REXLOG_INFO("translator: colour x surface (base/pitch: "
+                  "packed | fallback | none | untranscoded, draws:verts)");
+      for (const auto& [k, v] : s_bySurface) {
+        REXLOG_INFO(
+            "  {:03X}/{:<5} {}:{} | {}:{} | {}:{} | {}:{}",
+            uint32_t(k >> 32), uint32_t(k & 0xFFFFFFFF),
+            v.draws[2], v.verts[2],   // kPacked
+            v.draws[3], v.verts[3],   // kFallback
+            v.draws[1], v.verts[1],   // kNone
+            v.draws[0], v.verts[0]);  // kNotTranscoded
+      }
+    }
+  }
+
   static uint32_t s_calls = 0;
   if ((++s_calls % 20000) == 0) {
     std::string hist;
