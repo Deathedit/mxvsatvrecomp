@@ -1428,6 +1428,85 @@ same recorded signature (read at `0xFFFFFFFFFFFFFFFF`, host-side pointer,
 non-translator thread), consistent with the recorded ~1-in-8 and still not
 verified either way at this sample size.
 
+#### The interpreter exports window space, not clip space (2026-08-03)
+
+Every non-degenerate position the ALU exports reads like this:
+
+```
+pos=(640.0000 0.0000 1.0000 w=1.0000)
+pos=(1280.0000 0.0000 0.0000 w=1.0000)
+pos=(0.0000 0.0000 1.0000 w=1.0000)
+pos=(639.5000 -0.5000 1.0000 w=1.0000)
+```
+
+`640`, `1280`, `360`, `w=1`, with half-pixel offsets. That is **1280x720 window
+space in the D3D9 pixel-centre convention** — these shaders do the viewport
+transform themselves. Under this game's viewport (`xs=640 xo=640 ys=-360
+yo=360`) they map to exact clip corners: `(0,1)`, `(1,1)`, `(-1,1)`.
+
+The transcode believed the opposite. It asserted the answer was already clip
+space, perspective-divided it and handed the renderer an **identity** MVP,
+discarding `BuildViewportMvp` — which computes precisely the inverse the output
+wanted. **The fix was deleting that special case**, not adding a transform; the
+ALU path and the fetched-position path now agree about what space they are in.
+
+Scored over 4000 executions *before* deleting anything, in-range by position
+format, as-clip against after-the-inverse:
+
+| format | as clip | after inverse |
+|---|---|---|
+| 31 | 44% | 78% |
+| **32** | **32%** | **74%** |
+| 37 | 70% | 87% |
+| 38 | 65% | 74% |
+| 57 | 34% | 88% |
+
+Overall 47% to 81%. Every format improves and format 32 — the 35,655-draw
+majority — more than doubles.
+
+**The space buckets are genuinely mixed, so this is the better of two
+interpretations rather than a clean sweep:** clip-like 1203, window-like 901,
+neither 1083, degenerate 764. It was chosen on the per-format numbers.
+
+Two things worth keeping about how that was measured. The first pass could not
+be trusted, because `(0,0,0,w=0)` is the single most common export and it sits
+inside the unit cube — so it counted as clip-like while being evidence of
+nothing, *and* inflated the viewport-inverse count, since with `xo/xs == 1` the
+origin maps to exactly `(-1,+1)`. Separating it out was what made the verdict
+readable. And the clip/window tie is deliberately given to clip, so the bias runs
+against the hypothesis being tested rather than for it.
+
+**It did not put geometry on the screen.** The 2x2 over the two cvars is
+unchanged from before the fix — gate on black, gate off white, at t+25/45/70.
+That is consistent rather than contradictory: 764 degenerate plus 1203 clip-like
+is **49% of executions landing at or near the top-left corner** after the
+inverse, in range but collapsed. Which is exactly the convergence point of the
+streaks in the pre-fix capture. A position can be in range and still be wrong,
+and in-range alone is not a success criterion.
+
+So the round fixed a real defect and did not fix the screen. What remains is the
+19% of executions exporting `(0,0,0,w=0)` outright: the shader computes nothing,
+which points back at the ALU constant file still lacking the per-object
+transform. `no shader 0` in the transcode summary rules out a missing-shader
+explanation — every draw has one.
+
+AV: **0 in 9 runs** this round, against a recorded ~1-in-8 and 1-in-9 last round.
+Still not measurable at this n; do not read it as fixed.
+
+#### How to screenshot this thing (2026-08-03)
+
+Took several attempts to make trustworthy, so: capture the **`SDL_app`** window,
+not `MainWindowHandle` — that returns a different window and yields a
+full-desktop grab. **Raise it first**, because `CopyFromScreen` reads the desktop
+and will happily capture whatever is on top of it. And **bucket sampled pixel
+values** instead of eyeballing: the three outcomes are black, the clear colour
+`(13,20,46)` and white, and two of them look alike at a glance.
+
+Always run the defaults config as a control in the same sweep. When an
+override run came back 100% white it looked exactly like a broken capture; the
+defaults run reproducing the recorded black in the same session is the only
+reason the white was known to be real.
+
 ### Parser caveat
 
 `Pm4Parser` accepts any Type-3 with `body_word_count <= 0x4000`. A misparsed
