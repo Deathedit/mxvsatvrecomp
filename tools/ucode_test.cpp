@@ -327,6 +327,230 @@ void TestAluNoPosition() {
             false);
 }
 
+// ---------------------------------------------------------------------------
+// Synthetic ALU fixtures.
+//
+// The two blobs above are real microcode, but neither uses a0-relative
+// addressing or the const-register scalar ops, so neither can test them. These
+// are hand-assembled against the bit layout in rex/graphics/format/ucode.h:
+//
+//   word0: vector_dest:6 vector_dest_rel:1 abs_constants:1 scalar_dest:6
+//          scalar_dest_rel:1 export_data:1 vector_write_mask:4
+//          scalar_write_mask:4 vector_clamp:1 scalar_clamp:1 scalar_opc:6
+//   word1: src3_swiz:8 src2_swiz:8 src1_swiz:8 src{3,2,1}_reg_negate:1 each
+//          pred_condition:1 is_predicated:1 const_address_register_relative:1
+//          const_1_rel_abs:1 const_0_rel_abs:1
+//   word2: src3_reg:8 src2_reg:8 src1_reg:8 vector_opc:5
+//          src{3,2,1}_sel:1 each   (sel 1 = temp register, 0 = constant)
+//
+// They reuse fixture 1's control flow verbatim — exec 3 count 2 (the two
+// vfetches), then three single-instruction execs at 5, 6 and 7 — and only
+// replace the three ALU slots. That keeps the CF encoding, which is already
+// proven by the real fixtures, out of the thing under test.
+constexpr size_t kAluSlot0 = 15;  // instruction index 5
+constexpr size_t kAluSlot1 = 18;  // instruction index 6, the position export
+constexpr size_t kAluSlot2 = 21;  // instruction index 7
+
+// Assemble one ALU instruction. Only the fields these fixtures vary are
+// parameters; everything else is zero, and scalar_opc defaults to kRetainPrev
+// (50) so an instruction with no scalar half does nothing scalar.
+struct Alu {
+  uint32_t vector_dest = 0, vector_write_mask = 0, scalar_dest = 0,
+           scalar_write_mask = 0;
+  bool is_export = false;
+  uint32_t scalar_opc = 50;  // kRetainPrev
+  uint32_t vector_opc = 0;   // kAdd
+  uint32_t src1_swiz = 0, src2_swiz = 0, src3_swiz = 0;
+  uint32_t src1_reg = 0, src2_reg = 0, src3_reg = 0;
+  bool src1_temp = true, src2_temp = true, src3_temp = true;
+  bool const_0_rel_abs = false, const_addr_reg_relative = false;
+
+  void Emit(uint32_t* out) const {
+    out[0] = (vector_dest & 0x3F) | ((scalar_dest & 0x3F) << 8) |
+             (uint32_t(is_export) << 15) | ((vector_write_mask & 0xF) << 16) |
+             ((scalar_write_mask & 0xF) << 20) | ((scalar_opc & 0x3F) << 26);
+    out[1] = (src3_swiz & 0xFF) | ((src2_swiz & 0xFF) << 8) |
+             ((src1_swiz & 0xFF) << 16) |
+             (uint32_t(const_addr_reg_relative) << 29) |
+             (uint32_t(const_0_rel_abs) << 31);
+    out[2] = (src3_reg & 0xFF) | ((src2_reg & 0xFF) << 8) |
+             ((src1_reg & 0xFF) << 16) | ((vector_opc & 0x1F) << 24) |
+             (uint32_t(src3_temp) << 29) | (uint32_t(src2_temp) << 30) |
+             (uint32_t(src1_temp) << 31);
+  }
+};
+
+// Run a blob built from fixture 1's CF with these three ALU slots.
+mx::pm4::AluResult RunSynthetic(const Alu& a0, const Alu& a1, const Alu& a2,
+                                const uint32_t* consts) {
+  uint32_t blob[std::size(kFixturePosColor28)];
+  std::copy(std::begin(kFixturePosColor28), std::end(kFixturePosColor28), blob);
+  a0.Emit(blob + kAluSlot0);
+  a1.Emit(blob + kAluSlot1);
+  a2.Emit(blob + kAluSlot2);
+
+  std::vector<mx::pm4::VertexAttribute> attrs;
+  const char* fail = nullptr;
+  mx::pm4::DecodeVertexShaderFetches(blob, std::size(blob), attrs, &fail);
+  // attrs[0] -> r1 (position), attrs[1] -> r0 (colour).
+  std::vector<std::array<float, 4>> values = {{4.0f, 5.0f, 6.0f, 1.0f},
+                                              {2.0f, 0.0f, 0.0f, 0.0f}};
+  mx::pm4::AluInputs in;
+  in.alu_consts = consts;
+  in.alu_const_dwords = 2048;
+  return mx::pm4::ExecuteVertexShader(blob, std::size(blob), attrs, values, in);
+}
+
+void CheckPos(const char* what, const mx::pm4::AluResult& r, float x, float y,
+              float z, float w) {
+  std::printf("  %-34s status=%s pos=(%.3f %.3f %.3f %.3f)\n", what,
+              mx::pm4::AluStatusName(r.status), r.position[0], r.position[1],
+              r.position[2], r.position[3]);
+  if (r.status != mx::pm4::AluStatus::kOk) {
+    std::printf("  FAIL %s: expected ok, got %s (opcode %u)\n", what,
+                mx::pm4::AluStatusName(r.status), r.blocking_opcode);
+    ++g_failures;
+    return;
+  }
+  const float want[4] = {x, y, z, w};
+  for (int c = 0; c < 4; ++c) {
+    if (std::fabs(r.position[c] - want[c]) > 1e-5f) {
+      std::printf("  FAIL %s: position[%d] got %.6f, want %.6f\n", what, c,
+                  r.position[c], want[c]);
+      ++g_failures;
+    }
+  }
+}
+
+// Fill c[index] with four floats.
+void SetConst(uint32_t* consts, uint32_t index, float x, float y, float z,
+              float w) {
+  const float v[4] = {x, y, z, w};
+  std::memcpy(&consts[index * 4], v, sizeof(v));
+}
+
+// a0 must be written by the maxa family and consumed by relative constant
+// reads. This is the assertion that proves both halves: get the sign, the
+// rounding or the offset wrong and it reads a different constant.
+void TestAddressRegister() {
+  std::printf("a0 is written by maxa and consumed by relative constant reads\n");
+  uint32_t consts[2048] = {};
+  SetConst(consts, 0, -1, -1, -1, -1);
+  SetConst(consts, 3, 10, 20, 30, 40);   // what a0 = +3 should reach
+  SetConst(consts, 5, 50, 60, 70, 80);   // what a0 = -3 from c[8] should reach
+  SetConst(consts, 8, -9, -9, -9, -9);
+
+  // r0 was seeded (2,0,0,0), so r0.w is 0 and r0.x is 2. maxa takes its address
+  // from src0.w, so to get a0 = 3 the source must have 3 in w: swizzle r1
+  // (4,5,6,1) is no good, so use a constant instead. Simpler: mad-free path —
+  // set a0 from a constant whose w is 3.
+  SetConst(consts, 1, 0, 0, 0, 3.0f);    // c1.w = 3
+  SetConst(consts, 2, 0, 0, 0, -3.0f);   // c2.w = -3
+
+  // slot0: maxa r2, c1, c1  -> a0 = floor(c1.w + 0.5) = 3
+  Alu maxa;
+  maxa.vector_opc = 29;  // kMaxA
+  maxa.vector_dest = 2;
+  maxa.vector_write_mask = 0xF;
+  maxa.src1_reg = 1; maxa.src1_temp = false;
+  maxa.src2_reg = 1; maxa.src2_temp = false;
+
+  // slot1: export 62 = add(c[0 + a0], c[0 + a0]) / 2 is not available, so just
+  // read the relative constant through max, which returns it unchanged.
+  Alu exp;
+  exp.is_export = true;
+  exp.vector_dest = 62;
+  exp.vector_write_mask = 0xF;
+  exp.vector_opc = 2;  // kMax
+  exp.src1_reg = 0; exp.src1_temp = false;
+  exp.src2_reg = 0; exp.src2_temp = false;
+  exp.const_0_rel_abs = true;  // src1/src2 constant index is a0-relative
+
+  Alu nop;  // scalar_opc kRetainPrev, no writes
+
+  mx::pm4::AluResult r = RunSynthetic(maxa, exp, nop, consts);
+  CheckPos("a0 = +3 reads c[3]", r, 10, 20, 30, 40);
+
+  // Negative a0. c[8] with a0 = -3 must reach c[5]; a sign error reads c[11],
+  // which is zero, and an off-by-one reads c[4] or c[6] — also zero. Only the
+  // right answer is non-zero, so this cannot pass by accident.
+  maxa.src1_reg = 2; maxa.src2_reg = 2;  // c2.w = -3
+  exp.src1_reg = 8; exp.src2_reg = 8;
+  mx::pm4::AluResult n = RunSynthetic(maxa, exp, nop, consts);
+  CheckPos("a0 = -3 reads c[8-3] = c[5]", n, 50, 60, 70, 80);
+
+  // aL-relative must still be refused. Same instruction, plus the bit that
+  // says "the relative register is aL, not a0".
+  exp.src1_reg = 0; exp.src2_reg = 0;
+  exp.const_addr_reg_relative = true;
+  mx::pm4::AluResult l = RunSynthetic(maxa, exp, nop, consts);
+  std::printf("  %-34s status=%s\n", "aL-relative stays refused",
+              mx::pm4::AluStatusName(l.status));
+  CheckBool("aL-relative refused", l.status == mx::pm4::AluStatus::kLoopRelative,
+            true);
+}
+
+// The mulsc/addsc/subsc family: one constant operand named directly by src3,
+// one temp whose index is scattered across the opcode's low bit, src3_sel and
+// src3_swiz. Reconstruct that index backwards and the test reads register n^1.
+void TestConstRegScalarOps() {
+  std::printf("mulsc/addsc/subsc read one constant and one temp\n");
+  uint32_t consts[2048] = {};
+  SetConst(consts, 7, 3.0f, 0, 0, 0);  // the constant operand: c7.x = 3
+
+  // The temp operand must be a register we seeded. r0 holds the colour
+  // (2,0,0,0), so r0.x = 2. Encoding r0 means
+  // scalar_const_reg_op_src_temp_reg() == 0, i.e. opcode low bit 0, src3_sel 0
+  // and src3_swiz[2:5] 0 — so use the _0 form of each opcode with src3_sel
+  // clear. src3_swiz low 2 bits select component x.
+  struct Case { const char* name; uint32_t opc; float want; };
+  const Case cases[] = {
+      {"mulsc0  c7.x * r0.x", 42, 6.0f},
+      {"addsc0  c7.x + r0.x", 44, 5.0f},
+      {"subsc0  c7.x - r0.x", 46, 1.0f},
+  };
+
+  for (const Case& c : cases) {
+    // slot1 exports to 62: vector half writes nothing (mask 0), scalar half
+    // writes all four components with the scalar result.
+    Alu exp;
+    exp.is_export = true;
+    exp.vector_dest = 62;
+    exp.vector_write_mask = 0x0;
+    exp.scalar_write_mask = 0xF;
+    exp.scalar_opc = c.opc;
+    exp.src3_reg = 7;         // the constant index
+    exp.src3_temp = false;    // src3_sel 0 -> temp reg bit 1 clear
+    exp.src3_swiz = 0;        // component x, and temp index bits [2:5] zero
+    // The vector half must not fault: with vector_write_mask 0 on an export it
+    // still evaluates, so give it something harmless reading temps.
+    exp.vector_opc = 2;  // kMax
+    exp.src1_reg = 0; exp.src2_reg = 0;
+
+    Alu nop;
+    mx::pm4::AluResult r = RunSynthetic(nop, exp, nop, consts);
+    CheckPos(c.name, r, c.want, c.want, c.want, c.want);
+  }
+
+  // And the temp index really is reconstructed, not assumed zero: the _1 form
+  // sets the opcode's low bit, which selects r1 — the position (4,5,6,1), so
+  // r1.x = 4 and mulsc1 must give 12 rather than 6.
+  Alu exp;
+  exp.is_export = true;
+  exp.vector_dest = 62;
+  exp.vector_write_mask = 0x0;
+  exp.scalar_write_mask = 0xF;
+  exp.scalar_opc = 43;  // kMulsc1 -> temp register 1
+  exp.src3_reg = 7;
+  exp.src3_temp = false;
+  exp.src3_swiz = 0;
+  exp.vector_opc = 2;
+  exp.src1_reg = 0; exp.src2_reg = 0;
+  Alu nop;
+  mx::pm4::AluResult r = RunSynthetic(nop, exp, nop, consts);
+  CheckPos("mulsc1  c7.x * r1.x", r, 12, 12, 12, 12);
+}
+
 // Malformed input must be rejected, not crash and not spin. Each case is a
 // blob the decoder could plausibly be handed by a desynced parser.
 void TestMalformed() {
@@ -381,6 +605,8 @@ int main() {
   TestNoPositionExport();
   TestAluPassthrough();
   TestAluNoPosition();
+  TestAddressRegister();
+  TestConstRegScalarOps();
   TestMalformed();
   if (g_failures) {
     std::printf("\n%d check(s) FAILED\n", g_failures);

@@ -34,7 +34,11 @@ enum class AluStatus {
   kUnsupportedCf,      // a jump, call or loop — see the note in the .cpp
   kUnsupportedVectorOp,
   kUnsupportedScalarOp,
-  kRelativeAddressing,  // a0/aL-relative constant or register index
+  // aL-relative constant index. aL is the loop counter, and we deliberately walk
+  // every exec block once rather than unrolling loops, so there is no value to
+  // give it. Distinct from a0-relative addressing, which *is* modelled — keeping
+  // them apart is what lets the failure histogram show whether that work landed.
+  kLoopRelative,
   kInstructionCap,
 };
 

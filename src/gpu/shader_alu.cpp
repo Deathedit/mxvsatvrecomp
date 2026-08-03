@@ -17,7 +17,7 @@ const char* AluStatusName(AluStatus s) {
     case AluStatus::kUnsupportedCf: return "unsupported control flow";
     case AluStatus::kUnsupportedVectorOp: return "unsupported vector op";
     case AluStatus::kUnsupportedScalarOp: return "unsupported scalar op";
-    case AluStatus::kRelativeAddressing: return "relative addressing";
+    case AluStatus::kLoopRelative: return "aL-relative (loop)";
     case AluStatus::kInstructionCap: return "instruction cap";
   }
   return "?";
@@ -116,6 +116,12 @@ class Interpreter {
   Vec4 position;
   bool wrote_position = false;
 
+  // The address register. Written by the maxa family, read by every relative
+  // constant, source and destination index. Zero until something writes it,
+  // which matches the hardware — a shader that indexes relatively without
+  // writing a0 first reads c[0], it does not fault.
+  int32_t a0_ = 0;
+
   AluStatus status = AluStatus::kOk;
   uint32_t blocking_opcode = 0;
 
@@ -143,19 +149,29 @@ class Interpreter {
     Vec4 base;
     bool absolute = false;
     if (is_temp) {
+      // A relative temp index is aL-relative, never a0-relative — the register
+      // file simply has no a0 addressing mode. So modelling a0 does not help
+      // here and this stays refused.
       if (uc::AluInstruction::is_src_temp_relative(reg)) {
-        status = AluStatus::kRelativeAddressing;
+        status = AluStatus::kLoopRelative;
         return base;
       }
       base = temps[uc::AluInstruction::src_temp_reg(reg) & (kNumTemps - 1)];
       absolute = uc::AluInstruction::is_src_temp_value_absolute(reg);
     } else {
-      if (alu.src_const_is_addressed(i) ||
-          alu.is_const_address_register_relative()) {
-        status = AluStatus::kRelativeAddressing;
-        return base;
+      uint32_t index = reg & 0xFF;
+      if (alu.src_const_is_addressed(i)) {
+        // Relative to a0 or to aL, and the instruction says which. aL is the
+        // loop counter; we walk every exec block once instead of unrolling, so
+        // there is no honest value for it and this is refused rather than
+        // guessed. a0 we have.
+        if (alu.is_const_address_register_relative()) {
+          status = AluStatus::kLoopRelative;
+          return base;
+        }
+        index = (index + uint32_t(a0_)) & 0xFF;
       }
-      base = Const(reg & 0xFF);
+      base = Const(index);
       absolute = alu.abs_constants();
     }
 
@@ -172,6 +188,19 @@ class Interpreter {
   }
 
   static float Saturate(float f) { return f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f); }
+
+  // a0 is a signed 9-bit register: the hardware clamps to [-256, 255]. A NaN
+  // input lands on 0 rather than propagating, since the register is an index.
+  static int32_t ClampAddress(float f) {
+    if (!(f > -256.0f)) return std::isnan(f) ? 0 : -256;
+    if (f > 255.0f) return 255;
+    return int32_t(f);
+  }
+  // maxa / maxas write floor(x + 0.5) — round to nearest, halves upward — and
+  // then clamp. maxasf floors instead, and calls ClampAddress directly.
+  static int32_t SetAddressRegister(float f) {
+    return ClampAddress(std::floor(f + 0.5f));
+  }
 
   Vec4 VectorOp(const uc::AluInstruction& alu) {
     Vec4 r;
@@ -194,9 +223,9 @@ class Interpreter {
       case Op::kTrunc: for (int c = 0; c < 4; ++c) r[c] = std::trunc(a[c]); break;
       case Op::kFloor: for (int c = 0; c < 4; ++c) r[c] = std::floor(a[c]); break;
       case Op::kMaxA:
-        // max plus a copy of a.w into the address register, which we do not
-        // model — any instruction that then uses it relatively is refused by
-        // Src(), so ignoring the side effect cannot silently mislead.
+        // max, plus the address-register side effect. Modelling it is what lets
+        // Src() resolve relative constant reads instead of refusing them.
+        a0_ = SetAddressRegister(a[3]);
         for (int c = 0; c < 4; ++c) r[c] = a[c] >= b[c] ? a[c] : b[c];
         break;
       case Op::kMad: {
@@ -260,9 +289,49 @@ class Interpreter {
     return r;
   }
 
+  // The mulsc/addsc/subsc family, opcodes 42..47. These do not use the normal
+  // operand encoding, so they must not go through Src(): src3 names a constant
+  // *register* directly, and the temp register it multiplies against is
+  // scattered — one bit lives in the opcode field itself, which is why each
+  // operation has a _0 and a _1 form. The SDK reassembles it for us in
+  // scalar_const_reg_op_src_temp_reg().
+  //
+  // Both operands are scalars, selected by the low two bits of src3_swiz. The
+  // constant's negate bit still applies; the temp's does not, there being no
+  // field for it.
+  bool ConstRegScalarOp(const uc::AluInstruction& alu, float& out) {
+    using Op = uc::AluScalarOpcode;
+    const Op op = alu.scalar_opcode();
+    if (op < Op::kMulsc0 || op > Op::kSubsc1) return false;
+
+    const uint32_t comp = alu.src_swizzle(3) & 3;
+    Vec4 cv = Const(alu.src_reg(3) & 0xFF);
+    float a = cv[comp];
+    if (alu.abs_constants()) a = std::fabs(a);
+    if (alu.src_negate(3)) a = -a;
+
+    const float b =
+        temps[alu.scalar_const_reg_op_src_temp_reg() & (kNumTemps - 1)][comp];
+
+    switch (op) {
+      case Op::kMulsc0: case Op::kMulsc1: out = a * b; break;
+      case Op::kAddsc0: case Op::kAddsc1: out = a + b; break;
+      default:                            out = a - b; break;  // subsc0/1
+    }
+    return true;
+  }
+
   float ScalarOp(const uc::AluInstruction& alu) {
     using Op = uc::AluScalarOpcode;
     const Op op = alu.scalar_opcode();
+
+    // Handled ahead of the switch because their operands are not Src()-shaped.
+    if (float cr = 0.0f; ConstRegScalarOp(alu, cr)) {
+      if (alu.scalar_clamp()) cr = Saturate(cr);
+      ps_ = cr;
+      return cr;
+    }
+
     const Vec4 s = Src(alu, 3);
     // Two-operand scalar ops take x and y of the swizzled operand; one-operand
     // ops take x, and a few also read w.
@@ -300,16 +369,22 @@ class Interpreter {
       case Op::kSqrt: r = std::sqrt(a); break;
       case Op::kSin: r = std::sin(a); break;
       case Op::kCos: r = std::cos(a); break;
-      case Op::kMaxAs: case Op::kMaxAsf:
-        // As kMaxA: the address-register side effect is not modelled, and any
-        // later relative use is refused rather than approximated.
+      case Op::kMaxAs:
+        // As kMaxA, but the address source is src0.x rather than src0.w.
+        a0_ = SetAddressRegister(a);
+        r = a >= w ? a : w;
+        break;
+      case Op::kMaxAsf:
+        // The "floor" variant: truncates toward negative infinity instead of
+        // rounding to nearest. Same clamp.
+        a0_ = ClampAddress(std::floor(a));
         r = a >= w ? a : w;
         break;
       case Op::kRetainPrev: r = ps_; break;
       default:
-        // The setp/kill families and the mulsc/addsc/subsc constant-operand
-        // family, whose operand encoding is a special case worth implementing
-        // only once something needs it.
+        // The setp and kill families — predicate machinery and pixel-shader
+        // operations. The mulsc/addsc/subsc family used to land here too; it is
+        // now handled above, ahead of this switch.
         status = AluStatus::kUnsupportedScalarOp;
         blocking_opcode = uint32_t(op);
         return ps_;
@@ -349,8 +424,13 @@ class Interpreter {
       return;
     }
 
+    // Destinations name temp registers, so a relative destination is
+    // aL-relative for the same reason a relative temp source is. Refused, not
+    // approximated. (In the export path above, is_scalar_dest_relative is not
+    // an index at all — it is the "write unwritten components as 0" flag —
+    // which is why this check lives here and not at the top of Execute.)
     if (alu.is_vector_dest_relative() || alu.is_scalar_dest_relative()) {
-      status = AluStatus::kRelativeAddressing;
+      status = AluStatus::kLoopRelative;
       return;
     }
     if (vmask) {
