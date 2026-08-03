@@ -919,7 +919,15 @@ void Pm4Translator::NoteAluExecution(const AluResult& r, uint32_t pos_format) {
   static std::map<uint32_t, uint64_t> s_inByFormatVp;
   // And what each position *looks* like, so the verdict is not just "one number
   // is bigger than the other".
-  static uint64_t s_clipLike = 0, s_windowLike = 0, s_neither = 0;
+  //
+  // s_degenerate is the reason this needed a second pass. The most common single
+  // export is (0, 0, 0, w=0), which sits inside the unit cube and would be
+  // counted as clip-like while being no evidence of anything. It also inflates
+  // the viewport-inverse in-range count, because with xo/xs == 1 the origin maps
+  // to exactly (-1, +1) — a corner, in range, and meaningless. Counted apart so
+  // neither interpretation gets credit for it.
+  static uint64_t s_clipLike = 0, s_windowLike = 0, s_neither = 0,
+                  s_degenerate = 0;
 
   ++s_status[int(r.status)];
   if (r.status != AluStatus::kOk) {
@@ -965,8 +973,12 @@ void Pm4Translator::NoteAluExecution(const AluResult& r, uint32_t pos_format) {
       // Checked in this order because the two overlap near the origin — a point
       // inside the unit cube is also inside the viewport rectangle. Clip wins
       // the tie, which biases against the hypothesis being tested here rather
-      // than for it.
-      if (clip_like) ++s_clipLike;
+      // than for it. Degenerate output is taken out first so it cannot be read
+      // as support for either.
+      const bool degenerate = (w == 0.0f) || (std::fabs(x) < 1e-4f &&
+                                              std::fabs(y) < 1e-4f);
+      if (degenerate) ++s_degenerate;
+      else if (clip_like) ++s_clipLike;
       else if (win_like) ++s_windowLike;
       else ++s_neither;
     }
@@ -995,10 +1007,10 @@ void Pm4Translator::NoteAluExecution(const AluResult& r, uint32_t pos_format) {
                 s_nonFinite, inf.empty() ? "none " : inf,
                 outf.empty() ? "none " : outf);
     REXLOG_INFO("alu space: as-clip in {} out {} | after viewport inverse in {} "
-                "out {} — looks like clip {} window {} neither {} — "
-                "viewport-inverse in-range by pos format {}",
+                "out {} — looks like clip {} window {} neither {} degenerate {} "
+                "— viewport-inverse in-range by pos format {}",
                 s_inRange, s_outOfRange, s_inRangeVp, s_outOfRangeVp,
-                s_clipLike, s_windowLike, s_neither,
+                s_clipLike, s_windowLike, s_neither, s_degenerate,
                 infvp.empty() ? "none " : infvp);
   }
 }
