@@ -1716,6 +1716,57 @@ Also: `Get-ChildItem logs\*.log | ... | Sort-Object` over 15MB of logs does not
 finish inside a 10-minute timeout. Filter with `Select-String -Path` first, then
 sort only the matches.
 
+### Surface routing cannot fix the overpaint — the populations share surfaces (2026-08-03)
+
+A round that stopped at its first stage, on purpose, because the measurement
+came out against the plan.
+
+The theory was good enough to be worth testing: 16 guest colour surfaces are
+flattened into one host target, the last pass to paint wins, and the tint had
+just shown the last painter everywhere is a colourless draw. `graphics_system.cpp`
+had already written down the intended fix — *honour the surface binding, present
+the one the guest swaps, do not guess by pitch*.
+
+So before gating anything, `LogSurface` cross-tabulated colour source against
+surface (`DrawCall::color_source`). Two runs, ≥150s, reproducing closely:
+
+```
+surface     packed (draws:verts)   none (draws:verts)
+2D0/1280    9215:3333610           4656:191292      <- and 9315:3361288 / 4628:181916
+2D0/160     9822:3748638           4082:16328
+2D0/800     3666:1217112            498:1992
+```
+
+**The colourless draws are not on a surface of their own.** They sit on the same
+surfaces as the packed geometry, and their largest population by vertices is on
+`2D0/1280` — the main surface — next to 3.3M packed vertices. Any gate that
+keeps the main surface keeps the overpaint with it; any gate that drops the
+overpaint drops the scene.
+
+So `present_surface_only` was **not written**. The stop condition was in the plan
+before the measurement existed, which is the only reason it was honoured rather
+than rationalised into a threshold to tune.
+
+This does **not** retire "a colourless pass overpaints the main scene" — the
+tint still shows exactly that. It retires *surface identity* as the way to tell
+the two apart. Whatever distinguishes them is within a surface: draw order,
+depth, or the draws themselves being wrong. Note the PSO leaves
+`DepthStencilState` zeroed (`d3d12_game.cpp:11`), so **draw order alone decides
+what wins**, and order within a surface is exactly what a surface gate cannot
+touch.
+
+Two things worth keeping from the table:
+
+- **`kNotTranscoded` had to be split from `kNone`.** `TranscodeVertices` returns
+  early in several places without resolving any colour; folding those into
+  "no colour attribute" would have inflated the very population being measured.
+  On `2D0/1280` they are 20167 draws and 10.8M vertices — larger than every
+  other class combined, and they would have swamped the result.
+- **`main_surface_only`'s premise was half right.** `2D0/1280` really is the
+  plurality surface (~35400 draws), but most of it is untranscoded, which is why
+  gating on it collapsed submissions to 5/frame. The table now says that
+  directly instead of leaving it as a surprise.
+
 ### Parser caveat
 
 `Pm4Parser` accepts any Type-3 with `body_word_count <= 0x4000`. A misparsed
