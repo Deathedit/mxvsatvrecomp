@@ -340,10 +340,19 @@ class Pm4Translator {
   // outside the clip volume cannot render correctly; submitting it anyway is
   // what smears the frame white over the geometry that is right.
   enum class DrawClass {
-    kPartial,      // at least one vertex lands. The normal case — never skip
+    kPartial,      // at least one vertex lands, and nothing looks broken
     kDegenerate,   // every vertex at the origin
     kOutOfRange,   // nothing lands anywhere near the clip volume
+    // Some vertices collapsed to exactly the origin and others did not. Real
+    // geometry does not put a handful of vertices at exactly (0,0,0) and leave
+    // the rest alone — this is a transform that failed for part of the draw,
+    // and it is the shape that stretches a triangle from the corner across the
+    // whole frame. The two clean cases above turned out to be only 7.5% of
+    // draws and 1.5% of vertices, far too little to explain a white screen, so
+    // this is where the smear actually comes from.
+    kMixedOrigin,
   };
+  static constexpr int kDrawClassCount = 4;
   // `verts` is the transcoded buffer: kOutStride bytes per vertex, position in
   // the leading 12. Judged against BuildViewportMvp, the same transform
   // FinalizeDraw will attach to the draw.

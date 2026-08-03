@@ -1129,6 +1129,7 @@ Pm4Translator::DrawClass Pm4Translator::ClassifyTransformedDraw(
   BuildViewportMvp(mvp);
 
   bool all_origin = true;
+  bool any_origin = false;
   bool any_near = false;
   for (uint32_t v = 0; v < count; ++v) {
     float in[4] = {0, 0, 0, 1};
@@ -1136,6 +1137,8 @@ Pm4Translator::DrawClass Pm4Translator::ClassifyTransformedDraw(
     if (std::fabs(in[0]) > 1e-6f || std::fabs(in[1]) > 1e-6f ||
         std::fabs(in[2]) > 1e-6f) {
       all_origin = false;
+    } else {
+      any_origin = true;
     }
     float o[4];
     for (uint32_t r = 0; r < 4; ++r) {
@@ -1153,14 +1156,19 @@ Pm4Translator::DrawClass Pm4Translator::ClassifyTransformedDraw(
       const float lim = std::fabs(o[3]) * 4.0f;
       if (std::fabs(o[0]) <= lim && std::fabs(o[1]) <= lim) any_near = true;
     }
-    if (!all_origin && any_near) break;  // already kPartial, nothing left to learn
   }
 
   // Origin-collapsed is reported ahead of out-of-range because it is the more
   // specific fact: the ALU writes xyz = 0 exactly when it exports w == 0, and w
   // does not survive into the transcoded buffer to be tested directly.
   if (all_origin) return DrawClass::kDegenerate;
-  return any_near ? DrawClass::kPartial : DrawClass::kOutOfRange;
+  if (!any_near) return DrawClass::kOutOfRange;
+  // Checked last so it only claims draws that would otherwise have passed as
+  // ordinary. A draw with some vertices at exactly the origin and some not is
+  // a transform that failed for part of its vertices, and it is the shape that
+  // stretches one triangle from the corner across the whole frame.
+  if (any_origin) return DrawClass::kMixedOrigin;
+  return DrawClass::kPartial;
 }
 
 void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
@@ -1176,8 +1184,9 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
   // Draw classification, indexed by DrawClass: partial / degenerate / out of
   // range. Kept beside the transcode counters so one log line says both what
   // was produced and how much of it could not possibly draw.
-  static uint64_t s_class[3] = {}, s_classVerts[3] = {};
-  static std::map<uint32_t, uint32_t> s_classByFormat[3];
+  static uint64_t s_class[kDrawClassCount] = {},
+                  s_classVerts[kDrawClassCount] = {};
+  static std::map<uint32_t, uint32_t> s_classByFormat[kDrawClassCount];
 
   // Leave the guest layout and the stride the caller already set alone. The
   // renderer's stride-28 gate then decides, exactly as before this existed.
@@ -1363,19 +1372,27 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
                 s_fromExport, s_fromGuess, pf, ef.empty() ? "none " : ef,
                 uh.empty() ? "none " : uh);
 
-    std::string dgf, oof;
+    std::string dgf, oof, mxf;
     for (const auto& [f, n] : s_classByFormat[int(DrawClass::kDegenerate)])
       dgf += fmt::format("{}:{} ", f, n);
     for (const auto& [f, n] : s_classByFormat[int(DrawClass::kOutOfRange)])
       oof += fmt::format("{}:{} ", f, n);
-    const uint64_t tot = s_class[0] + s_class[1] + s_class[2];
+    for (const auto& [f, n] : s_classByFormat[int(DrawClass::kMixedOrigin)])
+      mxf += fmt::format("{}:{} ", f, n);
+    uint64_t tot = 0, vtot = 0;
+    for (int i = 0; i < kDrawClassCount; ++i) { tot += s_class[i]; vtot += s_classVerts[i]; }
+    const uint64_t bad = s_class[1] + s_class[2] + s_class[3];
+    const uint64_t badv = s_classVerts[1] + s_classVerts[2] + s_classVerts[3];
     REXLOG_INFO("transcode class: partial {} ({} vtx) | degenerate {} ({} vtx) "
-                "by format {}| out-of-range {} ({} vtx) by format {}— "
-                "{:.1f}% of draws could not draw correctly",
+                "by format {}| out-of-range {} ({} vtx) by format {}| "
+                "mixed-origin {} ({} vtx) by format {}— {:.1f}% of draws and "
+                "{:.1f}% of vertices could not draw correctly",
                 s_class[0], s_classVerts[0], s_class[1], s_classVerts[1],
                 dgf.empty() ? "none " : dgf, s_class[2], s_classVerts[2],
-                oof.empty() ? "none " : oof,
-                tot ? 100.0 * double(s_class[1] + s_class[2]) / double(tot) : 0.0);
+                oof.empty() ? "none " : oof, s_class[3], s_classVerts[3],
+                mxf.empty() ? "none " : mxf,
+                tot ? 100.0 * double(bad) / double(tot) : 0.0,
+                vtot ? 100.0 * double(badv) / double(vtot) : 0.0);
   }
 }
 
