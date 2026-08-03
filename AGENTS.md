@@ -1565,6 +1565,61 @@ as a trend.
 ALU status stayed `ok:4000`, viewport-inverse in-range 3263/690 (83%),
 format 32 at 1594. AV 0 in this round's runs.
 
+#### Skipping the broken draws does not clear the screen (2026-08-03)
+
+The theory was that the white frame is broken geometry painted over good
+geometry, so not submitting the provably-broken draws would reveal what is
+underneath. **It does not.** `skip_untransformable_draws` works mechanically and
+changes nothing visible.
+
+Each transcoded draw is classified against the same `BuildViewportMvp` the
+renderer will apply:
+
+| class | draws | vertices | |
+|---|---|---|---|
+| partial | 14642 | 3,282,769 | at least one vertex lands — never skipped |
+| degenerate | 1006 | 42,654 | every vertex at the origin |
+| out-of-range | 536 | 2,135 | nothing near the clip volume |
+| **mixed-origin** | **3816** | **12,336** | some vertices at exactly the origin, some not |
+
+**`mixed-origin` is the interesting class and it had to be discovered.** The
+first cut only counted a draw degenerate when *every* vertex sat at the origin,
+which found 7.5% of draws and 1.5% of vertices — far too little to explain a
+white screen, and a skip built on it would have done nothing. Real breakage looks
+different: some vertices collapsed to exactly `(0,0,0)` and the rest not. Those
+draws average **3.0 vertices** — single triangles with one corner pinned at the
+origin, which is exactly the streak fan. They are 77% format 37.
+
+Together the three bad classes are **26.8% of draws but only 1.7% of vertices**,
+which is why skipping looked worth doing. 5358 draws were skipped in the
+transcode and 5273 at the renderer, 238 submitted against 79 skipped per frame.
+The screen stayed 100% white at t+30/50/75 in both runs.
+
+**So the white is coming from the `partial` draws — the bulk geometry, 3.28M
+vertices — not from a broken minority.** That relocates the problem and is the
+real result of the round: it is not "a few bad draws smear over good ones", it is
+that the main geometry is itself mis-transformed. The four-times-the-frustum
+bound calls a draw partial if *any* vertex lands, so a draw with one good vertex
+and the rest at ±1000 still counts as partial and still stretches. Tightening
+that bound was deliberately not done — it deletes real geometry crossing the
+frustum edge and makes the screen look cleaner while showing less.
+
+**The cvar stays off by default and is a mitigation, not a fix.** The draws it
+removes are still transformed wrongly; they are merely not drawn. Any screenshot
+taken with it on has to be read that way.
+
+**Running each configuration twice is what kept this honest.** The first
+skip-on run showed 24.9% non-white and looked like a clear win. It was the grey
+`rgb(128,128,128)` boot quadrant that appears in both configurations at early
+timestamps, plus single-pixel colours — the second run was 100% white. One
+capture is not a result, and this is the second time this session a single
+sample nearly became a false conclusion.
+
+Also worth re-learning: `cat logs/*.log | grep ... | tail` is **not** in
+timestamp order across rotated files. It briefly showed `transcode skip: 0` and
+suggested the cvar was not being parsed, when the skip had in fact engaged. Pipe
+through `sort` on the timestamp prefix, as recorded earlier in this file.
+
 ### Parser caveat
 
 `Pm4Parser` accepts any Type-3 with `body_word_count <= 0x4000`. A misparsed
