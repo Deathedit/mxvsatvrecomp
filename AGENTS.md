@@ -1507,6 +1507,64 @@ override run came back 100% white it looked exactly like a broken capture; the
 defaults run reproducing the recorded black in the same session is the only
 reason the white was known to be real.
 
+#### The constant file is not the problem (2026-08-03)
+
+A negative result, measured, and it closes off the most attractive remaining
+hypothesis.
+
+**`SQ_VS_CONST` (0x2307) reads `base=0 size=255`. `SQ_PS_CONST` (0x2308) reads
+`base=256 size=255`.** Both in vec4. So the vertex stage is based at **zero**,
+`Const()`'s absolute indexing is already right, and **no rebasing is needed**.
+
+That the two decode to exactly the two 256-vec4 banks also validates the bit
+layout, which is worth stating because it came from Xenia and not from the SDK —
+`register_table.inc` names both registers but carries no bitfield for either:
+
+```
+bits [8:0]   base   (vec4)
+bits [20:12] size   (vec4)
+```
+
+It also settles what `LOAD_ALU_CONSTANT`'s two destinations are. It writes only
+dword `0x0`, `0x3E0`, `0x3F0` and `0x7F0`; `0x3F0` is vec4 252 and `0x7F0` is
+vec4 508 — the last four vec4 of bank 0 and bank 1 respectively. With VS based
+at 0 and PS at 256, **`0x3F0` is the vertex matrix and `0x7F0` the pixel one**,
+one of each per draw. Nothing is landing in the wrong bank.
+
+**And the shaders are getting real constants.** `Const()` is the single choke
+point for every constant read — plain, `a0`-relative and `mulsc` alike — so it
+now counts reads, all-zero reads and the index range, split by whether the
+execution went on to produce nothing:
+
+| | n | reads/exec | zero reads/exec | index range |
+|---|---|---|---|---|
+| produced a position | 3249 | 10.4 | **0.1** | 0..255 |
+| degenerate `(0,0,0,w=0)` | 704 | 14.2 | **0.8** | 0..255 |
+
+Degenerate executions read 8x more zeros, which is a real correlation — but 0.8
+of 14.2 reads is not a shader starved of constants. They also read *more*
+constants than the ones that succeed, so they are not shorter or simpler
+shaders. And the distribution of the highest index each execution touches —
+`67:12 79:922 255:2012` — says the majority **do** reach `c255`, exactly where
+the per-object matrix arrives.
+
+So: the matrices arrive, in the right bank, at the right index, non-zero, and
+the shaders read them. **The remaining defect is downstream of the constant
+file** — in the arithmetic or in the vertex inputs, not in what the shader was
+given. Three rounds of "the per-object transform is missing" can be retired as
+an explanation.
+
+**Screenshot honesty note.** The override run in this round showed 9.1% coherent
+green with a clean curved silhouette, against 100% white the round before. That
+is **not** an improvement from this work — the commit is read-only by
+construction and cannot change rendering. It is run-to-run variance in how much
+content has loaded by a given timestamp, which the per-frame submitted counts
+(5 to 321 at frame #301) already showed is large. Do not read a single capture
+as a trend.
+
+ALU status stayed `ok:4000`, viewport-inverse in-range 3263/690 (83%),
+format 32 at 1594. AV 0 in this round's runs.
+
 ### Parser caveat
 
 `Pm4Parser` accepts any Type-3 with `body_word_count <= 0x4000`. A misparsed
