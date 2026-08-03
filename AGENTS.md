@@ -1834,13 +1834,37 @@ vertex declarations directly, which is exactly what several rounds have been
 spent guessing at (`PickColorAttribute`, the stride heuristic, the format-38
 fallback).
 
-It is not available here. The Xbox 360 XDK links D3D **statically into the
-XEX**, so there is no import table to hook, and the recompiler emitted no
-symbols for it — `grep` over `generated/` finds no `D3DDevice`,
-`DrawIndexedPrimitive`, `SetVertexDeclaration` or any related name. Every
-candidate is an anonymous `sub_xxxxxxxx`. Using that path would mean first
-identifying the D3D entry points by hand from the disassembly, then hooking
-dozens of them, before any of the benefit arrives.
+It is not available as a hook point. Confirmed from the XEX header itself
+(`XexTool`), not inferred:
+
+```
+Import Libraries          Static Libraries
+  0) xam.xex                0) D3D9     v2.0.20209.3
+  1) xboxkrnl.exe           1) D3DX9    v2.0.20209.0
+                            3) XGRAPHC  v2.0.20209.3
+```
+
+**Two imports, neither of them D3D.** D3D is linked statically, so there is no
+import table to hook, and the recompiler emitted no symbols — `grep` over
+`generated/` finds no `D3DDevice`, `DrawIndexedPrimitive`,
+`SetVertexDeclaration` or any related name. Every candidate is an anonymous
+`sub_xxxxxxxx`.
+
+What the header does give, and it is worth keeping: **the D3D9 code is present
+as a contiguous block, from a known XDK — 2.0.20209**, built with
+`LINK v10.0.10224` / `C1,C2 v16.0.10224` (VS2010). Static libraries link
+contiguously, so one confirmed D3D function localizes the whole region. And an
+exact-version `d3d9.lib` from that XDK would make FLIRT/FLAIR signatures an
+exact compiler and version match rather than a fuzzy one — the difference
+between naming a few functions and naming the library.
+
+Other useful header facts: base `0x82000000`, entry `0x82BFD3C0`, code
+`0x821D0000`–`0x82D00000`, data to `0x83150000`, and the title module carries an
+**export table at `0x82CEA8B8`** (unusual for a game, unexamined).
+
+Using this path would still mean identifying the entry points before any benefit
+arrives, and the 360 D3D API inlines much of its command-buffer writing into the
+caller, so a chunk of pipeline state would only ever exist as PM4 regardless.
 
 PM4 is the boundary that actually exists in this binary, and it is where Xenia
 works too. Keeping it.
