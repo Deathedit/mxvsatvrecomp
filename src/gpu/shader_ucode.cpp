@@ -190,18 +190,40 @@ inline float Snorm16(uint16_t u) {
 
 }  // namespace
 
-bool ReadVertexAttribute(const uint8_t* vertex_base, uint32_t vertex_bytes,
-                         const VertexAttribute& attr, float out[4]) {
+namespace {
+
+// Signed reads of the sub-byte widths the packed formats use.
+inline float S8(uint32_t v)  { return float(int8_t(v & 0xFF)); }
+inline float S16(uint32_t v) { return float(int16_t(v & 0xFFFF)); }
+inline int32_t S10(uint32_t v) {
+  const int32_t x = int32_t(v & 0x3FF);
+  return (x & 0x200) ? x - 0x400 : x;
+}
+inline int32_t S2(uint32_t v) {
+  const int32_t x = int32_t(v & 0x3);
+  return (x & 0x2) ? x - 0x4 : x;
+}
+// D3D's signed-normalized rule: the most negative value maps to -1, not below.
+inline float Norm(float v, float scale) {
+  const float f = v / scale;
+  return f < -1.0f ? -1.0f : f;
+}
+
+}  // namespace
+
+bool ReadVertexAttributeAs(const uint8_t* vertex_base, uint32_t vertex_bytes,
+                           uint32_t format, uint32_t offset_bytes,
+                           uint32_t size_bytes, NumFormat num, float out[4]) {
   if (!vertex_base) return false;
-  const uint32_t size = attr.size_bytes;
-  if (size == 0) return false;
-  if (attr.offset_bytes + size > vertex_bytes) return false;
-  const uint8_t* p = vertex_base + attr.offset_bytes;
+  if (size_bytes == 0) return false;
+  if (offset_bytes + size_bytes > vertex_bytes) return false;
+  const uint8_t* p = vertex_base + offset_bytes;
 
   out[0] = out[1] = out[2] = 0.0f;
   out[3] = 1.0f;
 
-  switch (attr.format) {
+  switch (format) {
+    // Float formats: the signed/normalized bits do not apply.
     case 36:  // k_32_FLOAT
       out[0] = RdF32(p);
       return true;
@@ -220,26 +242,61 @@ bool ReadVertexAttribute(const uint8_t* vertex_base, uint32_t vertex_bytes,
     case 32:  // k_16_16_16_16_FLOAT
       for (int i = 0; i < 4; ++i) out[i] = HalfToFloat(Rd16(p + i * 2));
       return true;
-    case 25:  // k_16_16 — signed normalised
-      out[0] = Snorm16(Rd16(p)); out[1] = Snorm16(Rd16(p + 2));
-      return true;
-    case 26:  // k_16_16_16_16
-      for (int i = 0; i < 4; ++i) out[i] = Snorm16(Rd16(p + i * 2));
-      return true;
-    case 6: {  // k_8_8_8_8 — unsigned normalised, low byte is component 0
-      const uint32_t v = Rd32(p);
-      for (int i = 0; i < 4; ++i)
-        out[i] = float((v >> (i * 8)) & 0xFF) / 255.0f;
-      return true;
-    }
-    case 7: {  // k_2_10_10_10 — 10/10/10 then 2
-      const uint32_t v = Rd32(p);
-      out[0] = float(v & 0x3FF) / 1023.0f;
-      out[1] = float((v >> 10) & 0x3FF) / 1023.0f;
-      out[2] = float((v >> 20) & 0x3FF) / 1023.0f;
-      out[3] = float((v >> 30) & 0x3) / 3.0f;
+
+    case 25:    // k_16_16
+    case 26: {  // k_16_16_16_16
+      const int n = (format == 25) ? 2 : 4;
+      for (int i = 0; i < n; ++i) {
+        const uint16_t u = Rd16(p + i * 2);
+        switch (num) {
+          case NumFormat::kSnorm: out[i] = Norm(S16(u), 32767.0f); break;
+          case NumFormat::kUnorm: out[i] = float(u) / 65535.0f;    break;
+          case NumFormat::kSint:  out[i] = S16(u);                 break;
+          case NumFormat::kUint:  out[i] = float(u);               break;
+        }
+      }
       return true;
     }
+
+    case 6: {  // k_8_8_8_8 — low byte is component 0
+      const uint32_t v = Rd32(p);
+      for (int i = 0; i < 4; ++i) {
+        const uint32_t b = (v >> (i * 8)) & 0xFF;
+        switch (num) {
+          case NumFormat::kUnorm: out[i] = float(b) / 255.0f;    break;
+          case NumFormat::kSnorm: out[i] = Norm(S8(b), 127.0f);  break;
+          case NumFormat::kUint:  out[i] = float(b);             break;
+          case NumFormat::kSint:  out[i] = S8(b);                break;
+        }
+      }
+      return true;
+    }
+
+    case 7: {  // k_2_10_10_10 — three 10-bit components then a 2-bit one
+      const uint32_t v = Rd32(p);
+      const uint32_t raw[4] = {v & 0x3FF, (v >> 10) & 0x3FF, (v >> 20) & 0x3FF,
+                               (v >> 30) & 0x3};
+      for (int i = 0; i < 4; ++i) {
+        const bool two = (i == 3);
+        switch (num) {
+          case NumFormat::kUnorm:
+            out[i] = float(raw[i]) / (two ? 3.0f : 1023.0f);
+            break;
+          case NumFormat::kSnorm:
+            out[i] = two ? Norm(float(S2(raw[i])), 1.0f)
+                         : Norm(float(S10(raw[i])), 511.0f);
+            break;
+          case NumFormat::kUint:
+            out[i] = float(raw[i]);
+            break;
+          case NumFormat::kSint:
+            out[i] = two ? float(S2(raw[i])) : float(S10(raw[i]));
+            break;
+        }
+      }
+      return true;
+    }
+
     case 16: {  // k_10_11_11 — x:11 y:11 z:10, low to high
       const uint32_t v = Rd32(p);
       out[0] = float(v & 0x7FF) / 2047.0f;
@@ -260,6 +317,18 @@ bool ReadVertexAttribute(const uint8_t* vertex_base, uint32_t vertex_bytes,
       // plausible-looking guess.
       return false;
   }
+}
+
+bool ReadVertexAttribute(const uint8_t* vertex_base, uint32_t vertex_bytes,
+                         const VertexAttribute& attr, float out[4]) {
+  // The interpretation this function has always applied, kept exactly so the
+  // PM4 path's output does not move. attr.is_signed / attr.is_normalized are
+  // deliberately *not* consulted here: they were never consulted before, and
+  // honouring them would change PM4 geometry as a side effect of a D3D9 change.
+  NumFormat num = NumFormat::kUnorm;
+  if (attr.format == 25 || attr.format == 26) num = NumFormat::kSnorm;
+  return ReadVertexAttributeAs(vertex_base, vertex_bytes, attr.format,
+                               attr.offset_bytes, attr.size_bytes, num, out);
 }
 
 const VertexAttribute* PickPositionAttribute(

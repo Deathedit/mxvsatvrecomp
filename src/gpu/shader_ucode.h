@@ -86,10 +86,33 @@ float HalfToFloat(uint16_t h);
 // any non-zero mode, which is wrong for the 8in16 buffers this game also uses.
 void ApplyFetchEndian(uint8_t* data, size_t bytes, uint32_t endian);
 
+// How a format's raw bits are interpreted. The layout of a format says how many
+// bits each component gets; this says what they mean, and the two are
+// independent — k_8_8_8_8 is D3DCOLOR under kUnorm and a bone index under
+// kUint, with identical bits.
+//
+// On the PM4 path this is not selectable: a vfetch does carry the two bits, but
+// ReadVertexAttribute was written before they were decoded and hardcodes one
+// choice per format. The D3D9 path does have them, from the declaration's Type
+// dword, and losing that distinction is exactly the failure the HLE route
+// exists to avoid.
+enum class NumFormat : uint8_t {
+  kUnorm = 0,   // and every float format, where it does not apply
+  kSnorm,
+  kUint,
+  kSint,
+};
+
 // Decode one attribute of one vertex to up to 4 floats. `vertex_base` points at
 // the start of the vertex, already endian-corrected. Unwritten components are
 // left as (0,0,0,1). Returns false for a format not handled, leaving `out`
 // untouched, so callers can count the gap instead of rendering a guess.
+bool ReadVertexAttributeAs(const uint8_t* vertex_base, uint32_t vertex_bytes,
+                           uint32_t format, uint32_t offset_bytes,
+                           uint32_t size_bytes, NumFormat num, float out[4]);
+
+// The PM4 path's entry point. Delegates to the above with the interpretation
+// this function has always used per format, so its results are unchanged.
 bool ReadVertexAttribute(const uint8_t* vertex_base, uint32_t vertex_bytes,
                          const VertexAttribute& attr, float out[4]);
 

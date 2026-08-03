@@ -1,5 +1,9 @@
 #include "gpu/d3d9_layout.h"
 
+// For ReadVertexAttributeAs — the format decode has one implementation, and it
+// is the one the PM4 path has been using all along.
+#include "gpu/shader_ucode.h"
+
 namespace mx::pm4 {
 namespace {
 
@@ -266,6 +270,9 @@ bool BuildInputLayout(const D3D9Element* elements, uint32_t count,
     h.unpack = decoded.unpack;
     h.swizzle = decoded.swizzle;
     h.usage = e.usage;
+    h.xenos_format = decoded.format;
+    h.is_signed = decoded.is_signed;
+    h.is_normalized = decoded.is_normalized;
     out.elements.push_back(h);
 
     if (e.stream > out.max_stream) out.max_stream = e.stream;
@@ -274,6 +281,53 @@ bool BuildInputLayout(const D3D9Element* elements, uint32_t count,
   }
 
   err.failed_element = 0;
+  return true;
+}
+
+const HleInputElement* FindUsage(const HleInputLayout& layout, uint8_t usage,
+                                 uint32_t usage_index) {
+  for (const auto& e : layout.elements) {
+    if (e.usage == usage && e.semantic_index == usage_index) return &e;
+  }
+  return nullptr;
+}
+
+bool ReadHleElement(const uint8_t* vertex_base, uint32_t vertex_bytes,
+                    const HleInputElement& element, float out[4]) {
+  // The two Type bits pick the interpretation. This is the whole reason the
+  // D3D9 route exists: COLOR and BLENDINDICES are both k_8_8_8_8 and differ
+  // only here, and a decode that ignored them would turn every bone index into
+  // a fraction while still producing something that looks like geometry.
+  NumFormat num;
+  if (element.is_normalized) {
+    num = element.is_signed ? NumFormat::kSnorm : NumFormat::kUnorm;
+  } else {
+    num = element.is_signed ? NumFormat::kSint : NumFormat::kUint;
+  }
+
+  float raw[4];
+  if (!ReadVertexAttributeAs(vertex_base, vertex_bytes, element.xenos_format,
+                             element.offset, element.size_bytes, num, raw)) {
+    return false;
+  }
+
+  // Apply the swizzle. On the host-layout path it is left for the shader,
+  // because that is where D3D9 puts it and a DXGI format that reordered
+  // components would apply it twice — but a CPU read has no shader downstream,
+  // so it has to happen here. Values are 0-3 for xyzw, 4 for constant 0 and 5
+  // for constant 1.
+  for (int i = 0; i < 4; ++i) {
+    const uint32_t sel = (element.swizzle >> (i * 3)) & 0x7;
+    switch (sel) {
+      case 0: case 1: case 2: case 3: out[i] = raw[sel]; break;
+      case 4: out[i] = 0.0f; break;
+      case 5: out[i] = 1.0f; break;
+      default:
+        // 6 and 7 are not swizzle values any capture produces. Failing is the
+        // point: a silent 0 here would be indistinguishable from a real one.
+        return false;
+    }
+  }
   return true;
 }
 

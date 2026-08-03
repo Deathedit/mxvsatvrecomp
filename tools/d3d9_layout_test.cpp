@@ -320,6 +320,189 @@ void RunFixture(const Fixture& f) {
   }
 }
 
+//===========================================================================
+// Reading actual bytes.
+//
+// Everything above checks that a declaration *describes* a layout correctly.
+// These check that the described layout then reads the right numbers out of
+// real vertex bytes — which is what Stage 2 does per vertex, per draw.
+//
+// The pair that matters most is COLOR and BLENDINDICES: identical bits,
+// identical format 6, differing only in the two Type bits, and one must come
+// back as 0.25 while the other comes back as 64.
+//===========================================================================
+
+// Build a single-element layout the same way the runtime does, so the test
+// exercises BuildInputLayout rather than a hand-filled struct.
+bool MakeElement(uint32_t type, uint8_t usage, mx::pm4::HleInputElement& out) {
+  uint8_t raw[2 * mx::pm4::kElementSize] = {};
+  raw[0] = 0; raw[1] = 0;                       // stream 0
+  raw[2] = 0; raw[3] = 0;                       // offset 0
+  raw[4] = uint8_t(type >> 24); raw[5] = uint8_t(type >> 16);
+  raw[6] = uint8_t(type >> 8);  raw[7] = uint8_t(type);
+  raw[8] = 0;                                   // method DEFAULT
+  raw[9] = usage;
+  raw[10] = 0;                                  // usage index
+  raw[12] = 0xFF; raw[13] = 0xFF;               // D3DDECL_END
+
+  mx::pm4::D3D9Element parsed[2];
+  for (int i = 0; i < 2; ++i)
+    parsed[i] = mx::pm4::ReadElement(raw + i * mx::pm4::kElementSize);
+
+  mx::pm4::HleInputLayout layout;
+  mx::pm4::LayoutError err;
+  if (!mx::pm4::BuildInputLayout(parsed, 1, layout, err)) return false;
+  if (layout.elements.size() != 1) return false;
+  out = layout.elements[0];
+  return true;
+}
+
+void CheckFloat4(const char* what, const float got[4], const float want[4]) {
+  for (int i = 0; i < 4; ++i) {
+    // Exact-representable values are chosen throughout, so the tolerance is
+    // only here to absorb the division, not to paper over a wrong decode.
+    const float d = got[i] - want[i];
+    if (d > 1e-6f || d < -1e-6f) {
+      std::printf("  FAIL %-34s component %d: got %g, want %g\n", what, i,
+                  got[i], want[i]);
+      ++g_failures;
+      return;
+    }
+  }
+}
+
+void CheckVertexDecode() {
+  // Four bytes shared by the first two cases. Component 0 is the low byte.
+  const uint8_t bgra[4] = {0x40, 0x80, 0xC0, 0xFF};
+
+  struct Case {
+    const char* what;
+    uint32_t type;        // the real Type dword
+    uint8_t usage;
+    const uint8_t* bytes;
+    uint32_t nbytes;
+    float want[4];
+  };
+
+  // k_2_10_10_10, signed normalized: x=+511, y=-511, z=0, w(2 bits)=+1, with
+  // the 3-component swizzle 0xA88 = (x,y,z,1).
+  //   v = (1 << 30) | (0 << 20) | (0x201 << 10) | 0x1FF = 0x400805FF
+  const uint8_t n2101010[4] = {0xFF, 0x05, 0x08, 0x40};
+
+  // k_16_16 signed integer: -2 and 300, swizzle 0xB08 = (x,y,0,1).
+  const uint8_t i1616[4] = {0xFE, 0xFF, 0x2C, 0x01};
+
+  // k_16_16_16_16 signed normalized: +32767, -32767, 0, +32767.
+  const uint8_t s16x4[8] = {0xFF, 0x7F, 0x01, 0x80, 0x00, 0x00, 0xFF, 0x7F};
+
+  // k_32_32_32_FLOAT: 1.0, -2.0, 0.5 — the flags must not matter here.
+  const uint8_t f32x3[12] = {0x00, 0x00, 0x80, 0x3F, 0x00, 0x00,
+                             0x00, 0xC0, 0x00, 0x00, 0x00, 0x3F};
+
+  const Case cases[] = {
+      // The captured COLOR dword: format 6, unsigned, normalized, swizzle
+      // 0x60A = (z,y,x,w) — D3DCOLOR's BGRA arriving as RGBA.
+      {"COLOR 8_8_8_8 unorm+bgra", 0x00182886u, mx::pm4::kUsageColor, bgra, 4,
+       {0xC0 / 255.0f, 0x80 / 255.0f, 0x40 / 255.0f, 1.0f}},
+
+      // The captured BLENDINDICES dword: same format 6, same bytes, but the
+      // integer bit is set and the swizzle is identity. If these two ever
+      // agree, the two Type bits are being ignored.
+      {"BLENDINDICES 8_8_8_8 uint", 0x001A2286u, mx::pm4::kUsageBlendIndices,
+       bgra, 4, {64.0f, 128.0f, 192.0f, 255.0f}},
+
+      {"NORMAL 2_10_10_10 snorm", 0x002A2107u, mx::pm4::kUsageNormal,
+       n2101010, 4, {1.0f, -1.0f, 0.0f, 1.0f}},
+
+      {"POSITION 16_16 sint", 0x002C2319u, mx::pm4::kUsagePosition, i1616, 4,
+       {-2.0f, 300.0f, 0.0f, 1.0f}},
+
+      {"POSITION 16_16_16_16 snorm", 0x001A211Au, mx::pm4::kUsagePosition,
+       s16x4, 8, {1.0f, -1.0f, 0.0f, 1.0f}},
+
+      {"POSITION 32_32_32_FLOAT", 0x002A2039u, mx::pm4::kUsagePosition, f32x3,
+       12, {1.0f, -2.0f, 0.5f, 1.0f}},
+  };
+
+  for (const auto& c : cases) {
+    mx::pm4::HleInputElement e;
+    if (!MakeElement(c.type, c.usage, e)) {
+      Fail("build element", c.what);
+      continue;
+    }
+    float got[4];
+    if (!mx::pm4::ReadHleElement(c.bytes, c.nbytes, e, got)) {
+      Fail("read element", c.what);
+      continue;
+    }
+    CheckFloat4(c.what, got, c.want);
+    std::printf("  %-28s -> (%g, %g, %g, %g)\n", c.what, got[0], got[1], got[2],
+                got[3]);
+  }
+
+  // COLOR and BLENDINDICES must not merely differ — the first must be a
+  // fraction and the second a whole byte value. Asserted separately so a
+  // regression that made both UNORM would fail here loudly.
+  {
+    mx::pm4::HleInputElement col, idx;
+    if (MakeElement(0x00182886u, mx::pm4::kUsageColor, col) &&
+        MakeElement(0x001A2286u, mx::pm4::kUsageBlendIndices, idx)) {
+      float a[4], b[4];
+      if (mx::pm4::ReadHleElement(bgra, 4, col, a) &&
+          mx::pm4::ReadHleElement(bgra, 4, idx, b)) {
+        if (a[0] == b[0]) {
+          Fail("COLOR vs BLENDINDICES differ",
+               "same value from the same bits — the Type bits are ignored");
+        }
+      }
+    }
+  }
+
+  // A read that would run past the end of the vertex must fail rather than
+  // return whatever follows.
+  {
+    mx::pm4::HleInputElement e;
+    if (MakeElement(0x002A2039u, mx::pm4::kUsagePosition, e)) {
+      float got[4];
+      if (mx::pm4::ReadHleElement(f32x3, 8, e, got)) {
+        Fail("reject short vertex", "12-byte element read from 8 bytes");
+      }
+    }
+  }
+
+  // FindUsage must return the declaration's own answer, and null rather than a
+  // near miss.
+  {
+    uint8_t raw[3 * mx::pm4::kElementSize] = {};
+    // [0] POSITION 0 at offset 0, k_32_32_32_FLOAT
+    raw[3] = 0x00; raw[4] = 0x00; raw[5] = 0x2A; raw[6] = 0x2A; raw[7] = 0x39;
+    raw[9] = mx::pm4::kUsagePosition;
+    // [1] COLOR 0 at offset 12, k_8_8_8_8
+    raw[12 + 2] = 0x00; raw[12 + 3] = 0x0C;
+    raw[12 + 4] = 0x00; raw[12 + 5] = 0x18; raw[12 + 6] = 0x28; raw[12 + 7] = 0x86;
+    raw[12 + 9] = mx::pm4::kUsageColor;
+    raw[24] = 0xFF; raw[25] = 0xFF;
+
+    mx::pm4::D3D9Element parsed[2];
+    for (int i = 0; i < 2; ++i)
+      parsed[i] = mx::pm4::ReadElement(raw + i * mx::pm4::kElementSize);
+    mx::pm4::HleInputLayout layout;
+    mx::pm4::LayoutError err;
+    if (!mx::pm4::BuildInputLayout(parsed, 2, layout, err)) {
+      Fail("FindUsage fixture builds", mx::pm4::LayoutErrorText(err.reason));
+    } else {
+      const auto* pos = mx::pm4::FindUsage(layout, mx::pm4::kUsagePosition, 0);
+      const auto* col = mx::pm4::FindUsage(layout, mx::pm4::kUsageColor, 0);
+      const auto* nrm = mx::pm4::FindUsage(layout, mx::pm4::kUsageNormal, 0);
+      const auto* col1 = mx::pm4::FindUsage(layout, mx::pm4::kUsageColor, 1);
+      if (!pos || pos->offset != 0) Fail("FindUsage POSITION 0", "wrong element");
+      if (!col || col->offset != 12) Fail("FindUsage COLOR 0", "wrong element");
+      if (nrm) Fail("FindUsage absent NORMAL", "returned an element");
+      if (col1) Fail("FindUsage COLOR 1", "matched COLOR 0");
+    }
+  }
+}
+
 // The decode must reject rather than approximate. A silent fallback is the
 // failure mode this whole file exists to prevent: it produces geometry that
 // looks like geometry.
@@ -517,6 +700,9 @@ int main() {
   CheckSignedNormalized();
   CheckSwizzle();
   CheckRejections();
+
+  std::printf("\nReading vertex bytes:\n");
+  CheckVertexDecode();
 
   std::printf("\nThe 23 captured declarations:\n");
   for (const auto& f : kFixtures) RunFixture(f);

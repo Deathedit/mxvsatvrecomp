@@ -160,6 +160,13 @@ struct HleInputElement {
   Unpack      unpack         = Unpack::kNone;
   uint32_t    swizzle        = 0;
   uint8_t     usage          = 0;
+  // The raw 6-bit xenos::VertexFormat, plus the two bits that say what its bits
+  // mean. Kept because the DXGI format alone cannot express the k_2_10_10_10
+  // case, and because reading a vertex on the CPU needs the Xenon layout rather
+  // than the host one.
+  uint32_t    xenos_format   = 0;
+  bool        is_signed      = false;
+  bool        is_normalized  = false;
 };
 
 struct HleInputLayout {
@@ -192,5 +199,28 @@ const char* LayoutErrorText(LayoutError::Reason r);
 // False on the first element it cannot describe, with `err` filled in.
 bool BuildInputLayout(const D3D9Element* elements, uint32_t count,
                       HleInputLayout& out, LayoutError& err);
+
+//===========================================================================
+// Reading a vertex.
+//===========================================================================
+
+// The element carrying a given semantic, or null. This is what replaces
+// PickPositionAttribute and PickColorAttribute on the PM4 side: those inspect
+// offsets, component counts and formats to *infer* which attribute is the
+// position, and fall back to a guess when the microcode trace fails. The
+// declaration states it outright.
+const HleInputElement* FindUsage(const HleInputLayout& layout, uint8_t usage,
+                                 uint32_t usage_index);
+
+// Decode one element of one vertex to four floats. `vertex_base` points at the
+// start of the vertex within its own stream, already endian-corrected by
+// ApplyFetchEndian. Unwritten components come back (0,0,0,1).
+//
+// The swizzle is applied here, unlike on the host-layout path where it belongs
+// in the shader — a CPU read has no shader to carry it.
+//
+// False for a format the decoder cannot describe, leaving `out` untouched.
+bool ReadHleElement(const uint8_t* vertex_base, uint32_t vertex_bytes,
+                    const HleInputElement& element, float out[4]);
 
 }  // namespace mx::pm4
