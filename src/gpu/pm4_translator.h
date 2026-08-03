@@ -206,6 +206,9 @@ class Pm4Translator {
   // Read-only: counts the distinct guest colour surfaces draws target. Nothing
   // downstream consumes it — see the definition.
   void LogSurface(DrawCall& dc);
+  // Read-only: how much of the viewport each draw's transformed bounding box
+  // could cover, split by colour source. An UPPER BOUND — see the definition.
+  void NoteDrawCoverage(const DrawCall& dc) const;
 
   // ---- Shader microcode capture (read-only this round) --------------------
   //

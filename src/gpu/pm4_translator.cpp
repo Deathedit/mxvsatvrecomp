@@ -1696,6 +1696,100 @@ void Pm4Translator::LogNdc(const DrawCall& dc) const {
   }
 }
 
+// How much of the viewport each draw's geometry could possibly cover, split by
+// where its colour came from.
+//
+// The question. The tint screenshot says colourless draws paint 100% of the
+// drawn region; the counters say they are 2.5% of vertices and, on the main
+// surface, average ~39 vertices each. Small draws cannot paint everything
+// unless one of two things is true:
+//
+//   1. they are genuinely fullscreen — a real pass we render wrongly, or
+//   2. a bad transform has smeared small geometry across the whole screen,
+//      which is exactly the kMixedOrigin class already on record (2999 draws
+//      averaging 3.0 vertices with one corner pinned at the origin).
+//
+// Those want opposite fixes. A few draws each covering most of the viewport is
+// (1); thousands of tiny draws with enormous boxes is (2).
+//
+// THIS IS AN UPPER BOUND, NOT COVERAGE. A bounding box overestimates any
+// non-rectangular primitive — a fan with one vertex at the origin has a box
+// covering everything while painting slivers — and overlapping draws
+// double-count, so the sum can exceed 1.0 and means nothing by itself. Only the
+// comparison between colour sources is signal. Do not restate the sum as
+// "percent of screen"; that is the same mistake as reading vertex share as
+// pixel area, which already went wrong once this effort.
+void Pm4Translator::NoteDrawCoverage(const DrawCall& dc) const {
+  // kNotTranscoded draws keep the guest stride and the renderer's stride-28
+  // gate drops them, so they reach no pixels. Including them would swamp the
+  // table — on 2D0/1280 they are 20167 draws against 4628 colourless.
+  if (dc.color_source == DrawCall::ColorSource::kNotTranscoded) return;
+  if (dc.vertices.empty() || dc.vertex_stride < 12 || dc.vertex_count == 0) return;
+
+  float lo_x = 1e30f, lo_y = 1e30f, hi_x = -1e30f, hi_y = -1e30f;
+  bool degenerate = false;
+  for (uint32_t v = 0; v < dc.vertex_count; ++v) {
+    const size_t off = size_t(v) * dc.vertex_stride;
+    if (off + 12 > dc.vertices.size()) break;
+    const uint8_t* p = dc.vertices.data() + off;
+    float in[4] = {0, 0, 0, 1};
+    for (uint32_t c = 0; c < 3; ++c) std::memcpy(&in[c], p + c * 4, 4);
+    // Same transform as LogNdc above — dc.mvp is row-major.
+    float o[4];
+    for (uint32_t r = 0; r < 4; ++r) {
+      o[r] = dc.mvp[r * 4 + 0] * in[0] + dc.mvp[r * 4 + 1] * in[1] +
+             dc.mvp[r * 4 + 2] * in[2] + dc.mvp[r * 4 + 3] * in[3];
+    }
+    // A box that is huge because w <= 0 is behind the eye, not big. Counted
+    // apart so "covers the screen" cannot be manufactured by a sign error.
+    if (!(o[3] > 0.0f) || !std::isfinite(o[0]) || !std::isfinite(o[1])) {
+      degenerate = true;
+      continue;
+    }
+    const float nx = o[0] / o[3], ny = o[1] / o[3];
+    if (nx < lo_x) lo_x = nx;
+    if (nx > hi_x) hi_x = nx;
+    if (ny < lo_y) lo_y = ny;
+    if (hi_y < ny) hi_y = ny;
+  }
+
+  const auto clamp11 = [](float f) { return f < -1.0f ? -1.0f : (f > 1.0f ? 1.0f : f); };
+  double frac = 0.0;
+  if (hi_x >= lo_x && hi_y >= lo_y) {
+    const float w = clamp11(hi_x) - clamp11(lo_x);
+    const float h = clamp11(hi_y) - clamp11(lo_y);
+    if (w > 0.0f && h > 0.0f) frac = (double(w) * double(h)) / 4.0;  // NDC is 2x2
+  }
+
+  struct Cov {
+    uint64_t draws = 0, verts = 0, degenerate = 0, over_half = 0;
+    double sum = 0.0, max = 0.0;
+  };
+  static Cov s_cov[4];
+  auto& c = s_cov[static_cast<size_t>(dc.color_source)];
+  ++c.draws;
+  c.verts += dc.vertex_count;
+  if (degenerate) ++c.degenerate;
+  c.sum += frac;
+  if (frac > c.max) c.max = frac;
+  if (frac > 0.5) ++c.over_half;
+
+  static uint64_t s_n = 0;
+  if ((++s_n % 20000) != 0) return;
+  static const char* const kName[4] = {"untranscoded", "none", "packed", "fallback"};
+  REXLOG_INFO("translator: viewport coverage UPPER BOUND by colour source "
+              "(boxes overestimate and overlap double-counts — compare the "
+              "rows, do not read the sum as percent of screen)");
+  for (size_t i = 1; i < 4; ++i) {
+    const auto& r = s_cov[i];
+    if (!r.draws) continue;
+    REXLOG_INFO("  {:<12} draws {} verts {} — mean box {:.4f} max {:.4f} — "
+                "covering >50% alone: {} — with vertices behind the eye: {}",
+                kName[i], r.draws, r.verts,
+                r.sum / double(r.draws), r.max, r.over_half, r.degenerate);
+  }
+}
+
 void Pm4Translator::FinalizeDraw(DrawCall& dc) {
   BuildViewportMvp(dc.mvp);
   dc.topology = MapTopology(dc.prim_type);
@@ -1771,6 +1865,10 @@ void Pm4Translator::FinalizeDraw(DrawCall& dc) {
   LogShaderConstBases();
   LogSurface(dc);
   LogNdc(dc);
+  // After the RectangleList / QuadList expansion above, so the coverage is of
+  // the geometry that actually gets submitted rather than the pre-expansion
+  // vertex list.
+  NoteDrawCoverage(dc);
   ProbeAluMatrices(dc);
 }
 
