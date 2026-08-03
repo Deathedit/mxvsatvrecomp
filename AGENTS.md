@@ -1244,6 +1244,14 @@ it is not verified by the run count.
 
 #### Closing the ALU gaps: the scalar family was real, `a0` was not (2026-08-03)
 
+> **Half of this section's headline is wrong — corrected below in "The `a0`/`aL`
+> selector was inverted".** `a0` *was* real. It converted zero failures because
+> one condition in `Src()` had the a0/aL selector backwards, so the a0 arithmetic
+> was never once executed. Everything here about `mulsc`/`addsc`/`subsc` stands;
+> everything about `a0` "buying nothing" and about `aL` being what this game uses
+> does not. The evidence that should have caught it was already in the same log
+> line — see below.
+
 **`mulsc`/`addsc`/`subsc` (opcodes 42..47) are implemented, and that closed the
 whole unsupported-opcode population — 536 to 0.** Their operand encoding is the
 special case the earlier note warned about, and it is worth writing down because
@@ -1306,6 +1314,119 @@ finding seen twice.
 Defaults are unchanged and deliberately so: `alu_execute=false`,
 `transcode_confirmed_formats_only=true`, 108 submitted / 218 skipped per frame.
 With the gate off it is 268/47.
+
+#### The `a0`/`aL` selector was inverted (2026-08-03)
+
+`is_const_address_register_relative()` means relative to **the address
+register**, which is `a0`. The enum states the mapping outright
+(`ucode.h:191-199`):
+
+```cpp
+enum class AddressingMode : uint32_t {
+  kRelative = 0,   // c[aL + 5]
+  kAbsolute = 1,   // c[a0 + 5]
+};
+```
+
+`Src()` tested that condition without the `!`. It therefore refused every `a0`
+read — the case the interpreter implements — and applied `a0_` to every `aL`
+read, a case that never occurs here. Un-inverting it took the interpreter from
+**72% to 100%** of sampled executions, with `aL`-relative and every other failure
+class going to **0**. Nothing else changed.
+
+**The evidence was already in the log line that reported the null result.**
+`kUnsupportedCf` was `0` across all 4000 samples, and the interpreter refuses
+`kLoopStart`/`kLoopEnd` before reaching any ALU instruction — so zero means *no
+shader in this game contains a loop*. `aL` is the loop counter. 1112 instructions
+could not have been indexing by a register nothing ever starts a loop to set.
+Two numbers in one line contradicted each other and it took a round to notice.
+`shader_alu.h` now records that the two are a cross-check: a non-zero
+`kLoopRelative` against a zero `kUnsupportedCf` is a decode error, not a loop.
+
+**The method note, which is the part worth keeping.** *A fix that converts
+exactly zero failures is evidence about the instrument, not about the game.*
+Both times this interpreter has produced a surprising null result, the null was
+the bug — first the histogram sampled downstream of the filter it existed to
+justify removing, now this. A large, plausible number is harder to doubt than an
+impossible one, which is precisely why it survived.
+
+This is also the second bit-level fact in two rounds that read plausibly
+backwards, after `ucode.h:2045` on relative temp indices. Both cost real work.
+
+#### QuadList was half the frame, and was being dropped (2026-08-03)
+
+A `prim_type` histogram over a full run:
+
+| prim | topology | count | was |
+|---|---|---|---|
+| **13** | **QuadList** | **40,755** | **dropped — `kUndefined`** |
+| 6 | TriangleStrip | 26,731 | submitted |
+| 8 | RectangleList | 18,822 | expanded and submitted |
+| 0 | invalid | 3 | dropped |
+
+QuadList is the largest single population, larger than the other two combined,
+and every one fell through `MapTopology`'s `default:` case. `ExpandQuadList`
+handles it: unlike a rectangle a quad has all four corners, so vertices pass
+through untouched and only the index buffer is rebuilt, six indices per quad on
+the **v0-v2 diagonal**. It maps through the incoming indices rather than assuming
+the sequential ones an auto-draw synthesizes, so it is correct for a real
+`DRAW_INDX` too — measured, every QuadList draw in this game is an auto-draw with
+resolvable vertex data, so neither counter fired.
+
+After this the only unmapped topology left is 3 draws of `prim_type=0`.
+**TriangleFan does not occur once in a full run**, so it stays unimplemented on
+purpose — there is no measured population to justify the code.
+
+#### 100% executing, and still nothing recognisable on screen (2026-08-03)
+
+Both fixes landed and were measured. Neither puts geometry on the screen, and
+that is the honest headline of the round.
+
+| | before (`28228fa`) | after (`4fc00ed`) |
+|---|---|---|
+| ok | 2888 (72%) | **4000 (100%)** |
+| `aL`-relative (loop) | 1112 (28%) | **0** |
+| clip in / out / non-finite | 1427 / 1456 / 5 | 2053 / 1934 / 13 |
+| format 32 in-range | 32% | **39%** |
+
+**~48% of computed positions are still outside the clip volume even at 100%
+execution.** The interpreter is no longer the limit.
+
+A 2×2 over the two cvars, sampling actual pixel values rather than eyeballing:
+
+| | gate on | gate off |
+|---|---|---|
+| **ALU off** | black (defaults, unchanged) | white, with coloured streaks at t+25 |
+| **ALU on** | black — *identical to defaults* | white |
+
+Two things fall out of that table:
+
+- **The white is the format gate, not the ALU.** Turning the gate off submits
+  draws whose positions are wrong; they smear into long thin triangles radiating
+  from one point, in real interpolated vertex colours, and by t+45 cover the
+  screen. That signature — many triangles converging on a common point with the
+  third vertex flung away — is what a missing per-object transform looks like.
+- **`alu_execute` on with the gate on is bit-identical to defaults**, because the
+  gate returns before the interpreter is ever consulted
+  (`pm4_translator.cpp:1037` vs `:1063`). Only format-57 draws reach the ALU in
+  that configuration, and they are a small minority. Worth knowing before reading
+  any future A/B of that cvar as a null result.
+
+So the remaining problem is upstream of the interpreter: the ALU constant file is
+missing whatever supplies the per-object space, most likely matrices arriving
+through a door we do not shadow, or arriving *after* the draw that reads them,
+which a per-draw snapshot cannot capture. That is the next lever, and it is the
+third time this same missing per-object transform has been the answer.
+
+Per-frame submitted counts vary a lot run to run now (5 to 321 at frame #301 on
+defaults), because how much content has loaded by a given frame is not stable —
+do not read a single frame line as a regression signal.
+
+Defaults remain unchanged: `alu_execute=false`,
+`transcode_confirmed_formats_only=true`. **AV: 1 crashing run in 9 this session**,
+same recorded signature (read at `0xFFFFFFFFFFFFFFFF`, host-side pointer,
+non-translator thread), consistent with the recorded ~1-in-8 and still not
+verified either way at this sample size.
 
 ### Parser caveat
 
