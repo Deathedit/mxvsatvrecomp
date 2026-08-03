@@ -72,6 +72,12 @@ REXCVAR_DEFINE_BOOL(hide_colored_draws, false, "Debug",
 // one built before it existed. The state shadow behind it fills unconditionally
 // (state set before the first draw would otherwise read as unknown); this cvar
 // gates the per-draw scoring, the coverage report and the dump.
+REXCVAR_DEFINE_BOOL(hle_render, false, "Debug",
+                    "Build draws from the D3D9 description — declaration, "
+                    "stream bindings and index buffer — and submit those "
+                    "instead of the PM4 translator's. Off by default: PM4 "
+                    "still owns rendering until this is proven");
+
 REXCVAR_DEFINE_BOOL(hle_capture, false, "Debug",
                     "Score every D3D9 draw against the state shadow and report "
                     "what fraction is fully described, plus the first few "
@@ -242,7 +248,14 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
         // That is what made the window cycle through colours. Draw only the
         // surface whose pitch matches the 1280x720 output, which is also the one
         // carrying the plurality of draws by a wide margin (~63000 of ~140000).
-        if (REXCVAR_GET(main_surface_only) &&
+        //
+        // Skipped entirely under hle_render: the surface a draw targets comes
+        // from RB_SURFACE_INFO, which is a PM4 register the D3D9 path never
+        // sees. Leaving the filter on would drop every HLE draw for having
+        // pitch 0 — silently, and looking exactly like "HLE produced nothing".
+        // Modelling render targets is a later step; pretending to know the
+        // pitch here would be worse than admitting the gap.
+        if (!REXCVAR_GET(hle_render) && REXCVAR_GET(main_surface_only) &&
             d.surface_pitch != kMainSurfacePitch) {
           ++skipped;
           ++s_skippedSurfaces[(uint64_t(d.surface_base) << 32) |

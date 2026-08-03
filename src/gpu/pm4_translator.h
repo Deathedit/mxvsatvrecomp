@@ -209,17 +209,30 @@ class Pm4Translator {
   // would otherwise pack a float4x4 column-major and silently transpose this.
   void BuildViewportMvp(float out[16]) const;
 
+ public:
   // Map the raw 6-bit prim_type to a host topology. kUndefined means the
   // renderer must drop the draw — RectangleList maps to kUndefined here because
   // it is not a topology but an expansion, handled by ExpandRectangleList.
+  //
+  // Public because the D3D9 path needs it too, and needs *this* one: a
+  // D3DPRIMITIVETYPE on Xenon is the Xenos value, not a separate enum. That is
+  // not an assumption — D3DDevice_DrawVertices writes the argument straight
+  // into the draw initiator's low 6 bits, and indexes its own per-primitive
+  // table at 0x82002B90 with it. A second mapping here would be a copy that
+  // could drift from the one the renderer already agrees with.
   static HostTopology MapTopology(uint32_t prim_type);
 
+ private:
+
+ public:
   // Rewrite a RectangleList draw into a triangle list in place. D3D12 has no
   // rectangle topology. Each group of 3 vertices is a rectangle whose implied
   // 4th corner is v3 = v0 + v2 - v1; the synthesized vertex takes that
   // arithmetic on the leading 3 floats and copies its remaining bytes from v2.
   // Returns the number of rectangles expanded, 0 if the draw could not be.
-  uint32_t ExpandRectangleList(DrawCall& dc) const;
+  // Public and static for the same reason as MapTopology: the D3D9 path
+  // needs the identical expansion, and neither touches instance state.
+  static uint32_t ExpandRectangleList(DrawCall& dc);
 
   // Rewrite a QuadList draw into a triangle list in place. D3D12 has no quad
   // topology either, but a quad needs no synthesized corner: all four are
@@ -227,8 +240,9 @@ class Pm4Translator {
   // is rebuilt, six indices per quad on the v0-v2 diagonal. Maps through the
   // incoming indices, so it is correct for auto-draws and real index buffers
   // alike. Returns the number of quads expanded, 0 if the draw could not be.
-  uint32_t ExpandQuadList(DrawCall& dc) const;
+  static uint32_t ExpandQuadList(DrawCall& dc);
 
+ private:
   // Everything a draw needs once its vertices and indices are in place:
   // topology, the viewport transform, RectangleList expansion, and the NDC log.
   // Called by all three draw paths so none of them can drift.

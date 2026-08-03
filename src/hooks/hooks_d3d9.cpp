@@ -32,11 +32,13 @@
 #include <string>
 #include <fstream>
 
+#include "gpu/d3d9_draw.h"
 #include "gpu/d3d9_layout.h"
 #include "gpu/d3d9_state.h"
 
 // Defined in src/app/graphics_system.cpp with the rest of the Debug cvars.
 REXCVAR_DECLARE(bool, hle_capture);
+REXCVAR_DECLARE(bool, hle_render);
 
 namespace {
 
@@ -459,6 +461,68 @@ uint32_t FetchFileDword1Offset(uint32_t stream) {
   return 0x6F4 + (0x11 - stream) * 8;
 }
 
+//---------------------------------------------------------------------------
+// Stage 2 — build a renderable draw from the description.
+//
+// The hook owns guest access, so it resolves each buffer to a host pointer and
+// hands plain pointers to d3d9_draw.cpp, which stays free of the recompiler
+// macros. Every range is bounded by the size D3D9 itself recorded on the
+// object.
+//---------------------------------------------------------------------------
+uint64_t g_badPrimType[64] = {};
+
+void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
+                       uint32_t count, int32_t base_vertex, uint8_t* base) {
+  using namespace mx::pm4;
+  const auto& st = DeviceState();
+
+  HleDrawInputs in;
+  in.indexed = indexed;
+  in.prim_type = prim_type;
+  in.first = first;
+  in.count = count;
+  in.base_vertex = base_vertex;
+
+  const int id = g_currentDecl;
+  if (id >= 0 && g_declLayoutOk[id]) in.layout = &g_declLayout[id];
+
+  HleStream streams[kMaxStreams];
+  for (uint32_t i = 0; i < kMaxStreams; ++i) {
+    const auto& b = st.stream[i];
+    if (!b.bound || !b.address || !b.size_bytes) continue;
+    streams[i].host = reinterpret_cast<const uint8_t*>(REX_RAW_ADDR(b.address));
+    streams[i].size_bytes = b.size_bytes;
+    streams[i].stride = b.stride;
+    streams[i].offset_bytes = b.offset_bytes;
+    streams[i].endian = b.endian;
+    streams[i].bound = true;
+  }
+  in.streams = streams;
+
+  if (indexed && st.index.bound && st.index.address && st.index.size_bytes) {
+    in.index.host =
+        reinterpret_cast<const uint8_t*>(REX_RAW_ADDR(st.index.address));
+    in.index.size_bytes = st.index.size_bytes;
+    in.index.is_32bit = st.index.is_32bit;
+    in.index.bound = true;
+  }
+
+  DrawCall dc;
+  HleSkip skip = HleSkip::kNone;
+  if (!BuildHleDraw(in, dc, skip)) {
+    ++HleSkipCounts()[uint32_t(skip)];
+    // Which primitive types are being refused, rather than how many. The bare
+    // count says 62% of draws fail and nothing about whether that is one type
+    // needing expansion or a wrong prim-type argument.
+    if (skip == HleSkip::kBadTopology && prim_type < 64) {
+      ++g_badPrimType[prim_type];
+    }
+    return;
+  }
+  ++HleBuiltCount();
+  HleFrameDraws().push_back(std::move(dc));
+}
+
 // Records every gap this draw has, rather than stopping at the first, so the
 // report says which fields are actually missing across the population instead
 // of which one happens to be checked earliest.
@@ -636,6 +700,40 @@ void ReportCoverage() {
       REXLOG_INFO("d3d9: hle   missing: {:<28} x{}", DrawGapName(g), g_drawGaps[g]);
     }
   }
+  //-------------------------------------------------------------------------
+  // Stage 2: what was actually built, and why the rest was not. Every skip is
+  // named — a bare total cannot separate "the decoder refuses this format"
+  // from "this stream is not indexed the way we model it", and those need
+  // opposite fixes.
+  //-------------------------------------------------------------------------
+  {
+    const uint64_t built = mx::pm4::HleBuiltCount();
+    const uint64_t* counts = mx::pm4::HleSkipCounts();
+    uint64_t attempted = built;
+    for (uint32_t i = 1; i < uint32_t(mx::pm4::HleSkip::kCount); ++i)
+      attempted += counts[i];
+    if (attempted) {
+      REXLOG_INFO("d3d9: hle-render — {} of {} draws built ({}%)", built,
+                  attempted, (built * 100) / attempted);
+      for (uint32_t i = 1; i < uint32_t(mx::pm4::HleSkip::kCount); ++i) {
+        if (!counts[i]) continue;
+        REXLOG_INFO("d3d9: hle-render   skipped: {:<34} x{}",
+                    mx::pm4::HleSkipName(mx::pm4::HleSkip(i)), counts[i]);
+      }
+      std::string prims;
+      for (uint32_t i = 0; i < 64; ++i) {
+        if (!g_badPrimType[i]) continue;
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%u:%llu ", i,
+                      (unsigned long long)g_badPrimType[i]);
+        prims += buf;
+      }
+      if (!prims.empty())
+        REXLOG_INFO("d3d9: hle-render   refused prim types (type:count) {}",
+                    prims);
+    }
+  }
+
   //-------------------------------------------------------------------------
   // Stage 0 verdict.
   //-------------------------------------------------------------------------
@@ -1023,6 +1121,11 @@ extern "C" REX_FUNC(sub_825565C8) {
       << " start_index=" << ctx.r6.u32 << " index_count=" << ctx.r7.u32 << "\n";
     f.flush();
   }
+  if (REXCVAR_GET(hle_render)) {
+    // r4 PrimitiveType, r5 BaseVertexIndex, r6 StartIndex, r7 IndexCount.
+    BuildAndQueueDraw(/*indexed=*/true, ctx.r4.u32, ctx.r6.u32, ctx.r7.u32,
+                      ctx.r5.s32, base);
+  }
   if (REXCVAR_GET(hle_capture)) {
     DeviceState().NoteDevice(ctx.r3.u32, mx::pm4::kEpDraw);
     SampleFetchConstantFile(ctx.r3.u32, base);
@@ -1052,6 +1155,11 @@ extern "C" REX_FUNC(sub_825561B0) {
       << std::dec << " prim=" << ctx.r4.u32 << " start_vertex=" << ctx.r5.u32
       << " vertex_count=" << ctx.r6.u32 << "\n";
     f.flush();
+  }
+  if (REXCVAR_GET(hle_render)) {
+    // r4 PrimitiveType, r5 StartVertex, r6 VertexCount.
+    BuildAndQueueDraw(/*indexed=*/false, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, 0,
+                      base);
   }
   if (REXCVAR_GET(hle_capture)) {
     DeviceState().NoteDevice(ctx.r3.u32, mx::pm4::kEpDraw);
@@ -1167,7 +1275,21 @@ extern "C" REX_FUNC(sub_8254B8E0) {
   ib.bound = buffer != 0;
   if (buffer) {
     ib.common = REX_LOAD_U32(buffer + 0x00);
-    ib.address = REX_LOAD_U32(buffer + 0x18) & 0x1FFFFFFF;
+    // **Not masked with 0x1FFFFFFF.** D3D9 applies that mask itself
+    // (`rlwinm r11, r11, 0, 3, 31` in DrawIndexedVertices) because the GPU
+    // needs a *physical* address — but every read on this side goes through the
+    // guest's *virtual* space, where the buffer lives at the unmasked address.
+    // Masking relocated it: an index buffer at 0xF3B64000 was recorded as
+    // 0x13B64000, and reading there faulted at 0x1D00B000 in three separate
+    // runs before the cause was found.
+    //
+    // The vertex path never had this bug because it uses `& ~3` — keeping the
+    // high bits and clearing only the fetch constant's two type bits.
+    //
+    // The "index buffer holds its range 66,726/66,726" result did not catch it,
+    // and could not: that check compares a count against Size and never
+    // dereferences Address, so a relocated address passes it every time.
+    ib.address = REX_LOAD_U32(buffer + 0x18);
     ib.size_bytes = REX_LOAD_U32(buffer + 0x1C);
     ib.is_32bit = (ib.common & 0x80000000u) != 0;
   } else {

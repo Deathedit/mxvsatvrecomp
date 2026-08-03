@@ -332,7 +332,7 @@ HostTopology Pm4Translator::MapTopology(uint32_t prim_type) {
   }
 }
 
-uint32_t Pm4Translator::ExpandRectangleList(DrawCall& dc) const {
+uint32_t Pm4Translator::ExpandRectangleList(DrawCall& dc) {
   const uint32_t stride = dc.vertex_stride;
   if (stride < 12 || dc.vertices.size() < size_t(dc.vertex_count) * stride)
     return 0;
@@ -387,7 +387,7 @@ uint32_t Pm4Translator::ExpandRectangleList(DrawCall& dc) const {
   return rects;
 }
 
-uint32_t Pm4Translator::ExpandQuadList(DrawCall& dc) const {
+uint32_t Pm4Translator::ExpandQuadList(DrawCall& dc) {
   const uint32_t istride = dc.index_16bit ? 2u : 4u;
   const uint32_t have = uint32_t(dc.indices.size() / istride);
   const uint32_t quads = have / 4;

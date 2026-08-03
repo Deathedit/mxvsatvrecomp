@@ -20,6 +20,8 @@
 
 #include "hooks/hook_common.h"
 
+#include "gpu/d3d9_draw.h"
+
 #include "gpu/pm4_parser.h"
 #include "gpu/xenos_gpu_state.h"
 
@@ -36,6 +38,9 @@
 // Hooking here is still right: it is the frame boundary with the ring buffer
 // state we need. Only the name was wrong.
 //=============================================================================
+
+// Defined in src/app/graphics_system.cpp.
+REXCVAR_DECLARE(bool, hle_render);
 
 namespace {
 
@@ -234,7 +239,16 @@ extern "C" REX_FUNC(sub_82566B58) {
     // Always propagate, even when empty: empty list clears the renderer's stale
     // draw data so frames without a VdSwap don't replay the last captured draws.
     if (!is_plugin) {
-      mx::native::NativeGraphics::Get().SetDrawCalls(draws);
+      // hle_render selects the *source* of the frame's draws, not an extra
+      // one. Both paths publish through the same handoff, so letting both run
+      // would make whichever finished last win at random.
+      if (REXCVAR_GET(hle_render)) {
+        auto& hle = mx::pm4::HleFrameDraws();
+        mx::native::NativeGraphics::Get().SetDrawCalls(hle);
+        hle.clear();
+      } else {
+        mx::native::NativeGraphics::Get().SetDrawCalls(draws);
+      }
     }
   }
 

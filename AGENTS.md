@@ -2724,14 +2724,26 @@ maskings included.
   `0x4000`**: the scan had never been the problem, and two rounds were spent
   "fixing" it. Bisecting by disabling the other new read found the real one in
   one run.
-- **The real fault was the index-buffer walk**, and its cause is a mask already
-  known wrong. `SetIndices` records `address = REX_LOAD_U32(buffer + 0x18) &
-  0x1FFFFFFF` — the same mask corrected for vertex buffers a round earlier,
-  which clears the top three bits instead of the bottom two. The
-  **66,726/66,726 "index buffer holds its range" result does not contradict
-  this**: it compares a count against a size and never dereferences the address,
-  so a wrong address passes it every time. A check that cannot fail on the thing
-  it appears to validate is worth less than it looks.
+- **The real fault was the index-buffer walk**, from the `0x1FFFFFFF` mask in
+  `SetIndices`. The reason it is wrong took two attempts to state correctly:
+
+  > **First diagnosis, wrong:** "the same mask already found wrong for vertex
+  > buffers, which clears the top three bits instead of the bottom two."
+  > `DrawIndexedVertices` does exactly `rlwinm r11, r11, 0, 3, 31` on the
+  > address, so D3D9 applies that very mask.
+  >
+  > **Correct:** D3D9 applies it *to produce a physical address for the GPU*.
+  > Every read on this side goes through the guest's **virtual** space, where
+  > the buffer lives at the unmasked address. Masking relocates it — an index
+  > buffer at `0xF3B64000` was recorded as `0x13B64000`, which is the `ib=` value
+  > sitting in the logs the whole time. The vertex path escaped this because it
+  > uses `& ~3`, keeping the high bits.
+
+  The **66,726/66,726 "index buffer holds its range" result does not contradict
+  this, and could not**: it compares a count against `Size` and never
+  dereferences `Address`, so a relocated address passes it every time. A check
+  that cannot fail on the thing it appears to validate is worth less than it
+  looks — and this one read as reassurance for two rounds.
 
 ### Parser caveat
 
