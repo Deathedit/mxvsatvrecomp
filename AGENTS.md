@@ -1767,6 +1767,84 @@ Two things worth keeping from the table:
   gating on it collapsed submissions to 5/frame. The table now says that
   directly instead of leaving it as a surprise.
 
+### The white frame is ~12700 small draws smeared across the viewport (2026-08-03)
+
+The scene was underneath the whole time.
+
+Two probes settled it. First, viewport coverage: for every transcoded draw,
+transform all its vertices with `dc.mvp` (the same math as `LogNdc`), take the
+NDC bounding box, clamp it, aggregate by colour source. Two runs, matching to
+four decimals:
+
+```
+              draws    verts      mean box   >50% alone   behind eye
+none          12760    203607     0.5169     6609         205
+packed        19546    7143234    0.0045     24           13
+fallback       7694    130048     0.2135     1114         1
+```
+
+A colourless draw averages **16 vertices** and its box covers **52% of the
+viewport**; a packed-colour draw covers **0.45%**. That is 115x the area on a
+hundredth of the vertices, and 6609 draws each cover more than half the screen.
+
+**That rules out a fullscreen pass** — one of those is a handful of draws per
+frame, not thousands. It is small geometry smeared across the viewport by a bad
+transform, the same defect the `kMixedOrigin` class named earlier.
+
+Then the direct test. `hide_colorless_draws` (default off) drops draws whose
+shader has no colour attribute. Against a control run with identical flags:
+
+```
+hiding off:  bars 25.58%  white 74.42%  (all 3 captures, all 3 timestamps)
+hiding on:   bars 52.22%  clear 22.74%  white 0.00%  green 5.43%  orange present
+```
+
+**White goes from 100% of the drawn region to 0.00%**, and real coloured
+geometry appears — green terrain and `rgb(249,125,17)` orange. Reproduced across
+two runs; the second matched the first to the decimal and to the same 913046
+grey pixels.
+
+So the ordering of the last three rounds' conclusions is: the frame is white
+because ~12700 badly-transformed colourless draws paint over everything, and
+they win because **depth test is off** (`d3d12_game.cpp:11` leaves
+`DepthStencilState` zeroed) so draw order alone decides. The colour default of
+opaque white is what makes the smear *invisible as a defect* — it looks exactly
+like a blank screen.
+
+An **upper bound, not coverage**: bounding boxes overestimate non-rectangular
+primitives and overlapping draws double-count, so the sum can exceed 1.0. Only
+the comparison between rows is signal. The log line says so itself, because
+reading a share as pixel area is the mistake that made the previous round's
+first conclusion wrong.
+
+`kNotTranscoded` is excluded from the table — those keep the guest stride and
+the renderer's stride-28 gate drops them, so they reach no pixels. On `2D0/1280`
+they are 20167 draws against 4628 colourless and would have swamped it.
+
+Note also, unchanged from an older observation: the content is only there
+**early**. At t=60s there is geometry; by t=110s green has fallen to 0.04% and
+only the grey boot quadrant remains. Whatever causes that is separate and still
+open.
+
+### Why not high-level D3D9 interception (2026-08-03)
+
+Asked whether hooking the title's D3D9 calls and translating those to D3D12
+would be faster than PM4 → D3D12. It is the right question — HLE would hand us
+vertex declarations directly, which is exactly what several rounds have been
+spent guessing at (`PickColorAttribute`, the stride heuristic, the format-38
+fallback).
+
+It is not available here. The Xbox 360 XDK links D3D **statically into the
+XEX**, so there is no import table to hook, and the recompiler emitted no
+symbols for it — `grep` over `generated/` finds no `D3DDevice`,
+`DrawIndexedPrimitive`, `SetVertexDeclaration` or any related name. Every
+candidate is an anonymous `sub_xxxxxxxx`. Using that path would mean first
+identifying the D3D entry points by hand from the disassembly, then hooking
+dozens of them, before any of the benefit arrives.
+
+PM4 is the boundary that actually exists in this binary, and it is where Xenia
+works too. Keeping it.
+
 ### Parser caveat
 
 `Pm4Parser` accepts any Type-3 with `body_word_count <= 0x4000`. A misparsed
