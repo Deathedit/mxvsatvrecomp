@@ -121,6 +121,11 @@ bool CreateGamePipeline();
   HANDLE m_fenceEvent = nullptr;
   uint32_t m_rtvDescriptorSize = 0;
   uint32_t m_frameIndex = 0;
+  // The guest's aspect. It renders 1280x720 and nothing tells it otherwise —
+  // no video-mode export is hooked — so this is the shape the image must keep
+  // however wide the host window is.
+  static constexpr float kGuestAspect = 16.0f / 9.0f;
+
   D3D12_VIEWPORT m_viewport = {};
   D3D12_RECT m_scissorRect = {};
 

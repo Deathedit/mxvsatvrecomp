@@ -505,17 +505,52 @@ bool D3D12Renderer::CreateFence() {
 }
 
 void D3D12Renderer::CreateViewportAndScissor() {
-  m_viewport.TopLeftX = 0.0f;
-  m_viewport.TopLeftY = 0.0f;
-  m_viewport.Width = static_cast<float>(m_width);
-  m_viewport.Height = static_cast<float>(m_height);
+  // Pillarbox to the guest's aspect rather than stretching to the window's.
+  //
+  // The guest renders 1280x720 — its own viewport registers read xs=640,
+  // ys=-360, and it never learns the host window size because none of
+  // VdQueryVideoMode, XGetVideoMode or VdGetCurrentDisplayInformation is
+  // hooked. The transcode then normalises to clip [-1,1], which carries no
+  // aspect information at all. So stretching clip space across the full client
+  // area scales x and y by different factors: on a 3440x1440 window that is
+  // 2.389 against the guest's 1.778, and everything drawn came out 1.34x too
+  // wide. Every screenshot taken before this was distorted.
+  //
+  // The render target stays window-sized on purpose. PresentGameFrame copies it
+  // to the backbuffer with CopyTextureRegion, which requires matching
+  // dimensions — fitting the image is the viewport's job, not the resource's.
+  const float win_w = static_cast<float>(m_width);
+  const float win_h = static_cast<float>(m_height);
+  float draw_w = win_w;
+  float draw_h = win_h;
+  if (win_w > 0.0f && win_h > 0.0f) {
+    if (win_w / win_h > kGuestAspect) {
+      draw_w = win_h * kGuestAspect;   // window wider than 16:9 — bars at the sides
+    } else {
+      draw_h = win_w / kGuestAspect;   // taller — bars top and bottom
+    }
+  }
+  const float off_x = (win_w - draw_w) * 0.5f;
+  const float off_y = (win_h - draw_h) * 0.5f;
+
+  m_viewport.TopLeftX = off_x;
+  m_viewport.TopLeftY = off_y;
+  m_viewport.Width = draw_w;
+  m_viewport.Height = draw_h;
   m_viewport.MinDepth = 0.0f;
   m_viewport.MaxDepth = 1.0f;
 
-  m_scissorRect.left = 0;
-  m_scissorRect.top = 0;
-  m_scissorRect.right = static_cast<LONG>(m_width);
-  m_scissorRect.bottom = static_cast<LONG>(m_height);
+  // The scissor has to match, or the bars keep whatever the clear left and any
+  // geometry that escapes clip space paints into them.
+  m_scissorRect.left = static_cast<LONG>(off_x);
+  m_scissorRect.top = static_cast<LONG>(off_y);
+  m_scissorRect.right = static_cast<LONG>(off_x + draw_w);
+  m_scissorRect.bottom = static_cast<LONG>(off_y + draw_h);
+
+  REXLOG_INFO("renderer: client {}x{} (aspect {:.3f}) -> 16:9 drawn region "
+              "{}x{} at ({},{})",
+              m_width, m_height, win_h > 0.0f ? win_w / win_h : 0.0f,
+              LONG(draw_w), LONG(draw_h), LONG(off_x), LONG(off_y));
 }
 
 void D3D12Renderer::WaitForGpu() {
