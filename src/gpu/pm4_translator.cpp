@@ -1122,7 +1122,6 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
   static constexpr uint32_t kOutStride = 28;  // float3 position + float4 colour
   std::vector<uint8_t> out(size_t(dc.vertex_count) * kOutStride);
   bool any_read_failed = false;
-  bool used_alu = false;
 
   // The ALU interpreter. When `alu_execute` is on it replaces the raw attribute
   // as the position; either way the first vertices of sampled draws are run
@@ -1157,9 +1156,28 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
           static_cast<uint32_t>(m_currentVs->code.size()),
           m_currentVs->attrs, attr_values, alu_in);
       if (alu_on && r.status == AluStatus::kOk) {
-        // The interpreter's answer is already clip space, so it must not then
-        // be run through the viewport inverse. Perspective-divide it here and
-        // hand the renderer an identity transform for this draw.
+        // This used to say "the interpreter's answer is already clip space, so
+        // it must not then be run through the viewport inverse", and handed the
+        // renderer identity on that basis. It is not clip space. These shaders
+        // do the viewport transform themselves and export window coordinates in
+        // the D3D9 pixel-centre convention — (640, 0, 1, w=1), (1280, 0, 0,
+        // w=1), (639.5, -0.5, 1, w=1) against a 1280x720 target. So the answer
+        // wants exactly the same viewport inverse every fetched position gets,
+        // and the special case below was the only thing preventing it.
+        //
+        // Scored over 4000 executions before removing it. In-range by position
+        // format, as-clip against after-the-inverse: 31 44%/78%, 32 32%/74%,
+        // 37 70%/87%, 38 65%/74%, 57 34%/88%. Every format improves and format
+        // 32 — the 35,655-draw majority this exists for — more than doubles.
+        //
+        // The space buckets are genuinely mixed (clip 1129, window 864, neither
+        // 1130, degenerate 784), so this is the better of two interpretations
+        // rather than a clean sweep. It is chosen on the per-format numbers,
+        // which are what the geometry actually depends on.
+        //
+        // The divide stays: with w == 1, which is what every sampled export
+        // carries, it is a no-op, and it is the right thing for any shader that
+        // does export a genuine projective position.
         const float w = r.position[3];
         if (w != 0.0f) {
           p[0] = r.position[0] / w;
@@ -1169,7 +1187,6 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
           p[0] = r.position[0]; p[1] = r.position[1]; p[2] = r.position[2];
         }
         p[3] = 1.0f;
-        used_alu = true;
       }
     }
     // A position carrying its own w is already projected; divide through so the
@@ -1191,12 +1208,12 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
 
   dc.vertices = std::move(out);
   dc.vertex_stride = kOutStride;
-  // The ALU already produced clip space, so the viewport inverse must not be
-  // applied on top of it. Identity, row-major, matching kGameVS's cbuffer.
-  if (used_alu) {
-    std::memset(dc.mvp, 0, sizeof(dc.mvp));
-    dc.mvp[0] = dc.mvp[5] = dc.mvp[10] = dc.mvp[15] = 1.0f;
-  }
+  // There used to be an `if (used_alu)` override here forcing dc.mvp to
+  // identity, on the belief that the ALU had already produced clip space. It
+  // had not — see the note at the interpreter call above. FinalizeDraw's
+  // BuildViewportMvp is the transform the ALU output actually wants, and
+  // letting it stand is the whole fix. The ALU path and the fetched-position
+  // path now agree about what space they are in.
   ++s_done;
   ++s_posFormatsUsed[pos->format];
   if (from_export) ++s_exportFormats[pos->format];
