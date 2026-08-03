@@ -39,6 +39,31 @@ static constexpr uint32_t kMainSurfacePitch = 1280;
 // Kept, off, because the mechanism is right and the selector is wrong: the fix
 // is to honour the surface binding (render passes to separate targets, present
 // the one the guest swaps), not to guess one surface by pitch.
+// Two halves of one diagnostic: show the frame without the overpaint, and show
+// the overpaint by itself.
+//
+// Measured: draws with no colour attribute average 16 vertices yet their
+// transformed bounding box covers 52% of the viewport, against 0.45% for draws
+// carrying a real packed colour — a 115x difference on a hundredth of the
+// vertices. 6581 of them cover more than half the screen each. That is not a
+// fullscreen pass (which would be a handful of draws); it is small geometry
+// smeared across the viewport by a bad transform.
+//
+// hide_colorless_draws asks whether a real scene is underneath.
+// hide_colored_draws shows the shape of the smear on its own.
+//
+// DIAGNOSTICS, not rendering modes — the hidden draws are still produced and
+// still wrong. Never set both: that submits almost nothing and is not a
+// configuration worth reporting.
+REXCVAR_DEFINE_BOOL(hide_colorless_draws, false, "Debug",
+                    "Do not submit draws whose shader has no colour attribute "
+                    "(written opaque white). A diagnostic: it says whether a "
+                    "real scene is hidden under the overpaint, not a fix");
+REXCVAR_DEFINE_BOOL(hide_colored_draws, false, "Debug",
+                    "Do not submit draws that resolved a vertex colour, so only "
+                    "the colourless ones remain. A diagnostic: it shows the "
+                    "shape of the overpaint on its own, not a fix");
+
 REXCVAR_DEFINE_BOOL(main_surface_only, false, "Debug",
                     "Submit only draws targeting the guest's main colour "
                     "surface, instead of flattening every render pass into one "
@@ -150,6 +175,7 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       static std::map<uint32_t, uint32_t> s_skippedStrides;
       static std::map<uint64_t, uint32_t> s_skippedSurfaces;
       static uint64_t s_skippedUntransformable = 0;
+      static uint64_t s_skippedByColor = 0;
       // Filter first, bind second. The renderer's list is only replaced once we
       // know the new frame has something in it — a frame whose draws were all
       // skipped for stride would otherwise blank the screen just as surely as a
@@ -171,6 +197,24 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
           ++skipped;
           ++s_skippedUntransformable;
           continue;
+        }
+        // Colour-source diagnostics. Counted separately from every other skip
+        // reason so a screenshot taken with either one on can be read honestly
+        // against the draw counts.
+        {
+          using CS = mx::pm4::DrawCall::ColorSource;
+          // Spelled out rather than using !colorless, which would also catch
+          // kNotTranscoded — those resolved no colour at all and are neither
+          // population. The stride gate below drops them regardless.
+          const bool colorless = d.color_source == CS::kNone;
+          const bool colored = d.color_source == CS::kPacked ||
+                               d.color_source == CS::kFallback;
+          if ((REXCVAR_GET(hide_colorless_draws) && colorless) ||
+              (REXCVAR_GET(hide_colored_draws) && colored)) {
+            ++skipped;
+            ++s_skippedByColor;
+            continue;
+          }
         }
         if (d.vertex_stride != kSupportedStride) {
           ++skipped;
@@ -225,10 +269,12 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
         REXLOG_INFO("RenderThread: frame #{} submitted {} draws, skipped {} "
                     "— skipped strides (cumulative) {} — host ticks with/without "
                     "new draws {}/{} — skipped surfaces {} — skipped "
-                    "untransformable (cumulative) {}",
+                    "untransformable (cumulative) {} — skipped by colour "
+                    "source (cumulative) {}",
                     s_frame, submitted, skipped, hist.empty() ? "none" : hist,
                     s_ticksWithDraws, s_ticksEmpty,
-                    surf.empty() ? "none" : surf, s_skippedUntransformable);
+                    surf.empty() ? "none" : surf, s_skippedUntransformable,
+                    s_skippedByColor);
       }
       // BeginFrame and EndFrame own the whole frame: BeginFrame opens the
       // command list, transitions and clears the targets and then calls
