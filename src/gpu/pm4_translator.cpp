@@ -1254,6 +1254,50 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
   }
   const VertexAttribute* col = PickColorAttribute(m_currentVs->attrs);
 
+  // Where the vertex colour came from, if anywhere.
+  //
+  // The frame is uniformly *white*, not noise-coloured, and that is the
+  // signature of the colour being white rather than of the geometry being
+  // wrong: random positions carrying real vertex colours look like the streak
+  // capture — pink, orange, green, blue. Flat white is what the `c = {1,1,1,1}`
+  // default below produces when PickColorAttribute returns null, and it is the
+  // worst possible default because it is indistinguishable from real geometry
+  // and hides everything behind it.
+  //
+  // The fallback branch is no safer than none: "first 4-component attribute
+  // that is not the position" will take a normal or a texcoord, and anything
+  // with large components saturates to white after clamping. So a non-null
+  // colour is not evidence of correctness — the format histogram is what says
+  // whether it picked something plausible.
+  //
+  // Vertex counts as well as draw counts, because a handful of colourless
+  // draws covering the whole screen is exactly the scenario being tested and
+  // the two can point opposite ways.
+  enum : int { kColPacked = 0, kColFallback = 1, kColNone = 2 };
+  const int col_src = !col ? kColNone
+                           : (col->format == 6 || col->format == 7)
+                                 ? kColPacked
+                                 : kColFallback;
+  {
+    static uint64_t s_colDraws[3] = {}, s_colVerts[3] = {};
+    static std::map<uint32_t, uint64_t> s_fallbackFormats;
+    ++s_colDraws[col_src];
+    s_colVerts[col_src] += dc.vertex_count;
+    if (col_src == kColFallback) ++s_fallbackFormats[col->format];
+    static uint64_t s_n = 0;
+    if ((++s_n % 5000) == 0) {
+      std::string ff;
+      for (const auto& [f, n] : s_fallbackFormats) ff += fmt::format("{}:{} ", f, n);
+      const uint64_t vt = s_colVerts[0] + s_colVerts[1] + s_colVerts[2];
+      REXLOG_INFO("transcode colour: packed {} draws ({} vtx) | fallback {} "
+                  "({} vtx) formats {}| none {} ({} vtx) — {:.1f}% of vertices "
+                  "have no real colour and are written opaque white",
+                  s_colDraws[0], s_colVerts[0], s_colDraws[1], s_colVerts[1],
+                  ff.empty() ? "none " : ff, s_colDraws[2], s_colVerts[2],
+                  vt ? 100.0 * double(s_colVerts[2]) / double(vt) : 0.0);
+    }
+  }
+
   // The shader's stride is authoritative; the division guess is not. Where they
   // disagree the shader wins, but only if the buffer actually holds that many
   // vertices — a wrong stride here reads off the end.
