@@ -56,6 +56,14 @@ struct DrawCall {
   bool binned = false;                // true for DRAW_INDX_*_BIN variants
   float mvp[16] = {};
   bool valid = false;                 // set once index buffer is populated
+  // Set by the transcode when skip_untransformable_draws is on and this draw's
+  // positions came out degenerate, entirely out of clip, or with only some
+  // vertices collapsed to the origin. Its own flag rather than reusing
+  // topology == kUndefined (which would misreport the topology) or valid=false
+  // (which the renderer skips without counting) — the reason and the count both
+  // need to stay honest. A MITIGATION: the draw is still wrong, it is just no
+  // longer drawn over the ones that are right.
+  bool untransformable = false;
   // Which guest colour surface this draw targeted, from RB_COLOR_INFO /
   // RB_SURFACE_INFO at the time it was translated. A frame touches ~16 distinct
   // surfaces and the renderer has exactly one target, so without this every

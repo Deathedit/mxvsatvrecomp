@@ -42,6 +42,23 @@ REXCVAR_DEFINE_BOOL(alu_execute, false, "Debug",
                     "instead of passing the fetched attribute through the "
                     "viewport inverse");
 
+// A MITIGATION, NOT A FIX. These draws are still transformed wrongly; this only
+// stops them being drawn on top of the ones that come out right. Nothing here
+// repairs the underlying defect, and a screenshot taken with this on must be
+// read with that in mind.
+//
+// Worth doing because of the ratio: the draws it removes are 28.1% of all draws
+// but only 1.9% of all vertices. The mixed-origin class dominates it — 2999
+// draws averaging 3.0 vertices each, i.e. single triangles with one corner
+// pinned at the origin, which is precisely the streak fan that smears the frame
+// white. The bulk terrain (2.3M vertices) is untouched.
+REXCVAR_DEFINE_BOOL(skip_untransformable_draws, false, "Debug",
+                    "Do not submit draws whose transcoded positions come out "
+                    "degenerate, entirely outside the clip volume, or with only "
+                    "some vertices collapsed to the origin. A mitigation, not a "
+                    "fix: these draws are wrong and this stops them painting "
+                    "over the ones that are right");
+
 // The A/B knob for the export decode. Off reverts to the pure guess, so the
 // two can be compared on one build rather than across two.
 REXCVAR_DEFINE_BOOL(transcode_trust_export, true, "Debug",
@@ -1187,6 +1204,7 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
   static uint64_t s_class[kDrawClassCount] = {},
                   s_classVerts[kDrawClassCount] = {};
   static std::map<uint32_t, uint32_t> s_classByFormat[kDrawClassCount];
+  static uint64_t s_skippedClass[kDrawClassCount] = {};
 
   // Leave the guest layout and the stride the caller already set alone. The
   // renderer's stride-28 gate then decides, exactly as before this existed.
@@ -1353,6 +1371,11 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
     ++s_class[ci];
     s_classVerts[ci] += dc.vertex_count;
     if (cls != DrawClass::kPartial) ++s_classByFormat[ci][pos->format];
+    if (cls != DrawClass::kPartial &&
+        REXCVAR_GET(skip_untransformable_draws)) {
+      dc.untransformable = true;
+      ++s_skippedClass[ci];
+    }
   }
 
   ++s_done;
@@ -1393,6 +1416,11 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
                 mxf.empty() ? "none " : mxf,
                 tot ? 100.0 * double(bad) / double(tot) : 0.0,
                 vtot ? 100.0 * double(badv) / double(vtot) : 0.0);
+    REXLOG_INFO("transcode skip: {} (degenerate {} out-of-range {} "
+                "mixed-origin {}) — mitigation only, these draws are still "
+                "wrong and are merely not drawn",
+                s_skippedClass[1] + s_skippedClass[2] + s_skippedClass[3],
+                s_skippedClass[1], s_skippedClass[2], s_skippedClass[3]);
   }
 }
 

@@ -149,6 +149,7 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       // strides.
       static std::map<uint32_t, uint32_t> s_skippedStrides;
       static std::map<uint64_t, uint32_t> s_skippedSurfaces;
+      static uint64_t s_skippedUntransformable = 0;
       // Filter first, bind second. The renderer's list is only replaced once we
       // know the new frame has something in it — a frame whose draws were all
       // skipped for stride would otherwise blank the screen just as surely as a
@@ -160,6 +161,15 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
         if (!d.valid || d.vertices.empty() || d.index_count == 0) continue;
         if (d.topology == mx::pm4::HostTopology::kUndefined) {
           ++skipped;
+          continue;
+        }
+        // Set only when skip_untransformable_draws is on. A MITIGATION: the
+        // draw is still transformed wrongly, this only stops it being painted
+        // over the draws that come out right. Counted separately from the
+        // other skip reasons so a screenshot can be read honestly against it.
+        if (d.untransformable) {
+          ++skipped;
+          ++s_skippedUntransformable;
           continue;
         }
         if (d.vertex_stride != kSupportedStride) {
@@ -214,10 +224,11 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                               uint32_t(key & 0xFFFFFFFF), count);
         REXLOG_INFO("RenderThread: frame #{} submitted {} draws, skipped {} "
                     "— skipped strides (cumulative) {} — host ticks with/without "
-                    "new draws {}/{} — skipped surfaces {}",
+                    "new draws {}/{} — skipped surfaces {} — skipped "
+                    "untransformable (cumulative) {}",
                     s_frame, submitted, skipped, hist.empty() ? "none" : hist,
                     s_ticksWithDraws, s_ticksEmpty,
-                    surf.empty() ? "none" : surf);
+                    surf.empty() ? "none" : surf, s_skippedUntransformable);
       }
       // BeginFrame and EndFrame own the whole frame: BeginFrame opens the
       // command list, transitions and clears the targets and then calls
