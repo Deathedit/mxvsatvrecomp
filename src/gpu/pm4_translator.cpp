@@ -1120,6 +1120,49 @@ void Pm4Translator::ProbeAluExecution(const DrawCall& dc,
   }
 }
 
+Pm4Translator::DrawClass Pm4Translator::ClassifyTransformedDraw(
+    const std::vector<uint8_t>& verts, uint32_t count, uint32_t stride) const {
+  if (count == 0 || stride < 12 || verts.size() < size_t(count) * stride)
+    return DrawClass::kPartial;  // nothing to judge; do not condemn it
+
+  float mvp[16];
+  BuildViewportMvp(mvp);
+
+  bool all_origin = true;
+  bool any_near = false;
+  for (uint32_t v = 0; v < count; ++v) {
+    float in[4] = {0, 0, 0, 1};
+    std::memcpy(in, verts.data() + size_t(v) * stride, 12);
+    if (std::fabs(in[0]) > 1e-6f || std::fabs(in[1]) > 1e-6f ||
+        std::fabs(in[2]) > 1e-6f) {
+      all_origin = false;
+    }
+    float o[4];
+    for (uint32_t r = 0; r < 4; ++r) {
+      o[r] = mvp[r * 4 + 0] * in[0] + mvp[r * 4 + 1] * in[1] +
+             mvp[r * 4 + 2] * in[2] + mvp[r * 4 + 3] * in[3];
+    }
+    // Deliberately generous — four times the frustum. The question is not "is
+    // this vertex visible" but "could this draw possibly be right", and a draw
+    // is only hopeless when every vertex is wildly out. A tight bound here
+    // would delete real geometry crossing the frustum edge and make the screen
+    // look cleaner while showing less, which is the failure mode that flatters
+    // itself.
+    if (std::isfinite(o[0]) && std::isfinite(o[1]) && std::isfinite(o[3]) &&
+        o[3] != 0.0f) {
+      const float lim = std::fabs(o[3]) * 4.0f;
+      if (std::fabs(o[0]) <= lim && std::fabs(o[1]) <= lim) any_near = true;
+    }
+    if (!all_origin && any_near) break;  // already kPartial, nothing left to learn
+  }
+
+  // Origin-collapsed is reported ahead of out-of-range because it is the more
+  // specific fact: the ALU writes xyz = 0 exactly when it exports w == 0, and w
+  // does not survive into the transcoded buffer to be tested directly.
+  if (all_origin) return DrawClass::kDegenerate;
+  return any_near ? DrawClass::kPartial : DrawClass::kOutOfRange;
+}
+
 void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
   static uint64_t s_done = 0, s_noShader = 0, s_noPos = 0, s_readFail = 0;
   static uint64_t s_passthrough = 0;
@@ -1130,6 +1173,11 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
   // whether the formats the guess got wrong are the ones the shader disagrees
   // about.
   static std::map<uint32_t, uint32_t> s_exportFormats;
+  // Draw classification, indexed by DrawClass: partial / degenerate / out of
+  // range. Kept beside the transcode counters so one log line says both what
+  // was produced and how much of it could not possibly draw.
+  static uint64_t s_class[3] = {}, s_classVerts[3] = {};
+  static std::map<uint32_t, uint32_t> s_classByFormat[3];
 
   // Leave the guest layout and the stride the caller already set alone. The
   // renderer's stride-28 gate then decides, exactly as before this existed.
@@ -1286,6 +1334,18 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
   // BuildViewportMvp is the transform the ALU output actually wants, and
   // letting it stand is the whole fix. The ALU path and the fetched-position
   // path now agree about what space they are in.
+  // How this draw's positions came out. Counted only — nothing is skipped yet,
+  // so the numbers describe current behaviour and a later run with the skip on
+  // can be compared against them rather than against run variance.
+  {
+    const DrawClass cls =
+        ClassifyTransformedDraw(dc.vertices, dc.vertex_count, kOutStride);
+    const int ci = int(cls);
+    ++s_class[ci];
+    s_classVerts[ci] += dc.vertex_count;
+    if (cls != DrawClass::kPartial) ++s_classByFormat[ci][pos->format];
+  }
+
   ++s_done;
   ++s_posFormatsUsed[pos->format];
   if (from_export) ++s_exportFormats[pos->format];
@@ -1302,6 +1362,20 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
                 s_done, s_passthrough, s_noShader, s_noPos, s_readFail,
                 s_fromExport, s_fromGuess, pf, ef.empty() ? "none " : ef,
                 uh.empty() ? "none " : uh);
+
+    std::string dgf, oof;
+    for (const auto& [f, n] : s_classByFormat[int(DrawClass::kDegenerate)])
+      dgf += fmt::format("{}:{} ", f, n);
+    for (const auto& [f, n] : s_classByFormat[int(DrawClass::kOutOfRange)])
+      oof += fmt::format("{}:{} ", f, n);
+    const uint64_t tot = s_class[0] + s_class[1] + s_class[2];
+    REXLOG_INFO("transcode class: partial {} ({} vtx) | degenerate {} ({} vtx) "
+                "by format {}| out-of-range {} ({} vtx) by format {}— "
+                "{:.1f}% of draws could not draw correctly",
+                s_class[0], s_classVerts[0], s_class[1], s_classVerts[1],
+                dgf.empty() ? "none " : dgf, s_class[2], s_classVerts[2],
+                oof.empty() ? "none " : oof,
+                tot ? 100.0 * double(s_class[1] + s_class[2]) / double(tot) : 0.0);
   }
 }
 

@@ -334,6 +334,21 @@ class Pm4Translator {
 
   // Logs SQ_VS_CONST / SQ_PS_CONST, on change only. Called per draw.
   void LogShaderConstBases() const;
+
+  // How a transcoded draw's positions came out, judged after the viewport
+  // transform the renderer will apply. A draw that is degenerate or entirely
+  // outside the clip volume cannot render correctly; submitting it anyway is
+  // what smears the frame white over the geometry that is right.
+  enum class DrawClass {
+    kPartial,      // at least one vertex lands. The normal case — never skip
+    kDegenerate,   // every vertex at the origin
+    kOutOfRange,   // nothing lands anywhere near the clip volume
+  };
+  // `verts` is the transcoded buffer: kOutStride bytes per vertex, position in
+  // the leading 12. Judged against BuildViewportMvp, the same transform
+  // FinalizeDraw will attach to the draw.
+  DrawClass ClassifyTransformedDraw(const std::vector<uint8_t>& verts,
+                                    uint32_t count, uint32_t stride) const;
   static constexpr uint32_t kRegVportZScale  = 0x2113;
   static constexpr uint32_t kRegVportZOffset = 0x2114;
   uint32_t m_ctxRegs[kCtxRegCount] = {};
