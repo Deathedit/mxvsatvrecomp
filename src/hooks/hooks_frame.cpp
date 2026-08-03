@@ -24,7 +24,17 @@
 #include "gpu/xenos_gpu_state.h"
 
 //=============================================================================
-// sub_82566B58 — VdSwap
+// sub_82566B58 — D3D9's swap, NOT VdSwap itself
+//
+// The kernel VdSwap is the import thunk at 0x82CE9F98 and is already named by
+// the recompiler as __imp__VdSwap. sub_82566B58 *calls* it: the call site
+// returns to 0x82566E1C, and the next function after 0x82566B58 is 0x825671E0,
+// so it is inside this body. D3D9 is statically linked into the XEX and nothing
+// but D3D9's present path calls VdSwap, which makes this a confirmed anchor
+// inside the D3D9 library block — see the D3D9 note in AGENTS.md.
+//
+// Hooking here is still right: it is the frame boundary with the ring buffer
+// state we need. Only the name was wrong.
 //=============================================================================
 
 namespace {

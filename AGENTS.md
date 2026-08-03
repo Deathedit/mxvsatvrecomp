@@ -1866,6 +1866,32 @@ Using this path would still mean identifying the entry points before any benefit
 arrives, and the 360 D3D API inlines much of its command-buffer writing into the
 caller, so a chunk of pipeline state would only ever exist as PM4 regardless.
 
+**Two corrections to what this file assumed, both found while checking the
+above.**
+
+**1. 281 imports are already named.** The recompiler resolved the whole import
+table; the names live in `generated/default/mx_recomp*.cpp` as `__imp__VdSwap`,
+`__imp__XamContentCreateEx` and so on — *not* in `mx_init.h`, which only carries
+`DECLARE_REX_FUNC(sub_XXXXXXXX)`, and not in `mx_config.toml`, whose
+`[functions]` section is `0xADDR = { size = N }` boundary hints with no names at
+all. All 20 `Vd*` entry points are there and are directly hookable by name. IDA
+is not needed for anything in the import table.
+
+**2. `sub_82566B58` is not `VdSwap` — it is the function that calls it.** The
+kernel `VdSwap` is the thunk at `0x82CE9F98` (the thunk table runs
+`0x82CE9ED8`–`0x82CEA168`, 0x10 bytes each). `sub_82566B58` contains
+`bl 0x82ce9f98` returning to `0x82566E1C`, and the next declared function after
+`0x82566B58` is `0x825671E0`, so that call is inside its body.
+
+Nothing but D3D9's present path calls `VdSwap`, and D3D9 is statically linked,
+so **`sub_82566B58` is D3D9's swap — the first confirmed D3D9 function, and by
+the contiguity argument an anchor into the D3D9 block around `0x8256xxxx`.** The
+functions it calls nearby (`sub_825598A0`, `sub_82559AE0`, `sub_82571780`) sit in
+the same range and are D3D9 candidates.
+
+Hooking there remains correct — it is the frame boundary with the ring state we
+need. Only the name was wrong, and it is corrected in `hooks_frame.cpp`.
+
 PM4 is the boundary that actually exists in this binary, and it is where Xenia
 works too. Keeping it.
 
