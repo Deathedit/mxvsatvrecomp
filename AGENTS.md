@@ -1970,6 +1970,91 @@ and looking there gives a false "plugin is not installed" reading.
 `assets/default.xex.probe.i64`; the original was left untouched and verified
 unchanged afterwards.
 
+### The colourless draws are not a depth pre-pass — and the output merger is entirely unmodeled (2026-08-03)
+
+Two facts, one of which is a refuted hypothesis and the other of which is a
+standing defect nothing in this file previously stated.
+
+#### The renderer has no output merger at all
+
+`CreateGamePipeline` (`d3d12_game.cpp:91-113`) sets a rasterizer state and a
+write mask and stops. `BlendEnable` is FALSE, `DepthStencilState` is zeroed, and
+D3D12 has no alpha test to leave off. Searching `src/gpu` for `blend`,
+`RB_COLOR_MASK`, `RB_COLORCONTROL`, `RB_MODECONTROL` returned **zero matches** —
+the translator had never read one of these registers.
+
+So **every guest draw is composited fully opaque, in draw order, writing all four
+channels.** That is not one missing feature, it is the whole back end of the
+guest pipeline, and it stayed invisible because it still produces plausible
+geometry. Record it here because it bounds what any future rendering round can
+expect to achieve without it.
+
+#### The hypothesis, and why it was worth testing
+
+A shader exporting only a position has no colour attribute, so the transcode
+writes `{1,1,1,1}` opaque white. A **depth pre-pass** is exactly that draw:
+position-only, covering the world, writing no colour on the guest. That reading
+explained the flat white, the large bounding boxes, and — uniquely — why
+`ClassifyTransformedDraw` insists these draws transform *fine*. It predicted
+`RB_COLOR_MASK == 0` for the colourless population.
+
+#### It is wrong
+
+Two runs, `NoteOutputMerger` sampling the first 7500 transcoded draws:
+
+```
+run 1   none      draws 801  mask 0xF:801            ALL-OFF 0  depth write 0  blend non-trivial 514
+        packed    draws  30  mask 0xF:30             ALL-OFF 0  depth write 0  blend non-trivial  30
+        fallback  draws 6669 mask 0x0:1180 0xF:5489  ALL-OFF 1180  depth write 4405  blend non-trivial 2
+
+run 2   none      draws 786  mask 0x0:6 0xF:780      ALL-OFF 6  depth write 0  blend non-trivial 506
+        packed    draws  19  mask 0xF:19             ALL-OFF 0  depth write 0  blend non-trivial  19
+        fallback  draws 6695 mask 0x0:1161 0xF:5534  ALL-OFF 1161  depth write 4293  blend non-trivial 3
+```
+
+**The colourless draws write all four colour channels** (100% and 99.2%), and
+**never write depth** (0 of 801, 0 of 786). A depth pre-pass writes depth and
+masks colour; these do the exact opposite of both. The hypothesis is dead, and
+the round stopped at its stated stop condition rather than hunting for another
+register that would fit.
+
+The register file is genuinely live, so this is a real negative and not a
+measurement artifact: `RB_COLOR_MASK` is written 20119 / 19443 times per run,
+`RB_DEPTHCONTROL` ~78000, `RB_MODECONTROL` ~40000.
+
+#### What the same table did turn up
+
+- **~64% of the colourless draws have a non-trivial blend equation** (514/801,
+  506/786) — i.e. the guest composites them and we overwrite instead. This is a
+  *different* mechanism reaching the same symptom, and it is now the strongest
+  remaining lead for the white frame.
+- **~17.5% of the fallback draws have `RB_COLOR_MASK == 0`** (1180/6669,
+  1161/6695): the guest writes no colour for them and we paint them anyway. A
+  real, actionable population — just not the predicted one.
+- **Alpha test is never enabled anywhere**, 0 across every row of both runs. That
+  rules it out of this problem entirely.
+- **`edram_mode` 5 and 6 occur** (mode 5 on ~4000 fallback draws) and the SDK's
+  `EdramMode` names only `kNoOperation = 0` and `kColorDepth = 4`. Left as raw
+  numbers rather than guessed at.
+- The population mix early in a run is nothing like the full-run totals — packed
+  is 19-30 draws here against 19546 across a whole run. Do not compare a 7500-draw
+  window against a full-run figure.
+
+#### Two instrument traps this round hit
+
+Both would have produced a confident wrong answer.
+
+1. **`Clear()` wipes the register shadow every frame** (`hooks_frame.cpp:212`)
+   and the packets are replayed. A register set once at init and never re-set
+   therefore reads zero in every frame we look at — and a colour mask of zero is
+   precisely the finding being hunted. `DrawCall::om_seen` records which
+   registers had actually been written this frame before the draw, so
+   "guest set it to zero" is distinguishable from "nobody wrote it". Any future
+   probe reading a context register needs the same guard.
+2. **A 20000-draw reporting modulus reports nothing.** A 150s run reaches
+   5000-10000 transcoded draws, so the first probe logged not one line and
+   looked like the code was never reached. `NoteOutputMerger` reports every 2500.
+
 ### Parser caveat
 
 `Pm4Parser` accepts any Type-3 with `body_word_count <= 0x4000`. A misparsed

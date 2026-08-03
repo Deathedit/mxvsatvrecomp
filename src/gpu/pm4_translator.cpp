@@ -173,8 +173,23 @@ bool ClipWriteInto(uint32_t* file, uint32_t file_base, uint32_t file_len,
 void Pm4Translator::ApplyType0Write(uint32_t reg_base,
                                     const std::vector<uint32_t>& body) {
   ClipWriteInto(m_fetchConsts, kFetchConstBase, kFetchConstCount, reg_base, body);
-  if (ClipWriteInto(m_ctxRegs, kCtxRegBase, kCtxRegCount, reg_base, body))
+  if (ClipWriteInto(m_ctxRegs, kCtxRegBase, kCtxRegCount, reg_base, body)) {
     m_ctxWritten = true;
+    // Which of the output-merger registers this write actually covered. Type0
+    // writes arrive in blocks — cnt=21 to 0x2100 covers RB_COLOR_MASK on its
+    // way to the viewport registers — so coverage has to be tested per register
+    // against the write's range, not inferred from reg_base.
+    static constexpr uint32_t kOmRegs[kOmRegCount] = {
+        kRegColorMask, kRegDepthControl, kRegBlendControl,
+        kRegColorControl, kRegModeControl};
+    const uint32_t write_end = reg_base + static_cast<uint32_t>(body.size());
+    for (int i = 0; i < kOmRegCount; ++i) {
+      if (kOmRegs[i] >= reg_base && kOmRegs[i] < write_end) {
+        ++m_omRegWrites[i];
+        m_omSeen |= 1u << i;
+      }
+    }
+  }
   // The ALU constant file, 0x4000..0x47FF. This used to be dropped on the
   // floor, and AGENTS.md's "the game never writes the ALU constant file" was
   // partly an artifact of that: the check behind it covered 0x4000..0x41FF —
@@ -1790,6 +1805,130 @@ void Pm4Translator::NoteDrawCoverage(const DrawCall& dc) const {
   }
 }
 
+// What output-merger state the guest set, per draw, split by colour source.
+//
+// The question. Five rounds have converged on one population: 12760 colourless
+// draws, ~16 vertices each, mean NDC box 0.5169, and hiding them takes the
+// frame from 74.42% white to 0.00% with the real scene underneath. The standing
+// explanation is a transform smearing small geometry across the screen. This
+// tests a different one.
+//
+// A draw whose shader exports only a position has no colour attribute, so
+// PickColorAttribute returns null and the transcode writes {1,1,1,1} opaque
+// white. A depth pre-pass is exactly that draw: position-only, covering the
+// visible world, and writing no colour at all on the guest because its colour
+// mask is zero. That reading explains the flat white, the large boxes, and why
+// ClassifyTransformedDraw insists these draws transform fine — and unlike the
+// smearing hypothesis it makes a prediction that can fail here:
+//
+//   THE COLOURLESS DRAWS SHOULD HAVE RB_COLOR_MASK == 0.
+//
+// If they do not, the hypothesis is wrong and this round stops. Do not go
+// looking for a different register that would also explain it.
+//
+// Registers and bit positions are the SDK's, not remembered: register indices
+// from rex/graphics/register_table.inc (RB_COLOR_MASK 0x2104 line 511;
+// RB_DEPTHCONTROL 0x2200, RB_BLENDCONTROL0 0x2201, RB_COLORCONTROL 0x2202 and
+// RB_MODECONTROL 0x2208 lines 542-548), bit layouts from the unions in
+// rex/graphics/registers.h. EdramMode (xenos.h:875) names only kNoOperation = 0
+// and kColorDepth = 4, so every other value is reported as a bare number rather
+// than guessed at.
+//
+// READ THE WRITE COUNTS FIRST. Clear() memsets the context shadow once per
+// frame and the packets are replayed, so a register the guest set at init and
+// never re-set reads zero in every frame — which would make every draw look
+// like a pre-pass and hand this round its conclusion for free. The `seen` column
+// is how many draws had the register actually written this frame beforehand; a
+// zero there voids the mask distribution beside it.
+void Pm4Translator::NoteOutputMerger(const DrawCall& dc) const {
+  // Same exclusion as NoteDrawCoverage: kNotTranscoded draws keep the guest
+  // stride, the renderer's stride-28 gate drops them, and they reach no pixels.
+  if (dc.color_source == DrawCall::ColorSource::kNotTranscoded) return;
+
+  struct Om {
+    uint64_t draws = 0;
+    uint64_t seen = 0;           // colour mask had been written this frame
+    uint64_t mask_zero = 0;      // ...and all four RT0 channels were off
+    uint64_t alpha_test = 0;
+    uint64_t depth_enable = 0, depth_write = 0;
+    uint64_t blend_nontrivial = 0;
+    std::map<uint32_t, uint64_t> masks;      // RB_COLOR_MASK low nibble
+    std::map<uint32_t, uint64_t> edram;      // RB_MODECONTROL bits 0-2
+    std::map<uint32_t, uint64_t> alpha_func; // RB_COLORCONTROL bits 0-2
+  };
+  static Om s_om[4];
+  auto& o = s_om[static_cast<size_t>(dc.color_source)];
+  ++o.draws;
+
+  const bool mask_seen = (dc.om_seen & (1u << 0)) != 0;
+  const uint32_t mask = dc.colour_mask & 0xF;  // RT0 only; RT1-3 are bits 4-15
+  if (mask_seen) {
+    ++o.seen;
+    ++o.masks[mask];
+    if (mask == 0) ++o.mask_zero;
+  }
+  if (dc.om_seen & (1u << 4)) ++o.edram[dc.mode_control & 0x7];
+  if (dc.om_seen & (1u << 3)) {
+    if (dc.colour_control & (1u << 3)) {  // alpha_test_enable
+      ++o.alpha_test;
+      ++o.alpha_func[dc.colour_control & 0x7];
+    }
+  }
+  if (dc.om_seen & (1u << 1)) {
+    // RB_DEPTHCONTROL bit 1 = z_enable, bit 2 = z_write_enable.
+    if (dc.depth_control & (1u << 1)) ++o.depth_enable;
+    if (dc.depth_control & (1u << 2)) ++o.depth_write;
+  }
+  if (dc.om_seen & (1u << 2)) {
+    // Trivial is src * ONE + dst * ZERO with an ADD combine — i.e. plain
+    // replace, which is what our opaque PSO already does. BlendFactor ONE is 1
+    // and ZERO is 0; BlendOp ADD is 0. Fields: colour src [4:0], comb [7:5],
+    // dst [12:8]; alpha src [20:16], comb [23:21], dst [28:24].
+    const uint32_t b = dc.blend_control;
+    const bool trivial = ((b >> 0) & 0x1F) == 1 && ((b >> 5) & 0x7) == 0 &&
+                         ((b >> 8) & 0x1F) == 0 && ((b >> 16) & 0x1F) == 1 &&
+                         ((b >> 21) & 0x7) == 0 && ((b >> 24) & 0x1F) == 0;
+    if (!trivial) ++o.blend_nontrivial;
+  }
+
+  // Every 2500 draws, not the 20000 NoteDrawCoverage uses. A 150s run reaches
+  // somewhere between 5000 and 10000 transcoded draws — the transcode-colour
+  // line, which reports every 5000, fires exactly once — so a 20000 modulus
+  // reports nothing at all and the round silently measures nothing. Rare enough
+  // that it is a handful of lines, frequent enough that the last one survives
+  // the log rotation.
+  static uint64_t s_n = 0;
+  if ((++s_n % 2500) != 0) return;
+
+  REXLOG_INFO("translator: output-merger writes seen this run — RB_COLOR_MASK "
+              "{} RB_DEPTHCONTROL {} RB_BLENDCONTROL0 {} RB_COLORCONTROL {} "
+              "RB_MODECONTROL {} (a zero here voids the column that reads it)",
+              m_omRegWrites[0], m_omRegWrites[1], m_omRegWrites[2],
+              m_omRegWrites[3], m_omRegWrites[4]);
+
+  static const char* const kName[4] = {"untranscoded", "none", "packed",
+                                       "fallback"};
+  for (size_t i = 1; i < 4; ++i) {
+    const auto& r = s_om[i];
+    if (!r.draws) continue;
+    std::string mk, ed, af;
+    for (const auto& [k, n] : r.masks) mk += fmt::format("0x{:X}:{} ", k, n);
+    for (const auto& [k, n] : r.edram) {
+      const char* nm = k == 0 ? "NoOperation" : (k == 4 ? "ColorDepth" : "?");
+      ed += fmt::format("{}({}):{} ", k, nm, n);
+    }
+    for (const auto& [k, n] : r.alpha_func) af += fmt::format("{}:{} ", k, n);
+    REXLOG_INFO("  {:<12} draws {} — colour mask written before {} of them, of "
+                "which ALL-CHANNELS-OFF {} — masks {}— edram_mode {}— alpha "
+                "test on {} funcs {}— depth enable {} write {} — non-trivial "
+                "blend {}",
+                kName[i], r.draws, r.seen, r.mask_zero,
+                mk.empty() ? "none " : mk, ed.empty() ? "none " : ed,
+                r.alpha_test, af.empty() ? "none " : af, r.depth_enable,
+                r.depth_write, r.blend_nontrivial);
+  }
+}
+
 void Pm4Translator::FinalizeDraw(DrawCall& dc) {
   BuildViewportMvp(dc.mvp);
   dc.topology = MapTopology(dc.prim_type);
@@ -1862,6 +2001,16 @@ void Pm4Translator::FinalizeDraw(DrawCall& dc) {
     }
   }
 
+  // The guest's output-merger state as of this draw. Captured here for the same
+  // reason LogSurface captures the surface here: these are context registers,
+  // and their value is whatever the command stream last set before this draw.
+  dc.colour_mask    = CtxDword(kRegColorMask);
+  dc.depth_control  = CtxDword(kRegDepthControl);
+  dc.blend_control  = CtxDword(kRegBlendControl);
+  dc.colour_control = CtxDword(kRegColorControl);
+  dc.mode_control   = CtxDword(kRegModeControl);
+  dc.om_seen = m_omSeen;
+
   LogShaderConstBases();
   LogSurface(dc);
   LogNdc(dc);
@@ -1869,6 +2018,7 @@ void Pm4Translator::FinalizeDraw(DrawCall& dc) {
   // the geometry that actually gets submitted rather than the pre-expansion
   // vertex list.
   NoteDrawCoverage(dc);
+  NoteOutputMerger(dc);
   ProbeAluMatrices(dc);
 }
 

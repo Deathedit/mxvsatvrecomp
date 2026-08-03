@@ -94,6 +94,41 @@ struct DrawCall {
     kFallback,      // first 4-component non-position attribute, i.e. a guess
   };
   ColorSource color_source = ColorSource::kNotTranscoded;
+
+  // The guest's output-merger state as of this draw, captured raw.
+  //
+  // Nothing in this renderer has ever read one of these. CreateGamePipeline
+  // sets a write mask and a rasterizer state and stops: BlendEnable is FALSE,
+  // DepthStencilState is zeroed, and D3D12 has no alpha test to leave off. So
+  // every guest draw is composited fully opaque, in draw order, writing all
+  // four channels — the entire back end of the guest pipeline is missing, and
+  // it has stayed invisible because it still produces plausible geometry.
+  //
+  // Captured rather than acted on. A draw whose shader exports only a position
+  // has no colour attribute, so the transcode writes {1,1,1,1} opaque white —
+  // and a depth pre-pass is exactly that draw, covering the world while writing
+  // no colour at all on the guest. If that is what the 12760 colourless draws
+  // are, colour_mask reads zero for them and NoteOutputMerger will say so.
+  //
+  // Raw dwords, not decoded fields: the decode belongs next to the counters
+  // that report it, and storing raw keeps a misread visible.
+  uint32_t colour_mask = 0;    // RB_COLOR_MASK    0x2104, bits 0-3 = RGBA of RT0
+  uint32_t depth_control = 0;  // RB_DEPTHCONTROL  0x2200
+  uint32_t blend_control = 0;  // RB_BLENDCONTROL0 0x2201
+  uint32_t colour_control = 0; // RB_COLORCONTROL  0x2202, bit 3 = alpha test
+  uint32_t mode_control = 0;   // RB_MODECONTROL   0x2208, bits 0-2 = edram_mode
+
+  // Which of the five above had actually been written this frame, at the time
+  // this draw was finalized. Bit i corresponds to register i in the order
+  // listed. WITHOUT THIS THE VALUES ABOVE ARE UNREADABLE.
+  //
+  // The translator is Clear()ed once per frame (hooks_frame.cpp:212) and the
+  // context shadow is memset to zero, then the frame's packets are replayed. A
+  // register the guest set once at init and never re-set therefore reads zero
+  // in every frame we ever look at — and a colour mask of zero is exactly the
+  // finding this round is hunting for. Reading it without knowing whether
+  // anyone wrote it would let the instrument manufacture its own conclusion.
+  uint32_t om_seen = 0;
 };
 
 class Pm4Translator {
@@ -109,6 +144,7 @@ class Pm4Translator {
     std::memset(m_fetchConsts, 0, sizeof(m_fetchConsts));
     std::memset(m_ctxRegs, 0, sizeof(m_ctxRegs));
     m_ctxWritten = false;
+    m_omSeen = 0;
     m_vtxBufAddr = 0;
     m_vtxStride = 0;
     m_indexType16 = true;
@@ -209,6 +245,10 @@ class Pm4Translator {
   // Read-only: how much of the viewport each draw's transformed bounding box
   // could cover, split by colour source. An UPPER BOUND — see the definition.
   void NoteDrawCoverage(const DrawCall& dc) const;
+  // Read-only: what output-merger state the guest set, cross-tabulated against
+  // colour source. Reports the per-register write counts first — see the
+  // definition for why a distribution without them means nothing.
+  void NoteOutputMerger(const DrawCall& dc) const;
 
   // ---- Shader microcode capture (read-only this round) --------------------
   //
@@ -362,6 +402,33 @@ class Pm4Translator {
   // non-zero every constant read in every shader is off by it.
   static constexpr uint32_t kRegVsConst = 0x2307;
   static constexpr uint32_t kRegPsConst = 0x2308;
+
+  // The output-merger block. Numbers taken from the SDK's own register table,
+  // rex/graphics/register_table.inc lines 511 and 542-548, not from memory; bit
+  // layouts are the unions in rex/graphics/registers.h (RB_COLOR_MASK:754,
+  // RB_BLENDCONTROL:779, RB_COLORCONTROL:681, RB_MODECONTROL:659).
+  static constexpr uint32_t kRegColorMask    = 0x2104;
+  static constexpr uint32_t kRegDepthControl = 0x2200;
+  static constexpr uint32_t kRegBlendControl = 0x2201;
+  static constexpr uint32_t kRegColorControl = 0x2202;
+  static constexpr uint32_t kRegModeControl  = 0x2208;
+
+  // How many Type0 writes have actually covered each of the five registers
+  // above, in the order listed.
+  //
+  // This is not decoration. CtxDword returns its fallback for a register the
+  // game never wrote, and a colour mask reading zero because nothing set it is
+  // indistinguishable from one deliberately set to zero — except that the first
+  // makes *every* draw look like a depth pre-pass, which is precisely the
+  // conclusion this round is trying to reach. So the counts get reported before
+  // the distributions, and a zero here voids the table below it.
+  static constexpr int kOmRegCount = 5;
+  uint64_t m_omRegWrites[kOmRegCount] = {};
+  // Bit i set once register i has been written in the current frame. Reset by
+  // Clear(), unlike m_omRegWrites which accumulates across the whole run —
+  // "has the guest ever set this" and "had it set it before this draw" are
+  // different questions and both need answering.
+  uint32_t m_omSeen = 0;
 
   // Raw shadowed context register. CtxFloat reinterprets as float, which is
   // right for the viewport but wrong for a bitfield like SQ_VS_CONST.
