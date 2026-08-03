@@ -904,6 +904,23 @@ void Pm4Translator::NoteAluExecution(const AluResult& r, uint32_t pos_format) {
   static uint64_t s_inRange = 0, s_outOfRange = 0, s_nonFinite = 0;
   static std::map<uint32_t, uint64_t> s_inByFormat, s_outByFormat;
 
+  // The same positions scored a second way. The transcode asserts the
+  // interpreter's answer is already clip space and hands the renderer identity;
+  // but every sampled export so far reads (640, 0, 1, w=1), (1280, 0, 0, w=1),
+  // (639.5, -0.5, 1, w=1) — 1280x720 window coordinates in the D3D9
+  // pixel-centre convention, not clip space. If that generalises, the right
+  // transform is the viewport inverse BuildViewportMvp already computes, and
+  // the ALU path is the only thing opting out of it.
+  //
+  // Four log lines are not a population, so this scores both interpretations
+  // over every execution rather than acting on the samples. Reuses CtxFloat and
+  // the same registers BuildViewportMvp reads, so the two cannot drift apart.
+  static uint64_t s_inRangeVp = 0, s_outOfRangeVp = 0;
+  static std::map<uint32_t, uint64_t> s_inByFormatVp;
+  // And what each position *looks* like, so the verdict is not just "one number
+  // is bigger than the other".
+  static uint64_t s_clipLike = 0, s_windowLike = 0, s_neither = 0;
+
   ++s_status[int(r.status)];
   if (r.status != AluStatus::kOk) {
     ++s_blocking[r.blocking_opcode];
@@ -921,6 +938,38 @@ void Pm4Translator::NoteAluExecution(const AluResult& r, uint32_t pos_format) {
       ++s_outOfRange;
       ++s_outByFormat[pos_format];
     }
+
+    const float xs = CtxFloat(kRegVportXScale, 0.0f);
+    const float xo = CtxFloat(kRegVportXOffset, 0.0f);
+    const float ys = CtxFloat(kRegVportYScale, 0.0f);
+    const float yo = CtxFloat(kRegVportYOffset, 0.0f);
+    if (std::isfinite(x) && std::isfinite(y) && xs != 0.0f && ys != 0.0f) {
+      const float vx = (x - xo) / xs;
+      const float vy = (y - yo) / ys;
+      if (std::isfinite(vx) && std::isfinite(vy) && vx >= -1.05f &&
+          vx <= 1.05f && vy >= -1.05f && vy <= 1.05f) {
+        ++s_inRangeVp;
+        ++s_inByFormatVp[pos_format];
+      } else {
+        ++s_outOfRangeVp;
+      }
+
+      // Window-like is judged against the viewport's own extent rather than a
+      // hardcoded 1280x720: xs is half the width and ys half the height (ys is
+      // negative, y growing downward). A half-pixel margin covers the D3D9
+      // pixel-centre offsets seen in the samples.
+      const float wpx = std::fabs(xs) * 2.0f, wpy = std::fabs(ys) * 2.0f;
+      const bool clip_like = x >= -1.05f && x <= 1.05f && y >= -1.05f && y <= 1.05f;
+      const bool win_like = x >= -1.0f && x <= wpx + 1.0f &&
+                            y >= -1.0f && y <= wpy + 1.0f;
+      // Checked in this order because the two overlap near the origin — a point
+      // inside the unit cube is also inside the viewport rectangle. Clip wins
+      // the tie, which biases against the hypothesis being tested here rather
+      // than for it.
+      if (clip_like) ++s_clipLike;
+      else if (win_like) ++s_windowLike;
+      else ++s_neither;
+    }
   }
 
   static uint64_t s_n = 0;
@@ -932,18 +981,25 @@ void Pm4Translator::NoteAluExecution(const AluResult& r, uint32_t pos_format) {
                   r.position[2], r.position[3], pos_format);
       return;
     }
-    std::string st, bl, inf, outf;
+    std::string st, bl, inf, outf, infvp;
     for (const auto& [k, n] : s_status)
       st += fmt::format("{}:{} ", AluStatusName(AluStatus(k)), n);
     for (const auto& [k, n] : s_blocking) bl += fmt::format("{}:{} ", k, n);
     for (const auto& [k, n] : s_inByFormat) inf += fmt::format("{}:{} ", k, n);
     for (const auto& [k, n] : s_outByFormat) outf += fmt::format("{}:{} ", k, n);
+    for (const auto& [k, n] : s_inByFormatVp) infvp += fmt::format("{}:{} ", k, n);
     REXLOG_INFO("alu: exec {} — status {}— blocking opcodes {}— clip in-range "
                 "{} out-of-range {} non-finite {} — in-range by pos format {}— "
                 "out-of-range by pos format {}",
                 s_n, st, bl.empty() ? "none " : bl, s_inRange, s_outOfRange,
                 s_nonFinite, inf.empty() ? "none " : inf,
                 outf.empty() ? "none " : outf);
+    REXLOG_INFO("alu space: as-clip in {} out {} | after viewport inverse in {} "
+                "out {} — looks like clip {} window {} neither {} — "
+                "viewport-inverse in-range by pos format {}",
+                s_inRange, s_outOfRange, s_inRangeVp, s_outOfRangeVp,
+                s_clipLike, s_windowLike, s_neither,
+                infvp.empty() ? "none " : infvp);
   }
 }
 
