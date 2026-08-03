@@ -1171,6 +1171,142 @@ family. Both were left out deliberately — the `sc` operand encoding is a
 special case, and guessing at it produces exactly the confidently-wrong
 positions this whole line of work keeps running into.
 
+> **Both gaps were closed in `28228fa`, and only one of them was real.** See the
+> next section. `a0` converted zero failures: every relative refusal in this game
+> is `aL`-relative, not `a0`-relative.
+
+#### The black screen is the guest's own clear, drawn correctly (2026-08-03)
+
+Not a bug in the present path. Established by running with
+`--clear_magenta=true` and sampling the window's pixels at intervals:
+
+| t | game window |
+|---|---|
+| 6, 10, 14s | **magenta** — our clear reaches the screen |
+| 20s | magenta gone, black |
+| 30s | entirely black |
+
+So the clear works and the copy to the backbuffer works. Between 14s and 20s the
+guest starts submitting real frames, and one of them paints the whole target
+black *on top of* the magenta. That draw is visible in the log: `prim=8`
+(RectangleList), stride 28, expanded to a full-screen quad spanning clip
+`(-1.0008, 1.0014)`. It is the guest's own clear, and we replay it faithfully —
+`d3d12_device.cpp` says as much in the comment above `ClearRenderTargetView`.
+
+**The screen is black because the guest's clear lands and nothing lands on top of
+it.** The content is in the ~217 draws skipped per frame for stride and the
+~15,000 skipped per run for topology. Any future "the screen is black" theory
+has to beat this one first. Note also that a black screen is *not* the clear
+colour (`0.05/0.08/0.18` = `(13,20,46)`) — sampling the actual pixel values, not
+eyeballing a screenshot, is what separated the two.
+
+#### Every frame used to render and present twice (2026-08-03)
+
+Fixed in `10e71c8`. `BeginFrame` calls `RenderGameFrame` internally and
+`EndFrame` calls `PresentGameFrame` internally; the render thread called both
+again in between. Per tick the GPU actually saw:
+
+```
+BeginFrame   backbuf PRESENT->RT, gameRT PSR->RT, clear, RenderGameFrame  (draws)
+             RenderGameFrame                                              (draws again)
+Present #1   gameRT RT->COPY_SOURCE, copy, gameRT COPY_SOURCE->PSR
+EndFrame ->  Present #2   gameRT RT->COPY_SOURCE   <-- gameRT is in PSR. Invalid.
+```
+
+`PresentGameFrame`'s barriers are directional, so the second call declared a
+`StateBefore` the first had already moved away from. No `DeviceRemoved` ever
+appeared in a log — the runtime tolerated it silently, which is why it survived
+so long. The intro-video loop had the same shape with `RenderVideoFrame`. The
+three frame internals are now **private** so it cannot recur.
+
+#### D3D12 command lists do not keep your resources alive (2026-08-03)
+
+A comment in `d3d12_game.cpp` claimed "D3D12's internal command-list tracking
+keeps the underlying memory alive until the GPU finishes the last command using
+it". **That is false, and it was load-bearing.** It is a D3D11 guarantee;
+D3D12 command lists do not reference-count the resources they reference, and
+lifetime is entirely the application's job.
+
+On that assumption `ClearGameDraws` released every draw's vertex, index and
+constant buffer outright, once per frame, from the render thread *before*
+`BeginFrame` — while the previous frame's command list was still in flight. Up
+to 256 draws × 3 UPLOAD-heap resources per frame, freed under the GPU.
+
+Buffers now move to a fenced retirement deque (`RetiredFrame` in
+`d3d12_renderer.h`) and are released in `MoveToNextFrame` once `m_fence` has
+passed the value signalled for the submission that last used them.
+
+**Do not read this as "the intermittent AV is fixed."** The rate is ~1 run in 8
+and this session saw 1 in 8 (`mx_116`), with the same recorded signature — read
+at `0xFFFFFFFFFFFFFFFF` on a non-translator thread, a host-side pointer. n=8
+cannot separate 1-in-8 from 0. The lifetime fix is correct on the code reading;
+it is not verified by the run count.
+
+#### Closing the ALU gaps: the scalar family was real, `a0` was not (2026-08-03)
+
+**`mulsc`/`addsc`/`subsc` (opcodes 42..47) are implemented, and that closed the
+whole unsupported-opcode population — 536 to 0.** Their operand encoding is the
+special case the earlier note warned about, and it is worth writing down because
+nothing about it is guessable:
+
+- `src3_reg` names a **constant register** directly, 8 bits, not a Src()-shaped
+  operand. Do not route these through the normal source path — its swizzle and
+  negate handling assumes the other encoding and silently yields wrong operands.
+- The **temp** register it combines with is scattered. One bit of its index lives
+  in the opcode field itself, which is the entire reason each operation has a
+  `_0` and a `_1` form. The SDK reassembles it:
+  `scalar_const_reg_op_src_temp_reg() = (scalar_opc & 1) | (src3_sel << 1) | (src3_swiz & 0x3C)`.
+- Both operands are scalars, component-selected by `src3_swiz & 3`.
+
+Get that temp index backwards and the interpreter reads register `n^1` — another
+live value, so the result is plausible and wrong. `tools/ucode_test.cpp` guards
+it by asserting `mulsc0` reads r0 and `mulsc1` reads r1 with different seeds.
+
+**`a0` is modelled but bought nothing here.** Written by `maxa` (from `src0.w`),
+`maxas` (from `src0.x`, round-to-nearest) and `maxasf` (floor), clamped to
+`[-256, 255]` — it is a signed 9-bit register. Consumed by `c[a0+n]` reads.
+
+The trap, and the SDK states it outright at `ucode.h:2045`: *"Temporary registers
+can have only absolute and aL-relative indices, not a0-relative."* So a relative
+**temp source** and a relative **destination** are `aL`, never `a0`. An
+implementation that offsets those by `a0` compiles, passes casual inspection, and
+reads the wrong register. `AluStatus::kRelativeAddressing` was split into
+`kLoopRelative` specifically so the measurement could tell the two apart —
+without the split the result below would have read as "25% became 28%, the fix
+did nothing" with no way to see why.
+
+`aL` is the **loop** counter, and the interpreter deliberately walks every exec
+block once rather than unrolling, so there is no honest value to give it. It
+stays refused. Reaching those shaders means implementing `kLoopStart`/`kLoopEnd`
+for real — a larger piece of work than either item here, and now the single
+biggest remaining gap.
+
+Measured, 4000 sampled executions, three runs plus a default control:
+
+| | before (`53c44dd`) | after (`28228fa`) |
+|---|---|---|
+| ok | 2452 (61%) | 2882–2888 (**72%**) |
+| relative addressing | 1012 (25%) | *split* |
+| `aL`-relative (loop) | — | 1112–1118 (28%) |
+| unsupported scalar op | 536 (13%) | **0** |
+| unsupported vector op | 0 | 0 |
+
+Clip range: 1135/1315 in/out became 1337–1427 / 1456–1521. By position format,
+in/out, from the default-config run: `31:18/8  32:313/660  37:776/342
+38:184/142  57:136/304`. For `k_16_16_16_16_FLOAT` (format 32) — the 35,655-draw
+majority and the whole reason the interpreter exists — in-range went from 25% to
+about 30%. Better, and still not the answer.
+
+**What that points at.** 28% of shaders index constants by a loop counter. That
+is the shape of skinning or instanced per-object transforms, which is exactly the
+missing per-object space the export-62 work identified. The remaining
+out-of-range positions and the loop-relative refusals are plausibly the same
+finding seen twice.
+
+Defaults are unchanged and deliberately so: `alu_execute=false`,
+`transcode_confirmed_formats_only=true`, 108 submitted / 218 skipped per frame.
+With the gate off it is 268/47.
+
 ### Parser caveat
 
 `Pm4Parser` accepts any Type-3 with `body_word_count <= 0x4000`. A misparsed
