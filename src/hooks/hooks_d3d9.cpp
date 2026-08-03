@@ -462,6 +462,77 @@ uint32_t FetchFileDword1Offset(uint32_t stream) {
 }
 
 //---------------------------------------------------------------------------
+// Stage 3 — the vertex shader float constant file.
+//
+// Read out of D3DDevice_SetVertexShaderConstantFN's own arithmetic
+// (shader.obj, and 0x82550320 in the XEX), which is four instructions long
+// before it starts storing:
+//
+//     addi   r10, r4, 0x78          ; StartRegister + 0x78
+//     rlwinm r10, r10, 4, 0, 27     ; * 16 — one vec4 per register
+//     add    r10, r10, r3           ; + the device
+//
+// so register N lives at `device + 0x780 + N * 16`. The pixel-shader twin at
+// 0x825503F8 is the same function with 0x178 in place of 0x78, giving 0x1780 —
+// two 256-register files, 0x1000 bytes each, and they land exactly between the
+// vertex fetch constants (which end at 0x780) and the declaration at 0x2ED8.
+// Three independently-derived offsets tiling the struct with no overlap is what
+// makes this a layout rather than three lucky guesses.
+//
+// **Not hooked, deliberately.** The device holds the live value whichever path
+// wrote it — including the state-block path in blocks.obj that bypasses every
+// hook in this file. That is the third time reading the field has beaten
+// hooking the setter, after the declaration and the fetch constants.
+//---------------------------------------------------------------------------
+constexpr uint32_t kDeviceVsConstFile = 0x780;
+
+// Reads kHleProbeRegs vec4s into host order. Bounded by the same page guard the
+// device scan uses, and entirely inside a struct D3D9 is using on both sides of
+// this hook.
+bool ReadVsConstants(uint32_t device, uint8_t* base,
+                     float out[mx::pm4::kHleProbeRegs * 4]) {
+  (void)base;
+  if (!device) return false;
+  const uint32_t bytes = mx::pm4::kHleProbeRegs * 16;
+  if (!HostPageReadable(REX_RAW_ADDR(device + kDeviceVsConstFile)) ||
+      !HostPageReadable(REX_RAW_ADDR(device + kDeviceVsConstFile + bytes - 4)))
+    return false;
+  for (uint32_t i = 0; i < mx::pm4::kHleProbeRegs * 4; ++i) {
+    const uint32_t bits =
+        REX_LOAD_U32(device + kDeviceVsConstFile + i * 4);
+    std::memcpy(&out[i], &bits, 4);
+  }
+  return true;
+}
+
+// The control: the same transform the PM4 path applies today, built from the
+// D3D9 viewport instead of from the Xenos context registers. It maps window
+// coordinates to clip space, which is what BuildViewportMvp does — so if this
+// scores well, the guest's vertex positions really are pre-transformed and the
+// constant file is not where the geometry's transform lives.
+//
+// D3D9's own scale/offset: xs = width/2, xo = x + width/2, and y is flipped.
+bool BuildViewportMvp(float out[16]) {
+  const auto& v = DeviceState().viewport;
+  if (!v.seen || v.width == 0 || v.height == 0) return false;
+  const float xs = float(v.width) * 0.5f;
+  const float xo = float(v.x) + xs;
+  const float ys = -float(v.height) * 0.5f;
+  const float yo = float(v.y) + float(v.height) * 0.5f;
+  float zs = v.max_z - v.min_z;
+  const float zo = v.min_z;
+  if (zs == 0.0f) zs = 1.0f;
+
+  static const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0,
+                                      0, 0, 1, 0, 0, 0, 0, 1};
+  std::memcpy(out, kIdentity, sizeof(kIdentity));
+  out[0]  = 1.0f / xs;  out[3]  = -xo / xs;
+  out[5]  = 1.0f / ys;  out[7]  = -yo / ys;
+  out[10] = 1.0f / zs;  out[11] = -zo / zs;
+  return true;
+}
+
+//---------------------------------------------------------------------------
 // Stage 2 — build a renderable draw from the description.
 //
 // The hook owns guest access, so it resolves each buffer to a host pointer and
@@ -472,7 +543,8 @@ uint32_t FetchFileDword1Offset(uint32_t stream) {
 uint64_t g_badPrimType[64] = {};
 
 void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
-                       uint32_t count, int32_t base_vertex, uint8_t* base) {
+                       uint32_t count, int32_t base_vertex, uint32_t device,
+                       uint8_t* base) {
   using namespace mx::pm4;
   const auto& st = DeviceState();
 
@@ -507,6 +579,15 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     in.index.bound = true;
   }
 
+  // The transform the draw is *rendered* with, this stage, is the viewport
+  // inverse — the same one the PM4 path uses. That is not a claim that it is
+  // right; it is the only transform with evidence behind it today, and it makes
+  // the HLE picture directly comparable to the PM4 one on screen. What the
+  // constant file says is measured beside it, below, and acted on afterwards.
+  float vp[16];
+  const bool have_vp = BuildViewportMvp(vp);
+  if (have_vp) in.mvp = vp;
+
   DrawCall dc;
   HleSkip skip = HleSkip::kNone;
   if (!BuildHleDraw(in, dc, skip)) {
@@ -520,6 +601,36 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     return;
   }
   ++HleBuiltCount();
+
+  // Stage 3's measurement, on the built positions rather than on raw bytes: the
+  // vertices are already decoded and in host order here, so the probe scores the
+  // same numbers the renderer would receive.
+  {
+    static float consts[kHleProbeRegs * 4];
+    if (ReadVsConstants(device, base, consts)) {
+      ScoreHleTransform(dc, consts, have_vp ? vp : nullptr,
+                        st.vs_seen ? st.vertex_shader : 0);
+      // The first few register files in full. A ranking with no numbers behind
+      // it cannot be checked by eye, and "c3 col-major, 94%" is worth much less
+      // than seeing that c3..c6 look like a projection matrix.
+      static uint32_t s_dumped = 0;
+      if (s_dumped < 4) {
+        ++s_dumped;
+        auto& f = DeclFile();
+        f << "VS CONSTANTS (draw " << g_draws << ", device+0x780):\n";
+        for (uint32_t r = 0; r < 12; ++r) {
+          f << "    c" << r << " = " << consts[r * 4 + 0] << " "
+            << consts[r * 4 + 1] << " " << consts[r * 4 + 2] << " "
+            << consts[r * 4 + 3] << "\n";
+        }
+        f << "    first host position = " << *(const float*)dc.vertices.data()
+          << " " << *((const float*)dc.vertices.data() + 1) << " "
+          << *((const float*)dc.vertices.data() + 2) << "\n";
+        f.flush();
+      }
+    }
+  }
+
   HleFrameDraws().push_back(std::move(dc));
 }
 
@@ -732,6 +843,7 @@ void ReportCoverage() {
         REXLOG_INFO("d3d9: hle-render   refused prim types (type:count) {}",
                     prims);
     }
+    mx::pm4::ReportHleTransform();
   }
 
   //-------------------------------------------------------------------------
@@ -1124,7 +1236,7 @@ extern "C" REX_FUNC(sub_825565C8) {
   if (REXCVAR_GET(hle_render)) {
     // r4 PrimitiveType, r5 BaseVertexIndex, r6 StartIndex, r7 IndexCount.
     BuildAndQueueDraw(/*indexed=*/true, ctx.r4.u32, ctx.r6.u32, ctx.r7.u32,
-                      ctx.r5.s32, base);
+                      ctx.r5.s32, ctx.r3.u32, base);
   }
   if (REXCVAR_GET(hle_capture)) {
     DeviceState().NoteDevice(ctx.r3.u32, mx::pm4::kEpDraw);
@@ -1159,7 +1271,7 @@ extern "C" REX_FUNC(sub_825561B0) {
   if (REXCVAR_GET(hle_render)) {
     // r4 PrimitiveType, r5 StartVertex, r6 VertexCount.
     BuildAndQueueDraw(/*indexed=*/false, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, 0,
-                      base);
+                      ctx.r3.u32, base);
   }
   if (REXCVAR_GET(hle_capture)) {
     DeviceState().NoteDevice(ctx.r3.u32, mx::pm4::kEpDraw);

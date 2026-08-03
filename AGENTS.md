@@ -3180,3 +3180,89 @@ operational.
 | `docs/asset_format.md` | BXML format + reconstruction status, .xenon.package layout, per-asset-type heap headers, AssetDB_LoadStateMachine 12-case state machine, asset loader infrastructure, package encryption findings, shader microcode load path, asset catalog (23,183 assets), decoder tools |
 | `docs/pm4_pipeline.md` | PM4 parser (bit fields per Xenia, opcode table), Xenos GPU state shadow, plugin-mode data capture, gameplay PM4 frame structure, plugin cvar list, native backend strategy, PM4 translator status (auto + indexed draws, IB extraction blocker), ReXGlue SDK + Xenia reference files |
 | `docs/ida_notes.md` | Consolidated IDA bookmark table (slots 0-28) by theme: LoadStateMachine states, asset loader, shader microcode, OpenSSL AES, eng+8 writer |
+
+### The device struct's constant files, and why Stage 4 is blocked (2026-08-04)
+
+#### The vertex shader constant file is at `device + 0x780`
+
+Read off `D3DDevice_SetVertexShaderConstantFN`'s own arithmetic (`shader.obj`,
+`0x82550320`), which is three instructions before it starts storing:
+
+```asm
+addi   r10, r4, 0x78          ; StartRegister + 0x78
+rlwinm r10, r10, 4, 0, 27     ; * 16 — one vec4 per register
+add    r10, r10, r3           ; + the device
+```
+
+**Register N is at `device + 0x780 + N * 16`.** `SetPixelShaderConstantFN`
+(`0x825503F8`) is byte-for-byte the same function with `0x178` in place of
+`0x78`, giving `0x1780`.
+
+That makes three independently-derived offsets that tile the struct without
+overlapping: the vertex fetch constants end at `0x780`, the two 256-register
+constant files occupy `0x780..0x1780` and `0x1780..0x2780`, and the vertex
+declaration sits at `0x2ED8`. Three separate readings agreeing on a layout is
+what makes this a struct map rather than three lucky offsets.
+
+**Not hooked, deliberately** — the fourth time reading the field has beaten
+hooking the setter. The device holds the live value whichever path wrote it,
+including the state-block path in `blocks.obj` that bypasses every hook we have.
+
+The first draw's file, dumped verbatim:
+
+```
+c0..c3 = identity
+c4 = 1.35799 0       0        0
+c5 = 0       2.41421 0        0
+c6 = 0       0       1.00013 -2.00027
+c7 = 0       0       1        0
+```
+
+`2.41421` is `cot(22.5°)`, `1.35799` is that over 16:9, and row 3 being
+`(0,0,1,0)` makes `w = z`. That is `D3DXMatrixPerspectiveFovLH` for a 45°
+vertical FOV at `zn = 2`, stored transposed — exactly what `mul(mvp, float4(pos,
+1))` wants. Later draws carry full view-projection matrices at `c12..c15`, whose
+w-row `(0, -0.5823, 0.8130, 12.3056)` has a unit direction vector in it.
+
+#### There is no single MVP register, and the viewport inverse explains nothing
+
+Over 10,316 built draws, each scored against all 62 four-register windows in
+`c0..c63`, both layouts, plus two controls:
+
+| candidate | won | explains |
+|---|---|---|
+| identity (control) | 0 | **0** |
+| viewport inverse (control, what PM4 renders with today) | 0 | **0** |
+| `c1` row-major | 2,080 | 2,080 |
+| `c15` row-major | 842 | 2,762 |
+| `c3` col-major | 560 | 1,120 |
+
+**Only 55% of draws are explained by any candidate at all.** But cut by bound
+vertex shader, the winner is usually unique and total — `vs 0x2146FAA0`: 600/600
+on `c15` row-major, one distinct winner; `0x22D3E460`: 400/400 on `c1`; and so
+on for most handles. **The register is a property of the shader**, which is why
+no run-wide register can win and why a scored answer would be fitting rather
+than reading.
+
+So Stage 4 does not land. Selecting a matrix by score is exactly the
+"plausible-looking wrong geometry" failure this effort keeps avoiding; the
+transform has to be read out of the bound shader's microcode, the way the
+declaration and the fetch constants were. What *is* settled is that PM4's
+premise — positions already in window coordinates, corrected by the viewport
+inverse — holds for **zero** of the HLE-decoded draws.
+
+#### Two ways the probe lied before it told the truth
+
+Worth keeping, because both look like data and are not:
+
+1. **The report mutated its own counters.** It zeroed each winner as it printed,
+   assuming it ran once; it runs every 2,500 draws, so each report ate the
+   previous one's leaders and the top candidate appeared to change every few
+   seconds. The instability was the instrument.
+2. **A matrix that collapses everything to a point is inside the clip volume
+   under any input.** The first per-draw run had one candidate explaining all
+   10,266 draws while both controls explained none — a rank-1 matrix, obvious in
+   its numbers and invisible in its score. This is the `(0,0,0)` degenerate-input
+   trap moved from the input to the transform. Fixed by requiring that distinct
+   inputs stay distinct after projection; the explained rate fell 99% → 55%,
+   which is the honest number.

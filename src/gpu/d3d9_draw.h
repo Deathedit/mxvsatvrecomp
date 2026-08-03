@@ -51,6 +51,11 @@ struct HleDrawInputs {
   uint32_t first       = 0;   // StartVertex, or StartIndex when indexed
   uint32_t count       = 0;   // VertexCount, or IndexCount when indexed
   int32_t  base_vertex = 0;   // DrawIndexedVertices' BaseVertexIndex
+
+  // 16 row-major floats, or null for identity. Stage 3: the caller decides the
+  // transform, this file only applies it — so changing where the matrix comes
+  // from never means touching the vertex path.
+  const float* mvp = nullptr;
 };
 
 // Why a draw produced nothing. Every one is counted and named — a bare
@@ -96,5 +101,59 @@ std::vector<DrawCall>& HleFrameDraws();
 // Why draws did not build, by reason. Indexed by HleSkip.
 uint64_t* HleSkipCounts();
 uint64_t& HleBuiltCount();
+
+//===========================================================================
+// Stage 3 — where the transform comes from.
+//
+// The plan said to cross-check the HLE matrix against "the PM4 constant
+// shadow". **There is no such shadow.** `Pm4Translator::m_mvp` is dead: this
+// title emits neither SET_CONSTANT nor SET_SHADER_CONSTANTS, so
+// `DrawCall::mvp` is `BuildViewportMvp` — the viewport *inverse*, which treats
+// the guest's vertex positions as already being in window coordinates. That is
+// a claim about the geometry, not a matrix to compare against, and it is the
+// thing this stage has to test.
+//
+// So the cross-check is the instrument that settled the viewport question
+// before: transform real positions by each candidate and count how many land
+// inside the clip volume. A matrix that is the right one puts nearly all of
+// them there; a wrong one does not. Both readings are scored over the same
+// vertices in the same pass, so neither can be favoured by sampling.
+//
+// The constants are not hooked. `D3DDevice_SetVertexShaderConstantFN`
+// (0x82550320) writes them to `device + (StartRegister + 0x78) * 16` — read
+// straight off its own arithmetic — so, like the declaration at 0x2ED8 and the
+// fetch constants at 0x6F4, the device holds the live value whichever path
+// wrote it. Reading beats hooking here for the same reason it did twice
+// before: a state block would bypass the hook and not the field.
+//===========================================================================
+
+// Vec4 registers sampled from the constant file per draw. A 4x4 matrix can
+// start at any of these, and which one it is is exactly the open question.
+constexpr uint32_t kHleProbeRegs = 64;
+
+// Layouts a candidate can be read in. A D3D-era compiler packs a matrix into
+// four constants either way round, and picking wrong transposes the transform —
+// which looks like plausible geometry in the wrong place, not like a failure.
+enum class HleMatrixLayout : uint8_t { kRowMajor = 0, kColMajor };
+
+// Score one built draw's positions against every candidate. `consts` is
+// kHleProbeRegs*4 floats already in host order; `viewport_mvp` is the control,
+// the same transform the PM4 path uses today (may be null if no viewport).
+//
+// **Measurement only.** Nothing here selects a matrix — the draw is rendered
+// with whatever HleDrawInputs::mvp carried, which this stage sets to the
+// viewport inverse so the HLE picture is comparable to the PM4 one on screen.
+// Wiring a constant-file matrix in is a separate edit, made after reading the
+// verdict, not an adaptive choice made mid-run.
+// `vertex_shader` is the bound shader handle, cross-tabbed against the winner:
+// if the winning register is a property of the shader rather than of the run,
+// that is what says so, and a spread of winners across many registers means the
+// opposite. Pass 0 when unknown.
+void ScoreHleTransform(const DrawCall& dc, const float* consts,
+                       const float* viewport_mvp, uint32_t vertex_shader);
+
+// The verdict, written to the log. Reports the controls first so a candidate
+// that merely beats nothing is visible as such.
+void ReportHleTransform();
 
 }  // namespace mx::pm4

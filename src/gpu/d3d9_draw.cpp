@@ -1,7 +1,13 @@
 #include "gpu/d3d9_draw.h"
 
+#include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <map>
+#include <string>
 #include <vector>
+
+#include <rex/logging.h>
 
 #include "gpu/shader_ucode.h"   // ApplyFetchEndian
 
@@ -223,6 +229,14 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
     std::memcpy(dst + 12, c, 16);      // float4 COLOR
   }
 
+  if (in.mvp) {
+    std::memcpy(out.mvp, in.mvp, sizeof(out.mvp));
+  } else {
+    static const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0,
+                                        0, 0, 1, 0, 0, 0, 0, 1};
+    std::memcpy(out.mvp, kIdentity, sizeof(out.mvp));
+  }
+
   out.vertex_count = nverts;
   out.vertex_stride = kHostVertexStride;
   out.indices = std::move(indices);
@@ -262,6 +276,283 @@ uint64_t* HleSkipCounts() {
 uint64_t& HleBuiltCount() {
   static uint64_t n = 0;
   return n;
+}
+
+//===========================================================================
+// Stage 3 — scoring the candidate transforms.
+//
+// One candidate per (base register, layout), plus two controls: identity, and
+// the viewport inverse the PM4 path uses today. A vertex counts as in-clip when
+// |x| <= w, |y| <= w, 0 <= z <= w with w > 0 and everything finite.
+//
+// **Scored per draw, not per run.** The first version pooled every position in
+// the run and ranked candidates over the total, which asks "which single matrix
+// transforms this game" — and the constant dump says that question has no
+// answer. Draw 1 already carries positions at (-1, 1, 0) with c0..c3 identity,
+// while c4..c7 hold a perspective projection: the population is a mix of
+// pre-transformed 2D geometry and 3D geometry, and no one register can win over
+// both. Pooling produced a top candidate at 45% that changed between reports,
+// which is what "no single answer" looks like when you insist on one.
+//
+// So each draw votes for its own best candidate, and the report is a histogram
+// of winners plus how many draws any candidate could explain at all. That
+// distinguishes "the matrix is somewhere we are not looking" from "there are
+// several matrices" — the pooled version could not.
+//
+// The trap this is built around, learned the last time positions were scored
+// this way: **(0,0,0) passes every candidate**. A degenerate position sits
+// inside the clip volume under any matrix whatsoever, so a draw full of them
+// would score 100% for all 128 candidates and mean nothing. Degenerate inputs
+// are excluded from the denominator and counted separately, so a run whose
+// positions are mostly zero says so instead of producing a confident ranking.
+//===========================================================================
+namespace {
+
+constexpr uint32_t kCandidateBases = kHleProbeRegs - 3;   // need 4 registers
+constexpr uint32_t kCandidates = kCandidateBases * 2 + 2; // + identity, viewport
+constexpr uint32_t kIdentityCandidate = kCandidates - 2;
+constexpr uint32_t kViewportCandidate = kCandidates - 1;
+
+// Vertices sampled per draw. Enough to be a population per draw without making
+// the probe the most expensive thing in the frame.
+constexpr uint32_t kProbeVertsPerDraw = 16;
+
+// Draws each candidate won outright, and draws it would have explained on its
+// own. "Wins" and "explains" differ: several candidates can explain the same
+// draw when the geometry is small enough to sit inside the volume under more
+// than one matrix, and a winner-take-all histogram would hide that.
+uint64_t g_candWins[kCandidates] = {};
+uint64_t g_candExplains[kCandidates] = {};
+uint64_t g_probeDraws = 0;         // draws with any non-degenerate position
+uint64_t g_probeExplained = 0;     // draws some candidate put fully in clip
+uint64_t g_probeUnexplained = 0;
+uint64_t g_probeDegenerate = 0;    // positions rejected as (0,0,0)
+uint64_t g_probeAllDegenerate = 0; // draws with nothing else in them
+bool     g_probeSawViewport = false;
+
+// Winner per bound vertex shader, keyed (handle << 32 | candidate). The
+// question a run-wide histogram cannot answer: is the register a property of
+// the shader? If it is, each handle has one dominant winner and the spread
+// across the run is just the shader changing.
+std::map<uint64_t, uint32_t> g_shaderWins;
+std::map<uint32_t, uint32_t> g_shaderDraws;
+
+// A candidate "explains" a draw when it puts at least this much of it in the
+// clip volume. Not 100%: real geometry is legitimately clipped at the screen
+// edge, and demanding perfection would reject the right matrix.
+constexpr double kExplainFraction = 0.95;
+
+inline bool Transform(const float m[16], const float p[3], float o[4]) {
+  for (int r = 0; r < 4; ++r) {
+    o[r] = m[r * 4 + 0] * p[0] + m[r * 4 + 1] * p[1] + m[r * 4 + 2] * p[2] +
+           m[r * 4 + 3];
+  }
+  for (int i = 0; i < 4; ++i) {
+    if (!std::isfinite(o[i])) return false;
+  }
+  return true;
+}
+
+inline bool InClip(const float o[4]) {
+  if (o[3] <= 0.0f) return false;
+  return o[0] >= -o[3] && o[0] <= o[3] && o[1] >= -o[3] && o[1] <= o[3] &&
+         o[2] >= 0.0f && o[2] <= o[3];
+}
+
+// Distinct positions must stay distinct. **A matrix that collapses everything
+// onto one point sits inside the clip volume no matter what you feed it**, so
+// without this the ranking is won by whichever candidate is closest to rank 1 —
+// which is the (0,0,0) trap moved from the input to the transform, and it is
+// exactly what the first per-draw run produced: one candidate explaining all
+// 10,266 draws while both controls explained none.
+constexpr float kSpreadEpsilon = 1e-4f;
+
+const char* CandidateName(uint32_t c, char* buf, size_t n) {
+  if (c == kIdentityCandidate) return "identity (control)";
+  if (c == kViewportCandidate) return "viewport inverse (control, = PM4 today)";
+  std::snprintf(buf, n, "c%u %s", c / 2,
+                (c & 1) ? "col-major" : "row-major");
+  return buf;
+}
+
+}  // namespace
+
+void ScoreHleTransform(const DrawCall& dc, const float* consts,
+                       const float* viewport_mvp, uint32_t vertex_shader) {
+  if (!consts || dc.vertex_count == 0 || dc.vertex_stride != kHostVertexStride)
+    return;
+  if (viewport_mvp) g_probeSawViewport = true;
+
+  static const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0,
+                                      0, 0, 1, 0, 0, 0, 0, 1};
+
+  // Stride the sample across the draw rather than taking the first N: the first
+  // vertices of a strip are not representative of the whole.
+  const uint32_t n = dc.vertex_count;
+  const uint32_t step = n > kProbeVertsPerDraw ? n / kProbeVertsPerDraw : 1;
+
+  float pts[kProbeVertsPerDraw + 1][3];
+  uint32_t npts = 0;
+  for (uint32_t i = 0; i < n && npts <= kProbeVertsPerDraw; i += step) {
+    float p[3];
+    std::memcpy(p, dc.vertices.data() + size_t(i) * kHostVertexStride, 12);
+    if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2]))
+      continue;
+    if (p[0] == 0.0f && p[1] == 0.0f && p[2] == 0.0f) {
+      ++g_probeDegenerate;
+      continue;
+    }
+    std::memcpy(pts[npts++], p, sizeof(p));
+  }
+  if (npts == 0) { ++g_probeAllDegenerate; return; }
+  ++g_probeDraws;
+
+  const uint32_t need = uint32_t(double(npts) * kExplainFraction + 0.999);
+
+  // Whether the *inputs* are distinct at all. A draw whose sampled positions
+  // are genuinely one repeated point cannot be used to reject a collapsing
+  // matrix, so the spread test is only applied where it means something.
+  bool inputs_spread = false;
+  for (uint32_t i = 1; i < npts && !inputs_spread; ++i) {
+    for (int k = 0; k < 3; ++k)
+      inputs_spread = inputs_spread || pts[i][k] != pts[0][k];
+  }
+
+  uint32_t best = kCandidates;
+  uint32_t best_in = 0;
+  auto score = [&](uint32_t c, const float m[16]) {
+    uint32_t in = 0;
+    float lo[2] = {1e30f, 1e30f}, hi[2] = {-1e30f, -1e30f};
+    for (uint32_t i = 0; i < npts; ++i) {
+      float o[4];
+      if (!Transform(m, pts[i], o)) continue;
+      if (!InClip(o)) continue;
+      ++in;
+      for (int k = 0; k < 2; ++k) {
+        const float v = o[k] / o[3];
+        if (v < lo[k]) lo[k] = v;
+        if (v > hi[k]) hi[k] = v;
+      }
+    }
+    if (inputs_spread && in > 1 &&
+        (hi[0] - lo[0]) < kSpreadEpsilon && (hi[1] - lo[1]) < kSpreadEpsilon) {
+      return;   // collapses distinct geometry to a point: not a transform
+    }
+    if (in >= need) ++g_candExplains[c];
+    // Ties go to the lower candidate index, which is the lower register and then
+    // row-major — an arbitrary rule, but a fixed one, so a tie cannot drift
+    // between runs and look like a change in the data.
+    if (in > best_in) { best_in = in; best = c; }
+  };
+
+  for (uint32_t b = 0; b < kCandidateBases; ++b) {
+    const float* r = consts + size_t(b) * 4;
+    score(b * 2 + 0, r);   // row-major: register b+k is row k
+    // Column-major: register b+k is column k, which is how a D3D-era compiler
+    // usually packs a matrix into four constants.
+    float t[16];
+    for (int rr = 0; rr < 4; ++rr)
+      for (int cc = 0; cc < 4; ++cc) t[rr * 4 + cc] = r[cc * 4 + rr];
+    score(b * 2 + 1, t);
+  }
+  score(kIdentityCandidate, kIdentity);
+  if (viewport_mvp) score(kViewportCandidate, viewport_mvp);
+
+  if (best != kCandidates && best_in >= need) {
+    ++g_candWins[best];
+    ++g_probeExplained;
+    ++g_shaderWins[(uint64_t(vertex_shader) << 32) | best];
+    ++g_shaderDraws[vertex_shader];
+    // The first few winners in full. The last round's ranking was won by a
+    // matrix that turned out to collapse everything to a point — visible
+    // immediately in its numbers, and not at all in its score.
+    static uint32_t s_dumped = 0;
+    if (s_dumped < 8 && best < kCandidates - 2) {
+      ++s_dumped;
+      const uint32_t b = best / 2;
+      const float* r = consts + size_t(b) * 4;
+      char nm[64];
+      REXLOG_INFO(
+          "d3d9: stage3  winner {} on a draw of {} verts ({}/{} in clip): "
+          "[{:.4f} {:.4f} {:.4f} {:.4f}] [{:.4f} {:.4f} {:.4f} {:.4f}] "
+          "[{:.4f} {:.4f} {:.4f} {:.4f}] [{:.4f} {:.4f} {:.4f} {:.4f}], "
+          "first pos ({:.3f} {:.3f} {:.3f})",
+          CandidateName(best, nm, sizeof(nm)), dc.vertex_count, best_in, npts,
+          r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10],
+          r[11], r[12], r[13], r[14], r[15], pts[0][0], pts[0][1], pts[0][2]);
+    }
+  } else {
+    ++g_probeUnexplained;
+  }
+}
+
+void ReportHleTransform() {
+  if (g_probeDraws == 0) {
+    REXLOG_INFO(
+        "d3d9: stage3  transform probe — no draws scored ({} were entirely "
+        "degenerate positions)", g_probeAllDegenerate);
+    return;
+  }
+  REXLOG_INFO(
+      "d3d9: stage3  transform probe — {} draws scored, {} explained by some "
+      "candidate ({}%), {} by none; {} positions and {} whole draws rejected "
+      "as (0,0,0){}",
+      g_probeDraws, g_probeExplained, (g_probeExplained * 100) / g_probeDraws,
+      g_probeUnexplained, g_probeDegenerate, g_probeAllDegenerate,
+      g_probeSawViewport ? "" : " — NO VIEWPORT was ever set, so the viewport "
+                                "control is absent, not losing");
+
+  char buf[64];
+  // Controls first and unconditionally: a candidate that only beats nothing has
+  // to be visible as such, and burying the controls in a sorted list hides that.
+  for (uint32_t c : {kIdentityCandidate, kViewportCandidate}) {
+    REXLOG_INFO("d3d9: stage3    {:<40} won {:>7} draws, explains {:>7}",
+                CandidateName(c, buf, sizeof(buf)), g_candWins[c],
+                g_candExplains[c]);
+  }
+  // Then the best constant-file candidates. **Nothing is mutated here.** The
+  // first version zeroed each winner as it printed it, on the assumption that
+  // the report ran once; it runs every 2,500 draws, so each report ate the
+  // previous one's leaders and the winner appeared to change every few seconds.
+  // The instability was the instrument, not the data.
+  uint32_t shown[6] = {};
+  uint32_t nshown = 0;
+  for (uint32_t rank = 0; rank < 6; ++rank) {
+    uint32_t best = kCandidates;
+    uint64_t best_n = 0;
+    for (uint32_t c = 0; c < kCandidates - 2; ++c) {
+      bool already = false;
+      for (uint32_t i = 0; i < nshown; ++i) already = already || shown[i] == c;
+      if (already) continue;
+      if (g_candWins[c] > best_n) { best_n = g_candWins[c]; best = c; }
+    }
+    if (best == kCandidates || best_n == 0) break;
+    shown[nshown++] = best;
+    REXLOG_INFO("d3d9: stage3    {:<40} won {:>7} draws, explains {:>7}",
+                CandidateName(best, buf, sizeof(buf)), best_n,
+                g_candExplains[best]);
+  }
+
+  // And the same winners cut by bound shader. A shader whose draws agree on one
+  // register is evidence the register belongs to the shader; a shader whose
+  // draws scatter means the scoring is fitting noise, and no table built from it
+  // would be worth anything.
+  for (const auto& [handle, draws] : g_shaderDraws) {
+    if (draws < 32) continue;   // too few to say anything
+    uint32_t top = 0, top_n = 0, distinct = 0;
+    for (uint32_t c = 0; c < kCandidates; ++c) {
+      auto it = g_shaderWins.find((uint64_t(handle) << 32) | c);
+      if (it == g_shaderWins.end() || it->second == 0) continue;
+      ++distinct;
+      if (it->second > top_n) { top_n = it->second; top = c; }
+    }
+    if (!top_n) continue;
+    REXLOG_INFO(
+        "d3d9: stage3    vs 0x{:08X}: {} explained draws, top {} on {}/{} "
+        "({}%), {} distinct winners",
+        handle, draws, CandidateName(top, buf, sizeof(buf)), top_n, draws,
+        (top_n * 100) / draws, distinct);
+  }
 }
 
 }  // namespace mx::pm4
