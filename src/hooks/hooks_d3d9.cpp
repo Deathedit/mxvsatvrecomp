@@ -1421,12 +1421,84 @@ extern "C" REX_FUNC(sub_8254B8E0) {
 // step, and recording the handle is what makes it possible to tell how many
 // distinct shaders the population actually uses.
 //-----------------------------------------------------------------------------
+// Stage 3b — where a bound shader's microcode lives, read out of the accessors
+// in gpu.obj that reach it (dis.py prints addi's operands swapped; these are
+// corrected):
+//
+//   Promote(D3DVertexShader*)   = blr           ; the handle IS the CVertexShader
+//   SH_pPhysical(this)          = *(this + 0x20)
+//   GetUCodeHeader()            = this + 0x368
+//   GetUCode(i)                 = this + *(this + (i + 0x70)*8) + 0x368
+//   GetPhysicalMicrocode(i)     = *(variant + 0x368) + *(this + 0x20)
+//   GetPhysicalMicrocodeSize(i) = *(variant + 0x36C)
+//
+// So the object carries a table of *patched* microcode variants — which is what
+// PatchVertexShaderToMatchVertexDeclaration has been writing all along — and the
+// bytes sit at a physical base plus an offset out of the header.
+//
+// **The physical base is not dereferenced here.** `SH_pPhysical` is exactly the
+// kind of address that cost four access violations: D3D9 keeps it masked for the
+// GPU, and every read on this side goes through the guest's virtual space. This
+// dumps the object's own fields only, so the next step can be decided from what
+// they contain rather than from a guess about which space they are in.
+uint32_t g_vsDumped = 0;
+
+void DumpVertexShaderObject(uint32_t handle, uint8_t* base) {
+  if (!handle || g_vsDumped >= 6) return;
+  if (!HostPageReadable(REX_RAW_ADDR(handle)) ||
+      !HostPageReadable(REX_RAW_ADDR(handle + 0x380))) return;
+  ++g_vsDumped;
+  auto& f = DeclFile();
+  f << "VERTEX SHADER 0x" << std::hex << handle << ":\n    +0x00..0x40:";
+  for (uint32_t o = 0; o < 0x40; o += 4) {
+    f << " [" << o << "]=0x" << REX_LOAD_U32(handle + o);
+  }
+  f << "\n    header +0x360..0x380:";
+  for (uint32_t o = 0x360; o < 0x380; o += 4) {
+    f << " [" << o << "]=0x" << REX_LOAD_U32(handle + o);
+  }
+  f << "\n    SH_pPhysical=0x" << REX_LOAD_U32(handle + 0x20)
+    << " ucode_offset=0x" << REX_LOAD_U32(handle + 0x368)
+    << " ucode_size=0x" << REX_LOAD_U32(handle + 0x36C) << std::dec << "\n";
+
+  // The field's top bits are set (0xFD62A000), which is the *unmasked* form —
+  // the same shape the vertex buffer's 0xFD21C003 has before D3D9 masks it to
+  // 0x1D21D003 for the fetch constant. So this should be readable as-is, which
+  // is exactly the thing four access violations were caused by getting wrong.
+  // Page-guarded, and 16 dwords only: if it is microcode the first words will
+  // decode as one, and if it is not, that is the finding.
+  const uint32_t phys = REX_LOAD_U32(handle + 0x20);
+  if (phys && HostPageReadable(REX_RAW_ADDR(phys)) &&
+      HostPageReadable(REX_RAW_ADDR(phys + 0x3C))) {
+    f << "    ucode @0x" << std::hex << phys << ":";
+    for (uint32_t o = 0; o < 0x40; o += 4) f << " " << REX_LOAD_U32(phys + o);
+    f << std::dec << "\n";
+  } else {
+    f << "    ucode @0x" << std::hex << phys << std::dec
+      << " NOT READABLE in guest virtual space\n";
+  }
+  // The physical base reads as sixteen zero dwords — safe, and empty. So the
+  // code is not behind that pointer at bind time. CreateVertexShader copies the
+  // token stream to `this + 0x368` for *(source + 4) bytes, and +0x36C here is
+  // 0x200, so the object very likely carries the microcode inline. Dumped so the
+  // next step can compare it against what the ring carried for the same shader,
+  // which is a cross-check that actually exists.
+  if (HostPageReadable(REX_RAW_ADDR(handle + 0x468))) {
+    f << "    inline +0x368:";
+    for (uint32_t o = 0x368; o < 0x3E8; o += 4) f << " " << std::hex
+                                                  << REX_LOAD_U32(handle + o);
+    f << std::dec << "\n";
+  }
+  f.flush();
+}
+
 REX_IMPORT(__imp__sub_825508A8, orig_SetVertexShader, void());
 extern "C" REX_FUNC(sub_825508A8) {
   auto& st = DeviceState();
   st.NoteDevice(ctx.r3.u32, mx::pm4::kEpSetVertexShader);
   st.vertex_shader = ctx.r4.u32;
   st.vs_seen = true;
+  if (REXCVAR_GET(hle_capture)) DumpVertexShaderObject(ctx.r4.u32, base);
   orig_SetVertexShader(ctx, base);
 }
 
