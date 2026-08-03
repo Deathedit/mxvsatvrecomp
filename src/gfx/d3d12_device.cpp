@@ -237,7 +237,19 @@ void D3D12Renderer::BeginFrame() {
   // it runs after this clear, not instead of it.
   // rtvHandle is m_gameRT when it exists and the backbuffer otherwise; both
   // want clearing, so this is not conditioned on which one it is.
-  m_commandList->ClearRenderTargetView(rtvHandle, GameClearColor(), 0, nullptr);
+  //
+  // Two clears, not one. GameClearColor is *our* debug colour, not the guest's,
+  // and a single full-window clear painted it into the pillarbox bars as well —
+  // so the bars came out dark blue and read as part of the image rather than as
+  // dead space beside it. Black bars are the letterbox convention precisely
+  // because they cannot be mistaken for content.
+  //
+  // The scoped clear uses m_scissorRect, which CreateViewportAndScissor already
+  // fitted to the guest's 16:9, so the two cannot drift apart.
+  static const float kBars[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+  m_commandList->ClearRenderTargetView(rtvHandle, kBars, 0, nullptr);
+  m_commandList->ClearRenderTargetView(rtvHandle, GameClearColor(), 1,
+                                       &m_scissorRect);
 
   if (m_hasVideoFrame) {
     RenderVideoFrame();
