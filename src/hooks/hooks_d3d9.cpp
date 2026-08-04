@@ -1149,6 +1149,10 @@ constexpr uint32_t kD3d9ConstRegs = 256;
 
 uint64_t g_aluRuns = 0, g_aluInClip = 0, g_aluDegenerate = 0;
 uint64_t g_aluNoShader = 0, g_aluNoAttrs = 0, g_aluStrideMismatch = 0;
+// fetch_slot did not invert to a stream in [0, kMaxStreams). Its own counter:
+// "the stream mapping does not hold here" and "the bound stride disagrees" are
+// different failures and folding them together would hide either one.
+uint64_t g_aluBadStream = 0;
 uint64_t g_aluConstReads = 0, g_aluConstZero = 0;
 std::map<int, uint64_t> g_aluStatus;
 std::map<uint32_t, uint64_t> g_aluBlocking;
@@ -1212,11 +1216,29 @@ void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
   const uint32_t off = bi->second.off_dwords;
   if (off >= code.size()) { ++g_aluNoShader; return; }
 
-  const HleStream& s = streams[0];
-  if (!s.bound || !s.host || s.stride == 0 ||
-      s.stride != attrs[0].stride_bytes) {
-    ++g_aluStrideMismatch;
-    return;
+  // Which stream each attribute fetches from.
+  //
+  // No longer a guess. PatchVertexShaderToMatchVertexDeclaration writes
+  // `95 - element.stream` into the vfetch's constant field (subfic r20, r5,
+  // 0x5F at 0x82564E30), so inverting it gives the D3D9 stream number. The
+  // prediction probe agreed with what D3D9 actually wrote on 52 of 53 slots.
+  //
+  // This also explains why every observed fetch_slot was 95: it is stream 0.
+  // The value is ambiguous — the no-match path writes 95 too — but an unmatched
+  // vfetch is left with a canned format (0x60000) and swizzle (0x9250), and the
+  // measurement found 0 unmatched slots in this title.
+  static std::vector<uint32_t> astream;
+  astream.assign(attrs.size(), 0);
+  for (size_t a = 0; a < attrs.size(); ++a) {
+    const uint32_t fs = attrs[a].fetch_slot;
+    if (fs > 95 || (95u - fs) >= kMaxStreams) { ++g_aluBadStream; return; }
+    astream[a] = 95u - fs;
+    const HleStream& sa = streams[astream[a]];
+    if (!sa.bound || !sa.host || sa.stride == 0 ||
+        sa.stride != attrs[a].stride_bytes) {
+      ++g_aluStrideMismatch;
+      return;
+    }
   }
 
   // The constant file, straight from the device. Const(i) reads
@@ -1248,7 +1270,7 @@ void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
   float ctl_lo[2] = {1e30f, 1e30f}, ctl_hi[2] = {-1e30f, -1e30f};
   uint32_t ctl_scored = 0;
 
-  uint8_t vtx[256];
+  uint8_t vtx[kMaxStreams][256];
   std::vector<std::array<float, 4>> values(attrs.size());
   for (uint32_t v = 0; v < n; ++v) {
     // The stream index this built vertex came from. dc.vertices packs the
@@ -1257,14 +1279,31 @@ void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
     // histograms would not be comparable — which is the whole point of having
     // a control.
     const uint64_t src = uint64_t(dc.first_vertex) + v;
-    const uint64_t byte_off = src * s.stride + s.offset_bytes;
-    if (byte_off + s.stride > s.size_bytes || s.stride > sizeof(vtx)) break;
-    std::memcpy(vtx, s.host + byte_off, s.stride);
-    ApplyFetchEndian(vtx, s.stride, s.endian);
+
+    // One decoded vertex per stream this shader actually reads, fetched once
+    // and shared by every attribute that comes from it.
+    bool have[kMaxStreams] = {};
+    bool ranged = true;
+    for (size_t a = 0; a < attrs.size() && ranged; ++a) {
+      const uint32_t si = astream[a];
+      if (have[si]) continue;
+      const HleStream& sa = streams[si];
+      const uint64_t byte_off = src * sa.stride + sa.offset_bytes;
+      if (byte_off + sa.stride > sa.size_bytes ||
+          sa.stride > sizeof(vtx[0])) {
+        ranged = false;
+        break;
+      }
+      std::memcpy(vtx[si], sa.host + byte_off, sa.stride);
+      ApplyFetchEndian(vtx[si], sa.stride, sa.endian);
+      have[si] = true;
+    }
+    if (!ranged) break;
 
     for (size_t a = 0; a < attrs.size(); ++a) {
       float o[4] = {0, 0, 0, 1};
-      ReadVertexAttribute(vtx, s.stride, attrs[a], o);
+      ReadVertexAttribute(vtx[astream[a]], streams[astream[a]].stride, attrs[a],
+                          o);
       values[a] = {o[0], o[1], o[2], o[3]};
     }
 
@@ -1428,8 +1467,10 @@ void ReportShaderExecution() {
       g_aluConstReads, g_aluConstZero);
   REXLOG_INFO(
       "d3d9: stageC  skipped: no located shader {}, no attrs {}, bound stride "
-      "disagrees with the shader's {} — of {} draws entered",
-      g_aluNoShader, g_aluNoAttrs, g_aluStrideMismatch, g_aluDrawsEntered);
+      "disagrees with the shader's {}, fetch_slot did not invert to a stream "
+      "{} — of {} draws entered",
+      g_aluNoShader, g_aluNoAttrs, g_aluStrideMismatch, g_aluBadStream,
+      g_aluDrawsEntered);
   ReportClipHistogram();
 }
 
@@ -1696,6 +1737,319 @@ void ReportBlobSearch() {
   }
 }
 
+//---------------------------------------------------------------------------
+// The declaration-to-vfetch pairing rule, read out of
+// D3D::PatchVertexShaderToMatchVertexDeclaration (0x82564C50).
+//
+// This was the last bridge in the shader-execution path: attributes were taken
+// from PM4's decode because nothing said which declaration element feeds which
+// vfetch instruction. The function itself says, and it says it with a table.
+//
+//   this   = r3   CVertexShader*
+//   dest   = r4   the microcode being patched — where results are written
+//   decl   = r5   CVertexDeclaration*, count at +0x18, elements at +0x34
+//   strides= r6   const BYTE*, indexed by stream, stride in DWORDS
+//   variant= r7   which patched variant of the shader this is
+//
+// The shader carries a **binding table**, one dword per vfetch:
+//
+//   blob  = this + *(this + (variant + 0x70) * 8) + 0x368     ; GetUCode(variant)
+//   count = blob[0x1C]
+//   table = blob + 4 * (blob[0x18] + 9)
+//
+//   key[11:0]  -> vfetch instruction index; the patched triple is written to
+//                 dest + 12 * index
+//   key[15:12] -> D3DDECLUSAGE
+//   key[19:16] -> usage index
+//
+// **The pairing is by semantic, not by position.** The element whose `usage`
+// (byte 9) and `usage_index` (byte 10) equal the key's is the one that patches
+// that vfetch — a linear search, first match wins. That is why the template's
+// format/offset/stride are blank: they are not defaults, they are unbound.
+//
+// From the matched element:
+//   fetch constant index = 95 - element.stream       (subfic r20, r5, 0x5F)
+//   format/signed/integer/swizzle from the Type dword, as kType* already say
+//   offset field = element.offset / 4                (rlwinm r8, r8, 6, 1, 23)
+//   stride field = strides[element.stream]           (lbzx r5, r5, r6)
+//
+// **No match leaves fetch constant 95 as well**, which is the same value stream
+// 0 produces. So a decoded fetch_slot of 95 is ambiguous between "stream 0" and
+// "unbound", and PM4's decode showing 95 everywhere never distinguished them.
+// The unbound case is identifiable by its canned format bits (0x60000) and
+// swizzle (0x9250) instead.
+//
+// None of this is believed on the strength of the disassembly. The probe
+// predicts all three dwords of the patched vfetch *before* the call and
+// compares them against what D3D9 actually wrote *after* it. A rule read wrong
+// disagrees; a rule read right agrees on every dword of every vfetch.
+//---------------------------------------------------------------------------
+constexpr uint32_t kUCodePtrTable  = 0x70;   // this + (variant + 0x70) * 8
+constexpr uint32_t kUCodeBlobDelta = 0x368;
+constexpr uint32_t kBlobTableOff   = 0x18;   // dword: table start, in dwords - 9
+constexpr uint32_t kBlobFetchCount = 0x1C;   // dword: how many vfetches
+constexpr uint32_t kTemplateBase   = 0x44;   // this + 0x44 + 416 * variant
+constexpr uint32_t kTemplateStride = 0x1A0;
+constexpr uint32_t kDeclCountOff   = 0x18;
+constexpr uint32_t kDeclElemsOff   = 0x34;
+constexpr uint32_t kMaxPatchFetch  = 32;
+
+uint64_t g_patchProbed = 0;        // calls the probe actually examined
+uint64_t g_patchFetches = 0;       // vfetch slots predicted
+uint64_t g_patchBound = 0;         // ... of which a declaration element matched
+uint64_t g_patchUnbound = 0;       // ... of which none did
+// Per *field*, not per dword. A whole-dword comparison asks a stricter question
+// than the one that matters: two of these fields are written by machinery this
+// rule does not model (the second pass that coalesces adjacent fetches, and the
+// swizzle chain through word_8204E178), and folding them in would report the
+// fields that ARE read correctly as failures.
+enum PatchField : uint32_t {
+  kPfFetchConst = 0,   // dword0 [26:20] — 95 - stream
+  kPfCoalesce,         // dword0 [29:27] — second pass; NOT modelled
+  kPfFormat,           // dword1 [21:16] — Type[5:0]
+  kPfNumFormat,        // dword1 [13:12] — Type[9:8]
+  kPfSwizzle,          // dword1 [11:0]  — swizzle chain; NOT modelled
+  kPfOffset,           // dword2 [30:8]  — element.offset / 4
+  kPfStride,           // dword2 [7:0]   — strides[stream]
+  kPatchFieldCount,
+};
+const char* const kPatchFieldName[kPatchFieldCount] = {
+    "fetch const (95-stream)", "coalesce count [29:27] (unmodelled)",
+    "format", "signed/integer", "swizzle [11:0] (unmodelled)",
+    "offset (elem.offset/4)", "stride (strides[stream])"};
+const uint32_t kPatchFieldDword[kPatchFieldCount] = {0, 0, 1, 1, 1, 2, 2};
+const uint32_t kPatchFieldMask[kPatchFieldCount] = {
+    0x07F00000u, 0x38000000u, 0x003F0000u, 0x00003000u,
+    0x00000FFFu, 0x7FFFFF00u, 0x000000FFu};
+
+uint64_t g_pfAgree[kPatchFieldCount] = {};
+uint64_t g_pfDisagree[kPatchFieldCount] = {};
+
+uint64_t g_patchAgree[3] = {};     // per dword, prediction == what D3D9 wrote
+uint64_t g_patchDisagree[3] = {};
+uint64_t g_patchBadTable = 0;      // count or table offset outside anything sane
+
+// Where does D3D9 write the patched microcode? r4 is that destination, and if
+// it is the same memory the draw-time probe already reads (SH_pPhysical +
+// 0x40), then the patched code is directly readable and none of this rule needs
+// reimplementing — the prediction only ever needed to be a *check*. Measured
+// rather than assumed, because Stage B concluded that buffer held the unpatched
+// template and that conclusion has to be either confirmed or overturned.
+uint64_t g_destIsPhys40 = 0;       // dest == unmasked SH_pPhysical + 0x40
+uint64_t g_destIsPhysOther = 0;    // inside that allocation, different offset
+uint64_t g_destElsewhere = 0;
+uint32_t g_destSample[4] = {};     // self, dest, SH_pPhysical, delta
+bool     g_destHaveSample = false;
+uint32_t g_patchFirstMismatch[6] = {};  // predicted/actual triple, first miss
+bool     g_patchHaveMismatch = false;
+// usage -> how many vfetches bound to it, so the report says which semantics
+// this title actually feeds its shaders.
+std::map<uint32_t, uint64_t> g_patchUsage;
+
+struct PatchPrediction {
+  uint32_t dest_addr = 0;
+  uint32_t pred[3] = {};
+  bool     bound = false;
+};
+
+// Reads the binding table, predicts every patched vfetch, and returns them for
+// comparison after the original runs. Every read is page-guarded; the pointers
+// are D3D9's own arguments, which it is about to dereference itself.
+void PredictPatchedFetches(uint32_t self, uint32_t dest, uint32_t decl,
+                           uint32_t strides, uint32_t variant, uint8_t* base,
+                           std::vector<PatchPrediction>& out) {
+  out.clear();
+  if (!self || !dest || !decl || !strides) return;
+
+  // Is the destination the buffer the draw-time probe already reads?
+  if (HostPageReadable(REX_RAW_ADDR(self + 0x20))) {
+    const uint32_t phys = REX_LOAD_U32(self + 0x20);
+    if (dest == phys + 0x40) {
+      ++g_destIsPhys40;
+    } else if (phys && dest > phys && dest - phys < 0x1000) {
+      ++g_destIsPhysOther;
+    } else {
+      ++g_destElsewhere;
+    }
+    if (!g_destHaveSample) {
+      g_destHaveSample = true;
+      g_destSample[0] = self;
+      g_destSample[1] = dest;
+      g_destSample[2] = phys;
+      g_destSample[3] = dest - phys;
+    }
+  }
+
+  const uint32_t slot = self + (variant + kUCodePtrTable) * 8;
+  if (!HostPageReadable(REX_RAW_ADDR(slot))) return;
+  const uint32_t blob = self + REX_LOAD_U32(slot) + kUCodeBlobDelta;
+  if (!HostPageReadable(REX_RAW_ADDR(blob + kBlobFetchCount))) return;
+
+  const uint32_t count = REX_LOAD_U32(blob + kBlobFetchCount);
+  const uint32_t tbl_off = REX_LOAD_U32(blob + kBlobTableOff);
+  if (count == 0 || count > kMaxPatchFetch || tbl_off > 0x10000) {
+    ++g_patchBadTable;
+    return;
+  }
+  const uint32_t table = blob + 4 * (tbl_off + 9);
+
+  if (!HostPageReadable(REX_RAW_ADDR(decl + kDeclCountOff))) return;
+  const uint32_t nelem = REX_LOAD_U32(decl + kDeclCountOff);
+  if (nelem > kMaxElements) { ++g_patchBadTable; return; }
+
+  for (uint32_t i = 0; i < count; ++i) {
+    if (!HostPageReadable(REX_RAW_ADDR(table + i * 4))) return;
+    const uint32_t key = REX_LOAD_U32(table + i * 4);
+    const uint32_t instr = key & 0xFFF;
+    const uint32_t usage = (key >> 12) & 0xF;
+    const uint32_t uidx = (key >> 16) & 0xF;
+
+    // The template triple this vfetch starts from.
+    const uint32_t tmpl = self + kTemplateBase + kTemplateStride * variant +
+                          12 * i;
+    if (!HostPageReadable(REX_RAW_ADDR(tmpl)) ||
+        !HostPageReadable(REX_RAW_ADDR(tmpl + 8)))
+      return;
+    const uint32_t d0 = REX_LOAD_U32(tmpl);
+    const uint32_t d1 = REX_LOAD_U32(tmpl + 4);
+    const uint32_t d2 = REX_LOAD_U32(tmpl + 8);
+
+    // The linear search by semantic, exactly as the function does it.
+    uint32_t match = nelem;
+    for (uint32_t e = 0; e < nelem; ++e) {
+      const uint32_t ea = decl + kDeclElemsOff + e * kElementSize;
+      if (!HostPageReadable(REX_RAW_ADDR(ea))) return;
+      if (REX_LOAD_U8(ea + 9) == usage && REX_LOAD_U8(ea + 10) == uidx) {
+        match = e;
+        break;
+      }
+    }
+
+    PatchPrediction p;
+    p.dest_addr = dest + 12 * instr;
+    if (match < nelem) {
+      const uint32_t ea = decl + kDeclElemsOff + match * kElementSize;
+      const uint32_t stream = REX_LOAD_U16(ea + 0);
+      const uint32_t offset = REX_LOAD_U16(ea + 2);
+      const uint32_t type = REX_LOAD_U32(ea + 4);
+      if (!HostPageReadable(REX_RAW_ADDR(strides + stream))) return;
+      const uint32_t stride = REX_LOAD_U8(strides + stream);
+
+      p.pred[0] = (d0 & 0xC00FFFFFu) | (((95u - stream) & 0x7Fu) << 20);
+      p.pred[1] = (d1 & 0xBFC0CFFFu) |
+                  ((((type << 12) & 0x3F000u) | (type & 0x300u)) << 4);
+      p.pred[2] = (d2 & 0x80000000u) | ((offset << 6) & 0x7FFFFF00u) | stride;
+      p.bound = true;
+      ++g_patchUsage[usage];
+    } else {
+      p.pred[0] = (d0 & 0xC00FFFFFu) | 0x5F00000u;
+      p.pred[1] = (d1 & 0xBFC0CFFFu) | 0x60000u;
+      if (!HostPageReadable(REX_RAW_ADDR(strides))) return;
+      p.pred[2] = (d2 & 0x80000000u) | REX_LOAD_U8(strides);
+      p.bound = false;
+    }
+    out.push_back(p);
+  }
+}
+
+// After the original ran: did it write what the rule predicts?
+void CheckPatchedFetches(const std::vector<PatchPrediction>& pred,
+                         uint8_t* base) {
+  if (pred.empty()) return;
+  ++g_patchProbed;
+  for (const auto& p : pred) {
+    ++g_patchFetches;
+    if (p.bound) ++g_patchBound; else ++g_patchUnbound;
+    if (!HostPageReadable(REX_RAW_ADDR(p.dest_addr)) ||
+        !HostPageReadable(REX_RAW_ADDR(p.dest_addr + 8)))
+      continue;
+    uint32_t got[3] = {REX_LOAD_U32(p.dest_addr), REX_LOAD_U32(p.dest_addr + 4),
+                       REX_LOAD_U32(p.dest_addr + 8)};
+    for (uint32_t f = 0; f < kPatchFieldCount; ++f) {
+      const uint32_t m = kPatchFieldMask[f];
+      const uint32_t d = kPatchFieldDword[f];
+      if ((got[d] & m) == (p.pred[d] & m)) ++g_pfAgree[f];
+      else                                 ++g_pfDisagree[f];
+    }
+    for (uint32_t d = 0; d < 3; ++d) {
+      if (got[d] == p.pred[d]) {
+        ++g_patchAgree[d];
+      } else {
+        ++g_patchDisagree[d];
+        // Keep the first disagreement in full. A count says the rule is wrong;
+        // the two triples say which field of it is.
+        if (!g_patchHaveMismatch) {
+          g_patchHaveMismatch = true;
+          for (uint32_t k = 0; k < 3; ++k) {
+            g_patchFirstMismatch[k] = p.pred[k];
+            g_patchFirstMismatch[3 + k] = got[k];
+          }
+        }
+      }
+    }
+  }
+}
+
+void ReportPatchRule() {
+  if (!g_patchProbed) {
+    if (g_patchBadTable)
+      REXLOG_INFO(
+          "d3d9: pairing — nothing predicted; {} calls had an out-of-range "
+          "table or element count, so the header offsets are wrong",
+          g_patchBadTable);
+    return;
+  }
+  REXLOG_INFO(
+      "d3d9: pairing — {} patch calls, {} vfetch slots: {} bound to a "
+      "declaration element by (usage, usage_index), {} unbound; {} calls "
+      "rejected for a bad table",
+      g_patchProbed, g_patchFetches, g_patchBound, g_patchUnbound,
+      g_patchBadTable);
+  for (uint32_t f = 0; f < kPatchFieldCount; ++f) {
+    const uint64_t tot = g_pfAgree[f] + g_pfDisagree[f];
+    REXLOG_INFO("d3d9: pairing — field {:<36} {} of {} agree ({}%)",
+                kPatchFieldName[f], g_pfAgree[f], tot,
+                tot ? (g_pfAgree[f] * 100) / tot : 0);
+  }
+  static const char* const kName[3] = {"dword0", "dword1", "dword2"};
+  for (uint32_t d = 0; d < 3; ++d) {
+    const uint64_t tot = g_patchAgree[d] + g_patchDisagree[d];
+    REXLOG_INFO(
+        "d3d9: pairing — whole {} : {} of {} ({}%) — stricter than the "
+        "question; the unmodelled fields live here",
+        kName[d], g_patchAgree[d], tot,
+        tot ? (g_patchAgree[d] * 100) / tot : 0);
+  }
+  if (g_patchHaveMismatch) {
+    REXLOG_INFO(
+        "d3d9: pairing — first disagreement: predicted {:08X} {:08X} {:08X}, "
+        "D3D9 wrote {:08X} {:08X} {:08X}",
+        g_patchFirstMismatch[0], g_patchFirstMismatch[1],
+        g_patchFirstMismatch[2], g_patchFirstMismatch[3],
+        g_patchFirstMismatch[4], g_patchFirstMismatch[5]);
+  }
+  std::string u;
+  for (const auto& [usage, n] : g_patchUsage) {
+    const char* nm = mx::pm4::UsageSemanticName(uint8_t(usage));
+    char buf[48];
+    std::snprintf(buf, sizeof(buf), "%s:%llu ", nm ? nm : "?",
+                  (unsigned long long)n);
+    u += buf;
+  }
+  REXLOG_INFO("d3d9: pairing — bound semantics {}", u.empty() ? "none" : u);
+  REXLOG_INFO(
+      "d3d9: pairing — patch destination: {} calls wrote to SH_pPhysical+0x40 "
+      "(what the draw-time probe reads), {} elsewhere in that allocation, {} "
+      "somewhere else",
+      g_destIsPhys40, g_destIsPhysOther, g_destElsewhere);
+  if (g_destHaveSample) {
+    REXLOG_INFO(
+        "d3d9: pairing — first: shader 0x{:08X}, dest 0x{:08X}, SH_pPhysical "
+        "0x{:08X}, dest-phys 0x{:X}",
+        g_destSample[0], g_destSample[1], g_destSample[2], g_destSample[3]);
+  }
+}
+
 void ReportCoverage(uint8_t* base) {
   const auto& st = DeviceState();
   if (g_drawsChecked == 0) {
@@ -1748,6 +2102,7 @@ void ReportCoverage(uint8_t* base) {
   ReportBlobSearch();
   ReportPhysicalAtDrawTime();
   ReportShaderExecution();
+  ReportPatchRule();
   ReportAddressKeyTest(base);
 
   //-------------------------------------------------------------------------
@@ -2112,7 +2467,21 @@ extern "C" REX_FUNC(sub_82564C50) {
 
   if (found >= 0) g_patchDecl = found;
   ++g_patchCalls;
+
+  // Predict before, compare after. The arguments are only guaranteed good
+  // across this call, and the point of the test is what the *original* writes.
+  // Sampled: this fires on the lazy-state path, and the rule either holds on
+  // every slot or it does not hold at all.
+  static std::vector<PatchPrediction> s_pred;
+  const bool probe = REXCVAR_GET(hle_capture) && (g_patchCalls % 16) == 0;
+  if (probe) {
+    PredictPatchedFetches(args[0], args[1], args[2], args[3], args[4], base,
+                          s_pred);
+  }
+
   orig_PatchVertexShader(ctx, base);
+
+  if (probe) CheckPatchedFetches(s_pred, base);
 }
 
 //=============================================================================

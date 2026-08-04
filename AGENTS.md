@@ -3381,12 +3381,108 @@ is geometry with no spread left, which is the same rank-1 trap that once
 "explained" 99% of draws.
 
 So: neither distribution establishes a correct transform. What is established is
-that the microcode is reachable, decodable and runnable from a D3D9 handle, and
-that two bridges are still standing in for unread facts — attributes come from
-PM4's decode rather than the declaration, and values are read from stream 0
-because `fetch_slot` is a Xenos fetch-constant index, not a D3D9 stream number.
+that the microcode is reachable, decodable and runnable from a D3D9 handle.
 6,078 of 9,101 entered draws had no located shader at all, so this is a
 measurement over a minority of the population.
 
+*(Both bridges this section originally listed are resolved in the next section;
+`fetch_slot` inverts to a D3D9 stream, and PM4's attribute decode turns out to
+be the same data by a different route rather than a substitute for it.)*
+
 **Stage 4 stays blocked.** `hle_render` unchanged, `hle_shader_exec` defaults to
 0, `DrawCall::mvp` keeps the viewport inverse.
+
+### The declaration-to-vfetch pairing rule (2026-08-04)
+
+Read out of `D3D::PatchVertexShaderToMatchVertexDeclaration` (`0x82564C50`),
+which was the last unread step between a D3D9 declaration and the shader inputs
+it feeds. Arguments:
+
+```
+r3 CVertexShader*   r4 destination microcode   r5 CVertexDeclaration*
+r6 const BYTE* strides (per stream, in DWORDS)  r7 variant index
+```
+
+#### The shader carries a binding table
+
+```
+blob  = this + *(this + (variant + 0x70) * 8) + 0x368     ; GetUCode(variant)
+count = blob[0x1C]
+table = blob + 4 * (blob[0x18] + 9)
+```
+
+One dword per vfetch:
+
+| bits | meaning |
+|---|---|
+| `[11:0]` | vfetch instruction index — patched triple goes to `dest + 12 * index` |
+| `[15:12]` | `D3DDECLUSAGE` |
+| `[19:16]` | usage index |
+
+**The pairing is by semantic, not by position.** For each vfetch, a linear
+search over the declaration for the element whose `usage` (byte 9) and
+`usage_index` (byte 10) equal the key's; first match wins. That is why the
+template's format/offset/stride read blank — they are unbound, not defaulted.
+
+From the matched element:
+
+| vfetch field | value | instruction |
+|---|---|---|
+| fetch constant `[26:20]` | `95 - element.stream` | `subfic r20, r5, 0x5F` |
+| format `[21:16]`, signed `[12]`, integer `[13]` | from the Type dword | as `kType*` already record |
+| offset `[30:8]` | `element.offset / 4` | `rlwinm r8, r8, 6, 1, 23` |
+| stride `[7:0]` | `strides[element.stream]` | `lbzx r5, r5, r6` |
+
+No match writes fetch constant 95 as well, plus a canned format (`0x60000`) and
+swizzle (`0x9250`). **So a decoded `fetch_slot` of 95 is ambiguous between
+"stream 0" and "unbound"** — the canned bits are what tell them apart.
+
+#### Verified by prediction, not by reading
+
+The probe predicts all three dwords *before* the call and compares against what
+D3D9 wrote *after* it. Per field, over 53 slots in 41 patch calls:
+
+| field | agree |
+|---|---|
+| stride `strides[stream]` | **53/53 (100%)** |
+| fetch constant `95 - stream` | 52/53 (98%) |
+| format | 49/53 (92%) |
+| signed/integer | 49/53 (92%) |
+| offset `elem.offset/4` | 49/53 (92%) |
+| swizzle `[11:0]` — **unmodelled** | 40/53 (75%) |
+| coalesce count `[29:27]` — **unmodelled** | 45/53 (84%) |
+
+**53 of 53 slots bound, 0 unbound, 0 calls rejected for a bad table.** The
+structure is right or nothing would have matched at all.
+
+Two things are deliberately unmodelled, and they are where the whole-dword
+agreement (66–92%) is lost: a **second pass** that coalesces adjacent fetches
+(it writes `[29:27]` and *reorders* triples, which also explains the residual
+4/53 on the fields above), and the swizzle chain through `word_8204E178` that
+rewrites `[11:0]` to match the format's component count — visible as `0x688`
+(xyzw) becoming `0xA88` (xyz1).
+
+#### The patched microcode goes into the command ring, not the shader object
+
+`r4` pointed at `0xBED1B570` on 38 of 39 calls — the ring, where packets parse
+from. Only 1 wrote to `SH_pPhysical + 0x40`.
+
+This confirms Stage B rather than overturning it: the `+0x40` copy really is the
+template, and **PM4's attribute decode was never a substitute for the
+declaration — it is the patched result, read back off the ring.** The two routes
+agree because they are the same data.
+
+#### What changed in the probe
+
+`fetch_slot` now inverts to a stream (`95 - fetch_slot`) per attribute, instead
+of every attribute being read from stream 0. Attributes from different streams
+are fetched from their own buffers.
+
+**Draws skipped for "bound stride disagrees with the shader's" went from 598-742
+to 0**, with 0 failing to invert — which is the strongest evidence the mapping
+holds, because it is a check the code did not have to pass.
+
+The geometry did not change: 15,340 vertices, 36% in the clip volume, histogram
+within noise of the previous run. **Removing the bridges did not move the
+result**, so whatever is wrong with the transform is not the stream mapping and
+not the attribute source.
