@@ -513,22 +513,83 @@ bool ReadVsConstants(uint32_t device, uint8_t* base,
   return true;
 }
 
-// The control: the same transform the PM4 path applies today, built from the
-// D3D9 viewport instead of from the Xenos context registers. It maps window
-// coordinates to clip space, which is what BuildViewportMvp does — so if this
-// scores well, the guest's vertex positions really are pre-transformed and the
-// constant file is not where the geometry's transform lives.
+//---------------------------------------------------------------------------
+// The live viewport, off the device.
+//
+// `D3DDevice_SetViewport` (0x8254BF50) forwards to sub_8254BCE8, which stores
+// six floats and, crucially, **clamps Width and Height against the render
+// target** first — the surface extent it reads from `0x24(r9)` bounds
+// `X + Width` and `Y + Height` before the store:
+//
+//   stfs f31, 0x3218(r31)   X
+//   stfs f30, 0x321C(r31)   Y
+//   stfs f26, 0x3220(r31)   Width    (clamped)
+//   stfs f27, 0x3224(r31)   Height   (clamped)
+//   stfs f29, 0x3228(r31)   MinZ
+//   stfs f28, 0x322C(r31)   MaxZ
+//
+// That clamp is the whole fix. The argument shadow recorded `65535x65535` on
+// 9,130 of ~15,500 calls — a full-surface reset — and last-write-wins meant
+// most draws inherited it, so BuildViewportMvp divided by 32767 and collapsed
+// every position toward the origin. The device holds what D3D9 actually uses.
+//
+// Sixth time reading the field has beaten shadowing the call. Same reason each
+// time: the device holds the resolved value, whatever path produced it.
+//---------------------------------------------------------------------------
+constexpr uint32_t kDeviceViewport = 0x3218;
+
+uint64_t g_vpFromDevice = 0, g_vpFromShadow = 0, g_vpDisagreed = 0;
+
+bool ReadDeviceViewport(uint32_t device, uint8_t* base, float out[6]) {
+  if (!device) return false;
+  if (!HostPageReadable(REX_RAW_ADDR(device + kDeviceViewport)) ||
+      !HostPageReadable(REX_RAW_ADDR(device + kDeviceViewport + 20)))
+    return false;
+  for (uint32_t i = 0; i < 6; ++i) {
+    const uint32_t bits = REX_LOAD_U32(device + kDeviceViewport + i * 4);
+    std::memcpy(&out[i], &bits, 4);
+  }
+  // Width and height are the only two this is used for; a zero or non-finite
+  // extent is not a viewport and must not become a divide.
+  for (uint32_t i = 0; i < 6; ++i)
+    if (!std::isfinite(out[i])) return false;
+  return out[2] > 0.0f && out[3] > 0.0f;
+}
+
+// The transform the PM4 path applies today, built from the D3D9 viewport
+// instead of from the Xenos context registers. It maps window coordinates to
+// clip space.
 //
 // D3D9's own scale/offset: xs = width/2, xo = x + width/2, and y is flipped.
-bool BuildViewportMvp(float out[16]) {
-  const auto& v = DeviceState().viewport;
-  if (!v.seen || v.width == 0 || v.height == 0) return false;
-  const float xs = float(v.width) * 0.5f;
-  const float xo = float(v.x) + xs;
-  const float ys = -float(v.height) * 0.5f;
-  const float yo = float(v.y) + float(v.height) * 0.5f;
-  float zs = v.max_z - v.min_z;
-  const float zo = v.min_z;
+//
+// Prefers the device's clamped copy and falls back to the argument shadow only
+// when the device cannot be read, counting which was used — a silent fallback
+// to the value that caused the bug would be the worst of both.
+bool BuildViewportMvp(uint32_t device, uint8_t* base, float out[16]) {
+  float dv[6];
+  float vx, vy, vw, vh, vminz, vmaxz;
+  if (ReadDeviceViewport(device, base, dv)) {
+    vx = dv[0]; vy = dv[1]; vw = dv[2]; vh = dv[3];
+    vminz = dv[4]; vmaxz = dv[5];
+    ++g_vpFromDevice;
+    const auto& s = DeviceState().viewport;
+    if (s.seen && (float(s.width) != vw || float(s.height) != vh))
+      ++g_vpDisagreed;
+  } else {
+    const auto& v = DeviceState().viewport;
+    if (!v.seen || v.width == 0 || v.height == 0) return false;
+    vx = float(v.x); vy = float(v.y);
+    vw = float(v.width); vh = float(v.height);
+    vminz = v.min_z; vmaxz = v.max_z;
+    ++g_vpFromShadow;
+  }
+
+  const float xs = vw * 0.5f;
+  const float xo = vx + xs;
+  const float ys = -vh * 0.5f;
+  const float yo = vy + vh * 0.5f;
+  float zs = vmaxz - vminz;
+  const float zo = vminz;
   if (zs == 0.0f) zs = 1.0f;
 
   static const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0,
@@ -604,7 +665,7 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   // the HLE picture directly comparable to the PM4 one on screen. What the
   // constant file says is measured beside it, below, and acted on afterwards.
   float vp[16];
-  const bool have_vp = BuildViewportMvp(vp);
+  const bool have_vp = BuildViewportMvp(device, base, vp);
   if (have_vp) in.mvp = vp;
 
   DrawCall dc;
@@ -1400,7 +1461,7 @@ void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
   // Built once per draw; a draw with no viewport yet gets no control rather
   // than an identity standing in for one.
   float ctl[16];
-  const bool have_ctl = BuildViewportMvp(ctl);
+  const bool have_ctl = BuildViewportMvp(device, base, ctl);
   if (!have_ctl) ++g_aluNoViewportDraws;
   float ctl_lo[2] = {1e30f, 1e30f}, ctl_hi[2] = {-1e30f, -1e30f};
   uint32_t ctl_scored = 0;
@@ -1473,12 +1534,12 @@ void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
     // ClassifyExportSpace takes those out itself, and it has to, because the
     // origin is inside both regions.
     {
-      const auto& vp = DeviceState().viewport;
-      if (vp.seen && vp.width && vp.height) {
-        const float xs = float(vp.width) * 0.5f;
-        const float xo = float(vp.x) + xs;
-        const float ys = -float(vp.height) * 0.5f;
-        const float yo = float(vp.y) + float(vp.height) * 0.5f;
+      float dv[6];
+      if (ReadDeviceViewport(device, base, dv)) {
+        const float xs = dv[2] * 0.5f;
+        const float xo = dv[0] + xs;
+        const float ys = -dv[3] * 0.5f;
+        const float yo = dv[1] + dv[3] * 0.5f;
         ++g_spaceCount[uint32_t(
             ClassifyExportSpace(p[0], p[1], p[3], xs, xo, ys, yo))];
 
@@ -1504,10 +1565,13 @@ void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
         auto& f = DeclFile();
         f << "HLE EXPORT " << s_dumped << ": pos = " << p[0] << " " << p[1]
           << " " << p[2] << " w=" << p[3];
-        const auto& vp = DeviceState().viewport;
-        if (vp.seen)
-          f << "   viewport " << vp.x << "," << vp.y << " " << vp.width << "x"
-            << vp.height;
+        float dv[6];
+        if (ReadDeviceViewport(device, base, dv))
+          f << "   device viewport " << dv[0] << "," << dv[1] << " " << dv[2]
+            << "x" << dv[3];
+        const auto& sv = DeviceState().viewport;
+        if (sv.seen)
+          f << "   arg shadow " << sv.width << "x" << sv.height;
         f << "\n";
         f.flush();
       }
@@ -1646,9 +1710,17 @@ void ReportClipHistogram() {
       ve += buf;
     }
     REXLOG_INFO(
-        "d3d9: stageF  SetViewport extents seen — {}(the shadow keeps only the "
-        "last, and everything built on it inherits that)",
+        "d3d9: stageF  SetViewport *argument* extents seen — {}(the argument "
+        "shadow keeps only the last; the transform now reads the device's "
+        "clamped copy at +0x3218 instead)",
         ve);
+  }
+  if (g_vpFromDevice || g_vpFromShadow) {
+    REXLOG_INFO(
+        "d3d9: stageF  viewport source — device +0x3218 {}, argument shadow "
+        "fallback {}; device disagreed with the shadow's extent on {} of them "
+        "(that difference is the clamp, and the bug)",
+        g_vpFromDevice, g_vpFromShadow, g_vpDisagreed);
   }
 }
 

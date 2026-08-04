@@ -3629,3 +3629,68 @@ replacing a heuristic with exact code changed nothing. That is worth as much as
 a fix would have been: 36% is a property of this measurement, not an artefact of
 the 37% minority it used to be computed over. Whatever is wrong with the
 transform is not the shader identification either.
+
+### The viewport comes off the device, clamped (2026-08-04)
+
+`D3DDevice_SetViewport` (`0x8254BF50`) forwards to `sub_8254BCE8`, which stores
+six floats on the device — and **clamps Width and Height against the render
+target first**, bounding `X + Width` and `Y + Height` by the surface extent it
+reads from `0x24(r9)`:
+
+```asm
+stfs f31, 0x3218(r31)   ; X
+stfs f30, 0x321C(r31)   ; Y
+stfs f26, 0x3220(r31)   ; Width    (clamped)
+stfs f27, 0x3224(r31)   ; Height   (clamped)
+stfs f29, 0x3228(r31)   ; MinZ
+stfs f28, 0x322C(r31)   ; MaxZ
+```
+
+That clamp is the whole bug. The argument shadow recorded `65535x65535` on 3,628
+of ~6,300 calls — a full-surface reset — and last-write-wins meant most draws
+inherited it. **D3D9 never uses that value**; it clamps to the real surface.
+
+**Sixth time reading the device field has beaten shadowing the call.** Same
+reason each time: the device holds the resolved value, whatever path produced it
+and whatever the caller passed.
+
+#### What it measured
+
+```
+viewport source — device +0x3218 4036, argument shadow fallback 0
+device disagreed with the shadow's extent on 2897 of them
+```
+
+**72% of draws were using a wrong viewport.** The device copy was readable every
+time, so the fallback never fired.
+
+The decisive before/after is the control's collapse counter, because it is the
+same code path with the same inputs and only the viewport changed:
+
+| | before | after |
+|---|---|---|
+| control draws collapsed to a point | 1,410 | **6** |
+
+An `xs` of 32767.5 divided every position toward the origin, which is exactly
+what the `kSpreadEpsilon` guard was catching. With the real extent the control
+stops degenerating, so the Stage D2 comparison has a reference again.
+
+Also visible directly in the dump — the same draw, both sources:
+
+```
+pos = -1 1 0 w=1    device viewport 0,0 160x90    arg shadow 65535x65535
+pos =  1 1 0 w=1    device viewport 0,0 160x90    arg shadow 65535x65535
+pos = -1 -1 0 w=1   device viewport 0,0 160x90    arg shadow 65535x65535
+```
+
+Those three exports are the corners of a full-screen quad in clip space, on a
+160x90 render target.
+
+#### What this does *not* explain
+
+The in-clip fraction read 58% in this run against 36% before, and **that is not
+attributable to this fix**. The executed position comes from the shader and the
+constant file; it does not touch the viewport at all, so no mechanism connects
+them. The two runs sampled different draws — the earlier one was dominated by
+world geometry, this one by small render-target passes. Reported here so the
+next reader does not mistake the coincidence for a result.
