@@ -3565,3 +3565,67 @@ Consequences, all real:
 The fix is not a different offset. It is that a per-draw viewport has to be
 captured per draw — the same staleness class as the declaration lag already
 documented, and it wants the same treatment.
+
+### Executing the shader that was actually bound (2026-08-04)
+
+Draws were matched to microcode by ≥90% content similarity against PM4's cache.
+That heuristic could pick a near-identical wrong variant, and it failed outright
+on ~63% of draws — so every number before this came from a 37% minority.
+
+The patch hook has the real thing: `r4` is where D3D9 writes the patched
+microcode and `r3` names the shader. An exact key, no similarity involved.
+
+| shader source | before | after |
+|---|---|---|
+| patch hook (exact) | — | **5,271 (99%)** |
+| content match ≥90% | 2,912 (37%) | 0 |
+| none | 4,886 (62%) | 28 (0.5%) |
+
+Decode of the captured code: **5,271 matched the binding table's fetch count, 0
+decoded a different count, 0 refused.** Vertices executed nearly doubled,
+15,548 → 29,331.
+
+#### `dest` is the CF section start, and the first guess was wrong
+
+The capture needs the CF section, because `DecodeVertexShaderFetches` expects an
+array that starts there. The first attempt assumed the 0x40-byte gap Stage A
+found inside `SH_pPhysical`. **Every decode refused with "exec target at address
+0"** — the self-check earning its place, because a wrong start would otherwise
+have decoded into plausible nonsense.
+
+So the start was *searched* instead, with a checkable answer: the binding table
+states how many vfetches the shader has, and only the true CF start decodes to
+exactly that many. The result is `+0` on 43 of 47 shaders — **`dest` is the CF
+start**, and vfetch indices are relative to it. (`-3` ×3 and `-85` ×1 are search
+false positives; preferring an already-established offset keeps them from
+winning once the layout is known.)
+
+#### A cached answer that is never re-checked is an assumption
+
+Worth keeping, because it produced a report that looked fine and was not. The
+first version cached the resolved offset per shader and reused it blind on later
+captures. The draw-time decode then failed on ~7,770 captures while the source
+tally still counted those shaders as resolved. Fixed by verifying the cached
+offset decodes before reusing it, and re-searching when it does not — one decode
+in the common case.
+
+#### Attributes: 12% disagree, and that is not yet explained
+
+Our decode of D3D9's patched output against PM4's decode of the ring's copy —
+the same bytes by two routes:
+
+```
+1,547 agree   204 disagree (12%)   3,520 had no PM4 peer to compare against
+```
+
+The disagreement is real and unexplained. It is small enough not to dominate and
+large enough not to dismiss; the likely candidate is the second pass that
+reorders fetch triples, which is still unmodelled (see the pairing section).
+
+#### The in-clip fraction did not move
+
+**36%, on 29,331 vertices instead of 15,548.** Nearly doubling the sample and
+replacing a heuristic with exact code changed nothing. That is worth as much as
+a fix would have been: 36% is a property of this measurement, not an artefact of
+the 37% minority it used to be computed over. Whatever is wrong with the
+transform is not the shader identification either.

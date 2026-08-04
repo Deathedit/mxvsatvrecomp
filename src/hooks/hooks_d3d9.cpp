@@ -1156,6 +1156,59 @@ uint64_t g_aluNoShader = 0, g_aluNoAttrs = 0, g_aluStrideMismatch = 0;
 // "the stream mapping does not hold here" and "the bound stride disagrees" are
 // different failures and folding them together would hide either one.
 uint64_t g_aluBadStream = 0;
+
+//---------------------------------------------------------------------------
+// Stage G — execute the shader that was actually bound.
+//
+// Draws are matched to microcode by >=90% content similarity against PM4's
+// cache (g_bestKeyAtDraw). That is a heuristic on two counts: it can pick a
+// near-identical wrong variant, and it fails outright on ~63% of draws, so
+// every number so far comes from a 37% minority.
+//
+// The patch hook has the real thing. r4 is where D3D9 writes the patched
+// microcode and r3 names the shader — an exact key, no similarity involved.
+//
+// **The window's start is checked, not assumed.** Vfetch triples land at
+// dest + 12*index, so dest is the instruction section and the CF section
+// precedes it; Stage A found that gap to be 0x40 bytes. Rather than trust
+// that, the capture records the binding table's own vfetch count and the
+// decode has to produce exactly that many attributes. A wrong window start
+// decodes into plausible nonsense, and this makes that countable instead.
+//---------------------------------------------------------------------------
+// A first attempt assumed the CF section sat 0x40 bytes before dest, the gap
+// Stage A found inside SH_pPhysical. It does not: every decode refused with
+// "exec target at address 0", which is the self-check earning its place — a
+// wrong start would otherwise have decoded into plausible nonsense.
+//
+// So the start is *searched* rather than assumed, and the search has a
+// verifiable answer: the binding table says how many vfetches this shader has,
+// and only the true CF start decodes to exactly that many. Resolved once per
+// shader handle and reused, because the offset is a property of the layout.
+constexpr uint32_t kPatchWindowBack = 128;   // dwords captured before dest
+
+struct PatchedCode {
+  std::vector<uint32_t> code;   // host-endian, from dest - kPatchWindowBack*4
+  uint32_t expect_fetches = 0;  // what the binding table said
+  uint32_t variant = 0;
+  uint32_t code_off = 0;        // dwords into `code` where the CF section is
+  bool     resolved = false;    // code_off was found by decoding, not assumed
+};
+
+// Winning start, as a signed dword distance from dest. The histogram is the
+// finding: one value across every shader means a fixed layout.
+std::map<int32_t, uint64_t> g_patchCodeOffsets;
+std::map<uint32_t, PatchedCode> g_patchedCode;   // shader handle -> latest
+
+uint64_t g_srcPatchHook = 0;    // draws whose code came from the patch hook
+uint64_t g_srcHeuristic = 0;    // ... from the >=90% content match
+uint64_t g_srcNone = 0;
+uint64_t g_patchDecodeOk = 0;     // decoded, and the count matched the table
+uint64_t g_patchDecodeCount = 0;  // decoded, count disagreed with the table
+uint64_t g_patchDecodeFail = 0;   // refused outright
+std::map<std::string, uint64_t> g_patchDecodeFailWhy;
+// Independent third reading: our decode of D3D9's patched output against
+// PM4's decode of the ring's copy. Same bytes by two routes.
+uint64_t g_attrAgree = 0, g_attrDisagree = 0, g_attrNoPeer = 0;
 uint64_t g_aluConstReads = 0, g_aluConstZero = 0;
 std::map<int, uint64_t> g_aluStatus;
 std::map<uint32_t, uint64_t> g_aluBlocking;
@@ -1218,19 +1271,85 @@ void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
   } charge{t0};
   ++g_aluDrawsEntered;
 
+  // Stage G: the exact code first, the heuristic only as a fallback, and each
+  // counted separately so "coverage improved" is a measurement rather than a
+  // hope. Both paths are kept because the patch hook fires on the lazy-state
+  // path — a shader bound but never re-patched has no entry, and swapping one
+  // heuristic for one assumption would not be progress.
+  const std::vector<uint32_t>* codep = nullptr;
+  uint32_t off = 0;
+  static std::vector<VertexAttribute> decoded;
+  const std::vector<VertexAttribute>* attrsp = nullptr;
+  const std::vector<VertexAttribute>* peer = nullptr;   // PM4's, for comparison
+
+  auto pi = g_patchedCode.find(handle);
+  if (pi != g_patchedCode.end() && pi->second.resolved) {
+    decoded.clear();
+    const char* why = nullptr;
+    const uint32_t s = pi->second.code_off;
+    if (DecodeVertexShaderFetches(pi->second.code.data() + s,
+                                  uint32_t(pi->second.code.size() - s), decoded,
+                                  &why)) {
+      // The binding table said how many vfetches this shader has. If the decode
+      // disagrees, the captured window did not start where it was assumed to —
+      // a wrong start would otherwise decode into plausible nonsense.
+      if (decoded.size() == pi->second.expect_fetches) {
+        ++g_patchDecodeOk;
+        codep = &pi->second.code;
+        off = s;
+        attrsp = &decoded;
+      } else {
+        ++g_patchDecodeCount;
+      }
+    } else {
+      ++g_patchDecodeFail;
+      ++g_patchDecodeFailWhy[why ? why : "?"];
+    }
+  }
+
   auto bi = g_bestKeyAtDraw.find(handle);
-  if (bi == g_bestKeyAtDraw.end() || bi->second.pct < 90) { ++g_aluNoShader; return; }
   auto di = g_physDumpAtDraw.find(handle);
-  if (di == g_physDumpAtDraw.end()) { ++g_aluNoShader; return; }
-  auto ci = mx::pm4::CapturedShaders().find(bi->second.key);
-  if (ci == mx::pm4::CapturedShaders().end() || ci->second.attrs.empty()) {
-    ++g_aluNoAttrs;
+  auto ci = (bi != g_bestKeyAtDraw.end())
+                ? mx::pm4::CapturedShaders().find(bi->second.key)
+                : mx::pm4::CapturedShaders().end();
+  const bool heuristic_ok =
+      bi != g_bestKeyAtDraw.end() && bi->second.pct >= 90 &&
+      di != g_physDumpAtDraw.end() &&
+      ci != mx::pm4::CapturedShaders().end() && !ci->second.attrs.empty() &&
+      bi->second.off_dwords < di->second.size();
+  if (heuristic_ok) peer = &ci->second.attrs;
+
+  if (codep) {
+    ++g_srcPatchHook;
+    if (peer) {
+      // Third independent reading of the same fact: our decode of D3D9's
+      // patched output against PM4's decode of the ring's copy. Same bytes by
+      // two routes, so they should agree.
+      bool same = peer->size() == attrsp->size();
+      for (size_t a = 0; same && a < attrsp->size(); ++a) {
+        same = (*peer)[a].fetch_slot == (*attrsp)[a].fetch_slot &&
+               (*peer)[a].format == (*attrsp)[a].format &&
+               (*peer)[a].offset_bytes == (*attrsp)[a].offset_bytes &&
+               (*peer)[a].stride_bytes == (*attrsp)[a].stride_bytes;
+      }
+      if (same) ++g_attrAgree; else ++g_attrDisagree;
+    } else {
+      ++g_attrNoPeer;
+    }
+  } else if (heuristic_ok) {
+    ++g_srcHeuristic;
+    codep = &di->second;
+    off = bi->second.off_dwords;
+    attrsp = &ci->second.attrs;
+  } else {
+    ++g_srcNone;
+    ++g_aluNoShader;
     return;
   }
-  const auto& attrs = ci->second.attrs;
-  const std::vector<uint32_t>& code = di->second;
-  const uint32_t off = bi->second.off_dwords;
-  if (off >= code.size()) { ++g_aluNoShader; return; }
+
+  const std::vector<VertexAttribute>& attrs = *attrsp;
+  const std::vector<uint32_t>& code = *codep;
+  if (attrs.empty()) { ++g_aluNoAttrs; return; }
 
   // Which stream each attribute fetches from.
   //
@@ -1573,6 +1692,48 @@ void ReportShaderExecution() {
       g_aluNoShader, g_aluNoAttrs, g_aluStrideMismatch, g_aluBadStream,
       g_aluDrawsEntered);
   ReportClipHistogram();
+
+  // Stage G — where the executed code came from. The headline is coverage:
+  // the heuristic left 63% of draws with no shader at all, and every number
+  // above was computed on the remaining minority.
+  const uint64_t src_total = g_srcPatchHook + g_srcHeuristic + g_srcNone;
+  if (src_total) {
+    REXLOG_INFO(
+        "d3d9: stageG  shader source — patch hook (exact) {} ({}%), content "
+        "match >=90% {} ({}%), none {} ({}%) of {} draws",
+        g_srcPatchHook, (g_srcPatchHook * 100) / src_total, g_srcHeuristic,
+        (g_srcHeuristic * 100) / src_total, g_srcNone,
+        (g_srcNone * 100) / src_total, src_total);
+    std::string why;
+    for (const auto& [w, n] : g_patchDecodeFailWhy) {
+      char buf[96];
+      std::snprintf(buf, sizeof(buf), "%s:%llu ", w.c_str(),
+                    (unsigned long long)n);
+      why += buf;
+    }
+    REXLOG_INFO(
+        "d3d9: stageG  patched decode — {} matched the binding table's fetch "
+        "count, {} decoded a different count (wrong window start), {} refused "
+        "[{}]",
+        g_patchDecodeOk, g_patchDecodeCount, g_patchDecodeFail,
+        why.empty() ? "none" : why);
+    std::string offs;
+    for (const auto& [o, n] : g_patchCodeOffsets) {
+      char buf[48];
+      std::snprintf(buf, sizeof(buf), "%+d:%llu ", o, (unsigned long long)n);
+      offs += buf;
+    }
+    REXLOG_INFO(
+        "d3d9: stageG  CF section found at dword offsets from dest — {}(one "
+        "value across every shader means a fixed layout; assuming -16 was "
+        "wrong and the decode said so)",
+        offs.empty() ? "none resolved " : offs);
+    REXLOG_INFO(
+        "d3d9: stageG  attributes, our decode of D3D9's patched output vs "
+        "PM4's decode of the ring's copy — {} agree, {} disagree, {} had no "
+        "PM4 peer to compare against",
+        g_attrAgree, g_attrDisagree, g_attrNoPeer);
+  }
 }
 
 void ReportPhysicalAtDrawTime() {
@@ -1953,6 +2114,7 @@ struct PatchPrediction {
   bool     bound = false;
 };
 
+
 // Reads the binding table, predicts every patched vfetch, and returns them for
 // comparison after the original runs. Every read is page-guarded; the pointers
 // are D3D9's own arguments, which it is about to dereference itself.
@@ -2051,6 +2213,76 @@ void PredictPatchedFetches(uint32_t self, uint32_t dest, uint32_t decl,
     }
     out.push_back(p);
   }
+}
+
+// The binding table's vfetch count on its own, so the capture can run on every
+// call while the full prediction stays sampled.
+uint32_t ReadPatchFetchCount(uint32_t self, uint32_t variant, uint8_t* base) {
+  if (!self) return 0;
+  const uint32_t slot = self + (variant + kUCodePtrTable) * 8;
+  if (!HostPageReadable(REX_RAW_ADDR(slot))) return 0;
+  const uint32_t blob = self + REX_LOAD_U32(slot) + kUCodeBlobDelta;
+  if (!HostPageReadable(REX_RAW_ADDR(blob + kBlobFetchCount))) return 0;
+  const uint32_t count = REX_LOAD_U32(blob + kBlobFetchCount);
+  return count > kMaxPatchFetch ? 0 : count;
+}
+
+// Copies the patched microcode out of the destination, keyed by shader handle.
+// Must run immediately after the original: the destination is in the command
+// ring and will be overwritten.
+void CapturePatchedCode(uint32_t self, uint32_t dest, uint32_t variant,
+                        uint32_t expect_fetches, uint8_t* base) {
+  if (!self || !dest || dest < kPatchWindowBack * 4) return;
+  const uint32_t start = dest - kPatchWindowBack * 4;
+
+  auto it = g_patchedCode.find(self);
+  const bool known = it != g_patchedCode.end() && it->second.resolved;
+  const uint32_t known_off = known ? it->second.code_off : 0;
+
+  PatchedCode pc;
+  pc.expect_fetches = expect_fetches;
+  pc.variant = variant;
+  pc.code.reserve(kPatchWindowBack + kPhysProbeDwords);
+  for (uint32_t i = 0; i < kPatchWindowBack + kPhysProbeDwords; ++i) {
+    const uint32_t at = start + i * 4;
+    if ((at & (kHostPageSize - 1)) == 0 && !HostPageReadable(REX_RAW_ADDR(at)))
+      break;
+    pc.code.push_back(REX_LOAD_U32(at));
+  }
+  if (pc.code.size() < 32) return;
+
+  // Try the known offset first — but *verify* it, do not assume it. An earlier
+  // version cached the offset and reused it blind, and the draw-time decode
+  // then failed on thousands of captures while the report happily said the
+  // shader was resolved. A cached answer that is never re-checked is an
+  // assumption wearing a measurement's clothes.
+  static std::vector<mx::pm4::VertexAttribute> probe;
+  auto decodes_at = [&](uint32_t s) {
+    if (s >= pc.code.size()) return false;
+    probe.clear();
+    return mx::pm4::DecodeVertexShaderFetches(pc.code.data() + s,
+                                              uint32_t(pc.code.size() - s),
+                                              probe, nullptr) &&
+           probe.size() == expect_fetches;
+  };
+
+  if (known && decodes_at(known_off)) {
+    pc.code_off = known_off;
+    pc.resolved = true;
+  } else {
+    // Only the true CF start decodes to the count the binding table states, so
+    // this is a search with a checkable answer rather than a guess. Preferring
+    // the known offset first also stops a low false positive from winning when
+    // the real layout is already established.
+    for (uint32_t s = 0; s < pc.code.size(); ++s) {
+      if (!decodes_at(s)) continue;
+      pc.code_off = s;
+      pc.resolved = true;
+      ++g_patchCodeOffsets[int32_t(s) - int32_t(kPatchWindowBack)];
+      break;
+    }
+  }
+  g_patchedCode[self] = std::move(pc);
 }
 
 // After the original ran: did it write what the rule predicts?
@@ -2580,7 +2812,14 @@ extern "C" REX_FUNC(sub_82564C50) {
                           s_pred);
   }
 
+  const uint32_t nfetch =
+      REXCVAR_GET(hle_capture) ? ReadPatchFetchCount(args[0], args[4], base) : 0;
+
   orig_PatchVertexShader(ctx, base);
+
+  // Every call, not just the sampled ones: this is the coverage fix, and the
+  // destination is in the command ring so there is no second chance at it.
+  if (nfetch) CapturePatchedCode(args[0], args[1], args[4], nfetch, base);
 
   if (probe) CheckPatchedFetches(s_pred, base);
 }
