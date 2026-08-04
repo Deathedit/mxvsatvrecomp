@@ -1330,6 +1330,13 @@ struct ShaderScore {
   uint32_t attrs = 0;                     // fetch count, from the binding table
   uint32_t first_dword = 0;               // identity check, with attrs
   uint64_t vp_extent = 0;                 // (w<<32)|h, last seen
+  // Range of the position attribute's four components over every execution. A
+  // component that never moves is not a coordinate — it is padding, or a
+  // homogeneous 1 the shader needs, and reading it as z is a misinterpretation
+  // no amount of decode correctness will catch.
+  float in_lo[4] = {1e30f, 1e30f, 1e30f, 1e30f};
+  float in_hi[4] = {-1e30f, -1e30f, -1e30f, -1e30f};
+  uint64_t in_seen = 0;
   // The first execution in full, captured as it happens. Which shader is worst
   // is not known until the report, and by then the vertex is long gone — so
   // every shader records its first, and the report prints the one that earned
@@ -1569,6 +1576,17 @@ void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
     // The same guard the transform probe needed: an export of (0,0,0,w=0) sits
     // inside any volume and means nothing.
     ++ss.execs;
+    // The shader's own position input, before the shader touches it. attrs[0]
+    // is the attribute at offset 0, which every world shader here declares as
+    // its position.
+    if (!attrs.empty()) {
+      ++ss.in_seen;
+      for (uint32_t c = 0; c < 4; ++c) {
+        const float f = values[0][c];
+        if (f < ss.in_lo[c]) ss.in_lo[c] = f;
+        if (f > ss.in_hi[c]) ss.in_hi[c] = f;
+      }
+    }
     if (p[0] == 0.0f && p[1] == 0.0f && p[2] == 0.0f) {
       ++g_aluDegenerate;
       ++ss.degenerate;
@@ -1910,18 +1928,46 @@ void ReportPerShader() {
       g_shaderScore.size(), clean, clean_execs, pct(clean_execs, g_aluRuns),
       broken, broken_execs, pct(broken_execs, g_aluRuns));
 
-  // The seed for verifying one draw by hand, written where the declarations
+  // The seeds for verifying draws by hand, written where the declarations
   // already go.
-  if (worst && !worst->first_exec.empty()) {
-    auto& f = DeclFile();
-    f << "\nSTAGE I worst shader (most executions in no modelled space): 0x"
-      << std::hex << worst_handle << std::dec << "\n"
-      << "  " << worst->execs << " execs, "
-      << worst->space[uint32_t(mx::pm4::ExportSpace::kNeither)]
-      << " neither, " << worst->in_clip << " in clip\n"
-      << worst->first_exec << "\n";
-    f.flush();
+  //
+  // Ranking by raw `neither` count picked the 129x129 shadow pass, which is the
+  // least diagnostic shader in the table: a cascade covers a slice of the world
+  // and the whole scene is drawn against it, so geometry outside its frustum is
+  // what that pass is *supposed* to produce. The shaders worth reading by hand
+  // are the ones drawing world geometry at the back-buffer's own extent and
+  // exporting nothing inside the volume. So dump the busiest few outright, and
+  // let whoever reads them pick.
+  (void)worst;
+  (void)worst_handle;
+  auto& f = DeclFile();
+  uint32_t dumped = 0;
+  for (const auto* r : rows) {
+    const ShaderScore& s = r->second;
+    if (s.first_exec.empty()) continue;
+    if (dumped++ >= 6) break;
+    const uint64_t sp = s.space[0] + s.space[1] + s.space[2] + s.space[3];
+    const uint64_t scored = s.execs - s.degenerate;
+    f << "\nSTAGE I shader 0x" << std::hex << r->first << std::dec << " — "
+      << s.execs << " execs, rt " << uint32_t(s.vp_extent >> 32) << "x"
+      << uint32_t(s.vp_extent) << ", clip-like "
+      << pct(s.space[uint32_t(mx::pm4::ExportSpace::kClipLike)], sp)
+      << "%, window-like "
+      << pct(s.space[uint32_t(mx::pm4::ExportSpace::kWindowLike)], sp)
+      << "%, neither "
+      << pct(s.space[uint32_t(mx::pm4::ExportSpace::kNeither)], sp)
+      << "%, in-clip " << pct(s.in_clip, scored) << "%\n"
+      << s.first_exec;
+    if (s.in_seen) {
+      f << "  position input range over " << s.in_seen << " executions:\n";
+      for (uint32_t c = 0; c < 4; ++c) {
+        f << "    ." << "xyzw"[c] << "  [" << s.in_lo[c] << " .. "
+          << s.in_hi[c] << "]"
+          << (s.in_lo[c] == s.in_hi[c] ? "   CONSTANT" : "") << "\n";
+      }
+    }
   }
+  f.flush();
 }
 
 void ReportShaderExecution() {

@@ -3792,3 +3792,97 @@ vertex, and `w=1` out of a shader whose input `w` is 10.65 is worth explaining.
 Whether the fault is the `0x20` format decode or the shader is **not concluded
 here** — it is written down so the next step starts from a specific vertex with
 specific bytes rather than from a percentage.
+
+### The position input is (x, y, z, 1) read as (x, y, 1, z) (2026-08-04)
+
+Chasing the Stage I seed found a located defect, and not the one predicted.
+
+#### The format decode is correct — that hypothesis is dead
+
+`0x216C9620`'s position attribute is `fmt 0x20` = 32 = `k_16_16_16_16_FLOAT`.
+Decoding its eight bytes by hand against the IEEE half format reproduces what the
+probe printed, digit for digit:
+
+```
+raw BA 0D E5 D8 00 3C 53 49
+little-endian halves:  0.000349522  -156.625  1  10.6484
+probe printed       :  0.000349522  -156.625  1  10.6484
+```
+
+The other two attributes (`0x1F` = `k_16_16_FLOAT`, `0x06` = `k_8_8_8_8`) check
+out the same way. **`ReadVertexAttribute` is right, the format table is right,
+and the byte order within each component is right.** The defect is one level up:
+what the components *mean*.
+
+Also worth recording: ranking "worst" by raw `neither` count picked the 129x129
+shadow pass, which is the **least** diagnostic shader in the table — a cascade
+covers a slice of the world and the whole scene is drawn against it, so geometry
+outside its frustum is what that pass is supposed to produce. The shaders worth
+reading are the 1280x720 ones at 0% in-clip.
+
+#### The third component never moves
+
+Dumping the position attribute's per-component range over every execution, for
+the six busiest shaders:
+
+| shader | rt | `.x` | `.y` | `.z` | `.w` |
+|---|---|---|---|---|---|
+| `0x216C9620` | 129x129 | -0.005 .. 0.083 | -668.5 .. 183.6 | **1 .. 1** | -646 .. 570.5 |
+| `0x2160E720` | 768x384 | 0.002 .. 5.570 | -4.605 .. 1.788 | **1 .. 1** | -0.705 .. 3.768 |
+| `0x22D3E460` | 1280x720 | 2.395 .. 4.797 | -4.605 .. 0.284 | **1 .. 1** | -0.705 .. 3.768 |
+| `0x22D46B60` | 1280x720 | 3.059 .. 4.789 | -2.211 .. 0.178 | **1 .. 1** | -0.002 .. 0.226 |
+| `0x22D4B320` | 1280x720 | 0.103 .. 5.445 | -0.262 .. 0.443 | **1 .. 1** | -0.401 .. 0.288 |
+
+3,032 executions across five unrelated shaders and `.z` is bit-identical `1.0`
+every time (bytes 4-5 read `00 3C`, half `0x3C00`), while `.w` swings across six
+hundred units. **A homogeneous position has a constant `w`, not a constant `z`.**
+The components are being delivered in the wrong order.
+
+Swapping the two halves within each dword puts the constant where it belongs:
+
+| shader | as read now | halves swapped within each dword |
+|---|---|---|
+| `0x216C9620` | (0.00035, -156.6, **1**, 10.65) | (-156.6, 0.00035, 10.65, **w=1**) |
+| `0x2160E720` | (4.559, -2.373, **1**, -0.057) | (-2.373, 4.559, -0.057, **w=1**) |
+| `0x22D3E460` | (4.496, -2.076, **1**, -0.705) | (-2.076, 4.496, -0.705, **w=1**) |
+| `0x22D46B60` | (4.563, 0.178, **1**, 0.226) | (0.178, 4.563, 0.226, **w=1**) |
+| `0x22D4B320` | (0.263, 0.185, **1**, 0.201) | (0.185, 0.263, 0.201, **w=1**) |
+
+Every one lands on `w = 1.0` exactly. Five shaders do not agree on that by
+accident.
+
+#### The mechanism, and the part that is not yet settled
+
+`ApplyFetchEndian` (`shader_ucode.cpp:162`) implements `endian == 2` as a literal
+8-in-32 swap:
+
+```cpp
+} else if (endian == 2) {
+  for (size_t i = 0; i + 3 < bytes; i += 4) {
+    std::swap(data[i], data[i + 3]);
+    std::swap(data[i + 1], data[i + 2]);
+  }
+}
+```
+
+Reversing all four bytes of a dword that holds **two 16-bit components**
+byte-swaps each half *and* reverses their order. For big-endian halves `[A][B]`
+the correct result is `A, B` (an 8-in-16 swap); 8-in-32 yields `B, A`. That is
+exactly the permutation the data shows, and it would affect every 16-bit format —
+`k_16_16` (25), `k_16_16_16_16` (26), `k_16_16_FLOAT` (31), `k_16_16_16_16_FLOAT`
+(32).
+
+**Not concluded: whether that is the whole cause.** `VertexAttribute::dest_swizzle`
+is decoded (`shader_ucode.cpp:553`) and then **never applied anywhere** — not in
+`ReadVertexAttribute`, not in the interpreter. An unapplied vfetch swizzle is a
+second mechanism that could reorder components, and it has not been ruled out.
+The endian explanation matches the observed permutation mechanically and exactly;
+the swizzle one is simply untested.
+
+#### Blast radius — why this is not a drive-by fix
+
+`ApplyFetchEndian` is not probe-only. `CopyVertex` (`d3d9_draw.cpp:56`) uses it to
+build the vertices that are actually **rendered**, so changing it changes what
+appears on screen, not just what the probe reports. It needs its own step, with
+the 23 declaration fixtures and `ucode_test` run against it, and the swizzle
+question settled first.
