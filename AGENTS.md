@@ -3521,6 +3521,16 @@ file dump showed back in Stage 3.
 **So the clip test was the right yardstick and 36% is a real number.** The
 `2-10` bucket is genuinely off-screen geometry, not a units error.
 
+> **CORRECTED — this verdict was an average over three unrelated populations.**
+> Stage I broke the same measurement down per shader. 41% of all executions come
+> from a *single one-attribute shader* (`0x215F4B60`) that is 100% clip-like and
+> 100% in-clip — a fullscreen quad, which cannot be anything else. Every
+> multi-attribute shader drawing world geometry at 1280x720 reads **0% in-clip
+> and mostly window-like**, which is what the PM4 path said all along. The eight
+> raw exports quoted above are real, but they are not representative: they were
+> whichever draw the probe reached first. See "The space verdict was one shader"
+> below.
+
 Worth stating plainly: **the two paths disagree about the space, running the
 same shaders through the same interpreter.** The difference is the constants —
 PM4 feeds `m_aluConsts` from `LOAD_ALU_CONSTANT`, the D3D9 path reads
@@ -3694,3 +3704,91 @@ constant file; it does not touch the viewport at all, so no mechanism connects
 them. The two runs sampled different draws — the earlier one was dominated by
 world geometry, this one by small render-target passes. Reported here so the
 next reader does not mistake the coincidence for a result.
+
+### The space verdict was one shader (2026-08-04)
+
+The fraction of HLE-executed positions landing inside the clip volume sat at 36%
+across four independent improvements — the stream mapping, the attribute source,
+the sample size, and exact shader identification — then read 58% in the run after
+the viewport fix, which cannot have caused it. Five changes, no verdict.
+
+The reason none of that could be judged is not a bug:
+
+> **Nobody knew what the in-clip fraction was supposed to be.** Real scenes cull,
+> render shadow maps and run off-screen passes, so 100% is wrong and 36% might be
+> right. Every number collected compared the HLE path against itself.
+
+So Stage I stopped asking how big the failure is and asked where it is: the same
+counters, attributed to the shader handle that produced them
+(`ShaderScore` / `g_shaderScore`, `hooks_d3d9.cpp`). 300 s run, `mx_255.log`, 22
+shaders, zero access violations, per-shader sums equal to the globals they were
+taken beside, and zero handle-identity changes.
+
+| shader | attrs | execs | rt | clip-like | window-like | neither | in-clip |
+|---|---|---|---|---|---|---|---|
+| `0x215F4B60` | **1** | 2,922 | 1280x720 | **100%** | 0% | 0% | **100%** |
+| `0x216C9620` | 3 | 1,912 | **129x129** | 30% | 3% | 66% | 27% |
+| `0x2160E720` | 3 | 824 | 768x384 | 77% | 0% | 22% | 74% |
+| `0x22D3DC20` | 5 | 232 | 1280x720 | 5% | 69% | 25% | **0%** |
+| `0x22D46320` | 6 | 136 | 1280x720 | 0% | 35% | 64% | **0%** |
+| `0x22D4AAE0` | 6 | 136 | 1280x720 | 22% | 62% | 15% | **0%** |
+| `0x22D65B60` | 4 | 136 | 1280x720 | 0% | **100%** | 0% | **0%** |
+| `0x22D41BE0` | 6 | 88 | 1280x720 | 0% | 54% | 45% | **0%** |
+| `0x22D53760` | 6 | 88 | 1280x720 | 11% | 71% | 17% | **0%** |
+| `0x22D5C3E0` | 7 | 88 | 1280x720 | 0% | 28% | 71% | **0%** |
+
+The aggregate — "clip-like 59%" — is an average over three populations that have
+nothing to do with each other:
+
+1. **`0x215F4B60`, one attribute, 41% of every execution in the run.** A shader
+   with a single vertex attribute is a fullscreen quad or a blit. It exports
+   clip space because its positions *are* clip space, hardcoded. It cannot be
+   wrong, and it carried essentially the whole 59%.
+2. **`0x216C9620` at 129x129, another 27%.** A shadow or cube-map pass with its
+   own projection. Two shaders are 68% of the entire measurement.
+3. **Every multi-attribute shader drawing world geometry at 1280x720 is 0%
+   in-clip**, without exception, and reads window-like far more often than
+   clip-like.
+
+**That third row is the finding.** The D3D9 path and the PM4 path were never
+actually in disagreement about the space — PM4 said window coordinates for the
+world geometry, and so does this, once the quad shader stops outvoting it. The
+"exports are clip space" section above was reading a fullscreen quad.
+
+It also explains why four improvements moved nothing: they were all correct, and
+they all improved a number whose value was set by a shader that was already
+right.
+
+#### What this changes
+
+- **The global in-clip percentage is retired as a headline.** It averages a
+  post-process quad, a shadow pass and world geometry into one figure that
+  describes none of them. Read the per-shader table.
+- **Shader class predicts the outcome.** Attribute count and render-target
+  extent are on every row for exactly this reason: 1 attr at 1280x720 is a
+  quad, 3 attrs at 129x129 is a shadow map, 4–7 attrs at 1280x720 is the world.
+- **The unexplained 12% attribute disagreement is not evenly spread either** —
+  the `ATTR DISAGREE` dumps show HLE reading `stride=0 fmt=0` where PM4 has real
+  values, which is a decode returning nothing rather than something different.
+
+#### The seed for hand verification
+
+Every shader records its first execution in full so the worst one can be checked
+by hand without a second run. `0x216C9620`, 1,277 of 1,912 executions in no
+modelled space:
+
+```
+attr0  r1 (position) stream 0  fetch 95  fmt 0x20  off 0   stride 28
+       raw BA 0D E5 D8 00 3C 53 49  ->  0.000349522 -156.625 1 10.6484
+attr1  r0            stream 0  fetch 95  fmt 0x1F  off 12  stride 28
+       raw 5B C2 10 2C 00 00 00 00  ->  -3.17773 0.0634766 0 1
+attr2  r0            stream 0  fetch 95  fmt 0x06  off 20  stride 28
+       raw FF FF FF 00              ->  1 1 1 0
+position = -16.1811 11.9436 0.497487 w=1
+```
+
+A position input of `(0.00035, -156.6, 1, 10.65)` is not a plausible object-space
+vertex, and `w=1` out of a shader whose input `w` is 10.65 is worth explaining.
+Whether the fault is the `0x20` format decode or the shader is **not concluded
+here** — it is written down so the next step starts from a specific vertex with
+specific bytes rather than from a percentage.

@@ -27,6 +27,7 @@
 
 #include <rex/cvar.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -1304,6 +1305,43 @@ uint64_t g_ctlVerts = 0, g_ctlDegenerate = 0, g_aluNoViewportDraws = 0;
 uint64_t g_ctlCollapsedDraws = 0;
 constexpr float kCtlSpreadEpsilon = 1e-4f;
 
+// Stage I — the same numbers, attributed to the shader that produced them.
+//
+// Every count above is one percentage over a mixed population, and no one knows
+// what that percentage is supposed to be: real scenes cull, draw shadow maps and
+// run off-screen passes, so 100% in-clip is wrong and 36% may be right. Four
+// independent improvements moved it by nothing and a fifth appeared to move it
+// for a reason that cannot have caused it. A number with no target value cannot
+// judge a change.
+//
+// So stop asking how big the failure is and ask *where* it is. If the 29% that
+// land in no modelled space come from three shaders, that is a bug with an
+// address. If they are spread evenly over forty, the defect is in the model —
+// the constants, the interpreter, or the space hypothesis itself — and no amount
+// of further input precision will touch it. Both answers are useful; the single
+// global percentage can express neither.
+struct ShaderScore {
+  uint64_t execs = 0;
+  uint64_t space[4] = {};                 // indexed by ExportSpace
+  uint64_t clip[kClipBucketCount] = {};
+  uint64_t in_clip = 0;
+  uint64_t degenerate = 0;
+  uint64_t draws = 0;
+  uint32_t attrs = 0;                     // fetch count, from the binding table
+  uint32_t first_dword = 0;               // identity check, with attrs
+  uint64_t vp_extent = 0;                 // (w<<32)|h, last seen
+  // The first execution in full, captured as it happens. Which shader is worst
+  // is not known until the report, and by then the vertex is long gone — so
+  // every shader records its first, and the report prints the one that earned
+  // it. Costs one short string per distinct shader.
+  std::string first_exec;
+};
+std::map<uint32_t, ShaderScore> g_shaderScore;   // key: shader handle
+// If D3D9 recycles a handle for a different shader, the table silently merges
+// two populations and reads as a finding. Counted, and reported: a nonzero
+// value invalidates every row rather than quietly biasing it.
+uint64_t g_shaderIdentityChanged = 0;
+
 void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
                           const mx::pm4::HleStream* streams, uint32_t device,
                           uint8_t* base) {
@@ -1437,6 +1475,19 @@ void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
     }
   }
 
+  // Stage I: this draw's row. Keyed by the shader handle, which is only a valid
+  // identity if D3D9 does not reuse it — so the identity is checked, not
+  // assumed, against two things that cannot both survive a substitution.
+  ShaderScore& ss = g_shaderScore[handle];
+  const uint32_t first_dword = off < code.size() ? code[off] : 0;
+  if (ss.draws == 0) {
+    ss.attrs = uint32_t(attrs.size());
+    ss.first_dword = first_dword;
+  } else if (ss.attrs != attrs.size() || ss.first_dword != first_dword) {
+    ++g_shaderIdentityChanged;
+  }
+  ++ss.draws;
+
   // The constant file, straight from the device. Const(i) reads
   // alu_consts[i*4], and D3D9 register N lives at +0x780 + N*16, so the two are
   // the same indexing and no rebase is needed — the API applied the base.
@@ -1517,8 +1568,10 @@ void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
                         std::isfinite(p[2]) && std::isfinite(p[3]);
     // The same guard the transform probe needed: an export of (0,0,0,w=0) sits
     // inside any volume and means nothing.
+    ++ss.execs;
     if (p[0] == 0.0f && p[1] == 0.0f && p[2] == 0.0f) {
       ++g_aluDegenerate;
+      ++ss.degenerate;
     } else {
       // Kept exactly as Stage C measured it — full volume, z included — so the
       // 35% stays reproducible beside the histogram rather than being quietly
@@ -1526,8 +1579,10 @@ void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
       if (finite && p[3] > 0.0f && p[0] >= -p[3] && p[0] <= p[3] &&
           p[1] >= -p[3] && p[1] <= p[3] && p[2] >= 0.0f && p[2] <= p[3]) {
         ++g_aluInClip;
+        ++ss.in_clip;
       }
       ++g_clipExec[ClassifyClip(p)];
+      ++ss.clip[ClassifyClip(p)];
     }
 
     // Stage F. Scored on every execution including the degenerate ones —
@@ -1540,8 +1595,11 @@ void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
         const float xo = dv[0] + xs;
         const float ys = -dv[3] * 0.5f;
         const float yo = dv[1] + dv[3] * 0.5f;
-        ++g_spaceCount[uint32_t(
-            ClassifyExportSpace(p[0], p[1], p[3], xs, xo, ys, yo))];
+        const ExportSpace sp =
+            ClassifyExportSpace(p[0], p[1], p[3], xs, xo, ys, yo);
+        ++g_spaceCount[uint32_t(sp)];
+        ++ss.space[uint32_t(sp)];
+        ss.vp_extent = (uint64_t(uint32_t(dv[2])) << 32) | uint32_t(dv[3]);
 
         // The same buckets after the viewport inverse. Done on the divided
         // position and rewrapped with w=1, so the bucket function sees exactly
@@ -1553,6 +1611,43 @@ void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
           ++g_vpApplied;
         }
       }
+    }
+
+    // Stage I: this shader's first execution, in full — the raw bytes in, the
+    // decoded attributes, and the position out. Recorded for every shader
+    // because which one is worst is not known until the report, by which time
+    // the vertex is gone. This is the seed for verifying a draw by hand against
+    // the disassembly, and it costs one string per distinct shader.
+    if (ss.first_exec.empty() && g_shaderScore.size() <= 64) {
+      char buf[256];
+      std::snprintf(buf, sizeof(buf),
+                    "shader 0x%08X, %u attrs, vertex %llu of draw:\n",
+                    handle, uint32_t(attrs.size()),
+                    (unsigned long long)src);
+      ss.first_exec = buf;
+      for (size_t a = 0; a < attrs.size(); ++a) {
+        const HleStream& sa = streams[astream[a]];
+        std::snprintf(buf, sizeof(buf),
+                      "  attr%-2zu r%-2u%s stream %u  fetch %u  fmt 0x%02X  "
+                      "off %u  stride %u  ->  %g %g %g %g\n  raw",
+                      a, attrs[a].dest_reg,
+                      attrs[a].feeds_position ? " (position)" : "          ",
+                      astream[a], attrs[a].fetch_slot, attrs[a].format,
+                      attrs[a].offset_bytes, attrs[a].stride_bytes,
+                      values[a][0], values[a][1], values[a][2], values[a][3]);
+        ss.first_exec += buf;
+        // The bytes the value was read from, byte-swapped exactly as the fetch
+        // saw them, so the decode can be checked by hand and not just believed.
+        const uint32_t o = attrs[a].offset_bytes;
+        for (uint32_t k = 0; k < 16 && o + k < sa.stride; ++k) {
+          std::snprintf(buf, sizeof(buf), " %02X", vtx[astream[a]][o + k]);
+          ss.first_exec += buf;
+        }
+        ss.first_exec += "\n";
+      }
+      std::snprintf(buf, sizeof(buf), "  position = %g %g %g w=%g\n", p[0],
+                    p[1], p[2], p[3]);
+      ss.first_exec += buf;
     }
 
     // The first few exports in full. A bucket count cannot show that every
@@ -1724,6 +1819,111 @@ void ReportClipHistogram() {
   }
 }
 
+// Stage I — the same population, broken down by the shader that produced it.
+void ReportPerShader() {
+  if (g_shaderScore.empty()) return;
+
+  // The per-shader counts must sum to the globals they were taken beside. If
+  // they do not, the attribution is wrong and every row below is a plausible
+  // table describing nothing — so this is reported, not assumed.
+  uint64_t sum_execs = 0, sum_inclip = 0, sum_space = 0;
+  for (const auto& [h, s] : g_shaderScore) {
+    (void)h;
+    sum_execs += s.execs;
+    sum_inclip += s.in_clip;
+    for (uint32_t i = 0; i < 4; ++i) sum_space += s.space[i];
+  }
+  const uint64_t g_space_total = g_spaceCount[0] + g_spaceCount[1] +
+                                 g_spaceCount[2] + g_spaceCount[3];
+  REXLOG_INFO(
+      "d3d9: stageI  attribution check — per-shader sums vs globals: execs "
+      "{}/{} {}, in-clip {}/{} {}, space-scored {}/{} {}",
+      sum_execs, g_aluRuns, sum_execs == g_aluRuns ? "ok" : "MISMATCH",
+      sum_inclip, g_aluInClip, sum_inclip == g_aluInClip ? "ok" : "MISMATCH",
+      sum_space, g_space_total,
+      sum_space == g_space_total ? "ok" : "MISMATCH");
+  REXLOG_INFO(
+      "d3d9: stageI  handle identity — {} shaders scored, {} times a handle's "
+      "fetch count or first dword changed under it ({})",
+      g_shaderScore.size(), g_shaderIdentityChanged,
+      g_shaderIdentityChanged
+          ? "NONZERO: handles are reused, the rows below merge populations"
+          : "handles are stable, the rows below are one shader each");
+
+  // Most-executed first: a shader that is 100% broken over six executions is
+  // not a finding, and the row has to make that visible.
+  std::vector<const std::pair<const uint32_t, ShaderScore>*> rows;
+  for (const auto& e : g_shaderScore) rows.push_back(&e);
+  std::sort(rows.begin(), rows.end(), [](auto* a, auto* b) {
+    return a->second.execs > b->second.execs;
+  });
+
+  auto pct = [](uint64_t n, uint64_t d) { return d ? (n * 100) / d : 0; };
+  uint32_t clean = 0, broken = 0;
+  uint64_t clean_execs = 0, broken_execs = 0;
+  const ShaderScore* worst = nullptr;
+  uint32_t worst_handle = 0;
+  for (const auto* r : rows) {
+    const ShaderScore& s = r->second;
+    const uint64_t sp = s.space[0] + s.space[1] + s.space[2] + s.space[3];
+    if (!sp) continue;
+    const uint64_t cl = s.space[uint32_t(mx::pm4::ExportSpace::kClipLike)];
+    const uint64_t ne = s.space[uint32_t(mx::pm4::ExportSpace::kNeither)];
+    if (pct(cl, sp) >= 90) { ++clean; clean_execs += s.execs; }
+    if (pct(ne, sp) >= 90) { ++broken; broken_execs += s.execs; }
+    // Worst = most executions landing in no modelled space. Weighted by count
+    // so the seed for hand-verification is a shader that actually matters.
+    if (!worst || ne > worst->space[uint32_t(mx::pm4::ExportSpace::kNeither)]) {
+      worst = &s;
+      worst_handle = r->first;
+    }
+  }
+
+  uint32_t shown = 0;
+  for (const auto* r : rows) {
+    if (shown++ >= 12) break;
+    const ShaderScore& s = r->second;
+    const uint64_t sp = s.space[0] + s.space[1] + s.space[2] + s.space[3];
+    const uint64_t scored = s.execs - s.degenerate;
+    REXLOG_INFO(
+        "d3d9: stageI  shader 0x{:08X}: {:>6} execs over {:>5} draws, {} "
+        "attrs, rt {}x{} — clip-like {}%  window-like {}%  neither {}%  "
+        "degenerate {}%   in-clip {}%",
+        r->first, s.execs, s.draws, s.attrs, uint32_t(s.vp_extent >> 32),
+        uint32_t(s.vp_extent),
+        pct(s.space[uint32_t(mx::pm4::ExportSpace::kClipLike)], sp),
+        pct(s.space[uint32_t(mx::pm4::ExportSpace::kWindowLike)], sp),
+        pct(s.space[uint32_t(mx::pm4::ExportSpace::kNeither)], sp),
+        pct(s.space[uint32_t(mx::pm4::ExportSpace::kDegenerate)], sp),
+        pct(s.in_clip, scored));
+  }
+  if (rows.size() > shown) {
+    REXLOG_INFO("d3d9: stageI  ... and {} more shaders not shown",
+                rows.size() - shown);
+  }
+
+  REXLOG_INFO(
+      "d3d9: stageI  {} shaders: {} are >=90% clip-like ({} execs, {}% of "
+      "all), {} are >=90% neither ({} execs, {}% of all) — a failure held by a "
+      "few shaders is a bug with an address; one spread evenly is a wrong "
+      "model",
+      g_shaderScore.size(), clean, clean_execs, pct(clean_execs, g_aluRuns),
+      broken, broken_execs, pct(broken_execs, g_aluRuns));
+
+  // The seed for verifying one draw by hand, written where the declarations
+  // already go.
+  if (worst && !worst->first_exec.empty()) {
+    auto& f = DeclFile();
+    f << "\nSTAGE I worst shader (most executions in no modelled space): 0x"
+      << std::hex << worst_handle << std::dec << "\n"
+      << "  " << worst->execs << " execs, "
+      << worst->space[uint32_t(mx::pm4::ExportSpace::kNeither)]
+      << " neither, " << worst->in_clip << " in clip\n"
+      << worst->first_exec << "\n";
+    f.flush();
+  }
+}
+
 void ReportShaderExecution() {
   ReportShaderExecutionCost();
   if (!g_aluRuns) {
@@ -1806,6 +2006,7 @@ void ReportShaderExecution() {
         "PM4 peer to compare against",
         g_attrAgree, g_attrDisagree, g_attrNoPeer);
   }
+  ReportPerShader();
 }
 
 void ReportPhysicalAtDrawTime() {
