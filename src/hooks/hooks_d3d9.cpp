@@ -37,6 +37,8 @@
 #include "gpu/d3d9_draw.h"
 #include "gpu/d3d9_layout.h"
 #include "gpu/shader_ucode.h"   // DecodeVertexShaderFetches, VertexAttribute
+#include "gpu/shader_alu.h"     // ExecuteVertexShader
+#include <cmath>
 #include "gpu/d3d9_state.h"
 
 // Defined in src/app/graphics_system.cpp with the rest of the Debug cvars.
@@ -545,6 +547,14 @@ bool BuildViewportMvp(float out[16]) {
 //---------------------------------------------------------------------------
 uint64_t g_badPrimType[64] = {};
 
+// Stage C — run the guest's own vertex shader over this draw's vertices.
+// Defined further down, next to the microcode it needs; declared here because
+// the draw builder is the only place that has the vertices and the streams
+// together.
+void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
+                          const mx::pm4::HleStream* streams, uint32_t device,
+                          uint8_t* base);
+
 void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
                        uint32_t count, int32_t base_vertex, uint32_t device,
                        uint8_t* base) {
@@ -633,6 +643,9 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
       }
     }
   }
+
+  ProbeShaderExecution(dc, st.vs_seen ? st.vertex_shader : 0, streams, device,
+                       base);
 
   HleFrameDraws().push_back(std::move(dc));
 }
@@ -1054,6 +1067,166 @@ void ProbePhysicalAtDrawTime(uint32_t handle, uint8_t* base) {
   g_physDumpAtDraw.emplace(handle, std::move(dump));
 }
 
+//---------------------------------------------------------------------------
+// Stage C — execute the shader and see where the position lands.
+//
+// Everything needed is now located: the microcode at SH_pPhysical + 0x40, the
+// constants at device + 0x780, and an interpreter that is already validated.
+// The number this exists to produce is the in-clip fraction from *running the
+// guest's code*, against the 55% the best scored constant register managed and
+// the 0% the viewport inverse did.
+//
+// **Two honest bridges, both temporary and both stated.**
+//
+// 1. The attributes come from PM4's decode of the same shader, not from the
+//    declaration. The copy at +0x40 is the unpatched template — its format,
+//    offset and stride are blank (Stage B) — and pairing declaration elements
+//    to vfetch instructions is a rule this has not read out of
+//    PatchVertexShaderToMatchVertexDeclaration yet. Guessing that pairing here
+//    would put a second unknown inside the one measurement meant to settle the
+//    first.
+// 2. Attribute values are read from stream 0. PM4's fetch_slot is a Xenos
+//    fetch constant index (95), not a D3D9 stream number, and that mapping is
+//    also unread. Draws whose bound stride disagrees with the shader's are
+//    skipped and counted rather than read anyway.
+//
+// Neither bridge affects what the measurement can conclude: if executing the
+// shader puts positions in the clip volume, the microcode and the constants are
+// right, because nothing else would produce that.
+//---------------------------------------------------------------------------
+constexpr uint32_t kAluProbeVerts = 8;
+constexpr uint32_t kD3d9ConstRegs = 256;
+
+uint64_t g_aluRuns = 0, g_aluInClip = 0, g_aluDegenerate = 0;
+uint64_t g_aluNoShader = 0, g_aluNoAttrs = 0, g_aluStrideMismatch = 0;
+uint64_t g_aluConstReads = 0, g_aluConstZero = 0;
+std::map<int, uint64_t> g_aluStatus;
+std::map<uint32_t, uint64_t> g_aluBlocking;
+
+void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
+                          const mx::pm4::HleStream* streams, uint32_t device,
+                          uint8_t* base) {
+  using namespace mx::pm4;
+  if (!REXCVAR_GET(hle_capture) || !handle || !device) return;
+  // Bounded: this is an interpreter over ~1,000 draws a frame and the cost is
+  // Stage D's question, not this one's.
+  static uint64_t s_draws = 0;
+  if ((++s_draws % 64) != 0) return;
+
+  auto bi = g_bestKeyAtDraw.find(handle);
+  if (bi == g_bestKeyAtDraw.end() || bi->second.pct < 90) { ++g_aluNoShader; return; }
+  auto di = g_physDumpAtDraw.find(handle);
+  if (di == g_physDumpAtDraw.end()) { ++g_aluNoShader; return; }
+  auto ci = mx::pm4::CapturedShaders().find(bi->second.key);
+  if (ci == mx::pm4::CapturedShaders().end() || ci->second.attrs.empty()) {
+    ++g_aluNoAttrs;
+    return;
+  }
+  const auto& attrs = ci->second.attrs;
+  const std::vector<uint32_t>& code = di->second;
+  const uint32_t off = bi->second.off_dwords;
+  if (off >= code.size()) { ++g_aluNoShader; return; }
+
+  const HleStream& s = streams[0];
+  if (!s.bound || !s.host || s.stride == 0 ||
+      s.stride != attrs[0].stride_bytes) {
+    ++g_aluStrideMismatch;
+    return;
+  }
+
+  // The constant file, straight from the device. Const(i) reads
+  // alu_consts[i*4], and D3D9 register N lives at +0x780 + N*16, so the two are
+  // the same indexing and no rebase is needed — the API applied the base.
+  static std::vector<uint32_t> consts;
+  consts.assign(kD3d9ConstRegs * 4, 0);
+  if (!HostPageReadable(REX_RAW_ADDR(device + 0x780)) ||
+      !HostPageReadable(REX_RAW_ADDR(device + 0x780 + kD3d9ConstRegs * 16 - 4)))
+    return;
+  for (uint32_t i = 0; i < kD3d9ConstRegs * 4; ++i) {
+    const uint32_t bits = REX_LOAD_U32(device + 0x780 + i * 4);
+    consts[i] = bits;
+  }
+  AluInputs in;
+  in.alu_consts = consts.data();
+  in.alu_const_dwords = uint32_t(consts.size());
+
+  const uint32_t n = dc.vertex_count < kAluProbeVerts ? dc.vertex_count
+                                                      : kAluProbeVerts;
+  uint8_t vtx[256];
+  std::vector<std::array<float, 4>> values(attrs.size());
+  for (uint32_t v = 0; v < n; ++v) {
+    const uint64_t byte_off = uint64_t(v) * s.stride + s.offset_bytes;
+    if (byte_off + s.stride > s.size_bytes || s.stride > sizeof(vtx)) break;
+    std::memcpy(vtx, s.host + byte_off, s.stride);
+    ApplyFetchEndian(vtx, s.stride, s.endian);
+
+    for (size_t a = 0; a < attrs.size(); ++a) {
+      float o[4] = {0, 0, 0, 1};
+      ReadVertexAttribute(vtx, s.stride, attrs[a], o);
+      values[a] = {o[0], o[1], o[2], o[3]};
+    }
+
+    const AluResult r = ExecuteVertexShader(code.data() + off,
+                                            uint32_t(code.size() - off), attrs,
+                                            values, in);
+    ++g_aluRuns;
+    ++g_aluStatus[int(r.status)];
+    if (r.blocking_opcode) ++g_aluBlocking[r.blocking_opcode];
+    g_aluConstReads += r.const_reads;
+    g_aluConstZero += r.const_zero_reads;
+
+    const float* p = r.position;
+    const bool finite = std::isfinite(p[0]) && std::isfinite(p[1]) &&
+                        std::isfinite(p[2]) && std::isfinite(p[3]);
+    // The same guard the transform probe needed: an export of (0,0,0,w=0) sits
+    // inside any volume and means nothing.
+    if (p[0] == 0.0f && p[1] == 0.0f && p[2] == 0.0f) {
+      ++g_aluDegenerate;
+    } else if (finite && p[3] > 0.0f && p[0] >= -p[3] && p[0] <= p[3] &&
+               p[1] >= -p[3] && p[1] <= p[3] && p[2] >= 0.0f && p[2] <= p[3]) {
+      ++g_aluInClip;
+    }
+  }
+}
+
+void ReportShaderExecution() {
+  if (!g_aluRuns) {
+    REXLOG_INFO(
+        "d3d9: stageC  shader execution — nothing ran (no located shader {}, "
+        "no attrs {}, stride mismatch {})",
+        g_aluNoShader, g_aluNoAttrs, g_aluStrideMismatch);
+    return;
+  }
+  const uint64_t scored = g_aluRuns - g_aluDegenerate;
+  std::string st;
+  for (const auto& [k, n] : g_aluStatus) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%d:%llu ", k, (unsigned long long)n);
+    st += buf;
+  }
+  std::string bl;
+  for (const auto& [k, n] : g_aluBlocking) {
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "0x%X:%llu ", k, (unsigned long long)n);
+    bl += buf;
+  }
+  REXLOG_INFO(
+      "d3d9: stageC  shader execution — {} vertices run, {} exported a "
+      "degenerate position, {} of the remaining {} landed in the clip volume "
+      "({}%); status {}; blocking opcodes {}",
+      g_aluRuns, g_aluDegenerate, g_aluInClip, scored,
+      scored ? (g_aluInClip * 100) / scored : 0, st, bl.empty() ? "none" : bl);
+  REXLOG_INFO(
+      "d3d9: stageC  constant reads {} of which {} read zero — a shader "
+      "computing from an empty file is the failure that still looks like "
+      "success",
+      g_aluConstReads, g_aluConstZero);
+  REXLOG_INFO(
+      "d3d9: stageC  skipped: no located shader {}, no attrs {}, bound stride "
+      "disagrees with the shader's {}",
+      g_aluNoShader, g_aluNoAttrs, g_aluStrideMismatch);
+}
+
 void ReportPhysicalAtDrawTime() {
   if (g_physNonzeroAtDraw.empty()) return;
   uint32_t any = 0;
@@ -1368,6 +1541,7 @@ void ReportCoverage(uint8_t* base) {
 
   ReportBlobSearch();
   ReportPhysicalAtDrawTime();
+  ReportShaderExecution();
   ReportAddressKeyTest(base);
 
   //-------------------------------------------------------------------------
