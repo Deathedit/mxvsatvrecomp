@@ -833,6 +833,9 @@ constexpr uint32_t kMaxBlobDwords = 4096;   // 16 KB ceiling on one blob
 std::map<uint32_t, std::vector<uint32_t>> g_vsBlobs;
 uint64_t g_vsBlobUnreadable = 0;
 
+// SH_pPhysical per handle, for the address-key test below.
+std::map<uint32_t, uint32_t> g_vsPhys;
+
 void CollectVertexShaderBlob(uint32_t handle, uint8_t* base) {
   (void)base;
   if (!handle || g_vsBlobs.count(handle)) return;
@@ -859,6 +862,155 @@ void CollectVertexShaderBlob(uint32_t handle, uint8_t* base) {
     blob[i] = REX_LOAD_U32(handle + off);
   }
   g_vsBlobs.emplace(handle, std::move(blob));
+  if (HostPageReadable(REX_RAW_ADDR(handle + 0x20)))
+    g_vsPhys.emplace(handle, REX_LOAD_U32(handle + 0x20));
+}
+
+//---------------------------------------------------------------------------
+// Does the handle already name its own ring key?
+//
+// HandleImLoad (0x27) keys the shader cache by guest physical address,
+// `pkt.body[0] & ~3` (pm4_translator.cpp:638). SH_pPhysical is
+// `*(handle + 0x20)`. If D3D9 issues IM_LOAD for the shader it binds, then the
+// handle *is* the key and there is nothing to extract from the blob at all.
+//
+// Three forms are tried because D3D9 masks addresses on the way to the GPU and
+// the raw field is the unmasked one — the distinction that cost four access
+// violations. Three forms is not a fishing expedition: they are the raw value,
+// the physical mask D3D9 itself applies (`rlwinm r11, r11, 0, 3, 31`), and the
+// dword alignment HandleImLoad applies on top.
+//
+// Note the other door: IM_LOAD_IMMEDIATE (0x2B) carries no address, so its keys
+// are content hashes and no address can ever match them. How many keys are of
+// each kind is therefore part of the answer, not background — a miss means
+// nothing if every key in the cache is a hash.
+//---------------------------------------------------------------------------
+void ReportAddressKeyTest(uint8_t* base) {
+  const auto& captured = mx::pm4::CapturedShaders();
+  if (captured.empty() || g_vsPhys.empty()) {
+    REXLOG_INFO("d3d9: stageA  address-key test: nothing to compare ({} keys, "
+                "{} handles)", captured.size(), g_vsPhys.size());
+    return;
+  }
+
+  // A key that fits in 32 bits and lands in the guest's address range is an
+  // address; anything else is a content hash. Counting them says whether the
+  // test could have succeeded at all.
+  uint32_t addr_keys = 0, hash_keys = 0;
+  for (const auto& [key, cs] : captured) {
+    (void)cs;
+    if (key <= 0xFFFFFFFFull) ++addr_keys; else ++hash_keys;
+  }
+
+  uint32_t hit_raw = 0, hit_phys = 0, hit_aligned = 0;
+  auto& f = DeclFile();
+  uint32_t named = 0;
+  for (const auto& [handle, phys] : g_vsPhys) {
+    const uint64_t raw = phys;
+    const uint64_t masked = phys & 0x1FFFFFFFu;
+    const uint64_t aligned = masked & ~3u;
+    const bool a = captured.count(raw) != 0;
+    const bool b = captured.count(masked) != 0;
+    const bool c = captured.count(aligned) != 0;
+    hit_raw += a; hit_phys += b; hit_aligned += c;
+    if ((a || b || c) && named < 8) {
+      ++named;
+      f << "ADDRESS KEY HIT: shader 0x" << std::hex << handle
+        << " SH_pPhysical=0x" << phys << " matched as"
+        << (a ? " raw" : "") << (b ? " physical" : "")
+        << (c ? " physical-aligned" : "") << std::dec << "\n";
+    }
+  }
+  f.flush();
+
+  REXLOG_INFO(
+      "d3d9: stageA  address-key test over {} handles vs {} ring keys ({} look "
+      "like addresses, {} are content hashes): raw {} physical {} "
+      "physical-aligned {}",
+      g_vsPhys.size(), captured.size(), addr_keys, hash_keys, hit_raw, hit_phys,
+      hit_aligned);
+  // The exact test missed but most keys are addresses, so the two are probably
+  // the same region at a fixed offset — GetPhysicalMicrocode's shape is
+  // `*(variant + 0x368) + SH_pPhysical`, i.e. base plus an offset out of the
+  // header. Reporting the nearest key per handle turns "no" into a distance,
+  // and a delta that repeats is the offset.
+  if (addr_keys) {
+    std::map<int64_t, uint32_t> deltas;
+    for (const auto& [handle, phys] : g_vsPhys) {
+      (void)handle;
+      const int64_t p = int64_t(phys & 0x1FFFFFFFu);
+      int64_t best = 0;
+      bool have = false;
+      for (const auto& [key, cs] : captured) {
+        (void)cs;
+        if (key > 0xFFFFFFFFull) continue;
+        const int64_t d = int64_t(key) - p;
+        if (!have || (d < 0 ? -d : d) < (best < 0 ? -best : best)) {
+          best = d;
+          have = true;
+        }
+      }
+      if (have) ++deltas[best];
+    }
+    std::string top;
+    uint32_t shown = 0;
+    for (const auto& [d, n] : deltas) {
+      if (n < 2 || shown >= 8) continue;   // a delta seen once is a coincidence
+      ++shown;
+      char buf[48];
+      std::snprintf(buf, sizeof(buf), "%+lld:%u ", (long long)d, n);
+      top += buf;
+    }
+    REXLOG_INFO(
+        "d3d9: stageA  nearest ring key to each SH_pPhysical — {} distinct "
+        "deltas over {} handles; repeated ones: {}",
+        deltas.size(), g_vsPhys.size(), top.empty() ? "none" : top);
+
+    // **Confirm by content, not by arithmetic.** A nearest-neighbour delta can
+    // repeat for reasons that have nothing to do with the shader — if handles
+    // share a physical base, or if the allocator spaces every shader a page
+    // apart, the same delta falls out of the geometry alone. So take the
+    // candidate deltas the histogram named, read the guest at that address, and
+    // compare the dwords against the microcode the ring loaded under that key.
+    // Matching bytes are the claim; a matching subtraction is not.
+    static const int64_t kCandidateDeltas[] = {0x1040, 0x1000, -0xFC0, -0x1000};
+    for (int64_t d : kCandidateDeltas) {
+      uint32_t tried = 0, hit = 0, unreadable = 0;
+      for (const auto& [handle, phys] : g_vsPhys) {
+        (void)handle;
+        const uint64_t key = uint64_t(int64_t(phys & 0x1FFFFFFFu) + d);
+        auto it = captured.find(key);
+        if (it == captured.end() || it->second.code.empty()) continue;
+        ++tried;
+        // Read at the *unmasked* address: the guest's virtual space is where
+        // this side reads, which is the distinction that cost four AVs.
+        const uint32_t at = uint32_t(int64_t(phys) + d);
+        const uint32_t bytes = uint32_t(it->second.code.size() * 4);
+        if (!HostPageReadable(REX_RAW_ADDR(at)) ||
+            !HostPageReadable(REX_RAW_ADDR(at + bytes - 4))) {
+          ++unreadable;
+          continue;
+        }
+        bool same = true;
+        for (size_t i = 0; i < it->second.code.size() && same; ++i)
+          same = REX_LOAD_U32(at + uint32_t(i * 4)) == it->second.code[i];
+        hit += same ? 1 : 0;
+      }
+      if (tried) {
+        REXLOG_INFO(
+            "d3d9: stageA    delta {:+#x}: {} handles land on a ring key, {} of "
+            "them read back that exact microcode ({} unreadable)",
+            d, tried, hit, unreadable);
+      }
+    }
+  }
+
+  if (!hit_raw && !hit_phys && !hit_aligned && addr_keys == 0) {
+    REXLOG_INFO(
+        "d3d9: stageA  every ring key is a content hash — this title loads "
+        "shaders through IM_LOAD_IMMEDIATE, which carries no address, so no "
+        "address could have matched and the miss says nothing about the handle");
+  }
 }
 
 void ReportBlobSearch() {
@@ -953,7 +1105,7 @@ void ReportBlobSearch() {
   }
 }
 
-void ReportCoverage() {
+void ReportCoverage(uint8_t* base) {
   const auto& st = DeviceState();
   if (g_drawsChecked == 0) {
     REXLOG_INFO("d3d9: hle — no draws scored");
@@ -1003,6 +1155,7 @@ void ReportCoverage() {
   }
 
   ReportBlobSearch();
+  ReportAddressKeyTest(base);
 
   //-------------------------------------------------------------------------
   // Stage 0 verdict.
@@ -1201,13 +1354,13 @@ void ReportDeclHistogram() {
 // read together. A 150s run reaches 5000-10000 transcoded draws, so a coarser
 // cadence than 2500 reports nothing at all — the first output-merger probe was
 // lost to exactly that.
-void ReportDrawCounts() {
+void ReportDrawCounts(uint8_t* base) {
   const uint64_t total = g_indexed_draws + g_draws;
   if ((total % kDrawReportEvery) != 0) return;
   REXLOG_INFO("d3d9: draws — DrawIndexedVertices={} DrawVertices={} total={}",
               g_indexed_draws, g_draws, total);
   ReportDeclHistogram();
-  if (REXCVAR_GET(hle_capture)) ReportCoverage();
+  if (REXCVAR_GET(hle_capture)) ReportCoverage(base);
 }
 
 }  // namespace
@@ -1403,7 +1556,7 @@ extern "C" REX_FUNC(sub_825565C8) {
     DumpHleDraw(/*indexed=*/true, n, ctx.r4.u32, ctx.r5.s32, ctx.r6.u32,
                 ctx.r7.u32);
   }
-  ReportDrawCounts();
+  ReportDrawCounts(base);
   orig_DrawIndexedVertices(ctx, base);
 }
 
@@ -1437,7 +1590,7 @@ extern "C" REX_FUNC(sub_825561B0) {
     ScoreDraw(/*indexed=*/false, ctx.r5.u32, ctx.r6.u32, ctx.r3.u32, base);
     DumpHleDraw(/*indexed=*/false, n, ctx.r4.u32, 0, ctx.r5.u32, ctx.r6.u32);
   }
-  ReportDrawCounts();
+  ReportDrawCounts(base);
   orig_DrawVertices(ctx, base);
 }
 
