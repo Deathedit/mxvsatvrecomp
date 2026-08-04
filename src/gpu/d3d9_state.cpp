@@ -46,4 +46,14 @@ uint64_t& D3D9IndexedDrawCounter() {
   return n;
 }
 
+uint64_t& D3D9FrameCount() {
+  static uint64_t n = 0;
+  return n;
+}
+
+uint64_t& D3D9FrameNanos() {
+  static uint64_t n = 0;
+  return n;
+}
+
 }  // namespace mx::pm4

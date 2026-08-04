@@ -243,4 +243,23 @@ uint64_t& D3D9DrawCounter();
 // from "D3D9 issues draws the game never asked for" — opposite conclusions.
 uint64_t& D3D9IndexedDrawCounter();
 
+//===========================================================================
+// Frame wall time, accumulated by the swap hook.
+//
+// Here for the same reason as the draw counters: the swap hook owns the only
+// point that knows where one frame ends, and the report that needs the number
+// lives in another translation unit.
+//
+// The pair exists so the cost of running the guest's vertex shader can be
+// stated as a fraction of a frame rather than as a bare millisecond total. A
+// total says nothing on its own — 400ms of interpreter is irrelevant across
+// 600 frames and fatal across six.
+//
+// Measured swap-to-swap, so it is the frame *period* and includes whatever the
+// guest and the host renderer did in between. That is deliberate: the question
+// is what the interpreter costs against a real frame, not against an idle one.
+//===========================================================================
+uint64_t& D3D9FrameCount();
+uint64_t& D3D9FrameNanos();
+
 }  // namespace mx::pm4

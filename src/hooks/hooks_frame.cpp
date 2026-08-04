@@ -20,7 +20,10 @@
 
 #include "hooks/hook_common.h"
 
+#include <chrono>
+
 #include "gpu/d3d9_draw.h"
+#include "gpu/d3d9_state.h"
 
 #include "gpu/pm4_parser.h"
 #include "gpu/xenos_gpu_state.h"
@@ -73,6 +76,23 @@ REX_IMPORT(__imp__sub_82566B58, orig_VdSwap, void());
 extern "C" REX_FUNC(sub_82566B58) {
   static int swap_count = 0;
   ++swap_count;
+
+  // Frame period, swap to swap. The first swap has no predecessor and is not
+  // counted — otherwise the whole of startup lands in the first "frame" and
+  // drags the mean somewhere meaningless.
+  {
+    static std::chrono::steady_clock::time_point s_last{};
+    const auto now = std::chrono::steady_clock::now();
+    if (s_last.time_since_epoch().count() != 0) {
+      ++mx::pm4::D3D9FrameCount();
+      mx::pm4::D3D9FrameNanos() +=
+          uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                       now - s_last)
+                       .count());
+    }
+    s_last = now;
+  }
+
   if (swap_count <= 5) REXLOG_INFO("native: VdSwap #{} ENTER", swap_count);
   uint32_t cpu_val = REX_LOAD_U32(0x82D21818);
   REX_STORE_U32(0x83144208, cpu_val);

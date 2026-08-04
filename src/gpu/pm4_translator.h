@@ -56,6 +56,13 @@ struct DrawCall {
   bool binned = false;                // true for DRAW_INDX_*_BIN variants
   float mvp[16] = {};
   bool valid = false;                 // set once index buffer is populated
+  // HLE path only: the stream vertex index that `vertices[0]` was built from.
+  // BuildHleDraw packs the *referenced* range, so element i is stream vertex
+  // first_vertex + i, and a draw whose indices start at 4000 has vertices[0] =
+  // stream vertex 4000. Anything wanting to re-read the guest bytes behind a
+  // built vertex — the shader-execution probe does — needs this or it silently
+  // reads a different vertex and compares two unrelated things.
+  uint32_t first_vertex = 0;
   // Set by the transcode when skip_untransformable_draws is on and this draw's
   // positions came out degenerate, entirely out of clip, or with only some
   // vertices collapsed to the origin. Its own flag rather than reusing

@@ -27,6 +27,7 @@
 
 #include <rex/cvar.h>
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -44,6 +45,8 @@
 // Defined in src/app/graphics_system.cpp with the rest of the Debug cvars.
 REXCVAR_DECLARE(bool, hle_capture);
 REXCVAR_DECLARE(bool, hle_render);
+REXCVAR_DECLARE(uint32_t, hle_shader_exec);
+REXCVAR_DECLARE(uint32_t, hle_shader_verts);
 
 namespace {
 
@@ -1094,7 +1097,54 @@ void ProbePhysicalAtDrawTime(uint32_t handle, uint8_t* base) {
 // shader puts positions in the clip volume, the microcode and the constants are
 // right, because nothing else would produce that.
 //---------------------------------------------------------------------------
-constexpr uint32_t kAluProbeVerts = 8;
+//---------------------------------------------------------------------------
+// Stage D2 — where the exported positions land, as a distribution.
+//
+// Stage C reported one number: 35% inside the clip volume. That number cannot
+// be recorded as a result, because a single cutoff cannot tell "the transform
+// is right and this geometry is off-screen" from "the transform is wrong by a
+// factor of a thousand". Both are simply "not in clip".
+//
+// So bucket by how far outside it lands. A pile at 1-2 says the first; a pile
+// past 100 says the second; an even spread across every bucket says it is not
+// a transform at all. The buckets are on x and y only — z has its own near
+// plane convention and folding it in would blur the one axis being read.
+//
+// The viewport inverse gets the identical treatment on the identical vertices.
+// Without a reference the buckets are just numbers: it scored 0% under the
+// Stage 3 threshold, so what it looks like as a *distribution* is what says
+// whether the shader's output is different in kind or merely in degree.
+//---------------------------------------------------------------------------
+enum ClipBucket : uint32_t {
+  kClipIn = 0,      // <= 1: inside, on x and y
+  kClipJustOut,     // 1-2:   off-screen, but the same order of magnitude
+  kClipOut,         // 2-10
+  kClipFarOut,      // 10-100
+  kClipWild,        // > 100: the scale is wrong, not the framing
+  kClipBehind,      // w <= 0: behind the eye, no meaningful projection
+  kClipNonFinite,   // inf/nan
+  kClipBucketCount,
+};
+
+const char* const kClipBucketName[kClipBucketCount] = {
+    "<=1", "1-2", "2-10", "10-100", ">100", "w<=0", "nonfinite"};
+
+uint32_t ClassifyClip(const float p[4]) {
+  if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2]) ||
+      !std::isfinite(p[3]))
+    return kClipNonFinite;
+  if (p[3] <= 0.0f) return kClipBehind;
+  const float x = std::fabs(p[0] / p[3]);
+  const float y = std::fabs(p[1] / p[3]);
+  const float d = x > y ? x : y;
+  if (!std::isfinite(d)) return kClipNonFinite;
+  if (d <= 1.0f)   return kClipIn;
+  if (d <= 2.0f)   return kClipJustOut;
+  if (d <= 10.0f)  return kClipOut;
+  if (d <= 100.0f) return kClipFarOut;
+  return kClipWild;
+}
+
 constexpr uint32_t kD3d9ConstRegs = 256;
 
 uint64_t g_aluRuns = 0, g_aluInClip = 0, g_aluDegenerate = 0;
@@ -1103,15 +1153,50 @@ uint64_t g_aluConstReads = 0, g_aluConstZero = 0;
 std::map<int, uint64_t> g_aluStatus;
 std::map<uint32_t, uint64_t> g_aluBlocking;
 
+// Stage D — cost. Draws entered, not draws offered: the difference between the
+// two is every named skip below, and a rate quoted against the wrong
+// denominator is how "35% of draws" turns into a claim about the whole title.
+uint64_t g_aluDrawsEntered = 0;
+uint64_t g_aluNanos = 0;
+
+// Stage D2 — the two histograms, and the control's own degenerate count.
+uint64_t g_clipExec[kClipBucketCount] = {};
+uint64_t g_clipCtl[kClipBucketCount] = {};
+uint64_t g_ctlVerts = 0, g_ctlDegenerate = 0, g_aluNoViewportDraws = 0;
+// The guard the Stage 3 probe needed (d3d9_draw.cpp, kSpreadEpsilon): a
+// transform that collapses distinct inputs to a point lands them all in one
+// bucket and looks like agreement. Tracked per draw for the control, because a
+// degenerate control is not a reference — it is a second way of saying nothing.
+uint64_t g_ctlCollapsedDraws = 0;
+constexpr float kCtlSpreadEpsilon = 1e-4f;
+
 void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
                           const mx::pm4::HleStream* streams, uint32_t device,
                           uint8_t* base) {
   using namespace mx::pm4;
   if (!REXCVAR_GET(hle_capture) || !handle || !device) return;
-  // Bounded: this is an interpreter over ~1,000 draws a frame and the cost is
-  // Stage D's question, not this one's.
+  // Stage D: the sampling rate is the measurement, so it is a cvar and not a
+  // constant. 0 is off, N runs one draw in N, 1 runs every draw — and only the
+  // last of those says what using the interpreter would actually cost.
+  const uint32_t every = REXCVAR_GET(hle_shader_exec);
+  if (every == 0) return;
   static uint64_t s_draws = 0;
-  if ((++s_draws % 64) != 0) return;
+  if ((++s_draws % every) != 0) return;
+
+  // Timed from here, so the cost includes the lookups and the 1,024-word
+  // constant copy below and not merely the interpreter. Charging the frame only
+  // for ExecuteVertexShader would understate it by exactly the part that is
+  // easiest to forget.
+  const auto t0 = std::chrono::steady_clock::now();
+  struct ChargeTime {
+    std::chrono::steady_clock::time_point t;
+    ~ChargeTime() {
+      g_aluNanos += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - t)
+                                 .count());
+    }
+  } charge{t0};
+  ++g_aluDrawsEntered;
 
   auto bi = g_bestKeyAtDraw.find(handle);
   if (bi == g_bestKeyAtDraw.end() || bi->second.pct < 90) { ++g_aluNoShader; return; }
@@ -1150,12 +1235,29 @@ void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
   in.alu_consts = consts.data();
   in.alu_const_dwords = uint32_t(consts.size());
 
-  const uint32_t n = dc.vertex_count < kAluProbeVerts ? dc.vertex_count
-                                                      : kAluProbeVerts;
+  const uint32_t want = REXCVAR_GET(hle_shader_verts);
+  const uint32_t n = dc.vertex_count < want ? dc.vertex_count : want;
+
+  // The control's transform: the viewport inverse, which is what this draw is
+  // actually rendered with today and what scored 0% under Stage 3's threshold.
+  // Built once per draw; a draw with no viewport yet gets no control rather
+  // than an identity standing in for one.
+  float ctl[16];
+  const bool have_ctl = BuildViewportMvp(ctl);
+  if (!have_ctl) ++g_aluNoViewportDraws;
+  float ctl_lo[2] = {1e30f, 1e30f}, ctl_hi[2] = {-1e30f, -1e30f};
+  uint32_t ctl_scored = 0;
+
   uint8_t vtx[256];
   std::vector<std::array<float, 4>> values(attrs.size());
   for (uint32_t v = 0; v < n; ++v) {
-    const uint64_t byte_off = uint64_t(v) * s.stride + s.offset_bytes;
+    // The stream index this built vertex came from. dc.vertices packs the
+    // referenced range starting at first_vertex, so using v alone would run the
+    // shader on one vertex and the control on a different one, and the two
+    // histograms would not be comparable — which is the whole point of having
+    // a control.
+    const uint64_t src = uint64_t(dc.first_vertex) + v;
+    const uint64_t byte_off = src * s.stride + s.offset_bytes;
     if (byte_off + s.stride > s.size_bytes || s.stride > sizeof(vtx)) break;
     std::memcpy(vtx, s.host + byte_off, s.stride);
     ApplyFetchEndian(vtx, s.stride, s.endian);
@@ -1182,14 +1284,117 @@ void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
     // inside any volume and means nothing.
     if (p[0] == 0.0f && p[1] == 0.0f && p[2] == 0.0f) {
       ++g_aluDegenerate;
-    } else if (finite && p[3] > 0.0f && p[0] >= -p[3] && p[0] <= p[3] &&
-               p[1] >= -p[3] && p[1] <= p[3] && p[2] >= 0.0f && p[2] <= p[3]) {
-      ++g_aluInClip;
+    } else {
+      // Kept exactly as Stage C measured it — full volume, z included — so the
+      // 35% stays reproducible beside the histogram rather than being quietly
+      // redefined into a different number with the same name.
+      if (finite && p[3] > 0.0f && p[0] >= -p[3] && p[0] <= p[3] &&
+          p[1] >= -p[3] && p[1] <= p[3] && p[2] >= 0.0f && p[2] <= p[3]) {
+        ++g_aluInClip;
+      }
+      ++g_clipExec[ClassifyClip(p)];
     }
+
+    // The control, on the same vertex: the host position BuildHleDraw decoded
+    // for it, through the viewport inverse.
+    if (have_ctl &&
+        (size_t(v) + 1) * kHostVertexStride <= dc.vertices.size()) {
+      const float* hp =
+          reinterpret_cast<const float*>(dc.vertices.data() +
+                                         size_t(v) * kHostVertexStride);
+      if (hp[0] == 0.0f && hp[1] == 0.0f && hp[2] == 0.0f) {
+        ++g_ctlDegenerate;
+      } else {
+        float o[4];
+        for (uint32_t r4 = 0; r4 < 4; ++r4) {
+          o[r4] = ctl[r4 * 4 + 0] * hp[0] + ctl[r4 * 4 + 1] * hp[1] +
+                  ctl[r4 * 4 + 2] * hp[2] + ctl[r4 * 4 + 3];
+        }
+        ++g_ctlVerts;
+        ++g_clipCtl[ClassifyClip(o)];
+        if (o[3] != 0.0f) {
+          const float nx = o[0] / o[3], ny = o[1] / o[3];
+          if (nx < ctl_lo[0]) ctl_lo[0] = nx;
+          if (nx > ctl_hi[0]) ctl_hi[0] = nx;
+          if (ny < ctl_lo[1]) ctl_lo[1] = ny;
+          if (ny > ctl_hi[1]) ctl_hi[1] = ny;
+          ++ctl_scored;
+        }
+      }
+    }
+  }
+
+  // Did the control collapse this draw's distinct vertices onto one point? A
+  // transform that does lands every vertex in one bucket and reads as a strong
+  // signal while meaning nothing — the failure the Stage 3 probe hit and had to
+  // guard against (kSpreadEpsilon, d3d9_draw.cpp). Counted, not discarded: how
+  // often the reference degenerates is itself part of how much it is worth.
+  if (ctl_scored > 1 && (ctl_hi[0] - ctl_lo[0]) < kCtlSpreadEpsilon &&
+      (ctl_hi[1] - ctl_lo[1]) < kCtlSpreadEpsilon) {
+    ++g_ctlCollapsedDraws;
   }
 }
 
+// Stage D — the cost, stated against a frame rather than as a bare total.
+// Reported even when nothing ran, because "the interpreter was off and the
+// frame took N ms" is the baseline every other row is compared to.
+//
+// **Windowed, not cumulative.** A first run reported the run-wide mean and it
+// climbed monotonically — 219 ms/frame at frame 146, 808 ms at frame 186 —
+// because this title genuinely degrades as it runs. A run-wide mean therefore
+// measures mostly how long the run had been going, and comparing two configs on
+// it compares their durations. The delta since the previous report is the
+// number that can be compared; the cumulative figures stay beside it so the
+// drift remains visible rather than hidden by the fix.
+void ReportShaderExecutionCost() {
+  static uint64_t s_frames = 0, s_frameNs = 0, s_aluNs = 0, s_draws = 0,
+                  s_runs = 0;
+  const uint64_t frames = mx::pm4::D3D9FrameCount();
+  const uint64_t frame_ns = mx::pm4::D3D9FrameNanos();
+
+  const uint64_t d_frames = frames - s_frames;
+  const uint64_t d_frame_ns = frame_ns - s_frameNs;
+  const uint64_t d_alu_ns = g_aluNanos - s_aluNs;
+  const uint64_t d_draws = g_aluDrawsEntered - s_draws;
+  const uint64_t d_runs = g_aluRuns - s_runs;
+  s_frames = frames; s_frameNs = frame_ns; s_aluNs = g_aluNanos;
+  s_draws = g_aluDrawsEntered; s_runs = g_aluRuns;
+
+  const double win_frame_ms =
+      d_frames ? double(d_frame_ns) / double(d_frames) / 1e6 : 0.0;
+  const double win_alu_ms =
+      d_frames ? double(d_alu_ns) / double(d_frames) / 1e6 : 0.0;
+  REXLOG_INFO(
+      "d3d9: stageD  cost — exec={} verts={} | window: {} frames, {:.1f} "
+      "ms/frame, interpreter {:.3f} ms/frame ({:.2f}% of a frame), {} draws "
+      "entered, {} vertices | run total: {} frames, {:.1f}s, interpreter "
+      "{:.1f} ms, {} vertices",
+      REXCVAR_GET(hle_shader_exec), REXCVAR_GET(hle_shader_verts), d_frames,
+      win_frame_ms, win_alu_ms,
+      win_frame_ms > 0.0 ? (win_alu_ms / win_frame_ms) * 100.0 : 0.0, d_draws,
+      d_runs, frames, double(frame_ns) / 1e9, double(g_aluNanos) / 1e6,
+      g_aluRuns);
+}
+
+// Stage D2 — the two distributions, side by side, as counts.
+void ReportClipHistogram() {
+  if (!g_aluRuns) return;
+  for (uint32_t b = 0; b < kClipBucketCount; ++b) {
+    REXLOG_INFO("d3d9: stageD2 clip {:>9} : executed {:>7}   viewport-inverse {:>7}",
+                kClipBucketName[b], g_clipExec[b], g_clipCtl[b]);
+  }
+  REXLOG_INFO(
+      "d3d9: stageD2 control — {} vertices transformed, {} skipped as "
+      "degenerate input, {} draws had no viewport yet, {} draws collapsed to a "
+      "point (a collapsed control is not a reference)",
+      g_ctlVerts, g_ctlDegenerate, g_aluNoViewportDraws, g_ctlCollapsedDraws);
+  REXLOG_INFO(
+      "d3d9: stageD2 buckets are max(|x/w|,|y/w|); the '<=1' row is NOT the "
+      "same test as stageC's in-clip count, which also bounds z");
+}
+
 void ReportShaderExecution() {
+  ReportShaderExecutionCost();
   if (!g_aluRuns) {
     REXLOG_INFO(
         "d3d9: stageC  shader execution — nothing ran (no located shader {}, "
@@ -1223,8 +1428,9 @@ void ReportShaderExecution() {
       g_aluConstReads, g_aluConstZero);
   REXLOG_INFO(
       "d3d9: stageC  skipped: no located shader {}, no attrs {}, bound stride "
-      "disagrees with the shader's {}",
-      g_aluNoShader, g_aluNoAttrs, g_aluStrideMismatch);
+      "disagrees with the shader's {} — of {} draws entered",
+      g_aluNoShader, g_aluNoAttrs, g_aluStrideMismatch, g_aluDrawsEntered);
+  ReportClipHistogram();
 }
 
 void ReportPhysicalAtDrawTime() {

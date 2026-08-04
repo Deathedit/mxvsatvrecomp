@@ -187,6 +187,7 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
   }
 
   const uint32_t nverts = hi - lo + 1;
+  out.first_vertex = lo;
 
   // --- the vertices --------------------------------------------------------
   //

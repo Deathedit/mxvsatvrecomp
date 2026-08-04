@@ -3266,3 +3266,127 @@ Worth keeping, because both look like data and are not:
    trap moved from the input to the transform. Fixed by requiring that distinct
    inputs stay distinct after projection; the explained rate fell 99% → 55%,
    which is the honest number.
+
+### Running the guest's vertex shader from the D3D9 side (2026-08-04)
+
+The register above cannot be picked, so the transform is read by executing the
+shader that computes it. This records where the microcode lives, what it costs
+to run, and what running it actually produced — which is **not** a validation.
+
+#### The microcode is at `SH_pPhysical + 0x40`, and only at draw time
+
+`Promote(D3DVertexShader*)` is a bare `blr`, so the handle **is** the
+`CVertexShader`. `SH_pPhysical = *(handle + 0x20)`, and the microcode begins
+`0x40` bytes into it (17 of 19 located shaders; `0x80` for 2). Ring keys end in
+`040`, agreeing.
+
+**It is filled lazily.** All 33 handles read as zeros at `SetVertexShader` and
+non-zero at draw time. A probe that reads at bind finds nothing and concludes
+the wrong thing — which is what the first three attempts did.
+
+Read at the **unmasked** (virtual) address. D3D9 masks with `0x1FFFFFFF` to make
+a physical address for the GPU; `REX_RAW_ADDR` routes masked and unmasked to
+different host memory, and reading the masked one is four of this effort's
+access violations.
+
+#### Three dead ends, kept because rediscovering them is the expensive part
+
+1. **The blob at `handle + 0x368` is not the code.** It is an XDK container —
+   magic `0x102A1101`, total size at `+0x36C`, then section offsets. Best
+   alignment against the ring's microcode averaged 23% agreement, and the
+   byteswapped control scored identically, which is what "no signal" looks like.
+   Blobs are 45–128 dwords against shaders of 27–30.
+2. **The handle does not name its ring key.** Raw, masked and page-aligned all
+   scored 0 hits against 41 address-shaped keys. A repeating `+0x1040`
+   nearest-neighbour delta on 25 of 48 handles looked like a mapping and was
+   allocator page spacing: 33 handles landed on a ring key and **0** read back
+   that microcode. Arithmetic proposed it; content killed it.
+3. **There is no draw-count correspondence between D3D9 and the ring.** 0 of 660
+   frames equal. Ring `0x22`=146,546, `0x36`=24,223, `0x35`=12, `0x34`=0 against
+   150,558 D3D9 draws (56,424 indexed). No subset matches, so "the Nth ring draw
+   is the Nth D3D9 draw" is not available as a bridge.
+
+#### The `+0x40` copy is the unpatched template
+
+`DecodeVertexShaderFetches` decodes 19 of 19 located shaders, 0 refusals. Its
+attribute list agrees with PM4's on **count, `dest_reg` and `fetch_slot`**, and
+has `format`, `offset` and `stride` blank. That is the template before
+`PatchVertexShaderToMatchVertexDeclaration` rewrites the vfetch dwords — so the
+probe takes attributes from PM4's decode, and the declaration-to-vfetch pairing
+rule remains unread. Agreement against the ring is bimodal (0-19%: 3, 40-59%: 4,
+80-99%: 27), so the misses are shaders the ring had not loaded, not disputes.
+
+#### Constants: `device + 0x780`, no rebase
+
+`AluInputs::Const(i)` reads `alu_consts[i*4]` and D3D9 register N sits at
+`+0x780 + N*16`, so the indexing already matches and the caller's `SQ_VS_CONST`
+base does not apply. 86% of 1.9M constant reads found non-zero data, which is
+the check that matters: a shader computing confidently from an empty file is the
+failure that looks like success.
+
+#### It executes cleanly, and that is the whole of the good news
+
+87,169 vertices: **status `kOk` for every one, zero blocking opcodes, zero
+degenerate exports.** The interpreter runs this title's shaders end to end.
+
+#### Cost — per draw, not per vertex
+
+165s runs, `hle_capture` + `hle_render`, late-run windows, 0 access violations
+in all four:
+
+| `hle_shader_exec` | verts | ms/frame | interpreter ms/frame | share |
+|---|---|---|---|---|
+| 0 (baseline) | — | 2872–3006 | 0 | 0% |
+| 64 | 8 | 2879–3041 | 13–19 | ~0.5% |
+| 1 | 8 | 3713–3908 | 844–1033 | 22–26% |
+| 1 | 64 | 3981–4087 | 943–1134 | 24–28% |
+
+**7.4× the vertices cost 1.1× the time.** Marginal cost is ~26 µs/vertex against
+~13 ms fixed per executed draw, so ~90% of the bill is per-draw overhead. The
+only O(1024) per-draw work is the constant-file copy; naming the culprit exactly
+was deliberately left alone rather than optimised on a guess.
+
+**The 22–28% share badly understates the problem.** These frames are 3–4
+*seconds* long in a debug build. Against a real 16.7 ms frame, ~1,000 ms/frame
+of interpreter is roughly 60× the entire budget. Per-vertex interpretation is
+not shippable on this path; the number says so plainly.
+
+Frame time is reported **windowed, not run-wide**. The first version reported a
+cumulative mean that climbed 219 → 808 ms/frame as the run went on, because this
+title genuinely degrades — so a run-wide mean mostly measures how long the run
+had been going, and comparing two configs on it compares their durations.
+
+#### Where the positions land — and why this does not validate anything
+
+Buckets are `max(|x/w|, |y/w|)`; the `<=1` row is **not** stageC's in-clip count,
+which also bounds z. 87,169 vertices, same vertices through both transforms:
+
+| bucket | executed shader | viewport inverse (control) |
+|---|---|---|
+| `<=1` | 26,964 (31%) | 33,224 (38%) |
+| `1-2` | 12,327 (14%) | 51,691 (59%) |
+| `2-10` | 32,744 (38%) | 1,932 (2%) |
+| `10-100` | 2,576 (3%) | 322 (0.4%) |
+| `>100` | 3,036 (3.5%) | 0 |
+| `w<=0` | 9,522 (11%) | 0 |
+
+**Read this against the hope, not with it.** Executing the shader puts *fewer*
+vertices on screen than the viewport inverse does, with a long tail the control
+does not have: 38% at 2–10×, 3.5% past 100×, 11% behind the eye.
+
+But the control is not trustworthy either, and the instrument says so: **950 of
+its draws collapsed every vertex to a single point** (the `kSpreadEpsilon`
+guard, carried over from the register scoring). Much of its tight `1-2` cluster
+is geometry with no spread left, which is the same rank-1 trap that once
+"explained" 99% of draws.
+
+So: neither distribution establishes a correct transform. What is established is
+that the microcode is reachable, decodable and runnable from a D3D9 handle, and
+that two bridges are still standing in for unread facts — attributes come from
+PM4's decode rather than the declaration, and values are read from stream 0
+because `fetch_slot` is a Xenos fetch-constant index, not a D3D9 stream number.
+6,078 of 9,101 entered draws had no located shader at all, so this is a
+measurement over a minority of the population.
+
+**Stage 4 stays blocked.** `hle_render` unchanged, `hle_shader_exec` defaults to
+0, `DrawCall::mvp` keeps the viewport inverse.
