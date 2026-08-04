@@ -1013,6 +1013,105 @@ void ReportAddressKeyTest(uint8_t* base) {
   }
 }
 
+// Route 1: SH_pPhysical read at *draw* time rather than bind time. It was
+// sixteen zero dwords at bind; if D3D9 fills it lazily, the draw is when it
+// would be filled. Sampled once per handle so the cost is bounded.
+std::map<uint32_t, uint32_t> g_physNonzeroAtDraw;   // handle -> nonzero dwords
+// The bytes themselves, so the "is this the microcode" question is answered by
+// content and not by "it is no longer zero" — which a page of anything at all
+// would satisfy.
+constexpr uint32_t kPhysProbeDwords = 256;
+std::map<uint32_t, std::vector<uint32_t>> g_physDumpAtDraw;
+
+void ProbePhysicalAtDrawTime(uint32_t handle, uint8_t* base) {
+  (void)base;
+  if (!handle || g_physNonzeroAtDraw.count(handle)) return;
+  if (!HostPageReadable(REX_RAW_ADDR(handle + 0x20))) return;
+  const uint32_t phys = REX_LOAD_U32(handle + 0x20);
+  if (!phys || !HostPageReadable(REX_RAW_ADDR(phys)) ||
+      !HostPageReadable(REX_RAW_ADDR(phys + 0x7C))) {
+    g_physNonzeroAtDraw[handle] = 0;
+    return;
+  }
+  uint32_t nonzero = 0;
+  for (uint32_t i = 0; i < 32; ++i)
+    if (REX_LOAD_U32(phys + i * 4) != 0) ++nonzero;
+  g_physNonzeroAtDraw[handle] = nonzero;
+
+  std::vector<uint32_t> dump;
+  dump.reserve(kPhysProbeDwords);
+  for (uint32_t i = 0; i < kPhysProbeDwords; ++i) {
+    const uint32_t at = phys + i * 4;
+    if ((at & (kHostPageSize - 1)) == 0 && !HostPageReadable(REX_RAW_ADDR(at)))
+      break;
+    dump.push_back(REX_LOAD_U32(at));
+  }
+  g_physDumpAtDraw.emplace(handle, std::move(dump));
+}
+
+void ReportPhysicalAtDrawTime() {
+  if (g_physNonzeroAtDraw.empty()) return;
+  uint32_t any = 0;
+  for (const auto& [h, n] : g_physNonzeroAtDraw) { (void)h; any += n ? 1 : 0; }
+  REXLOG_INFO(
+      "d3d9: stageA  SH_pPhysical at draw time: {} of {} handles had any "
+      "non-zero dword in the first 32 (it was all zeros at bind time)",
+      any, g_physNonzeroAtDraw.size());
+
+  // Same scoring as the blob search, and for the same reason: an exact compare
+  // would fail on a patched vfetch even when the code is right there, so this
+  // reports best agreement and only calls it found at 90%.
+  const auto& captured = mx::pm4::CapturedShaders();
+  uint32_t found = 0, scored = 0;
+  uint64_t pct_sum = 0;
+  std::map<uint32_t, uint32_t> offsets;
+  auto& f = DeclFile();
+  uint32_t named = 0;
+  for (const auto& [handle, dump] : g_physDumpAtDraw) {
+    size_t best_hits = 0, best_len = 0, best_at = 0;
+    uint64_t best_key = 0;
+    for (const auto& [key, cs] : captured) {
+      if (cs.code.empty() || cs.code.size() > dump.size()) continue;
+      for (size_t at = 0; at + cs.code.size() <= dump.size(); ++at) {
+        size_t hits = 0;
+        for (size_t i = 0; i < cs.code.size(); ++i)
+          hits += dump[at + i] == cs.code[i] ? 1 : 0;
+        if (hits > best_hits) {
+          best_hits = hits; best_len = cs.code.size();
+          best_at = at; best_key = key;
+        }
+      }
+    }
+    if (!best_len) continue;
+    ++scored;
+    pct_sum += best_hits * 100 / best_len;
+    if (best_hits * 100 >= best_len * 90) {
+      ++found;
+      ++offsets[uint32_t(best_at * 4)];
+    }
+    if (named < 10) {
+      ++named;
+      f << "DRAWTIME UCODE: shader 0x" << std::hex << handle << std::dec
+        << " best " << best_hits << "/" << best_len << " at offset 0x"
+        << std::hex << uint32_t(best_at * 4) << " vs ring key 0x" << best_key
+        << std::dec << "\n";
+    }
+  }
+  f.flush();
+  if (scored) {
+    std::string offs;
+    for (const auto& [off, n] : offsets) {
+      char buf[32];
+      std::snprintf(buf, sizeof(buf), "0x%X:%u ", off, n);
+      offs += buf;
+    }
+    REXLOG_INFO(
+        "d3d9: stageA  draw-time SH_pPhysical vs the ring's microcode: {} of {} "
+        "handles matched at 90%+ (mean best {}%), at offsets {}",
+        found, scored, pct_sum / scored, offs.empty() ? "none" : offs);
+  }
+}
+
 void ReportBlobSearch() {
   const auto& captured = mx::pm4::CapturedShaders();
   uint64_t matched = 0, unmatched = 0;
@@ -1155,6 +1254,7 @@ void ReportCoverage(uint8_t* base) {
   }
 
   ReportBlobSearch();
+  ReportPhysicalAtDrawTime();
   ReportAddressKeyTest(base);
 
   //-------------------------------------------------------------------------
@@ -1534,6 +1634,10 @@ extern "C" REX_FUNC(sub_82564C50) {
 REX_IMPORT(__imp__sub_825565C8, orig_DrawIndexedVertices, void());
 extern "C" REX_FUNC(sub_825565C8) {
   const uint64_t n = ++g_indexed_draws;
+  ++mx::pm4::D3D9DrawCounter();
+  if (REXCVAR_GET(hle_capture))
+    ProbePhysicalAtDrawTime(DeviceState().vertex_shader, base);
+  ++mx::pm4::D3D9IndexedDrawCounter();
   NoteDrawDeclaration(ctx.r3.u32, base);
   if (n <= kMaxDrawsLogged) {
     // Same rotation problem as the declarations: the first draws happen at
@@ -1571,6 +1675,9 @@ extern "C" REX_FUNC(sub_825565C8) {
 REX_IMPORT(__imp__sub_825561B0, orig_DrawVertices, void());
 extern "C" REX_FUNC(sub_825561B0) {
   const uint64_t n = ++g_draws;
+  ++mx::pm4::D3D9DrawCounter();
+  if (REXCVAR_GET(hle_capture))
+    ProbePhysicalAtDrawTime(DeviceState().vertex_shader, base);
   NoteDrawDeclaration(ctx.r3.u32, base);
   if (n <= kMaxDrawsLogged) {
     auto& f = DeclFile();

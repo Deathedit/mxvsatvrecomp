@@ -219,6 +219,87 @@ extern "C" REX_FUNC(sub_82566B58) {
     translator.TranslatePackets(swap_packets, base, 0xBEDA0000);
     auto& draws = translator.DrawCalls();
 
+    //-----------------------------------------------------------------------
+    // Does the ring carry the same number of draws D3D9 was asked for?
+    //
+    // This is the last route left from a D3D9 shader handle to its microcode.
+    // The direct ones are all closed: the blob at +0x368 is not the code (23%
+    // agreement against what the ring loaded), SH_pPhysical reads as zeros at
+    // bind time, and its address is not the ring key (33 handles landed on a
+    // key at +0x1040 and none of them read back that microcode). But the ring
+    // does load 41 shaders *by address*, so the code is in guest memory — only
+    // the mapping is missing.
+    //
+    // If each frame's ring draw count equals its D3D9 draw count, the Nth ring
+    // draw is the Nth D3D9 draw, and the shader the ring bound for it is the
+    // one this handle means. If they differ, that correspondence is not there
+    // and saying so is the result — which is why this counts before assuming
+    // rather than assuming and checking later.
+    //
+    // Counted from the *raw draw packets*, not from DrawCalls(): the translator
+    // drops draws it cannot build, so its output would understate the ring and
+    // manufacture a mismatch that is really a filter.
+    //-----------------------------------------------------------------------
+    {
+      // Per opcode, not as one total: the ring has four draw opcodes and two of
+      // them are the binned forms, which replay a draw per bin. A bare total
+      // cannot tell that apart from D3D9 issuing draws the game never asked
+      // for, and those point opposite ways.
+      uint64_t op[4] = {};   // 0x22, 0x34, 0x35, 0x36
+      auto count_draw_packets = [&](const std::vector<mx::pm4::Pm4Packet>& v) {
+        for (const auto& p : v) {
+          if (p.type != mx::pm4::PacketType::Type3) continue;
+          switch (p.opcode) {
+            case 0x22: ++op[0]; break;
+            case 0x34: ++op[1]; break;
+            case 0x35: ++op[2]; break;
+            case 0x36: ++op[3]; break;
+            default: break;
+          }
+        }
+      };
+      count_draw_packets(frame_packets);
+      count_draw_packets(swap_packets);
+      const uint64_t ring = op[0] + op[1] + op[2] + op[3];
+
+      static uint64_t s_lastD3d9 = 0, s_lastIndexed = 0;
+      const uint64_t now = mx::pm4::D3D9DrawCounter();
+      const uint64_t now_idx = mx::pm4::D3D9IndexedDrawCounter();
+      const uint64_t d3d9 = now - s_lastD3d9;
+      const uint64_t d3d9_idx = now_idx - s_lastIndexed;
+      s_lastD3d9 = now;
+      s_lastIndexed = now_idx;
+
+      static uint64_t s_swaps = 0, s_equal = 0, s_ringTotal = 0, s_d3d9Total = 0;
+      static uint64_t s_opTotal[4] = {}, s_idxTotal = 0;
+      static uint64_t s_eqIdx35 = 0, s_eqNonIdx = 0;
+      // Only frames where either side drew say anything; a pair of zeros agrees
+      // trivially and would inflate the rate.
+      if (ring || d3d9) {
+        ++s_swaps;
+        s_ringTotal += ring;
+        s_d3d9Total += d3d9;
+        s_idxTotal += d3d9_idx;
+        for (int i = 0; i < 4; ++i) s_opTotal[i] += op[i];
+        if (ring == d3d9) ++s_equal;
+        // The two subsets worth testing on their own: the binned indexed form
+        // against D3D9's indexed draws, and the unbinned forms against the
+        // non-indexed ones.
+        if (op[2] == d3d9_idx) ++s_eqIdx35;
+        if (op[0] + op[3] == d3d9 - d3d9_idx) ++s_eqNonIdx;
+        if ((s_swaps % 60) == 0) {
+          REXLOG_INFO(
+              "{}: draw correspondence — total equal {}/{} frames; ring {} vs "
+              "D3D9 {} (indexed {}); ring by opcode 0x22={} 0x34={} 0x35={} "
+              "0x36={}; subsets equal: 0x35-vs-indexed {}, unbinned-vs-"
+              "nonindexed {}",
+              tag, s_equal, s_swaps, s_ringTotal, s_d3d9Total, s_idxTotal,
+              s_opTotal[0], s_opTotal[1], s_opTotal[2], s_opTotal[3],
+              s_eqIdx35, s_eqNonIdx);
+        }
+      }
+    }
+
     // The first swap that produces a draw is the whole point of this round, so
     // it is logged unconditionally however sparse the schedule is.
     static bool s_loggedFirstDraw = false;

@@ -36,4 +36,14 @@ const char* EntryPointName(uint32_t id) {
   }
 }
 
+uint64_t& D3D9DrawCounter() {
+  static uint64_t n = 0;
+  return n;
+}
+
+uint64_t& D3D9IndexedDrawCounter() {
+  static uint64_t n = 0;
+  return n;
+}
+
 }  // namespace mx::pm4

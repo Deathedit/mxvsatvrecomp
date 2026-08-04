@@ -218,4 +218,29 @@ struct D3D9DeviceState {
 // The single shadow instance.
 D3D9DeviceState& DeviceState();
 
+//===========================================================================
+// How many draws the D3D9 entry points have seen, cumulative.
+//
+// Lives here rather than in the hook file so the swap hook can read it without
+// reaching into another translation unit's anonymous namespace. It exists for
+// one question: does the ring carry the same number of draws per frame that
+// D3D9 was asked for?
+//
+// If it does, the Nth ring draw is the Nth D3D9 draw, and the shader the ring
+// bound for it is the shader this handle means — which is the only remaining
+// route from a D3D9 shader handle to its microcode, every direct one having
+// been closed (the blob at +0x368 is not the code, SH_pPhysical is zeros at
+// bind time and its address is not the ring key).
+//
+// If it does not, the correspondence is not there to be used, and saying so is
+// the result. This is deliberately a *checkable* correlation rather than an
+// assumed one.
+//===========================================================================
+uint64_t& D3D9DrawCounter();
+
+// Indexed draws only (DrawIndexedVertices). Split out because the ring has four
+// draw opcodes and a bare total cannot tell "the ring replays draws per bin"
+// from "D3D9 issues draws the game never asked for" — opposite conclusions.
+uint64_t& D3D9IndexedDrawCounter();
+
 }  // namespace mx::pm4
