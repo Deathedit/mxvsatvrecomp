@@ -36,6 +36,7 @@
 
 #include "gpu/d3d9_draw.h"
 #include "gpu/d3d9_layout.h"
+#include "gpu/shader_ucode.h"   // DecodeVertexShaderFetches, VertexAttribute
 #include "gpu/d3d9_state.h"
 
 // Defined in src/app/graphics_system.cpp with the rest of the Debug cvars.
@@ -1023,6 +1024,10 @@ std::map<uint32_t, uint32_t> g_physNonzeroAtDraw;   // handle -> nonzero dwords
 constexpr uint32_t kPhysProbeDwords = 256;
 std::map<uint32_t, std::vector<uint32_t>> g_physDumpAtDraw;
 
+// handle -> {ring key, dword offset of the code in the dump, agreement %}.
+struct BestMatch { uint64_t key; uint32_t off_dwords; uint32_t pct; };
+std::map<uint32_t, BestMatch> g_bestKeyAtDraw;
+
 void ProbePhysicalAtDrawTime(uint32_t handle, uint8_t* base) {
   (void)base;
   if (!handle || g_physNonzeroAtDraw.count(handle)) return;
@@ -1065,6 +1070,9 @@ void ReportPhysicalAtDrawTime() {
   uint32_t found = 0, scored = 0;
   uint64_t pct_sum = 0;
   std::map<uint32_t, uint32_t> offsets;
+  // Where each handle's code was located, so Stage B decodes the same bytes
+  // this scored rather than re-deriving the offset.
+  std::map<uint32_t, uint32_t> agreement_bands;   // band floor -> handles
   auto& f = DeclFile();
   uint32_t named = 0;
   for (const auto& [handle, dump] : g_physDumpAtDraw) {
@@ -1084,8 +1092,11 @@ void ReportPhysicalAtDrawTime() {
     }
     if (!best_len) continue;
     ++scored;
-    pct_sum += best_hits * 100 / best_len;
-    if (best_hits * 100 >= best_len * 90) {
+    const uint32_t pct = uint32_t(best_hits * 100 / best_len);
+    pct_sum += pct;
+    ++agreement_bands[(pct / 20) * 20];
+    g_bestKeyAtDraw[handle] = {best_key, uint32_t(best_at), pct};
+    if (pct >= 90) {
       ++found;
       ++offsets[uint32_t(best_at * 4)];
     }
@@ -1109,6 +1120,108 @@ void ReportPhysicalAtDrawTime() {
         "d3d9: stageA  draw-time SH_pPhysical vs the ring's microcode: {} of {} "
         "handles matched at 90%+ (mean best {}%), at offsets {}",
         found, scored, pct_sum / scored, offs.empty() ? "none" : offs);
+    // The shortfall, named rather than left as "19 of 33". A handle at ~0%
+    // is a shader the ring never loaded in this window; one in the middle is
+    // a real disagreement and would matter.
+    std::string spread;
+    for (const auto& [lo, n] : agreement_bands) {
+      char buf[32];
+      std::snprintf(buf, sizeof(buf), "%u-%u%%:%u ", lo, lo + 19, n);
+      spread += buf;
+    }
+    REXLOG_INFO("d3d9: stageA  agreement spread across handles: {}", spread);
+  }
+
+  //-------------------------------------------------------------------------
+  // Stage B — decode what was found, and check it against PM4's decode.
+  //
+  // This is the cross-check the plan promised and Stage 3's could not deliver:
+  // two independent paths to the same shader's vertex attributes. PM4 decoded
+  // the copy the ring carried; this decodes the copy sitting at
+  // SH_pPhysical + 0x40. If they name the same fetch slots, offsets, strides
+  // and formats, the D3D9 side can reach the shader — and that is the whole
+  // question this milestone exists to answer.
+  //-------------------------------------------------------------------------
+  {
+    uint32_t decoded = 0, decode_failed = 0, agreed = 0, disagreed = 0;
+    uint64_t attrs_same = 0, attrs_diff = 0;
+    std::map<std::string, uint32_t> fails;
+    uint32_t named_b = 0;
+    for (const auto& [handle, dump] : g_physDumpAtDraw) {
+      auto bi = g_bestKeyAtDraw.find(handle);
+      if (bi == g_bestKeyAtDraw.end()) continue;
+      const uint64_t key = bi->second.key;
+      const uint32_t off_dwords = bi->second.off_dwords;
+      const uint32_t pct = bi->second.pct;
+      if (pct < 90) continue;   // only where the code was actually located
+      auto ci = captured.find(key);
+      if (ci == captured.end()) continue;
+      if (off_dwords >= dump.size()) continue;
+
+      std::vector<mx::pm4::VertexAttribute> mine;
+      const char* fail = nullptr;
+      const bool ok = mx::pm4::DecodeVertexShaderFetches(
+          dump.data() + off_dwords, uint32_t(dump.size() - off_dwords), mine,
+          &fail);
+      if (!ok) {
+        ++decode_failed;
+        ++fails[fail ? fail : "?"];
+        continue;
+      }
+      ++decoded;
+
+      const auto& theirs = ci->second.attrs;
+      bool all_same = mine.size() == theirs.size();
+      for (size_t i = 0; i < mine.size() && i < theirs.size(); ++i) {
+        const auto& a = mine[i];
+        const auto& b = theirs[i];
+        const bool same = a.fetch_slot == b.fetch_slot &&
+                          a.offset_bytes == b.offset_bytes &&
+                          a.stride_bytes == b.stride_bytes &&
+                          a.format == b.format && a.dest_reg == b.dest_reg;
+        (same ? attrs_same : attrs_diff) += 1;
+        all_same = all_same && same;
+      }
+      (all_same ? agreed : disagreed) += 1;
+      if (!all_same && named_b < 8) {
+        ++named_b;
+        f << "ATTR DISAGREE: shader 0x" << std::hex << handle << " key 0x"
+          << key << std::dec << " — HLE " << mine.size() << " attrs, PM4 "
+          << theirs.size() << "\n";
+        for (size_t i = 0; i < mine.size() || i < theirs.size(); ++i) {
+          f << "    [" << i << "] HLE ";
+          if (i < mine.size())
+            f << "slot=" << mine[i].fetch_slot << " off=" << mine[i].offset_bytes
+              << " stride=" << mine[i].stride_bytes << " fmt=" << mine[i].format
+              << " dest=" << mine[i].dest_reg;
+          else
+            f << "(none)";
+          f << " | PM4 ";
+          if (i < theirs.size())
+            f << "slot=" << theirs[i].fetch_slot << " off="
+              << theirs[i].offset_bytes << " stride=" << theirs[i].stride_bytes
+              << " fmt=" << theirs[i].format << " dest=" << theirs[i].dest_reg;
+          else
+            f << "(none)";
+          f << "\n";
+        }
+      }
+    }
+    f.flush();
+    if (decoded || decode_failed) {
+      std::string why;
+      for (const auto& [k, n] : fails) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "%s:%u ", k.c_str(), n);
+        why += buf;
+      }
+      REXLOG_INFO(
+          "d3d9: stageB  decoded {} of {} located shaders ({} refused: {}) — "
+          "attribute lists identical to PM4's for {} shaders, differing for "
+          "{}; per attribute {} same {} different",
+          decoded, decoded + decode_failed, decode_failed,
+          why.empty() ? "none" : why, agreed, disagreed, attrs_same, attrs_diff);
+    }
   }
 }
 
