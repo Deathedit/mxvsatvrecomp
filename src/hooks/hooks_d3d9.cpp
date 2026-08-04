@@ -29,7 +29,9 @@
 
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
+#include <vector>
 #include <fstream>
 
 #include "gpu/d3d9_draw.h"
@@ -797,6 +799,160 @@ void ScoreDraw(bool indexed, uint32_t first, uint32_t count,
   if (complete) ++g_drawsComplete;
 }
 
+//---------------------------------------------------------------------------
+// Stage A — locate the microcode *inside* the blob, by comparison.
+//
+// `DecodeVertexShaderFetches` wants an array that starts at the control-flow
+// section ("the blob carries no header saying so", shader_ucode.cpp:396), and
+// no UCODE header parser exists anywhere — not in this tree, and not in the SDK
+// at rex/graphics/format/ucode.h. So the code's offset within the blob has to
+// be established before anything can be decoded.
+//
+// **Not by guessing which header dword is an offset.** The ring already carried
+// this exact microcode and CapturedShaders() holds it, so the offset is found
+// by searching the blob for what PM4 decoded. Both sides are host-endian —
+// REX_LOAD_U32 byteswaps on the way in, and the 0x2B path is host-endian
+// already (pm4_translator.cpp:622) — so the dwords compare directly.
+//
+// A match also settles which variant is bound, for free: GetUCode(i) says the
+// object holds several patched microcodes, and the ring carried the one the
+// hardware actually ran.
+//
+// **Blobs are collected at bind time and compared at report time.** A first
+// version compared on the spot and reported 0 of 48 matching — against "0
+// captured shaders" for the first blob and "3" for the next few, because the
+// game binds a shader long before the ring loads it and each handle was only
+// searched once. That comparison ran against an almost-empty captured set and
+// said nothing about the blob. Same class of mistake as the transform report
+// eating its own counters: the instrument, not the data.
+//---------------------------------------------------------------------------
+constexpr uint32_t kVsBlobOffset = 0x368;   // CreateVertexShader copies here
+constexpr uint32_t kVsBlobSizeAt = 0x36C;
+constexpr uint32_t kMaxBlobDwords = 4096;   // 16 KB ceiling on one blob
+
+std::map<uint32_t, std::vector<uint32_t>> g_vsBlobs;
+uint64_t g_vsBlobUnreadable = 0;
+
+void CollectVertexShaderBlob(uint32_t handle, uint8_t* base) {
+  (void)base;
+  if (!handle || g_vsBlobs.count(handle)) return;
+  if (!HostPageReadable(REX_RAW_ADDR(handle + kVsBlobOffset)) ||
+      !HostPageReadable(REX_RAW_ADDR(handle + kVsBlobSizeAt))) {
+    ++g_vsBlobUnreadable;
+    return;
+  }
+  const uint32_t size_bytes = REX_LOAD_U32(handle + kVsBlobSizeAt);
+  if (size_bytes == 0 || size_bytes > kMaxBlobDwords * 4) {
+    ++g_vsBlobUnreadable;
+    return;
+  }
+  const uint32_t n = size_bytes / 4;
+
+  std::vector<uint32_t> blob(n);
+  for (uint32_t i = 0; i < n; ++i) {
+    const uint32_t off = kVsBlobOffset + i * 4;
+    if ((off & (kHostPageSize - 1)) == 0 &&
+        !HostPageReadable(REX_RAW_ADDR(handle + off))) {
+      blob.resize(i);
+      break;
+    }
+    blob[i] = REX_LOAD_U32(handle + off);
+  }
+  g_vsBlobs.emplace(handle, std::move(blob));
+}
+
+void ReportBlobSearch() {
+  const auto& captured = mx::pm4::CapturedShaders();
+  uint64_t matched = 0, unmatched = 0;
+  std::map<uint32_t, uint32_t> offsets;
+  auto& f = DeclFile();
+  uint32_t named = 0;
+
+  // **Partial agreement, not memcmp.** An exact compare answers the wrong
+  // question here: PatchVertexShaderToMatchVertexDeclaration rewrites vfetch
+  // dwords, so the copy the ring carries is the *patched* one while the object
+  // may hold the original. Those two are the same shader and would never be
+  // byte-identical. Scoring the best alignment turns "no match" from a verdict
+  // into a measurement — 90% agreement at one offset says the code is there and
+  // patched; 25% everywhere says it is not there at all.
+  //
+  // The byteswapped score is a control. If it wins, the two sides simply
+  // disagree about endianness and nothing deeper is wrong.
+  uint64_t best_pct_sum = 0;
+  uint32_t scored = 0;
+  for (const auto& [handle, blob] : g_vsBlobs) {
+    size_t best_hits = 0, best_len = 0, best_at = 0, best_swapped_hits = 0;
+    uint64_t best_key = 0;
+    bool best_ok = false;
+    for (const auto& [key, cs] : captured) {
+      if (cs.code.empty() || cs.code.size() > blob.size()) continue;
+      for (size_t at = 0; at + cs.code.size() <= blob.size(); ++at) {
+        size_t hits = 0, swapped = 0;
+        for (size_t i = 0; i < cs.code.size(); ++i) {
+          const uint32_t b = blob[at + i];
+          if (b == cs.code[i]) ++hits;
+          if (__builtin_bswap32(b) == cs.code[i]) ++swapped;
+        }
+        if (hits > best_hits) {
+          best_hits = hits;
+          best_len = cs.code.size();
+          best_at = at;
+          best_key = key;
+          best_ok = cs.ok;
+        }
+        if (swapped > best_swapped_hits) best_swapped_hits = swapped;
+      }
+    }
+    if (!best_len) continue;
+    ++scored;
+    const uint32_t pct = uint32_t(best_hits * 100 / best_len);
+    best_pct_sum += pct;
+    // Treated as found only when nearly all of it agrees. A patched vfetch is a
+    // handful of dwords; a different shader is most of them.
+    if (best_hits * 100 >= best_len * 90) {
+      ++matched;
+      ++offsets[uint32_t(best_at * 4)];
+    } else {
+      ++unmatched;
+    }
+    if (named < 12) {
+      ++named;
+      f << "UCODE BEST: shader 0x" << std::hex << handle << std::dec
+        << " blob " << blob.size() << " dwords — best " << best_hits << "/"
+        << best_len << " (" << pct << "%) at blob byte offset 0x" << std::hex
+        << uint32_t(best_at * 4) << " vs ring key 0x" << best_key << std::dec
+        << " (decode " << (best_ok ? "ok" : "FAILED")
+        << "), byteswapped control best " << best_swapped_hits << "\n";
+    }
+  }
+  f.flush();
+  if (scored) {
+    REXLOG_INFO(
+        "d3d9: stageA  mean best agreement across {} blobs: {}% — a shader that "
+        "is present but patched scores high, one that is absent scores low",
+        scored, best_pct_sum / scored);
+  }
+
+  REXLOG_INFO(
+      "d3d9: stageA  shader blobs: {} of {} contained microcode the ring "
+      "loaded, against {} distinct shaders the ring captured ({} blobs "
+      "unreadable)",
+      matched, g_vsBlobs.size(), captured.size(), g_vsBlobUnreadable);
+  if (offsets.empty()) {
+    REXLOG_INFO(
+        "d3d9: stageA  NO blob contained any captured microcode — the blob at "
+        "+0x368 is not raw ucode, and nothing downstream should be built on it");
+  } else {
+    std::string offs;
+    for (const auto& [off, n] : offsets) {
+      char buf[32];
+      std::snprintf(buf, sizeof(buf), "0x%X:%u ", off, n);
+      offs += buf;
+    }
+    REXLOG_INFO("d3d9: stageA  microcode found at blob byte offsets {}", offs);
+  }
+}
+
 void ReportCoverage() {
   const auto& st = DeviceState();
   if (g_drawsChecked == 0) {
@@ -845,6 +1001,8 @@ void ReportCoverage() {
     }
     mx::pm4::ReportHleTransform();
   }
+
+  ReportBlobSearch();
 
   //-------------------------------------------------------------------------
   // Stage 0 verdict.
@@ -1498,7 +1656,10 @@ extern "C" REX_FUNC(sub_825508A8) {
   st.NoteDevice(ctx.r3.u32, mx::pm4::kEpSetVertexShader);
   st.vertex_shader = ctx.r4.u32;
   st.vs_seen = true;
-  if (REXCVAR_GET(hle_capture)) DumpVertexShaderObject(ctx.r4.u32, base);
+  if (REXCVAR_GET(hle_capture)) {
+    DumpVertexShaderObject(ctx.r4.u32, base);
+    CollectVertexShaderBlob(ctx.r4.u32, base);
+  }
   orig_SetVertexShader(ctx, base);
 }
 

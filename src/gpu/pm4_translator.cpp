@@ -86,6 +86,20 @@ REXCVAR_DEFINE_BOOL(vfetch_use_shader_slot, true, "Debug",
 
 namespace mx::pm4 {
 
+namespace {
+// Backing store for the read-only registry declared in the header. Written only
+// by DecodeAndCacheShader; see the comment there for why this is a free
+// registry rather than an accessor on the translator.
+std::map<uint64_t, CapturedShader>& MutableCapturedShaders() {
+  static std::map<uint64_t, CapturedShader> m;
+  return m;
+}
+}  // namespace
+
+const std::map<uint64_t, CapturedShader>& CapturedShaders() {
+  return MutableCapturedShaders();
+}
+
 #if defined(_WIN32)
 // Probe the host-side page state — ReXGlue reserves 512MB up-front but only
 // commits pages that guest code explicitly Alloc()'d. The plugin's GPU
@@ -547,6 +561,17 @@ const Pm4Translator::ShaderLayout* Pm4Translator::DecodeAndCacheShader(
 
   auto [pos, inserted] = m_shaderCache.emplace(key, std::move(layout));
   const ShaderLayout& sl = pos->second;
+
+  // Publish to the read-only registry the D3D9 side compares against. Same key,
+  // so a match there is a match here.
+  if (inserted) {
+    auto& reg = MutableCapturedShaders();
+    CapturedShader cs;
+    cs.code = sl.code;
+    cs.attrs = sl.attrs;
+    cs.ok = sl.ok;
+    reg.emplace(key, std::move(cs));
+  }
 
   // Dump the first shaders in full, then only count. Log rotation is at 5MB
   // and this fires 68+357 times a frame, so an uncapped line would bury the

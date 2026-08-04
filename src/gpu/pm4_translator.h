@@ -131,6 +131,31 @@ struct DrawCall {
   uint32_t om_seen = 0;
 };
 
+//===========================================================================
+// Every distinct vertex shader the ring has loaded, so another layer can see
+// what the hardware actually ran.
+//
+// This exists for the D3D9 HLE side. It has a shader *handle* and an object
+// carrying an XDK blob; the ring carries raw microcode. Comparing the two is
+// how the microcode's offset inside the blob gets *located* rather than
+// guessed at from header fields — and it is a cross-check that genuinely
+// exists, unlike the constant shadow an earlier plan assumed.
+//
+// A free registry rather than an accessor on the translator: `ShaderLayout` is
+// private, and the one translator instance is a function-local static in
+// hooks_frame.cpp, so there is nothing to hand out a reference to. Written only
+// by DecodeAndCacheShader, read-only for everyone else.
+//
+// Keyed exactly as the cache is: the guest address for IM_LOAD (0x27), a
+// content hash for IM_LOAD_IMMEDIATE (0x2B). One uint64_t namespace holds both.
+struct CapturedShader {
+  std::vector<uint32_t> code;    // host-endian microcode dwords
+  std::vector<VertexAttribute> attrs;
+  bool ok = false;
+};
+
+const std::map<uint64_t, CapturedShader>& CapturedShaders();
+
 class Pm4Translator {
  public:
   Pm4Translator() = default;
