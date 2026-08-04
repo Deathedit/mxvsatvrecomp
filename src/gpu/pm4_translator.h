@@ -163,6 +163,44 @@ struct CapturedShader {
 
 const std::map<uint64_t, CapturedShader>& CapturedShaders();
 
+//===========================================================================
+// Which space an executed vertex shader's exported position lives in.
+//
+// The PM4 path settled this for the ring's own executions: every sampled export
+// read like window coordinates — (640, 0, 1, w=1), (1280, 0, 0, w=1),
+// (639.5, -0.5, 1, w=1) in a 1280x720 window — not clip space. That is why
+// BuildViewportMvp exists and why the renderer applies the viewport inverse.
+//
+// A free function because two paths now ask the same question from different
+// inputs: PM4 reads the Xenos context registers, the D3D9 path reads the
+// D3D9 viewport. Only the *inputs* differ, so only the inputs should be
+// duplicated. Two copies of the classification would be free to drift, and a
+// drifted control is worse than no control.
+//
+// Three rules are baked in, and each was paid for:
+//
+//   1. **Degenerate first.** (0,0,0,w=0) sits inside the unit cube *and*
+//      inside the viewport rectangle, so it would otherwise count as evidence
+//      for whichever hypothesis is checked first.
+//   2. **Clip wins the tie.** The two regions overlap near the origin. The tie
+//      goes against the window hypothesis, not for it.
+//   3. **The window extent comes from the viewport**, not a hardcoded
+//      1280x720: xs is half the width, ys half the height (negative, y growing
+//      downward). A half-pixel margin covers D3D9's pixel-centre convention.
+//===========================================================================
+enum class ExportSpace : uint8_t {
+  kDegenerate = 0,  // no evidence either way
+  kClipLike,
+  kWindowLike,
+  kNeither,
+};
+
+// x, y, w are the raw exported position; the perspective divide is applied
+// here so callers cannot disagree about whether it was already done.
+ExportSpace ClassifyExportSpace(float x, float y, float w, float xs, float xo,
+                                float ys, float yo);
+const char* ExportSpaceName(ExportSpace s);
+
 class Pm4Translator {
  public:
   Pm4Translator() = default;

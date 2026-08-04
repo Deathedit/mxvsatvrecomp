@@ -3374,11 +3374,17 @@ which also bounds z. 87,169 vertices, same vertices through both transforms:
 vertices on screen than the viewport inverse does, with a long tail the control
 does not have: 38% at 2–10×, 3.5% past 100×, 11% behind the eye.
 
-But the control is not trustworthy either, and the instrument says so: **950 of
-its draws collapsed every vertex to a single point** (the `kSpreadEpsilon`
-guard, carried over from the register scoring). Much of its tight `1-2` cluster
-is geometry with no spread left, which is the same rank-1 trap that once
-"explained" 99% of draws.
+But the control is not trustworthy either, and the instrument said so at the
+time: **950 of its draws collapsed every vertex to a single point** (the
+`kSpreadEpsilon` guard, carried over from the register scoring).
+
+> **CORRECTED — the control column above is invalid.** The next section
+> establishes that the viewport shadow reads `65535x65535` for most of the run,
+> so the "viewport inverse" this control applied was built from a nonsense
+> extent and divided every position by 32767. That is *why* 950 draws collapsed
+> to a point. **Do not read the right-hand column as a reference for anything**;
+> the executed-shader column stands, and is re-reported correctly in the next
+> section.
 
 So: neither distribution establishes a correct transform. What is established is
 that the microcode is reachable, decodable and runnable from a D3D9 handle.
@@ -3486,3 +3492,76 @@ The geometry did not change: 15,340 vertices, 36% in the clip volume, histogram
 within noise of the previous run. **Removing the bridges did not move the
 result**, so whatever is wrong with the transform is not the stream mapping and
 not the attribute source.
+
+### The exports are clip space, and the viewport shadow is wrong (2026-08-04)
+
+Two findings, one of which invalidates a control used in the section above.
+
+#### The HLE-executed position is clip space, not window coordinates
+
+The suspicion was that the clip-volume test had been the wrong yardstick all
+along: the PM4 path established, on the ring's own executions, that this title's
+shaders export **window coordinates** — `(640, 0, 1, w=1)`, `(1280, 0, 0, w=1)`
+— which is the whole reason `BuildViewportMvp` and the viewport inverse exist.
+
+It is not what the D3D9 path produces. The first eight exports, verbatim:
+
+```
+pos = 9.93374 12.2319 9.31915 w=29.9977
+pos = 7.77483 5.78460 8.52087 w=25.8431
+pos = 7.92958 6.69047 8.85351 w=26.4269
+pos = 13.3802 21.4615 10.6591 w=35.9452
+```
+
+Divided through, the first is `(0.331, 0.408, 0.311)` — inside the unit cube,
+with `w ≈ 30` reading as a point thirty units from the camera. That is textbook
+perspective output, and it matches the `c4..c7` projection matrix the constant
+file dump showed back in Stage 3.
+
+**So the clip test was the right yardstick and 36% is a real number.** The
+`2-10` bucket is genuinely off-screen geometry, not a units error.
+
+Worth stating plainly: **the two paths disagree about the space, running the
+same shaders through the same interpreter.** The difference is the constants —
+PM4 feeds `m_aluConsts` from `LOAD_ALU_CONSTANT`, the D3D9 path reads
+`device + 0x780`. The D3D9 constant file produces a projection; the ring's copy
+produces pre-transformed window coordinates. Which is *correct* is not settled
+here, but the D3D9 side is the one whose output looks like a projection matrix
+was involved.
+
+The `window-like` classification (23%) is **not a finding** — see below, it was
+computed against a 65535-wide viewport and would accept nearly any position.
+
+#### `SetViewport` is called with eight different extents, mostly 65535x65535
+
+Every distinct extent over a 165 s run:
+
+| extent | calls |
+|---|---|
+| `65535x65535` | **9,130** |
+| `1280x720` | 5,658 |
+| `1280x640`, `1280x80`, `640x720`, `640x360`, `128x32`, `64x64` | ~153 each |
+| `256x256` | 6 |
+
+The struct read is correct — `D3DDevice_SetViewport` (`0x8254BF50`) takes six
+dwords, X/Y/Width/Height as integers then MinZ/MaxZ as floats, and the
+decompiler names them. **The bug is the model, not the read**: the shadow is
+last-write-wins over a title that uses eight viewports, and the most frequent
+one is a full-surface reset.
+
+Consequences, all real:
+
+1. **`BuildViewportMvp` produces a nonsense matrix most of the time** — `xs =
+   32767.5`, so every position is divided by 32767 and collapses toward the
+   origin.
+2. **The Stage D2 "viewport inverse" control was built from it**, which is
+   exactly why 950 of its draws tripped the collapse guard. That column is
+   corrected above and must not be used as a reference.
+3. **`DrawCall::mvp` for HLE-rendered draws is built from it too**
+   (`BuildAndQueueDraw` sets `in.mvp = vp`), so `hle_render` has been drawing
+   with a broken transform whenever the last viewport set was the full-surface
+   one.
+
+The fix is not a different offset. It is that a per-draw viewport has to be
+captured per draw — the same staleness class as the declaration lag already
+documented, and it wants the same treatment.

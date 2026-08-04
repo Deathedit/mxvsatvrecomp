@@ -550,6 +550,9 @@ bool BuildViewportMvp(float out[16]) {
 //---------------------------------------------------------------------------
 uint64_t g_badPrimType[64] = {};
 
+// (width << 32) | height -> how many SetViewport calls used it.
+std::map<uint64_t, uint64_t> g_viewportExtents;
+
 // Stage C — run the guest's own vertex shader over this draw's vertices.
 // Defined further down, next to the microcode it needs; declared here because
 // the draw builder is the only place that has the vertices and the streams
@@ -1163,6 +1166,19 @@ std::map<uint32_t, uint64_t> g_aluBlocking;
 uint64_t g_aluDrawsEntered = 0;
 uint64_t g_aluNanos = 0;
 
+// Stage F — which space the exported position is in.
+//
+// Everything before this assumed clip space, and never tested it. The PM4 path
+// established on the *same shaders* that the ring's exports read like window
+// coordinates, which is the entire reason the renderer applies the viewport
+// inverse. If that holds here too then the clip-volume test has been the wrong
+// yardstick and the numbers it produced measure the wrong thing.
+uint64_t g_spaceCount[4] = {};        // indexed by ExportSpace
+// The same histogram as the raw one, but after the viewport inverse. If these
+// positions are window coordinates, this is where they collapse into <=1.
+uint64_t g_clipExecVp[kClipBucketCount] = {};
+uint64_t g_vpApplied = 0;             // executions the inverse could be applied to
+
 // Stage D2 — the two histograms, and the control's own degenerate count.
 uint64_t g_clipExec[kClipBucketCount] = {};
 uint64_t g_clipCtl[kClipBucketCount] = {};
@@ -1334,6 +1350,50 @@ void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
       ++g_clipExec[ClassifyClip(p)];
     }
 
+    // Stage F. Scored on every execution including the degenerate ones —
+    // ClassifyExportSpace takes those out itself, and it has to, because the
+    // origin is inside both regions.
+    {
+      const auto& vp = DeviceState().viewport;
+      if (vp.seen && vp.width && vp.height) {
+        const float xs = float(vp.width) * 0.5f;
+        const float xo = float(vp.x) + xs;
+        const float ys = -float(vp.height) * 0.5f;
+        const float yo = float(vp.y) + float(vp.height) * 0.5f;
+        ++g_spaceCount[uint32_t(
+            ClassifyExportSpace(p[0], p[1], p[3], xs, xo, ys, yo))];
+
+        // The same buckets after the viewport inverse. Done on the divided
+        // position and rewrapped with w=1, so the bucket function sees exactly
+        // what the renderer would put on screen.
+        if (p[3] != 0.0f && std::isfinite(p[3])) {
+          const float dx = p[0] / p[3], dy = p[1] / p[3];
+          const float q[4] = {(dx - xo) / xs, (dy - yo) / ys, 0.0f, 1.0f};
+          ++g_clipExecVp[ClassifyClip(q)];
+          ++g_vpApplied;
+        }
+      }
+    }
+
+    // The first few exports in full. A bucket count cannot show that every
+    // position reads (640, 0, 1, 1) — which is how the ring's space was
+    // identified in the first place.
+    {
+      static uint32_t s_dumped = 0;
+      if (s_dumped < 8) {
+        ++s_dumped;
+        auto& f = DeclFile();
+        f << "HLE EXPORT " << s_dumped << ": pos = " << p[0] << " " << p[1]
+          << " " << p[2] << " w=" << p[3];
+        const auto& vp = DeviceState().viewport;
+        if (vp.seen)
+          f << "   viewport " << vp.x << "," << vp.y << " " << vp.width << "x"
+            << vp.height;
+        f << "\n";
+        f.flush();
+      }
+    }
+
     // The control, on the same vertex: the host position BuildHleDraw decoded
     // for it, through the viewport inverse.
     if (have_ctl &&
@@ -1430,6 +1490,47 @@ void ReportClipHistogram() {
   REXLOG_INFO(
       "d3d9: stageD2 buckets are max(|x/w|,|y/w|); the '<=1' row is NOT the "
       "same test as stageC's in-clip count, which also bounds z");
+
+  // Stage F. The question every number above assumed an answer to.
+  const uint64_t sp_total = g_spaceCount[0] + g_spaceCount[1] + g_spaceCount[2] +
+                            g_spaceCount[3];
+  if (sp_total) {
+    REXLOG_INFO(
+        "d3d9: stageF  export space — clip-like {} ({}%), window-like {} ({}%), "
+        "neither {}, degenerate {} — of {} scored (clip wins ties, degenerate "
+        "removed first)",
+        g_spaceCount[uint32_t(mx::pm4::ExportSpace::kClipLike)],
+        (g_spaceCount[uint32_t(mx::pm4::ExportSpace::kClipLike)] * 100) /
+            sp_total,
+        g_spaceCount[uint32_t(mx::pm4::ExportSpace::kWindowLike)],
+        (g_spaceCount[uint32_t(mx::pm4::ExportSpace::kWindowLike)] * 100) /
+            sp_total,
+        g_spaceCount[uint32_t(mx::pm4::ExportSpace::kNeither)],
+        g_spaceCount[uint32_t(mx::pm4::ExportSpace::kDegenerate)], sp_total);
+    for (uint32_t b = 0; b < kClipBucketCount; ++b) {
+      REXLOG_INFO(
+          "d3d9: stageF  clip {:>9} : raw {:>7}   after viewport inverse {:>7}",
+          kClipBucketName[b], g_clipExec[b], g_clipExecVp[b]);
+    }
+    REXLOG_INFO(
+        "d3d9: stageF  viewport inverse applied to {} of {} executions; if "
+        "these positions are window coordinates this is where they collapse "
+        "into <=1",
+        g_vpApplied, sp_total);
+  }
+  if (!g_viewportExtents.empty()) {
+    std::string ve;
+    for (const auto& [k, n] : g_viewportExtents) {
+      char buf[48];
+      std::snprintf(buf, sizeof(buf), "%ux%u:%llu ", uint32_t(k >> 32),
+                    uint32_t(k), (unsigned long long)n);
+      ve += buf;
+    }
+    REXLOG_INFO(
+        "d3d9: stageF  SetViewport extents seen — {}(the shadow keeps only the "
+        "last, and everything built on it inherits that)",
+        ve);
+  }
 }
 
 void ReportShaderExecution() {
@@ -2837,6 +2938,13 @@ extern "C" REX_FUNC(sub_8254BF50) {
     std::memcpy(&v.min_z, &min_bits, 4);
     std::memcpy(&v.max_z, &max_bits, 4);
     v.seen = true;
+    // Every distinct extent, not just the last one. The shadow is
+    // last-write-wins, and the first Stage F run read 65535x65535 out of it —
+    // which built a nonsense viewport inverse and made the "window-like" test
+    // accept almost any position. Whether that is the only viewport this title
+    // sets or merely the most recent one is the difference between a wrong
+    // read and a wrong *model*, and a single value cannot say which.
+    ++g_viewportExtents[(uint64_t(v.width) << 32) | v.height];
   }
   orig_SetViewport(ctx, base);
 }
