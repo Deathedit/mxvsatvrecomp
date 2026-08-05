@@ -234,3 +234,26 @@ MX_TIME_CALLEE(sub_82B600A8, orig_RpCallee1, "RP.sub_82B600A8")
 MX_TIME_CALLEE(sub_82AFE978, orig_RpCallee2, "RP.sub_82AFE978")
 MX_TIME_CALLEE(sub_82ABF638, orig_RpCallee3, "RP.sub_82ABF638")
 MX_TIME_CALLEE(sub_82ABCC48, orig_RpCallee4, "RP.sub_82ABCC48")
+
+// sub_82AFE978's own callees. A Release build costs exactly what Debug does
+// here — 300ms bodies, 27 MainLoop iterations in 70s, both — so this is a wait,
+// not compute, and one of these blocks. Read off its body: it fetches a D3D9
+// device from TLS+22428, then calls these in order. sub_8254C3B0
+// (SetDepthStencil) and sub_8255D520 (GpuState) are excluded — already hooked.
+// sub_825599A8 takes only the device, which is the shape of a block-until-idle.
+MX_TIME_CALLEE(sub_82AFCA38, orig_RtCallee1, "RT.sub_82AFCA38")
+
+// sub_82AFCA38 is the leaf so far and it is large — 4,416 lines of recompiled
+// PPC calling SetTexture 31 times, Resolve 4, plus 7 indirect calls. These are
+// its hot callees that are not already hooked in hooks_d3d9.cpp; the D3D9 ones
+// that are hooked get their timing added there instead.
+MX_TIME_CALLEE(sub_8254ADF8, orig_LeafA, "LEAF.sub_8254ADF8")
+MX_TIME_CALLEE(sub_8254AC50, orig_LeafB, "LEAF.sub_8254AC50")
+MX_TIME_CALLEE(sub_8254A630, orig_LeafC, "LEAF.sub_8254A630")
+MX_TIME_CALLEE(sub_82AFA520, orig_LeafD, "LEAF.sub_82AFA520")
+MX_TIME_CALLEE(sub_82AEC708, orig_LeafE, "LEAF.sub_82AEC708")
+MX_TIME_CALLEE(sub_82ACFC88, orig_RtCallee2, "RT.sub_82ACFC88")
+MX_TIME_CALLEE(sub_8254C688, orig_RtCallee3, "RT.sub_8254C688")
+MX_TIME_CALLEE(sub_82550D68, orig_RtCallee4, "RT.sub_82550D68")
+MX_TIME_CALLEE(sub_82550C80, orig_RtCallee5, "RT.sub_82550C80")
+MX_TIME_CALLEE(sub_825599A8, orig_RtCallee6, "RT.sub_825599A8")

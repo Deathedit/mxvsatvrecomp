@@ -4403,10 +4403,23 @@ void FinalizePendingD3D9Draws(uint8_t* base) {
 // build, and plugin-mode MainLoop fell from ~17.6/s on 2026-08-03, before this
 // file grew, to ~0.37/s once it had. Every hook here calls its original exactly
 // once, so returning straight after it is the complete plugin-mode behaviour.
-#define MX_D3D9_PLUGIN_PASSTHROUGH(orig) \
-  if (mx::native::g_plugin_mode) {       \
-    orig(ctx, base);                     \
-    return;                              \
+// d3d9_hooks_passthrough additionally disables this layer in *native* mode. It
+// breaks native rendering by design and exists to answer one question: native
+// MainLoop spends all its time in a recursive guest scene traversal
+// (sub_82B70760 -> sub_82B70578 -> sub_82AFE978 -> sub_82AFCA38 -> sub_82AFA520
+// -> sub_82AF93C8, which recurses), and a Release build costs exactly what Debug
+// does — so the time is not recompiled PPC compute. That traversal reaches D3D9
+// through indirect calls, so either it is blocking inside these hooks or it is
+// not. Turning them off separates those two cases in one run.
+REXCVAR_DEFINE_BOOL(d3d9_hooks_passthrough, false, "Debug",
+                    "Diagnostic: make the D3D9 HLE hooks pass straight through "
+                    "in native mode too. Breaks rendering; isolates whether "
+                    "native frame time is spent in this layer");
+
+#define MX_D3D9_PLUGIN_PASSTHROUGH(orig)                                 \
+  if (mx::native::g_plugin_mode || REXCVAR_GET(d3d9_hooks_passthrough)) { \
+    orig(ctx, base);                                                     \
+    return;                                                              \
   }
 
 //=============================================================================
@@ -5028,7 +5041,20 @@ extern "C" REX_FUNC(sub_8255CE98) {
           dest_texture, fetch0);
     }
   }
-  orig_Resolve(ctx, base);
+  // sub_82AFCA38 calls Resolve four times and is where the native frame time
+  // goes. Resolve is the EDRAM-to-memory bridge, so it is the call most likely
+  // to block on the host side. Timed to confirm or clear it.
+  {
+    const auto _t0 = std::chrono::steady_clock::now();
+    orig_Resolve(ctx, base);
+    const auto _ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - _t0)
+                         .count();
+    if (_ms >= 50) {
+      static uint64_t _n = 0;
+      REXLOG_INFO("native: Resolve slow #{} {}ms", ++_n, _ms);
+    }
+  }
 }
 
 //-----------------------------------------------------------------------------

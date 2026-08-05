@@ -274,6 +274,35 @@ Use `MX_D3D9_PLUGIN_PASSTHROUGH(orig)` on any hook added to that file. Every
 hook there calls its original exactly once, so returning straight after it is
 the complete plugin-mode behaviour.
 
+**The same layer is ~85% of native frame time, where it is on the critical
+path.** Native `MainLoop` bodies run 300ms rising to 3100ms. Timing each level
+gives one chain, each step matching its parent to within milliseconds:
+
+```
+MainLoop sub_82B70760 -> RenderPipeline sub_82B70578 -> sub_82AFE978
+  -> sub_82AFCA38 (4,416 lines, 31 SetTexture, 4 Resolve)
+    -> sub_82AFA520 -> sub_82AF93C8, which recurses
+```
+
+Everything else on the path is cheap or free: `MainLoopPump` and the pre-calls
+never reach 50ms, BeginFrame/EndFrame are stubbed natively, Resolve never
+reaches 50ms, and VdSwap's whole hook peaks at 87ms with its own original under
+50ms — so parsing ~11,600 PM4 packets a swap is not the cost.
+
+Two measurements identify it as ours, not the guest's:
+
+- **A Release build costs exactly what Debug does** — same 300ms bodies, same 27
+  MainLoop iterations in 70s. Recompiled PPC compute would not behave that way.
+- `--d3d9_hooks_passthrough=true` makes the 14 hooks pass through in native too.
+  MainLoop bodies drop to **7–70ms**, a ~50x change. That flag **breaks
+  rendering by design and the run crashes ~19s in** (the host renderer loses the
+  state tracking while the PM4 translator keeps going) — it is an A/B
+  instrument, not a mode.
+
+So the per-draw bookkeeping is expensive in both modes. Plugin mode was pure
+waste and is fixed; native needs the layer, so the work is to make it cheap,
+not to skip it.
+
 `--log_high_frequency_kernel_calls=true` does **not** gate these calls: a run
 with it has the same 15 `[krnl]` lines as one without. Hook the wrappers.
 
