@@ -141,8 +141,10 @@ void D3D12Renderer::Shutdown() {
   m_gameCB.Reset();
   m_gameCbvHeap.Reset();
   m_gameTextures.clear();
+  m_gameRenderTargets.clear();
   m_gameSrvHeap.Reset();
   m_gameSrvDescriptorSize = 0;
+  m_nextGameSrvDescriptor = 0;
   m_hasGamePipeline = false;
 
   m_gameDraws.clear();
@@ -154,6 +156,7 @@ void D3D12Renderer::Shutdown() {
   m_gameRT.Reset();
   m_gameDepth.Reset();
   m_gameRtvHeap.Reset();
+  m_gameRtvDescriptorSize = 0;
   m_gameDsvHeap.Reset();
 
   for (auto& rt : m_renderTargets) {

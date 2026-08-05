@@ -280,7 +280,7 @@ bool D3D12Renderer::EnsureGameTexture(
     descriptorIndex = it->second.descriptorIndex;
     return true;
   }
-  if (m_gameTextures.size() >= kMaxGameTextures) {
+  if (m_nextGameSrvDescriptor >= kMaxGameTextures) {
     static bool s_logged = false;
     if (!s_logged) {
       s_logged = true;
@@ -385,7 +385,8 @@ bool D3D12Renderer::EnsureGameTexture(
   barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
   m_commandList->ResourceBarrier(1, &barrier);
 
-  entry.descriptorIndex = uint32_t(m_gameTextures.size());
+  if (m_nextGameSrvDescriptor >= kMaxGameTextures) return false;
+  entry.descriptorIndex = m_nextGameSrvDescriptor++;
   D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
   srv.Format = format;
   srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -410,6 +411,80 @@ bool D3D12Renderer::EnsureGameTexture(
   return true;
 }
 
+D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameRenderTarget(
+    uint32_t object, uint32_t width, uint32_t height) {
+  if (!object || !width || !height || width > 8192 || height > 8192 ||
+      !m_gameRtvHeap || !m_gameSrvHeap)
+    return nullptr;
+  if (auto it = m_gameRenderTargets.find(object);
+      it != m_gameRenderTargets.end()) {
+    if (it->second.width != width || it->second.height != height) {
+      static bool s_logged = false;
+      if (!s_logged) {
+        s_logged = true;
+        LogError("game render-target object changed dimensions");
+      }
+      return nullptr;
+    }
+    return &it->second;
+  }
+  if (m_gameRenderTargets.size() >= kMaxGameRenderTargets ||
+      m_nextGameSrvDescriptor >= kMaxGameTextures)
+    return nullptr;
+
+  GameRenderTarget entry;
+  entry.width = width;
+  entry.height = height;
+  entry.rtvIndex = uint32_t(m_gameRenderTargets.size()) + 1;
+  entry.srvIndex = m_nextGameSrvDescriptor++;
+
+  D3D12_HEAP_PROPERTIES hp = {};
+  hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC rd = {};
+  rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  rd.Width = width;
+  rd.Height = height;
+  rd.DepthOrArraySize = 1;
+  rd.MipLevels = 1;
+  rd.Format = kBackBufferFormat;
+  rd.SampleDesc.Count = 1;
+  rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  D3D12_CLEAR_VALUE cv = {};
+  cv.Format = kBackBufferFormat;
+  cv.Color[0] = 0.0f;
+  cv.Color[1] = 0.0f;
+  cv.Color[2] = 0.0f;
+  cv.Color[3] = 0.0f;
+  if (FAILED(m_device->CreateCommittedResource(
+          &hp, D3D12_HEAP_FLAG_NONE, &rd,
+          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv,
+          IID_PPV_ARGS(&entry.resource))))
+    return nullptr;
+
+  auto rtv = m_gameRtvHeap->GetCPUDescriptorHandleForHeapStart();
+  rtv.ptr += SIZE_T(entry.rtvIndex) * m_gameRtvDescriptorSize;
+  m_device->CreateRenderTargetView(entry.resource.Get(), nullptr, rtv);
+
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+  srv.Format = kBackBufferFormat;
+  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv.Texture2D.MipLevels = 1;
+  auto cpu = m_gameSrvHeap->GetCPUDescriptorHandleForHeapStart();
+  cpu.ptr += SIZE_T(entry.srvIndex) * m_gameSrvDescriptorSize;
+  m_device->CreateShaderResourceView(entry.resource.Get(), &srv, cpu);
+
+  auto [it, inserted] = m_gameRenderTargets.emplace(object, std::move(entry));
+  if (!inserted) return nullptr;
+  char message[192];
+  std::snprintf(message, sizeof(message),
+                "game render target: object 0x%08X %ux%u cache %zu",
+                object, width, height, m_gameRenderTargets.size());
+  LogInfo(message);
+  return &it->second;
+}
+
 void D3D12Renderer::RenderGameFrame() {
   if (!m_hasGamePipeline) return;
   m_commandList->SetGraphicsRootSignature(m_gameRootSig.Get());
@@ -417,6 +492,8 @@ void D3D12Renderer::RenderGameFrame() {
 
   ID3D12DescriptorHeap* heaps[] = {m_gameSrvHeap.Get()};
   m_commandList->SetDescriptorHeaps(1, heaps);
+  for (auto& [object, target] : m_gameRenderTargets)
+    target.usedThisFrame = false;
 
   if (m_gameDraws.empty() && !m_hasEverDrawnGame) {
     // Placeholder triangle, under the identity matrix in m_gameCB. Only until
@@ -434,11 +511,104 @@ void D3D12Renderer::RenderGameFrame() {
     return;
   }
 
+  uint32_t boundTargetObject = 0;  // zero is the final m_gameRT.
+  static const float kOffscreenClear[4] = {0, 0, 0, 0};
   for (const auto& d : m_gameDraws) {
+    // Keep the final 1280x720 surface on m_gameRT so PresentGameFrame remains
+    // an exact-size copy. Every other proven D3D9 target is isolated here;
+    // this is what prevents the old 129x129/160x90 passes from overpainting the
+    // visible scene when hle_main_viewport_only is disabled.
+    GameRenderTarget* drawTarget = nullptr;
+    if (d.targetObject && d.targetWidth && d.targetHeight &&
+        (d.targetWidth != 1280 || d.targetHeight != 720)) {
+      drawTarget = EnsureGameRenderTarget(d.targetObject, d.targetWidth,
+                                          d.targetHeight);
+    }
+    if (drawTarget) {
+      if (drawTarget->state != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+        D3D12_RESOURCE_BARRIER barrier = {};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition.pResource = drawTarget->resource.Get();
+        barrier.Transition.StateBefore = drawTarget->state;
+        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        m_commandList->ResourceBarrier(1, &barrier);
+        drawTarget->state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+      }
+      if (boundTargetObject != d.targetObject) {
+        auto rtv = m_gameRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += SIZE_T(drawTarget->rtvIndex) * m_gameRtvDescriptorSize;
+        m_commandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        D3D12_VIEWPORT viewport = {};
+        viewport.Width = float(drawTarget->width);
+        viewport.Height = float(drawTarget->height);
+        viewport.MinDepth = 0.0f;
+        viewport.MaxDepth = 1.0f;
+        D3D12_RECT scissor = {0, 0, LONG(drawTarget->width),
+                              LONG(drawTarget->height)};
+        m_commandList->RSSetViewports(1, &viewport);
+        m_commandList->RSSetScissorRects(1, &scissor);
+        boundTargetObject = d.targetObject;
+      }
+      if (!drawTarget->usedThisFrame) {
+        auto rtv = m_gameRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += SIZE_T(drawTarget->rtvIndex) * m_gameRtvDescriptorSize;
+        m_commandList->ClearRenderTargetView(rtv, kOffscreenClear, 0, nullptr);
+        drawTarget->usedThisFrame = true;
+      }
+    } else if (boundTargetObject != 0) {
+      auto rtv = m_gameRtvHeap->GetCPUDescriptorHandleForHeapStart();
+      auto dsv = m_gameDsvHeap->GetCPUDescriptorHandleForHeapStart();
+      m_commandList->OMSetRenderTargets(1, &rtv, FALSE,
+                                        m_gameDepth ? &dsv : nullptr);
+      m_commandList->RSSetViewports(1, &m_viewport);
+      m_commandList->RSSetScissorRects(1, &m_scissorRect);
+      boundTargetObject = 0;
+    }
+
     uint32_t textureDescriptor = 0;
-    const bool textured = EnsureGameTexture(d.texture, textureDescriptor);
-    const uint32_t pso_index = (d.depthEnable ? 1u : 0u) |
-                               (d.depthWrite ? 2u : 0u) |
+    bool textured = false;
+    if (d.sampledTargetObject &&
+        d.sampledTargetObject != d.targetObject) {
+      if (auto it = m_gameRenderTargets.find(d.sampledTargetObject);
+          it != m_gameRenderTargets.end()) {
+        auto& sampled = it->second;
+        if (sampled.state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
+          D3D12_RESOURCE_BARRIER barrier = {};
+          barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+          barrier.Transition.pResource = sampled.resource.Get();
+          barrier.Transition.StateBefore = sampled.state;
+          barrier.Transition.StateAfter =
+              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+          barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+          m_commandList->ResourceBarrier(1, &barrier);
+          sampled.state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        }
+        textureDescriptor = sampled.srvIndex;
+        textured = true;
+        static uint64_t s_resolved_hits = 0;
+        if (++s_resolved_hits <= 16 || (s_resolved_hits % 1000) == 0) {
+          char message[160];
+          std::snprintf(message, sizeof(message),
+                        "game resolved-target sample hit: object 0x%08X "
+                        "descriptor %u (hit %llu)",
+                        d.sampledTargetObject, textureDescriptor,
+                        static_cast<unsigned long long>(s_resolved_hits));
+          LogInfo(message);
+        }
+      }
+    }
+    if (!textured)
+      textured = EnsureGameTexture(d.texture, textureDescriptor);
+
+    // Offscreen targets do not yet have per-surface depth resources. The
+    // post-processing/resolve chain observed in ST_Southwest is colour-only;
+    // keep depth disabled there rather than bind the 1280x720 DSV against a
+    // smaller RTV, which is invalid D3D12 state.
+    const bool depthEnable = !drawTarget && d.depthEnable;
+    const bool depthWrite = depthEnable && d.depthWrite;
+    const uint32_t pso_index = (depthEnable ? 1u : 0u) |
+                               (depthWrite ? 2u : 0u) |
                                (d.colorWrite ? 0u : 4u) |
                                (textured ? 8u : 0u);
     m_commandList->SetPipelineState(m_gamePSOs[pso_index].Get());
@@ -497,7 +667,10 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t idxCount, const float* mvp,
                                  uint32_t topology, bool depthEnable,
                                  bool depthWrite, bool colorWrite,
-                                 std::shared_ptr<const mx::pm4::HleTexturePayload> texture) {
+                                 std::shared_ptr<const mx::pm4::HleTexturePayload> texture,
+                                 uint32_t targetObject, uint32_t targetWidth,
+                                 uint32_t targetHeight,
+                                 uint32_t sampledTargetObject) {
   // PERF(per-frame-allocs): this creates three ID3D12Resource's per call (VB +
   // IB + CB) on the UPLOAD heap, and is called once per submitted draw rather
   // than once per frame, so the allocation rate scales with the draw count —
@@ -563,6 +736,10 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.depthWrite = depthWrite;
   d.colorWrite = colorWrite;
   d.texture = std::move(texture);
+  d.targetObject = targetObject;
+  d.targetWidth = targetWidth;
+  d.targetHeight = targetHeight;
+  d.sampledTargetObject = sampledTargetObject;
 
   // Carry the translator's transform. Without this the draw renders under the
   // identity matrix baked into m_gameCB, which makes a correct transform and a
@@ -611,10 +788,14 @@ bool D3D12Renderer::CreateGameRenderTargets() {
   {
     D3D12_DESCRIPTOR_HEAP_DESC hd = {};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    hd.NumDescriptors = 1;
+    // Descriptor zero is the final 1280x720 target; the remaining descriptors
+    // are stable slots for D3D9 offscreen surface identities.
+    hd.NumDescriptors = kMaxGameRenderTargets + 1;
     if (FAILED(m_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&m_gameRtvHeap)))) {
       return false;
     }
+    m_gameRtvDescriptorSize = m_device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     m_device->CreateRenderTargetView(m_gameRT.Get(), nullptr,
         m_gameRtvHeap->GetCPUDescriptorHandleForHeapStart());
   }

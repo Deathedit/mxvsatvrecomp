@@ -119,10 +119,10 @@ REXCVAR_DEFINE_BOOL(main_surface_only, false, "Debug",
 // the 1280x720 scene produces the long white wedges seen in ST_Southwest.
 // Unlike main_surface_only's PM4 pitch guess, this selector comes from D3D9's
 // resolved, render-target-clamped viewport and is enabled only for HLE.
-REXCVAR_DEFINE_BOOL(hle_main_viewport_only, true, "Debug",
+REXCVAR_DEFINE_BOOL(hle_main_viewport_only, false, "Debug",
                     "In HLE rendering, submit only draws using the resolved "
-                    "1280x720 D3D9 viewport until separate render targets are "
-                    "modelled");
+                    "1280x720 D3D9 viewport. Diagnostic fallback now that "
+                    "separate render targets are modelled");
 
 // The intro playlist runs 47.4s (THQ 9.5s + Attract 37.9s) and the RenderPipeline
 // hook stands down for its whole duration, so the guest render path cannot run
@@ -333,7 +333,10 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                       (d->depth_control & (1u << 2)) != 0,
                                   (d->om_seen & (1u << 0)) == 0 ||
                                       (d->colour_mask & 0xFu) != 0,
-                                  d->texture);
+                                  d->texture, d->render_target_object,
+                                  d->render_target_width,
+                                  d->render_target_height,
+                                  d->sampled_render_target_object);
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;

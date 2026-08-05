@@ -53,7 +53,10 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  const uint8_t* indices, uint32_t idxBytes, bool idx16,
                  uint32_t idxCount, const float* mvp, uint32_t topology,
                  bool depthEnable, bool depthWrite, bool colorWrite,
-                 std::shared_ptr<const mx::pm4::HleTexturePayload> texture = {});
+                 std::shared_ptr<const mx::pm4::HleTexturePayload> texture = {},
+                 uint32_t targetObject = 0, uint32_t targetWidth = 0,
+                 uint32_t targetHeight = 0,
+                 uint32_t sampledTargetObject = 0);
 
 // Drop the previous frame's draws and retire the startup placeholder. Called
 // when a real guest-frame handoff arrives, including one whose draws are all
@@ -105,6 +108,9 @@ void ClearGameDraws();
   bool CreateGameRenderTargets();
   bool EnsureGameTexture(const std::shared_ptr<const mx::pm4::HleTexturePayload>& texture,
                          uint32_t& descriptorIndex);
+  struct GameRenderTarget;
+  GameRenderTarget* EnsureGameRenderTarget(uint32_t object, uint32_t width,
+                                           uint32_t height);
 
   void WaitForGpu();
   void MoveToNextFrame();
@@ -156,6 +162,7 @@ void ClearGameDraws();
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_gameCbvHeap;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_gameSrvHeap;
   uint32_t m_gameSrvDescriptorSize = 0;
+  uint32_t m_nextGameSrvDescriptor = 0;
   static constexpr uint32_t kMaxGameTextures = 1024;
   struct GameTexture {
     Microsoft::WRL::ComPtr<ID3D12Resource> resource;
@@ -184,6 +191,10 @@ void ClearGameDraws();
     bool depthWrite = false;
     bool colorWrite = true;
     std::shared_ptr<const mx::pm4::HleTexturePayload> texture;
+    uint32_t targetObject = 0;
+    uint32_t targetWidth = 0;
+    uint32_t targetHeight = 0;
+    uint32_t sampledTargetObject = 0;
   };
   // Bounded because each entry costs three CreateCommittedResource calls — see
   // the PERF(per-frame-allocs) note in d3d12_game.cpp.
@@ -218,4 +229,16 @@ void ClearGameDraws();
   Microsoft::WRL::ComPtr<ID3D12Resource> m_gameDepth;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_gameRtvHeap;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_gameDsvHeap;
+  uint32_t m_gameRtvDescriptorSize = 0;
+  static constexpr uint32_t kMaxGameRenderTargets = 64;
+  struct GameRenderTarget {
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t rtvIndex = 0;
+    uint32_t srvIndex = 0;
+    D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    bool usedThisFrame = false;
+  };
+  std::unordered_map<uint32_t, GameRenderTarget> m_gameRenderTargets;
 };
