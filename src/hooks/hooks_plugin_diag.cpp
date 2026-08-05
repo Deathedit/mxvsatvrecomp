@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cstdlib>
 #include <string>
 #include <utility>
@@ -516,6 +517,103 @@ extern "C" REX_FUNC(sub_8253CF80) {
                 REX_LOAD_U32(0x830577C0), REX_LOAD_U32(0x83057900));
     s_last = ret;
   }
+}
+
+//=============================================================================
+// The front end is script-driven, not C++ virtual dispatch (2026-08-05)
+//
+// Tracing the load-request chain upward through the recompiled sources runs out
+// of static call sites: four of the five functions above `sub_82352AE0` have
+// zero direct callers. They are not virtual methods either. They are entries in
+// a **name -> function binding table** at `0x8203F2E0`, 228 pairs of
+// `const char*` and code pointer, registered from `MXRavage_Xenon_00cb`
+// (0x824F1E1C). The vocabulary is a scripting API:
+//
+//   [  6] LoadAssetDB          [ 10] ExecuteScriptAsset
+//   [ 40] GetUIState           [ 50] LoadUIAssetPackage
+//   [ 53] LoadUIAssetDatabasePackage
+//   [ 66] StartWorldLoad       [ 67] EnableWorld
+//   [110] SwitchToUIWorld
+//
+// `StartWorldLoad` is `sub_824CD280` — the function that reaches
+// `sub_82534980`, the load-request API. So nothing requests a scene because
+// **no script ever calls StartWorldLoad**, and the question is whether the
+// script environment runs at all.
+//
+// These four probes answer that. They deliberately sit at different depths:
+// ExecuteScriptAsset is "does any script run", the two UI loaders are "does the
+// front end's content arrive", and StartWorldLoad is the endpoint we already
+// know is silent. Whichever is the last to fire names the break.
+//
+// Note the standing suspicion this connects to: AGENTS.md lists the binary
+// `.xenon.package` heaps as encrypted (entropy ~7.98, routine unknown). If the
+// UI scripts live in those heaps, the encryption is not a side issue — it is
+// the reason there is no menu.
+//=============================================================================
+
+// Shared reporting: first few calls in full, then time-limited. A fixed budget
+// is what hid the UV measurements — it spends itself on the boot phase and goes
+// quiet exactly when the interesting work starts.
+void ReportScriptProbe(const char* name, uint32_t a1, uint32_t lr,
+                       uint64_t& count) {
+  static std::chrono::steady_clock::time_point s_last[8]{};
+  const size_t slot = size_t(reinterpret_cast<uintptr_t>(name)) % 8;
+  const auto now = std::chrono::steady_clock::now();
+  const bool due = (now - s_last[slot]) >= std::chrono::seconds(5);
+  if (++count <= 4 || due) {
+    if (due) s_last[slot] = now;
+    REXLOG_INFO("{}: script {} #{} a1=0x{:08X} from lr=0x{:08X}",
+                mx::native::g_plugin_mode ? "plugin" : "native", name, count,
+                a1, lr);
+  }
+}
+
+#define MX_SCRIPT_PROBE(addr, orig, label)                       \
+  REX_IMPORT(__imp__##addr, orig, void());                       \
+  extern "C" REX_FUNC(addr) {                                    \
+    static uint64_t s_count = 0;                                 \
+    const uint32_t a1 = ctx.r3.u32;                              \
+    const uint32_t lr = uint32_t(ctx.lr);                        \
+    ReportScriptProbe(label, a1, lr, s_count);                   \
+    orig(ctx, base);                                             \
+  }
+
+MX_SCRIPT_PROBE(sub_824AF838, orig_ExecuteScriptAsset, "ExecuteScriptAsset")
+MX_SCRIPT_PROBE(sub_824CBF90, orig_LoadUIAssetPackage, "LoadUIAssetPackage")
+MX_SCRIPT_PROBE(sub_824CC218, orig_LoadUIAssetDbPackage,
+                "LoadUIAssetDatabasePackage")
+MX_SCRIPT_PROBE(sub_824D0F18, orig_SwitchToUIWorld, "SwitchToUIWorld")
+MX_SCRIPT_PROBE(sub_824CD280, orig_StartWorldLoad, "StartWorldLoad")
+
+// The registration site is 0x824F1E1C; its enclosing function is
+// `sub_824F1C98` — resolved from the recompiled sources, where the next
+// definition after it is `sub_824F1F78`, not guessed from the site address. If
+// this never runs, the script environment was never set up at all, which is a
+// different failure from "set up but never fed".
+MX_SCRIPT_PROBE(sub_824F1C98, orig_ScriptBindingRegister, "BindingRegister")
+
+// The script VM's native-call dispatcher. `ExecuteScriptAsset` was observed
+// being called from lr=0x82AA78F4, and 0x82AA78F4 lies inside `sub_82AA7638`
+// (the next definition in the recompiled sources is `sub_82AA7928`). This is
+// the discriminator: if it fires only a handful of times the VM itself is idle,
+// and if it fires continuously then scripts are running but never take the
+// branch that loads a world.
+MX_SCRIPT_PROBE(sub_82AA7638, orig_ScriptDispatch, "VMDispatch")
+
+// The asset names themselves. `ExecuteScriptAsset` (sub_824AF838) validates
+// that it got exactly one `char const*`, resolves it with the VM's string
+// accessor, and passes the result to `sub_824F91E8` — so that function's r3 is
+// the script asset name, in plain guest memory, before any VM indirection.
+// Read out of the binding's own body, not inferred from the call shape.
+REX_IMPORT(__imp__sub_824F91E8, orig_RunScriptAsset, void());
+extern "C" REX_FUNC(sub_824F91E8) {
+  const uint32_t name_ptr = ctx.r3.u32;
+  const std::string name = GuestString(base, name_ptr, 128);
+  static uint64_t s_count = 0;
+  REXLOG_INFO("{}: script asset #{} \"{}\" (ptr=0x{:08X}) from lr=0x{:08X}",
+              mx::native::g_plugin_mode ? "plugin" : "native", ++s_count, name,
+              name_ptr, uint32_t(ctx.lr));
+  orig_RunScriptAsset(ctx, base);
 }
 
 // sub_82B38558 — TerminatorVtableCtor (installs off_8213F70C vtable)
