@@ -299,9 +299,41 @@ Two measurements identify it as ours, not the guest's:
   state tracking while the PM4 translator keeps going) — it is an A/B
   instrument, not a mode.
 
-So the per-draw bookkeeping is expensive in both modes. Plugin mode was pure
-waste and is fixed; native needs the layer, so the work is to make it cheap,
-not to skip it.
+### It was `VirtualQuery`, and it is fixed (2026-08-06)
+
+Not the per-draw bookkeeping — that was a guess and it was wrong. `DeclFile()`
+writes stop after `kMaxDrawsLogged = 16` draws, `ReportDrawCounts` early-returns
+2499 times in 2500, and `REXCVAR_GET(x)` is a storage accessor.
+
+`HostPageReadable` was **~100% of native frame time**: 502 calls a frame costing
+3082ms of a 3128ms MainLoop body. Note the shape — **~6ms per call**, not many
+cheap calls. A `VirtualQuery` is normally microseconds; six milliseconds is what
+it costs against this process's address space, and that is also why a Release
+build cost exactly what Debug did.
+
+The fix is not to call it less by guesswork. `VirtualQuery` already returns the
+whole contiguous run it found in `mbi.BaseAddress` / `mbi.RegionSize`, with
+identical `State` and `Protect` throughout, so one query legitimately answers for
+every address in that range. `HostPageReadable` now keeps an 8-entry MRU region
+cache, cleared once per swap from the VdSwap hook so a commit or decommit is
+picked up within a frame — a stale *positive* on a decommitted page is a crash,
+which is the whole reason this function exists.
+
+`--d3d9_page_cache_verify=true` re-queries the OS on every cache hit and logs
+disagreements. **0 mismatches in 5,557 checks**, which is the correctness
+argument, run rather than asserted.
+
+| | before | after |
+|---|---|---|
+| MainLoop body | 300 → 3100ms | ~105ms |
+| MainLoop in 70s | ~26 | **901–961** (3/3) |
+| VirtualQuery per frame | 502 | 5–7 |
+
+Native is now ~13/s against the plugin's ~16/s, from 0.37/s.
+
+**And it did not move the front end: still 2 script assets and 4 VM dispatches,
+3/3.** Frame starvation was not what held it back. The script-layer divergence
+against plugin mode is a separate cause and remains the open question.
 
 `--log_high_frequency_kernel_calls=true` does **not** gate these calls: a run
 with it has the same 15 `[krnl]` lines as one without. Hook the wrappers.

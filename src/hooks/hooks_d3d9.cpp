@@ -326,12 +326,102 @@ constexpr uint32_t kDeviceScanBytes = 0x4000;
 constexpr uint32_t kDeviceScanDwords = kDeviceScanBytes / 4;
 constexpr uint32_t kHostPageSize = 4096;
 
-bool HostPageReadable(const void* p) {
+// VirtualQuery here was ~100% of native frame time: 502 calls a frame costing
+// 3082ms of a 3128ms MainLoop body, measured 2026-08-06. Note the shape — it is
+// **~6ms per call**, not a large number of cheap calls. A VirtualQuery is
+// normally microseconds; six milliseconds is what it costs against this
+// process's address space, and that also explains why a Release build cost
+// exactly what Debug did.
+//
+// The fix is not to call it less often by guesswork. VirtualQuery already
+// reports the whole contiguous run it found in mbi.BaseAddress / mbi.RegionSize,
+// with identical State and Protect throughout, so one query legitimately answers
+// for every address in that range. Cache the region and answer subsequent
+// queries from it: the cached answer is exactly what the OS said, not a
+// heuristic.
+//
+// The cache is cleared once per swap (ReportHostPageQueryStats, called from the
+// VdSwap hook) so a commit or decommit underneath it is picked up within a
+// frame. That matters in one direction specifically: a stale *positive* on a
+// decommitted page is a crash, and avoiding exactly that is why this function
+// exists. Guest allocations cluster at load, so per-frame is ample.
+REXCVAR_DEFINE_BOOL(d3d9_page_cache_verify, false, "Debug",
+                    "Verify every page-readability cache hit against a fresh "
+                    "VirtualQuery and log mismatches. Slow; correctness check "
+                    "for the region cache");
+
+struct HostRegionCacheEntry {
+  const uint8_t* base = nullptr;
+  size_t size = 0;
+  bool ok = false;
+};
+constexpr size_t kHostRegionCacheSize = 8;
+HostRegionCacheEntry g_hprCache[kHostRegionCacheSize];
+size_t g_hprCacheCount = 0;
+size_t g_hprCacheNext = 0;
+uint64_t g_hprCalls = 0;
+uint64_t g_hprQueries = 0;
+uint64_t g_hprNanos = 0;
+
+bool UncachedHostPageReadable(const void* p) {
   MEMORY_BASIC_INFORMATION mbi = {};
   if (VirtualQuery(p, &mbi, sizeof(mbi)) != sizeof(mbi)) return false;
   if (mbi.State != MEM_COMMIT) return false;
   constexpr DWORD kNoRead = PAGE_NOACCESS | PAGE_GUARD;
   return mbi.Protect != 0 && (mbi.Protect & kNoRead) == 0;
+}
+
+bool HostPageReadable(const void* p) {
+  ++g_hprCalls;
+  const auto* addr = static_cast<const uint8_t*>(p);
+  for (size_t i = 0; i < g_hprCacheCount; ++i) {
+    const auto& e = g_hprCache[i];
+    if (addr >= e.base && addr < e.base + e.size) {
+      // Paranoid mode: ask the OS anyway and compare. This is the correctness
+      // argument for the cache, run rather than asserted. Slow by design.
+      if (REXCVAR_GET(d3d9_page_cache_verify)) {
+        const bool truth = UncachedHostPageReadable(p);
+        if (truth != e.ok) {
+          static uint64_t s_bad = 0;
+          if (++s_bad <= 40)
+            REXLOG_ERROR(
+                "d3d9: page cache MISMATCH #{} at {} — cached {}, actual {} "
+                "(region {} +{:#x})",
+                s_bad, p, e.ok, truth, static_cast<const void*>(e.base),
+                e.size);
+        }
+      }
+      return e.ok;
+    }
+  }
+
+  const auto _t0 = std::chrono::steady_clock::now();
+  ++g_hprQueries;
+  MEMORY_BASIC_INFORMATION mbi = {};
+  const bool queried = VirtualQuery(p, &mbi, sizeof(mbi)) == sizeof(mbi);
+  g_hprNanos += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now() - _t0)
+                             .count());
+  if (!queried) return false;  // no region to cache
+
+  constexpr DWORD kNoRead = PAGE_NOACCESS | PAGE_GUARD;
+  const bool ok = mbi.State == MEM_COMMIT && mbi.Protect != 0 &&
+                  (mbi.Protect & kNoRead) == 0;
+
+  if (mbi.RegionSize) {
+    const size_t slot = g_hprCacheCount < kHostRegionCacheSize
+                            ? g_hprCacheCount++
+                            : (g_hprCacheNext =
+                                   (g_hprCacheNext + 1) % kHostRegionCacheSize);
+    g_hprCache[slot] = {static_cast<const uint8_t*>(mbi.BaseAddress),
+                        mbi.RegionSize, ok};
+  }
+  return ok;
+}
+
+void InvalidateHostPageCache() {
+  g_hprCacheCount = 0;
+  g_hprCacheNext = 0;
 }
 
 // One bit per dword offset. Starts all-set and is intersected; anything still
@@ -4388,6 +4478,30 @@ void ReportDrawCounts(uint8_t* base) {
 
 void FinalizePendingD3D9Draws(uint8_t* base) {
   FinalizePendingD3D9DrawsImpl(base);
+}
+
+void ReportHostPageQueryStats() {
+  static uint64_t s_calls = 0, s_queries = 0, s_nanos = 0;
+  const uint64_t calls = g_hprCalls - s_calls;
+  const uint64_t queries = g_hprQueries - s_queries;
+  const uint64_t nanos = g_hprNanos - s_nanos;
+  s_calls = g_hprCalls;
+  s_queries = g_hprQueries;
+  s_nanos = g_hprNanos;
+  static uint64_t s_frame = 0;
+  ++s_frame;
+  static std::chrono::steady_clock::time_point s_last{};
+  const auto now = std::chrono::steady_clock::now();
+  const bool due = (now - s_last) >= std::chrono::seconds(5);
+  if (s_frame <= 8 || due) {
+    if (due) s_last = now;
+    REXLOG_INFO(
+        "d3d9: page checks this frame — {} calls, {} VirtualQuery, {}ms "
+        "(total {} queries)",
+        calls, queries, nanos / 1000000, g_hprQueries);
+  }
+  // Bound the staleness: see the note on HostPageReadable.
+  InvalidateHostPageCache();
 }
 
 //=============================================================================

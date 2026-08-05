@@ -96,6 +96,7 @@ extern "C" REX_FUNC(sub_82566B58) {
   static int swap_count = 0;
   ++swap_count;
   SwapTimer _swap_timer{"VdSwap hook total", swap_count};
+  if (!mx::native::g_plugin_mode) ReportHostPageQueryStats();
 
   // Frame period, swap to swap. The first swap has no predecessor and is not
   // counted — otherwise the whole of startup lands in the first "frame" and

@@ -129,17 +129,16 @@ extern "C" REX_FUNC(sub_82B70760) {
     }
   }
 
-  // Time the guest's own body. Native gets under 61 iterations in 75s against
-  // plugin mode's 1200 in 73s, and turning the HLE renderer off changes nothing,
-  // so the cost is inside orig_MainLoop rather than in anything above it. Log
-  // every iteration until the shape is known — at this rate that is a handful of
-  // lines, not a flood.
+  // Time the guest's own body. This is the number that tracked the whole
+  // native-vs-plugin gap: 300ms rising to 3100ms before the page-readability
+  // cache, ~105ms after. The threshold sits above the normal body so a healthy
+  // run stays quiet and a regression announces itself.
   const auto t0 = std::chrono::steady_clock::now();
   orig_MainLoop(ctx, base);
   const auto body_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                            std::chrono::steady_clock::now() - t0)
                            .count();
-  if (ml <= 60 || body_ms >= 100)
+  if (ml <= 8 || body_ms >= 250)
     REXLOG_INFO("native: MainLoop #{} body={}ms", ml, body_ms);
   ctx.r3.u32 = 1;
   if ((ml % 60) == 1) {
@@ -196,64 +195,8 @@ extern "C" REX_FUNC(sub_82B70578) {
   if (ms >= 50) REXLOG_INFO("native: RenderPipeline #{} took {}ms", rp, ms);
 }
 
-//=============================================================================
-// MainLoop's other callees, timed
-//=============================================================================
-// MainLoop's body runs 350ms rising to 3000ms natively against ~16ms under the
-// plugin, and it is not the 500ms poll wait (measured) and not BeginFrame /
-// EndFrame (stubbed natively, no original called). These are the rest of what it
-// calls directly, read off the recompiled body of sub_82B70760: the pump inside
-// the poll loop, and the two calls on the way in.
-#define MX_TIME_CALLEE(addr, orig, label)                                  \
-  REX_IMPORT(__imp__##addr, orig, void());                                 \
-  extern "C" REX_FUNC(addr) {                                              \
-    if (mx::native::g_plugin_mode) {                                       \
-      orig(ctx, base);                                                     \
-      return;                                                              \
-    }                                                                      \
-    const auto t0 = std::chrono::steady_clock::now();                      \
-    orig(ctx, base);                                                       \
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>( \
-                        std::chrono::steady_clock::now() - t0)             \
-                        .count();                                          \
-    if (ms >= 50) {                                                        \
-      static uint64_t s_n = 0;                                             \
-      REXLOG_INFO("native: {} slow #{} {}ms", label, ++s_n, ms);           \
-    }                                                                      \
-  }
-
-MX_TIME_CALLEE(sub_82AB6F18, orig_MainLoopPump, "MainLoopPump")
-MX_TIME_CALLEE(sub_82BDB290, orig_MainLoopPre1, "MainLoopPre1")
-MX_TIME_CALLEE(sub_82BFC090, orig_MainLoopPre2, "MainLoopPre2")
-
-// RenderPipeline turned out to be 100% of MainLoop's body, and VdSwap is at most
-// ~87ms of that (its own orig never reaches 50ms). These are the rest of what
-// sub_82B70578 calls directly — sub_82ABF828 and sub_82ABF930 are excluded
-// because hooks_frame.cpp already stubs them natively, so they cost nothing.
-MX_TIME_CALLEE(sub_82B600A8, orig_RpCallee1, "RP.sub_82B600A8")
-MX_TIME_CALLEE(sub_82AFE978, orig_RpCallee2, "RP.sub_82AFE978")
-MX_TIME_CALLEE(sub_82ABF638, orig_RpCallee3, "RP.sub_82ABF638")
-MX_TIME_CALLEE(sub_82ABCC48, orig_RpCallee4, "RP.sub_82ABCC48")
-
-// sub_82AFE978's own callees. A Release build costs exactly what Debug does
-// here — 300ms bodies, 27 MainLoop iterations in 70s, both — so this is a wait,
-// not compute, and one of these blocks. Read off its body: it fetches a D3D9
-// device from TLS+22428, then calls these in order. sub_8254C3B0
-// (SetDepthStencil) and sub_8255D520 (GpuState) are excluded — already hooked.
-// sub_825599A8 takes only the device, which is the shape of a block-until-idle.
-MX_TIME_CALLEE(sub_82AFCA38, orig_RtCallee1, "RT.sub_82AFCA38")
-
-// sub_82AFCA38 is the leaf so far and it is large — 4,416 lines of recompiled
-// PPC calling SetTexture 31 times, Resolve 4, plus 7 indirect calls. These are
-// its hot callees that are not already hooked in hooks_d3d9.cpp; the D3D9 ones
-// that are hooked get their timing added there instead.
-MX_TIME_CALLEE(sub_8254ADF8, orig_LeafA, "LEAF.sub_8254ADF8")
-MX_TIME_CALLEE(sub_8254AC50, orig_LeafB, "LEAF.sub_8254AC50")
-MX_TIME_CALLEE(sub_8254A630, orig_LeafC, "LEAF.sub_8254A630")
-MX_TIME_CALLEE(sub_82AFA520, orig_LeafD, "LEAF.sub_82AFA520")
-MX_TIME_CALLEE(sub_82AEC708, orig_LeafE, "LEAF.sub_82AEC708")
-MX_TIME_CALLEE(sub_82ACFC88, orig_RtCallee2, "RT.sub_82ACFC88")
-MX_TIME_CALLEE(sub_8254C688, orig_RtCallee3, "RT.sub_8254C688")
-MX_TIME_CALLEE(sub_82550D68, orig_RtCallee4, "RT.sub_82550D68")
-MX_TIME_CALLEE(sub_82550C80, orig_RtCallee5, "RT.sub_82550C80")
-MX_TIME_CALLEE(sub_825599A8, orig_RtCallee6, "RT.sub_825599A8")
+// The per-callee timing probes that found this are REMOVED 2026-08-06, having
+// done their job. They wrapped hot recursive guest functions in two
+// steady_clock reads each, which is its own cost on the path being measured.
+// The chain they established is in AGENTS.md; git history has the probes if
+// another level ever needs walking.
