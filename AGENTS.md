@@ -241,6 +241,39 @@ slow "is a pad connected" cadence, not a front end reading a stick.
 So there is one bug here, not three. Do not open audio or controller work as a
 separate thread until the front end runs.
 
+**The plugin-mode reference, measured 2026-08-06 with the same probes.** With
+the D3D9 HLE hooks guarded (below) so the plugin runs at full speed, the guest
+gets far past where it stops natively:
+
+| | native | plugin |
+|---|---|---|
+| script assets | 2 (`RSLibrary`, `UI_Helper`) | **8**, incl. `IG_PlayerListHelper`, `SH_GarageHelper`, `SH_XPHelper`, `FE_Home_Cameras`, `SH_CutsceneHelper` |
+| VMDispatch | 4 | **16** |
+| audio | 0 non-silent / 30,776 | **11,786 non-silent / 13,115, peak 0.216** |
+
+`FE_Home_Cameras` is a front-end script. So the front end does run under the
+plugin, and the audio path is not merely alive but ~90% non-silent. **The
+divergence is in the script layer and it is the most informative open thread in
+the project** — it is the first thing that separates the two modes at the level
+of the actual blocker. Whatever native mode is missing, plugin mode has it.
+
+### The D3D9 HLE hooks must no-op in plugin mode (2026-08-06)
+
+`hooks_d3d9.cpp` is the native renderer, but until 2026-08-06 all 14 of its
+hooks ran in **both** modes — the only hooks file without `g_plugin_mode`
+guards (`hooks_boot.cpp` 9/9, `hooks_frame.cpp` 8/8, `hooks_gameloop.cpp` 2/2).
+`hle_render` and `hle_shader_exec` default off, so the transcode and CPU-shader
+paths were not running; the per-draw bookkeeping alone was enough, at ~1,480
+draws a frame in a Debug build.
+
+Measured cost: plugin-mode `MainLoop` fell from **~17.6/s** (2026-08-03, before
+this file grew — every commit that grew it is dated 2026-08-05) to **~0.37/s**.
+Restoring the guard brings it back to ~16.4/s.
+
+Use `MX_D3D9_PLUGIN_PASSTHROUGH(orig)` on any hook added to that file. Every
+hook there calls its original exactly once, so returning straight after it is
+the complete plugin-mode behaviour.
+
 `--log_high_frequency_kernel_calls=true` does **not** gate these calls: a run
 with it has the same 15 `[krnl]` lines as one without. Hook the wrappers.
 

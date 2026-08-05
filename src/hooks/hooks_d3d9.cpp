@@ -4391,6 +4391,25 @@ void FinalizePendingD3D9Draws(uint8_t* base) {
 }
 
 //=============================================================================
+// Plugin-mode passthrough
+//=============================================================================
+// This whole layer is the native renderer. When --gpu_plugin=xenos is set the
+// plugin owns rendering and none of the work below is wanted — but until
+// 2026-08-06 every hook in this file ran in both modes, unlike the other five
+// hooks files, which all guard consistently.
+//
+// It was not free. The per-draw bookkeeping alone (NoteDrawDeclaration,
+// ReportDrawCounts, the REXCVAR_GET calls) runs ~1,480 times a frame in a Debug
+// build, and plugin-mode MainLoop fell from ~17.6/s on 2026-08-03, before this
+// file grew, to ~0.37/s once it had. Every hook here calls its original exactly
+// once, so returning straight after it is the complete plugin-mode behaviour.
+#define MX_D3D9_PLUGIN_PASSTHROUGH(orig) \
+  if (mx::native::g_plugin_mode) {       \
+    orig(ctx, base);                     \
+    return;                              \
+  }
+
+//=============================================================================
 // 0x82550B80 — D3DVertexDeclaration* D3DDevice_CreateVertexDeclaration(
 //                  const D3DVERTEXELEMENT9* pVertexElements)
 //
@@ -4406,6 +4425,7 @@ void FinalizePendingD3D9Draws(uint8_t* base) {
 
 REX_IMPORT(__imp__sub_82550B80, orig_CreateVertexDeclaration, void());
 extern "C" REX_FUNC(sub_82550B80) {
+  MX_D3D9_PLUGIN_PASSTHROUGH(orig_CreateVertexDeclaration);
   const uint32_t elements = ctx.r3.u32;
   const uint64_t n = ++g_decls;
 
@@ -4509,6 +4529,7 @@ extern "C" REX_FUNC(sub_82550B80) {
 
 REX_IMPORT(__imp__sub_82564C50, orig_PatchVertexShader, void());
 extern "C" REX_FUNC(sub_82564C50) {
+  MX_D3D9_PLUGIN_PASSTHROUGH(orig_PatchVertexShader);
   const uint32_t args[5] = {ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
                             ctx.r7.u32};
   int found = -1;
@@ -4581,6 +4602,7 @@ extern "C" REX_FUNC(sub_82564C50) {
 
 REX_IMPORT(__imp__sub_825565C8, orig_DrawIndexedVertices, void());
 extern "C" REX_FUNC(sub_825565C8) {
+  MX_D3D9_PLUGIN_PASSTHROUGH(orig_DrawIndexedVertices);
   const uint32_t primitive_type = ctx.r4.u32;
   const int32_t base_vertex = ctx.r5.s32;
   const uint32_t start_index = ctx.r6.u32;
@@ -4630,6 +4652,7 @@ extern "C" REX_FUNC(sub_825565C8) {
 
 REX_IMPORT(__imp__sub_825561B0, orig_DrawVertices, void());
 extern "C" REX_FUNC(sub_825561B0) {
+  MX_D3D9_PLUGIN_PASSTHROUGH(orig_DrawVertices);
   const uint32_t primitive_type = ctx.r4.u32;
   const uint32_t start_vertex = ctx.r5.u32;
   const uint32_t vertex_count = ctx.r6.u32;
@@ -4692,6 +4715,7 @@ extern "C" REX_FUNC(sub_825561B0) {
 //-----------------------------------------------------------------------------
 REX_IMPORT(__imp__sub_8254B7C0, orig_SetStreamSource, void());
 extern "C" REX_FUNC(sub_8254B7C0) {
+  MX_D3D9_PLUGIN_PASSTHROUGH(orig_SetStreamSource);
   const uint32_t stream = ctx.r4.u32;
   const uint32_t buffer = ctx.r5.u32;
   const uint32_t offset = ctx.r6.u32;
@@ -4757,6 +4781,7 @@ extern "C" REX_FUNC(sub_8254B7C0) {
 //-----------------------------------------------------------------------------
 REX_IMPORT(__imp__sub_8254B8E0, orig_SetIndices, void());
 extern "C" REX_FUNC(sub_8254B8E0) {
+  MX_D3D9_PLUGIN_PASSTHROUGH(orig_SetIndices);
   const uint32_t buffer = ctx.r4.u32;
   auto& st = DeviceState();
   st.NoteDevice(ctx.r3.u32, mx::pm4::kEpSetIndices);
@@ -4873,6 +4898,7 @@ void DumpVertexShaderObject(uint32_t handle, uint8_t* base) {
 
 REX_IMPORT(__imp__sub_825508A8, orig_SetVertexShader, void());
 extern "C" REX_FUNC(sub_825508A8) {
+  MX_D3D9_PLUGIN_PASSTHROUGH(orig_SetVertexShader);
   auto& st = DeviceState();
   st.NoteDevice(ctx.r3.u32, mx::pm4::kEpSetVertexShader);
   st.vertex_shader = ctx.r4.u32;
@@ -4886,6 +4912,7 @@ extern "C" REX_FUNC(sub_825508A8) {
 
 REX_IMPORT(__imp__sub_825506E8, orig_SetPixelShader, void());
 extern "C" REX_FUNC(sub_825506E8) {
+  MX_D3D9_PLUGIN_PASSTHROUGH(orig_SetPixelShader);
   auto& st = DeviceState();
   st.NoteDevice(ctx.r3.u32, mx::pm4::kEpSetPixelShader);
   st.pixel_shader = ctx.r4.u32;
@@ -4924,6 +4951,7 @@ mx::pm4::RenderTargetBinding SnapshotRenderTarget(uint32_t object,
 
 REX_IMPORT(__imp__sub_8254C060, orig_SetRenderTarget, void());
 extern "C" REX_FUNC(sub_8254C060) {
+  MX_D3D9_PLUGIN_PASSTHROUGH(orig_SetRenderTarget);
   const uint32_t slot = ctx.r4.u32;
   const uint32_t object = ctx.r5.u32;
   if (slot < 4) {
@@ -4954,6 +4982,7 @@ extern "C" REX_FUNC(sub_8254C060) {
 
 REX_IMPORT(__imp__sub_8254C3B0, orig_SetDepthStencil, void());
 extern "C" REX_FUNC(sub_8254C3B0) {
+  MX_D3D9_PLUGIN_PASSTHROUGH(orig_SetDepthStencil);
   auto& st = DeviceState();
   st.NoteDevice(ctx.r3.u32, mx::pm4::kEpSetDepthStencil);
   st.depth_stencil = SnapshotRenderTarget(ctx.r4.u32, base);
@@ -4971,6 +5000,7 @@ extern "C" REX_FUNC(sub_8254C3B0) {
 //-----------------------------------------------------------------------------
 REX_IMPORT(__imp__sub_8255CE98, orig_Resolve, void());
 extern "C" REX_FUNC(sub_8255CE98) {
+  MX_D3D9_PLUGIN_PASSTHROUGH(orig_Resolve);
   auto& st = DeviceState();
   st.NoteDevice(ctx.r3.u32, mx::pm4::kEpResolve);
   const uint32_t source_slot = ctx.r4.u32 & 7u;
@@ -5010,6 +5040,7 @@ extern "C" REX_FUNC(sub_8255CE98) {
 //-----------------------------------------------------------------------------
 REX_IMPORT(__imp__sub_8254E748, orig_SetTexture, void());
 extern "C" REX_FUNC(sub_8254E748) {
+  MX_D3D9_PLUGIN_PASSTHROUGH(orig_SetTexture);
   const uint32_t device = ctx.r3.u32;
   const uint32_t sampler = ctx.r4.u32;
   const uint32_t texture = ctx.r5.u32;
@@ -5077,6 +5108,7 @@ extern "C" REX_FUNC(sub_8254E748) {
 //-----------------------------------------------------------------------------
 REX_IMPORT(__imp__sub_8254BF50, orig_SetViewport, void());
 extern "C" REX_FUNC(sub_8254BF50) {
+  MX_D3D9_PLUGIN_PASSTHROUGH(orig_SetViewport);
   const uint32_t p = ctx.r4.u32;
   if (p) {
     auto& st = DeviceState();
@@ -5107,6 +5139,7 @@ extern "C" REX_FUNC(sub_8254BF50) {
 //-----------------------------------------------------------------------------
 REX_IMPORT(__imp__sub_8254B678, orig_SetScissorRect, void());
 extern "C" REX_FUNC(sub_8254B678) {
+  MX_D3D9_PLUGIN_PASSTHROUGH(orig_SetScissorRect);
   const uint32_t p = ctx.r4.u32;
   if (p) {
     auto& st = DeviceState();
