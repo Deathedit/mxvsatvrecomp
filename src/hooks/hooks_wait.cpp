@@ -19,7 +19,12 @@ extern "C" REX_FUNC(sub_82BFB740) {
   // REMOVED 2026-08-06. It dated to 3cca295 (2026-08-01), predating the D3D9 HLE
   // layer, and was never scoped to a thread or a handle — it spun every 500ms
   // wait in the process, not just the renderer handshake it was written for.
-  // Same vintage and same shape as the mid-ASM renderer skip already retired.
+  //
+  // MainLoop does contain a `li r4,500` wait, in its poll loop at 0x82B707E4
+  // (`Wait(*(r30+732), 500)`, looping while r3 == 258 STATUS_TIMEOUT), so this
+  // looked like the reason native MainLoop crawls. It is not: restoring the
+  // short-circuit leaves the loop body at 350ms rising to 3000ms, unchanged.
+  // Measured, not assumed — do not restore it on the strength of that call site.
   if (ctx.r4.u32 == 0xFFFFFFFF) {
     static int inf = 0;
     ++inf;
@@ -34,7 +39,32 @@ extern "C" REX_FUNC(sub_82BFB740) {
     // Note the old timer was a single process-wide `static t0`, not per-wait,
     // so 3s after the FIRST wait every wait in the process became a no-op.
   }
+  // Slow-wait detector. Native MainLoop manages under 61 iterations in 75s
+  // where plugin mode does 1200 in 73s, and it is not HLE cost — a native run
+  // with hle_render and hle_shader_exec off behaves identically. So something
+  // blocks, and a wait is the first place to look. Log the handle, the
+  // requested timeout and the caller for anything that actually stalls.
+  const uint32_t handle = ctx.r3.u32;
+  const uint32_t timeout = ctx.r4.u32;
+  const uint32_t lr = uint32_t(ctx.lr);
+  const auto t0 = std::chrono::steady_clock::now();
   orig_Wait(ctx, base);
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count();
+  if (ms >= 50) {
+    static uint64_t s_slow = 0;
+    static std::chrono::steady_clock::time_point s_last{};
+    const auto now = std::chrono::steady_clock::now();
+    const bool due = (now - s_last) >= std::chrono::seconds(5);
+    if (++s_slow <= 20 || due) {
+      if (due) s_last = now;
+      REXLOG_INFO(
+          "native: slow wait #{} {}ms handle=0x{:08X} timeout=0x{:08X} "
+          "r3=0x{:08X} from lr=0x{:08X}",
+          s_slow, ms, handle, timeout, ctx.r3.u32, lr);
+    }
+  }
 }
 
 // The sub_82BFB748 (NtSetEvent) hook is REMOVED 2026-08-06. It was a frontier

@@ -7,6 +7,8 @@
 
 #include "hooks/hook_common.h"
 
+#include <chrono>
+
 //=============================================================================
 // sub_82B70760 — Main game loop
 //=============================================================================
@@ -127,7 +129,18 @@ extern "C" REX_FUNC(sub_82B70760) {
     }
   }
 
+  // Time the guest's own body. Native gets under 61 iterations in 75s against
+  // plugin mode's 1200 in 73s, and turning the HLE renderer off changes nothing,
+  // so the cost is inside orig_MainLoop rather than in anything above it. Log
+  // every iteration until the shape is known — at this rate that is a handful of
+  // lines, not a flood.
+  const auto t0 = std::chrono::steady_clock::now();
   orig_MainLoop(ctx, base);
+  const auto body_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - t0)
+                           .count();
+  if (ml <= 60 || body_ms >= 100)
+    REXLOG_INFO("native: MainLoop #{} body={}ms", ml, body_ms);
   ctx.r3.u32 = 1;
   if ((ml % 60) == 1) {
     REXLOG_INFO("native: MainLoop #{}", ml);
@@ -175,5 +188,49 @@ extern "C" REX_FUNC(sub_82B70578) {
   }
   if (rp == 1 || (rp % 600) == 0)
     REXLOG_INFO("native: RenderPipeline #{} — calling orig", rp);
+  const auto t0 = std::chrono::steady_clock::now();
   orig_RenderPipeline(ctx, base);
+  const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::steady_clock::now() - t0)
+                      .count();
+  if (ms >= 50) REXLOG_INFO("native: RenderPipeline #{} took {}ms", rp, ms);
 }
+
+//=============================================================================
+// MainLoop's other callees, timed
+//=============================================================================
+// MainLoop's body runs 350ms rising to 3000ms natively against ~16ms under the
+// plugin, and it is not the 500ms poll wait (measured) and not BeginFrame /
+// EndFrame (stubbed natively, no original called). These are the rest of what it
+// calls directly, read off the recompiled body of sub_82B70760: the pump inside
+// the poll loop, and the two calls on the way in.
+#define MX_TIME_CALLEE(addr, orig, label)                                  \
+  REX_IMPORT(__imp__##addr, orig, void());                                 \
+  extern "C" REX_FUNC(addr) {                                              \
+    if (mx::native::g_plugin_mode) {                                       \
+      orig(ctx, base);                                                     \
+      return;                                                              \
+    }                                                                      \
+    const auto t0 = std::chrono::steady_clock::now();                      \
+    orig(ctx, base);                                                       \
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>( \
+                        std::chrono::steady_clock::now() - t0)             \
+                        .count();                                          \
+    if (ms >= 50) {                                                        \
+      static uint64_t s_n = 0;                                             \
+      REXLOG_INFO("native: {} slow #{} {}ms", label, ++s_n, ms);           \
+    }                                                                      \
+  }
+
+MX_TIME_CALLEE(sub_82AB6F18, orig_MainLoopPump, "MainLoopPump")
+MX_TIME_CALLEE(sub_82BDB290, orig_MainLoopPre1, "MainLoopPre1")
+MX_TIME_CALLEE(sub_82BFC090, orig_MainLoopPre2, "MainLoopPre2")
+
+// RenderPipeline turned out to be 100% of MainLoop's body, and VdSwap is at most
+// ~87ms of that (its own orig never reaches 50ms). These are the rest of what
+// sub_82B70578 calls directly — sub_82ABF828 and sub_82ABF930 are excluded
+// because hooks_frame.cpp already stubs them natively, so they cost nothing.
+MX_TIME_CALLEE(sub_82B600A8, orig_RpCallee1, "RP.sub_82B600A8")
+MX_TIME_CALLEE(sub_82AFE978, orig_RpCallee2, "RP.sub_82AFE978")
+MX_TIME_CALLEE(sub_82ABF638, orig_RpCallee3, "RP.sub_82ABF638")
+MX_TIME_CALLEE(sub_82ABCC48, orig_RpCallee4, "RP.sub_82ABCC48")

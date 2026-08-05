@@ -73,10 +73,29 @@ void LogOpcodeHistogram(const char* tag, const char* range, int swap_count,
 
 }  // namespace
 
+// Splits our PM4 work from the guest's. RenderPipeline is 100% of MainLoop's
+// 400ms-rising-to-3100ms body, and VdSwap fires once per RenderPipeline while
+// parsing ~11,600 packets a swap — so the question is whether the cost is this
+// hook or the original underneath it. RAII because the hook has several exits.
+namespace {
+struct SwapTimer {
+  const char* what;
+  int n;
+  std::chrono::steady_clock::time_point t0{std::chrono::steady_clock::now()};
+  ~SwapTimer() {
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0)
+                        .count();
+    if (ms >= 50) REXLOG_INFO("native: {} #{} took {}ms", what, n, ms);
+  }
+};
+}  // namespace
+
 REX_IMPORT(__imp__sub_82566B58, orig_VdSwap, void());
 extern "C" REX_FUNC(sub_82566B58) {
   static int swap_count = 0;
   ++swap_count;
+  SwapTimer _swap_timer{"VdSwap hook total", swap_count};
 
   // Frame period, swap to swap. The first swap has no predecessor and is not
   // counted — otherwise the whole of startup lands in the first "frame" and
@@ -120,7 +139,10 @@ extern "C" REX_FUNC(sub_82566B58) {
     }
   }
 
-  orig_VdSwap(ctx, base);
+  {
+    SwapTimer _orig_timer{"VdSwap orig", swap_count};
+    orig_VdSwap(ctx, base);
+  }
 
   uint32_t pm4_write_after = REX_LOAD_U32(a1 + 48);
 
