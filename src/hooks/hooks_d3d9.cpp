@@ -560,6 +560,53 @@ bool ReadDeviceViewport(uint32_t device, uint8_t* base, float out[6]) {
   return out[2] > 0.0f && out[3] > 0.0f;
 }
 
+//---------------------------------------------------------------------------
+// SQ_PROGRAM_CNTL, and whether the pixel shader's r0 is even an interpolator.
+//
+// The UV export path reads a *vertex shader export* register named by the
+// pixel shader's texture profile. That is only correct while PS r0 is an
+// interpolated vertex output. Xenos can instead have the rasterizer generate
+// it: SQ_PROGRAM_CNTL bit 18 (`param_gen`) makes PS r0 the screen-space
+// position, and no VS export feeds it at all.
+//
+// The offset is not guessed. `D3DDevice_DrawVertices` (0x825561B0) flushes the
+// register with `sub_82564768(device, 0, 8576, device + 10528)` — 8576 is
+// 0x2180, SQ_PROGRAM_CNTL, and 10528 is the shadow it sends. Both
+// `SetPixelShader` (0x825506E8) and `SetVertexShader` (0x825508A8) reach the
+// same word: each walks an AND/OR patch list carried in the shader object and
+// applies it to `device + 1152 + offset`, and 10528 - 1152 = 9376 is in range
+// of the 16-bit offset those lists use. So the register is per-shader-pair
+// state, which is exactly why it has to be read per draw rather than once.
+//---------------------------------------------------------------------------
+constexpr uint32_t kDeviceSqProgramCntl = 10528;
+
+struct SqProgramCntl {
+  uint32_t raw = 0;
+  uint32_t vs_num_reg = 0;
+  uint32_t ps_num_reg = 0;
+  bool param_gen = false;
+  bool gen_index_pix = false;
+  uint32_t vs_export_count = 0;
+  uint32_t vs_export_mode = 0;
+  uint32_t ps_export_mode = 0;
+};
+
+bool ReadSqProgramCntl(uint32_t device, uint8_t* base, SqProgramCntl* out) {
+  if (!device) return false;
+  if (!HostPageReadable(REX_RAW_ADDR(device + kDeviceSqProgramCntl)))
+    return false;
+  const uint32_t v = REX_LOAD_U32(device + kDeviceSqProgramCntl);
+  out->raw = v;
+  out->vs_num_reg = v & 0x3F;
+  out->ps_num_reg = (v >> 8) & 0x3F;
+  out->param_gen = (v & (1u << 18)) != 0;
+  out->gen_index_pix = (v & (1u << 19)) != 0;
+  out->vs_export_count = (v >> 20) & 0xF;
+  out->vs_export_mode = (v >> 24) & 0x7;
+  out->ps_export_mode = (v >> 27) & 0x1F;
+  return true;
+}
+
 // The transform the PM4 path applies today, built from the D3D9 viewport
 // instead of from the Xenos context registers. It maps window coordinates to
 // clip space.
@@ -1828,6 +1875,14 @@ ShaderApplyResult ApplyShaderOutputs(
   uint64_t uv_vertices = 0, uv_missing_export = 0;
   float uv_min[2] = {1.0e30f, 1.0e30f};
   float uv_max[2] = {-1.0e30f, -1.0e30f};
+  // First referenced vertex, kept whole so a collapsed UV can be traced to the
+  // stage that produced it: the attribute values that went into the shader,
+  // and every export that came out — not only the one the texture profile
+  // selected. Reporting the selected export alone cannot distinguish "the
+  // shader exported zero" from "the UV is in a different export".
+  AluResult probe{};
+  std::vector<std::array<float, 4>> probe_values;
+  bool have_probe = false;
   for (uint32_t v = 0; v < dc.vertex_count; ++v) {
     if (!referenced[v]) continue;
     const uint64_t src = uint64_t(dc.first_vertex) + v;
@@ -1855,6 +1910,11 @@ ShaderApplyResult ApplyShaderOutputs(
     const AluResult r = ExecuteVertexShader(
         patch.code.data() + patch.code_off,
         uint32_t(patch.code.size() - patch.code_off), attrs, values, alu_in);
+    if (!have_probe) {
+      have_probe = true;
+      probe = r;
+      probe_values.assign(values.begin(), values.begin() + attrs.size());
+    }
     const float w = r.position[3];
     if (r.status != AluStatus::kOk || !std::isfinite(r.position[0]) ||
         !std::isfinite(r.position[1]) || !std::isfinite(r.position[2]) ||
@@ -1939,8 +1999,18 @@ ShaderApplyResult ApplyShaderOutputs(
     const bool collapsed = uv_vertices &&
         std::abs(uv_max[0] - uv_min[0]) < 1.0e-6f &&
         std::abs(uv_max[1] - uv_min[1]) < 1.0e-6f;
-    if (++s_uv_reports <= 32 || (collapsed && s_uv_reports <= 256) ||
-        (s_uv_reports % 1000) == 0) {
+    // A fixed budget for collapsed reports spends itself on whatever draws
+    // happen first. In the 2026-08-05 runs that was the pre-load compositor:
+    // all 256 slots were gone 28 seconds before `force_load` fired, so every
+    // UV line in the log described a scene that was not loaded yet and the
+    // 300k textured world vertices were never measured at all. Rate-limit by
+    // time instead, so each phase of the run gets reported.
+    static std::chrono::steady_clock::time_point s_last_collapsed{};
+    const auto now = std::chrono::steady_clock::now();
+    const bool collapsed_due =
+        collapsed && (now - s_last_collapsed) >= std::chrono::seconds(5);
+    if (collapsed_due) s_last_collapsed = now;
+    if (++s_uv_reports <= 32 || collapsed_due || (s_uv_reports % 1000) == 0) {
       REXLOG_INFO(
           "d3d9: HLE UV r{} swiz=0x{:02X} denorm={} wrote {}/{} missing {}; "
           "range ({:.5g},{:.5g})..({:.5g},{:.5g}) collapsed={} cpu={} "
@@ -1950,6 +2020,112 @@ ShaderApplyResult ApplyShaderOutputs(
           uv_missing_export, uv_min[0], uv_min[1], uv_max[0], uv_max[1],
           collapsed, bool(dc.texture), dc.sampled_render_target_object,
           dc.sampled_texture_width, dc.sampled_texture_height);
+
+      // A collapsed range is where the reporting used to stop. Everything
+      // below distinguishes the three stages that can produce it.
+      if (collapsed && have_probe) {
+        SqProgramCntl pc{};
+        if (ReadSqProgramCntl(device, base, &pc)) {
+          REXLOG_INFO(
+              "d3d9:   SQ_PROGRAM_CNTL=0x{:08X} param_gen={} gen_index_pix={} "
+              "vs_num_reg={} ps_num_reg={} vs_export_count={} "
+              "vs_export_mode={} ps_export_mode={}",
+              pc.raw, pc.param_gen, pc.gen_index_pix, pc.vs_num_reg,
+              pc.ps_num_reg, pc.vs_export_count, pc.vs_export_mode,
+              pc.ps_export_mode);
+        } else {
+          REXLOG_INFO("d3d9:   SQ_PROGRAM_CNTL unreadable (device=0x{:08X})",
+                      device);
+        }
+        for (size_t a = 0; a < probe_values.size() && a < attrs.size(); ++a) {
+          const HleStream& s = streams[attr_stream[a]];
+          REXLOG_INFO(
+              "d3d9:   attr[{}] stream={} slot={} off={} stride={} fmt={} "
+              "dest=r{} -> ({:.5g},{:.5g},{:.5g},{:.5g})",
+              a, attr_stream[a], attrs[a].fetch_slot, attrs[a].offset_bytes,
+              s.stride, attrs[a].format, attrs[a].dest_reg, probe_values[a][0],
+              probe_values[a][1], probe_values[a][2], probe_values[a][3]);
+        }
+        for (uint32_t e = 0; e < AluResult::kMaxInterpolators; ++e) {
+          if (!(probe.export_mask & (1u << e))) continue;
+          REXLOG_INFO("d3d9:   export[{}] = ({:.5g},{:.5g},{:.5g},{:.5g})", e,
+                      probe.exports[e][0], probe.exports[e][1],
+                      probe.exports[e][2], probe.exports[e][3]);
+        }
+        // A shader with one float2 input and one exported interpolator has to
+        // be computing that interpolator from constants. Whether it asked for
+        // any, and whether they came back empty, separates "the interpreter
+        // dropped the maths" from "the constant file we handed it was blank".
+        REXLOG_INFO(
+            "d3d9:   alu status={} export_mask=0x{:04X} const_reads={} "
+            "zero_reads={} index_range={}..{} const_dwords={}",
+            AluStatusName(probe.status), probe.export_mask, probe.const_reads,
+            probe.const_zero_reads, probe.const_min_index,
+            probe.const_max_index, alu_in.alu_const_dwords);
+        // How much of the constant file is populated at all. "c255 is zero"
+        // means one thing if the file is otherwise full and quite another if
+        // the whole file is blank — the second would indict the read, not the
+        // guest.
+        {
+          uint32_t live = 0, first_live = 0xFFFFFFFF, last_live = 0;
+          for (uint32_t s = 0; s * 4 + 3 < alu_in.alu_const_dwords; ++s) {
+            const uint32_t* v = alu_in.alu_consts + s * 4;
+            if (v[0] || v[1] || v[2] || v[3]) {
+              ++live;
+              if (first_live == 0xFFFFFFFF) first_live = s;
+              last_live = s;
+            }
+          }
+          const uint32_t* c255 = alu_in.alu_consts + 255 * 4;
+          REXLOG_INFO(
+              "d3d9:   vs const file: {} live vec4 of {}, live range {}..{}; "
+              "c255 raw = {:08X} {:08X} {:08X} {:08X}",
+              live, alu_in.alu_const_dwords / 4, first_live, last_live,
+              c255[0], c255[1], c255[2], c255[3]);
+        }
+        // The microcode itself. A shader that reads exactly one constant, and
+        // that constant is index 255 = 0xFF, is as consistent with a masked or
+        // saturated index as with a real c255 — and only the instruction words
+        // tell the two apart.
+        {
+          const uint32_t* code = patch.code.data() + patch.code_off;
+          const uint32_t n =
+              uint32_t(patch.code.size() - patch.code_off);
+          std::string dw;
+          for (uint32_t i = 0; i < n && i < 96; ++i) {
+            char one[12];
+            std::snprintf(one, sizeof(one), "%08X ", code[i]);
+            dw += one;
+            if ((i % 12) == 11) {
+              REXLOG_INFO("d3d9:   ucode[{:3}] {}", i - 11, dw);
+              dw.clear();
+            }
+          }
+          if (!dw.empty())
+            REXLOG_INFO("d3d9:   ucode[...] {}", dw);
+          REXLOG_INFO("d3d9:   ucode dwords={} code_off={}", n,
+                      patch.code_off);
+        }
+        // The bytes themselves, last: if the attribute values above are zero
+        // the question becomes whether the stream held zeros or the read
+        // missed them, and only the raw window answers that.
+        for (uint32_t si = 0; si < kMaxStreams; ++si) {
+          const HleStream& s = streams[si];
+          if (!s.host || !s.stride) continue;
+          const uint64_t off = uint64_t(dc.first_vertex) * s.stride +
+                               s.offset_bytes;
+          if (off + s.stride > s.size_bytes) continue;
+          std::string hex;
+          for (uint32_t b = 0; b < s.stride && b < 64; ++b) {
+            char byte[4];
+            std::snprintf(byte, sizeof(byte), "%02X ", s.host[off + b]);
+            hex += byte;
+          }
+          REXLOG_INFO(
+              "d3d9:   stream[{}] stride={} base_off={} endian={} v0: {}", si,
+              s.stride, off, uint32_t(s.endian), hex);
+        }
+      }
     }
   }
   if (identity_in_clip > viewport_in_clip) {
