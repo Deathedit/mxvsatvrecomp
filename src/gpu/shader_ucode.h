@@ -98,6 +98,23 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
                                const char** fail,
                                bool* out_saw_position_export = nullptr);
 
+// Exact vertex-shader identity comparison across the two representations D3D9
+// creates: an unpatched template and the PM4-ready copy after
+// PatchVertexShaderToMatchVertexDeclaration. Control flow, ALU instructions and
+// every non-patched vfetch bit must agree. Only fields proven to be rewritten
+// by that D3D9 routine (fetch slot/coalescing, format/number interpretation,
+// swizzle, offset and stride) are ignored. Returns false for malformed code.
+struct VertexShaderStructureStats {
+  uint32_t equal_dwords = 0;       // after masking proven patch fields
+  uint32_t fetch_mismatches = 0;   // retained bits differ in a vfetch
+  uint32_t other_mismatches = 0;   // CF, ALU, texture fetch, or padding
+  uint32_t fetch_xor[3] = {};      // all raw differing vfetch bits, per word
+};
+
+bool VertexShaderStructureMatches(
+    const uint32_t* shader_template, const uint32_t* patched_shader,
+    uint32_t dword_count, VertexShaderStructureStats* stats = nullptr);
+
 // Byte size of a xenos::VertexFormat, or 0 if unrecognised. Exposed for the
 // same reason it is hand-written rather than taken from the SDK: the SDK's
 // GetVertexFormatComponentCount asserts on an unhandled case, and a 6-bit field

@@ -212,6 +212,35 @@ void TestPosUv20() {
   CheckPickedPosition(attrs, 0, /*want_from_export=*/true);
 }
 
+void TestVertexShaderStructureMatch() {
+  std::printf("vertex template matches only across proven patch fields\n");
+  uint32_t shader_template[std::size(kFixturePosColor28)];
+  std::copy(std::begin(kFixturePosColor28), std::end(kFixturePosColor28),
+            shader_template);
+
+  // Both executable vfetches may have their declaration-dependent fields
+  // rewritten and must retain the same structural identity.
+  for (uint32_t at : {9u, 12u}) {
+    shader_template[at + 0] ^= 0x3FF00000u;
+    shader_template[at + 1] ^= 0x003F3FFFu;
+    shader_template[at + 2] ^= 0x7FFFFFFFu;
+  }
+  CheckBool("patched vfetch fields ignored",
+            mx::pm4::VertexShaderStructureMatches(
+                shader_template, kFixturePosColor28,
+                std::size(kFixturePosColor28)),
+            true);
+
+  // The opcode is not patched by the D3D9 routine. A one-bit difference there
+  // must reject even though every control-flow and ALU dword still agrees.
+  shader_template[9] ^= 1u;
+  CheckBool("non-patch vfetch bit retained",
+            mx::pm4::VertexShaderStructureMatches(
+                shader_template, kFixturePosColor28,
+                std::size(kFixturePosColor28)),
+            false);
+}
+
 // A blob with fetches but no export to register 62 must leave every attribute
 // unmarked and fall back to the offset/format guess — not silently claim the
 // shader confirmed something. This is fixture 1 with the two export
@@ -657,6 +686,7 @@ void TestPixelTextureBinding() {
 int main() {
   TestPosColor28();
   TestPosUv20();
+  TestVertexShaderStructureMatch();
   TestNoPositionExport();
   TestAluPassthrough();
   TestAluNoPosition();

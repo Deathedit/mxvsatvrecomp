@@ -304,6 +304,9 @@ bool D3D12Renderer::EnsureGameTexture(
     case mx::pm4::HostTextureFormat::kBc3:
       format = DXGI_FORMAT_BC3_UNORM;
       break;
+    case mx::pm4::HostTextureFormat::kBc5:
+      format = DXGI_FORMAT_BC5_UNORM;
+      break;
     case mx::pm4::HostTextureFormat::kR16Float:
       format = DXGI_FORMAT_R16_FLOAT;
       break;

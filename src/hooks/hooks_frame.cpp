@@ -19,6 +19,7 @@
 // range ran ~11552 bytes per frame at boot and was never looked at.
 
 #include "hooks/hook_common.h"
+#include "hooks/hooks_d3d9.h"
 
 #include <chrono>
 
@@ -344,6 +345,10 @@ extern "C" REX_FUNC(sub_82566B58) {
       // one. Both paths publish through the same handoff, so letting both run
       // would make whichever finished last win at random.
       if (REXCVAR_GET(hle_render)) {
+        // D3D9 draw entry points precede the PM4 IM_LOAD packets that expose
+        // the patched shader for this frame. Retry only those same-frame draws
+        // now that TranslatePackets has populated CapturedShaders().
+        FinalizePendingD3D9Draws(base);
         auto& hle = mx::pm4::HleFrameDraws();
         mx::native::NativeGraphics::Get().SetDrawCalls(hle);
         hle.clear();

@@ -67,6 +67,24 @@ int main() {
   Check(decoded.row_pitch == 16 && decoded.data.size() == 32,
         "BC1 block pitch and extent");
 
+  rex::graphics::xenos::xe_gpu_texture_fetch_t fetchBc5{};
+  fetchBc5.type = rex::graphics::xenos::FetchConstantType::kTexture;
+  fetchBc5.dimension = rex::graphics::xenos::DataDimension::k2DOrStacked;
+  fetchBc5.base_address = 1;
+  fetchBc5.pitch = 1;
+  fetchBc5.size_2d.width = 31;
+  fetchBc5.size_2d.height = 31;
+  fetchBc5.format = rex::graphics::xenos::TextureFormat::k_DXN;
+  HleTextureSource bc5{};
+  const auto* fetchBc5Words =
+      reinterpret_cast<const uint32_t*>(&fetchBc5);
+  Check(DescribeHleTexture2D(fetchBc5Words, bc5, &why),
+        "DXN descriptor accepted");
+  Check(bc5.host_format == HostTextureFormat::kBc5 &&
+            bc5.block_width == 4 && bc5.block_height == 4 &&
+            bc5.bytes_per_block == 16,
+        "DXN maps to BC5 block storage");
+
   HleTextureSource tiled = linear;
   tiled.width = tiled.height = 8;
   tiled.pitch_blocks = 32;

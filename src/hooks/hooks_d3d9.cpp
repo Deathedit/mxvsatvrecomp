@@ -28,6 +28,7 @@
 #include <rex/cvar.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -83,6 +84,7 @@ using mx::pm4::kMaxElements;   // refuses to walk a runaway array
 constexpr int kMaxDeclsLogged = 512;
 constexpr int kMaxDrawsLogged = 16;
 constexpr uint64_t kDrawReportEvery = 2500;  // see the om1 trap in AGENTS.md
+constexpr uint32_t kD3d9ConstRegs = 256;
 
 uint64_t g_indexed_draws = 0;
 uint64_t g_draws = 0;
@@ -634,16 +636,55 @@ std::map<uint32_t, uint32_t> g_resolvedTextureTargets;
 void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
                           const mx::pm4::HleStream* streams, uint32_t device,
                           uint8_t* base);
-bool ApplyShaderOutputs(mx::pm4::DrawCall& dc, uint32_t handle,
-                        const mx::pm4::HleStream* streams, uint32_t device,
-                        uint8_t* base,
-                        const mx::pm4::PixelTextureBinding* texture_binding);
+enum class ShaderApplyResult : uint8_t { kApplied, kNoCode, kFailed };
+ShaderApplyResult ApplyShaderOutputs(
+    mx::pm4::DrawCall& dc, uint32_t handle,
+    const mx::pm4::HleStream* streams, uint32_t device, uint8_t* base,
+    const mx::pm4::PixelTextureBinding* texture_binding,
+    const uint32_t* constant_snapshot = nullptr);
 bool PrepareDrawTexture(mx::pm4::DrawCall& dc, uint32_t pixel_shader,
                         uint32_t device, uint8_t* base,
                         mx::pm4::PixelTextureBinding& binding);
 void ProbePixelProfileForDraw(uint32_t pixel_shader, uint32_t device,
                               uint8_t* base,
                               const mx::pm4::DrawCall& dc);
+
+struct PendingHleDraw {
+  mx::pm4::DrawCall draw;
+  std::array<mx::pm4::HleStream, mx::pm4::kMaxStreams> streams;
+  std::array<uint32_t, kD3d9ConstRegs * 4> constants;
+  mx::pm4::PixelTextureBinding texture_binding;
+  uint32_t vertex_shader = 0;
+  uint32_t device = 0;
+  bool have_texture = false;
+};
+
+std::vector<PendingHleDraw> g_pendingHleDraws;
+uint64_t g_pendingQueued = 0, g_pendingApplied = 0, g_pendingDropped = 0;
+constexpr size_t kMaxPendingHleDraws = 2048;
+
+bool CaptureVertexConstants(uint32_t device, uint8_t* base,
+                            std::array<uint32_t, kD3d9ConstRegs * 4>& out) {
+  const uint32_t bytes = kD3d9ConstRegs * 16;
+  if (!device || !HostPageReadable(REX_RAW_ADDR(device + 0x780)) ||
+      !HostPageReadable(REX_RAW_ADDR(device + 0x780 + bytes - 4)))
+    return false;
+  for (uint32_t i = 0; i < out.size(); ++i)
+    out[i] = REX_LOAD_U32(device + 0x780 + i * 4);
+  return true;
+}
+
+bool FinishHleDraw(mx::pm4::DrawCall& dc) {
+  mx::pm4::HleSkip skip = mx::pm4::HleSkip::kNone;
+  if (!mx::pm4::FinalizeHleTopology(dc, skip)) {
+    ++mx::pm4::HleSkipCounts()[uint32_t(skip)];
+    return false;
+  }
+  mx::pm4::HleFrameDraws().push_back(std::move(dc));
+  return true;
+}
+
+void FinalizePendingD3D9DrawsImpl(uint8_t* base);
 
 void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
                        uint32_t count, int32_t base_vertex, uint32_t device,
@@ -777,20 +818,6 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
       }
     }
   }
-  if (!ApplyShaderOutputs(dc, st.vs_seen ? st.vertex_shader : 0, streams,
-                          device, base,
-                          have_texture ? &texture_binding : nullptr)) {
-    return;
-  }
-
-  // RectangleList's implied corner must be derived from shader outputs. If it
-  // is expanded earlier, the fourth packed vertex has no corresponding source
-  // vertex and shader execution reads unrelated guest memory.
-  if (!FinalizeHleTopology(dc, skip)) {
-    ++HleSkipCounts()[uint32_t(skip)];
-    return;
-  }
-
   // Carry the two output-merger states this HLE path knows exactly into the
   // same raw fields the PM4 path uses. D3D9 and Xenos both use RGBA bits 0..3
   // for the colour mask. RB_DEPTHCONTROL bits 1/2 are depth-test/write enable;
@@ -807,7 +834,33 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     dc.om_seen |= 1u << 1;
   }
 
-  HleFrameDraws().push_back(std::move(dc));
+  const uint32_t vertex_shader = st.vs_seen ? st.vertex_shader : 0;
+  const ShaderApplyResult applied = ApplyShaderOutputs(
+      dc, vertex_shader, streams, device, base,
+      have_texture ? &texture_binding : nullptr);
+  if (applied == ShaderApplyResult::kApplied) {
+    FinishHleDraw(dc);
+    return;
+  }
+  if (applied != ShaderApplyResult::kNoCode ||
+      g_pendingHleDraws.size() >= kMaxPendingHleDraws) {
+    if (applied == ShaderApplyResult::kNoCode) ++g_pendingDropped;
+    return;
+  }
+
+  PendingHleDraw pending;
+  pending.draw = std::move(dc);
+  std::copy_n(streams, kMaxStreams, pending.streams.begin());
+  pending.texture_binding = texture_binding;
+  pending.vertex_shader = vertex_shader;
+  pending.device = device;
+  pending.have_texture = have_texture;
+  if (!CaptureVertexConstants(device, base, pending.constants)) {
+    ++g_pendingDropped;
+    return;
+  }
+  g_pendingHleDraws.push_back(std::move(pending));
+  ++g_pendingQueued;
 }
 
 // Records every gap this draw has, rather than stopping at the first, so the
@@ -1303,8 +1356,6 @@ uint32_t ClassifyClip(const float p[4]) {
   return kClipWild;
 }
 
-constexpr uint32_t kD3d9ConstRegs = 256;
-
 uint64_t g_aluRuns = 0, g_aluInClip = 0, g_aluDegenerate = 0;
 uint64_t g_aluNoShader = 0, g_aluNoAttrs = 0, g_aluStrideMismatch = 0;
 // fetch_slot did not invert to a stream in [0, kMaxStreams). Its own counter:
@@ -1453,12 +1504,201 @@ uint64_t g_hleShaderBadStream = 0, g_hleShaderBadConstants = 0;
 uint64_t g_hleShaderBadVertex = 0;
 uint64_t g_hleShaderIdentityMvp = 0, g_hleShaderViewportMvp = 0;
 
-bool ApplyShaderOutputs(mx::pm4::DrawCall& dc, uint32_t handle,
-                        const mx::pm4::HleStream* streams, uint32_t device,
-                        uint8_t* base,
-                        const mx::pm4::PixelTextureBinding* texture_binding) {
+// Some shaders are already resident before the title reaches
+// PatchVertexShaderToMatchVertexDeclaration, so the exact post-call capture
+// above never observes them.  SH_pPhysical still names the live allocation
+// D3D9 binds for the draw.  Accept that second exact source only when one and
+// only one CF start decodes and every resulting vfetch agrees with a currently
+// bound stream, including its patched stride.  An unpatched template has blank
+// fetch fields and fails this test; an arbitrary offset that happens to decode
+// is rejected by the uniqueness requirement.
+std::map<uint32_t, PatchedCode> g_liveVertexCode;
+std::map<uint32_t, size_t> g_liveVertexFailedAtShaderCount;
+uint64_t g_liveVertexResolved = 0, g_liveVertexAmbiguous = 0;
+uint64_t g_liveVertexUnreadable = 0, g_liveVertexNoMatch = 0;
+
+const PatchedCode* ResolveLiveVertexCode(uint32_t handle,
+                                         const mx::pm4::HleStream* streams,
+                                         uint8_t* base) {
   using namespace mx::pm4;
-  (void)base;
+  constexpr uint32_t kMaxLiveFetches = 32;
+  if (auto it = g_liveVertexCode.find(handle); it != g_liveVertexCode.end())
+    return &it->second;
+  const size_t captured_shader_count = CapturedShaders().size();
+  if (auto it = g_liveVertexFailedAtShaderCount.find(handle);
+      it != g_liveVertexFailedAtShaderCount.end() &&
+      it->second == captured_shader_count)
+    return nullptr;
+
+  if (!HostPageReadable(REX_RAW_ADDR(handle + 0x20))) {
+    ++g_liveVertexUnreadable;
+    return nullptr;
+  }
+  const uint32_t physical = REX_LOAD_U32(handle + 0x20);
+  if (!physical || !HostPageReadable(REX_RAW_ADDR(physical))) {
+    ++g_liveVertexUnreadable;
+    return nullptr;
+  }
+
+  PatchedCode live;
+  live.code.reserve(kPhysProbeDwords);
+  for (uint32_t i = 0; i < kPhysProbeDwords; ++i) {
+    const uint32_t at = physical + i * 4;
+    if ((at & (kHostPageSize - 1)) == 0 &&
+        !HostPageReadable(REX_RAW_ADDR(at)))
+      break;
+    live.code.push_back(REX_LOAD_U32(at));
+  }
+  if (live.code.size() < 32) {
+    ++g_liveVertexUnreadable;
+    return nullptr;
+  }
+
+  uint32_t matches = 0;
+  uint32_t winning_offset = 0;
+  uint32_t winning_fetches = 0;
+  bool structural_source = false;
+  std::vector<VertexAttribute> attrs;
+  for (uint32_t offset = 0; offset < live.code.size(); ++offset) {
+    attrs.clear();
+    if (!DecodeVertexShaderFetches(live.code.data() + offset,
+                                   uint32_t(live.code.size() - offset), attrs,
+                                   nullptr) ||
+        attrs.empty() || attrs.size() > kMaxLiveFetches)
+      continue;
+
+    bool streams_match = true;
+    for (const VertexAttribute& attr : attrs) {
+      const uint32_t fs = attr.fetch_slot;
+      if (fs > 95 || (95u - fs) >= kMaxStreams) {
+        streams_match = false;
+        break;
+      }
+      const HleStream& stream = streams[95u - fs];
+      if (!stream.bound || !stream.host || !stream.stride ||
+          stream.stride > 256 || stream.stride != attr.stride_bytes) {
+        streams_match = false;
+        break;
+      }
+    }
+    if (!streams_match) continue;
+    ++matches;
+    winning_offset = offset;
+    winning_fetches = uint32_t(attrs.size());
+    if (matches > 1) break;
+  }
+
+  // The resident allocation may be the unpatched template. Link that to the
+  // PM4-ready copy by exact structure, masking only fields the observed D3D9
+  // patch routine rewrites. This is deliberately attempted only when the live
+  // bytes themselves did not already yield a patched, stream-valid shader.
+  if (matches == 0) {
+    PatchedCode structural;
+    uint32_t structural_matches = 0;
+    VertexShaderStructureStats best_stats;
+    uint32_t best_total = 0;
+    uint64_t best_key = 0;
+    uint32_t best_offset = 0;
+    for (const auto& [key, captured] : CapturedShaders()) {
+      if (captured.code.empty() || captured.attrs.empty() ||
+          captured.code.size() > live.code.size())
+        continue;
+
+      bool streams_match = true;
+      for (const VertexAttribute& attr : captured.attrs) {
+        const uint32_t fs = attr.fetch_slot;
+        if (fs > 95 || (95u - fs) >= kMaxStreams) {
+          streams_match = false;
+          break;
+        }
+        const HleStream& stream = streams[95u - fs];
+        if (!stream.bound || !stream.host || !stream.stride ||
+            stream.stride > 256 || stream.stride != attr.stride_bytes) {
+          streams_match = false;
+          break;
+        }
+      }
+      for (uint32_t offset = 0;
+           offset + captured.code.size() <= live.code.size(); ++offset) {
+        VertexShaderStructureStats stats;
+        const bool exact = VertexShaderStructureMatches(
+            live.code.data() + offset, captured.code.data(),
+            uint32_t(captured.code.size()), &stats);
+        if (stats.equal_dwords > best_stats.equal_dwords) {
+          best_stats = stats;
+          best_total = uint32_t(captured.code.size());
+          best_key = key;
+          best_offset = offset;
+        }
+        if (!exact || !streams_match) continue;
+        // Several PM4 keys may carry byte-identical code. That is one shader,
+        // not an ambiguous identity.
+        if (structural_matches && structural.code == captured.code) continue;
+        ++structural_matches;
+        structural.code = captured.code;
+        structural.code_off = 0;
+        structural.expect_fetches = uint32_t(captured.attrs.size());
+        structural.resolved = true;
+        if (structural_matches > 1) break;
+      }
+      if (structural_matches > 1) break;
+    }
+    if (structural_matches == 1) {
+      live = std::move(structural);
+      matches = 1;
+      winning_offset = 0;
+      winning_fetches = live.expect_fetches;
+      structural_source = true;
+    } else if (structural_matches > 1) {
+      matches = structural_matches;
+    } else if (best_total) {
+      static uint32_t s_logged_structure_miss = 0;
+      if (s_logged_structure_miss++ < 24) {
+        REXLOG_INFO(
+            "d3d9: vertex shader 0x{:08X} best structural candidate key "
+            "0x{:X} at live+0x{:X}: {}/{} dwords equal; retained fetch "
+            "mismatches {} other mismatches {}; raw fetch xor {:08X} "
+            "{:08X} {:08X}",
+            handle, best_key, best_offset * 4, best_stats.equal_dwords,
+            best_total, best_stats.fetch_mismatches,
+            best_stats.other_mismatches, best_stats.fetch_xor[0],
+            best_stats.fetch_xor[1], best_stats.fetch_xor[2]);
+      }
+    }
+  }
+
+  if (matches != 1) {
+    g_liveVertexFailedAtShaderCount[handle] = captured_shader_count;
+    if (matches > 1)
+      ++g_liveVertexAmbiguous;
+    else
+      ++g_liveVertexNoMatch;
+    return nullptr;
+  }
+
+  live.code_off = winning_offset;
+  live.expect_fetches = winning_fetches;
+  live.resolved = true;
+  auto [it, inserted] = g_liveVertexCode.emplace(handle, std::move(live));
+  (void)inserted;
+  ++g_liveVertexResolved;
+  if (g_liveVertexResolved <= 24) {
+    REXLOG_INFO("d3d9: vertex shader 0x{:08X} resolved from {} "
+                "0x{:08X}+0x{:X}: {} fetch(es); exact unique "
+                "structure/stream match",
+                handle, structural_source ? "PM4-patched template match" :
+                                             "live allocation",
+                physical, winning_offset * 4, winning_fetches);
+  }
+  return &it->second;
+}
+
+ShaderApplyResult ApplyShaderOutputs(
+    mx::pm4::DrawCall& dc, uint32_t handle,
+    const mx::pm4::HleStream* streams, uint32_t device, uint8_t* base,
+    const mx::pm4::PixelTextureBinding* texture_binding,
+    const uint32_t* constant_snapshot) {
+  using namespace mx::pm4;
   const uint64_t attempt = ++g_hleShaderAttempts;
   struct ReportApply {
     uint64_t attempt;
@@ -1467,23 +1707,30 @@ bool ApplyShaderOutputs(mx::pm4::DrawCall& dc, uint32_t handle,
       REXLOG_INFO(
           "d3d9: HLE shader output attempts {}: applied {} draws / {} "
           "vertices; skipped no-code {} decode {} stream {} constants {} "
-          "vertex {}; output transform identity {} viewport {}",
+          "vertex {}; output transform identity {} viewport {}; live shader "
+          "resolved {} no-match {} ambiguous {} unreadable {}",
           g_hleShaderAttempts, g_hleShaderDraws, g_hleShaderVertices,
           g_hleShaderNoCode, g_hleShaderBadDecode, g_hleShaderBadStream,
           g_hleShaderBadConstants, g_hleShaderBadVertex,
-          g_hleShaderIdentityMvp, g_hleShaderViewportMvp);
+          g_hleShaderIdentityMvp, g_hleShaderViewportMvp,
+          g_liveVertexResolved, g_liveVertexNoMatch, g_liveVertexAmbiguous,
+          g_liveVertexUnreadable);
     }
   } report{attempt};
   if (!handle || !device) {
     ++g_hleShaderNoCode;
-    return false;
+    return ShaderApplyResult::kNoCode;
   }
 
-  // Rendering only trusts the exact capture made by
-  // PatchVertexShaderToMatchVertexDeclaration. The >=90% PM4 content match is
-  // useful as a diagnostic fallback, but it is not a safe source for pixels.
+  // Prefer the exact capture made by PatchVertexShaderToMatchVertexDeclaration.
+  // Shaders resident before that hook first fires may use the independently
+  // validated live allocation fallback above.  The >=90% PM4 content match
+  // remains diagnostic-only and is never a source for pixels.
   auto pi = g_patchedCode.find(handle);
-  if (pi == g_patchedCode.end() || !pi->second.resolved) {
+  const PatchedCode* patchp =
+      pi != g_patchedCode.end() && pi->second.resolved ? &pi->second : nullptr;
+  if (!patchp) patchp = ResolveLiveVertexCode(handle, streams, base);
+  if (!patchp) {
     ++g_hleShaderNoCode;
     static uint32_t s_logged_no_code = 0;
     if (s_logged_no_code++ < 24) {
@@ -1494,12 +1741,12 @@ bool ApplyShaderOutputs(mx::pm4::DrawCall& dc, uint32_t handle,
                   dc.render_target_height, dc.viewport_width,
                   dc.viewport_height, dc.vertex_count, dc.index_count);
     }
-    return false;
+    return ShaderApplyResult::kNoCode;
   }
-  const PatchedCode& patch = pi->second;
+  const PatchedCode& patch = *patchp;
   if (patch.code_off >= patch.code.size()) {
     ++g_hleShaderBadDecode;
-    return false;
+    return ShaderApplyResult::kFailed;
   }
 
   std::vector<VertexAttribute> attrs;
@@ -1509,7 +1756,7 @@ bool ApplyShaderOutputs(mx::pm4::DrawCall& dc, uint32_t handle,
                                  attrs, &why) ||
       attrs.empty() || attrs.size() != patch.expect_fetches) {
     ++g_hleShaderBadDecode;
-    return false;
+    return ShaderApplyResult::kFailed;
   }
 
   std::vector<uint32_t> attr_stream(attrs.size());
@@ -1517,27 +1764,30 @@ bool ApplyShaderOutputs(mx::pm4::DrawCall& dc, uint32_t handle,
     const uint32_t fs = attrs[a].fetch_slot;
     if (fs > 95 || (95u - fs) >= kMaxStreams) {
       ++g_hleShaderBadStream;
-      return false;
+      return ShaderApplyResult::kFailed;
     }
     const uint32_t si = 95u - fs;
     const HleStream& s = streams[si];
     if (!s.bound || !s.host || s.stride == 0 || s.stride > 256 ||
         s.stride != attrs[a].stride_bytes) {
       ++g_hleShaderBadStream;
-      return false;
+      return ShaderApplyResult::kFailed;
     }
     attr_stream[a] = si;
   }
 
-  std::vector<uint32_t> consts(kD3d9ConstRegs * 4);
-  const uint32_t const_bytes = kD3d9ConstRegs * 16;
-  if (!HostPageReadable(REX_RAW_ADDR(device + 0x780)) ||
-      !HostPageReadable(REX_RAW_ADDR(device + 0x780 + const_bytes - 4))) {
-    ++g_hleShaderBadConstants;
-    return false;
+  std::vector<uint32_t> consts;
+  if (constant_snapshot) {
+    consts.assign(constant_snapshot,
+                  constant_snapshot + kD3d9ConstRegs * 4);
+  } else {
+    std::array<uint32_t, kD3d9ConstRegs * 4> captured;
+    if (!CaptureVertexConstants(device, base, captured)) {
+      ++g_hleShaderBadConstants;
+      return ShaderApplyResult::kFailed;
+    }
+    consts.assign(captured.begin(), captured.end());
   }
-  for (uint32_t i = 0; i < consts.size(); ++i)
-    consts[i] = REX_LOAD_U32(device + 0x780 + i * 4);
 
   AluInputs alu_in;
   alu_in.alu_consts = consts.data();
@@ -1552,7 +1802,7 @@ bool ApplyShaderOutputs(mx::pm4::DrawCall& dc, uint32_t handle,
     const uint32_t iw = dc.index_16bit ? 2u : 4u;
     if (dc.indices.size() < uint64_t(dc.index_count) * iw) {
       ++g_hleShaderBadVertex;
-      return false;
+      return ShaderApplyResult::kFailed;
     }
     for (uint32_t i = 0; i < dc.index_count; ++i) {
       uint32_t index = 0;
@@ -1565,7 +1815,7 @@ bool ApplyShaderOutputs(mx::pm4::DrawCall& dc, uint32_t handle,
       }
       if (index >= dc.vertex_count) {
         ++g_hleShaderBadVertex;
-        return false;
+        return ShaderApplyResult::kFailed;
       }
       referenced[index] = 1;
     }
@@ -1585,7 +1835,7 @@ bool ApplyShaderOutputs(mx::pm4::DrawCall& dc, uint32_t handle,
         const uint64_t byte_off = src * s.stride + s.offset_bytes;
         if (byte_off + s.stride > s.size_bytes) {
           ++g_hleShaderBadVertex;
-          return false;
+          return ShaderApplyResult::kFailed;
         }
         std::memcpy(vtx[si], s.host + byte_off, s.stride);
         have[si] = true;
@@ -1593,7 +1843,7 @@ bool ApplyShaderOutputs(mx::pm4::DrawCall& dc, uint32_t handle,
       float f[4] = {0, 0, 0, 1};
       if (!ReadVertexAttribute(vtx[si], s.stride, attrs[a], s.endian, f)) {
         ++g_hleShaderBadVertex;
-        return false;
+        return ShaderApplyResult::kFailed;
       }
       values[a] = {f[0], f[1], f[2], f[3]};
     }
@@ -1606,7 +1856,7 @@ bool ApplyShaderOutputs(mx::pm4::DrawCall& dc, uint32_t handle,
         !std::isfinite(r.position[1]) || !std::isfinite(r.position[2]) ||
         !std::isfinite(w)) {
       ++g_hleShaderBadVertex;
-      return false;
+      return ShaderApplyResult::kFailed;
     }
 
     // PA_CL_VTE_CNTL is 0x300 in the captured stream: XYZ are already
@@ -1666,7 +1916,32 @@ bool ApplyShaderOutputs(mx::pm4::DrawCall& dc, uint32_t handle,
   }
   ++g_hleShaderDraws;
   g_hleShaderVertices += applied_vertices;
-  return true;
+  return ShaderApplyResult::kApplied;
+}
+
+void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
+  const size_t count = g_pendingHleDraws.size();
+  uint64_t applied = 0, dropped = 0;
+  for (PendingHleDraw& pending : g_pendingHleDraws) {
+    const ShaderApplyResult result = ApplyShaderOutputs(
+        pending.draw, pending.vertex_shader, pending.streams.data(),
+        pending.device, base,
+        pending.have_texture ? &pending.texture_binding : nullptr,
+        pending.constants.data());
+    if (result == ShaderApplyResult::kApplied && FinishHleDraw(pending.draw))
+      ++applied;
+    else
+      ++dropped;
+  }
+  g_pendingApplied += applied;
+  g_pendingDropped += dropped;
+  g_pendingHleDraws.clear();
+  if (count && (g_pendingQueued <= 32 || (g_pendingQueued % 1000) < count)) {
+    REXLOG_INFO("d3d9: deferred HLE draws: frame {} applied {} dropped {}; "
+                "cumulative queued {} applied {} dropped {}",
+                count, applied, dropped, g_pendingQueued, g_pendingApplied,
+                g_pendingDropped);
+  }
 }
 
 void CollectPixelShaderBlob(uint32_t handle, uint8_t* base) {
@@ -1891,6 +2166,79 @@ bool ResolvePixelBinding(uint32_t handle,
   return false;
 }
 
+bool ReadLiveTextureFetch(uint32_t device, uint8_t* base, uint32_t sampler,
+                          uint32_t out[6]) {
+  if (!out || sampler >= mx::pm4::kMaxSamplers) return false;
+  std::memset(out, 0, sizeof(uint32_t) * 6);
+  const uint32_t fetch_at = device + 0x480 + sampler * 24;
+  if (device && HostPageReadable(REX_RAW_ADDR(fetch_at)) &&
+      HostPageReadable(REX_RAW_ADDR(fetch_at + 20))) {
+    for (uint32_t i = 0; i < 6; ++i)
+      out[i] = REX_LOAD_U32(fetch_at + i * 4);
+    if ((out[0] & 3u) == 2u) return true;
+  }
+  const auto& tb = DeviceState().texture[sampler];
+  if (!tb.bound || !tb.valid) return false;
+  std::memcpy(out, tb.fetch, sizeof(uint32_t) * 6);
+  return true;
+}
+
+// The milestone can sample one texture even when the guest shader uses many.
+// Pick from evidence in the live descriptors: normalized colour storage is a
+// closer approximation to the shader's visible base colour than BC5 normal
+// maps, float intermediates, or unnormalized render-target inputs. Ties retain
+// shader instruction order; no sampler number is treated as a semantic.
+bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
+                                uint8_t* base,
+                                mx::pm4::PixelTextureBinding& out) {
+  if (ResolvePixelBinding(handle, out)) return true;
+  const ResolvedPixelBinding* profile = ResolvePixelProfile(handle);
+  if (!profile || !profile->decoded || profile->bindings.empty()) return false;
+
+  int best_score = -1;
+  mx::pm4::HleTextureSource best_source;
+  bool found = false;
+  for (const auto& candidate : profile->bindings) {
+    if (candidate.sampler >= mx::pm4::kMaxSamplers) continue;
+    uint32_t fetch[6];
+    if (!ReadLiveTextureFetch(device, base, candidate.sampler, fetch)) continue;
+    mx::pm4::HleTextureSource source;
+    if (!mx::pm4::DescribeHleTexture2D(fetch, source, nullptr)) continue;
+
+    int score = candidate.unnormalized ? 0 : 20;
+    switch (source.host_format) {
+      case mx::pm4::HostTextureFormat::kRgba8:
+      case mx::pm4::HostTextureFormat::kBc1:
+      case mx::pm4::HostTextureFormat::kBc2:
+      case mx::pm4::HostTextureFormat::kBc3:
+        score += 100;
+        break;
+      case mx::pm4::HostTextureFormat::kR16Float:
+      case mx::pm4::HostTextureFormat::kRgba16Float:
+        score += 40;
+        break;
+      case mx::pm4::HostTextureFormat::kBc5:
+        score += 10;
+        break;
+    }
+    if (score <= best_score) continue;
+    best_score = score;
+    out = candidate;
+    best_source = source;
+    found = true;
+  }
+  if (!found) return false;
+  static std::map<uint32_t, bool> s_logged;
+  if (s_logged.size() < 32 && s_logged.emplace(handle, true).second) {
+    REXLOG_INFO("d3d9: selected s{} r{} {}x{} format {} from {}-fetch "
+                "pixel shader 0x{:08X} (descriptor score {})",
+                out.sampler, out.src_reg, best_source.width,
+                best_source.height, uint32_t(best_source.host_format),
+                profile->bindings.size(), handle, best_score);
+  }
+  return true;
+}
+
 void ProbePixelProfileForDraw(uint32_t pixel_shader, uint32_t device,
                               uint8_t* base,
                               const mx::pm4::DrawCall& dc) {
@@ -1952,7 +2300,8 @@ bool ReadBoundPixelShader(uint32_t device, uint8_t* base, uint32_t& handle,
       REX_LOAD_U32(device + kDevicePixelShaderOffset);
   if (!candidate) return false;
   CollectPixelShaderBlob(candidate, base);
-  if (!ResolvePixelBinding(candidate, binding)) return false;
+  if (!ResolvePixelBindingForDraw(candidate, device, base, binding))
+    return false;
   handle = candidate;
   static uint32_t s_logged = 0;
   if (s_logged++ < 8) {
@@ -1993,7 +2342,8 @@ bool PrepareDrawTexture(mx::pm4::DrawCall& dc, uint32_t pixel_shader,
   static uint64_t s_attempts = 0, s_ready = 0, s_no_shader = 0;
   static uint64_t s_no_binding = 0, s_bad_desc = 0, s_unreadable = 0;
   ++s_attempts;
-  if ((!pixel_shader || !ResolvePixelBinding(pixel_shader, binding)) &&
+  if ((!pixel_shader ||
+       !ResolvePixelBindingForDraw(pixel_shader, device, base, binding)) &&
       !ReadBoundPixelShader(device, base, pixel_shader, binding)) {
     ++s_no_shader;
     if (s_no_shader <= 8 || (s_attempts % 2500) == 0) {
@@ -2015,22 +2365,7 @@ bool PrepareDrawTexture(mx::pm4::DrawCall& dc, uint32_t pixel_shader,
     return false;
   }
   uint32_t fetch[6] = {};
-  bool validFetch = false;
-  const uint32_t fetchAt = device + 0x480 + binding.sampler * 24;
-  if (device && HostPageReadable(REX_RAW_ADDR(fetchAt)) &&
-      HostPageReadable(REX_RAW_ADDR(fetchAt + 20))) {
-    for (uint32_t i = 0; i < 6; ++i)
-      fetch[i] = REX_LOAD_U32(fetchAt + i * 4);
-    validFetch = (fetch[0] & 3u) == 2u;
-  }
-  // Direct device state is authoritative, including for state-block binds.
-  // The setter snapshot is retained only as a fallback for unusual devices.
-  const auto& tb = DeviceState().texture[binding.sampler];
-  if (!validFetch && tb.bound && tb.valid) {
-    std::memcpy(fetch, tb.fetch, sizeof(fetch));
-    validFetch = true;
-  }
-  if (!validFetch) {
+  if (!ReadLiveTextureFetch(device, base, binding.sampler, fetch)) {
     ++s_no_binding;
     if (s_no_binding <= 8) {
       REXLOG_INFO("d3d9: HLE texture fallback: sampler {} has no 2D fetch "
@@ -3709,6 +4044,10 @@ void ReportDrawCounts(uint8_t* base) {
 }
 
 }  // namespace
+
+void FinalizePendingD3D9Draws(uint8_t* base) {
+  FinalizePendingD3D9DrawsImpl(base);
+}
 
 //=============================================================================
 // 0x82550B80 — D3DVertexDeclaration* D3DDevice_CreateVertexDeclaration(

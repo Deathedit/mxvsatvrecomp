@@ -611,6 +611,85 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
   return true;
 }
 
+bool VertexShaderStructureMatches(const uint32_t* shader_template,
+                                  const uint32_t* patched_shader,
+                                  uint32_t dword_count,
+                                  VertexShaderStructureStats* stats) {
+  VertexShaderStructureStats local;
+  if (!stats) stats = &local;
+  *stats = {};
+  if (!shader_template || !patched_shader || dword_count < 3) return false;
+
+  // First establish the executable fetch locations from the patched copy. The
+  // control-flow words are compared verbatim below, so the template cannot
+  // redirect execution to different instructions and still match.
+  uint32_t max_cf_dword = dword_count - (dword_count % 3);
+  bool saw_exec = false;
+  for (uint32_t i = 0; i + 2 < max_cf_dword; i += 3) {
+    uc::ControlFlowInstruction cf[2];
+    uc::UnpackControlFlowInstructions(patched_shader + i, cf);
+    for (int j = 0; j < 2; ++j) {
+      if (!IsExec(cf[j].opcode())) continue;
+      saw_exec = true;
+      const uint64_t target = uint64_t(ExecAddress(cf[j])) * 3;
+      if (target < max_cf_dword) max_cf_dword = uint32_t(target);
+    }
+  }
+  if (!saw_exec || max_cf_dword == 0) return false;
+
+  std::vector<uint8_t> patched_fetch(dword_count, 0);
+  for (uint32_t i = 0; i + 2 < max_cf_dword; i += 3) {
+    uc::ControlFlowInstruction cf[2];
+    uc::UnpackControlFlowInstructions(patched_shader + i, cf);
+    for (int j = 0; j < 2; ++j) {
+      if (!IsExec(cf[j].opcode())) continue;
+      const uint32_t addr = ExecAddress(cf[j]);
+      const uint32_t count = ExecCount(cf[j]);
+      const uint32_t seq = ExecSequence(cf[j]);
+      for (uint32_t n = 0; n < count; ++n) {
+        const uint64_t at64 = (uint64_t(addr) + n) * 3;
+        if (at64 + 3 > dword_count) return false;
+        const uint32_t at = uint32_t(at64);
+        if (!((seq >> (n * 2)) & 1u)) continue;
+        if ((patched_shader[at] & 0x1Fu) !=
+            uint32_t(uc::FetchOpcode::kVertexFetch))
+          continue;
+        patched_fetch[at] = 1;
+      }
+    }
+  }
+
+  // These are precisely the fields checked by the live prediction around
+  // PatchVertexShaderToMatchVertexDeclaration in hooks_d3d9.cpp. Keeping every
+  // other bit makes this an identity comparison, not a similarity score.
+  constexpr uint32_t kKeep[3] = {
+      ~0x3FF00000u,  // fetch constant and coalescing count
+      ~0x003F3FFFu,  // data/number format and destination swizzle
+      0x80000000u,   // offset and stride; retain the mini/sign bit
+  };
+  for (uint32_t i = 0; i < dword_count; ++i) {
+    uint32_t a = shader_template[i];
+    uint32_t b = patched_shader[i];
+    const uint32_t base = i - (i % 3);
+    if (base < patched_fetch.size() && patched_fetch[base]) {
+      const uint32_t word = i % 3;
+      a &= kKeep[word];
+      b &= kKeep[word];
+    }
+    if (base < patched_fetch.size() && patched_fetch[base]) {
+      stats->fetch_xor[i % 3] |= shader_template[i] ^ patched_shader[i];
+    }
+    if (a == b) {
+      ++stats->equal_dwords;
+    } else if (base < patched_fetch.size() && patched_fetch[base]) {
+      ++stats->fetch_mismatches;
+    } else {
+      ++stats->other_mismatches;
+    }
+  }
+  return stats->equal_dwords == dword_count;
+}
+
 bool DecodePixelTextureFetches(const uint32_t* dwords, uint32_t dword_count,
                                std::vector<PixelTextureBinding>& out,
                                const char** fail) {

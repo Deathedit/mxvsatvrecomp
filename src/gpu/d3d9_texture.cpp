@@ -63,6 +63,12 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
     case xenos::TextureFormat::k_DXT4_5:
       out.host_format = HostTextureFormat::kBc3;
       break;
+    // DXN is the Xbox 360 two-channel block-compressed normal-map format.
+    // Its 4x4 / 16-byte storage is host-compatible with BC5_UNORM after the
+    // same fetch-endian conversion and untile pass used by DXT textures.
+    case xenos::TextureFormat::k_DXN:
+      out.host_format = HostTextureFormat::kBc5;
+      break;
     // ReXGlue's canonical mapping folds the EXPAND variants observed in
     // ST_Southwest into their corresponding half-float formats.
     case xenos::TextureFormat::k_16_FLOAT:

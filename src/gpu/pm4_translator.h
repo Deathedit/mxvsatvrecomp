@@ -17,6 +17,7 @@ enum class HostTextureFormat : uint8_t {
   kBc1,
   kBc2,
   kBc3,
+  kBc5,
   kR16Float,
   kRgba16Float,
 };
