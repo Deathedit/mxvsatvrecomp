@@ -165,8 +165,14 @@ native: script asset #2 "UI_Helper" (ptr=0x2040A5D0) from lr=0x824AF8B0
 
 - Both are **libraries**, not drivers. The `MXUI` database holds **57 unique
   script assets**, including `IN_BootStrapper`, `FE_Title`, `FE_Home`,
-  `IN_Loading`, `IG_WorldLoading`, `SH_LuaDataProvider`. **`IN_BootStrapper`
-  never runs**, so nothing drives the front end.
+  `IN_Loading`, `IG_WorldLoading`, `SH_LuaDataProvider`.
+- **Careful about what this does and does not prove.** `ExecuteScriptAsset` is a
+  *script binding* — a script called it twice. So a root script **is** running;
+  something started it, and it loaded two libraries and then stopped. The probe
+  shows only that no *third* asset is executed **by name** through
+  `sub_824F91E8`. It does not show that `IN_BootStrapper` never runs — the root
+  script could well be `IN_BootStrapper` itself, stalling after its first two
+  statements. Which of those it is has not been measured.
 - The VM's own native-call dispatcher (`sub_82AA7638`, identified from
   `ExecuteScriptAsset`'s caller `lr=0x82AA78F4`) fires **4 times in an 80-second
   run, all within the first 1.6 seconds**, then goes silent. The probe is
@@ -175,15 +181,107 @@ native: script asset #2 "UI_Helper" (ptr=0x2040A5D0) from lr=0x824AF8B0
   `PlayerMode`, by the loader's own gate. `Location`, the key naming the scene to
   load, is never read.
 
-**Open question, and the obvious next move.** The binary `.xenon.package` heaps
-are encrypted (entropy ≈7.98, routine unknown). If the UI scripts live in those
-heaps, that blocker is not a side issue — it is the reason there is no menu. Not
-yet measured: whether `IN_BootStrapper` fails to load or is never asked for.
+**The script layer is a Lua VM.** `sub_82AA7638` is the call handler and carries
+the familiar strings (`"stack overflow"` via `sub_82AA9D48`); `sub_82A9F4F8` is
+the `luaL_error`-style reporter that `ExecuteScriptAsset` uses for argument
+mismatches; `SH_LuaDataProvider` is in the asset list. So the next move is to
+hook those two error paths and ask the direct question: **is the root script
+throwing?** A script that dies on statement three looks exactly like this from
+the outside.
+
+**Disproved, so nobody retries it:** the one active mid-ASM hook
+(`NativeSkipRendererDispatch`, skipping `bl sub_82B34998` at 0x82B70EF4) is
+**not** the cause. That block contains three `bctrl` indirect calls per
+LoaderTick, which made it a strong suspect. Re-enabling it changes nothing —
+still 4 VM dispatches, still the same two script assets, still no error.
+
+Worth keeping from that experiment: **the block no longer crashes without the
+skip.** Its premise was "this needs the Xenos GPU", written before the D3D9 HLE
+layer existed. Draw counts are unchanged and there is no fault. That is one run,
+not the 3/3 this file demands, so verify before relying on it.
+
+**Do not reverse-engineer the AssetDB for this.** ReXGlue handles asset loading
+fine, and the runtime confirms it — the only failed opens in a full run are four
+DLC camera `.bxml` files and `\Device\Image`, which Xenia also shows. The
+encrypted `.xenon.package` heaps are a limitation of the *offline* tools in
+`tools/`, not evidence that the guest cannot read its own packages.
 
 `PlayerMode = "None"` is index 4 of the game's own five-value vocabulary
 (`SplitScreen`, `SinglePlayer`, `Online`, `LAN`, `None`; the *failure* value is
 5). It is the expected value before a menu has chosen a mode — a symptom, not a
 cause.
+
+### Audio and input are downstream of this, not separate bugs (2026-08-06)
+
+Neither works in native mode, and the natural suspicion was that native mode
+broke ReXGlue's handlers. It did not. Measured by hooking the guest's own XDK
+wrappers around the import thunks — the thunks are defined in the runtime
+library and cannot be redefined, but the wrappers are ordinary recompiled
+functions (`sub_82C08EC0` → `XamInputGetState`, `sub_82C08ED0` →
+`XamInputGetCapabilities`, `sub_82C87F78` → `XAudioRegisterRenderDriverClient`,
+`sub_82C87B98` → `XAudioSubmitRenderDriverFrame`, `sub_82C4C268` →
+`XMACreateContext`).
+
+**Audio is a working pipe carrying silence.** The guest registers a render
+driver client (r3=0), then submits **30,776 frames in 165s** — 187/s, exactly
+the 360's 256-sample-at-48kHz frame rate, so the SDK is consuming and pacing it
+in real time. `sub_82C87B98` is the XDK mixer, not a thin wrapper: it has
+`sub_82C87950` fill a buffer at r1+1888 and passes that to the import
+(mx_recomp.94.cpp:31435), and 8064-1888 = 6176 bytes of room fits one
+256 x 6ch x float32 frame. Hooking that fill and scanning all 1536 floats gives
+**peak = 0.000000 on every frame**, with and without `force_load`. Neighbouring
+uninitialised stack reads as the 0xBCBCBCBC fill pattern, so exact zero means
+the mixer really did write silence. The game is playing nothing.
+
+**Input works end to end.** `XamInputGetState` returns success and the packet
+number advances (1 → 16 → 17 across runs), so live pad state reaches the guest.
+It is polled only ~18 times in 75s, from `sub_82B6DB28` (lr=0x82B6DBD4) — the
+slow "is a pad connected" cadence, not a front end reading a stick.
+
+So there is one bug here, not three. Do not open audio or controller work as a
+separate thread until the front end runs.
+
+`--log_high_frequency_kernel_calls=true` does **not** gate these calls: a run
+with it has the same 15 `[krnl]` lines as one without. Hook the wrappers.
+
+### More stale workarounds retired (2026-08-06)
+
+Both were the same vintage and shape as the mid-ASM skip above — written before
+the D3D9 HLE layer, never revisited. Both are neutral over 3/3 runs (2 script
+assets, 4 VM dispatches, no crash, no Lua error), so neither was the cause, but
+both were arbitrary and are now gone.
+
+- **The blanket 500 ms wait short-circuit** in `hooks_wait.cpp` returned
+  SUCCESS from `NtWaitForSingleObjectEx` for *any* 500 ms wait, process-wide,
+  never scoped to the renderer handshake it was written for.
+- **`sub_82BFBF48` was stubbed to nothing** and labelled "error recovery". That
+  name was a guess and it was wrong: it tail-calls `sub_82C01138`, which is a
+  pure CRT thread-block read (`r13+336 ? 0 : *(*(r13+256) + 352)`), an
+  errno-style pointer accessor with no side effects. Stubbing it left r3
+  undefined at 156 call sites. Unstubbed.
+- The `sub_82BFB748` (NtSetEvent) hook was deleted. It called the original
+  unconditionally in both modes — eight log lines, no behaviour.
+
+**Also not the cause: the intro skip.** `skip_intro` is host-side only; it
+skips mx's own Bink playback loop in `D3D12GraphicsSystem::RenderThreadFunc`.
+Its one guest-visible effect is `IsBinkPlaying()`, which makes the guest's
+`RenderPipeline` stand down — so skipping the intro makes the guest run *more*.
+Measured: a full run with the intro actually playing its 47.4s still gives 2
+script assets and 4 VM dispatches, all inside the first 3.3s.
+
+**The FFmpeg dependency is a native-mode substitute for a guest path that
+works.** `MxApp::OnPreSetup` returns before creating `D3D12GraphicsSystem` when
+a GPU plugin is set, so `RenderThreadFunc` — and with it the whole host Bink
+player — never starts in plugin mode. The intro plays fine under the plugin
+anyway (confirmed 2026-08-06), which means the guest decodes Bink itself and
+`src/gfx/bink_player.cpp`, the five FFmpeg DLLs and the `ffmpeg/` tree are
+covering for the *renderer*, not for a missing guest decoder.
+
+That workaround predates the D3D9 HLE layer, like the others above. It is also
+hardcoded to two English filenames (`graphics_system.h:51`) while
+`assets/Videos/` holds DEU/FRA/ITA/SPA variants, so it cannot follow the
+language setting. Whether the guest's own decoder now renders through HLE is the
+test that would let the whole dependency go; it has not been run.
 
 ---
 
@@ -281,7 +379,14 @@ covering slots 252–255. **The fix is to source the HLE constant file from the
 - `dword_830B03EC` (GPU physical base) stays 0 in native mode and is not a
   blocker for asset loading.
 
-### The asset load state machine
+### The asset load state machine — a detour, kept only for `force_load`
+
+**Reverse-engineering the AssetDB was a wrong turn**, and a long one. ReXGlue
+handles asset loading; the guest's file I/O works. The state machine is not
+stuck — it idles because the layer above it never asks for anything, and that
+layer is the Lua front end. Do not resume this thread. What follows is retained
+only because `force_load` depends on it, and `force_load` is what gets a scene
+on screen for rendering work.
 
 `sub_8253AA40`, 12-case switch, state at `*(AssetDB + 28)`. Idles in state 2.
 `sub_82534980(AssetDB, name, flags)` is the load-request API: it `strncpy`s up to

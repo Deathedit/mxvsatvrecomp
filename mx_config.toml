@@ -1663,10 +1663,18 @@ memchr = 0x82BDEEB0
 # name = "NativeSkipLoaderRenderer"
 # jump_address = 0x82B710BC
 
-[[midasm_hook]]
-address = 0x82B70EF4
-name = "NativeSkipRendererDispatch"
-jump_address = 0x82B70EF8
+# DISABLED 2026-08-05 as an experiment. The premise above — "only one
+# instruction in that band actually needs the Xenos GPU" — dates from
+# 2026-08-02 and predates the entire D3D9 HLE layer, which now handles the GPU
+# work natively. The block also contains three `bctrl` indirect calls whose
+# targets are not visible statically, so skipping it removes three virtual
+# dispatches per LoaderTick. The front end is a Lua VM that goes silent 1.6s
+# into boot with no error, which is what "nothing ticks it" looks like.
+# Restore by uncommenting if this turns out to be load-bearing.
+# [[midasm_hook]]
+# address = 0x82B70EF4
+# name = "NativeSkipRendererDispatch"
+# jump_address = 0x82B70EF8
 
 # #7 — its band (0x82B70E18..0x82B70EC8) holds the engine vtable /
 # scene-manager / entity block and, at its end, the vt[6] gate that dispatches

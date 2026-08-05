@@ -15,10 +15,11 @@
 REX_IMPORT(__imp__sub_82BFB740, orig_Wait, void());
 extern "C" REX_FUNC(sub_82BFB740) {
   if (mx::native::g_plugin_mode) { orig_Wait(ctx, base); return; }
-  if (ctx.r4.u32 == 500) {
-    ctx.r3.u32 = 0;
-    return;
-  }
+  // The blanket "every 500ms wait returns SUCCESS immediately" short-circuit is
+  // REMOVED 2026-08-06. It dated to 3cca295 (2026-08-01), predating the D3D9 HLE
+  // layer, and was never scoped to a thread or a handle — it spun every 500ms
+  // wait in the process, not just the renderer handshake it was written for.
+  // Same vintage and same shape as the mid-ASM renderer skip already retired.
   if (ctx.r4.u32 == 0xFFFFFFFF) {
     static int inf = 0;
     ++inf;
@@ -36,26 +37,20 @@ extern "C" REX_FUNC(sub_82BFB740) {
   orig_Wait(ctx, base);
 }
 
-//=============================================================================
-// sub_82BFB748 — NtSetEvent wrapper (call orig, events needed for loading)
-//=============================================================================
-
-REX_IMPORT(__imp__sub_82BFB748, orig_SetEvent, void());
-extern "C" REX_FUNC(sub_82BFB748) {
-  if (mx::native::g_plugin_mode) { orig_SetEvent(ctx, base); return; }
-  // Frontier probe: Transition's loop calls NtSetEvent(tr+0x2DC) after each
-  // LoaderTick. The crash lands between LoaderTick #1 returning and Timing #2.
-  static int se = 0;
-  ++se;
-  bool loud = se <= 8;
-  if (loud) REXLOG_INFO("native: NtSetEvent #{} ENTER handle=0x{:08X}", se, ctx.r3.u32);
-  orig_SetEvent(ctx, base);
-  if (loud) REXLOG_INFO("native: NtSetEvent #{} RETURNED r3=0x{:08X}", se, ctx.r3.u32);
-}
+// The sub_82BFB748 (NtSetEvent) hook is REMOVED 2026-08-06. It was a frontier
+// probe for a crash between LoaderTick #1 and Timing #2 that no longer happens,
+// and it called the original unconditionally in both modes — eight log lines and
+// no behaviour. Nothing depended on it.
 
 //=============================================================================
-// sub_82BFBF48 — error recovery (stubbed)
+// sub_82BFBF48 — CRT per-thread errno accessor (no longer stubbed)
 //=============================================================================
-
-REX_IMPORT(__imp__sub_82BFBF48, orig_ErrorRecovery, void());
-extern "C" REX_FUNC(sub_82BFBF48) {}
+// Named "error recovery" and stubbed to nothing since 2026-08-01. That name was
+// a guess and it was wrong. The function tail-calls `sub_82C01138`, which is a
+// pure read of the CRT thread block: `r13+336 ? 0 : *(*(r13+256) + 352)` — an
+// errno-style pointer accessor with no side effects and no GPU dependency.
+//
+// Stubbing it did not "skip error recovery"; it left r3 holding whatever the
+// caller had, at 156 call sites. UNSTUBBED 2026-08-06.
+REX_IMPORT(__imp__sub_82BFBF48, orig_CrtErrnoPtr, void());
+extern "C" REX_FUNC(sub_82BFBF48) { orig_CrtErrnoPtr(ctx, base); }

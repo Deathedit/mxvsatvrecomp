@@ -14,6 +14,7 @@
 #include <bit>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
@@ -600,6 +601,36 @@ MX_SCRIPT_PROBE(sub_824F1C98, orig_ScriptBindingRegister, "BindingRegister")
 // branch that loads a world.
 MX_SCRIPT_PROBE(sub_82AA7638, orig_ScriptDispatch, "VMDispatch")
 
+// The script layer is a Lua VM, so ask it directly whether it threw.
+//
+// `sub_82AA7638` is the call handler and carries the usual strings — it calls
+// `sub_82AA9D48(L, "stack overflow")`. `sub_82A9F4F8` is the luaL_error-style
+// reporter, used by ExecuteScriptAsset itself for argument mismatches
+// ("Error in %s expected %d..%d args, got %d"), so its r4 is a format string.
+//
+// A root script that dies on its third statement looks, from outside, exactly
+// like the two-libraries-then-silence pattern that is actually observed. These
+// two hooks distinguish "stopped" from "crashed", which is the whole question.
+REX_IMPORT(__imp__sub_82A9F4F8, orig_LuaError, void());
+extern "C" REX_FUNC(sub_82A9F4F8) {
+  static uint64_t s_count = 0;
+  REXLOG_INFO("{}: lua error #{} fmt=\"{}\" (L=0x{:08X}) from lr=0x{:08X}",
+              mx::native::g_plugin_mode ? "plugin" : "native", ++s_count,
+              GuestString(base, ctx.r4.u32, 160), ctx.r3.u32,
+              uint32_t(ctx.lr));
+  orig_LuaError(ctx, base);
+}
+
+REX_IMPORT(__imp__sub_82AA9D48, orig_LuaRunError, void());
+extern "C" REX_FUNC(sub_82AA9D48) {
+  static uint64_t s_count = 0;
+  REXLOG_INFO("{}: lua runerror #{} msg=\"{}\" (L=0x{:08X}) from lr=0x{:08X}",
+              mx::native::g_plugin_mode ? "plugin" : "native", ++s_count,
+              GuestString(base, ctx.r4.u32, 160), ctx.r3.u32,
+              uint32_t(ctx.lr));
+  orig_LuaRunError(ctx, base);
+}
+
 // The asset names themselves. `ExecuteScriptAsset` (sub_824AF838) validates
 // that it got exactly one `char const*`, resolves it with the VM's string
 // accessor, and passes the result to `sub_824F91E8` — so that function's r3 is
@@ -614,6 +645,132 @@ extern "C" REX_FUNC(sub_824F91E8) {
               mx::native::g_plugin_mode ? "plugin" : "native", ++s_count, name,
               name_ptr, uint32_t(ctx.lr));
   orig_RunScriptAsset(ctx, base);
+}
+
+//=============================================================================
+// Does the guest ever ask for input or audio?
+//=============================================================================
+// ReXGlue's own audio and input systems come up in native mode — the log shows
+// "Input system initialized", "Audio system initialized", and the pad added at
+// index 0 — yet neither works. The untested half is the guest: nothing in any
+// log shows it calling in, because those are high-frequency kernel calls.
+// `--log_high_frequency_kernel_calls=true` changed nothing (mx_386.log has the
+// same 15 [krnl] lines as mx_385.log without it), so it does not gate these and
+// the question has to be asked directly.
+//
+// These are the XDK wrappers around the import thunks, not the thunks — the
+// thunks are defined in the runtime library and cannot be redefined here, but
+// the wrappers are ordinary recompiled functions. Read out of the generated
+// sources rather than inferred: each one's body is a register shuffle followed
+// by a tail branch to the import (e.g. sub_82C08EC0 is `mr r5,r4; li r4,1;
+// b __imp__XamInputGetState`, mx_recomp.90.cpp:16730).
+//
+// If all five stay silent, audio and input are downstream of "there is no menu"
+// and are not a second bug.
+
+REX_IMPORT(__imp__sub_82C08EC0, orig_XInputGetState, void());
+extern "C" REX_FUNC(sub_82C08EC0) {
+  static uint64_t s_count = 0;
+  const uint32_t user = ctx.r3.u32;
+  const uint32_t state_ptr = ctx.r4.u32;  // wrapper moves this to r5
+  const uint32_t lr = uint32_t(ctx.lr);
+  orig_XInputGetState(ctx, base);
+  // Log the packet number after the call. The verification that matters is that
+  // it changes while a button is held — a constant packet number means the break
+  // is between SDL and the SDK, not in the guest.
+  static std::chrono::steady_clock::time_point s_last{};
+  const auto now = std::chrono::steady_clock::now();
+  const bool due = (now - s_last) >= std::chrono::seconds(5);
+  if (++s_count <= 4 || due) {
+    if (due) s_last = now;
+    const uint32_t packet = state_ptr ? REX_LOAD_U32(state_ptr) : 0;
+    const uint32_t buttons = state_ptr ? REX_LOAD_U32(state_ptr + 4) : 0;
+    REXLOG_INFO(
+        "{}: XamInputGetState #{} user={} r3=0x{:08X} packet={} buttons=0x{:08X}"
+        " from lr=0x{:08X}",
+        mx::native::g_plugin_mode ? "plugin" : "native", s_count, user,
+        ctx.r3.u32, packet, buttons, lr);
+  }
+}
+
+// Boot-time pad enumeration. Fires a handful of times or not at all, so no
+// throttle.
+#define MX_IO_PROBE(addr, orig, label)                                      \
+  REX_IMPORT(__imp__##addr, orig, void());                                  \
+  extern "C" REX_FUNC(addr) {                                               \
+    static uint64_t s_count = 0;                                            \
+    const uint32_t a1 = ctx.r3.u32;                                         \
+    const uint32_t lr = uint32_t(ctx.lr);                                   \
+    ++s_count;                                                              \
+    orig(ctx, base);                                                        \
+    if (s_count <= 8)                                                       \
+      REXLOG_INFO("{}: {} #{} a1=0x{:08X} -> r3=0x{:08X} from lr=0x{:08X}",  \
+                  mx::native::g_plugin_mode ? "plugin" : "native", label,   \
+                  s_count, a1, ctx.r3.u32, lr);                             \
+  }
+
+MX_IO_PROBE(sub_82C08ED0, orig_XInputGetCaps, "XamInputGetCapabilities")
+MX_IO_PROBE(sub_82C87F78, orig_XAudioRegister, "XAudioRegisterRenderDriverClient")
+MX_IO_PROBE(sub_82C4C268, orig_XMACreateContext, "XMACreateContext")
+
+// The PCM submit path. Per-frame if audio is alive at all, so time-limited.
+REX_IMPORT(__imp__sub_82C87B98, orig_XAudioSubmit, void());
+extern "C" REX_FUNC(sub_82C87B98) {
+  static uint64_t s_count = 0;
+  const uint32_t a1 = ctx.r3.u32;
+  const uint32_t lr = uint32_t(ctx.lr);
+  static std::chrono::steady_clock::time_point s_last{};
+  const auto now = std::chrono::steady_clock::now();
+  const bool due = (now - s_last) >= std::chrono::seconds(5);
+  orig_XAudioSubmit(ctx, base);
+  if (++s_count <= 4 || due) {
+    if (due) s_last = now;
+    REXLOG_INFO(
+        "{}: XAudioSubmitRenderDriverFrame #{} a1=0x{:08X} -> r3=0x{:08X}"
+        " from lr=0x{:08X}",
+        mx::native::g_plugin_mode ? "plugin" : "native", s_count, a1,
+        ctx.r3.u32, lr);
+  }
+}
+
+// Is the guest submitting real audio, or silence?
+//
+// `sub_82C87B98` is not a thin wrapper — it is the XDK mixer. It stack-allocates
+// 8064 bytes, has `sub_82C87950` fill a buffer at r1+1888, and passes that to
+// `__imp__XAudioSubmitRenderDriverFrame` (mx_recomp.94.cpp:31435). 8064-1888 =
+// 6176 bytes of room, and a 360 render-driver frame is 256 samples x 6 channels
+// x float32 = 6144, so the fill target is the frame buffer itself.
+//
+// Hooking the fill is the only way to see the samples: the import thunk is
+// defined in the runtime library and cannot be redefined here. This separates
+// "the SDK is dropping our audio" from "the game is playing nothing", which the
+// submit count alone cannot.
+REX_IMPORT(__imp__sub_82C87950, orig_AudioMixFrame, void());
+extern "C" REX_FUNC(sub_82C87950) {
+  const uint32_t dst = ctx.r4.u32;
+  orig_AudioMixFrame(ctx, base);
+  static uint64_t s_count = 0;
+  static uint64_t s_nonsilent = 0;
+  float peak = 0.0f;
+  if (dst) {
+    for (uint32_t i = 0; i < 256 * 6; ++i) {
+      const uint32_t bits = REX_LOAD_U32(dst + i * 4);
+      float v;
+      std::memcpy(&v, &bits, sizeof(v));
+      const float a = v < 0.0f ? -v : v;
+      if (a > peak) peak = a;
+    }
+  }
+  if (peak > 0.0f) ++s_nonsilent;
+  static std::chrono::steady_clock::time_point s_last{};
+  const auto now = std::chrono::steady_clock::now();
+  const bool due = (now - s_last) >= std::chrono::seconds(5);
+  if (++s_count <= 4 || due) {
+    if (due) s_last = now;
+    REXLOG_INFO("{}: audio mix #{} dst=0x{:08X} peak={:.6f} non-silent={}/{}",
+                mx::native::g_plugin_mode ? "plugin" : "native", s_count, dst,
+                peak, s_nonsilent, s_count);
+  }
 }
 
 // sub_82B38558 — TerminatorVtableCtor (installs off_8213F70C vtable)
