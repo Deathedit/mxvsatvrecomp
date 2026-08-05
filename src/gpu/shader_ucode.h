@@ -56,6 +56,18 @@ struct PixelTextureBinding {
   bool unnormalized = false;
 };
 
+// Walk the executable clauses of a pixel shader and enumerate every 2D
+// texture fetch in program order. This is the evidence/diagnostic decoder: it
+// does not impose the renderer's current one-texture limit. Relative or non-2D
+// fetches still reject the blob because their sampler/coordinate linkage cannot
+// be represented by PixelTextureBinding without guessing.
+//
+// Appends to `out` (does not clear it). Returns false for malformed or
+// unsupported fetch instructions and sets *fail to a static reason string.
+bool DecodePixelTextureFetches(const uint32_t* dwords, uint32_t dword_count,
+                               std::vector<PixelTextureBinding>& out,
+                               const char** fail = nullptr);
+
 // Accepts only a pixel shader containing exactly one 2D texture fetch. Other
 // fetch profiles deliberately fall back to the colour-only host pipeline.
 bool DecodeSingleTexturePixelShader(const uint32_t* dwords,

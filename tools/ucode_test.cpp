@@ -633,6 +633,13 @@ void TestPixelTextureBinding() {
   blob[12] = blob[9];
   blob[13] = blob[10];
   blob[14] = blob[11];
+  std::vector<mx::pm4::PixelTextureBinding> bindings;
+  CheckBool("multiple textures enumerated",
+            mx::pm4::DecodePixelTextureFetches(
+                blob, std::size(blob), bindings, &fail), true);
+  CheckU32("pixel fetch count", uint32_t(bindings.size()), 2);
+  CheckU32("second pixel sampler", bindings[1].sampler, 5);
+  CheckU32("second pixel UV source", bindings[1].src_reg, 7);
   CheckBool("multiple textures rejected",
             mx::pm4::DecodeSingleTexturePixelShader(
                 blob, std::size(blob), binding, &fail), false);

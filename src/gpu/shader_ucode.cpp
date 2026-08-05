@@ -611,17 +611,16 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
   return true;
 }
 
-bool DecodeSingleTexturePixelShader(const uint32_t* dwords,
-                                    uint32_t dword_count,
-                                    PixelTextureBinding& out,
-                                    const char** fail) {
+bool DecodePixelTextureFetches(const uint32_t* dwords, uint32_t dword_count,
+                               std::vector<PixelTextureBinding>& out,
+                               const char** fail) {
   auto reject = [&](const char* why) {
     if (fail) *fail = why;
     return false;
   };
   if (fail) *fail = nullptr;
-  out = {};
   if (!dwords || dword_count < 3) return reject("blob too short");
+  const size_t out_base = out.size();
 
   uint32_t max_cf_dword = dword_count - (dword_count % 3);
   bool saw_exec = false;
@@ -637,7 +636,6 @@ bool DecodeSingleTexturePixelShader(const uint32_t* dwords,
   }
   if (!saw_exec || max_cf_dword == 0) return reject("no exec instruction");
 
-  uint32_t texture_fetches = 0;
   for (uint32_t i = 0; i + 2 < max_cf_dword; i += 3) {
     uc::ControlFlowInstruction cf[2];
     uc::UnpackControlFlowInstructions(dwords + i, cf);
@@ -655,19 +653,36 @@ bool DecodeSingleTexturePixelShader(const uint32_t* dwords,
           continue;
         uc::TextureFetchInstruction tf{};
         std::memcpy(&tf, dwords + at, sizeof(tf));
-        if (++texture_fetches != 1) return reject("multiple texture fetches");
         if (tf.is_src_relative() || tf.is_dest_relative())
           return reject("relative texture fetch");
         if (tf.dimension() != rex::graphics::xenos::FetchOpDimension::k2D)
           return reject("non-2D texture fetch");
-        out.sampler = tf.fetch_constant_index();
-        out.src_reg = tf.src();
-        out.src_swizzle = tf.src_swizzle();
-        out.unnormalized = tf.unnormalized_coordinates();
+        PixelTextureBinding binding;
+        binding.sampler = tf.fetch_constant_index();
+        binding.src_reg = tf.src();
+        binding.src_swizzle = tf.src_swizzle();
+        binding.unnormalized = tf.unnormalized_coordinates();
+        out.push_back(binding);
       }
     }
   }
-  return texture_fetches == 1 ? true : reject("no texture fetch");
+  return out.size() != out_base ? true : reject("no texture fetch");
+}
+
+bool DecodeSingleTexturePixelShader(const uint32_t* dwords,
+                                    uint32_t dword_count,
+                                    PixelTextureBinding& out,
+                                    const char** fail) {
+  out = {};
+  std::vector<PixelTextureBinding> bindings;
+  if (!DecodePixelTextureFetches(dwords, dword_count, bindings, fail))
+    return false;
+  if (bindings.size() != 1) {
+    if (fail) *fail = "multiple texture fetches";
+    return false;
+  }
+  out = bindings.front();
+  return true;
 }
 
 }  // namespace mx::pm4

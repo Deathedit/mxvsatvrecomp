@@ -641,6 +641,9 @@ bool ApplyShaderOutputs(mx::pm4::DrawCall& dc, uint32_t handle,
 bool PrepareDrawTexture(mx::pm4::DrawCall& dc, uint32_t pixel_shader,
                         uint32_t device, uint8_t* base,
                         mx::pm4::PixelTextureBinding& binding);
+void ProbePixelProfileForDraw(uint32_t pixel_shader, uint32_t device,
+                              uint8_t* base,
+                              const mx::pm4::DrawCall& dc);
 
 void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
                        uint32_t count, int32_t base_vertex, uint32_t device,
@@ -758,6 +761,7 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     dc.surface_base = rt.color_info & 0xFFFu;
     dc.surface_pitch = rt.surface_info & 0x3FFFu;
   }
+  ProbePixelProfileForDraw(st.ps_seen ? st.pixel_shader : 0, device, base, dc);
   const bool have_texture =
       PrepareDrawTexture(dc, st.ps_seen ? st.pixel_shader : 0, device, base,
                          texture_binding);
@@ -1697,35 +1701,165 @@ void CollectPixelShaderBlob(uint32_t handle, uint8_t* base) {
 }
 
 struct ResolvedPixelBinding {
-  mx::pm4::PixelTextureBinding binding;
-  bool valid = false;
+  std::vector<mx::pm4::PixelTextureBinding> bindings;
+  const char* fail = nullptr;
+  uint64_t exact_key = 0;
+  uint32_t code_offset_dwords = 0;
+  size_t captured_count = 0;
+  bool exact = false;
+  bool decoded = false;
 };
 std::map<uint32_t, ResolvedPixelBinding> g_resolvedPixelBindings;
 std::map<uint64_t, std::shared_ptr<const mx::pm4::HleTexturePayload>>
     g_hleCpuTextures;
 
-bool ResolvePixelBinding(uint32_t handle,
-                         mx::pm4::PixelTextureBinding& out) {
+const ResolvedPixelBinding* ResolvePixelProfile(uint32_t handle) {
+  const auto& captured = mx::pm4::CapturedPixelShaders();
   auto known = g_resolvedPixelBindings.find(handle);
-  if (known != g_resolvedPixelBindings.end()) {
-    if (known->second.valid) out = known->second.binding;
-    return known->second.valid;
+  // D3D9 binds and draws before VdSwap publishes that frame's PM4 shader
+  // loads. A failed first-frame lookup is therefore not final: retry whenever
+  // the captured set grows, until an exact code match is established.
+  if (known != g_resolvedPixelBindings.end() &&
+      (known->second.exact ||
+       known->second.captured_count == captured.size())) {
+    return &known->second;
   }
   auto bi = g_psBlobs.find(handle);
-  if (bi == g_psBlobs.end()) return false;
+  if (bi == g_psBlobs.end()) return nullptr;
 
   ResolvedPixelBinding resolved;
-  const char* why = nullptr;
-  resolved.valid = mx::pm4::DecodeSingleTexturePixelShader(
-      bi->second.data(), uint32_t(bi->second.size()), resolved.binding, &why);
-  g_resolvedPixelBindings.emplace(handle, resolved);
-  static uint64_t s_ok = 0, s_rejected = 0;
-  if (resolved.valid) ++s_ok; else ++s_rejected;
-  REXLOG_INFO("d3d9: pixel shader 0x{:08X} single-texture profile {}{}",
-              handle, resolved.valid ? "accepted" : "rejected",
-              resolved.valid ? "" : fmt::format(" ({})", why ? why : "?") );
-  if (resolved.valid) out = resolved.binding;
-  return resolved.valid;
+  resolved.captured_count = captured.size();
+  const uint32_t* code = bi->second.data();
+  uint32_t code_count = uint32_t(bi->second.size());
+  size_t best_count = 0;
+  for (const auto& [key, candidate] : captured) {
+    if (candidate.empty() || candidate.size() > bi->second.size() ||
+        candidate.size() <= best_count)
+      continue;
+    auto at = std::search(bi->second.begin(), bi->second.end(),
+                          candidate.begin(), candidate.end());
+    if (at == bi->second.end()) continue;
+    best_count = candidate.size();
+    resolved.exact = true;
+    resolved.exact_key = key;
+    resolved.code_offset_dwords =
+        uint32_t(std::distance(bi->second.begin(), at));
+    code = &*at;
+    code_count = uint32_t(candidate.size());
+  }
+  resolved.decoded = mx::pm4::DecodePixelTextureFetches(
+      code, code_count, resolved.bindings, &resolved.fail);
+  if (!resolved.decoded && !resolved.exact) {
+    // Pixel shader allocations with literal constants place those values in
+    // front of the CF stream (the loaded main-pass shaders consistently begin
+    // at dword 16). Do not hardcode that observation: try a bounded set of
+    // suffixes and accept only a unique valid decode. A second valid alignment
+    // makes the blob ambiguous and leaves the draw on the colour fallback.
+    uint32_t valid_offsets = 0;
+    std::vector<mx::pm4::PixelTextureBinding> unique_bindings;
+    uint32_t unique_offset = 0;
+    const uint32_t limit =
+        std::min<uint32_t>(64, uint32_t(bi->second.size()));
+    for (uint32_t offset = 1; offset + 3 <= limit; ++offset) {
+      std::vector<mx::pm4::PixelTextureBinding> candidate;
+      const char* candidate_fail = nullptr;
+      if (!mx::pm4::DecodePixelTextureFetches(
+              bi->second.data() + offset,
+              uint32_t(bi->second.size()) - offset, candidate,
+              &candidate_fail))
+        continue;
+      ++valid_offsets;
+      unique_offset = offset;
+      unique_bindings = std::move(candidate);
+    }
+    if (valid_offsets == 1) {
+      resolved.decoded = true;
+      resolved.fail = nullptr;
+      resolved.code_offset_dwords = unique_offset;
+      resolved.bindings = std::move(unique_bindings);
+    } else if (valid_offsets > 1) {
+      resolved.fail = "ambiguous CF offset in D3D9 allocation";
+    }
+  }
+  g_resolvedPixelBindings[handle] = std::move(resolved);
+  auto& profile = g_resolvedPixelBindings[handle];
+  std::string linkage;
+  for (const auto& b : profile.bindings) {
+    linkage += fmt::format(" s{}<-r{}{}", b.sampler, b.src_reg,
+                           b.unnormalized ? "(unnorm)" : "");
+  }
+  REXLOG_INFO("d3d9: pixel shader 0x{:08X} texture profile: {}{}{}; source {}",
+              handle,
+              profile.decoded
+                  ? fmt::format("{} 2D fetch(es)", profile.bindings.size())
+                  : "rejected",
+              linkage,
+              profile.decoded
+                  ? ""
+                  : fmt::format(" ({})", profile.fail ? profile.fail : "?"),
+              profile.exact
+                  ? fmt::format("exact PM4 key 0x{:X} at blob+0x{:X}",
+                                profile.exact_key,
+                                profile.code_offset_dwords * 4)
+                  : profile.code_offset_dwords
+                        ? fmt::format("unique CF suffix at blob+0x{:X}",
+                                      profile.code_offset_dwords * 4)
+                        : fmt::format(
+                              "whole {}-dword D3D9 allocation against {} "
+                              "captured PM4 pixel shaders",
+                              bi->second.size(), captured.size()));
+  if (!profile.decoded) {
+    static std::map<uint32_t, bool> s_dumped_rejected;
+    if (s_dumped_rejected.size() < 16 &&
+        s_dumped_rejected.emplace(handle, true).second) {
+      std::string words;
+      uint32_t shown = 0;
+      for (uint32_t i = 0; i < bi->second.size() && shown < 16; ++i) {
+        if (!bi->second[i]) continue;
+        words += fmt::format(" [{}]={:08X}", i, bi->second[i]);
+        ++shown;
+      }
+      REXLOG_INFO("d3d9: rejected pixel shader 0x{:08X} first nonzero "
+                  "allocation dwords:{}",
+                  handle, words.empty() ? " none" : words);
+    }
+  }
+  return &profile;
+}
+
+bool ResolvePixelBinding(uint32_t handle,
+                         mx::pm4::PixelTextureBinding& out) {
+  const ResolvedPixelBinding* profile = ResolvePixelProfile(handle);
+  if (!profile || !profile->decoded || profile->bindings.size() != 1)
+    return false;
+  out = profile->bindings.front();
+  return true;
+}
+
+void ProbePixelProfileForDraw(uint32_t pixel_shader, uint32_t device,
+                              uint8_t* base,
+                              const mx::pm4::DrawCall& dc) {
+  if (!pixel_shader && device &&
+      HostPageReadable(REX_RAW_ADDR(device + 0x3244))) {
+    pixel_shader = REX_LOAD_U32(device + 0x3244);
+  }
+  if (!pixel_shader) return;
+  CollectPixelShaderBlob(pixel_shader, base);
+  const ResolvedPixelBinding* profile = ResolvePixelProfile(pixel_shader);
+  if (!profile) return;
+
+  // One line per shader/target pairing is enough to identify the profile used
+  // by the present-sized pass without flooding a frame with repeated draws.
+  const uint64_t key = (uint64_t(pixel_shader) << 32) |
+                       uint64_t(dc.render_target_object);
+  static std::map<uint64_t, bool> s_seen;
+  if (s_seen.size() >= 64 || !s_seen.emplace(key, true).second) return;
+  REXLOG_INFO("d3d9: pixel profile draw ps=0x{:08X}, target=0x{:08X} "
+              "{}x{}, viewport={}x{}, fetches={}{}",
+              pixel_shader, dc.render_target_object, dc.render_target_width,
+              dc.render_target_height, dc.viewport_width, dc.viewport_height,
+              profile->bindings.size(),
+              profile->decoded ? "" : " (unsupported)");
 }
 
 // IDA proves D3DDevice_SetPixelShader stores the live shader at device+0x3244
