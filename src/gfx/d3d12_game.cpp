@@ -21,6 +21,7 @@
 
 #include <cstring>
 #include <algorithm>
+#include <unordered_set>
 #include <utility>
 
 // mx::pm4::HostTopology carries D3D_PRIMITIVE_TOPOLOGY values so the translator
@@ -513,14 +514,24 @@ void D3D12Renderer::RenderGameFrame() {
 
   uint32_t boundTargetObject = 0;  // zero is the final m_gameRT.
   static const float kOffscreenClear[4] = {0, 0, 0, 0};
+  std::unordered_set<uint32_t> sampledTargets;
+  sampledTargets.reserve(m_gameDraws.size());
   for (const auto& d : m_gameDraws) {
-    // Keep the final 1280x720 surface on m_gameRT so PresentGameFrame remains
-    // an exact-size copy. Every other proven D3D9 target is isolated here;
-    // this is what prevents the old 129x129/160x90 passes from overpainting the
-    // visible scene when hle_main_viewport_only is disabled.
+    if (d.sampledTargetObject &&
+        d.sampledTargetObject != d.targetObject)
+      sampledTargets.insert(d.sampledTargetObject);
+  }
+  for (const auto& d : m_gameDraws) {
+    // Keep only the unsampled final 1280x720 surface on m_gameRT so
+    // PresentGameFrame remains an exact-size copy. A full-size scene target
+    // that a later compositor samples is still offscreen and needs its own SRV;
+    // classifying solely by dimensions made that target alias m_gameRT and
+    // left the final draw with nothing it could legally sample.
     GameRenderTarget* drawTarget = nullptr;
+    const bool feedsLaterDraw =
+        d.targetObject && sampledTargets.contains(d.targetObject);
     if (d.targetObject && d.targetWidth && d.targetHeight &&
-        (d.targetWidth != 1280 || d.targetHeight != 720)) {
+        (feedsLaterDraw || d.targetWidth != 1280 || d.targetHeight != 720)) {
       drawTarget = EnsureGameRenderTarget(d.targetObject, d.targetWidth,
                                           d.targetHeight);
     }

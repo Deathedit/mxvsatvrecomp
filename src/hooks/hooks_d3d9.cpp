@@ -1485,6 +1485,15 @@ bool ApplyShaderOutputs(mx::pm4::DrawCall& dc, uint32_t handle,
   auto pi = g_patchedCode.find(handle);
   if (pi == g_patchedCode.end() || !pi->second.resolved) {
     ++g_hleShaderNoCode;
+    static uint32_t s_logged_no_code = 0;
+    if (s_logged_no_code++ < 24) {
+      REXLOG_INFO("d3d9: HLE producer rejected: vertex shader 0x{:08X} has "
+                  "no exact patched code, target 0x{:08X} {}x{}, viewport "
+                  "{}x{}, {} verts / {} indices",
+                  handle, dc.render_target_object, dc.render_target_width,
+                  dc.render_target_height, dc.viewport_width,
+                  dc.viewport_height, dc.vertex_count, dc.index_count);
+    }
     return false;
   }
   const PatchedCode& patch = pi->second;
@@ -1830,10 +1839,56 @@ const ResolvedPixelBinding* ResolvePixelProfile(uint32_t handle) {
 bool ResolvePixelBinding(uint32_t handle,
                          mx::pm4::PixelTextureBinding& out) {
   const ResolvedPixelBinding* profile = ResolvePixelProfile(handle);
-  if (!profile || !profile->decoded || profile->bindings.size() != 1)
+  if (!profile || !profile->decoded || profile->bindings.empty())
     return false;
-  out = profile->bindings.front();
-  return true;
+  if (profile->bindings.size() == 1) {
+    out = profile->bindings.front();
+    return true;
+  }
+
+  // Multiple fetch instructions may still describe one host texture. Blur
+  // passes in ST_Southwest issue 3 or 9 taps of s0 from the same interpolator;
+  // base-mip HLE cannot reproduce their offsets/ALU yet, but one s0 sample is
+  // the explicit approximation this milestone permits.
+  const auto& first = profile->bindings.front();
+  bool same_linkage = true;
+  bool same_interpolator = true;
+  bool same_sampler = true;
+  for (const auto& b : profile->bindings) {
+    same_interpolator = same_interpolator && b.src_reg == first.src_reg;
+    same_linkage = same_linkage && b.src_reg == first.src_reg &&
+                   b.src_swizzle == first.src_swizzle &&
+                   b.unnormalized == first.unnormalized;
+    same_sampler = same_sampler && b.sampler == first.sampler;
+  }
+  if (same_linkage && same_sampler) {
+    out = first;
+    return true;
+  }
+
+  // Evidence-selected final compositor profile, measured on the 1280x720
+  // ST_Southwest draw: s0 is the resolved 1280x720 scene, s1 is 160x90, s2 is
+  // 1x1 and s3 is another full-size input. Select only the base scene and only
+  // for this exact fetch order/linkage; do not generalise "sampler zero wins"
+  // to unrelated shaders.
+  static constexpr uint32_t kFinalSamplers[4] = {3, 1, 2, 0};
+  if (same_interpolator &&
+      profile->bindings.size() == std::size(kFinalSamplers)) {
+    bool exact = true;
+    for (uint32_t i = 0; i < std::size(kFinalSamplers); ++i)
+      exact = exact && profile->bindings[i].sampler == kFinalSamplers[i];
+    if (exact) {
+      out = profile->bindings.back();  // s0, the resolved 1280x720 scene.
+      static bool s_logged = false;
+      if (!s_logged) {
+        s_logged = true;
+        REXLOG_INFO("d3d9: selected s0 base scene for observed "
+                    "four-input final compositor shader 0x{:08X}", handle);
+      }
+      return true;
+    }
+  }
+  return false;
 }
 
 void ProbePixelProfileForDraw(uint32_t pixel_shader, uint32_t device,
@@ -1860,6 +1915,27 @@ void ProbePixelProfileForDraw(uint32_t pixel_shader, uint32_t device,
               dc.render_target_height, dc.viewport_width, dc.viewport_height,
               profile->bindings.size(),
               profile->decoded ? "" : " (unsupported)");
+  if (profile->decoded) {
+    std::string inputs;
+    for (const auto& binding : profile->bindings) {
+      if (binding.sampler >= mx::pm4::kMaxSamplers) continue;
+      const auto& tb = DeviceState().texture[binding.sampler];
+      mx::pm4::HleTextureSource source;
+      const char* why = nullptr;
+      const bool described = tb.valid &&
+          mx::pm4::DescribeHleTexture2D(tb.fetch, source, &why);
+      uint32_t resolved = 0;
+      if (const auto it = g_resolvedTextureTargets.find(tb.object);
+          it != g_resolvedTextureTargets.end())
+        resolved = it->second;
+      inputs += fmt::format(" s{}=tex0x{:08X}", binding.sampler, tb.object);
+      if (described)
+        inputs += fmt::format("({}x{})", source.width, source.height);
+      if (resolved) inputs += fmt::format("->rt0x{:08X}", resolved);
+    }
+    REXLOG_INFO("d3d9: pixel profile inputs ps=0x{:08X}:{}", pixel_shader,
+                inputs.empty() ? " none" : inputs);
+  }
 }
 
 // IDA proves D3DDevice_SetPixelShader stores the live shader at device+0x3244
