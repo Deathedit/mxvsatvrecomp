@@ -249,21 +249,26 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
 
   // The same two expansions the PM4 path uses, shared rather than reimplemented
   // — a second copy could drift from the one the renderer already agrees with.
-  if (expand_rects) {
-    if (Pm4Translator::ExpandRectangleList(out) == 0) {
+  out.valid = true;
+  out.color_source = col ? DrawCall::ColorSource::kPacked
+                         : DrawCall::ColorSource::kNone;
+  return true;
+}
+
+bool FinalizeHleTopology(DrawCall& draw, HleSkip& skip) {
+  skip = HleSkip::kNone;
+  const auto prim = static_cast<PrimitiveType>(draw.prim_type);
+  if (prim == PrimitiveType::kRectangleList) {
+    if (Pm4Translator::ExpandRectangleList(draw) == 0) {
       skip = HleSkip::kBadTopology;
       return false;
     }
-  } else if (expand_quads) {
-    if (Pm4Translator::ExpandQuadList(out) == 0) {
+  } else if (prim == PrimitiveType::kQuadList) {
+    if (Pm4Translator::ExpandQuadList(draw) == 0) {
       skip = HleSkip::kBadTopology;
       return false;
     }
   }
-
-  out.valid = true;
-  out.color_source = col ? DrawCall::ColorSource::kPacked
-                         : DrawCall::ColorSource::kNone;
   return true;
 }
 

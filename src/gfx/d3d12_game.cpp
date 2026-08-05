@@ -87,7 +87,6 @@ bool D3D12Renderer::CreateGamePipeline() {
     {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12,
      D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
   };
-
   D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
   pso.pRootSignature = m_gameRootSig.Get();
   pso.VS.pShaderBytecode = vsBlob->GetBufferPointer();
@@ -96,7 +95,6 @@ bool D3D12Renderer::CreateGamePipeline() {
   pso.PS.BytecodeLength = psBlob->GetBufferSize();
   pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
   pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-  pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
   pso.SampleMask = UINT_MAX;
   pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   pso.NumRenderTargets = 1;
@@ -111,12 +109,25 @@ bool D3D12Renderer::CreateGamePipeline() {
   pso.InputLayout.NumElements = 2;
   pso.InputLayout.pInputElementDescs = inputLayout;
 
-  hr = m_device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&m_gamePSO));
-  if (FAILED(hr)) {
-    LogError("CreateGamePipeline: PSO creation failed");
-    return false;
+  for (uint32_t i = 0; i < m_gamePSOs.size(); ++i) {
+    const bool depth_enable = (i & 1u) != 0;
+    const bool depth_write = depth_enable && (i & 2u) != 0;
+    const bool color_write = (i & 4u) == 0;
+    pso.DepthStencilState = {};
+    pso.DepthStencilState.DepthEnable = depth_enable;
+    pso.DepthStencilState.DepthWriteMask = depth_write
+        ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+    pso.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+    pso.BlendState.RenderTarget[0].RenderTargetWriteMask = color_write
+        ? D3D12_COLOR_WRITE_ENABLE_ALL : 0;
+    hr = m_device->CreateGraphicsPipelineState(
+        &pso, IID_PPV_ARGS(&m_gamePSOs[i]));
+    if (FAILED(hr)) {
+      LogError("CreateGamePipeline: PSO variant creation failed");
+      return false;
+    }
   }
-  LogInfo("CreateGamePipeline: PSO created");
+  LogInfo("CreateGamePipeline: PSO variants created");
 
   struct Vertex { float x, y, z, r, g, b, a; };
   Vertex verts[] = {
@@ -219,7 +230,7 @@ bool D3D12Renderer::CreateGamePipeline() {
 void D3D12Renderer::RenderGameFrame() {
   if (!m_hasGamePipeline) return;
   m_commandList->SetGraphicsRootSignature(m_gameRootSig.Get());
-  m_commandList->SetPipelineState(m_gamePSO.Get());
+  m_commandList->SetPipelineState(m_gamePSOs[0].Get());
 
   ID3D12DescriptorHeap* heaps[] = {m_gameCbvHeap.Get()};
   m_commandList->SetDescriptorHeaps(1, heaps);
@@ -241,6 +252,10 @@ void D3D12Renderer::RenderGameFrame() {
   }
 
   for (const auto& d : m_gameDraws) {
+    const uint32_t pso_index = (d.depthEnable ? 1u : 0u) |
+                               (d.depthWrite ? 2u : 0u) |
+                               (d.colorWrite ? 0u : 4u);
+    m_commandList->SetPipelineState(m_gamePSOs[pso_index].Get());
     // Each translated draw brings its own transform; a draw whose cb failed to
     // allocate falls back to the identity matrix rather than being dropped.
     ID3D12Resource* cb = d.cb ? d.cb.Get() : m_gameCB.Get();
@@ -254,6 +269,10 @@ void D3D12Renderer::RenderGameFrame() {
 }
 
 void D3D12Renderer::ClearGameDraws() {
+  // ClearGameDraws is called when the render thread receives a real guest
+  // frame, even if filtering leaves it with zero submittable draws. Receipt of
+  // that frame permanently retires the startup placeholder triangle.
+  m_hasEverDrawnGame = true;
   if (m_gameDraws.empty()) return;
 
   // Hand the buffers to the retirement list rather than releasing them here.
@@ -285,7 +304,8 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t vtxStride, const uint8_t* indices,
                                  uint32_t idxBytes, bool idx16,
                                  uint32_t idxCount, const float* mvp,
-                                 uint32_t topology) {
+                                 uint32_t topology, bool depthEnable,
+                                 bool depthWrite, bool colorWrite) {
   // PERF(per-frame-allocs): this creates three ID3D12Resource's per call (VB +
   // IB + CB) on the UPLOAD heap, and is called once per submitted draw rather
   // than once per frame, so the allocation rate scales with the draw count —
@@ -347,6 +367,9 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.ibv.SizeInBytes = idxBytes;
   d.indexCount = idxCount;
   d.topology = static_cast<D3D12_PRIMITIVE_TOPOLOGY>(topology);
+  d.depthEnable = depthEnable;
+  d.depthWrite = depthWrite;
+  d.colorWrite = colorWrite;
 
   // Carry the translator's transform. Without this the draw renders under the
   // identity matrix baked into m_gameCB, which makes a correct transform and a

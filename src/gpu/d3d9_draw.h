@@ -92,6 +92,13 @@ constexpr uint32_t kMaxHleVertices = 1u << 20;
 // cleared on entry either way.
 bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip);
 
+// Finish primitive types that are expansions rather than native host
+// topologies. Kept separate from BuildHleDraw because the HLE hook executes the
+// guest vertex shader between the two steps: RectangleList's implied fourth
+// corner must be derived from shader outputs, not mistaken for another source
+// vertex and fetched from guest memory.
+bool FinalizeHleTopology(DrawCall& draw, HleSkip& skip);
+
 // The frame's draws, accumulated by the D3D9 draw hooks and taken by the swap
 // hook. No lock: every D3D9 entry point in this title arrives on one thread,
 // which was measured rather than assumed — each `d3d9: draws` line within a run

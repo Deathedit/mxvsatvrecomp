@@ -84,6 +84,10 @@ struct DrawCall {
   // off-screen pass overpaints the main scene. See LogSurface.
   uint32_t surface_base = 0;          // RB_COLOR_INFO[11:0], in 4KB tiles
   uint32_t surface_pitch = 0;         // RB_SURFACE_INFO[13:0]
+  // HLE path: resolved D3D9 viewport extent at draw time. This separates
+  // shadow/off-screen passes when render-target identity is not yet modelled.
+  uint32_t viewport_width = 0;
+  uint32_t viewport_height = 0;
 
   // Where TranscodeVertices got this draw's vertex colour, so LogSurface can
   // cross-tabulate it against the surface. Carried on the draw rather than

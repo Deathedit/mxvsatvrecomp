@@ -84,9 +84,10 @@ REXCVAR_DEFINE_BOOL(hle_capture, false, "Debug",
                     "resolved draws to d3d9_dump_decls.txt. Capture only — it "
                     "submits nothing and renders nothing");
 
-// Runs the guest's own vertex shader microcode, from the D3D9 side, on the
-// vertices of the draws hle_capture describes. Nothing is rendered from the
-// result — it is measured against the clip volume and reported.
+// Samples the guest's own vertex shader microcode, from the D3D9 side, on the
+// vertices of the draws hle_capture describes. hle_render independently runs
+// every referenced vertex and renders it. hle_shader_exec only controls the
+// sampled measurement against the clip volume and its report.
 //
 // A divisor rather than a bool because the interpreter's cost is the open
 // question and a fixed sampling rate cannot answer it: at 64 the measurement is
@@ -109,8 +110,18 @@ REXCVAR_DEFINE_UINT32(hle_shader_verts, 8, "Debug",
 
 REXCVAR_DEFINE_BOOL(main_surface_only, false, "Debug",
                     "Submit only draws targeting the guest's main colour "
-                    "surface, instead of flattening every render pass into one "
-                    "target. Known to make things worse — see the note above");
+                    "surface by PM4 pitch. Known to make PM4 rendering worse; "
+                    "see the note above");
+
+// HLE does not yet create a host target for every guest render target. Until
+// it does, mixing the 129x129 shadow pass and other off-screen viewports into
+// the 1280x720 scene produces the long white wedges seen in ST_Southwest.
+// Unlike main_surface_only's PM4 pitch guess, this selector comes from D3D9's
+// resolved, render-target-clamped viewport and is enabled only for HLE.
+REXCVAR_DEFINE_BOOL(hle_main_viewport_only, true, "Debug",
+                    "In HLE rendering, submit only draws using the resolved "
+                    "1280x720 D3D9 viewport until separate render targets are "
+                    "modelled");
 
 // The intro playlist runs 47.4s (THQ 9.5s + Attract 37.9s) and the RenderPipeline
 // hook stands down for its whole duration, so the guest render path cannot run
@@ -217,6 +228,7 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       // strides.
       static std::map<uint32_t, uint32_t> s_skippedStrides;
       static std::map<uint64_t, uint32_t> s_skippedSurfaces;
+      static std::map<uint64_t, uint32_t> s_skippedViewports;
       static uint64_t s_skippedUntransformable = 0;
       static uint64_t s_skippedByColor = 0;
       // Filter first, bind second. The renderer's list is only replaced once we
@@ -278,26 +290,48 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
         // pitch 0 — silently, and looking exactly like "HLE produced nothing".
         // Modelling render targets is a later step; pretending to know the
         // pitch here would be worse than admitting the gap.
-        if (!REXCVAR_GET(hle_render) && REXCVAR_GET(main_surface_only) &&
-            d.surface_pitch != kMainSurfacePitch) {
-          ++skipped;
-          ++s_skippedSurfaces[(uint64_t(d.surface_base) << 32) |
-                              d.surface_pitch];
-          continue;
+        if (REXCVAR_GET(hle_render)) {
+          if (REXCVAR_GET(hle_main_viewport_only) &&
+              (d.viewport_width != 1280 || d.viewport_height != 720)) {
+            ++skipped;
+            ++s_skippedViewports[(uint64_t(d.viewport_width) << 32) |
+                                 d.viewport_height];
+            continue;
+          }
+        } else if (REXCVAR_GET(main_surface_only) &&
+                   d.surface_pitch != kMainSurfacePitch) {
+            ++skipped;
+            ++s_skippedSurfaces[(uint64_t(d.surface_base) << 32) |
+                                d.surface_pitch];
+            continue;
         }
         submittable.push_back(&d);
         ++submitted;
       }
 
-      if (!submittable.empty()) {
+      // A non-empty handoff is a real guest frame even when every draw is
+      // filtered. Retire the previous frame and, crucially, retire the baked
+      // placeholder triangle. Previously ClearGameDraws only ran when a draw
+      // survived filtering, so hide_colorless_draws filtered all 14 startup
+      // draws and left m_hasEverDrawnGame false forever: the guest kept
+      // swapping while the host visibly replayed its placeholder.
+      if (!draws.empty()) {
         m_renderer->ClearGameDraws();
+      }
+      if (!submittable.empty()) {
         for (const auto* d : submittable) {
           m_renderer->AddGameDraw(d->vertices.data(),
                                   static_cast<uint32_t>(d->vertices.size()),
                                   d->vertex_stride, d->indices.data(),
                                   static_cast<uint32_t>(d->indices.size()),
                                   d->index_16bit, d->index_count, d->mvp,
-                                  static_cast<uint32_t>(d->topology));
+                                  static_cast<uint32_t>(d->topology),
+                                  (d->om_seen & (1u << 1)) != 0 &&
+                                      (d->depth_control & (1u << 1)) != 0,
+                                  (d->om_seen & (1u << 1)) != 0 &&
+                                      (d->depth_control & (1u << 2)) != 0,
+                                  (d->om_seen & (1u << 0)) == 0 ||
+                                      (d->colour_mask & 0xFu) != 0);
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;
@@ -316,14 +350,20 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
         for (const auto& [key, count] : s_skippedSurfaces)
           surf += fmt::format("{:03X}/{}:{} ", uint32_t(key >> 32),
                               uint32_t(key & 0xFFFFFFFF), count);
+        std::string viewports;
+        for (const auto& [key, count] : s_skippedViewports)
+          viewports += fmt::format("{}x{}:{} ", uint32_t(key >> 32),
+                                   uint32_t(key & 0xFFFFFFFF), count);
         REXLOG_INFO("RenderThread: frame #{} submitted {} draws, skipped {} "
                     "— skipped strides (cumulative) {} — host ticks with/without "
-                    "new draws {}/{} — skipped surfaces {} — skipped "
+                    "new draws {}/{} — skipped surfaces {} — skipped viewports {} — skipped "
                     "untransformable (cumulative) {} — skipped by colour "
                     "source (cumulative) {}",
                     s_frame, submitted, skipped, hist.empty() ? "none" : hist,
                     s_ticksWithDraws, s_ticksEmpty,
-                    surf.empty() ? "none" : surf, s_skippedUntransformable,
+                    surf.empty() ? "none" : surf,
+                    viewports.empty() ? "none" : viewports,
+                    s_skippedUntransformable,
                     s_skippedByColor);
       }
       // BeginFrame and EndFrame own the whole frame: BeginFrame opens the

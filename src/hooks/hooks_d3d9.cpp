@@ -566,7 +566,9 @@ bool ReadDeviceViewport(uint32_t device, uint8_t* base, float out[6]) {
 // Prefers the device's clamped copy and falls back to the argument shadow only
 // when the device cannot be read, counting which was used — a silent fallback
 // to the value that caused the bug would be the worst of both.
-bool BuildViewportMvp(uint32_t device, uint8_t* base, float out[16]) {
+bool BuildViewportMvp(uint32_t device, uint8_t* base, float out[16],
+                      uint32_t* out_width = nullptr,
+                      uint32_t* out_height = nullptr) {
   float dv[6];
   float vx, vy, vw, vh, vminz, vmaxz;
   if (ReadDeviceViewport(device, base, dv)) {
@@ -592,6 +594,9 @@ bool BuildViewportMvp(uint32_t device, uint8_t* base, float out[16]) {
   float zs = vmaxz - vminz;
   const float zo = vminz;
   if (zs == 0.0f) zs = 1.0f;
+
+  if (out_width) *out_width = uint32_t(std::lround(vw));
+  if (out_height) *out_height = uint32_t(std::lround(vh));
 
   static const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0,
                                       0, 0, 1, 0, 0, 0, 0, 1};
@@ -622,6 +627,9 @@ std::map<uint64_t, uint64_t> g_viewportExtents;
 void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
                           const mx::pm4::HleStream* streams, uint32_t device,
                           uint8_t* base);
+bool ApplyShaderOutputs(mx::pm4::DrawCall& dc, uint32_t handle,
+                        const mx::pm4::HleStream* streams, uint32_t device,
+                        uint8_t* base);
 
 void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
                        uint32_t count, int32_t base_vertex, uint32_t device,
@@ -666,7 +674,13 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   // the HLE picture directly comparable to the PM4 one on screen. What the
   // constant file says is measured beside it, below, and acted on afterwards.
   float vp[16];
-  const bool have_vp = BuildViewportMvp(device, base, vp);
+  uint32_t viewport_width = 0, viewport_height = 0;
+  const bool have_vp = BuildViewportMvp(device, base, vp, &viewport_width,
+                                        &viewport_height);
+  // PA_CL_VTE_CNTL disables the hardware X/Y scale and offset for these draws,
+  // so a shader output without the inverse viewport cannot be submitted under
+  // identity. Unknown is not a usable viewport.
+  if (!have_vp) return;
   if (have_vp) in.mvp = vp;
 
   DrawCall dc;
@@ -714,6 +728,40 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
 
   ProbeShaderExecution(dc, st.vs_seen ? st.vertex_shader : 0, streams, device,
                        base);
+
+  // The declaration supplies inputs, not the position the GPU rasterizes.
+  // Execute the bound guest shader and replace POSITION with its homogeneous
+  // screen-space export before the inverse viewport in dc.mvp is applied.
+  if (!ApplyShaderOutputs(dc, st.vs_seen ? st.vertex_shader : 0, streams,
+                          device, base)) {
+    return;
+  }
+  dc.viewport_width = viewport_width;
+  dc.viewport_height = viewport_height;
+
+  // RectangleList's implied corner must be derived from shader outputs. If it
+  // is expanded earlier, the fourth packed vertex has no corresponding source
+  // vertex and shader execution reads unrelated guest memory.
+  if (!FinalizeHleTopology(dc, skip)) {
+    ++HleSkipCounts()[uint32_t(skip)];
+    return;
+  }
+
+  // Carry the two output-merger states this HLE path knows exactly into the
+  // same raw fields the PM4 path uses. D3D9 and Xenos both use RGBA bits 0..3
+  // for the colour mask. RB_DEPTHCONTROL bits 1/2 are depth-test/write enable;
+  // ZWriteEnable is not one of the uniquely identified D3D9 entry points yet,
+  // so use D3D9's normal writable-depth mode whenever ZEnable is on. Most
+  // importantly, ColorWriteEnable=0 identifies the depth-only passes that the
+  // host previously painted opaque white.
+  if (st.render_state.Seen(kRsColorWriteEnable)) {
+    dc.colour_mask = st.render_state.value[kRsColorWriteEnable] & 0xFu;
+    dc.om_seen |= 1u << 0;
+  }
+  if (st.render_state.Seen(kRsZEnable)) {
+    if (st.render_state.value[kRsZEnable]) dc.depth_control = (1u << 1) | (1u << 2);
+    dc.om_seen |= 1u << 1;
+  }
 
   HleFrameDraws().push_back(std::move(dc));
 }
@@ -1348,6 +1396,209 @@ std::map<uint32_t, ShaderScore> g_shaderScore;   // key: shader handle
 // two populations and reads as a finding. Counted, and reported: a nonzero
 // value invalidates every row rather than quietly biasing it.
 uint64_t g_shaderIdentityChanged = 0;
+
+// HLE rendering must consume the shader's position export, not the raw
+// declaration POSITION that BuildHleDraw initially packs. These counters are
+// deliberately separate from the sampling/probe counters below: rendering
+// executes every vertex, while hle_shader_exec may sample only a few.
+uint64_t g_hleShaderAttempts = 0, g_hleShaderDraws = 0;
+uint64_t g_hleShaderVertices = 0;
+uint64_t g_hleShaderNoCode = 0, g_hleShaderBadDecode = 0;
+uint64_t g_hleShaderBadStream = 0, g_hleShaderBadConstants = 0;
+uint64_t g_hleShaderBadVertex = 0;
+uint64_t g_hleShaderIdentityMvp = 0, g_hleShaderViewportMvp = 0;
+
+bool ApplyShaderOutputs(mx::pm4::DrawCall& dc, uint32_t handle,
+                        const mx::pm4::HleStream* streams, uint32_t device,
+                        uint8_t* base) {
+  using namespace mx::pm4;
+  (void)base;
+  const uint64_t attempt = ++g_hleShaderAttempts;
+  struct ReportApply {
+    uint64_t attempt;
+    ~ReportApply() {
+      if (attempt > 10 && (attempt % 250) != 0) return;
+      REXLOG_INFO(
+          "d3d9: HLE shader output attempts {}: applied {} draws / {} "
+          "vertices; skipped no-code {} decode {} stream {} constants {} "
+          "vertex {}; output transform identity {} viewport {}",
+          g_hleShaderAttempts, g_hleShaderDraws, g_hleShaderVertices,
+          g_hleShaderNoCode, g_hleShaderBadDecode, g_hleShaderBadStream,
+          g_hleShaderBadConstants, g_hleShaderBadVertex,
+          g_hleShaderIdentityMvp, g_hleShaderViewportMvp);
+    }
+  } report{attempt};
+  if (!handle || !device) {
+    ++g_hleShaderNoCode;
+    return false;
+  }
+
+  // Rendering only trusts the exact capture made by
+  // PatchVertexShaderToMatchVertexDeclaration. The >=90% PM4 content match is
+  // useful as a diagnostic fallback, but it is not a safe source for pixels.
+  auto pi = g_patchedCode.find(handle);
+  if (pi == g_patchedCode.end() || !pi->second.resolved) {
+    ++g_hleShaderNoCode;
+    return false;
+  }
+  const PatchedCode& patch = pi->second;
+  if (patch.code_off >= patch.code.size()) {
+    ++g_hleShaderBadDecode;
+    return false;
+  }
+
+  std::vector<VertexAttribute> attrs;
+  const char* why = nullptr;
+  if (!DecodeVertexShaderFetches(patch.code.data() + patch.code_off,
+                                 uint32_t(patch.code.size() - patch.code_off),
+                                 attrs, &why) ||
+      attrs.empty() || attrs.size() != patch.expect_fetches) {
+    ++g_hleShaderBadDecode;
+    return false;
+  }
+
+  std::vector<uint32_t> attr_stream(attrs.size());
+  for (size_t a = 0; a < attrs.size(); ++a) {
+    const uint32_t fs = attrs[a].fetch_slot;
+    if (fs > 95 || (95u - fs) >= kMaxStreams) {
+      ++g_hleShaderBadStream;
+      return false;
+    }
+    const uint32_t si = 95u - fs;
+    const HleStream& s = streams[si];
+    if (!s.bound || !s.host || s.stride == 0 || s.stride > 256 ||
+        s.stride != attrs[a].stride_bytes) {
+      ++g_hleShaderBadStream;
+      return false;
+    }
+    attr_stream[a] = si;
+  }
+
+  std::vector<uint32_t> consts(kD3d9ConstRegs * 4);
+  const uint32_t const_bytes = kD3d9ConstRegs * 16;
+  if (!HostPageReadable(REX_RAW_ADDR(device + 0x780)) ||
+      !HostPageReadable(REX_RAW_ADDR(device + 0x780 + const_bytes - 4))) {
+    ++g_hleShaderBadConstants;
+    return false;
+  }
+  for (uint32_t i = 0; i < consts.size(); ++i)
+    consts[i] = REX_LOAD_U32(device + 0x780 + i * 4);
+
+  AluInputs alu_in;
+  alu_in.alu_consts = consts.data();
+  alu_in.alu_const_dwords = uint32_t(consts.size());
+
+  // Commit only after every vertex succeeds. Mixing shader outputs and raw
+  // declaration positions within one primitive produces plausible-looking but
+  // invalid geometry and is worse than dropping the draw explicitly.
+  std::vector<uint8_t> transformed = dc.vertices;
+  std::vector<uint8_t> referenced(dc.vertex_count, dc.index_count ? 0 : 1);
+  if (dc.index_count) {
+    const uint32_t iw = dc.index_16bit ? 2u : 4u;
+    if (dc.indices.size() < uint64_t(dc.index_count) * iw) {
+      ++g_hleShaderBadVertex;
+      return false;
+    }
+    for (uint32_t i = 0; i < dc.index_count; ++i) {
+      uint32_t index = 0;
+      if (dc.index_16bit) {
+        uint16_t v;
+        std::memcpy(&v, dc.indices.data() + size_t(i) * 2, 2);
+        index = v;
+      } else {
+        std::memcpy(&index, dc.indices.data() + size_t(i) * 4, 4);
+      }
+      if (index >= dc.vertex_count) {
+        ++g_hleShaderBadVertex;
+        return false;
+      }
+      referenced[index] = 1;
+    }
+  }
+  uint8_t vtx[kMaxStreams][256];
+  std::vector<std::array<float, 4>> values(attrs.size());
+  uint64_t applied_vertices = 0;
+  uint64_t identity_in_clip = 0, viewport_in_clip = 0;
+  for (uint32_t v = 0; v < dc.vertex_count; ++v) {
+    if (!referenced[v]) continue;
+    const uint64_t src = uint64_t(dc.first_vertex) + v;
+    bool have[kMaxStreams] = {};
+    for (size_t a = 0; a < attrs.size(); ++a) {
+      const uint32_t si = attr_stream[a];
+      const HleStream& s = streams[si];
+      if (!have[si]) {
+        const uint64_t byte_off = src * s.stride + s.offset_bytes;
+        if (byte_off + s.stride > s.size_bytes) {
+          ++g_hleShaderBadVertex;
+          return false;
+        }
+        std::memcpy(vtx[si], s.host + byte_off, s.stride);
+        have[si] = true;
+      }
+      float f[4] = {0, 0, 0, 1};
+      if (!ReadVertexAttribute(vtx[si], s.stride, attrs[a], s.endian, f)) {
+        ++g_hleShaderBadVertex;
+        return false;
+      }
+      values[a] = {f[0], f[1], f[2], f[3]};
+    }
+
+    const AluResult r = ExecuteVertexShader(
+        patch.code.data() + patch.code_off,
+        uint32_t(patch.code.size() - patch.code_off), attrs, values, alu_in);
+    const float w = r.position[3];
+    if (r.status != AluStatus::kOk || !std::isfinite(r.position[0]) ||
+        !std::isfinite(r.position[1]) || !std::isfinite(r.position[2]) ||
+        !std::isfinite(w)) {
+      ++g_hleShaderBadVertex;
+      return false;
+    }
+
+    // PA_CL_VTE_CNTL is 0x300 in the captured stream: XYZ are already
+    // multiplied by 1/W0. Preserve those post-divide values; reconstructing a
+    // homogeneous W from the export was tested against ST_Southwest and clipped
+    // the entire coloured scene away, so it is not the value D3D12 needs here.
+    const float p[3] = {r.position[0], r.position[1], r.position[2]};
+    std::memcpy(transformed.data() + size_t(v) * dc.vertex_stride, p,
+                sizeof(p));
+
+    // VTE scale/offset enable state is draw state, but the HLE draw entry point
+    // does not carry that register. Distinguish the two legal modes using the
+    // shader output itself: normalized coordinates are already host-ready,
+    // while pre-transformed window coordinates only enter clip after the live
+    // viewport inverse. This is scored over every referenced vertex, per draw.
+    if (p[0] >= -1.0f && p[0] <= 1.0f && p[1] >= -1.0f && p[1] <= 1.0f &&
+        p[2] >= 0.0f && p[2] <= 1.0f) {
+      ++identity_in_clip;
+    }
+    const float vx = dc.mvp[0] * p[0] + dc.mvp[1] * p[1] +
+                     dc.mvp[2] * p[2] + dc.mvp[3];
+    const float vy = dc.mvp[4] * p[0] + dc.mvp[5] * p[1] +
+                     dc.mvp[6] * p[2] + dc.mvp[7];
+    const float vz = dc.mvp[8] * p[0] + dc.mvp[9] * p[1] +
+                     dc.mvp[10] * p[2] + dc.mvp[11];
+    const float vw = dc.mvp[12] * p[0] + dc.mvp[13] * p[1] +
+                     dc.mvp[14] * p[2] + dc.mvp[15];
+    if (vw > 0.0f && vx >= -vw && vx <= vw && vy >= -vw && vy <= vw &&
+        vz >= 0.0f && vz <= vw) {
+      ++viewport_in_clip;
+    }
+    ++applied_vertices;
+  }
+
+  dc.vertices = std::move(transformed);
+  if (identity_in_clip > viewport_in_clip) {
+    static constexpr float kIdentity[16] = {
+        1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+    std::memcpy(dc.mvp, kIdentity, sizeof(dc.mvp));
+    ++g_hleShaderIdentityMvp;
+  } else {
+    ++g_hleShaderViewportMvp;
+  }
+  ++g_hleShaderDraws;
+  g_hleShaderVertices += applied_vertices;
+  return true;
+}
 
 void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
                           const mx::pm4::HleStream* streams, uint32_t device,
@@ -3133,7 +3384,9 @@ extern "C" REX_FUNC(sub_82564C50) {
   }
 
   const uint32_t nfetch =
-      REXCVAR_GET(hle_capture) ? ReadPatchFetchCount(args[0], args[4], base) : 0;
+      (REXCVAR_GET(hle_capture) || REXCVAR_GET(hle_render))
+          ? ReadPatchFetchCount(args[0], args[4], base)
+          : 0;
 
   orig_PatchVertexShader(ctx, base);
 

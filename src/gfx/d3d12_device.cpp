@@ -134,7 +134,7 @@ void D3D12Renderer::Shutdown() {
   m_videoPipelineState.Reset();
   m_videoRootSignature.Reset();
 
-  m_gamePSO.Reset();
+  for (auto& pso : m_gamePSOs) pso.Reset();
   m_gameRootSig.Reset();
   m_gameVB.Reset();
   m_gameIB.Reset();

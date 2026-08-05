@@ -47,11 +47,12 @@ void UploadVideoFrame(const uint8_t* rgba, uint32_t width, uint32_t height);
 // draws a frame translated, at most one could ever be submitted.
 void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  const uint8_t* indices, uint32_t idxBytes, bool idx16,
-                 uint32_t idxCount, const float* mvp, uint32_t topology);
+                 uint32_t idxCount, const float* mvp, uint32_t topology,
+                 bool depthEnable, bool depthWrite, bool colorWrite);
 
-// Drop the previous frame's draws. Called once per render-thread iteration
-// before any AddGameDraw, so a frame that translated nothing falls back to the
-// placeholder triangle rather than replaying stale geometry.
+// Drop the previous frame's draws and retire the startup placeholder. Called
+// when a real guest-frame handoff arrives, including one whose draws are all
+// filtered; an empty render-thread tick still re-presents the previous frame.
 void ClearGameDraws();
 
   [[nodiscard]] ID3D12Device* GetDevice() const noexcept { return m_device.Get(); }
@@ -139,7 +140,8 @@ bool CreateGamePipeline();
   uint32_t m_videoHeight = 0;
 
   Microsoft::WRL::ComPtr<ID3D12RootSignature> m_gameRootSig;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> m_gamePSO;
+  // Indexed by depth-enable bit 0, depth-write bit 1, no-colour bit 2.
+  std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, 8> m_gamePSOs;
   Microsoft::WRL::ComPtr<ID3D12Resource> m_gameVB;
   Microsoft::WRL::ComPtr<ID3D12Resource> m_gameIB;
   Microsoft::WRL::ComPtr<ID3D12Resource> m_gameCB;
@@ -161,6 +163,9 @@ bool CreateGamePipeline();
     D3D12_INDEX_BUFFER_VIEW ibv = {};
     uint32_t indexCount = 0;
     D3D12_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+    bool depthEnable = false;
+    bool depthWrite = false;
+    bool colorWrite = true;
   };
   // Bounded because each entry costs three CreateCommittedResource calls — see
   // the PERF(per-frame-allocs) note in d3d12_game.cpp.
