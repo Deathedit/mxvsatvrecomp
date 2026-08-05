@@ -100,6 +100,15 @@ const std::map<uint64_t, CapturedShader>& CapturedShaders() {
   return MutableCapturedShaders();
 }
 
+std::map<uint64_t, std::vector<uint32_t>>& MutableCapturedPixelShaders() {
+  static std::map<uint64_t, std::vector<uint32_t>> m;
+  return m;
+}
+
+const std::map<uint64_t, std::vector<uint32_t>>& CapturedPixelShaders() {
+  return MutableCapturedPixelShaders();
+}
+
 ExportSpace ClassifyExportSpace(float x, float y, float w, float xs, float xo,
                                 float ys, float yo) {
   (void)xo;
@@ -399,12 +408,14 @@ uint32_t Pm4Translator::ExpandRectangleList(DrawCall& dc) {
     const uint32_t base = r * 4;
     verts.insert(verts.end(), src, src + size_t(3) * stride);
 
-    // v3 = v0 + v2 - v1, on position only; everything else comes from v2, which
-    // is the corner v3 shares an edge with in both directions.
+    // v3 = v0 + v2 - v1 for every host interpolant. Position, colour and UV
+    // describe the same affine plane; copying v2's UV makes textured rectangles
+    // collapse one edge into a smear.
     verts.insert(verts.end(), src + size_t(2) * stride,
                  src + size_t(3) * stride);
     uint8_t* v3 = verts.data() + (size_t(base) + 3) * stride;
-    for (uint32_t c = 0; c < 3; ++c) {
+    const uint32_t float_components = std::min(stride / 4, 9u);
+    for (uint32_t c = 0; c < float_components; ++c) {
       float p0, p1, p2;
       std::memcpy(&p0, src + c * 4, 4);
       std::memcpy(&p1, src + stride + c * 4, 4);
@@ -656,6 +667,21 @@ const Pm4Translator::ShaderLayout* Pm4Translator::DecodeAndCacheShader(
   return &sl;
 }
 
+void Pm4Translator::CapturePixelShader(uint64_t key, const uint32_t* dwords,
+                                       uint32_t count) {
+  if (!dwords || !count) return;
+  auto [it, inserted] = MutableCapturedPixelShaders().try_emplace(
+      key, dwords, dwords + count);
+  if (inserted) {
+    static uint32_t s_logged = 0;
+    if (s_logged++ < 12) {
+      REXLOG_INFO("ucode: captured pixel shader key=0x{:X}, {} dwords, code "
+                  "{:08X} {:08X} {:08X}", key, count, dwords[0],
+                  count > 1 ? dwords[1] : 0, count > 2 ? dwords[2] : 0);
+    }
+  }
+}
+
 void Pm4Translator::HandleImLoadImmediate(const Pm4Packet& pkt) {
   if (pkt.body.size() < 2) return;
   const uint32_t type = pkt.body[0];
@@ -674,7 +700,6 @@ void Pm4Translator::HandleImLoadImmediate(const Pm4Packet& pkt) {
     }
     return;
   }
-  if (type != 0) return;  // 1 = pixel shader, carries no vertex layout
   if (size_dwords == 0 || pkt.body.size() < size_dwords + 2) return;
 
   const uint32_t* code = pkt.body.data() + 2;
@@ -688,7 +713,12 @@ void Pm4Translator::HandleImLoadImmediate(const Pm4Packet& pkt) {
     key *= 1099511628211ull;
   }
 
-  m_currentVs = DecodeAndCacheShader(key, code, size_dwords, "IM_LOAD_IMMEDIATE");
+  if (type == 0) {
+    m_currentVs = DecodeAndCacheShader(key, code, size_dwords,
+                                       "IM_LOAD_IMMEDIATE");
+  } else if (type == 1) {
+    CapturePixelShader(key, code, size_dwords);
+  }
 }
 
 void Pm4Translator::HandleImLoad(const Pm4Packet& pkt, uint8_t* guest_base) {
@@ -696,8 +726,20 @@ void Pm4Translator::HandleImLoad(const Pm4Packet& pkt, uint8_t* guest_base) {
   const uint32_t addr = pkt.body[0] & ~0x3u;
   const uint32_t type = pkt.body[0] & 0x3;
   const uint32_t size_dwords = pkt.body[1];
-  if (type != 0) return;  // vertex shaders only
   if (addr == 0 || size_dwords == 0 || size_dwords > 4096) return;
+
+  if (type == 1) {
+    std::vector<uint8_t> raw;
+    if (!ReadGuestRange(guest_base, addr, size_dwords * 4, raw,
+                        "pixel shader"))
+      return;
+    std::vector<uint32_t> code(size_dwords);
+    std::memcpy(code.data(), raw.data(), size_dwords * 4);
+    for (auto& w : code) w = __builtin_bswap32(w);
+    CapturePixelShader(addr, code.data(), size_dwords);
+    return;
+  }
+  if (type != 0) return;
 
   // Reuse by address before touching guest memory — 0x1D5FF040 alone recurs
   // ~40 times a frame, and ReadGuestRange is the expensive part.

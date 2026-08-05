@@ -18,7 +18,11 @@
 #include <array>
 #include <cstdint>
 #include <deque>
+#include <memory>
+#include <unordered_map>
 #include <vector>
+
+namespace mx::pm4 { struct HleTexturePayload; }
 
 class D3D12Renderer {
  public:
@@ -48,7 +52,8 @@ void UploadVideoFrame(const uint8_t* rgba, uint32_t width, uint32_t height);
 void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  const uint8_t* indices, uint32_t idxBytes, bool idx16,
                  uint32_t idxCount, const float* mvp, uint32_t topology,
-                 bool depthEnable, bool depthWrite, bool colorWrite);
+                 bool depthEnable, bool depthWrite, bool colorWrite,
+                 std::shared_ptr<const mx::pm4::HleTexturePayload> texture = {});
 
 // Drop the previous frame's draws and retire the startup placeholder. Called
 // when a real guest-frame handoff arrives, including one whose draws are all
@@ -96,8 +101,10 @@ void ClearGameDraws();
 
   bool CreateVideoPipeline();
 
-bool CreateGamePipeline();
+  bool CreateGamePipeline();
   bool CreateGameRenderTargets();
+  bool EnsureGameTexture(const std::shared_ptr<const mx::pm4::HleTexturePayload>& texture,
+                         uint32_t& descriptorIndex);
 
   void WaitForGpu();
   void MoveToNextFrame();
@@ -140,12 +147,22 @@ bool CreateGamePipeline();
   uint32_t m_videoHeight = 0;
 
   Microsoft::WRL::ComPtr<ID3D12RootSignature> m_gameRootSig;
-  // Indexed by depth-enable bit 0, depth-write bit 1, no-colour bit 2.
-  std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, 8> m_gamePSOs;
+  // Indexed by depth-enable bit 0, depth-write bit 1, no-colour bit 2,
+  // textured bit 3.
+  std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, 16> m_gamePSOs;
   Microsoft::WRL::ComPtr<ID3D12Resource> m_gameVB;
   Microsoft::WRL::ComPtr<ID3D12Resource> m_gameIB;
   Microsoft::WRL::ComPtr<ID3D12Resource> m_gameCB;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_gameCbvHeap;
+  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_gameSrvHeap;
+  uint32_t m_gameSrvDescriptorSize = 0;
+  static constexpr uint32_t kMaxGameTextures = 1024;
+  struct GameTexture {
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    Microsoft::WRL::ComPtr<ID3D12Resource> upload;
+    uint32_t descriptorIndex = 0;
+  };
+  std::unordered_map<uint64_t, GameTexture> m_gameTextures;
   D3D12_VERTEX_BUFFER_VIEW m_gameVbv = {};
   D3D12_INDEX_BUFFER_VIEW m_gameIbv = {};
   uint32_t m_gameIndexCount = 0;
@@ -166,6 +183,7 @@ bool CreateGamePipeline();
     bool depthEnable = false;
     bool depthWrite = false;
     bool colorWrite = true;
+    std::shared_ptr<const mx::pm4::HleTexturePayload> texture;
   };
   // Bounded because each entry costs three CreateCommittedResource calls — see
   // the PERF(per-frame-allocs) note in d3d12_game.cpp.

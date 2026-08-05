@@ -140,6 +140,9 @@ void D3D12Renderer::Shutdown() {
   m_gameIB.Reset();
   m_gameCB.Reset();
   m_gameCbvHeap.Reset();
+  m_gameTextures.clear();
+  m_gameSrvHeap.Reset();
+  m_gameSrvDescriptorSize = 0;
   m_hasGamePipeline = false;
 
   m_gameDraws.clear();

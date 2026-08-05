@@ -7,9 +7,34 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <vector>
 
 namespace mx::pm4 {
+
+enum class HostTextureFormat : uint8_t {
+  kRgba8 = 0,
+  kBc1,
+  kBc2,
+  kBc3,
+  kR16Float,
+  kRgba16Float,
+};
+
+// Immutable CPU-side base mip shared by all draws that reference it. The hook
+// owns guest-memory access; the renderer only sees validated host bytes.
+struct HleTexturePayload {
+  uint64_t key = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t row_pitch = 0;
+  HostTextureFormat format = HostTextureFormat::kRgba8;
+  uint32_t swizzle = 0;
+  uint8_t clamp_x = 0;
+  uint8_t clamp_y = 0;
+  bool linear_filter = true;
+  std::vector<uint8_t> data;
+};
 
 // Mimics PrimitiveType from xenos.h (subset — only values seen in MX vs ATV).
 // Fan is 5 and strip is 6, per Xenia's xenos::PrimitiveType. This enum had them
@@ -88,6 +113,7 @@ struct DrawCall {
   // shadow/off-screen passes when render-target identity is not yet modelled.
   uint32_t viewport_width = 0;
   uint32_t viewport_height = 0;
+  std::shared_ptr<const HleTexturePayload> texture;
 
   // Where TranscodeVertices got this draw's vertex colour, so LogSurface can
   // cross-tabulate it against the surface. Carried on the draw rather than
@@ -173,6 +199,7 @@ struct CapturedShader {
 };
 
 const std::map<uint64_t, CapturedShader>& CapturedShaders();
+const std::map<uint64_t, std::vector<uint32_t>>& CapturedPixelShaders();
 
 //===========================================================================
 // Which space an executed vertex shader's exported position lives in.
@@ -380,6 +407,8 @@ class Pm4Translator {
   // for IM_LOAD and a content hash for IM_LOAD_IMMEDIATE.
   const ShaderLayout* DecodeAndCacheShader(uint64_t key, const uint32_t* dwords,
                                            uint32_t count, const char* origin);
+  void CapturePixelShader(uint64_t key, const uint32_t* dwords,
+                          uint32_t count);
 
   // The heart of this round: report the stride the shader actually declares
   // beside the one AttachVertices guessed by division. Logs only — nothing

@@ -316,6 +316,10 @@ void TestAluNoPosition() {
   std::printf("  status=%s\n", mx::pm4::AluStatusName(r.status));
   CheckBool("refused with no-position-export",
             r.status == mx::pm4::AluStatus::kNoPositionExport, true);
+  CheckBool("general export 1 retained", (r.export_mask & (1u << 1)) != 0,
+            true);
+  CheckBool("general export 1 x", std::fabs(r.exports[1][0] - 1.0f) < 1e-6f,
+            true);
 
   // And it must not crash or hang on the malformed blobs either.
   const uint32_t garbage[] = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
@@ -607,6 +611,40 @@ void TestMalformed() {
   }
 }
 
+void TestPixelTextureBinding() {
+  std::printf("single 2D pixel texture fetch links sampler and UV register\n");
+  uint32_t blob[std::size(kFixturePosColor28)];
+  std::copy(std::begin(kFixturePosColor28), std::end(kFixturePosColor28), blob);
+  // Instruction 3 is selected as a fetch by fixture 1's first exec. Encode a
+  // tfetch2D using sampler 5 and coordinates from r7.
+  blob[9] = 1u | (7u << 5) | (3u << 12) | (5u << 20) | (1u << 25);
+  blob[10] = 0;
+  blob[11] = 1u << 14;  // FetchOpDimension::k2D.
+  mx::pm4::PixelTextureBinding binding;
+  const char* fail = nullptr;
+  CheckBool("single texture accepted",
+            mx::pm4::DecodeSingleTexturePixelShader(
+                blob, std::size(blob), binding, &fail), true);
+  CheckU32("pixel sampler", binding.sampler, 5);
+  CheckU32("pixel UV source", binding.src_reg, 7);
+  CheckBool("unnormalized coordinates", binding.unnormalized, true);
+
+  // A second tfetch in the same exec is outside the supported profile.
+  blob[12] = blob[9];
+  blob[13] = blob[10];
+  blob[14] = blob[11];
+  CheckBool("multiple textures rejected",
+            mx::pm4::DecodeSingleTexturePixelShader(
+                blob, std::size(blob), binding, &fail), false);
+  blob[12] = kFixturePosColor28[12];
+  blob[13] = kFixturePosColor28[13];
+  blob[14] = kFixturePosColor28[14];
+  blob[11] = 2u << 14;  // 3D/stacked.
+  CheckBool("3D texture rejected",
+            mx::pm4::DecodeSingleTexturePixelShader(
+                blob, std::size(blob), binding, &fail), false);
+}
+
 }  // namespace
 
 int main() {
@@ -617,6 +655,7 @@ int main() {
   TestAluNoPosition();
   TestAddressRegister();
   TestConstRegScalarOps();
+  TestPixelTextureBinding();
   TestMalformed();
   if (g_failures) {
     std::printf("\n%d check(s) FAILED\n", g_failures);

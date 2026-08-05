@@ -78,10 +78,10 @@ enum class HleSkip : uint8_t {
 
 const char* HleSkipName(HleSkip s);
 
-// The renderer's game pipeline takes a fixed 28-byte vertex: float3 POSITION
-// then float4 COLOR (see d3d12_game.cpp's input layout). Named here because
-// three places have to agree on it.
-constexpr uint32_t kHostVertexStride = 28;
+// The renderer's game pipeline takes a fixed 36-byte vertex: float3 POSITION,
+// float4 COLOR, then float2 UV (see d3d12_game.cpp's input layout). Named here
+// because three places have to agree on it.
+// Declared in d3d9_layout.h so the renderer and layout tests share one value.
 
 // A sanity ceiling on one draw's vertex range, so a misread count cannot make
 // this allocate wildly. Well above anything observed (the largest captured draw

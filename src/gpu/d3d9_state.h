@@ -154,6 +154,13 @@ struct RenderStateShadow {
   }
 };
 
+struct TextureBinding {
+  uint32_t object = 0;
+  uint32_t fetch[6] = {};
+  bool bound = false;
+  bool valid = false;
+};
+
 //===========================================================================
 // The whole shadow.
 //
@@ -183,7 +190,7 @@ struct D3D9DeviceState {
   bool     vs_seen = false;
   bool     ps_seen = false;
 
-  uint32_t texture[kMaxSamplers] = {};
+  TextureBinding texture[kMaxSamplers];
   uint32_t texture_seen_mask = 0;
 
   ViewportState     viewport;

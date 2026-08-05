@@ -14,12 +14,13 @@
 
 #include "gfx/bink_player.h"
 #include "gpu/pm4_translator.h"
+#include "gpu/d3d9_layout.h"
 #include "hooks/native_bridge.h"
 
 // The one vertex stride the game PSO's input layout actually describes —
 // POSITION float3 at offset 0 plus COLOR float4 at offset 12. See the gate in
 // RenderThreadFunc.
-static constexpr uint32_t kSupportedStride = 28;
+static constexpr uint32_t kSupportedStride = mx::pm4::kHostVertexStride;
 
 // RB_SURFACE_INFO pitch of the guest's main scene target, matching the 1280x720
 // output. A frame also renders into ~15 other colour surfaces at pitches 0, 80,
@@ -261,7 +262,7 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
           // Spelled out rather than using !colorless, which would also catch
           // kNotTranscoded — those resolved no colour at all and are neither
           // population. The stride gate below drops them regardless.
-          const bool colorless = d.color_source == CS::kNone;
+          const bool colorless = d.color_source == CS::kNone && !d.texture;
           const bool colored = d.color_source == CS::kPacked ||
                                d.color_source == CS::kFallback;
           if ((REXCVAR_GET(hide_colorless_draws) && colorless) ||
@@ -331,7 +332,8 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   (d->om_seen & (1u << 1)) != 0 &&
                                       (d->depth_control & (1u << 2)) != 0,
                                   (d->om_seen & (1u << 0)) == 0 ||
-                                      (d->colour_mask & 0xFu) != 0);
+                                      (d->colour_mask & 0xFu) != 0,
+                                  d->texture);
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;

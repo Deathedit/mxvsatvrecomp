@@ -231,6 +231,8 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
 
     std::memcpy(dst + 0, p, 12);       // float3 POSITION
     std::memcpy(dst + 12, c, 16);      // float4 COLOR
+    const float uv[2] = {0.0f, 0.0f};
+    std::memcpy(dst + 28, uv, sizeof(uv));
   }
 
   if (in.mvp) {

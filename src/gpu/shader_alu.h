@@ -53,8 +53,11 @@ enum class AluStatus {
 const char* AluStatusName(AluStatus s);
 
 struct AluResult {
+  static constexpr uint32_t kMaxInterpolators = 16;
   AluStatus status = AluStatus::kMalformed;
   float position[4] = {0, 0, 0, 1};  // the register 62 export
+  std::array<std::array<float, 4>, kMaxInterpolators> exports = {};
+  uint32_t export_mask = 0;
   // The opcode that stopped us, when status names an unsupported op. Lets the
   // caller build a histogram of exactly which instructions are missing instead
   // of a single opaque failure count.

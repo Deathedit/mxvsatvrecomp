@@ -27,6 +27,8 @@
 
 namespace mx::pm4 {
 
+constexpr uint32_t kHostVertexStride = 36;  // float3 position + float4 colour + float2 UV
+
 //===========================================================================
 // The guest element, as D3D9 on Xenon lays it out.
 //

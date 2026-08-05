@@ -20,6 +20,7 @@
 #include "gpu/pm4_translator.h"
 
 #include <cstring>
+#include <algorithm>
 #include <utility>
 
 // mx::pm4::HostTopology carries D3D_PRIMITIVE_TOPOLOGY values so the translator
@@ -45,11 +46,20 @@ bool D3D12Renderer::CreateGamePipeline() {
 
   auto vsBlob = CompileShader(mx::gfx::shaders::kGameVS, "vs_5_0", "main");
   auto psBlob = CompileShader(mx::gfx::shaders::kGamePS, "ps_5_0", "main");
-  if (!vsBlob || !psBlob) {
+  auto texturePsBlob = CompileShader(mx::gfx::shaders::kGameTexturePS,
+                                     "ps_5_0", "main");
+  if (!vsBlob || !psBlob || !texturePsBlob) {
     LogError("CreateGamePipeline: shader compilation failed");
     return false;
   }
   LogInfo("CreateGamePipeline: shaders compiled");
+
+  D3D12_DESCRIPTOR_RANGE srvRange = {};
+  srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  srvRange.NumDescriptors = 1;
+  srvRange.BaseShaderRegister = 0;
+  srvRange.RegisterSpace = 0;
+  srvRange.OffsetInDescriptorsFromTableStart = 0;
 
   D3D12_ROOT_PARAMETER rootParams[2] = {};
   rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
@@ -57,14 +67,30 @@ bool D3D12Renderer::CreateGamePipeline() {
   rootParams[0].Descriptor.RegisterSpace = 0;
   rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 
-  rootParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
-  rootParams[1].Descriptor.ShaderRegister = 1;
-  rootParams[1].Descriptor.RegisterSpace = 0;
+  rootParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  rootParams[1].DescriptorTable.NumDescriptorRanges = 1;
+  rootParams[1].DescriptorTable.pDescriptorRanges = &srvRange;
   rootParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+  D3D12_STATIC_SAMPLER_DESC sampler = {};
+  sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+  sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+  sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+  sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+  sampler.MipLODBias = 0.0f;
+  sampler.MaxAnisotropy = 1;
+  sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+  sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+  sampler.MinLOD = 0.0f;
+  sampler.MaxLOD = 0.0f;
+  sampler.ShaderRegister = 0;
+  sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
   D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
   rootDesc.NumParameters = 2;
   rootDesc.pParameters = rootParams;
+  rootDesc.NumStaticSamplers = 1;
+  rootDesc.pStaticSamplers = &sampler;
   rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
   Microsoft::WRL::ComPtr<ID3DBlob> sigBlob;
@@ -86,6 +112,8 @@ bool D3D12Renderer::CreateGamePipeline() {
      D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
     {"COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12,
      D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
+    {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 28,
+     D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0},
   };
   D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
   pso.pRootSignature = m_gameRootSig.Get();
@@ -106,13 +134,18 @@ bool D3D12Renderer::CreateGamePipeline() {
   // becomes a real state mismatch the moment depth is turned on.
   pso.DSVFormat = kGameDepthFormat;
   pso.SampleDesc.Count = 1;
-  pso.InputLayout.NumElements = 2;
+  pso.InputLayout.NumElements = 3;
   pso.InputLayout.pInputElementDescs = inputLayout;
 
   for (uint32_t i = 0; i < m_gamePSOs.size(); ++i) {
     const bool depth_enable = (i & 1u) != 0;
     const bool depth_write = depth_enable && (i & 2u) != 0;
     const bool color_write = (i & 4u) == 0;
+    const bool textured = (i & 8u) != 0;
+    pso.PS.pShaderBytecode = textured ? texturePsBlob->GetBufferPointer()
+                                      : psBlob->GetBufferPointer();
+    pso.PS.BytecodeLength = textured ? texturePsBlob->GetBufferSize()
+                                     : psBlob->GetBufferSize();
     pso.DepthStencilState = {};
     pso.DepthStencilState.DepthEnable = depth_enable;
     pso.DepthStencilState.DepthWriteMask = depth_write
@@ -129,11 +162,11 @@ bool D3D12Renderer::CreateGamePipeline() {
   }
   LogInfo("CreateGamePipeline: PSO variants created");
 
-  struct Vertex { float x, y, z, r, g, b, a; };
+  struct Vertex { float x, y, z, r, g, b, a, u, v; };
   Vertex verts[] = {
-    { 0.0f,  0.6f, 0.0f, 1.0f, 0.2f, 0.2f, 1.0f},
-    { 0.6f, -0.6f, 0.0f, 0.2f, 1.0f, 0.2f, 1.0f},
-    {-0.6f, -0.6f, 0.0f, 0.2f, 0.2f, 1.0f, 1.0f},
+    { 0.0f,  0.6f, 0.0f, 1.0f, 0.2f, 0.2f, 1.0f, 0.5f, 0.0f},
+    { 0.6f, -0.6f, 0.0f, 0.2f, 1.0f, 0.2f, 1.0f, 1.0f, 1.0f},
+    {-0.6f, -0.6f, 0.0f, 0.2f, 0.2f, 1.0f, 1.0f, 0.0f, 1.0f},
   };
   uint16_t idx[] = {0, 1, 2};
   m_gameIndexCount = 3;
@@ -157,6 +190,18 @@ bool D3D12Renderer::CreateGamePipeline() {
     m_gameVbv.BufferLocation = m_gameVB->GetGPUVirtualAddress();
     m_gameVbv.StrideInBytes = sizeof(Vertex);
     m_gameVbv.SizeInBytes = vbSize;
+  }
+
+  {
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = kMaxGameTextures;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(m_device->CreateDescriptorHeap(&hd,
+                                               IID_PPV_ARGS(&m_gameSrvHeap))))
+      return false;
+    m_gameSrvDescriptorSize = m_device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
   }
 
   UINT ibSize = sizeof(idx);
@@ -227,12 +272,150 @@ bool D3D12Renderer::CreateGamePipeline() {
   return true;
 }
 
+bool D3D12Renderer::EnsureGameTexture(
+    const std::shared_ptr<const mx::pm4::HleTexturePayload>& texture,
+    uint32_t& descriptorIndex) {
+  if (!texture || texture->data.empty() || !m_gameSrvHeap) return false;
+  if (auto it = m_gameTextures.find(texture->key); it != m_gameTextures.end()) {
+    descriptorIndex = it->second.descriptorIndex;
+    return true;
+  }
+  if (m_gameTextures.size() >= kMaxGameTextures) {
+    static bool s_logged = false;
+    if (!s_logged) {
+      s_logged = true;
+      LogError("game texture cache full; falling back to vertex colour");
+    }
+    return false;
+  }
+
+  DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+  switch (texture->format) {
+    case mx::pm4::HostTextureFormat::kRgba8:
+      format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      break;
+    case mx::pm4::HostTextureFormat::kBc1:
+      format = DXGI_FORMAT_BC1_UNORM;
+      break;
+    case mx::pm4::HostTextureFormat::kBc2:
+      format = DXGI_FORMAT_BC2_UNORM;
+      break;
+    case mx::pm4::HostTextureFormat::kBc3:
+      format = DXGI_FORMAT_BC3_UNORM;
+      break;
+    case mx::pm4::HostTextureFormat::kR16Float:
+      format = DXGI_FORMAT_R16_FLOAT;
+      break;
+    case mx::pm4::HostTextureFormat::kRgba16Float:
+      format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+      break;
+  }
+  if (format == DXGI_FORMAT_UNKNOWN || !texture->width || !texture->height)
+    return false;
+
+  GameTexture entry;
+  D3D12_RESOURCE_DESC td = {};
+  td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  td.Width = texture->width;
+  td.Height = texture->height;
+  td.DepthOrArraySize = 1;
+  td.MipLevels = 1;
+  td.Format = format;
+  td.SampleDesc.Count = 1;
+  td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  D3D12_HEAP_PROPERTIES defaultHeap = {};
+  defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  if (FAILED(m_device->CreateCommittedResource(
+          &defaultHeap, D3D12_HEAP_FLAG_NONE, &td,
+          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+          IID_PPV_ARGS(&entry.resource))))
+    return false;
+
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+  UINT rows = 0;
+  UINT64 rowBytes = 0;
+  UINT64 uploadBytes = 0;
+  m_device->GetCopyableFootprints(&td, 0, 1, 0, &footprint, &rows,
+                                  &rowBytes, &uploadBytes);
+  D3D12_RESOURCE_DESC bd = {};
+  bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  bd.Width = uploadBytes;
+  bd.Height = 1;
+  bd.DepthOrArraySize = 1;
+  bd.MipLevels = 1;
+  bd.Format = DXGI_FORMAT_UNKNOWN;
+  bd.SampleDesc.Count = 1;
+  bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  D3D12_HEAP_PROPERTIES uploadHeap = {};
+  uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+  if (FAILED(m_device->CreateCommittedResource(
+          &uploadHeap, D3D12_HEAP_FLAG_NONE, &bd,
+          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+          IID_PPV_ARGS(&entry.upload))))
+    return false;
+
+  uint8_t* mapped = nullptr;
+  if (FAILED(entry.upload->Map(0, nullptr,
+                               reinterpret_cast<void**>(&mapped))))
+    return false;
+  const uint32_t copyRows = std::min<uint32_t>(rows,
+      uint32_t(texture->data.size() / texture->row_pitch));
+  const size_t copyBytes = std::min<size_t>(texture->row_pitch, size_t(rowBytes));
+  for (uint32_t y = 0; y < copyRows; ++y) {
+    std::memcpy(mapped + footprint.Offset + size_t(y) * footprint.Footprint.RowPitch,
+                texture->data.data() + size_t(y) * texture->row_pitch,
+                copyBytes);
+  }
+  entry.upload->Unmap(0, nullptr);
+
+  D3D12_TEXTURE_COPY_LOCATION dst = {};
+  dst.pResource = entry.resource.Get();
+  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  dst.SubresourceIndex = 0;
+  D3D12_TEXTURE_COPY_LOCATION src = {};
+  src.pResource = entry.upload.Get();
+  src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  src.PlacedFootprint = footprint;
+  m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  D3D12_RESOURCE_BARRIER barrier = {};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  barrier.Transition.pResource = entry.resource.Get();
+  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+  barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  m_commandList->ResourceBarrier(1, &barrier);
+
+  entry.descriptorIndex = uint32_t(m_gameTextures.size());
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+  srv.Format = format;
+  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  srv.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
+      (texture->swizzle >> 0) & 7u, (texture->swizzle >> 3) & 7u,
+      (texture->swizzle >> 6) & 7u, (texture->swizzle >> 9) & 7u);
+  srv.Texture2D.MipLevels = 1;
+  auto cpu = m_gameSrvHeap->GetCPUDescriptorHandleForHeapStart();
+  cpu.ptr += SIZE_T(entry.descriptorIndex) * m_gameSrvDescriptorSize;
+  m_device->CreateShaderResourceView(entry.resource.Get(), &srv, cpu);
+  descriptorIndex = entry.descriptorIndex;
+  m_gameTextures.emplace(texture->key, std::move(entry));
+  static uint64_t s_uploads = 0;
+  if (++s_uploads <= 16 || (s_uploads % 100) == 0) {
+    char message[192];
+    std::snprintf(message, sizeof(message),
+                  "game texture upload: %ux%u, format %u, cache %zu",
+                  texture->width, texture->height,
+                  uint32_t(texture->format), m_gameTextures.size());
+    LogInfo(message);
+  }
+  return true;
+}
+
 void D3D12Renderer::RenderGameFrame() {
   if (!m_hasGamePipeline) return;
   m_commandList->SetGraphicsRootSignature(m_gameRootSig.Get());
   m_commandList->SetPipelineState(m_gamePSOs[0].Get());
 
-  ID3D12DescriptorHeap* heaps[] = {m_gameCbvHeap.Get()};
+  ID3D12DescriptorHeap* heaps[] = {m_gameSrvHeap.Get()};
   m_commandList->SetDescriptorHeaps(1, heaps);
 
   if (m_gameDraws.empty() && !m_hasEverDrawnGame) {
@@ -252,15 +435,23 @@ void D3D12Renderer::RenderGameFrame() {
   }
 
   for (const auto& d : m_gameDraws) {
+    uint32_t textureDescriptor = 0;
+    const bool textured = EnsureGameTexture(d.texture, textureDescriptor);
     const uint32_t pso_index = (d.depthEnable ? 1u : 0u) |
                                (d.depthWrite ? 2u : 0u) |
-                               (d.colorWrite ? 0u : 4u);
+                               (d.colorWrite ? 0u : 4u) |
+                               (textured ? 8u : 0u);
     m_commandList->SetPipelineState(m_gamePSOs[pso_index].Get());
     // Each translated draw brings its own transform; a draw whose cb failed to
     // allocate falls back to the identity matrix rather than being dropped.
     ID3D12Resource* cb = d.cb ? d.cb.Get() : m_gameCB.Get();
     m_commandList->SetGraphicsRootConstantBufferView(0,
                                                      cb->GetGPUVirtualAddress());
+    if (textured) {
+      auto gpu = m_gameSrvHeap->GetGPUDescriptorHandleForHeapStart();
+      gpu.ptr += UINT64(textureDescriptor) * m_gameSrvDescriptorSize;
+      m_commandList->SetGraphicsRootDescriptorTable(1, gpu);
+    }
     m_commandList->IASetPrimitiveTopology(d.topology);
     m_commandList->IASetVertexBuffers(0, 1, &d.vbv);
     m_commandList->IASetIndexBuffer(&d.ibv);
@@ -305,7 +496,8 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t idxBytes, bool idx16,
                                  uint32_t idxCount, const float* mvp,
                                  uint32_t topology, bool depthEnable,
-                                 bool depthWrite, bool colorWrite) {
+                                 bool depthWrite, bool colorWrite,
+                                 std::shared_ptr<const mx::pm4::HleTexturePayload> texture) {
   // PERF(per-frame-allocs): this creates three ID3D12Resource's per call (VB +
   // IB + CB) on the UPLOAD heap, and is called once per submitted draw rather
   // than once per frame, so the allocation rate scales with the draw count —
@@ -370,6 +562,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.depthEnable = depthEnable;
   d.depthWrite = depthWrite;
   d.colorWrite = colorWrite;
+  d.texture = std::move(texture);
 
   // Carry the translator's transform. Without this the draw renders under the
   // identity matrix baked into m_gameCB, which makes a correct transform and a

@@ -46,6 +46,23 @@ struct VertexAttribute {
   bool     feeds_position = false;
 };
 
+// The single sampled-texture profile understood by the HLE renderer. This is
+// decoded from the pixel shader's tfetch instruction, so UV linkage is based
+// on the register the shader reads rather than a declaration-order guess.
+struct PixelTextureBinding {
+  uint32_t sampler = 0;
+  uint32_t src_reg = 0;
+  uint32_t src_swizzle = 0;
+  bool unnormalized = false;
+};
+
+// Accepts only a pixel shader containing exactly one 2D texture fetch. Other
+// fetch profiles deliberately fall back to the colour-only host pipeline.
+bool DecodeSingleTexturePixelShader(const uint32_t* dwords,
+                                    uint32_t dword_count,
+                                    PixelTextureBinding& out,
+                                    const char** fail = nullptr);
+
 // The Xenos vertex position export destination. A vertex shader writes its
 // clip-space position by exporting to this register; every other export is an
 // interpolator, a point size or a misc output.

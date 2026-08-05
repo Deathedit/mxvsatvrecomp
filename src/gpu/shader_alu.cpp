@@ -115,6 +115,8 @@ class Interpreter {
   Vec4 temps[kNumTemps];
   Vec4 position;
   bool wrote_position = false;
+  std::array<Vec4, AluResult::kMaxInterpolators> exports = {};
+  uint32_t export_mask = 0;
 
   // The address register. Written by the maxa family, read by every relative
   // constant, source and destination index. Zero until something writes it,
@@ -447,18 +449,26 @@ class Interpreter {
     if (status != AluStatus::kOk) return;
 
     if (alu.is_export()) {
-      if (alu.vector_dest() != kPositionExportRegister) return;
-      wrote_position = true;
+      const uint32_t dest = alu.vector_dest();
+      Vec4* target = nullptr;
+      if (dest == kPositionExportRegister) {
+        wrote_position = true;
+        target = &position;
+      } else if (dest < AluResult::kMaxInterpolators) {
+        export_mask |= 1u << dest;
+        target = &exports[dest];
+      }
+      if (!target) return;
       // Export write masking is its own scheme, per component:
       //   v=1 s=0 -> vector result     v=0 s=1 -> scalar result
       //   v=1 s=1 -> constant 1
       //   v=0 s=0 -> unchanged, or constant 0 if scalar_dest_rel is set
       for (uint32_t c = 0; c < 4; ++c) {
         const bool vb = (vmask >> c) & 1, sb = (smask >> c) & 1;
-        if (vb && sb) position[c] = 1.0f;
-        else if (vb) position[c] = vres[c];
-        else if (sb) position[c] = sres;
-        else if (alu.is_scalar_dest_relative()) position[c] = 0.0f;
+        if (vb && sb) (*target)[c] = 1.0f;
+        else if (vb) (*target)[c] = vres[c];
+        else if (sb) (*target)[c] = sres;
+        else if (alu.is_scalar_dest_relative()) (*target)[c] = 0.0f;
       }
       return;
     }
@@ -525,6 +535,12 @@ AluResult ExecuteVertexShader(
     out.const_zero_reads = in.const_zero_reads;
     out.const_min_index = in.const_min_index;
     out.const_max_index = in.const_max_index;
+    for (size_t r = 0; r < out.exports.size(); ++r) {
+      for (size_t c = 0; c < out.exports[r].size(); ++c) {
+        out.exports[r][c] = in.exports[r][c];
+      }
+    }
+    out.export_mask = in.export_mask;
     return out;
   };
 

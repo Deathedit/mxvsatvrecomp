@@ -38,6 +38,7 @@
 
 #include "gpu/d3d9_draw.h"
 #include "gpu/d3d9_layout.h"
+#include "gpu/d3d9_texture.h"
 #include "gpu/shader_ucode.h"   // DecodeVertexShaderFetches, VertexAttribute
 #include "gpu/shader_alu.h"     // ExecuteVertexShader
 #include <cmath>
@@ -629,7 +630,11 @@ void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
                           uint8_t* base);
 bool ApplyShaderOutputs(mx::pm4::DrawCall& dc, uint32_t handle,
                         const mx::pm4::HleStream* streams, uint32_t device,
-                        uint8_t* base);
+                        uint8_t* base,
+                        const mx::pm4::PixelTextureBinding* texture_binding);
+bool PrepareDrawTexture(mx::pm4::DrawCall& dc, uint32_t pixel_shader,
+                        uint32_t device, uint8_t* base,
+                        mx::pm4::PixelTextureBinding& binding);
 
 void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
                        uint32_t count, int32_t base_vertex, uint32_t device,
@@ -732,12 +737,17 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   // The declaration supplies inputs, not the position the GPU rasterizes.
   // Execute the bound guest shader and replace POSITION with its homogeneous
   // screen-space export before the inverse viewport in dc.mvp is applied.
-  if (!ApplyShaderOutputs(dc, st.vs_seen ? st.vertex_shader : 0, streams,
-                          device, base)) {
-    return;
-  }
+  PixelTextureBinding texture_binding;
   dc.viewport_width = viewport_width;
   dc.viewport_height = viewport_height;
+  const bool have_texture =
+      PrepareDrawTexture(dc, st.ps_seen ? st.pixel_shader : 0, device, base,
+                         texture_binding);
+  if (!ApplyShaderOutputs(dc, st.vs_seen ? st.vertex_shader : 0, streams,
+                          device, base,
+                          have_texture ? &texture_binding : nullptr)) {
+    return;
+  }
 
   // RectangleList's implied corner must be derived from shader outputs. If it
   // is expanded earlier, the fourth packed vertex has no corresponding source
@@ -961,6 +971,7 @@ constexpr uint32_t kVsBlobSizeAt = 0x36C;
 constexpr uint32_t kMaxBlobDwords = 4096;   // 16 KB ceiling on one blob
 
 std::map<uint32_t, std::vector<uint32_t>> g_vsBlobs;
+std::map<uint32_t, std::vector<uint32_t>> g_psBlobs;
 uint64_t g_vsBlobUnreadable = 0;
 
 // SH_pPhysical per handle, for the address-key test below.
@@ -1410,7 +1421,8 @@ uint64_t g_hleShaderIdentityMvp = 0, g_hleShaderViewportMvp = 0;
 
 bool ApplyShaderOutputs(mx::pm4::DrawCall& dc, uint32_t handle,
                         const mx::pm4::HleStream* streams, uint32_t device,
-                        uint8_t* base) {
+                        uint8_t* base,
+                        const mx::pm4::PixelTextureBinding* texture_binding) {
   using namespace mx::pm4;
   (void)base;
   const uint64_t attempt = ++g_hleShaderAttempts;
@@ -1561,6 +1573,20 @@ bool ApplyShaderOutputs(mx::pm4::DrawCall& dc, uint32_t handle,
     const float p[3] = {r.position[0], r.position[1], r.position[2]};
     std::memcpy(transformed.data() + size_t(v) * dc.vertex_stride, p,
                 sizeof(p));
+    if (texture_binding && dc.texture &&
+        texture_binding->src_reg < AluResult::kMaxInterpolators &&
+        (r.export_mask & (1u << texture_binding->src_reg))) {
+      const auto& e = r.exports[texture_binding->src_reg];
+      const uint32_t sx = (texture_binding->src_swizzle >> 0) & 3u;
+      const uint32_t sy = (texture_binding->src_swizzle >> 2) & 3u;
+      float uv[2] = {e[sx], e[sy]};
+      if (texture_binding->unnormalized) {
+        uv[0] /= float(dc.texture->width);
+        uv[1] /= float(dc.texture->height);
+      }
+      std::memcpy(transformed.data() + size_t(v) * dc.vertex_stride + 28,
+                  uv, sizeof(uv));
+    }
 
     // VTE scale/offset enable state is draw state, but the HLE draw entry point
     // does not carry that register. Distinguish the two legal modes using the
@@ -1597,6 +1623,233 @@ bool ApplyShaderOutputs(mx::pm4::DrawCall& dc, uint32_t handle,
   }
   ++g_hleShaderDraws;
   g_hleShaderVertices += applied_vertices;
+  return true;
+}
+
+void CollectPixelShaderBlob(uint32_t handle, uint8_t* base) {
+  (void)base;
+  if (!handle || g_psBlobs.count(handle)) return;
+  // D3DDevice_CreatePixelShader copies the source header to object+0x28,
+  // allocates pFunction[2] code bytes separately, and sub_825506B0 stores that
+  // allocation at object+0x18. Thus +0x30 is the exact code size; pixel shader
+  // objects do not share the vertex shader's inline +0x368 representation.
+  constexpr uint32_t kPsCodePointerAt = 0x18;
+  constexpr uint32_t kPsCodeSizeAt = 0x30;
+  if (!HostPageReadable(REX_RAW_ADDR(handle + kPsCodePointerAt)) ||
+      !HostPageReadable(REX_RAW_ADDR(handle + kPsCodeSizeAt)))
+    return;
+  const uint32_t code = REX_LOAD_U32(handle + kPsCodePointerAt);
+  const uint32_t size_bytes = REX_LOAD_U32(handle + kPsCodeSizeAt);
+  if (!size_bytes || size_bytes > kMaxBlobDwords * 4 || (size_bytes & 3))
+    return;
+  if (!code || !HostPageReadable(REX_RAW_ADDR(code))) return;
+  std::vector<uint32_t> blob(size_bytes / 4);
+  for (uint32_t i = 0; i < blob.size(); ++i) {
+    const uint32_t at = code + i * 4;
+    if ((at & (kHostPageSize - 1)) == 0 &&
+        !HostPageReadable(REX_RAW_ADDR(at))) {
+      blob.resize(i);
+      break;
+    }
+    blob[i] = REX_LOAD_U32(at);
+  }
+  if (!blob.empty()) {
+    static uint32_t s_logged = 0;
+    if (s_logged++ < 8) {
+      REXLOG_INFO("d3d9: captured pixel shader object 0x{:08X}: "
+                  "{} dwords from 0x{:08X}, code {:08X} {:08X} {:08X}",
+                  handle, blob.size(), code, blob[0],
+                  blob.size() > 1 ? blob[1] : 0,
+                  blob.size() > 2 ? blob[2] : 0);
+    }
+    g_psBlobs.emplace(handle, std::move(blob));
+  }
+}
+
+struct ResolvedPixelBinding {
+  mx::pm4::PixelTextureBinding binding;
+  bool valid = false;
+};
+std::map<uint32_t, ResolvedPixelBinding> g_resolvedPixelBindings;
+std::map<uint64_t, std::shared_ptr<const mx::pm4::HleTexturePayload>>
+    g_hleCpuTextures;
+
+bool ResolvePixelBinding(uint32_t handle,
+                         mx::pm4::PixelTextureBinding& out) {
+  auto known = g_resolvedPixelBindings.find(handle);
+  if (known != g_resolvedPixelBindings.end()) {
+    if (known->second.valid) out = known->second.binding;
+    return known->second.valid;
+  }
+  auto bi = g_psBlobs.find(handle);
+  if (bi == g_psBlobs.end()) return false;
+
+  ResolvedPixelBinding resolved;
+  const char* why = nullptr;
+  resolved.valid = mx::pm4::DecodeSingleTexturePixelShader(
+      bi->second.data(), uint32_t(bi->second.size()), resolved.binding, &why);
+  g_resolvedPixelBindings.emplace(handle, resolved);
+  static uint64_t s_ok = 0, s_rejected = 0;
+  if (resolved.valid) ++s_ok; else ++s_rejected;
+  REXLOG_INFO("d3d9: pixel shader 0x{:08X} single-texture profile {}{}",
+              handle, resolved.valid ? "accepted" : "rejected",
+              resolved.valid ? "" : fmt::format(" ({})", why ? why : "?") );
+  if (resolved.valid) out = resolved.binding;
+  return resolved.valid;
+}
+
+// IDA proves D3DDevice_SetPixelShader stores the live shader at device+0x3244
+// (the adjacent vertex shader is device+0x3248). State-block application may
+// bypass our public setter hook, so read the authoritative D3D9 device field at
+// draw time and still require exact microcode agreement with a captured PM4 PS.
+bool ReadBoundPixelShader(uint32_t device, uint8_t* base, uint32_t& handle,
+                          mx::pm4::PixelTextureBinding& binding) {
+  constexpr uint32_t kDevicePixelShaderOffset = 0x3244;
+  if (!device ||
+      !HostPageReadable(REX_RAW_ADDR(device + kDevicePixelShaderOffset)))
+    return false;
+  const uint32_t candidate =
+      REX_LOAD_U32(device + kDevicePixelShaderOffset);
+  if (!candidate) return false;
+  CollectPixelShaderBlob(candidate, base);
+  if (!ResolvePixelBinding(candidate, binding)) return false;
+  handle = candidate;
+  static uint32_t s_logged = 0;
+  if (s_logged++ < 8) {
+    REXLOG_INFO("d3d9: active pixel shader 0x{:08X} read from "
+                "device+0x3244 (sampler {}, UV r{})",
+                handle, binding.sampler, binding.src_reg);
+  }
+  return true;
+}
+
+bool CopyTexturePhysical(const mx::pm4::HleTextureSource& source, uint8_t* base,
+                         std::vector<uint8_t>& out) {
+  const uint32_t candidates[] = {
+      source.address, source.address | 0xA0000000u,
+      source.address | 0xC0000000u, source.address | 0xE0000000u};
+  for (uint32_t candidate : candidates) {
+    bool readable = true;
+    for (uint64_t o = 0; o < source.source_bytes; o += kHostPageSize) {
+      if (!HostPageReadable(REX_RAW_ADDR(candidate + uint32_t(o)))) {
+        readable = false;
+        break;
+      }
+    }
+    if (!readable || !HostPageReadable(
+                         REX_RAW_ADDR(candidate + source.source_bytes - 1)))
+      continue;
+    out.resize(source.source_bytes);
+    std::memcpy(out.data(), REX_RAW_ADDR(candidate), source.source_bytes);
+    return true;
+  }
+  return false;
+}
+
+bool PrepareDrawTexture(mx::pm4::DrawCall& dc, uint32_t pixel_shader,
+                        uint32_t device, uint8_t* base,
+                        mx::pm4::PixelTextureBinding& binding) {
+  using namespace mx::pm4;
+  static uint64_t s_attempts = 0, s_ready = 0, s_no_shader = 0;
+  static uint64_t s_no_binding = 0, s_bad_desc = 0, s_unreadable = 0;
+  ++s_attempts;
+  if ((!pixel_shader || !ResolvePixelBinding(pixel_shader, binding)) &&
+      !ReadBoundPixelShader(device, base, pixel_shader, binding)) {
+    ++s_no_shader;
+    if (s_no_shader <= 8 || (s_attempts % 2500) == 0) {
+      const uint32_t direct =
+          device && HostPageReadable(REX_RAW_ADDR(device + 0x3244))
+              ? REX_LOAD_U32(device + 0x3244)
+              : 0;
+      REXLOG_INFO("d3d9: HLE texture fallback: no eligible pixel shader "
+                  "(attempt {}, setter=0x{:08X}, device=0x{:08X})",
+                  s_attempts, pixel_shader, direct);
+    }
+    return false;
+  }
+  if (binding.sampler >= kMaxSamplers) {
+    ++s_no_binding;
+    if (s_no_binding <= 8)
+      REXLOG_INFO("d3d9: HLE texture fallback: sampler {} out of range",
+                  binding.sampler);
+    return false;
+  }
+  uint32_t fetch[6] = {};
+  bool validFetch = false;
+  const uint32_t fetchAt = device + 0x480 + binding.sampler * 24;
+  if (device && HostPageReadable(REX_RAW_ADDR(fetchAt)) &&
+      HostPageReadable(REX_RAW_ADDR(fetchAt + 20))) {
+    for (uint32_t i = 0; i < 6; ++i)
+      fetch[i] = REX_LOAD_U32(fetchAt + i * 4);
+    validFetch = (fetch[0] & 3u) == 2u;
+  }
+  // Direct device state is authoritative, including for state-block binds.
+  // The setter snapshot is retained only as a fallback for unusual devices.
+  const auto& tb = DeviceState().texture[binding.sampler];
+  if (!validFetch && tb.bound && tb.valid) {
+    std::memcpy(fetch, tb.fetch, sizeof(fetch));
+    validFetch = true;
+  }
+  if (!validFetch) {
+    ++s_no_binding;
+    if (s_no_binding <= 8) {
+      REXLOG_INFO("d3d9: HLE texture fallback: sampler {} has no 2D fetch "
+                  "(device words {:08X} {:08X} {:08X} {:08X} {:08X} {:08X})",
+                  binding.sampler, fetch[0], fetch[1], fetch[2], fetch[3],
+                  fetch[4], fetch[5]);
+    }
+    return false;
+  }
+  HleTextureSource source;
+  const char* why = nullptr;
+  if (!DescribeHleTexture2D(fetch, source, &why)) {
+    ++s_bad_desc;
+    if (s_bad_desc <= 12) {
+      REXLOG_INFO("d3d9: HLE texture fallback: sampler {} descriptor rejected "
+                  "({}), words {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                  binding.sampler, why ? why : "?", fetch[0], fetch[1],
+                  fetch[2], fetch[3], fetch[4], fetch[5]);
+    }
+    return false;
+  }
+  const uint64_t key = HleTextureKey(fetch);
+  auto cached = g_hleCpuTextures.find(key);
+  if (cached != g_hleCpuTextures.end()) {
+    dc.texture = cached->second;
+    ++s_ready;
+    return true;
+  }
+  std::vector<uint8_t> guest;
+  if (!CopyTexturePhysical(source, base, guest)) {
+    ++s_unreadable;
+    if (s_unreadable <= 8) {
+      REXLOG_INFO("d3d9: HLE texture fallback: sampler {} source 0x{:08X} "
+                  "(size {}) unreadable",
+                  binding.sampler, source.address, source.source_bytes);
+    }
+    return false;
+  }
+  auto payload = std::make_shared<HleTexturePayload>();
+  if (!DecodeHleTexture2D(source, guest.data(), guest.size(), *payload, &why)) {
+    ++s_bad_desc;
+    if (s_bad_desc <= 12)
+      REXLOG_INFO("d3d9: HLE texture decode rejected ({})",
+                  why ? why : "?");
+    return false;
+  }
+  payload->key = key;
+  dc.texture = payload;
+  g_hleCpuTextures.emplace(key, std::move(payload));
+  ++s_ready;
+  if (s_ready <= 8 || (s_attempts % 2500) == 0) {
+    REXLOG_INFO("d3d9: HLE textures attempts {} ready {} cached {} no-shader "
+                "{} no-binding {} bad-desc {} unreadable {}; latest {}x{} "
+                "format {} in viewport {}x{}",
+                s_attempts, s_ready, g_hleCpuTextures.size(), s_no_shader,
+                s_no_binding, s_bad_desc, s_unreadable, dc.texture->width,
+                dc.texture->height, uint32_t(dc.texture->format),
+                dc.viewport_width, dc.viewport_height);
+  }
   return true;
 }
 
@@ -3704,6 +3957,8 @@ extern "C" REX_FUNC(sub_825506E8) {
   st.NoteDevice(ctx.r3.u32, mx::pm4::kEpSetPixelShader);
   st.pixel_shader = ctx.r4.u32;
   st.ps_seen = true;
+  if (REXCVAR_GET(hle_capture) || REXCVAR_GET(hle_render))
+    CollectPixelShaderBlob(ctx.r4.u32, base);
   orig_SetPixelShader(ctx, base);
 }
 
@@ -3711,20 +3966,67 @@ extern "C" REX_FUNC(sub_825506E8) {
 // 0x8254E748 — D3DDevice_SetTexture(D3DDevice*, DWORD Sampler,
 //                                   D3DBaseTexture*)
 //
-// 307 call sites, the most-called entry point in the set. The texture object
-// itself is not read: unlike a vertex buffer it is not two dwords, and nothing
-// this round does with it would justify the reads.
+// IDA shows the texture's six hardware-fetch dwords at object+0x1C..+0x30 and
+// SetTexture copying them into device+0x480+sampler*24.
 //-----------------------------------------------------------------------------
 REX_IMPORT(__imp__sub_8254E748, orig_SetTexture, void());
 extern "C" REX_FUNC(sub_8254E748) {
+  const uint32_t device = ctx.r3.u32;
   const uint32_t sampler = ctx.r4.u32;
+  const uint32_t texture = ctx.r5.u32;
   if (sampler < mx::pm4::kMaxSamplers) {
     auto& st = DeviceState();
     st.NoteDevice(ctx.r3.u32, mx::pm4::kEpSetTexture);
-    st.texture[sampler] = ctx.r5.u32;
+    auto& binding = st.texture[sampler];
+    binding = {};
+    binding.object = texture;
+    binding.bound = texture != 0;
+    // Read while SetTexture guarantees the object is live; never dereference
+    // this object later at draw time.
+    constexpr uint32_t kTextureFetchObjectOffset = 0x1C;
+    if (texture &&
+        HostPageReadable(REX_RAW_ADDR(texture + kTextureFetchObjectOffset)) &&
+        HostPageReadable(
+            REX_RAW_ADDR(texture + kTextureFetchObjectOffset + 20))) {
+      for (uint32_t i = 0; i < 6; ++i)
+        binding.fetch[i] =
+            REX_LOAD_U32(texture + kTextureFetchObjectOffset + i * 4);
+      binding.valid = (binding.fetch[0] & 3u) == 2u;
+    }
     st.texture_seen_mask |= 1u << sampler;
   }
   orig_SetTexture(ctx, base);
+
+  // Cross-check the object snapshot against D3D9's resolved device fetch file.
+  // The object is authoritative when they agree; the post-call device value is
+  // a safe fallback for state normalization performed by SetTexture itself.
+  if (sampler < mx::pm4::kMaxSamplers && texture && device) {
+    auto& binding = DeviceState().texture[sampler];
+    const uint32_t at = device + 0x480 + sampler * 24;
+    if (HostPageReadable(REX_RAW_ADDR(at)) &&
+        HostPageReadable(REX_RAW_ADDR(at + 20))) {
+      uint32_t resolved[6];
+      bool same = binding.valid;
+      for (uint32_t i = 0; i < 6; ++i) {
+        resolved[i] = REX_LOAD_U32(at + i * 4);
+        same = same && resolved[i] == binding.fetch[i];
+      }
+      static uint64_t s_object_agree = 0, s_device_fallback = 0;
+      if (same) {
+        ++s_object_agree;
+      } else if ((resolved[0] & 3u) == 2u) {
+        std::memcpy(binding.fetch, resolved, sizeof(resolved));
+        binding.valid = true;
+        ++s_device_fallback;
+      }
+      const uint64_t total = s_object_agree + s_device_fallback;
+      if (total && total % 5000 == 0) {
+        REXLOG_INFO("d3d9: texture fetch snapshot object agreed {}, device "
+                    "resolved fallback {}", s_object_agree,
+                    s_device_fallback);
+      }
+    }
+  }
 }
 
 //-----------------------------------------------------------------------------

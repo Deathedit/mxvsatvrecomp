@@ -611,4 +611,63 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
   return true;
 }
 
+bool DecodeSingleTexturePixelShader(const uint32_t* dwords,
+                                    uint32_t dword_count,
+                                    PixelTextureBinding& out,
+                                    const char** fail) {
+  auto reject = [&](const char* why) {
+    if (fail) *fail = why;
+    return false;
+  };
+  if (fail) *fail = nullptr;
+  out = {};
+  if (!dwords || dword_count < 3) return reject("blob too short");
+
+  uint32_t max_cf_dword = dword_count - (dword_count % 3);
+  bool saw_exec = false;
+  for (uint32_t i = 0; i + 2 < max_cf_dword; i += 3) {
+    uc::ControlFlowInstruction cf[2];
+    uc::UnpackControlFlowInstructions(dwords + i, cf);
+    for (int j = 0; j < 2; ++j) {
+      if (!IsExec(cf[j].opcode())) continue;
+      saw_exec = true;
+      const uint64_t target = uint64_t(ExecAddress(cf[j])) * 3;
+      if (target < max_cf_dword) max_cf_dword = uint32_t(target);
+    }
+  }
+  if (!saw_exec || max_cf_dword == 0) return reject("no exec instruction");
+
+  uint32_t texture_fetches = 0;
+  for (uint32_t i = 0; i + 2 < max_cf_dword; i += 3) {
+    uc::ControlFlowInstruction cf[2];
+    uc::UnpackControlFlowInstructions(dwords + i, cf);
+    for (int j = 0; j < 2; ++j) {
+      if (!IsExec(cf[j].opcode())) continue;
+      const uint32_t addr = ExecAddress(cf[j]);
+      const uint32_t count = ExecCount(cf[j]);
+      const uint32_t seq = ExecSequence(cf[j]);
+      for (uint32_t n = 0; n < count; ++n) {
+        if (!((seq >> (n * 2)) & 1)) continue;
+        const uint64_t at = (uint64_t(addr) + n) * 3;
+        if (at + 3 > dword_count) return reject("instruction out of range");
+        if ((dwords[at] & 0x1F) !=
+            uint32_t(uc::FetchOpcode::kTextureFetch))
+          continue;
+        uc::TextureFetchInstruction tf{};
+        std::memcpy(&tf, dwords + at, sizeof(tf));
+        if (++texture_fetches != 1) return reject("multiple texture fetches");
+        if (tf.is_src_relative() || tf.is_dest_relative())
+          return reject("relative texture fetch");
+        if (tf.dimension() != rex::graphics::xenos::FetchOpDimension::k2D)
+          return reject("non-2D texture fetch");
+        out.sampler = tf.fetch_constant_index();
+        out.src_reg = tf.src();
+        out.src_swizzle = tf.src_swizzle();
+        out.unnormalized = tf.unnormalized_coordinates();
+      }
+    }
+  }
+  return texture_fetches == 1 ? true : reject("no texture fetch");
+}
+
 }  // namespace mx::pm4

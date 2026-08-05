@@ -33,10 +33,12 @@ inline constexpr const char* kGameVS = R"(
 struct VSInput {
   float3 pos : POSITION;
   float4 col : COLOR;
+  float2 uv  : TEXCOORD0;
 };
 struct VSOutput {
   float4 pos : SV_POSITION;
   float4 col : COLOR;
+  float2 uv  : TEXCOORD0;
 };
 cbuffer GameCB : register(b0) {
   // row_major is load-bearing. Pm4Translator builds this matrix row-major and
@@ -48,7 +50,17 @@ VSOutput main(VSInput input) {
   VSOutput o;
   o.pos = mul(mvp, float4(input.pos, 1.0));
   o.col = input.col;
+  o.uv = input.uv;
   return o;
+}
+)";
+
+inline constexpr const char* kGameTexturePS = R"(
+Texture2D    g_tex : register(t0);
+SamplerState g_smp : register(s0);
+float4 main(float4 pos : SV_POSITION, float4 col : COLOR,
+            float2 uv : TEXCOORD0) : SV_TARGET {
+  return g_tex.Sample(g_smp, uv) * col;
 }
 )";
 
