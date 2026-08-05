@@ -621,6 +621,12 @@ uint64_t g_badPrimType[64] = {};
 // (width << 32) | height -> how many SetViewport calls used it.
 std::map<uint64_t, uint64_t> g_viewportExtents;
 
+// D3DDevice_Resolve establishes the explicit EDRAM -> texture relationship.
+// Keyed by destination D3D texture object; consumed when that same object is
+// subsequently bound through SetTexture. This is deliberately object identity,
+// not a guessed match between EDRAM tile base and system-memory address.
+std::map<uint32_t, uint32_t> g_resolvedTextureTargets;
+
 // Stage C — run the guest's own vertex shader over this draw's vertices.
 // Defined further down, next to the microcode it needs; declared here because
 // the draw builder is the only place that has the vertices and the streams
@@ -740,9 +746,33 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   PixelTextureBinding texture_binding;
   dc.viewport_width = viewport_width;
   dc.viewport_height = viewport_height;
+  const auto& rt = st.render_target[0];
+  if (rt.valid) {
+    dc.render_target_object = rt.object;
+    dc.render_target_surface_info = rt.surface_info;
+    dc.render_target_color_info = rt.color_info;
+    dc.render_target_width = rt.width;
+    dc.render_target_height = rt.height;
+    // Reuse the established PM4-facing fields so diagnostics can compare the
+    // two independent paths without another parallel vocabulary.
+    dc.surface_base = rt.color_info & 0xFFFu;
+    dc.surface_pitch = rt.surface_info & 0x3FFFu;
+  }
   const bool have_texture =
       PrepareDrawTexture(dc, st.ps_seen ? st.pixel_shader : 0, device, base,
                          texture_binding);
+  if (have_texture && texture_binding.sampler < kMaxSamplers) {
+    const uint32_t texture_object = st.texture[texture_binding.sampler].object;
+    if (const auto it = g_resolvedTextureTargets.find(texture_object);
+        it != g_resolvedTextureTargets.end()) {
+      dc.sampled_render_target_object = it->second;
+      static uint64_t s_resolved_samples = 0;
+      if (++s_resolved_samples <= 16 || (s_resolved_samples % 1000) == 0) {
+        REXLOG_INFO("d3d9: draw samples resolved texture 0x{:08X} from "
+                    "target 0x{:08X}", texture_object, it->second);
+      }
+    }
+  }
   if (!ApplyShaderOutputs(dc, st.vs_seen ? st.vertex_shader : 0, streams,
                           device, base,
                           have_texture ? &texture_binding : nullptr)) {
@@ -3960,6 +3990,112 @@ extern "C" REX_FUNC(sub_825506E8) {
   if (REXCVAR_GET(hle_capture) || REXCVAR_GET(hle_render))
     CollectPixelShaderBlob(ctx.r4.u32, base);
   orig_SetPixelShader(ctx, base);
+}
+
+//-----------------------------------------------------------------------------
+// 0x8254C060 / 0x8254C3B0 — SetRenderTarget / SetDepthStencilSurface.
+//
+// Proven from default.xex.probe.i64 rather than inferred from viewport sizes:
+//   device+0x3148 + slot*4 = active colour-surface object
+//   device+0x3158          = active depth-surface object
+//   surface+0x18           = GPU_SURFACEINFO
+//   surface+0x1C           = GPU_COLORINFO / GPU_DEPTHINFO
+//   surface+0x24           = packed width/height used by viewport clamping
+//-----------------------------------------------------------------------------
+mx::pm4::RenderTargetBinding SnapshotRenderTarget(uint32_t object,
+                                                  uint8_t* base) {
+  mx::pm4::RenderTargetBinding out;
+  out.object = object;
+  out.bound = object != 0;
+  if (!object || !HostPageReadable(REX_RAW_ADDR(object + 0x18)) ||
+      !HostPageReadable(REX_RAW_ADDR(object + 0x24)))
+    return out;
+  out.surface_info = REX_LOAD_U32(object + 0x18);
+  out.color_info = REX_LOAD_U32(object + 0x1C);
+  out.extent = REX_LOAD_U32(object + 0x24);
+  out.width = (out.extent >> 18) + 1;
+  out.height = ((out.extent >> 3) & 0x7FFFu) + 1;
+  out.valid = out.width <= 8192 && out.height <= 8192;
+  return out;
+}
+
+REX_IMPORT(__imp__sub_8254C060, orig_SetRenderTarget, void());
+extern "C" REX_FUNC(sub_8254C060) {
+  const uint32_t slot = ctx.r4.u32;
+  const uint32_t object = ctx.r5.u32;
+  if (slot < 4) {
+    auto& st = DeviceState();
+    st.NoteDevice(ctx.r3.u32, mx::pm4::kEpSetRenderTarget);
+    st.render_target[slot] = SnapshotRenderTarget(object, base);
+    st.render_target_seen_mask |= 1u << slot;
+
+    const auto& rt = st.render_target[slot];
+    static std::map<uint64_t, uint64_t> s_targets;
+    if (rt.valid) {
+      const uint64_t key = (uint64_t(rt.object) << 32) |
+                           (uint64_t(rt.width) << 16) | rt.height;
+      const bool first = s_targets.emplace(key, 0).second;
+      ++s_targets[key];
+      if (first) {
+        REXLOG_INFO(
+            "d3d9: render target slot {} object 0x{:08X} {}x{} "
+            "surface=0x{:08X} color=0x{:08X} base=0x{:03X} pitch={}",
+            slot, rt.object, rt.width, rt.height, rt.surface_info,
+            rt.color_info, rt.color_info & 0xFFFu,
+            rt.surface_info & 0x3FFFu);
+      }
+    }
+  }
+  orig_SetRenderTarget(ctx, base);
+}
+
+REX_IMPORT(__imp__sub_8254C3B0, orig_SetDepthStencil, void());
+extern "C" REX_FUNC(sub_8254C3B0) {
+  auto& st = DeviceState();
+  st.NoteDevice(ctx.r3.u32, mx::pm4::kEpSetDepthStencil);
+  st.depth_stencil = SnapshotRenderTarget(ctx.r4.u32, base);
+  orig_SetDepthStencil(ctx, base);
+}
+
+//-----------------------------------------------------------------------------
+// 0x8255CE98 — D3DDevice_Resolve.
+//
+// r4 low three bits select colour target 0..3 or depth target 4; r6 is the
+// destination D3DBaseTexture. The internal helper reads that texture's fetch
+// descriptor at +0x1C, proving this call — not SetTexture — is the EDRAM to
+// system-memory bridge. Record the ordered relationship for host-side
+// render-to-texture routing.
+//-----------------------------------------------------------------------------
+REX_IMPORT(__imp__sub_8255CE98, orig_Resolve, void());
+extern "C" REX_FUNC(sub_8255CE98) {
+  auto& st = DeviceState();
+  st.NoteDevice(ctx.r3.u32, mx::pm4::kEpResolve);
+  const uint32_t source_slot = ctx.r4.u32 & 7u;
+  const uint32_t dest_texture = ctx.r6.u32;
+  const mx::pm4::RenderTargetBinding* source = nullptr;
+  if (source_slot < 4)
+    source = &st.render_target[source_slot];
+  else if (source_slot == 4)
+    source = &st.depth_stencil;
+
+  if (dest_texture && source && source->valid) {
+    g_resolvedTextureTargets[dest_texture] = source->object;
+    static std::map<uint64_t, uint64_t> s_resolves;
+    const uint64_t key = (uint64_t(source->object) << 32) | dest_texture;
+    const bool first = s_resolves.emplace(key, 0).second;
+    ++s_resolves[key];
+    if (first) {
+      uint32_t fetch0 = 0;
+      if (HostPageReadable(REX_RAW_ADDR(dest_texture + 0x1C)))
+        fetch0 = REX_LOAD_U32(dest_texture + 0x1C);
+      REXLOG_INFO(
+          "d3d9: resolve slot {} target 0x{:08X} {}x{} -> texture "
+          "0x{:08X} fetch0=0x{:08X}",
+          source_slot, source->object, source->width, source->height,
+          dest_texture, fetch0);
+    }
+  }
+  orig_Resolve(ctx, base);
 }
 
 //-----------------------------------------------------------------------------

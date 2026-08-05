@@ -113,6 +113,19 @@ struct DrawCall {
   // shadow/off-screen passes when render-target identity is not yet modelled.
   uint32_t viewport_width = 0;
   uint32_t viewport_height = 0;
+  // HLE path: exact D3D9 render-target snapshot. `render_target_object` is the
+  // stable API identity; the raw Xenos words are retained for matching a later
+  // SetTexture binding to render-to-texture storage without guessing by size.
+  uint32_t render_target_object = 0;
+  uint32_t render_target_surface_info = 0;
+  uint32_t render_target_color_info = 0;
+  uint32_t render_target_width = 0;
+  uint32_t render_target_height = 0;
+  // HLE path: if the sampled D3D9 texture was most recently populated by
+  // D3DDevice_Resolve, this is the source render-target object. It is separate
+  // from the CPU texture payload because a resolve is an ordered GPU operation,
+  // not immutable guest-memory content.
+  uint32_t sampled_render_target_object = 0;
   std::shared_ptr<const HleTexturePayload> texture;
 
   // Where TranscodeVertices got this draw's vertex colour, so LogSurface can

@@ -340,6 +340,11 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
             REXLOG_INFO("RenderThread: first translated draw — {} verts ({} B, stride {}), {} indices, topology {}",
                         d->vertex_count, d->vertices.size(), d->vertex_stride,
                         d->index_count, static_cast<uint32_t>(d->topology));
+            REXLOG_INFO("RenderThread: first translated draw target 0x{:08X} "
+                        "{}x{} samples resolved target 0x{:08X}",
+                        d->render_target_object, d->render_target_width,
+                        d->render_target_height,
+                        d->sampled_render_target_object);
           }
         }
       }

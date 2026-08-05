@@ -29,6 +29,9 @@ const char* EntryPointName(uint32_t id) {
     case kEpSetVertexShader:  return "SetVertexShader";
     case kEpSetPixelShader:   return "SetPixelShader";
     case kEpSetTexture:       return "SetTexture";
+    case kEpSetRenderTarget:  return "SetRenderTarget";
+    case kEpSetDepthStencil:  return "SetDepthStencilSurface";
+    case kEpResolve:          return "Resolve";
     case kEpSetViewport:      return "SetViewport";
     case kEpSetScissorRect:   return "SetScissorRect";
     case kEpSetRenderState:   return "SetRenderState_*";

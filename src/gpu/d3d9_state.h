@@ -135,6 +135,9 @@ enum EntryPointId : uint32_t {
   kEpSetVertexShader,
   kEpSetPixelShader,
   kEpSetTexture,
+  kEpSetRenderTarget,
+  kEpSetDepthStencil,
+  kEpResolve,
   kEpSetViewport,
   kEpSetScissorRect,
   kEpSetRenderState,
@@ -157,6 +160,21 @@ struct RenderStateShadow {
 struct TextureBinding {
   uint32_t object = 0;
   uint32_t fetch[6] = {};
+  bool bound = false;
+  bool valid = false;
+};
+
+// Snapshot while SetRenderTarget guarantees the guest surface object is live.
+// The offsets come directly from D3DDevice_SetRenderTarget/sub_8254BFD0 in
+// default.xex.probe.i64: SurfaceInfo +0x18, ColorInfo +0x1C and packed extent
+// +0x24. Keeping the raw words makes later format decoding auditable.
+struct RenderTargetBinding {
+  uint32_t object = 0;
+  uint32_t surface_info = 0;
+  uint32_t color_info = 0;
+  uint32_t extent = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
   bool bound = false;
   bool valid = false;
 };
@@ -192,6 +210,10 @@ struct D3D9DeviceState {
 
   TextureBinding texture[kMaxSamplers];
   uint32_t texture_seen_mask = 0;
+
+  RenderTargetBinding render_target[4];
+  RenderTargetBinding depth_stencil;
+  uint32_t render_target_seen_mask = 0;
 
   ViewportState     viewport;
   ScissorState      scissor;
