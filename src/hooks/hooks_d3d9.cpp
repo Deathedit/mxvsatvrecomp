@@ -1548,8 +1548,9 @@ void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
         ranged = false;
         break;
       }
+      // Copied in guest byte order. The swap is applied per attribute below,
+      // where the format — and so the correct swap width — is known.
       std::memcpy(vtx[si], sa.host + byte_off, sa.stride);
-      ApplyFetchEndian(vtx[si], sa.stride, sa.endian);
       have[si] = true;
     }
     if (!ranged) break;
@@ -1557,7 +1558,7 @@ void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
     for (size_t a = 0; a < attrs.size(); ++a) {
       float o[4] = {0, 0, 0, 1};
       ReadVertexAttribute(vtx[astream[a]], streams[astream[a]].stride, attrs[a],
-                          o);
+                          streams[astream[a]].endian, o);
       values[a] = {o[0], o[1], o[2], o[3]};
     }
 

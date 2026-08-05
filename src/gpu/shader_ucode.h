@@ -78,13 +78,33 @@ uint32_t VertexFormatSizeBytes(uint32_t format, uint32_t* out_components);
 // IEEE half -> float.
 float HalfToFloat(uint16_t h);
 
+// The width of the unit a format's bits are packed into, which is the unit the
+// endian swap has to operate on — 2 for the 16-bit-component formats, 4 for
+// everything else (a k_8_8_8_8 colour is one big-endian dword, not four
+// independent bytes). 0 for a format not recognised.
+//
+// This is not the same as the per-component width and must not be confused with
+// it: k_8_8_8_8 has 1-byte components packed in a 4-byte unit.
+uint32_t VertexFormatUnitBytes(uint32_t format);
+
 // Apply the vertex fetch constant's endian swap in place, turning guest bytes
-// into GPU-native little-endian — which is what the hardware does, and what
-// makes every later read a plain little-endian read at its natural offset.
-//   0 = none, 1 = 8in16 (swap within each u16), 2 = 8in32 (within each u32)
-// Doing this per mode matters: the translator used to apply a 32-bit swap for
-// any non-zero mode, which is wrong for the 8in16 buffers this game also uses.
-void ApplyFetchEndian(uint8_t* data, size_t bytes, uint32_t endian);
+// into GPU-native little-endian.
+//   endian: 0 = none, 1 = 8in16, 2 = 8in32
+//   format: the xenos::VertexFormat those bytes hold
+//
+// The mode alone does not determine the swap width. Reversing all four bytes of
+// a dword that holds *two* 16-bit components byte-swaps each component **and
+// exchanges the pair** — so an 8in32 request over a 16-bit format has to be
+// performed as a 2-byte reversal. Applying the mode literally is what turned
+// every (x, y, z, w=1) position into (y, x, w=1, z) and left the interpreter
+// reading a constant 1.0 as the z coordinate. See AGENTS.md, "The position input
+// is (x, y, z, 1) read as (x, y, 1, z)".
+//
+// Because the right width depends on the format, this cannot be applied once
+// over a whole vertex: a single vertex mixes 16-bit positions with 32-bit
+// colours. It is applied per attribute, inside the read.
+void ApplyFetchEndianFor(uint8_t* data, size_t bytes, uint32_t endian,
+                         uint32_t format);
 
 // How a format's raw bits are interpreted. The layout of a format says how many
 // bits each component gets; this says what they mean, and the two are
@@ -104,17 +124,22 @@ enum class NumFormat : uint8_t {
 };
 
 // Decode one attribute of one vertex to up to 4 floats. `vertex_base` points at
-// the start of the vertex, already endian-corrected. Unwritten components are
-// left as (0,0,0,1). Returns false for a format not handled, leaving `out`
-// untouched, so callers can count the gap instead of rendering a guess.
+// the start of the vertex **in guest byte order**; `endian` is the fetch
+// constant's swap mode and is applied here, at the format's own unit width,
+// because only here is the format known. Pass 0 for bytes already in host
+// order. Unwritten components are left as (0,0,0,1). Returns false for a format
+// not handled, leaving `out` untouched, so callers can count the gap instead of
+// rendering a guess.
 bool ReadVertexAttributeAs(const uint8_t* vertex_base, uint32_t vertex_bytes,
                            uint32_t format, uint32_t offset_bytes,
-                           uint32_t size_bytes, NumFormat num, float out[4]);
+                           uint32_t size_bytes, NumFormat num, uint32_t endian,
+                           float out[4]);
 
 // The PM4 path's entry point. Delegates to the above with the interpretation
 // this function has always used per format, so its results are unchanged.
 bool ReadVertexAttribute(const uint8_t* vertex_base, uint32_t vertex_bytes,
-                         const VertexAttribute& attr, float out[4]);
+                         const VertexAttribute& attr, uint32_t endian,
+                         float out[4]);
 
 // Pick the position attribute. Prefers an attribute the decoder proved feeds
 // the position export; falls back, only when none does, to the old guess — the

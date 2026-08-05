@@ -50,6 +50,13 @@ struct DrawCall {
   uint32_t vertex_count = 0;
   uint32_t index_count = 0;
   uint32_t vertex_stride = 0;
+  // The fetch constant's endian swap mode for `vertices` (0 none, 1 8in16,
+  // 2 8in32). The bytes are left in guest order and the swap is applied per
+  // attribute at read time, because its correct width is the format's packed
+  // unit and one vertex mixes 16-bit positions with 32-bit colours. Swapping
+  // the whole buffer up front is what read every (x, y, z, w=1) position as
+  // (y, x, w=1, z).
+  uint32_t vertex_endian = 0;
   uint32_t prim_type = 0;            // xenos::PrimitiveType (raw 6-bit value)
   HostTopology topology = HostTopology::kUndefined;  // mapped from prim_type
   bool index_16bit = true;

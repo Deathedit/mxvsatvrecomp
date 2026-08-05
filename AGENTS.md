@@ -3886,3 +3886,92 @@ build the vertices that are actually **rendered**, so changing it changes what
 appears on screen, not just what the probe reports. It needs its own step, with
 the 23 declaration fixtures and `ucode_test` run against it, and the swizzle
 question settled first.
+
+### Fixed: the endian swap width is the format's, not the mode's (2026-08-04)
+
+The defect located in the section above, fixed and measured.
+
+#### The swizzle question, settled first
+
+Two mechanisms could have produced the observed component rotation: the 8in32
+swap over 16-bit components, or `dest_swizzle` being decoded and never applied.
+Both predict the same corrected output, so the reordering alone could not choose
+between them. Undoing the swap to recover what is actually in guest memory does:
+
+```
+guest bytes 31 ED 34 37 32 72 3C 00  ->  (0.185181, 0.263428, 0.201416, 1)
+```
+
+Memory order is already `(x, y, z, w=1)`. Nothing needs reordering, so no
+swizzle is involved — **the endian width is the whole defect.** (`dest_swizzle`
+is still decoded and unapplied on the vfetch path; it is simply not this bug.
+`ReadHleElement` does apply the declaration's swizzle, and always did.)
+
+#### The fix
+
+The swap unit must be the format's own packed unit, not the mode's nominal
+width — `VertexFormatUnitBytes` returns 2 for formats 25/26/31/32 and 4 for the
+rest, and `ApplyFetchEndianFor` narrows the mode to it.
+
+That width depends on the format, so **the swap cannot be applied once over a
+whole vertex** — a vertex mixes 16-bit positions with 32-bit colours. Both
+callers stopped pre-swapping and now pass the mode down:
+
+| was | now |
+|---|---|
+| `CopyVertex` swapped the vertex, `ReadHleElement(…, out)` | `CopyVertex` copies guest bytes, `ReadHleElement(…, s.endian, out)` |
+| PM4 swapped `dc.vertices` in one pass | `dc.vertex_endian` carries the mode; `ReadVertexAttribute(…, dc.vertex_endian, …)` |
+
+PM4 had the identical bug on the path that actually renders, so it is fixed
+there too rather than left in the live path while the disabled one is corrected.
+
+#### Verified
+
+`tools/d3d9_layout_test.cpp` gains the real failing vertex as a fixture — shader
+`0x22D4B320` vertex 0, guest bytes, `endian=2` — asserting the homogeneous
+result and, separately, that `w` did not land in `z`. **The test was confirmed to
+fail without the fix** (`got 0.263428, want 0.185181`), because a regression test
+that passes either way is not one. A second fixture asserts 8in32 over
+`k_8_8_8_8` still reverses the whole dword, so the narrowing cannot be applied
+to every format. All 23 declaration fixtures and `ucode_test` pass.
+
+#### Measured — 300 s run, `mx_258.log`, zero access violations
+
+The input is now a homogeneous position on **every** shader, over thousands of
+executions:
+
+```
+.z  [-646 .. 570.5]        (was CONSTANT 1)
+.w  [1 .. 1]   CONSTANT    (was the varying one)
+```
+
+And the output classification, per shader:
+
+| shader | rt | neither before | neither after | in-clip before | in-clip after |
+|---|---|---|---|---|---|
+| `0x2160E720` | 768x384 | 22% | **0%** | 74% | **100%** |
+| `0x22D3E460` | 1280x720 | 25% | **0%** | 0% | **69%** |
+| `0x22D46B60` | 1280x720 | 64% | **0%** | 0% | 0% (100% window-like) |
+| `0x22D4B320` | 1280x720 | 15% | **0%** | 0% | 0% (100% window-like) |
+| `0x22D5CC20` | 1280x720 | 71% | **0%** | 0% | 0% |
+| `0x216D3920` | 129x129 | 43% | **4%** | 17% | **45%** |
+
+Globally: `neither` 2,038 → **1,208**; shaders that are ≥90% `neither` **4 → 0**;
+shaders ≥90% clip-like 2 → **5** (55% of executions). No shader is stuck in an
+unmodelled space any more.
+
+**Every world shader now classifies cleanly as clip-like or window-like, and the
+1280x720 ones are overwhelmingly window-like** — which is what the PM4 path
+concluded from the ring, and what the aggregate hid.
+
+#### What is left
+
+All remaining `neither` is essentially **one shader**: `0x216C9620`, the 129x129
+shadow pass, still 62% (1,912 executions, ~1,185 of the global 1,208). Its input
+is a clean homogeneous position, so this is no longer a decode question. A
+cascade covers a slice of the world and the whole scene is drawn against it, so
+some of that is expected — how much is not established.
+
+The in-clip figure moved 58% → 62% globally, but that number is still an average
+over a post-process quad, a shadow pass and world geometry. **Read the per-shader
+table, not the total.**

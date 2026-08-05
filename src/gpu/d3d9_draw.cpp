@@ -43,9 +43,13 @@ inline uint32_t RdIndex32(const uint8_t* p) {
          (uint32_t(p[2]) << 8) | p[3];
 }
 
-// Copy one vertex out of a stream and undo the guest byte order, so every later
-// read is a plain little-endian read at its natural offset — which is what the
-// hardware's fetch does and what ReadHleElement expects.
+// Copy one vertex out of a stream, in guest byte order.
+//
+// This used to undo the byte order here, once for the whole vertex. It cannot
+// be done here: the correct swap width is the format's packed unit, and one
+// vertex mixes 16-bit positions with 32-bit colours — a blanket 8in32 over a
+// 16-bit position exchanges its components as well as their bytes. The swap now
+// happens inside ReadHleElement, which knows the format. Pass `s.endian` there.
 bool CopyVertex(const HleStream& s, uint32_t index, uint8_t* dst,
                 uint32_t dst_bytes) {
   const uint64_t byte_off =
@@ -53,7 +57,6 @@ bool CopyVertex(const HleStream& s, uint32_t index, uint8_t* dst,
   if (byte_off + s.stride > s.size_bytes) return false;
   const uint32_t n = s.stride < dst_bytes ? s.stride : dst_bytes;
   std::memcpy(dst, s.host + byte_off, n);
-  ApplyFetchEndian(dst, n, s.endian);
   return true;
 }
 
@@ -210,7 +213,7 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
         skip = HleSkip::kVertexOutOfRange;
         return false;
       }
-      if (!ReadHleElement(vtx, s.stride, *pos, p)) {
+      if (!ReadHleElement(vtx, s.stride, *pos, s.endian, p)) {
         skip = HleSkip::kUnreadableFormat;
         return false;
       }
@@ -220,7 +223,7 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
     if (col) {
       const HleStream& s = in.streams[col->stream];
       if (s.stride <= sizeof(vtx) && CopyVertex(s, src_index, vtx, sizeof(vtx))) {
-        if (!ReadHleElement(vtx, s.stride, *col, c)) {
+        if (!ReadHleElement(vtx, s.stride, *col, s.endian, c)) {
           c[0] = c[1] = c[2] = c[3] = 1.0f;
         }
       }

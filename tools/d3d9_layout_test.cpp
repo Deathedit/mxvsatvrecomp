@@ -431,7 +431,7 @@ void CheckVertexDecode() {
       continue;
     }
     float got[4];
-    if (!mx::pm4::ReadHleElement(c.bytes, c.nbytes, e, got)) {
+    if (!mx::pm4::ReadHleElement(c.bytes, c.nbytes, e, 0, got)) {
       Fail("read element", c.what);
       continue;
     }
@@ -448,12 +448,65 @@ void CheckVertexDecode() {
     if (MakeElement(0x00182886u, mx::pm4::kUsageColor, col) &&
         MakeElement(0x001A2286u, mx::pm4::kUsageBlendIndices, idx)) {
       float a[4], b[4];
-      if (mx::pm4::ReadHleElement(bgra, 4, col, a) &&
-          mx::pm4::ReadHleElement(bgra, 4, idx, b)) {
+      if (mx::pm4::ReadHleElement(bgra, 4, col, 0, a) &&
+          mx::pm4::ReadHleElement(bgra, 4, idx, 0, b)) {
         if (a[0] == b[0]) {
           Fail("COLOR vs BLENDINDICES differ",
                "same value from the same bits — the Type bits are ignored");
         }
+      }
+    }
+  }
+
+  // The endian swap width must be the format's packed unit, not the mode's
+  // nominal one.
+  //
+  // These are the real bytes of vertex 0 of shader 0x22D4B320 (NAT_Farm, 300 s
+  // run, mx_257.log), in guest order, with the endian=2 the stream's fetch
+  // constant carries. A literal 8-in-32 swap reverses each dword, which
+  // byte-swaps the two 16-bit components *and exchanges them*, yielding
+  // (y, x, w, z) = (0.263, 0.185, 1, 0.201) — a constant 1.0 sitting where z
+  // belongs. That shipped, and it is why the interpreter's positions never
+  // landed in the clip volume.
+  //
+  // The correct read is a homogeneous position, w last and equal to 1.
+  {
+    const uint8_t pos16x4[8] = {0x31, 0xED, 0x34, 0x37, 0x32, 0x72, 0x3C, 0x00};
+    mx::pm4::HleInputElement e;
+    // FLOAT16_4 at offset 0, POSITION 0 — format 32, float, identity swizzle.
+    if (MakeElement(0x002A2020u, mx::pm4::kUsagePosition, e)) {
+      float got[4];
+      if (!mx::pm4::ReadHleElement(pos16x4, 8, e, 2, got)) {
+        Fail("16_16_16_16_FLOAT with endian 8in32", "read refused");
+      } else {
+        const float want[4] = {0.185181f, 0.263428f, 0.201416f, 1.0f};
+        CheckFloat4("FLOAT16_4 endian 8in32 keeps component order", got, want);
+        std::printf("  %-28s -> (%g, %g, %g, %g)\n", "FLOAT16_4 8in32", got[0],
+                    got[1], got[2], got[3]);
+        if (got[2] == 1.0f && got[3] != 1.0f) {
+          Fail("FLOAT16_4 endian 8in32",
+               "the dword swap exchanged the component pair: w landed in z");
+        }
+      }
+    } else {
+      Fail("build element", "FLOAT16_4 POSITION");
+    }
+  }
+
+  // The same swap over a 32-bit format must still reverse the whole dword —
+  // narrowing the unit for every format would break colours instead.
+  {
+    const uint8_t be_color[4] = {0xFF, 0xC0, 0x80, 0x40};  // guest-order dword
+    mx::pm4::HleInputElement e;
+    if (MakeElement(0x001A2286u, mx::pm4::kUsageBlendIndices, e)) {
+      float got[4];
+      if (!mx::pm4::ReadHleElement(be_color, 4, e, 2, got)) {
+        Fail("8_8_8_8 with endian 8in32", "read refused");
+      } else {
+        // Reversed dword is 40 80 C0 FF; component 0 is the low byte.
+        const float want[4] = {64.0f, 128.0f, 192.0f, 255.0f};
+        CheckFloat4("8_8_8_8 endian 8in32 still swaps the whole dword", got,
+                    want);
       }
     }
   }
@@ -464,7 +517,7 @@ void CheckVertexDecode() {
     mx::pm4::HleInputElement e;
     if (MakeElement(0x002A2039u, mx::pm4::kUsagePosition, e)) {
       float got[4];
-      if (mx::pm4::ReadHleElement(f32x3, 8, e, got)) {
+      if (mx::pm4::ReadHleElement(f32x3, 8, e, 0, got)) {
         Fail("reject short vertex", "12-byte element read from 8 bytes");
       }
     }

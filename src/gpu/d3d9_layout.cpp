@@ -293,7 +293,8 @@ const HleInputElement* FindUsage(const HleInputLayout& layout, uint8_t usage,
 }
 
 bool ReadHleElement(const uint8_t* vertex_base, uint32_t vertex_bytes,
-                    const HleInputElement& element, float out[4]) {
+                    const HleInputElement& element, uint32_t endian,
+                    float out[4]) {
   // The two Type bits pick the interpretation. This is the whole reason the
   // D3D9 route exists: COLOR and BLENDINDICES are both k_8_8_8_8 and differ
   // only here, and a decode that ignored them would turn every bone index into
@@ -307,7 +308,8 @@ bool ReadHleElement(const uint8_t* vertex_base, uint32_t vertex_bytes,
 
   float raw[4];
   if (!ReadVertexAttributeAs(vertex_base, vertex_bytes, element.xenos_format,
-                             element.offset, element.size_bytes, num, raw)) {
+                             element.offset, element.size_bytes, num, endian,
+                             raw)) {
     return false;
   }
 

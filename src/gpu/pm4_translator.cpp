@@ -1213,7 +1213,8 @@ void Pm4Translator::ProbeAluExecution(const DrawCall& dc,
     const uint8_t* src = dc.vertices.data() + size_t(v) * src_stride;
     for (size_t i = 0; i < m_currentVs->attrs.size(); ++i) {
       float f[4] = {0, 0, 0, 1};
-      ReadVertexAttribute(src, src_stride, m_currentVs->attrs[i], f);
+      ReadVertexAttribute(src, src_stride, m_currentVs->attrs[i],
+                          dc.vertex_endian, f);
       for (int c = 0; c < 4; ++c) values[i][c] = f[c];
     }
     NoteAluExecution(ExecuteVertexShader(
@@ -1431,7 +1432,7 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
   for (uint32_t v = 0; v < dc.vertex_count; ++v) {
     const uint8_t* src = dc.vertices.data() + size_t(v) * src_stride;
     float p[4] = {0, 0, 0, 1};
-    if (!ReadVertexAttribute(src, src_stride, *pos, p)) {
+    if (!ReadVertexAttribute(src, src_stride, *pos, dc.vertex_endian, p)) {
       any_read_failed = true;
       ++s_unhandled[pos->format];
       break;
@@ -1443,7 +1444,8 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
       // as zero rather than as what the shader would have seen.
       for (size_t i = 0; i < m_currentVs->attrs.size(); ++i) {
         float f[4] = {0, 0, 0, 1};
-        ReadVertexAttribute(src, src_stride, m_currentVs->attrs[i], f);
+        ReadVertexAttribute(src, src_stride, m_currentVs->attrs[i],
+                            dc.vertex_endian, f);
         for (int c = 0; c < 4; ++c) attr_values[i][c] = f[c];
       }
       const AluResult r = ExecuteVertexShader(
@@ -1498,7 +1500,7 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
       // of eyeballed — the same reason the capture script buckets pixels.
       std::memcpy(c, tint, sizeof(c));
     } else if (col) {
-      ReadVertexAttribute(src, src_stride, *col, c);
+      ReadVertexAttribute(src, src_stride, *col, dc.vertex_endian, c);
     }
 
     uint8_t* dst = out.data() + size_t(v) * kOutStride;
@@ -1706,12 +1708,16 @@ void Pm4Translator::AttachVertices(DrawCall& dc, uint8_t* guest_base) {
   }
   dc.vertex_stride = read_stride;
 
-  // Apply the fetch constant's endian swap, per mode. This used to apply a
-  // 32-bit swap for any non-zero mode, on the grounds that the 16-bit formats
-  // could not be identified without the shader — which is no longer true, and
-  // the assumption was wrong anyway: both 8in16 (1) and 8in32 (2) occur in this
-  // game's fetch constants, 13 and 26 of the first 52 logged.
-  ApplyFetchEndian(dc.vertices.data(), dc.vertices.size(), pick->endian);
+  // Carry the fetch constant's endian mode; do not apply it here.
+  //
+  // This used to swap the whole buffer up front, correctly per mode (8in16 and
+  // 8in32 both occur in this game's fetch constants, 13 and 26 of the first 52
+  // logged) — but the *mode* is not the *width*. Reversing a dword that holds
+  // two 16-bit components byte-swaps each and exchanges the pair, so every
+  // (x, y, z, w=1) position was read as (y, x, w=1, z). One swap over a whole
+  // vertex cannot be right anyway: a vertex mixes 16-bit positions with 32-bit
+  // colours. The swap now happens per attribute, where the format is known.
+  dc.vertex_endian = pick->endian;
 
   // Transcode into the one layout the game PSO describes: POSITION float3 at 0,
   // COLOR float4 at 12, stride 28. Everything above this point produced the

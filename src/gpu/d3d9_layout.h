@@ -213,14 +213,17 @@ const HleInputElement* FindUsage(const HleInputLayout& layout, uint8_t usage,
                                  uint32_t usage_index);
 
 // Decode one element of one vertex to four floats. `vertex_base` points at the
-// start of the vertex within its own stream, already endian-corrected by
-// ApplyFetchEndian. Unwritten components come back (0,0,0,1).
+// start of the vertex within its own stream, **in guest byte order**; `endian`
+// is the stream's fetch swap mode and is applied per element at the format's own
+// unit width, which is the only place that width is known. Unwritten components
+// come back (0,0,0,1).
 //
 // The swizzle is applied here, unlike on the host-layout path where it belongs
 // in the shader — a CPU read has no shader to carry it.
 //
 // False for a format the decoder cannot describe, leaving `out` untouched.
 bool ReadHleElement(const uint8_t* vertex_base, uint32_t vertex_bytes,
-                    const HleInputElement& element, float out[4]);
+                    const HleInputElement& element, uint32_t endian,
+                    float out[4]);
 
 }  // namespace mx::pm4
