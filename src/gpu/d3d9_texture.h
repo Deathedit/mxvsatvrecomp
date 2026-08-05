@@ -31,5 +31,11 @@ bool DecodeHleTexture2D(const HleTextureSource& source,
                         const uint8_t* guest, size_t guest_bytes,
                         HleTexturePayload& out, const char** fail = nullptr);
 uint64_t HleTextureKey(const uint32_t fetch_words[6]);
+// Returns true when the decoded base mip contains more than an empty/cleared
+// backing store. This is intentionally format-agnostic: it is a guard against
+// publishing guest render-target storage that is all zero because the original
+// GPU dispatch is skipped, not an attempt to classify texture semantics.
+bool HleTextureHasNonzeroData(const HleTexturePayload& texture,
+                              size_t* nonzero_bytes = nullptr);
 
 }  // namespace mx::pm4

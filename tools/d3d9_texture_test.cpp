@@ -5,6 +5,7 @@
 
 #include "gpu/d3d9_texture.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -42,6 +43,13 @@ int main() {
   Check(decoded.data == std::vector<uint8_t>(rgba, rgba + 16),
         "linear RGBA8 bytes");
   Check(decoded.swizzle == 0x60A, "swizzle metadata retained");
+  size_t nonzero = 0;
+  Check(HleTextureHasNonzeroData(decoded, &nonzero) && nonzero == 15,
+        "RGBA8 activity count");
+  HleTexturePayload cleared = decoded;
+  std::fill(cleared.data.begin(), cleared.data.end(), 0);
+  Check(!HleTextureHasNonzeroData(cleared, &nonzero) && nonzero == 0,
+        "cleared texture rejected as empty");
 
   HleTextureSource swapped = linear;
   swapped.width = swapped.height = swapped.pitch_blocks = 1;

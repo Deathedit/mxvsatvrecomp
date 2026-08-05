@@ -32,6 +32,15 @@ uint64_t HleTextureKey(const uint32_t fetch_words[6]) {
   return h;
 }
 
+bool HleTextureHasNonzeroData(const HleTexturePayload& texture,
+                              size_t* nonzero_bytes) {
+  const size_t count = std::count_if(
+      texture.data.begin(), texture.data.end(),
+      [](uint8_t value) { return value != 0; });
+  if (nonzero_bytes) *nonzero_bytes = count;
+  return count != 0;
+}
+
 bool DescribeHleTexture2D(const uint32_t fetch_words[6],
                           HleTextureSource& out, const char** fail) {
   auto reject = [&](const char* why) {

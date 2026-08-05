@@ -436,8 +436,12 @@ class Interpreter {
   }
 
   void Execute(const uc::AluInstruction& alu) {
-    const uint32_t vmask = alu.vector_write_mask();
-    const uint32_t smask = alu.scalar_write_mask();
+    // The raw vector/scalar mask fields overlap with the export constant 0/1
+    // encoding. Use the canonical decoded masks for both temp and export writes.
+    // Treating the raw bits as ordinary masks happened to preserve position in
+    // many shaders, but turned interpolator exports (including UV r0) into zero.
+    const uint32_t vmask = alu.GetVectorOpResultWriteMask();
+    const uint32_t smask = alu.GetScalarOpResultWriteMask();
 
     // Evaluate both halves. They read the register file before either writes,
     // which is the co-issue semantics.
@@ -459,16 +463,16 @@ class Interpreter {
         target = &exports[dest];
       }
       if (!target) return;
-      // Export write masking is its own scheme, per component:
-      //   v=1 s=0 -> vector result     v=0 s=1 -> scalar result
-      //   v=1 s=1 -> constant 1
-      //   v=0 s=0 -> unchanged, or constant 0 if scalar_dest_rel is set
+      const uint32_t zero_mask = alu.GetConstant0WriteMask();
+      const uint32_t one_mask = alu.GetConstant1WriteMask();
+      const uint32_t written_mask = vmask | smask | zero_mask | one_mask;
+      if (!written_mask) return;
       for (uint32_t c = 0; c < 4; ++c) {
-        const bool vb = (vmask >> c) & 1, sb = (smask >> c) & 1;
-        if (vb && sb) (*target)[c] = 1.0f;
-        else if (vb) (*target)[c] = vres[c];
-        else if (sb) (*target)[c] = sres;
-        else if (alu.is_scalar_dest_relative()) (*target)[c] = 0.0f;
+        const uint32_t bit = 1u << c;
+        if (vmask & bit) (*target)[c] = vres[c];
+        else if (smask & bit) (*target)[c] = sres;
+        else if (one_mask & bit) (*target)[c] = 1.0f;
+        else if (zero_mask & bit) (*target)[c] = 0.0f;
       }
       return;
     }

@@ -807,7 +807,8 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
       PrepareDrawTexture(dc, st.ps_seen ? st.pixel_shader : 0, device, base,
                          texture_binding);
   if (have_texture && texture_binding.sampler < kMaxSamplers) {
-    const uint32_t texture_object = st.texture[texture_binding.sampler].object;
+    const auto& sampled_texture = st.texture[texture_binding.sampler];
+    const uint32_t texture_object = sampled_texture.object;
     if (const auto it = g_resolvedTextureTargets.find(texture_object);
         it != g_resolvedTextureTargets.end()) {
       dc.sampled_render_target_object = it->second;
@@ -1824,6 +1825,9 @@ ShaderApplyResult ApplyShaderOutputs(
   std::vector<std::array<float, 4>> values(attrs.size());
   uint64_t applied_vertices = 0;
   uint64_t identity_in_clip = 0, viewport_in_clip = 0;
+  uint64_t uv_vertices = 0, uv_missing_export = 0;
+  float uv_min[2] = {1.0e30f, 1.0e30f};
+  float uv_max[2] = {-1.0e30f, -1.0e30f};
   for (uint32_t v = 0; v < dc.vertex_count; ++v) {
     if (!referenced[v]) continue;
     const uint64_t src = uint64_t(dc.first_vertex) + v;
@@ -1866,19 +1870,43 @@ ShaderApplyResult ApplyShaderOutputs(
     const float p[3] = {r.position[0], r.position[1], r.position[2]};
     std::memcpy(transformed.data() + size_t(v) * dc.vertex_stride, p,
                 sizeof(p));
-    if (texture_binding && dc.texture &&
+    // Resolved render-target samples intentionally carry no CPU texture
+    // payload: the renderer samples the ordered target resource instead. UVs
+    // are shader outputs and must be populated for both resource paths. The old
+    // `dc.texture` guard left every resolved sample at BuildHleDraw's default
+    // (0,0), which explains the flat single-texel compositor wedges.
+    if (texture_binding &&
         texture_binding->src_reg < AluResult::kMaxInterpolators &&
         (r.export_mask & (1u << texture_binding->src_reg))) {
       const auto& e = r.exports[texture_binding->src_reg];
       const uint32_t sx = (texture_binding->src_swizzle >> 0) & 3u;
       const uint32_t sy = (texture_binding->src_swizzle >> 2) & 3u;
       float uv[2] = {e[sx], e[sy]};
+      bool uv_valid = true;
       if (texture_binding->unnormalized) {
-        uv[0] /= float(dc.texture->width);
-        uv[1] /= float(dc.texture->height);
+        const uint32_t width = dc.texture ? dc.texture->width
+                                          : dc.sampled_texture_width;
+        const uint32_t height = dc.texture ? dc.texture->height
+                                           : dc.sampled_texture_height;
+        if (!width || !height) {
+          ++uv_missing_export;
+          uv_valid = false;
+        } else {
+          uv[0] /= float(width);
+          uv[1] /= float(height);
+        }
       }
-      std::memcpy(transformed.data() + size_t(v) * dc.vertex_stride + 28,
-                  uv, sizeof(uv));
+      if (uv_valid && std::isfinite(uv[0]) && std::isfinite(uv[1])) {
+        std::memcpy(transformed.data() + size_t(v) * dc.vertex_stride + 28,
+                    uv, sizeof(uv));
+        uv_min[0] = std::min(uv_min[0], uv[0]);
+        uv_min[1] = std::min(uv_min[1], uv[1]);
+        uv_max[0] = std::max(uv_max[0], uv[0]);
+        uv_max[1] = std::max(uv_max[1], uv[1]);
+        ++uv_vertices;
+      }
+    } else if (texture_binding) {
+      ++uv_missing_export;
     }
 
     // VTE scale/offset enable state is draw state, but the HLE draw entry point
@@ -1906,6 +1934,24 @@ ShaderApplyResult ApplyShaderOutputs(
   }
 
   dc.vertices = std::move(transformed);
+  if (texture_binding) {
+    static uint64_t s_uv_reports = 0;
+    const bool collapsed = uv_vertices &&
+        std::abs(uv_max[0] - uv_min[0]) < 1.0e-6f &&
+        std::abs(uv_max[1] - uv_min[1]) < 1.0e-6f;
+    if (++s_uv_reports <= 32 || (collapsed && s_uv_reports <= 256) ||
+        (s_uv_reports % 1000) == 0) {
+      REXLOG_INFO(
+          "d3d9: HLE UV r{} swiz=0x{:02X} denorm={} wrote {}/{} missing {}; "
+          "range ({:.5g},{:.5g})..({:.5g},{:.5g}) collapsed={} cpu={} "
+          "resolved=0x{:08X} extent={}x{}",
+          texture_binding->src_reg, texture_binding->src_swizzle,
+          texture_binding->unnormalized, uv_vertices, applied_vertices,
+          uv_missing_export, uv_min[0], uv_min[1], uv_max[0], uv_max[1],
+          collapsed, bool(dc.texture), dc.sampled_render_target_object,
+          dc.sampled_texture_width, dc.sampled_texture_height);
+    }
+  }
   if (identity_in_clip > viewport_in_clip) {
     static constexpr float kIdentity[16] = {
         1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
@@ -1996,6 +2042,7 @@ struct ResolvedPixelBinding {
 std::map<uint32_t, ResolvedPixelBinding> g_resolvedPixelBindings;
 std::map<uint64_t, std::shared_ptr<const mx::pm4::HleTexturePayload>>
     g_hleCpuTextures;
+std::map<uint64_t, bool> g_hleEmptyTextures;
 
 const ResolvedPixelBinding* ResolvePixelProfile(uint32_t handle) {
   const auto& captured = mx::pm4::CapturedPixelShaders();
@@ -2205,20 +2252,50 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
     mx::pm4::HleTextureSource source;
     if (!mx::pm4::DescribeHleTexture2D(fetch, source, nullptr)) continue;
 
-    int score = candidate.unnormalized ? 0 : 20;
+    // A D3D9 Resolve establishes an ordered host render-target dependency.
+    // Its guest backing may legitimately be all zero in native mode because
+    // the skipped Xenos dispatch never populated that memory, so this identity
+    // is stronger evidence than the descriptor's storage format.
+    const auto& texture_state = DeviceState().texture[candidate.sampler];
+    const bool mapped_render_target =
+        texture_state.object &&
+        g_resolvedTextureTargets.contains(texture_state.object);
+    const uint64_t candidate_key = mx::pm4::HleTextureKey(fetch);
+    if (!mapped_render_target && g_hleEmptyTextures.contains(candidate_key))
+      continue;
+    if (!mapped_render_target &&
+        (source.host_format == mx::pm4::HostTextureFormat::kBc5 ||
+         source.host_format == mx::pm4::HostTextureFormat::kR16Float ||
+         source.host_format == mx::pm4::HostTextureFormat::kRgba16Float))
+      continue;
+    // A mapped render target is authoritative storage, but it is not normally
+    // the visible base colour of a material. Multi-input world shaders often
+    // combine one or more scene/intermediate targets with immutable colour
+    // atlases. Giving mapped targets absolute priority made those shaders
+    // sample a black native-mode intermediate instead of their BC1 diffuse
+    // texture. Prefer normalized immutable colour assets when both kinds are
+    // present. The observed final compositor is handled explicitly above and
+    // still selects its mapped s0 scene input.
+    int score = mapped_render_target ? 40 :
+                (candidate.unnormalized ? 0 : 200);
     switch (source.host_format) {
       case mx::pm4::HostTextureFormat::kRgba8:
       case mx::pm4::HostTextureFormat::kBc1:
       case mx::pm4::HostTextureFormat::kBc2:
       case mx::pm4::HostTextureFormat::kBc3:
-        score += 100;
+        score += mapped_render_target ? 40 : 200;
         break;
       case mx::pm4::HostTextureFormat::kR16Float:
       case mx::pm4::HostTextureFormat::kRgba16Float:
-        score += 40;
+        // Float descriptors observed in ST_Southwest are render/resolve
+        // intermediates. Only the mapped host-target path above may select
+        // them; immutable guest copies are black while GPU dispatch is skipped.
+        score += mapped_render_target ? 30 : 0;
         break;
       case mx::pm4::HostTextureFormat::kBc5:
-        score += 10;
+        // DXN/BC5 is a normal map. Keep support for inspection and future
+        // shader translation, but never prefer it as visible base colour.
+        score += mapped_render_target ? 10 : 0;
         break;
     }
     if (score <= best_score) continue;
@@ -2230,11 +2307,14 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
   if (!found) return false;
   static std::map<uint32_t, bool> s_logged;
   if (s_logged.size() < 32 && s_logged.emplace(handle, true).second) {
+    const auto& selected_state = DeviceState().texture[out.sampler];
+    const bool mapped = selected_state.object &&
+                        g_resolvedTextureTargets.contains(selected_state.object);
     REXLOG_INFO("d3d9: selected s{} r{} {}x{} format {} from {}-fetch "
-                "pixel shader 0x{:08X} (descriptor score {})",
+                "pixel shader 0x{:08X} (descriptor score {}, mapped {})",
                 out.sampler, out.src_reg, best_source.width,
                 best_source.height, uint32_t(best_source.host_format),
-                profile->bindings.size(), handle, best_score);
+                profile->bindings.size(), handle, best_score, mapped);
   }
   return true;
 }
@@ -2341,6 +2421,7 @@ bool PrepareDrawTexture(mx::pm4::DrawCall& dc, uint32_t pixel_shader,
   using namespace mx::pm4;
   static uint64_t s_attempts = 0, s_ready = 0, s_no_shader = 0;
   static uint64_t s_no_binding = 0, s_bad_desc = 0, s_unreadable = 0;
+  static uint64_t s_mapped = 0, s_empty = 0, s_semantic_reject = 0;
   ++s_attempts;
   if ((!pixel_shader ||
        !ResolvePixelBindingForDraw(pixel_shader, device, base, binding)) &&
@@ -2363,6 +2444,26 @@ bool PrepareDrawTexture(mx::pm4::DrawCall& dc, uint32_t pixel_shader,
       REXLOG_INFO("d3d9: HLE texture fallback: sampler {} out of range",
                   binding.sampler);
     return false;
+  }
+  const auto& texture_state = DeviceState().texture[binding.sampler];
+  if (texture_state.object &&
+      g_resolvedTextureTargets.contains(texture_state.object)) {
+    ++s_mapped;
+    // The resolved texture still owns a normal fetch descriptor. Capture its
+    // logical extent before taking the host-target path so denormalized shader
+    // coordinates can be converted without requiring a CPU payload.
+    uint32_t mapped_fetch[6] = {};
+    HleTextureSource mapped_source;
+    const char* mapped_why = nullptr;
+    if (ReadLiveTextureFetch(device, base, binding.sampler, mapped_fetch) &&
+        DescribeHleTexture2D(mapped_fetch, mapped_source, &mapped_why)) {
+      dc.sampled_texture_width = mapped_source.width;
+      dc.sampled_texture_height = mapped_source.height;
+    }
+    // The renderer samples the live host render target identified below. Do
+    // not also upload its stale/empty guest storage as an immutable texture.
+    dc.texture.reset();
+    return true;
   }
   uint32_t fetch[6] = {};
   if (!ReadLiveTextureFetch(device, base, binding.sampler, fetch)) {
@@ -2387,7 +2488,24 @@ bool PrepareDrawTexture(mx::pm4::DrawCall& dc, uint32_t pixel_shader,
     }
     return false;
   }
+  dc.sampled_texture_width = source.width;
+  dc.sampled_texture_height = source.height;
+  if (source.host_format == HostTextureFormat::kBc5 ||
+      source.host_format == HostTextureFormat::kR16Float ||
+      source.host_format == HostTextureFormat::kRgba16Float) {
+    ++s_semantic_reject;
+    if (s_semantic_reject <= 12) {
+      REXLOG_INFO("d3d9: HLE texture fallback: sampler {} format {} is not "
+                  "an immutable colour asset",
+                  binding.sampler, uint32_t(source.host_format));
+    }
+    return false;
+  }
   const uint64_t key = HleTextureKey(fetch);
+  if (g_hleEmptyTextures.contains(key)) {
+    ++s_empty;
+    return false;
+  }
   auto cached = g_hleCpuTextures.find(key);
   if (cached != g_hleCpuTextures.end()) {
     dc.texture = cached->second;
@@ -2412,18 +2530,32 @@ bool PrepareDrawTexture(mx::pm4::DrawCall& dc, uint32_t pixel_shader,
                   why ? why : "?");
     return false;
   }
+  size_t nonzero_bytes = 0;
+  if (!HleTextureHasNonzeroData(*payload, &nonzero_bytes)) {
+    g_hleEmptyTextures.emplace(key, true);
+    ++s_empty;
+    if (s_empty <= 12) {
+      REXLOG_INFO("d3d9: HLE texture fallback: sampler {} {}x{} format {} "
+                  "decoded to an all-zero guest payload",
+                  binding.sampler, source.width, source.height,
+                  uint32_t(source.host_format));
+    }
+    return false;
+  }
   payload->key = key;
   dc.texture = payload;
   g_hleCpuTextures.emplace(key, std::move(payload));
   ++s_ready;
   if (s_ready <= 8 || (s_attempts % 2500) == 0) {
-    REXLOG_INFO("d3d9: HLE textures attempts {} ready {} cached {} no-shader "
-                "{} no-binding {} bad-desc {} unreadable {}; latest {}x{} "
-                "format {} in viewport {}x{}",
-                s_attempts, s_ready, g_hleCpuTextures.size(), s_no_shader,
-                s_no_binding, s_bad_desc, s_unreadable, dc.texture->width,
+    REXLOG_INFO("d3d9: HLE textures attempts {} ready {} mapped {} cached {} "
+                "empty {} semantic-reject {} no-shader {} no-binding {} "
+                "bad-desc {} unreadable {}; latest {}x{} format {} in "
+                "viewport {}x{} ({} nonzero bytes)",
+                s_attempts, s_ready, s_mapped, g_hleCpuTextures.size(), s_empty,
+                s_semantic_reject, s_no_shader, s_no_binding, s_bad_desc,
+                s_unreadable, dc.texture->width,
                 dc.texture->height, uint32_t(dc.texture->format),
-                dc.viewport_width, dc.viewport_height);
+                dc.viewport_width, dc.viewport_height, nonzero_bytes);
   }
   return true;
 }
@@ -3681,7 +3813,40 @@ void CapturePatchedCode(uint32_t self, uint32_t dest, uint32_t variant,
       break;
     }
   }
-  g_patchedCode[self] = std::move(pc);
+  // A ring-window read is inherently transient: the destination may wrap or
+  // be overwritten between the original call and this hook's copy. Never let
+  // such a failed observation destroy a previously proven capture for the
+  // same shader variant. This used to turn valid shaders back into
+  // "no exact patched code" later in the frame.
+  const bool same_variant_as_known = known && it->second.variant == variant;
+  static uint64_t s_capture_attempts = 0;
+  static uint64_t s_capture_resolved = 0;
+  static uint64_t s_capture_preserved = 0;
+  static uint64_t s_capture_invalidated = 0;
+  ++s_capture_attempts;
+  const bool capture_resolved = pc.resolved;
+  if (capture_resolved) {
+    g_patchedCode[self] = std::move(pc);
+    ++s_capture_resolved;
+  } else if (same_variant_as_known) {
+    ++s_capture_preserved;
+  } else {
+    // A different variant is a different program. Refuse to use stale exact
+    // code if the replacement could not itself be captured.
+    if (known) {
+      g_patchedCode.erase(it);
+      ++s_capture_invalidated;
+    }
+  }
+  if (s_capture_attempts <= 24 || (s_capture_attempts % 1000) == 0) {
+    REXLOG_INFO(
+        "d3d9: patched VS capture {} self=0x{:08X} bound=0x{:08X} "
+        "variant={} fetches={} resolved={} totals resolved {} preserved {} "
+        "invalidated {}",
+        s_capture_attempts, self, DeviceState().vertex_shader, variant,
+        expect_fetches, capture_resolved, s_capture_resolved, s_capture_preserved,
+        s_capture_invalidated);
+  }
 }
 
 // After the original ran: did it write what the rule predicts?
@@ -4240,6 +4405,11 @@ extern "C" REX_FUNC(sub_82564C50) {
 
 REX_IMPORT(__imp__sub_825565C8, orig_DrawIndexedVertices, void());
 extern "C" REX_FUNC(sub_825565C8) {
+  const uint32_t primitive_type = ctx.r4.u32;
+  const int32_t base_vertex = ctx.r5.s32;
+  const uint32_t start_index = ctx.r6.u32;
+  const uint32_t index_count = ctx.r7.u32;
+  const uint32_t device = ctx.r3.u32;
   const uint64_t n = ++g_indexed_draws;
   ++mx::pm4::D3D9DrawCounter();
   if (REXCVAR_GET(hle_capture))
@@ -4255,11 +4425,6 @@ extern "C" REX_FUNC(sub_825565C8) {
       << " start_index=" << ctx.r6.u32 << " index_count=" << ctx.r7.u32 << "\n";
     f.flush();
   }
-  if (REXCVAR_GET(hle_render)) {
-    // r4 PrimitiveType, r5 BaseVertexIndex, r6 StartIndex, r7 IndexCount.
-    BuildAndQueueDraw(/*indexed=*/true, ctx.r4.u32, ctx.r6.u32, ctx.r7.u32,
-                      ctx.r5.s32, ctx.r3.u32, base);
-  }
   if (REXCVAR_GET(hle_capture)) {
     DeviceState().NoteDevice(ctx.r3.u32, mx::pm4::kEpDraw);
     SampleFetchConstantFile(ctx.r3.u32, base);
@@ -4267,8 +4432,16 @@ extern "C" REX_FUNC(sub_825565C8) {
     DumpHleDraw(/*indexed=*/true, n, ctx.r4.u32, ctx.r5.s32, ctx.r6.u32,
                 ctx.r7.u32);
   }
-  ReportDrawCounts(base);
   orig_DrawIndexedVertices(ctx, base);
+  // The original draw performs D3D9's lazy vertex-shader patching. Translate
+  // after it returns so a shader's first draw can use the exact patched code
+  // captured by sub_82564C50 during this call. Save the PPC arguments above:
+  // the guest call is free to clobber volatile registers.
+  if (REXCVAR_GET(hle_render)) {
+    BuildAndQueueDraw(/*indexed=*/true, primitive_type, start_index,
+                      index_count, base_vertex, device, base);
+  }
+  ReportDrawCounts(base);
 }
 
 //=============================================================================
@@ -4281,6 +4454,10 @@ extern "C" REX_FUNC(sub_825565C8) {
 
 REX_IMPORT(__imp__sub_825561B0, orig_DrawVertices, void());
 extern "C" REX_FUNC(sub_825561B0) {
+  const uint32_t primitive_type = ctx.r4.u32;
+  const uint32_t start_vertex = ctx.r5.u32;
+  const uint32_t vertex_count = ctx.r6.u32;
+  const uint32_t device = ctx.r3.u32;
   const uint64_t n = ++g_draws;
   ++mx::pm4::D3D9DrawCounter();
   if (REXCVAR_GET(hle_capture))
@@ -4293,19 +4470,20 @@ extern "C" REX_FUNC(sub_825561B0) {
       << " vertex_count=" << ctx.r6.u32 << "\n";
     f.flush();
   }
-  if (REXCVAR_GET(hle_render)) {
-    // r4 PrimitiveType, r5 StartVertex, r6 VertexCount.
-    BuildAndQueueDraw(/*indexed=*/false, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, 0,
-                      ctx.r3.u32, base);
-  }
   if (REXCVAR_GET(hle_capture)) {
     DeviceState().NoteDevice(ctx.r3.u32, mx::pm4::kEpDraw);
     SampleFetchConstantFile(ctx.r3.u32, base);
     ScoreDraw(/*indexed=*/false, ctx.r5.u32, ctx.r6.u32, ctx.r3.u32, base);
     DumpHleDraw(/*indexed=*/false, n, ctx.r4.u32, 0, ctx.r5.u32, ctx.r6.u32);
   }
-  ReportDrawCounts(base);
   orig_DrawVertices(ctx, base);
+  // See the indexed path above: the original call makes the current patched
+  // vertex shader observable for this same draw.
+  if (REXCVAR_GET(hle_render)) {
+    BuildAndQueueDraw(/*indexed=*/false, primitive_type, start_vertex,
+                      vertex_count, 0, device, base);
+  }
+  ReportDrawCounts(base);
 }
 
 //=============================================================================

@@ -127,6 +127,12 @@ struct DrawCall {
   // from the CPU texture payload because a resolve is an ordered GPU operation,
   // not immutable guest-memory content.
   uint32_t sampled_render_target_object = 0;
+  // Extent of the D3D9 texture object selected by the pixel fetch. This is
+  // needed even for resolved render-target samples, which deliberately have no
+  // CPU texture payload, because an unnormalized tfetch still needs conversion
+  // to the normalized coordinates consumed by the host sampler.
+  uint32_t sampled_texture_width = 0;
+  uint32_t sampled_texture_height = 0;
   std::shared_ptr<const HleTexturePayload> texture;
 
   // Where TranscodeVertices got this draw's vertex colour, so LogSurface can
