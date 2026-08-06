@@ -11,6 +11,13 @@ with a host D3D12 renderer replacing the Xenos GPU. The `rexgpu-xenos` plugin is
 > cross-checked from more than one source). The old text and the four deleted
 > `docs/*.md` files remain in git history if something is wanted back — but
 > treat anything recovered from there as a claim to re-verify, not as fact.
+> `docs/` exists again but holds none of that text — see below.
+
+**Guest-binary analysis lives in [docs/guest_binary.md](docs/guest_binary.md).**
+Addresses, vtables, struct offsets, register layouts and the IDA workflow are
+properties of a shipped 2010 binary and never change; this file covers the host
+port and what we measured. Where a section below drops a table, that is where it
+went.
 
 ---
 
@@ -178,8 +185,9 @@ rather than assumed:
   5-entry ring at `a1+36..a1+52`, guarded by `if (*(a1+28))`. Observed 0.
 
 The stub wrote a fixed `1/60` to `a1+24` and nothing else. The real function also
-maintains `a1+56` (the 5-sample smoothing sum), **`a1+60`, total elapsed time**,
-`a1+64`, `a1+104` and `a1+112`. A front end that advances on elapsed time had
+maintains a 5-sample smoothing sum and, decisively, **total elapsed time** — full
+field map in [docs/guest_binary.md](docs/guest_binary.md). A front end that
+advances on elapsed time had
 nothing to advance on — the measured symptom was `f1` arriving at
 `RendererDispatch` as exactly `0.00` in native and varying under the plugin.
 
@@ -207,20 +215,17 @@ The chain, each step measured:
 - Tracing the load-request API upward through the recompiled sources dead-ends.
   Four of the five functions above `sub_82352AE0` have **zero** direct callers,
   and they are not virtual methods either.
-- They are entries in a **name → function binding table at `0x8203F2E0`** — 228
-  pairs of `const char*` and code pointer, registered from `sub_824F1C98`
-  (site 0x824F1E1C). The vocabulary is a scripting API.
+- They are entries in a **name → function binding table** of 228 `const char*`
+  and code-pointer pairs. The vocabulary is a scripting API. Addresses and slot
+  indices: [docs/guest_binary.md](docs/guest_binary.md).
 
-| Binding | Address | |
-|---|---|---|
-| `[6] LoadAssetDB` | `0x824AF3C0` | |
-| `[10] ExecuteScriptAsset` | `0x824AF838` | **fires twice, then never** |
-| `[40] GetUIState` | `0x824BBA40` | |
-| `[50] LoadUIAssetPackage` | `0x824CBF90` | never fires |
-| `[53] LoadUIAssetDatabasePackage` | `0x824CC218` | never fires |
-| `[66] StartWorldLoad` | `0x824CD280` | never fires — reaches `sub_82534980` |
-| `[67] EnableWorld` | `0x824CD308` | |
-| `[110] SwitchToUIWorld` | `0x824D0F18` | never fires |
+| Binding | |
+|---|---|
+| `ExecuteScriptAsset` | **fires twice, then never** |
+| `LoadUIAssetPackage` | never fires |
+| `LoadUIAssetDatabasePackage` | never fires |
+| `StartWorldLoad` | never fires — reaches the load-request API |
+| `SwitchToUIWorld` | never fires |
 
 - `ExecuteScriptAsset` validates one `char const*` argument and passes it to
   `sub_824F91E8`, whose `r3` is therefore the script asset name in plain guest
@@ -249,10 +254,9 @@ native: script asset #2 "UI_Helper" (ptr=0x2040A5D0) from lr=0x824AF8B0
   `PlayerMode`, by the loader's own gate. `Location`, the key naming the scene to
   load, is never read.
 
-**The script layer is a Lua VM.** `sub_82AA7638` is the call handler and carries
-the familiar strings (`"stack overflow"` via `sub_82AA9D48`); `sub_82A9F4F8` is
-the `luaL_error`-style reporter that `ExecuteScriptAsset` uses for argument
-mismatches; `SH_LuaDataProvider` is in the asset list. So the next move is to
+**The script layer is a Lua VM** — call handler, error reporters and struct
+offsets in [docs/guest_binary.md](docs/guest_binary.md); `SH_LuaDataProvider` is
+in the asset list. So the next move is to
 hook those two error paths and ask the direct question: **is the root script
 throwing?** A script that dies on statement three looks exactly like this from
 the outside.
@@ -451,19 +455,12 @@ test that would let the whole dependency go; it has not been run.
 
 ### The guest opens Bink under the plugin and never natively (2026-08-06)
 
-Bink is statically linked into the XEX the same way D3D9 is: a `BINKCONS` data
-segment at `0x821CD1D0` and library code from about `0x82CEB650` to `0x82CF0508`.
-The guest carries a complete decoder.
+Bink is statically linked into the XEX the same way D3D9 is; the guest carries a
+complete decoder. Segment, symbols, vtables and open flags:
+[docs/guest_binary.md](docs/guest_binary.md).
 
-| Symbol | Address | How it was identified |
-|---|---|---|
-| `BinkOpen(path, flags)` | `sub_82CEB7C8` | Owns `"Not a Bink file."` (`0x82144B9C`) and `"Error reading Bink header."` (`0x82144B28`), referenced nowhere else. Two callers total, so it is *the* choke point |
-| `XenonBinkVideoManager::Open` | `sub_8234E0A8` | vtable `0x82017510` slot [1]; formats `"game:\%s.bik"` |
-| `XenonBinkVideoManager::Open` | `sub_8234E290` | slot [2]; formats `"%s.bik"` |
-| `BinkAsset::Init` | `sub_8234CBB8` | Reads `"Texture To Override"`, then resolves `"Bink Video Asset"` and requests fourcc `1651076715` = `0x62696E6B` = `'bink'` |
-| `XenonBinkVideo` vtable | `0x820172BC` | 12 entries; HBINK at object `+144`, its critical section at `+156` |
-
-Probes on the first four are in `hooks_plugin_diag.cpp` and are mode-neutral.
+Probes on `BinkOpen`, both manager `Open`s and `BinkAsset::Init` are in
+`hooks_plugin_diag.cpp` and are mode-neutral.
 **4 native runs, 2 plugin runs, `--skip_intro=true`, no `--force_load`:**
 
 | | native 4/4 | plugin 2/2 |
@@ -477,9 +474,7 @@ Probes on the first four are in `hooks_plugin_diag.cpp` and are mode-neutral.
 
 Under the plugin the guest opens `game:\Videos\THQ_Logo_wSound.bik`,
 `Attract.ENG.bik` and `FE_Smoke.bik` itself, in that order, roughly 3 s in. The
-flags confirm the static read of `sub_8234E0A8`: `a4=1` gives `0x00102400`
-(`0x2000|0x100400`) and `a4=0` gives `0x01100400`, the branch that first calls
-`sub_82CEB3F0(10485760)`.
+observed flags match the static read of the manager's two branches exactly.
 
 **Natively not one video is ever opened.** `BinkAsset::Init` still fires — which
 is what proves the probe is live rather than absent — but its asset handle comes
@@ -512,18 +507,11 @@ key in `.rdata`.
 | plugin, every extra string key | `0x824AA590` | `sub_824AA568`, called only by `sub_824B1C20` |
 | plugin, every int key | `0x824AA518` | `sub_824AA4F8`, called only by `sub_824B1788` |
 
-`sub_824B1C20` is the **Lua binding `GetVariableString`**: it validates its
-arguments through the same `sub_82A9F4F8` reporter as `ExecuteScriptAsset` and
-names itself `VariableCollection_GetVariableString` in its own error strings.
-`sub_824B1788` is the int twin, `GetVariableInt`. Both are registered in a
-second `(name, func)` table in `.data` around `0x82D1B21C`, distinct from the
-228-entry one at `0x8203F2E0`.
-
-**Correction:** an earlier version of this section put those two in a table at
-`0x821A1740`/`0x821A1750`. That is `.pdata` — function address plus unwind
-flags — not a binding table. Same mistake as reading `0x82198B50` as a vtable;
-the giveaway both times is a second dword like `0x400003A3` that is not a
-pointer. Check that before reading any address pair as `(x, func)`.
+Those callers are the Lua bindings `GetVariableString` and `GetVariableInt`,
+registered in a second `(name, func)` table distinct from the 228-entry one —
+see [docs/guest_binary.md](docs/guest_binary.md), whose **Traps** section also
+records the `.pdata` block an earlier version of this text misread as that
+table.
 
 So this is not a settings file being consulted. **It is the front-end script
 reading its own state**, and under the plugin it reads a recognisable boot
@@ -549,20 +537,10 @@ and confirm with `Get-Process mx` that exactly one is running.
 
 ### Native and plugin run the same 28 script calls, then native stops (2026-08-06)
 
-`sub_82AA7638` is Lua's `luaD_precall`, and its `r4` is the `func` StkId, so the
-callee is readable before it runs:
-
-| offset | meaning |
-|---|---|
-| `*(func + 8) == 6` | `TValue.tt`, `LUA_TFUNCTION` |
-| `*(func + 0)` | the `Closure` |
-| `*(closure + 6)` | `isC` — a C binding rather than Lua bytecode |
-| `*(closure + 16)` | the C function pointer, for `isC` closures |
-
-Lua 5.1 offsets, confirmed against this binary rather than assumed: the
-function's own Lua-closure branch reads Proto fields at `+73` numparams, `+74`
-is_vararg, `+75` maxstacksize, `+12` code, and reports `"stack overflow"` at
-exactly the 20000 limit.
+The VM's call handler is Lua's `luaD_precall`, and the callee is readable before
+it runs — the `TValue`, `Closure` and `Proto` offsets, confirmed against this
+binary rather than assumed, are in
+[docs/guest_binary.md](docs/guest_binary.md).
 
 **The old "4 VM dispatches" figure was a rate-limiting artifact.** The previous
 probe logged the first four and then one line per 5 s, so the true count was
@@ -631,9 +609,9 @@ incomplete. A front end that advances on elapsed time would never advance.
 That is a lead, not a conclusion: dt is one measured difference on one call, and
 nothing yet connects it to the VM entry. Test it before believing it.
 
-Caveat on naming: `0x829E8FA8` is a bare `return 0` with hundreds of xrefs, so
-identical-code folding makes several trivial bindings share one address. A
-`cfunc` value alone cannot name such a binding; the native/plugin *sequence
+Caveat on naming: identical-code folding makes several trivial bindings share
+one address (see **Traps** in [docs/guest_binary.md](docs/guest_binary.md)), so a
+`cfunc` value alone cannot name such a binding. The native/plugin *sequence
 diff* is what carries the result, and it needs no names.
 
 ### Draws land outside the clip volume on z (2026-08-06)
@@ -677,7 +655,8 @@ through `CapturedPixelShaders()` — 14 shaders decoded only with the ring live,
 all 14 via its exact key. It was caught only by checking a counter the gate had
 not been designed around. When retiring a subsystem, enumerate its consumers
 first and measure each; a headline number from one of them proves nothing about
-the rest. (That dependency is now gone — see the pixel shader object table.)
+the rest. (That dependency is now gone — see the pixel shader object table in
+[docs/guest_binary.md](docs/guest_binary.md).)
 
 **The untranscoded share depends entirely on `--force_load`, so always state
 which.** Measured at equal `done 5000`: with `--force_load=NAT_Farm`,
@@ -724,11 +703,8 @@ ran.
 ## D3D9 HLE rendering
 
 The working approach. D3D9 is linked statically into the XEX, so there is no
-import table — but static linking removes the imports, not the functions.
-Entry points were located by matching COFF symbols from a genuine Xbox 360
-`d3d9.lib` (machine `0x01F2`, PowerPC BE); `tools/match_d3d9.py` regenerates the
-patterns. **FLIRT/FLAIR does not work here and is not needed** — the COFF symbol
-tables parse directly and give more.
+import table; how the entry points were located anyway, and the addresses
+themselves, are in [docs/guest_binary.md](docs/guest_binary.md).
 
 ### The transform choice is a register, not a contest (2026-08-06)
 
@@ -738,20 +714,13 @@ viewport. With `in-clip` commonly 0 for both candidates, most draws defaulted
 rather than won: measured, that rule disagreed with the hardware on **87789 of
 106132 draws (82.7%)**.
 
-The hardware states the answer. **PA_CL_VTE_CNTL (0x2206)** says whether the GPU
-applies the viewport transform itself, which is exactly the question. Its shadow
-follows the pattern already established for `SQ_PROGRAM_CNTL`: the draw-time
-flush issues `sub_82564768(device, 0, 8704, device + 10548)` with 8704 = 0x2200
-= RB_DEPTHCONTROL, and `sub_82564768` sends register `base + i` from
-`shadow + i*4`, so **0x2206 lives at `device + 10572`**.
-
-That derivation contradicted this file's note that VTE_CNTL is 0x300, so it was
-checked before being acted on. Dumping the surrounding dwords settled it — 17
-dwords below `+10572` are `640.0, 640.0, -90.0, 90.0, 1.0`, which are
-`PA_CL_VPORT_XSCALE/XOFFSET/YSCALE/YOFFSET/ZSCALE` (0x210F..0x2113); the 0x2100
-block's own shadow base (`device + 10444`) puts XSCALE at `10444 + 15*4 = 10504`,
-exactly there. 640 is half of 1280. **The offset is right and the 0x300 note is
-stale.**
+The hardware states the answer. **`PA_CL_VTE_CNTL`** says whether the GPU applies
+the viewport transform itself, which is exactly the question. Its shadow offset
+was derived from the draw-time flush and then corroborated against the viewport
+scale/bias dwords sitting beside it — derivation in
+[docs/guest_binary.md](docs/guest_binary.md). It contradicted an earlier note in
+this file claiming a different register address, so it was checked before being
+acted on; the earlier note was stale.
 
 The register reads **0x43F**, one value across every draw: all six viewport
 enables set, `vtx_w0_fmt` set. The GPU applies the viewport, so the shader
@@ -781,71 +750,12 @@ compositor still paints one texel over everything. **The UV collapse is now the
 thing in front — it is what makes the frame unreadable, whichever transform is
 in use.**
 
-### Entry points
+### Entry points and device offsets
 
-| function | address | function | address |
-|---|---|---|---|
-| `DrawIndexedVertices` | `0x825565C8` | `SetRenderTarget` | `0x8254C060` |
-| `DrawVertices` | `0x825561B0` | `SetDepthStencilSurface` | `0x8254C3B0` |
-| `SetStreamSource` | `0x8254B7C0` | `SetViewport` | `0x8254BF50` |
-| `SetIndices` | `0x8254B8E0` | `SetScissorRect` | `0x8254B678` |
-| `SetVertexShader` | `0x825508A8` | `Clear` | `0x8255B258` |
-| `SetPixelShader` | `0x825506E8` | `Resolve` | `0x8255CE98` |
-| `CreateVertexShader` | `0x82552330` | `SetTexture` | `0x8254E748` |
-| `CreatePixelShader` | `0x82552148` | `CreateTexture` | `0x8254E3C8` |
-| `SetVertexShaderConstantF` | `0x82550320` | `CreateVertexDeclaration` | `0x82550B80` |
-| `SetPixelShaderConstantF` | `0x825503F8` | `XGSetVertexDeclaration` | `0x82550A90` |
-| `PatchVertexShaderToMatch…` | `0x82564C50` | `Swap` | `0x82566B58` |
-
-IDA's auto-analysis defines no function at the two constant setters; the
-addresses are confirmed by the byte match and by their own arithmetic (below).
-
-### Device offsets
-
-All read out of the consuming code, never guessed:
-
-| Offset | What | Read from |
-|---|---|---|
-| `device + 0x780 + i*16` | VS float constant `i` | `SetVertexShaderConstantF`: `addi r10,r4,0x78` / `slwi r10,r10,4` / `add r10,r10,r3` |
-| `device + 0x1780 + i*16` | PS float constant `i` | the twin setter at `0x825503F8`, `addi r10,r4,0x178` |
-| `device + 0x480 + s*24` | texture fetch constant, sampler `s` | |
-| `device + 0x2ED8` | current vertex declaration | `SetVertexDeclaration`'s `stw r4,0x2ed8(r3)` |
-| `device + 0x3218` | viewport (clamped) | |
-| `device + 0x3244` | current pixel shader | |
-| `device + 10528` | `SQ_PROGRAM_CNTL` (0x2180) shadow | `DrawVertices`: `sub_82564768(device, 0, 8576, device + 10528)` |
-| `device + 1920` / `+ 6016` | VS / PS constant flush shadows | `DrawVertices`: `sub_82564B00(device, dirty, 0x4000, device + 1920)` |
-| `device + 1152 + off` | register shadow patched by shader objects | both shader setters walk an AND/OR list from the shader object |
-
-Pixel shader object (not the device — the `D3DPixelShader*`). `D3DPixelShader`
-is only the 24-byte `D3DResource` base, so IDA renders `pShader[1].Identifier`
-as +0x28 and `pShader[2].ReadFence` as +0x3C:
-
-| Offset | What | Read from |
-|---|---|---|
-| `ps + 0x18` | code allocation | `sub_825506B0` stores it there; `CreatePixelShader` (`0x82552148`) copies `a1[2]` bytes from `a1 + a1[1]` into it |
-| `ps + 0x28` | copy of the source header | `CreatePixelShader`: `sub_82BFB9D8(v7 + 5, a1, a1[1])` |
-| `ps + 0x30` | code **allocation** size — a bound, not the program length | |
-| `ps + 0x3C` | offset of the constant-patch list within the +0x28 header | `SetPixelShader` walks `(ps + 0x28) + *(ps + 0x3C)` |
-| `ps + 0x40` | offset of the program info block | shader flush `sub_82565928` |
-| `*(ps + 0x40) + 0x28` | **byte offset of the CF stream inside the code allocation** | `sub_82565928`: `v22 = *((char*)v8 + v8[16] + 40) + v8[6]` |
-| `*(ps + 0x40) + 0x2C` | program length in bytes (`>> 2` for dwords) | same, `*v23 = *(... + 44) >> 2` |
-
-Vertex shader object. The same structure, different offsets, read out of
-`sub_82565928`'s VS branch (raw disassembly at 0x82566234, not the decompiler's
-folded arithmetic) and confirmed against
-`D3D_PatchVertexShaderToMatchVertexDeclaration` (0x82564C50), which indexes the
-identical `0x380 + variant*8` field:
-
-| Offset | What | Read from |
-|---|---|---|
-| `vs + 0x20` | code allocation | `lwz r8, 0x20(r30)` — added to the CF offset to form the program address |
-| `vs + 0x380 + variant*8` | offset of the info block | `slwi r10, r11, 3` with `r11 = variant + 112`, then `lwzx r11, r10, r30` |
-| `info + 0x368` | **byte offset of the CF stream inside the code allocation** | `lwz r11, 0x368(r11)` then `add r11, r11, r8` |
-| `info + 0x36C` | program length in bytes (`>> 2` for dwords) | `lwz r11, 0x36C(r11)` / `srwi r11, r11, 2` |
-| `info + 0x384` | number of patchable vfetch instructions | the patcher's `v7` |
-
-`variant` is the same 0/1 selector `sub_82565928` computes; the patcher takes it
-as its own argument.
+The 22 guest D3D9 entry-point addresses, the device struct offsets with their
+PPC derivations, and the pixel- and vertex-shader object field maps are all in
+[docs/guest_binary.md](docs/guest_binary.md). All were read out of the consuming
+code, never guessed.
 
 **The patched code is usually NOT in the shader's own allocation.** An earlier
 version of this section claimed the opposite, reasoning that the patcher writes
@@ -893,8 +803,9 @@ interpreter is handed is not the one those draws execute against.
 
 **The CF stream does not start at the beginning of the code allocation.** Big
 shaders carry a prologue that reads as zeros; small ones start at 0. That is
-not a fixed 64-byte header to be inferred from a histogram — it is the field
-above, and `sub_82565928` is what hands the resulting address to the hardware.
+not a fixed 64-byte header to be inferred from a histogram — it is a field in
+the shader object, and the shader flush is what hands the resulting address to
+the hardware.
 
 This replaced two workarounds: searching the blob for what PM4 had loaded, and
 failing that, trying every offset and accepting a unique valid decode. Result
@@ -903,24 +814,18 @@ with PM4 off entirely: **40 of 49 pixel shaders decoded against PM4's 37 of
 genuine "no texture fetch"**. The seven previously-PM4-only shaders that
 appeared in both runs produce byte-identical bindings.
 
-`SQ_PROGRAM_CNTL` bits: `vs_num_reg[5:0]`, `ps_num_reg[13:8]`, `param_gen[18]`,
-`gen_index_pix[19]`, `vs_export_count[23:20]`, `vs_export_mode[26:24]`,
-`ps_export_mode[31:27]`. **`param_gen` is measured false** for the compositor
-shaders, so PS r0 is a real interpolator there.
+`SQ_PROGRAM_CNTL`'s bit layout is in
+[docs/guest_binary.md](docs/guest_binary.md). **`param_gen` is measured false**
+for the compositor shaders, so PS r0 is a real interpolator there.
 
 ### Guest texture formats
 
-The guest carries its own complete 64-entry `GPUTEXTUREFORMAT` name table: a
-pointer array at **`0x82d24378`** (near-duplicate at `0x82d59d00`) indexing the
-`FMT_*` strings in `0x820a9d00`-`0x820a9fd0` and `0x8205b5ec`-`0x8205b6d0`. Both
-belong to the HLSL compiler embedded in the XEX (`sub_8263F9C0`,
-`sub_82C1BB88`), so they are guest diagnostics, not the runtime texture path --
-but the table is authoritative for the enum, and decoding it confirmed
-index-for-index, from the game's own binary rather than from Xenia, that
-`fetch.format` indexes the ordering `xenos.h` assumes. It is transcribed into
-`GuestTextureFormatName` in [d3d9_texture.cpp](src/gpu/d3d9_texture.cpp).
-Index 20 is spelled `FMT_4_5` in the guest, not `FMT_DXT4_5`; the value still
-matches `k_DXT4_5 = 20`.
+The guest carries its own complete 64-entry `GPUTEXTUREFORMAT` name table, and
+decoding it confirmed index-for-index — from the game's own binary rather than
+from Xenia — that `fetch.format` indexes the ordering `xenos.h` assumes. Table
+addresses and provenance: [docs/guest_binary.md](docs/guest_binary.md). It is
+transcribed into `GuestTextureFormatName` in
+[d3d9_texture.cpp](src/gpu/d3d9_texture.cpp).
 
 **The formats this game actually uses are a very short list.** Measured after
 `ac278db` made the rejection name the format, three runs per configuration:
@@ -971,19 +876,9 @@ rather than assuming the list is now empty.
 
 ### The `Type` dword in a vertex declaration
 
-From `PatchVertexShaderToMatchVertexDeclaration`, the function that consumes it:
-
-| Type bits | meaning |
-|---|---|
-| `[5:0]` | `xenos::VertexFormat` |
-| `[8]` | `fomat_comp_all` — 1 = signed |
-| `[9]` | `num_format_all` — 0 = normalized, 1 = integer |
-| `[21:10]` | vfetch destination swizzle, x in `[12:10]`, w in `[21:19]` |
-
-Bits `[9:8]` are what make this correct rather than merely plausible: `COLOR` is
-`0x00182886` and `BLENDINDICES` is `0x001A2286` — same format 6 (`k_8_8_8_8`),
-differing only there. The format size table is the guest's own, at `0x8204E188`,
-indexed by the vfetch format field; illegal formats are 0.
+Its bit layout, and the guest's own format size table, are in
+[docs/guest_binary.md](docs/guest_binary.md) — both read out of
+`PatchVertexShaderToMatchVertexDeclaration`, the function that consumes them.
 
 Signed-normalized `k_2_10_10_10` (used for `NORMAL` and `TANGENT`) has no DXGI
 equivalent. It passes through as `R10G10B10A2_UINT` with
@@ -992,7 +887,7 @@ equivalent. It passes through as `R10G10B10A2_UINT` with
 ### Render targets — done, and instrumented
 
 Each guest colour surface gets its own host target. The device offsets are in
-the Device offsets section; `EnsureGameRenderTarget` in
+[docs/guest_binary.md](docs/guest_binary.md); `EnsureGameRenderTarget` in
 `src/gfx/d3d12_game.cpp` owns the routing, capped at `kMaxGameRenderTargets`
 (64).
 
@@ -1059,23 +954,15 @@ render path, which is the thing the pure-HLE work removed.
 said so originally, then two rounds of my own analysis wrongly concluded nothing
 published it. Both are recorded here because the mistakes are instructive.
 
-`sub_825656A0`, called from the draw-time flush as
-`sub_825656A0(device, vs + 0x368, *(vs + 0x20))`, walks a table in the shader
-object and emits one PM4 Type-3 packet per entry with header **0xC0022F00** —
-opcode 0x2F, LOAD_ALU_CONSTANT — body `[source_address, 4 * reg, dword_count]`:
-
-```
-H = vs + 0x368;  P = H + *(H + 0x14)
-P + 0x10  u32   list byte length;  entries at P + 0x14
-entry: u16 reg_index, u16 dword_count, u32 data_offset   (8 bytes)
-        terminated by dword_count == 0
-source = *(vs + 0x20) + data_offset
-```
+A routine called from the draw-time flush walks a table in the shader object and
+emits one PM4 Type-3 LOAD_ALU_CONSTANT packet per entry — the emitter, the packet
+header and the guest table layout are in
+[docs/guest_binary.md](docs/guest_binary.md).
 
 Measured: every shader publishes one entry covering **c252..c255**, holding
 screen-space scale/bias — `(0.5, -0.5, 0, 0)`, `(0, 1, 0.5, -0.5)`,
-`(1, 2, 0.5, -0.5)`. `4 * 252 = 0x3F0`, and `0x4000 + 0x3F0 = 0x43F0` — the
-exact `LOAD_ALU_CONSTANT reg=0x43F0 dwords=16` this file cited from the start.
+`(1, 2, 0.5, -0.5)` — which is the exact
+`LOAD_ALU_CONSTANT reg=0x43F0 dwords=16` this file cited from the start.
 
 None of it passes through `device + 0x780`, which is the only place
 `CaptureVertexConstants` looked. `OverlayShaderConstants` now applies it after
@@ -1105,50 +992,26 @@ gave was the one I already believed.
 
 ## Guest architecture
 
-- Base `0x82000000`, XEX `assets/default.xex`. IDB at `assets/default.xex.i64`.
-- Engine state pointer `dword_830BE400`; AssetDB at `*(0x830577C0)`.
-- `dword_830B03EC` (GPU physical base) stays 0 in native mode and is not a
-  blocker for asset loading.
-
-### The asset load state machine — a detour, kept only for `force_load`
+Base address, engine state pointers, the asset load state machine that
+`force_load` depends on, and the known external blockers are all in
+[docs/guest_binary.md](docs/guest_binary.md).
 
 **Reverse-engineering the AssetDB was a wrong turn**, and a long one. ReXGlue
 handles asset loading; the guest's file I/O works. The state machine is not
 stuck — it idles because the layer above it never asks for anything, and that
-layer is the Lua front end. Do not resume this thread. What follows is retained
-only because `force_load` depends on it, and `force_load` is what gets a scene
-on screen for rendering work.
-
-`sub_8253AA40`, 12-case switch, state at `*(AssetDB + 28)`. Idles in state 2.
-`sub_82534980(AssetDB, name, flags)` is the load-request API: it `strncpy`s up to
-260 bytes of `name` into `AssetDB + 29540` (a `MAX_PATH` buffer, **not** a flag —
-the places that appear to test a boolean are testing `name[0] != 0`) and, if the
-state is 2, selects state 3.
-
-With `force_load` + `ReadyToLaunch=1` the full sequence runs:
-`2 → 3 → 4 (~380 ticks) → 5 → 6 → 7 → 8 → 11 → 2`.
-
-The state 6 gate is `sub_8253CF80`: passes if network mode is Online(2) or
-LAN(3), else if `*(0x83057900)` is set (state 1 clears it), else the registry's
-`ReadyToLaunch`. Registry keys: `Location` `0x8200C864`, `PlayerMode`
-`0x8200C870`, `ReadyToLaunch` `0x8204C630`. Getters: `sub_825487C8` (string),
-`sub_82548758` (int), `sub_82548EA8` (int set).
-
-### Known external blockers
-
-- Binary `.xenon.package` heaps are encrypted (entropy ≈7.98, routine unknown;
-  the guest's OpenSSL AES is TLS-only). **Possibly the root cause of the missing
-  front end** — see above.
-- FATAL crash at `0x82327CF0` during gameplay.
+layer is the Lua front end. Do not resume this thread. It is documented only
+because `force_load` depends on it, and `force_load` is what gets a scene on
+screen for rendering work.
 
 ---
 
 ## Tooling
 
 `tools/` holds BXML/package decoders (all three formats decode; the binary
-package heaps only dump) and the IDA scripts. All 130 databases decode to
-`out/asset_catalog.json`, 23,183 assets indexed — that catalog is how the MXUI
-script list above was obtained.
+package heaps only dump) and the IDA scripts (listed in
+[docs/guest_binary.md](docs/guest_binary.md)). All 130 databases decode to
+`out/asset_catalog.json`, 23,183 assets indexed — that catalog is how the 57-asset
+MXUI script list above was obtained.
 
 ### Scripted RenderDoc captures
 
@@ -1168,26 +1031,8 @@ the process is running under RenderDoc.
 
 ### Headless IDA
 
-IDA Pro v9 at `C:\Users\VM\Desktop\IDA Pro v9`; `hexppc.dll` is present, so the
-PPC decompiler works.
-
-```bash
-cp assets/default.xex.i64 "$SCRATCH/work.i64" && "C:/Users/VM/Desktop/IDA Pro v9/idat.exe" -A -L"$SCRATCH/out.log" -S"tools/ida_dump_param_gen.py" "$SCRATCH/work.i64"
-```
-
-**Always work on a copy** — `idat` writes to the IDB. `-L<file>` is required:
-`ida_kernwin.msg()` output does not reach stdout in batch mode.
-
-API notes for IDA 9 (each of these cost a failed run): use
-`idc.get_operand_value` and `idc.generate_disasm_line`, not the `ida_bytes`
-spellings. `ida_funcs.add_func` will not always define a function at a matched
-address; fall back to raw disassembly.
-
-Existing scripts: `ida_dump_param_gen.py`, `ida_dump_vs_const255.py`,
-`ida_dump_const_emitters.py`, `ida_dump_frontend_vtables.py`,
-`ida_dump_script_api.py`, `ida_dump_execute_script.py`,
-`ida_dump_patch_vertex_shader.py`, `ida_dump_render_targets.py`,
-`ida_dump_texture_bind_order.py`, `ida_dump_d3d9.py`.
+Batch invocation, the work-on-a-copy rule, the IDA 9 API gotchas and the ten
+`ida_dump_*.py` scripts are in [docs/guest_binary.md](docs/guest_binary.md).
 
 ---
 
@@ -1196,13 +1041,13 @@ Existing scripts: `ida_dump_param_gen.py`, `ida_dump_vs_const255.py`,
 The one thing this project keeps re-learning, recorded because it has paid off
 every time and guessing has failed first every time:
 
-**Read the field out of the code that consumes it.** The `Type` bit layout came
-from `PatchVertexShaderToMatchVertexDeclaration`'s own arithmetic; the format
-size table was lifted verbatim from `0x8204E188`; the vertex declaration offset
-came from `SetVertexDeclaration`'s single `stw`; the constant file layout came
-from `SetVertexShaderConstantF`'s three instructions; `SQ_PROGRAM_CNTL`'s shadow
-offset came from the argument `DrawVertices` passes. In each case an earlier
-attempt to infer the answer from data produced something plausible and wrong.
+**Read the field out of the code that consumes it.** The `Type` bit layout, the
+vertex declaration offset, the constant file layout and `SQ_PROGRAM_CNTL`'s
+shadow offset were each read out of the guest function that uses them, and the
+format size table was lifted verbatim from the guest's own table — every
+derivation is recorded beside its result in
+[docs/guest_binary.md](docs/guest_binary.md). In each case an earlier attempt to
+infer the answer from data produced something plausible and wrong.
 
 Two corollaries:
 
