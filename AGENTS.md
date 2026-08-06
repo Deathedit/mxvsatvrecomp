@@ -145,7 +145,57 @@ there is no manual input hook.
 
 ---
 
-## Why there is no menu (2026-08-05)
+## SOLVED: it was the frame-pacing stub (2026-08-06)
+
+**The native `sub_82B70370` stub was the blocker.** Unstubbing it takes the
+script VM from 28 dispatches to 686 and the front end starts running. Everything
+in the section below is still an accurate description of the *symptoms*; the
+cause is here.
+
+| native, 60 s run | stubbed | real timing |
+|---|---|---|
+| VM dispatches | 28 | **686** (3/3: mx_473, mx_474, mx_475) |
+| script assets | 2 | **4** — adds `IG_PlayerListHelper` |
+| registry string keys | 1 | **4** — adds `IntroMode`, `GameContentInstall`, `GameSessionNotification` |
+| `BinkOpen` | 0 | **3** — THQ_Logo, Attract.ENG, FE_Smoke, all OK |
+| bindings reached | — | `LoadUIAssetDatabasePackage`, `LoadUIAssetPackage`, `IsUIAssetPackageLoaded`, `LoadAssetDB`, `LoadAssetPackage`, `SendUIEvent`, `CastUIContainer`, `CastUIFlashComponent` |
+| lua errors | 0 | 0 |
+
+Those are the plugin's numbers. **The native/plugin divergence is closed.**
+
+With `--hide_colorless_draws=true` the front end renders 11,250 draws / 33,750
+vertices with **every skip counter at zero** — no-code 0, decode 0, stream 0,
+constants 0, vertex 0.
+
+**Both hazards the stub was written for are false**, read out of `sub_82B70370`
+rather than assumed:
+
+- *"`a1+20` drives a busy-wait."* The guest's own test is
+  `if (*(float*)(a1+20) != 3.4028235e38 && dt < target)`. `a1+20` reads
+  `0x7F7FFFFF` — exactly that FLT_MAX sentinel — so the guest disables the spin
+  itself. Logged and confirmed at runtime: `FLT_MAX=true`.
+- *"`a1+32` is an unbounded store offset."* It is `v9 = *(a1+32) + 9;
+  *(float*)(4*v9 + a1) = dt;` with `if (v10 >= 5) *(a1+32) = 0` — a bounded
+  5-entry ring at `a1+36..a1+52`, guarded by `if (*(a1+28))`. Observed 0.
+
+The stub wrote a fixed `1/60` to `a1+24` and nothing else. The real function also
+maintains `a1+56` (the 5-sample smoothing sum), **`a1+60`, total elapsed time**,
+`a1+64`, `a1+104` and `a1+112`. A front end that advances on elapsed time had
+nothing to advance on — the measured symptom was `f1` arriving at
+`RendererDispatch` as exactly `0.00` in native and varying under the plugin.
+
+`--native_timing_stub=true` restores the old behaviour.
+
+**Why this took so long to find, worth remembering:** the stub dates from before
+the D3D9 HLE layer, like the four other workarounds retired on 2026-08-06, and
+its comment stated both hazards as fact. Nobody re-derived them. The
+instrumentation was also one-sided — the VM-dispatch probe was rate-limited to
+four lines, so "4 dispatches" looked like a hard floor, and the
+`RendererDispatch` probe logged only under `g_plugin_mode`, so native's `f1=0.00`
+was never visible. **Two probes that could not have detected the bug were used as
+evidence that the bug was not there.**
+
+## Why there is no menu (2026-08-05) — superseded, kept for the symptom trail
 
 **The front end is script-driven, and the script VM stops 1.6 seconds into
 boot.** This supersedes every earlier explanation in this file's history,

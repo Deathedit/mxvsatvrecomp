@@ -42,6 +42,12 @@ REXCVAR_DEFINE_STRING(force_load, "", "Debug",
 REXCVAR_DEFINE_STRING(registry_override, "", "Debug",
                       "Comma-separated key=value overrides for guest registry string reads");
 
+// Escape hatch for the frame-pacing unstub in the sub_82B70370 hook below. The
+// stub is off by default now that both hazards it was written for have been
+// disproved against the guest code; set this true to put it back.
+REXCVAR_DEFINE_BOOL(native_timing_stub, false, "Debug",
+                    "Restore the fixed-1/60 stub for sub_82B70370 in native mode");
+
 // sub_82B34998 — RendererDispatchBlock, called from LoaderTick on the Transition
 // thread.
 //
@@ -102,20 +108,49 @@ extern "C" REX_FUNC(sub_82B70370) {
     orig_Timing(ctx, base);
     return;
   }
-  // NATIVE: stubbed. This is frame pacing — it QPCs a delta, divides by the
-  // perf frequency, and stores elapsed seconds at a1+24. Two things in it are
-  // fatal here, both because hook #5 skips the SetupRenderer band that would
-  // have initialized this struct (0x830EC248):
-  //   - a1+20 (target frame time) drives a busy-wait at 0x82B703D4
-  //   - a1+32 is a ring index used as an unbounded store offset
-  //     (`REX_STORE_U32(*(a1+32) + a1, dt)`), which access-violates on garbage.
-  // Downstream only consumes the dt at a1+24, so supply a fixed 60Hz step.
-  uint32_t a1 = ctx.r3.u32;
-  if (loud) {
-    REXLOG_INFO("native: Timing #{} STUBBED a1=0x{:08X} +20=0x{:08X} +32=0x{:08X}",
-                tm, a1, a1 ? REX_LOAD_U32(a1 + 20) : 0, a1 ? REX_LOAD_U32(a1 + 32) : 0);
+  // NATIVE: no longer stubbed by default (2026-08-06). Both hazards the old
+  // stub was written for are false against this binary, read out of
+  // sub_82B70370 rather than assumed:
+  //
+  //   - "a1+20 drives a busy-wait". The guest's own test is
+  //     `if (*(float*)(a1+20) != 3.4028235e38 && dt < target)`. a1+20 reads
+  //     0x7F7FFFFF, which is exactly that FLT_MAX sentinel, so the spin is
+  //     disabled by the guest itself.
+  //   - "a1+32 is an unbounded store offset". It is `v9 = *(a1+32) + 9;
+  //     *(float*)(4*v9 + a1) = dt;` with the index wrapped by
+  //     `if (v10 >= 5) *(a1+32) = 0` — a bounded 5-entry ring at a1+36..a1+52,
+  //     guarded by `if (*(a1+28))`. Observed value is 0.
+  //
+  // The stub cost more than it saved: it wrote a fixed 1/60 to a1+24 and
+  // nothing else, while the real function also maintains a1+56 (the 5-sample
+  // smoothing sum), a1+60 (TOTAL ELAPSED TIME), a1+64, a1+104 and a1+112. The
+  // measured symptom is that f1 reaching RendererDispatch is exactly 0.00 in
+  // native and varies under the plugin.
+  //
+  // Set --native_timing_stub=true to restore the old behaviour if this turns
+  // out to hang or fault.
+  const uint32_t a1 = ctx.r3.u32;
+  if (REXCVAR_GET(native_timing_stub)) {
+    if (loud) {
+      REXLOG_INFO("native: Timing #{} STUBBED a1=0x{:08X} +20=0x{:08X} +32=0x{:08X}",
+                  tm, a1, a1 ? REX_LOAD_U32(a1 + 20) : 0, a1 ? REX_LOAD_U32(a1 + 32) : 0);
+    }
+    if (a1) REX_STORE_U32(a1 + 24, std::bit_cast<uint32_t>(1.0f / 60.0f));
+    return;
   }
-  if (a1) REX_STORE_U32(a1 + 24, std::bit_cast<uint32_t>(1.0f / 60.0f));
+  // The guard values are what make the call safe, so record them once rather
+  // than trusting the reading above to hold at runtime.
+  if (tm == 1 && a1) {
+    REXLOG_INFO("native: Timing REAL — guards +20=0x{:08X} (FLT_MAX={}) +28=0x{:08X} +32=0x{:08X}",
+                REX_LOAD_U32(a1 + 20), REX_LOAD_U32(a1 + 20) == 0x7F7FFFFFu,
+                REX_LOAD_U32(a1 + 28), REX_LOAD_U32(a1 + 32));
+  }
+  orig_Timing(ctx, base);
+  if (loud && a1) {
+    REXLOG_INFO("native: Timing #{} REAL dt={:.6f} total={:.3f} a1=0x{:08X}", tm,
+                std::bit_cast<float>(REX_LOAD_U32(a1 + 24)),
+                std::bit_cast<float>(REX_LOAD_U32(a1 + 60)), a1);
+  }
 }
 
 // sub_82B6D230 — called from LoaderTick's entity block @0x82B70E4C with f1=dt.
