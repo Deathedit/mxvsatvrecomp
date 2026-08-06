@@ -611,12 +611,39 @@ PM4 translator, deleted in 4dd1790. The ring is still parsed, but nothing
 tracks constants from it, and reinstating that would be a PM4 dependency on the
 render path, which is the thing the pure-HLE work removed.
 
-So the finding stands and the fix does not: **c255 must be recovered from the
-guest D3D9 side.** The parallel is the pixel shader CF offset (5309f2a), which
-looked like it needed the ring and turned out to be a field the guest's own
-emitter reads — found in IDA, and better than the PM4 answer once found. The
-equivalent question here is which D3D9 entry point publishes slots 252–255, and
-it should be settled in `default.xex.probe.i64`, not inferred. Not yet done.
+**There is no publisher for c255. The question was wrong.** Three independent
+checks agree, and they close it:
+
+1. The device shadow at `device + 0x780 + 255*16` is zero, with 86 live vec4
+   confined to indices 0..218.
+2. The PM4 flush is `sub_82564B00` -> `sub_82564120`, and the latter is a plain
+   `*++dst = *++src` dword copy out of `device + 0x780`. **The ring and the
+   device shadow are the same memory**, so `LOAD_ALU_CONSTANT reg=0x43F0` was
+   copying those same zeros. PM4 was never a second source, and the fix this
+   file used to propose could not have worked even before the deletion.
+3. `D3DDevice_SetVertexShader` (0x825508A8) does carry a constant publisher —
+   it memcpys literal data from the shader object into the constants block:
+
+   ```
+   H = pShader + 0x368;  P = H + *(u32*)(H + 0x14)
+   P + 0x00  u64  dirty bits ANDC-cleared from device + 0x00
+   P + 0x10  u32  byte length of the entry list;  entries start at P + 0x14
+   entry: u16 byte_offset, u16 dword_count, then dword_count dwords
+   memcpy(device + 0x480 + byte_offset, payload, dword_count * 4)
+   ```
+
+   Destination base is `device + 0x480` (`addi r28, r30, 0x480`) — the whole
+   constants block, so c255 would be byte offset `0x12F0`. Measured over 32
+   distinct shaders: **every one publishes exactly one entry, `+0xFC x16`,
+   none covers c255**, and c255 is unchanged across the guest's own call. That
+   entry lands at `device + 0x57C`, in the fetch-constant region — this list is
+   the vfetch publisher.
+
+So the guest reads an all-zero c255, and real hardware would have too. The open
+question is therefore **not** where the value comes from but why we believe this
+shader reads c255 at all: either the VS code window (`code_off`) is wrong, the
+way the pixel shader's was until 5309f2a, or the constant index decode is. The
+VS analogue of `sub_82565928` is where to look next.
 
 ---
 

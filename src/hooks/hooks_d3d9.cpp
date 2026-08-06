@@ -4323,17 +4323,105 @@ void DumpVertexShaderObject(uint32_t handle, uint8_t* base) {
   f.flush();
 }
 
+//-----------------------------------------------------------------------------
+// Does SetVertexShader publish literal constants, and is c255 among them?
+//
+// From the disassembly of D3DDevice_SetVertexShader (0x825508A8), which walks a
+// patch block carried by the shader object:
+//
+//   H = pShader + 0x368                       (the header)
+//   P = H + *(u32*)(H + 0x14)                 (the patch block)
+//   P + 0x00  u64   dirty bits ANDC-cleared from device + 0x00
+//   P + 0x10  u32   byte length of the entry list
+//   P + 0x14        first entry
+//
+//   entry: u16 byte_offset, u16 dword_count, then dword_count dwords of data.
+//   memcpy(device + 0x480 + byte_offset, entry_payload, dword_count * 4)
+//
+// `addi r28, r30, 0x480` is the destination base, so offsets are relative to the
+// whole constants block, not to the VS float file. VS constant i therefore sits
+// at 0x780 - 0x480 + i*16, making c255 offset 0x12F0.
+//
+// Read either side of the original call on purpose. We call through to the
+// guest's own D3D9, so if this list is what fills c255 then the value must
+// change across that call — and if it does not, this mechanism is not the
+// answer whatever the list contains. That distinction is the whole point of the
+// probe; the list alone would only show intent.
+//-----------------------------------------------------------------------------
+constexpr uint32_t kVsPatchHeaderAt = 0x368;
+constexpr uint32_t kVsPatchOffsetAt = 0x14;
+constexpr uint32_t kConstantsBase = 0x480;
+constexpr uint32_t kC255Offset = 0x780 - kConstantsBase + 255 * 16;
+
+void ProbeVertexShaderConstantPatch(uint32_t shader, uint32_t device,
+                                    const uint32_t before[4], uint8_t* base) {
+  (void)base;
+  static std::map<uint32_t, bool> s_seen;
+  if (s_seen.size() >= 32 || !s_seen.emplace(shader, true).second) return;
+
+  const uint32_t c255_addr = device + kConstantsBase + kC255Offset;
+  uint32_t after[4] = {};
+  if (HostPageReadable(REX_RAW_ADDR(c255_addr))) {
+    for (uint32_t i = 0; i < 4; ++i) after[i] = REX_LOAD_U32(c255_addr + i * 4);
+  }
+  const bool changed = before[0] != after[0] || before[1] != after[1] ||
+                       before[2] != after[2] || before[3] != after[3];
+
+  const uint32_t h = shader + kVsPatchHeaderAt;
+  std::string entries;
+  bool covers_c255 = false;
+  uint32_t count = 0;
+  if (HostPageReadable(REX_RAW_ADDR(h + kVsPatchOffsetAt))) {
+    const uint32_t rel = REX_LOAD_U32(h + kVsPatchOffsetAt);
+    if (rel && rel < 0x10000 && HostPageReadable(REX_RAW_ADDR(h + rel + 0x10))) {
+      const uint32_t pblk = h + rel;
+      const uint32_t bytes = REX_LOAD_U32(pblk + 0x10);
+      uint32_t at = pblk + 0x14;
+      const uint32_t end = at + (bytes < 0x10000 ? bytes : 0);
+      // Loop 1 is the 8-byte-entry list, loop 2 is the memcpy list. Walk the
+      // same way the guest does rather than assuming which one we landed in.
+      while (at + 4 <= end && HostPageReadable(REX_RAW_ADDR(at))) {
+        const uint32_t hdr = REX_LOAD_U32(at);
+        const uint32_t off = hdr >> 16, dwords = hdr & 0xFFFF;
+        at += 4;
+        if (!dwords) break;
+        if (++count <= 8) {
+          entries += fmt::format(" [+0x{:X} x{}]", off, dwords);
+        }
+        if (off <= kC255Offset && kC255Offset < off + dwords * 4)
+          covers_c255 = true;
+        at += dwords * 4;
+      }
+    }
+  }
+  REXLOG_INFO(
+      "d3d9: vs 0x{:08X} const patch: {} entries{}{}; c255 {:08X} {:08X} "
+      "{:08X} {:08X} -> {:08X} {:08X} {:08X} {:08X} ({})",
+      shader, count, entries, covers_c255 ? " COVERS-C255" : "", before[0],
+      before[1], before[2], before[3], after[0], after[1], after[2], after[3],
+      changed ? "CHANGED" : "unchanged");
+}
+
 REX_IMPORT(__imp__sub_825508A8, orig_SetVertexShader, void());
 extern "C" REX_FUNC(sub_825508A8) {
   MX_D3D9_PLUGIN_PASSTHROUGH(orig_SetVertexShader);
   auto& st = DeviceState();
-  st.NoteDevice(ctx.r3.u32, mx::hle::kEpSetVertexShader);
-  st.vertex_shader = ctx.r4.u32;
+  const uint32_t device = ctx.r3.u32;
+  const uint32_t shader = ctx.r4.u32;
+  st.NoteDevice(device, mx::hle::kEpSetVertexShader);
+  st.vertex_shader = shader;
   st.vs_seen = true;
   if (REXCVAR_GET(hle_capture)) {
-    DumpVertexShaderObject(ctx.r4.u32, base);
+    DumpVertexShaderObject(shader, base);
+  }
+  uint32_t before[4] = {};
+  const uint32_t c255_addr = device + kConstantsBase + kC255Offset;
+  const bool probe = shader && HostPageReadable(REX_RAW_ADDR(c255_addr));
+  if (probe) {
+    for (uint32_t i = 0; i < 4; ++i) before[i] = REX_LOAD_U32(c255_addr + i * 4);
   }
   orig_SetVertexShader(ctx, base);
+  if (probe) ProbeVertexShaderConstantPatch(shader, device, before, base);
 }
 
 REX_IMPORT(__imp__sub_825506E8, orig_SetPixelShader, void());
