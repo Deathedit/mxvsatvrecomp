@@ -389,10 +389,12 @@ extern "C" REX_FUNC(sub_825487C8) {
   const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
 
   // The original clobbers r4/r5 (it moves the key into r3 to hash it), so the
-  // arguments have to be captured before it runs.
+  // arguments have to be captured before it runs. `lr` goes with them: the call
+  // overwrites it, and the log line below runs after.
   const uint32_t key_addr = ctx.r4.u32;
   const uint32_t out = ctx.r5.u32;
   const uint32_t size = ctx.r6.u32;
+  const uint32_t from = static_cast<uint32_t>(ctx.lr);
   const std::string key = GuestString(base, key_addr, 64);
 
   // One-shot: prove the two key addresses and the mode vocabulary against the
@@ -415,11 +417,18 @@ extern "C" REX_FUNC(sub_825487C8) {
 
   // First sighting per distinct key, capped so a per-frame reader cannot flood
   // the log. `out` is only meaningful when the lookup succeeded.
+  //
+  // `lr` is the point of this line as much as the value is. Native reads exactly
+  // one string key in a whole run and the plugin reads four, so the callers of
+  // the three extra ones are the boundary native stops short of — and naming
+  // them off the return address beats inferring them from which function happens
+  // to mention the key in .rdata.
   static std::vector<std::string> s_seen;
   if (s_seen.size() < 40 && std::find(s_seen.begin(), s_seen.end(), key) == s_seen.end()) {
     s_seen.push_back(key);
-    REXLOG_INFO("{}: registry get \"{}\" size={} -> r3={} value=\"{}\"", tag, key, size,
-                ctx.r3.u32, ctx.r3.u32 ? GuestString(base, out, size) : std::string());
+    REXLOG_INFO("{}: registry get \"{}\" size={} -> r3={} value=\"{}\" from lr=0x{:08X}",
+                tag, key, size, ctx.r3.u32,
+                ctx.r3.u32 ? GuestString(base, out, size) : std::string(), from);
   }
 
   for (const auto& [k, v] : RegistryOverrides()) {
@@ -450,6 +459,7 @@ extern "C" REX_FUNC(sub_82548758) {
   const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
   const uint32_t key_addr = ctx.r4.u32;
   const uint32_t out = ctx.r5.u32;
+  const uint32_t from = static_cast<uint32_t>(ctx.lr);
   const std::string key = GuestString(base, key_addr, 64);
 
   orig_RegistryGetInt(ctx, base);
@@ -468,8 +478,8 @@ extern "C" REX_FUNC(sub_82548758) {
   static std::vector<std::string> s_seen;
   if (s_seen.size() < 40 && std::find(s_seen.begin(), s_seen.end(), key) == s_seen.end()) {
     s_seen.push_back(key);
-    REXLOG_INFO("{}: registry getint \"{}\" -> {}", tag, key,
-                out ? REX_LOAD_U32(out) : 0xFFFFFFFFu);
+    REXLOG_INFO("{}: registry getint \"{}\" -> {} from lr=0x{:08X}", tag, key,
+                out ? REX_LOAD_U32(out) : 0xFFFFFFFFu, from);
   }
 }
 

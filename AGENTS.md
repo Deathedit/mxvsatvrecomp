@@ -448,11 +448,33 @@ string key in a whole run; the plugin reads four:
 | `IntroMode` | — | ✓ `"full"` |
 | `GameSessionNotification` | — | ✓ |
 
-The three extra keys are all defaults registered by `sub_823526D8`, but that
-function registers ~35 keys and only these three are *read*, so the readers have
-not been identified. The registry-get probe does not log `lr`; adding it is one
-line and would name those callers directly instead of by inference. Do that
-before drawing any conclusion from this table.
+**The probes now log `lr`, and it names the callers outright.** Both registry
+getters capture `lr` at entry — the call clobbers it and both log after — so the
+return address is the caller, not an inference from which function mentions the
+key in `.rdata`.
+
+| Read | from `lr` | which is |
+|---|---|---|
+| native `PlayerMode` | `0x82536294` | `sub_82536250` — the loader's own gate |
+| plugin, every extra string key | `0x824AA590` | `sub_824AA568`, called only by `sub_824B1C20` |
+| plugin, every int key | `0x824AA518` | `sub_824AA4F8`, called only by `sub_824B1788` |
+
+`sub_824B1C20` is the **Lua binding `GetVariableString`**: it validates its
+arguments through the same `sub_82A9F4F8` reporter as `ExecuteScriptAsset` and
+names itself `VariableCollection_GetVariableString` in its own error strings.
+`sub_824B1788` is the int twin. They sit in a binding table at `0x821A1740`/
+`0x821A1750` — a different table from the 228-entry one at `0x8203F2E0`.
+
+So this is not a settings file being consulted. **It is the front-end script
+reading its own state**, and under the plugin it reads a recognisable boot
+sequence: `GameContentInstall`, `UILoaded`, `IntroMode`, `InitialLoadCompleteFlag`,
+`LaunchActivity`, `TableLoadError`, `InvitePending`, `InviteProcessing`,
+`GameSessionNotification`. Natively that binding is called **zero** times; the
+one native read comes from the loader, not from any script.
+
+That makes `sub_824B1C20` and `sub_824B1788` a live progress trace of the front
+end, and the sharpest instrument yet for the script-layer divergence — every
+call is a statement the script actually reached.
 
 **A process-hygiene warning, learned the expensive way.** The first pass at this
 measurement reported "zero Bink calls in both modes" and was wrong twice over.
