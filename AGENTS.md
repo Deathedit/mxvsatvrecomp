@@ -672,39 +672,51 @@ PM4 translator, deleted in 4dd1790. The ring is still parsed, but nothing
 tracks constants from it, and reinstating that would be a PM4 dependency on the
 render path, which is the thing the pure-HLE work removed.
 
-**There is no publisher for c255. The question was wrong.** Three independent
-checks agree, and they close it:
+**c255 is published by the shader itself, through a ring packet.** This file
+said so originally, then two rounds of my own analysis wrongly concluded nothing
+published it. Both are recorded here because the mistakes are instructive.
 
-1. The device shadow at `device + 0x780 + 255*16` is zero, with 86 live vec4
-   confined to indices 0..218.
-2. The PM4 flush is `sub_82564B00` -> `sub_82564120`, and the latter is a plain
-   `*++dst = *++src` dword copy out of `device + 0x780`. **The ring and the
-   device shadow are the same memory**, so `LOAD_ALU_CONSTANT reg=0x43F0` was
-   copying those same zeros. PM4 was never a second source, and the fix this
-   file used to propose could not have worked even before the deletion.
-3. `D3DDevice_SetVertexShader` (0x825508A8) does carry a constant publisher —
-   it memcpys literal data from the shader object into the constants block:
+`sub_825656A0`, called from the draw-time flush as
+`sub_825656A0(device, vs + 0x368, *(vs + 0x20))`, walks a table in the shader
+object and emits one PM4 Type-3 packet per entry with header **0xC0022F00** —
+opcode 0x2F, LOAD_ALU_CONSTANT — body `[source_address, 4 * reg, dword_count]`:
 
-   ```
-   H = pShader + 0x368;  P = H + *(u32*)(H + 0x14)
-   P + 0x00  u64  dirty bits ANDC-cleared from device + 0x00
-   P + 0x10  u32  byte length of the entry list;  entries start at P + 0x14
-   entry: u16 byte_offset, u16 dword_count, then dword_count dwords
-   memcpy(device + 0x480 + byte_offset, payload, dword_count * 4)
-   ```
+```
+H = vs + 0x368;  P = H + *(H + 0x14)
+P + 0x10  u32   list byte length;  entries at P + 0x14
+entry: u16 reg_index, u16 dword_count, u32 data_offset   (8 bytes)
+        terminated by dword_count == 0
+source = *(vs + 0x20) + data_offset
+```
 
-   Destination base is `device + 0x480` (`addi r28, r30, 0x480`) — the whole
-   constants block, so c255 would be byte offset `0x12F0`. Measured over 32
-   distinct shaders: **every one publishes exactly one entry, `+0xFC x16`,
-   none covers c255**, and c255 is unchanged across the guest's own call. That
-   entry lands at `device + 0x57C`, in the fetch-constant region — this list is
-   the vfetch publisher.
+Measured: every shader publishes one entry covering **c252..c255**, holding
+screen-space scale/bias — `(0.5, -0.5, 0, 0)`, `(0, 1, 0.5, -0.5)`,
+`(1, 2, 0.5, -0.5)`. `4 * 252 = 0x3F0`, and `0x4000 + 0x3F0 = 0x43F0` — the
+exact `LOAD_ALU_CONSTANT reg=0x43F0 dwords=16` this file cited from the start.
 
-So the guest reads an all-zero c255, and real hardware would have too. The open
-question is therefore **not** where the value comes from but why we believe this
-shader reads c255 at all: either the VS code window (`code_off`) is wrong, the
-way the pixel shader's was until 5309f2a, or the constant index decode is. The
-VS analogue of `sub_82565928` is where to look next.
+None of it passes through `device + 0x780`, which is the only place
+`CaptureVertexConstants` looked. `OverlayShaderConstants` now applies it after
+the device file, matching hardware order (the load is emitted at draw time,
+after any `SetVertexShaderConstantF`). The data is read from the shader object
+in guest memory — the packet only carries an address — so **no PM4 is involved**
+and the earlier retraction of the PM4-shadow fix still stands on its own terms.
+
+Result: constant reads returning zero went **72 of 128 probes to 0 of 90**, the
+live range went 0..218 to **0..255**, and c255 reads back `(0.5, -0.5, 0, 0)`.
+Applied held at 88.85%. **stageI did not move** — 5 shaders at >=90% clip-like,
+24% of execs, identical before and after. The constants were wrong and are now
+right; that was not what the clip-volume problem is.
+
+**Two ways I got this wrong, both worth remembering.** First I argued the ring
+and the device shadow were the same memory, because `sub_82564B00` flushes
+`device + 0x780` verbatim. True of *that* packet, and irrelevant: a second,
+unrelated LOAD_ALU_CONSTANT exists. Proving one publisher is a copy does not
+enumerate the publishers. Second, a probe did walk the right table but parsed it
+with the neighbouring list's layout, read `reg_index` 0xFC as a byte offset,
+compared it against c255's byte offset 0x12F0, and reported "none covers c255".
+`0xFC` is c252 and the count covered c255. A field read in the wrong units is
+indistinguishable from a negative result, and it survived because the answer it
+gave was the one I already believed.
 
 ---
 

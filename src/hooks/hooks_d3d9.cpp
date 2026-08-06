@@ -799,7 +799,81 @@ std::vector<PendingHleDraw> g_pendingHleDraws;
 uint64_t g_pendingQueued = 0, g_pendingApplied = 0, g_pendingDropped = 0;
 constexpr size_t kMaxPendingHleDraws = 2048;
 
-bool CaptureVertexConstants(uint32_t device, uint8_t* base,
+// Vertex shader object layout, read out of sub_82565928's VS branch at
+// 0x82566234 and cross-checked against the patcher at 0x82564C50. The pixel
+// shader twin is ps + 0x18 / ps + 0x40 / info + 0x28 / info + 0x2C (see
+// CollectPixelShaderBlob).
+constexpr uint32_t kVsCodeAllocAt = 0x20;      // code allocation pointer
+constexpr uint32_t kVsInfoOffsetAt = 0x380;    // + variant*8 -> info block
+constexpr uint32_t kVsInfoCodeOffset = 0x368;  // CF byte offset in the allocation
+constexpr uint32_t kVsInfoCodeSize = 0x36C;    // program length in bytes
+constexpr uint32_t kVsPatchHeaderAt = 0x368;   // constant/patch header
+constexpr uint32_t kVsPatchOffsetAt = 0x14;    // -> the patch block
+
+uint64_t g_shaderConstOverlays = 0;
+
+// Overlay the constants a vertex shader carries as literal data.
+//
+// device + 0x780 is only one of two publishers. The other is sub_825656A0,
+// called from the draw-time flush, which walks a table in the shader object and
+// emits a PM4 LOAD_ALU_CONSTANT (header 0xC0022F00) per entry pointing the GPU
+// at literal data inside the shader's own code allocation:
+//
+//   H = vs + 0x368;  P = H + *(H + 0x14)
+//   P + 0x10  u32   list byte length;  entries at P + 0x14
+//   entry: u16 reg_index, u16 dword_count, u32 data_offset   (8 bytes)
+//   terminated by dword_count == 0
+//   source = *(vs + 0x20) + data_offset
+//
+// Measured: every shader publishes one entry covering c252..c255, holding
+// screen-space scale/bias values like (0.5, -0.5, 0, 0) and (0, 1, 0.5, -0.5).
+// None of it passes through the device shadow, which is why c255 read as zero
+// there and why the one-instruction compositor shaders — MAD on c255 — exported
+// (0,0,0,0).
+//
+// Read from the shader object, not from the ring: the packet only carries an
+// address, and that address is guest memory we can read directly. No PM4.
+//
+// Applied AFTER the device file so a shader literal wins for its own slots.
+// That is the hardware order — the load is emitted at draw time, after any
+// SetVertexShaderConstantF the app made.
+void OverlayShaderConstants(uint32_t shader, uint8_t* base,
+                            std::array<uint32_t, kD3d9ConstRegs * 4>& out) {
+  (void)base;
+  if (!shader) return;
+  const uint32_t h = shader + kVsPatchHeaderAt;
+  if (!HostPageReadable(REX_RAW_ADDR(h + kVsPatchOffsetAt)) ||
+      !HostPageReadable(REX_RAW_ADDR(shader + kVsCodeAllocAt)))
+    return;
+  const uint32_t rel = REX_LOAD_U32(h + kVsPatchOffsetAt);
+  if (!rel || rel >= 0x10000) return;
+  const uint32_t pblk = h + rel;
+  if (!HostPageReadable(REX_RAW_ADDR(pblk + 0x10))) return;
+  const uint32_t bytes = REX_LOAD_U32(pblk + 0x10);
+  if (bytes >= 0x10000) return;
+  const uint32_t code_alloc = REX_LOAD_U32(shader + kVsCodeAllocAt);
+
+  uint32_t at = pblk + 0x14;
+  const uint32_t end = at + bytes;
+  while (at + 8 <= end && HostPageReadable(REX_RAW_ADDR(at))) {
+    const uint32_t hdr = REX_LOAD_U32(at);
+    const uint32_t reg = hdr >> 16, dwords = hdr & 0xFFFF;
+    if (!dwords) break;
+    const uint32_t data = code_alloc + REX_LOAD_U32(at + 4);
+    at += 8;
+    if (reg >= kD3d9ConstRegs || dwords > kD3d9ConstRegs * 4 ||
+        reg * 4 + dwords > out.size())
+      continue;
+    for (uint32_t i = 0; i < dwords; ++i) {
+      const uint32_t src = data + i * 4;
+      if (!HostPageReadable(REX_RAW_ADDR(src))) break;
+      out[reg * 4 + i] = REX_LOAD_U32(src);
+    }
+    ++g_shaderConstOverlays;
+  }
+}
+
+bool CaptureVertexConstants(uint32_t device, uint8_t* base, uint32_t shader,
                             std::array<uint32_t, kD3d9ConstRegs * 4>& out) {
   const uint32_t bytes = kD3d9ConstRegs * 16;
   if (!device || !HostPageReadable(REX_RAW_ADDR(device + 0x780)) ||
@@ -807,6 +881,7 @@ bool CaptureVertexConstants(uint32_t device, uint8_t* base,
     return false;
   for (uint32_t i = 0; i < out.size(); ++i)
     out[i] = REX_LOAD_U32(device + 0x780 + i * 4);
+  OverlayShaderConstants(shader, base, out);
   return true;
 }
 
@@ -992,7 +1067,8 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   pending.vertex_shader = vertex_shader;
   pending.device = device;
   pending.have_texture = have_texture;
-  if (!CaptureVertexConstants(device, base, pending.constants)) {
+  if (!CaptureVertexConstants(device, base, vertex_shader,
+                              pending.constants)) {
     ++g_pendingDropped;
     return;
   }
@@ -1302,13 +1378,6 @@ uint64_t g_aluBadStream = 0;
 // shader handle and reused, because the offset is a property of the layout.
 constexpr uint32_t kPatchWindowBack = 128;   // dwords captured before dest
 
-// Vertex shader object, read out of sub_82565928's VS branch at 0x82566234 and
-// cross-checked against the patcher at 0x82564C50. The pixel shader twin is at
-// ps + 0x18 / ps + 0x40 / info + 0x28 / info + 0x2C (see CollectPixelShaderBlob).
-constexpr uint32_t kVsCodeAllocAt = 0x20;    // code allocation pointer
-constexpr uint32_t kVsInfoOffsetAt = 0x380;  // + variant*8 -> info block offset
-constexpr uint32_t kVsInfoCodeOffset = 0x368;  // CF byte offset in the allocation
-constexpr uint32_t kVsInfoCodeSize = 0x36C;    // program length in bytes
 uint64_t g_vsWindowAgree = 0, g_vsWindowDisagree = 0, g_vsWindowNoField = 0;
 uint64_t g_vsWindowAtDest = 0, g_vsWindowEarly = 0, g_vsWindowLate = 0;
 uint64_t g_vsWindowLenRejected = 0;
@@ -1524,7 +1593,7 @@ ShaderApplyResult ApplyShaderOutputs(
                   constant_snapshot + kD3d9ConstRegs * 4);
   } else {
     std::array<uint32_t, kD3d9ConstRegs * 4> captured;
-    if (!CaptureVertexConstants(device, base, captured)) {
+    if (!CaptureVertexConstants(device, base, handle, captured)) {
       ++g_hleShaderBadConstants;
       return ShaderApplyResult::kFailed;
     }
@@ -4456,58 +4525,80 @@ void DumpVertexShaderObject(uint32_t handle, uint8_t* base) {
 // answer whatever the list contains. That distinction is the whole point of the
 // probe; the list alone would only show intent.
 //-----------------------------------------------------------------------------
-constexpr uint32_t kVsPatchHeaderAt = 0x368;
-constexpr uint32_t kVsPatchOffsetAt = 0x14;
-constexpr uint32_t kConstantsBase = 0x480;
-constexpr uint32_t kC255Offset = 0x780 - kConstantsBase + 255 * 16;
 
+// Walk the shader's embedded constant-load table and report what it publishes.
+//
+// sub_825656A0, called from the draw-time flush sub_82565928 as
+// sub_825656A0(device, vs + 0x368, *(vs + 0x20)), walks the list at P + 0x14
+// (P = H + *(H + 0x14), H = vs + 0x368) and emits, per entry, a PM4 Type-3
+// packet with header 0xC0022F00 — opcode 0x2F, LOAD_ALU_CONSTANT — whose body
+// is [source_address, 4 * reg_index, dword_count].
+//
+//   entry: u16 reg_index, u16 dword_count, u32 data_offset   (8 bytes)
+//   terminated by dword_count == 0
+//   source = *(vs + 0x20) + data_offset
+//
+// These are the entries D3DDevice_SetVertexShader's FIRST loop steps over
+// without acting on; its memcpy loop is a different, later list in the same
+// block. An earlier version of this probe walked the first list with the
+// second's layout, read reg_index 0xFC as a byte offset, compared it against
+// c255's byte offset 0x12F0, and concluded nothing published c255. 0xFC is
+// c252, and the count of 16 dwords covers c252..c255 — which is register
+// 0x4000 + 252*4 = 0x43F0, the LOAD_ALU_CONSTANT already on record.
+//
+// So this data never passes through device + 0x780. It is literal constant
+// data carried inside the shader's own code allocation and handed to the GPU
+// by address, which is why the device shadow the HLE reads shows zeros.
 void ProbeVertexShaderConstantPatch(uint32_t shader, uint32_t device,
                                     const uint32_t before[4], uint8_t* base) {
   (void)base;
+  (void)device;
+  (void)before;
   static std::map<uint32_t, bool> s_seen;
-  if (s_seen.size() >= 32 || !s_seen.emplace(shader, true).second) return;
-
-  const uint32_t c255_addr = device + kConstantsBase + kC255Offset;
-  uint32_t after[4] = {};
-  if (HostPageReadable(REX_RAW_ADDR(c255_addr))) {
-    for (uint32_t i = 0; i < 4; ++i) after[i] = REX_LOAD_U32(c255_addr + i * 4);
-  }
-  const bool changed = before[0] != after[0] || before[1] != after[1] ||
-                       before[2] != after[2] || before[3] != after[3];
+  if (s_seen.size() >= 24 || !s_seen.emplace(shader, true).second) return;
 
   const uint32_t h = shader + kVsPatchHeaderAt;
+  if (!HostPageReadable(REX_RAW_ADDR(h + kVsPatchOffsetAt)) ||
+      !HostPageReadable(REX_RAW_ADDR(shader + kVsCodeAllocAt)))
+    return;
+  const uint32_t rel = REX_LOAD_U32(h + kVsPatchOffsetAt);
+  if (!rel || rel >= 0x10000) return;
+  const uint32_t pblk = h + rel;
+  if (!HostPageReadable(REX_RAW_ADDR(pblk + 0x10))) return;
+  const uint32_t code_alloc = REX_LOAD_U32(shader + kVsCodeAllocAt);
+  const uint32_t bytes = REX_LOAD_U32(pblk + 0x10);
+  if (bytes >= 0x10000) return;
+
   std::string entries;
-  bool covers_c255 = false;
-  uint32_t count = 0;
-  if (HostPageReadable(REX_RAW_ADDR(h + kVsPatchOffsetAt))) {
-    const uint32_t rel = REX_LOAD_U32(h + kVsPatchOffsetAt);
-    if (rel && rel < 0x10000 && HostPageReadable(REX_RAW_ADDR(h + rel + 0x10))) {
-      const uint32_t pblk = h + rel;
-      const uint32_t bytes = REX_LOAD_U32(pblk + 0x10);
-      uint32_t at = pblk + 0x14;
-      const uint32_t end = at + (bytes < 0x10000 ? bytes : 0);
-      // Loop 1 is the 8-byte-entry list, loop 2 is the memcpy list. Walk the
-      // same way the guest does rather than assuming which one we landed in.
-      while (at + 4 <= end && HostPageReadable(REX_RAW_ADDR(at))) {
-        const uint32_t hdr = REX_LOAD_U32(at);
-        const uint32_t off = hdr >> 16, dwords = hdr & 0xFFFF;
-        at += 4;
-        if (!dwords) break;
-        if (++count <= 8) {
-          entries += fmt::format(" [+0x{:X} x{}]", off, dwords);
+  std::string c255;
+  uint32_t at = pblk + 0x14;
+  const uint32_t end = at + bytes;
+  uint32_t n = 0;
+  while (at + 8 <= end && HostPageReadable(REX_RAW_ADDR(at))) {
+    const uint32_t hdr = REX_LOAD_U32(at);
+    const uint32_t reg = hdr >> 16, dwords = hdr & 0xFFFF;
+    if (!dwords) break;
+    const uint32_t data_off = REX_LOAD_U32(at + 4);
+    at += 8;
+    if (++n <= 6)
+      entries += fmt::format(" c{}..c{} @+0x{:X}", reg,
+                             reg + dwords / 4 - 1, data_off);
+    // The published value of c255 itself, read from where the packet points.
+    if (reg <= 255 && 255 < reg + dwords / 4) {
+      const uint32_t src = code_alloc + data_off + (255 - reg) * 16;
+      if (HostPageReadable(REX_RAW_ADDR(src))) {
+        float f[4];
+        for (uint32_t i = 0; i < 4; ++i) {
+          const uint32_t w = REX_LOAD_U32(src + i * 4);
+          std::memcpy(&f[i], &w, 4);
         }
-        if (off <= kC255Offset && kC255Offset < off + dwords * 4)
-          covers_c255 = true;
-        at += dwords * 4;
+        c255 = fmt::format(" c255 = ({:.6g}, {:.6g}, {:.6g}, {:.6g}) @0x{:08X}",
+                           f[0], f[1], f[2], f[3], src);
       }
     }
   }
-  REXLOG_INFO(
-      "d3d9: vs 0x{:08X} const patch: {} entries{}{}; c255 {:08X} {:08X} "
-      "{:08X} {:08X} -> {:08X} {:08X} {:08X} {:08X} ({})",
-      shader, count, entries, covers_c255 ? " COVERS-C255" : "", before[0],
-      before[1], before[2], before[3], after[0], after[1], after[2], after[3],
-      changed ? "CHANGED" : "unchanged");
+  REXLOG_INFO("d3d9: vs 0x{:08X} const loads: {} entries{}{}", shader, n,
+              entries, c255.empty() ? " — none covers c255" : c255);
 }
 
 REX_IMPORT(__imp__sub_825508A8, orig_SetVertexShader, void());
@@ -4523,19 +4614,14 @@ extern "C" REX_FUNC(sub_825508A8) {
   if (capture) {
     DumpVertexShaderObject(shader, base);
   }
-  uint32_t before[4] = {};
-  // Behind hle_capture like every other diagnostic here. It is one-shot per
-  // shader and capped, so the cost is small — but "small" is not the rule this
-  // flag enforces. A measurement that runs when nobody asked for it is how a
-  // default run stops being the thing being measured.
-  const uint32_t c255_addr = device + kConstantsBase + kC255Offset;
-  const bool probe =
-      capture && shader && HostPageReadable(REX_RAW_ADDR(c255_addr));
-  if (probe) {
-    for (uint32_t i = 0; i < 4; ++i) before[i] = REX_LOAD_U32(c255_addr + i * 4);
-  }
   orig_SetVertexShader(ctx, base);
-  if (probe) ProbeVertexShaderConstantPatch(shader, device, before, base);
+  // Behind hle_capture like every other diagnostic here. No longer sampled
+  // either side of the original call: that comparison was built to test whether
+  // SetVertexShader itself writes c255 into the device shadow. It does not, and
+  // the reason is now known — the value never goes through the shadow at all.
+  if (capture && shader) {
+    ProbeVertexShaderConstantPatch(shader, device, nullptr, base);
+  }
 }
 
 REX_IMPORT(__imp__sub_825506E8, orig_SetPixelShader, void());
