@@ -23,6 +23,44 @@ void SwapBlock(uint8_t* p, uint32_t bytes, xenos::Endian endian) {
 }
 }  // namespace
 
+// Transcribed from the guest's own GPUTEXTUREFORMAT name table: a 64-entry
+// pointer array at 0x82d24378 (near-duplicate at 0x82d59d00), indexing the
+// FMT_* strings in 0x820a9d00-0x820a9fd0 and 0x8205b5ec-0x8205b6d0. Both
+// tables belong to the HLSL compiler embedded in the XEX (sub_8263F9C0 and
+// sub_82C1BB88), so they are guest diagnostics rather than the runtime texture
+// path — but they are authoritative for the enum, and decoding them confirmed
+// index-for-index that fetch.format indexes the same ordering xenos.h assumes.
+// Spellings are the guest's own, including index 20's truncated "FMT_4_5" for
+// DXT4_5 and index 0's lowercase tail. Indices 61-63 are compiler-internal and
+// have no GPU meaning.
+const char* GuestTextureFormatName(uint32_t guest_format) {
+  static constexpr const char* kNames[64] = {
+      "FMT_1_reverse", "FMT_1", "FMT_8", "FMT_1_5_5_5",
+      "FMT_5_6_5", "FMT_6_5_5", "FMT_8_8_8_8", "FMT_2_10_10_10",
+      "FMT_8_A", "FMT_8_B", "FMT_8_8", "FMT_CR",
+      "FMT_Y1", "FMT_SHADOW", "FMT_8_8_8_8_A", "FMT_4_4_4_4",
+      "FMT_10_11_11", "FMT_11_11_10", "FMT_DXT1", "FMT_DXT2_3",
+      "FMT_4_5", "FMT_DXV", "FMT_24_8", "FMT_24_8_FLOAT",
+      "FMT_16", "FMT_16_16", "FMT_16_16_16_16", "FMT_16_EXPAND",
+      "FMT_16_16_EXPAND", "FMT_16_16_16_16_EXPAND", "FMT_16_FLOAT",
+      "FMT_16_16_FLOAT",
+      "FMT_16_16_16_16_FLOAT", "FMT_32", "FMT_32_32", "FMT_32_32_32_32",
+      "FMT_32_FLOAT", "FMT_32_32_FLOAT", "FMT_32_32_32_32_FLOAT",
+      "FMT_32_AS_8",
+      "FMT_32_AS_8_8", "FMT_16_MPEG", "FMT_16_16_MPEG", "FMT_8_INTERLACED",
+      "FMT_32_AS_8_INTERLACED", "FMT_32_AS_8_8_INTERLACED",
+      "FMT_16_INTERLACED", "FMT_16_MPEG_INTERLACED",
+      "FMT_16_16_INTERLACED", "FMT_DXN", "FMT_8_8_8_8_AS_16_16_16_16",
+      "FMT_DXT1_AS_16_16_16_16",
+      "FMT_DXT2_3_AS_16_16_16_16", "FMT_DXT4_5_AS_16_16_16_16",
+      "FMT_2_10_10_10_AS_16_16_16_16", "FMT_10_11_11_AS_16_16_16_16",
+      "FMT_11_11_10_AS_16_16_16_16", "FMT_32_32_32_FLOAT", "FMT_DXT3A",
+      "FMT_DXT5A",
+      "FMT_CTX1", "FMT_compiler_61", "FMT_compiler_62", "FMT_compiler_63",
+  };
+  return guest_format < 64 ? kNames[guest_format] : "FMT_?";
+}
+
 uint64_t HleTextureKey(const uint32_t fetch_words[6]) {
   uint64_t h = 1469598103934665603ull;
   for (uint32_t i = 0; i < 6; ++i) {
@@ -59,6 +97,8 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
   if (!fetch.base_address) return reject("texture has no base level");
 
   const auto format = rex::graphics::GetBaseFormat(fetch.format);
+  // Recorded before the accept-list so the reject path can name what it hit.
+  out.guest_format = uint32_t(format);
   switch (format) {
     case xenos::TextureFormat::k_8_8_8_8:
       out.host_format = HostTextureFormat::kRgba8;

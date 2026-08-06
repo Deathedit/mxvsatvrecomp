@@ -8,6 +8,11 @@
 namespace mx::hle {
 
 struct HleTextureSource {
+  // The raw 6-bit format field, already folded through GetBaseFormat. Set
+  // before the accept-list switch runs, so it is valid even when
+  // DescribeHleTexture2D returns false — that is the whole point of it, since
+  // "unsupported texture format" is useless without naming the format.
+  uint32_t guest_format = 0;
   uint32_t address = 0;
   uint32_t source_bytes = 0;
   uint32_t width = 0;
@@ -24,6 +29,10 @@ struct HleTextureSource {
   bool linear_filter = true;
   HostTextureFormat host_format = HostTextureFormat::kRgba8;
 };
+
+// Name of a guest texture format, transcribed from the game's own 64-entry
+// table. Never null; unknown indices return "FMT_?".
+const char* GuestTextureFormatName(uint32_t guest_format);
 
 bool DescribeHleTexture2D(const uint32_t fetch_words[6],
                           HleTextureSource& out, const char** fail = nullptr);

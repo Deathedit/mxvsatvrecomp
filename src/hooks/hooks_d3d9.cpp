@@ -2278,6 +2278,47 @@ bool ReadLiveTextureFetch(uint32_t device, uint8_t* base, uint32_t sampler,
 // closer approximation to the shader's visible base colour than BC5 normal
 // maps, float intermediates, or unnormalized render-target inputs. Ties retain
 // shader instruction order; no sampler number is treated as a semantic.
+// Per-guest-format tally of descriptors the HLE decoder turned down, shared by
+// both rejection sites. This replaced a flat "log the first 12" cap, which
+// could spend its whole budget on one format and leave every other one
+// invisible — the reason "unsupported texture format" has never once told us
+// which format to add. Keyed by the base format index; the value counts
+// sightings and the first of each is logged in full.
+std::map<uint32_t, uint64_t> g_hleRejectedFormats;
+
+void NoteRejectedTextureFormat(const char* site, uint32_t sampler,
+                               const mx::hle::HleTextureSource& source,
+                               const char* why, const uint32_t fetch[6]) {
+  const uint32_t fmt = source.guest_format;
+  const bool first = ++g_hleRejectedFormats[fmt] == 1;
+  if (!first) return;
+  REXLOG_INFO("d3d9: HLE texture reject [{}]: sampler {} format {} ({}) — {}; "
+              "words {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+              site, sampler, fmt, mx::hle::GuestTextureFormatName(fmt),
+              why ? why : "?", fetch[0], fetch[1], fetch[2], fetch[3],
+              fetch[4], fetch[5]);
+}
+
+// Renders the tally as "4:FMT_5_6_5=1832 15:FMT_4_4_4_4=97", ranked by count,
+// for the periodic summary. Empty string when nothing has been rejected.
+std::string RejectedFormatSummary() {
+  std::vector<std::pair<uint64_t, uint32_t>> ranked;
+  ranked.reserve(g_hleRejectedFormats.size());
+  for (const auto& [fmt, count] : g_hleRejectedFormats)
+    ranked.emplace_back(count, fmt);
+  std::sort(ranked.begin(), ranked.end(), std::greater<>());
+  std::string out;
+  for (const auto& [count, fmt] : ranked) {
+    if (!out.empty()) out += ' ';
+    out += std::to_string(fmt);
+    out += ':';
+    out += mx::hle::GuestTextureFormatName(fmt);
+    out += '=';
+    out += std::to_string(count);
+  }
+  return out;
+}
+
 bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
                                 uint8_t* base,
                                 mx::hle::PixelTextureBinding& out) {
@@ -2293,7 +2334,15 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
     uint32_t fetch[6];
     if (!ReadLiveTextureFetch(device, base, candidate.sampler, fetch)) continue;
     mx::hle::HleTextureSource source;
-    if (!mx::hle::DescribeHleTexture2D(fetch, source, nullptr)) continue;
+    const char* candidate_why = nullptr;
+    if (!mx::hle::DescribeHleTexture2D(fetch, source, &candidate_why)) {
+      // Selection used to discard this reason entirely, so a format rejected
+      // while choosing a binding produced no log line at all — half the
+      // rejections in any run were invisible.
+      NoteRejectedTextureFormat("select", candidate.sampler, source,
+                                candidate_why, fetch);
+      continue;
+    }
 
     // A D3D9 Resolve establishes an ordered host render-target dependency.
     // Its guest backing may legitimately be all zero in native mode because
@@ -2466,6 +2515,13 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
   static uint64_t s_no_binding = 0, s_bad_desc = 0, s_unreadable = 0;
   static uint64_t s_mapped = 0, s_empty = 0, s_semantic_reject = 0;
   ++s_attempts;
+  // Driven by attempts, not by successes: the summary further down only fires
+  // once a texture is ready, so a run in which every descriptor is rejected —
+  // precisely the run this tally exists to characterise — would print nothing.
+  if ((s_attempts % 2500) == 0 && !g_hleRejectedFormats.empty()) {
+    REXLOG_INFO("d3d9: HLE rejected guest texture formats after {} attempts: {}",
+                s_attempts, RejectedFormatSummary());
+  }
   if ((!pixel_shader ||
        !ResolvePixelBindingForDraw(pixel_shader, device, base, binding)) &&
       !ReadBoundPixelShader(device, base, pixel_shader, binding)) {
@@ -2523,12 +2579,7 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
   const char* why = nullptr;
   if (!DescribeHleTexture2D(fetch, source, &why)) {
     ++s_bad_desc;
-    if (s_bad_desc <= 12) {
-      REXLOG_INFO("d3d9: HLE texture fallback: sampler {} descriptor rejected "
-                  "({}), words {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
-                  binding.sampler, why ? why : "?", fetch[0], fetch[1],
-                  fetch[2], fetch[3], fetch[4], fetch[5]);
-    }
+    NoteRejectedTextureFormat("prepare", binding.sampler, source, why, fetch);
     return false;
   }
   dc.sampled_texture_width = source.width;
@@ -2538,9 +2589,15 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
       source.host_format == HostTextureFormat::kRgba16Float) {
     ++s_semantic_reject;
     if (s_semantic_reject <= 12) {
-      REXLOG_INFO("d3d9: HLE texture fallback: sampler {} format {} is not "
-                  "an immutable colour asset",
-                  binding.sampler, uint32_t(source.host_format));
+      // Named in guest terms as well: this drop is a policy choice about a
+      // format we *can* decode, so telling the two kinds of loss apart in the
+      // log matters when deciding what to add next.
+      REXLOG_INFO("d3d9: HLE texture fallback: sampler {} guest format {} ({}) "
+                  "decodes to host format {} but is not an immutable colour "
+                  "asset",
+                  binding.sampler, source.guest_format,
+                  GuestTextureFormatName(source.guest_format),
+                  uint32_t(source.host_format));
     }
     return false;
   }
