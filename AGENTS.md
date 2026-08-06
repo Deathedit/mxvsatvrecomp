@@ -574,6 +574,22 @@ Signed-normalized `k_2_10_10_10` (used for `NORMAL` and `TANGENT`) has no DXGI
 equivalent. It passes through as `R10G10B10A2_UINT` with
 `Unpack::kSnorm2_10_10_10` so the shader finishes the conversion.
 
+### Render targets — done, and instrumented
+
+Each guest colour surface gets its own host target. The device offsets are in
+the Device offsets section; `EnsureGameRenderTarget` in
+`src/gfx/d3d12_game.cpp` owns the routing, capped at `kMaxGameRenderTargets`
+(64).
+
+**The failure mode is silent:** when the cap is exhausted, or an object is
+reused at a new size, `EnsureGameRenderTarget` returns nullptr and the caller
+falls back to the main target — reinstating the overpainting this exists to
+prevent. `game RT routing:` counts it, splitting draws that never wanted an
+offscreen target from those that asked and were refused. Measured healthy:
+**OVERPAINT 0, refusals 0, 22/64 live targets**, flat over a 420s run. Note the
+D3D9 hook logs ~53 distinct render-target *objects* — only 22 become routable
+targets, so that number is not the one to compare against the cap.
+
 ### State
 
 With `--force_load=ST_Southwest --registry_override=ReadyToLaunch=1`:
@@ -585,10 +601,22 @@ triangles sample a single texel. Their vertex shader is one instruction,
 `MAD export0 = r0 * c255 + c255`, and c255 reads back `(0,0,0,0)`. The constant
 file is populated (70 live vec4 across indices 0..218) and the read offset is
 confirmed by the setter's own arithmetic, so the slot is genuinely never
-published through the device shadow. The PM4 side shows the other publisher:
+published through the device shadow. The PM4 side showed the other publisher:
 `LOAD_ALU_CONSTANT write reg=0x43F0 dwords=16` is register `0x4000 + 252*4`,
-covering slots 252–255. **The fix is to source the HLE constant file from the
-`LOAD_ALU_CONSTANT` shadow as well as from `device + 0x780`.** Not yet done.
+covering slots 252–255.
+
+**The fix this file used to propose — source the constant file from the
+`LOAD_ALU_CONSTANT` shadow — is no longer available.** That shadow lived in the
+PM4 translator, deleted in 4dd1790. The ring is still parsed, but nothing
+tracks constants from it, and reinstating that would be a PM4 dependency on the
+render path, which is the thing the pure-HLE work removed.
+
+So the finding stands and the fix does not: **c255 must be recovered from the
+guest D3D9 side.** The parallel is the pixel shader CF offset (5309f2a), which
+looked like it needed the ring and turned out to be a field the guest's own
+emitter reads — found in IDA, and better than the PM4 answer once found. The
+equivalent question here is which D3D9 entry point publishes slots 252–255, and
+it should be settled in `default.xex.probe.i64`, not inferred. Not yet done.
 
 ---
 
