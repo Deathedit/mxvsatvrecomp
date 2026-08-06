@@ -42,26 +42,17 @@ REXCVAR_DEFINE_STRING(force_load, "", "Debug",
 REXCVAR_DEFINE_STRING(registry_override, "", "Debug",
                       "Comma-separated key=value overrides for guest registry string reads");
 
-// Escape hatch for the frame-pacing unstub in the sub_82B70370 hook below. The
-// stub is off by default now that both hazards it was written for have been
-// disproved against the guest code; set this true to put it back.
-REXCVAR_DEFINE_BOOL(native_timing_stub, false, "Debug",
-                    "Restore the fixed-1/60 stub for sub_82B70370 in native mode");
-
 // sub_82B34998 — RendererDispatchBlock, called from LoaderTick on the Transition
 // thread.
 //
-// MADE MODE-NEUTRAL 2026-08-06. It used to log only under the plugin and call
-// the original silently in native, which hid the one number that matters: the
-// plugin enters the Lua VM from this thread immediately after this function
-// returns, and it returns a non-null r3 (0x21293D44) every time. Natively the
-// Transition thread never enters the VM at all. Whether that is because this
-// returns something different has never been observable — the probe was
-// one-sided.
+// MADE MODE-NEUTRAL 2026-08-06, and keep it that way. It used to log only under
+// the plugin and call the original silently in native, which hid the number that
+// found the frame-pacing bug: `f1` arriving here was exactly 0.00 in native and
+// varied under the plugin. **A one-sided probe was read as evidence that native
+// behaved the same.** See the sub_82B70370 hook below.
 //
-// Beware of reading any *other* Transition-thread line difference between the
-// two modes: most of the probes on that thread are still plugin-only, so their
-// absence in a native log means nothing.
+// The same warning still applies to the rest of this file: most Transition-thread
+// probes are plugin-only, so their absence from a native log means nothing.
 REX_IMPORT(__imp__sub_82B34998, orig_RendererDispatch, void());
 extern "C" REX_FUNC(sub_82B34998) {
   const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
@@ -97,57 +88,45 @@ extern "C" REX_FUNC(sub_82B3C7D0) {
   orig_LazyInit(ctx, base);
 }
 
-// sub_82B70370 — timing function (busy-wait spin in native)
+// sub_82B70370 — frame pacing: QPC delta / perf frequency -> dt at a1+24, then
+// a 5-sample smoothing pass and the running totals at a1+56/60/64.
+//
+// This was stubbed in native mode until 2026-08-06, and that stub was the reason
+// the front end never ran: it wrote a fixed 1/60 to a1+24 and nothing else, so
+// a1+60 (total elapsed time) never advanced and the dt reaching LoaderTick's
+// RendererDispatch was exactly 0.00. Unstubbing took the script VM from 28
+// dispatches to 686, script assets from 2 to 4 and Bink opens from 0 to 3 —
+// plugin mode's numbers exactly, 3/3 runs.
+//
+// The stub's two stated hazards were both false, and neither had been checked
+// against the guest code:
+//
+//   - "a1+20 drives a busy-wait". The guest's own test is
+//     `if (*(float*)(a1+20) != 3.4028235e38 && dt < target)`, and a1+20 holds
+//     0x7F7FFFFF — exactly that FLT_MAX sentinel — so the guest disables the
+//     spin itself. The one-time log below re-checks it at runtime.
+//   - "a1+32 is an unbounded store offset". It is `v9 = *(a1+32) + 9;
+//     *(float*)(4*v9 + a1) = dt;` with `if (v10 >= 5) *(a1+32) = 0` — a bounded
+//     5-entry ring at a1+36..a1+52, guarded by `if (*(a1+28))`.
+//
+// No cvar to restore the stub. It was wrong, not a trade-off; git has it.
 REX_IMPORT(__imp__sub_82B70370, orig_Timing, void());
 extern "C" REX_FUNC(sub_82B70370) {
   static int tm = 0;
   ++tm;
-  bool loud = tm <= 5 || (tm % 1000) == 0;
-  if (mx::native::g_plugin_mode) {
-    if (loud) REXLOG_INFO("plugin: Timing(sub_82B70370) #{} a1=0x{:08X}", tm, ctx.r3.u32);
-    orig_Timing(ctx, base);
-    return;
-  }
-  // NATIVE: no longer stubbed by default (2026-08-06). Both hazards the old
-  // stub was written for are false against this binary, read out of
-  // sub_82B70370 rather than assumed:
-  //
-  //   - "a1+20 drives a busy-wait". The guest's own test is
-  //     `if (*(float*)(a1+20) != 3.4028235e38 && dt < target)`. a1+20 reads
-  //     0x7F7FFFFF, which is exactly that FLT_MAX sentinel, so the spin is
-  //     disabled by the guest itself.
-  //   - "a1+32 is an unbounded store offset". It is `v9 = *(a1+32) + 9;
-  //     *(float*)(4*v9 + a1) = dt;` with the index wrapped by
-  //     `if (v10 >= 5) *(a1+32) = 0` — a bounded 5-entry ring at a1+36..a1+52,
-  //     guarded by `if (*(a1+28))`. Observed value is 0.
-  //
-  // The stub cost more than it saved: it wrote a fixed 1/60 to a1+24 and
-  // nothing else, while the real function also maintains a1+56 (the 5-sample
-  // smoothing sum), a1+60 (TOTAL ELAPSED TIME), a1+64, a1+104 and a1+112. The
-  // measured symptom is that f1 reaching RendererDispatch is exactly 0.00 in
-  // native and varies under the plugin.
-  //
-  // Set --native_timing_stub=true to restore the old behaviour if this turns
-  // out to hang or fault.
   const uint32_t a1 = ctx.r3.u32;
-  if (REXCVAR_GET(native_timing_stub)) {
-    if (loud) {
-      REXLOG_INFO("native: Timing #{} STUBBED a1=0x{:08X} +20=0x{:08X} +32=0x{:08X}",
-                  tm, a1, a1 ? REX_LOAD_U32(a1 + 20) : 0, a1 ? REX_LOAD_U32(a1 + 32) : 0);
-    }
-    if (a1) REX_STORE_U32(a1 + 24, std::bit_cast<uint32_t>(1.0f / 60.0f));
-    return;
-  }
-  // The guard values are what make the call safe, so record them once rather
-  // than trusting the reading above to hold at runtime.
+  // The guards are what make this call safe, so record them once rather than
+  // trusting the reading above to still hold.
   if (tm == 1 && a1) {
-    REXLOG_INFO("native: Timing REAL — guards +20=0x{:08X} (FLT_MAX={}) +28=0x{:08X} +32=0x{:08X}",
-                REX_LOAD_U32(a1 + 20), REX_LOAD_U32(a1 + 20) == 0x7F7FFFFFu,
-                REX_LOAD_U32(a1 + 28), REX_LOAD_U32(a1 + 32));
+    REXLOG_INFO("{}: Timing guards +20=0x{:08X} (FLT_MAX={}) +28=0x{:08X} +32=0x{:08X}",
+                mx::native::g_plugin_mode ? "plugin" : "native", REX_LOAD_U32(a1 + 20),
+                REX_LOAD_U32(a1 + 20) == 0x7F7FFFFFu, REX_LOAD_U32(a1 + 28),
+                REX_LOAD_U32(a1 + 32));
   }
   orig_Timing(ctx, base);
-  if (loud && a1) {
-    REXLOG_INFO("native: Timing #{} REAL dt={:.6f} total={:.3f} a1=0x{:08X}", tm,
+  if ((tm <= 5 || (tm % 1000) == 0) && a1) {
+    REXLOG_INFO("{}: Timing #{} dt={:.6f} total={:.3f} a1=0x{:08X}",
+                mx::native::g_plugin_mode ? "plugin" : "native", tm,
                 std::bit_cast<float>(REX_LOAD_U32(a1 + 24)),
                 std::bit_cast<float>(REX_LOAD_U32(a1 + 60)), a1);
   }
@@ -846,140 +825,6 @@ extern "C" REX_FUNC(sub_82B38558) {
 }
 
 //=============================================================================
-// Does the guest load Bink itself?
-//=============================================================================
-// Bink is statically linked into the XEX, the same way D3D9 is: there is a
-// BINKCONS data segment at 0x821CD1D0 and the library code runs from about
-// 0x82CEB650 to 0x82CF0508. The guest has a complete decoder and needs nothing
-// from the host player in src/gfx/bink_player.cpp.
-//
-// It also demonstrably uses it. The intro plays under --gpu_plugin, and in
-// plugin mode MxApp::OnPreSetup returns before creating D3D12GraphicsSystem, so
-// RenderThreadFunc and the FFmpeg BinkPlayer never start at all. Something in
-// the guest decoded and presented that video.
-//
-// Natively, nothing has ever measured whether it even tries. Across 1,035 logs
-// the only lines matching /bink/ are mx's own "RenderPipeline #1 — skipped
-// (Bink playing)". That is not a negative result — no hook has ever existed on
-// the guest path — which is what these four add.
-//
-// Deliberately mode-neutral: comparing native against plugin is the entire
-// point, so every hook logs in both modes and calls the original. Nothing here
-// changes guest behaviour.
-
-namespace {
-
-// First `head` hits verbatim, then at most one line per 5s, matching the audio
-// and RequestLoad probes above. A looping video would otherwise flood the log.
-bool BinkLogDue(uint64_t count, std::chrono::steady_clock::time_point& last,
-                uint64_t head) {
-  if (count <= head) return true;
-  const auto now = std::chrono::steady_clock::now();
-  if ((now - last) < std::chrono::seconds(5)) return false;
-  last = now;
-  return true;
-}
-
-const char* BinkTag() { return mx::native::g_plugin_mode ? "plugin" : "native"; }
-
-}  // namespace
-
-// sub_82CEB7C8 — BinkOpen(path, flags). Named from its own error strings, not
-// from the call shape: "Not a Bink file." (0x82144B9C) and "Error reading Bink
-// header." (0x82144B28) are referenced from this function and nowhere else. It
-// has exactly two callers, both of them the manager opens below, so it is the
-// single choke point for every video the guest plays.
-//
-// The return is the line that matters. It separates "the guest never asked"
-// from "the guest asked and was refused" — two completely different problems.
-// 0 is failure, so failures get a much larger unrate-limited head.
-REX_IMPORT(__imp__sub_82CEB7C8, orig_BinkOpen, void());
-extern "C" REX_FUNC(sub_82CEB7C8) {
-  const uint32_t flags = ctx.r4.u32;
-  const uint32_t from = static_cast<uint32_t>(ctx.lr);
-  const std::string path = GuestString(base, ctx.r3.u32, 260);
-  orig_BinkOpen(ctx, base);
-  const uint32_t hbink = ctx.r3.u32;
-  static uint64_t s_count = 0;
-  static std::chrono::steady_clock::time_point s_last{};
-  if (BinkLogDue(++s_count, s_last, hbink ? 8 : 64)) {
-    REXLOG_INFO(
-        "{}: BinkOpen #{} \"{}\" flags=0x{:08X} -> hbink=0x{:08X} {} from lr=0x{:08X}",
-        BinkTag(), s_count, path, flags, hbink, hbink ? "OK" : "FAILED", from);
-  }
-}
-
-// sub_8234E0A8 — XenonBinkVideoManager::Open, slot [1] of the vtable at
-// 0x82017510. Formats "game:\%s.bik" from a3 and hands it to BinkOpen. a4 picks
-// the branch: non-zero passes flags 0x2000|0x100400 straight through, zero
-// first calls sub_82CEB3F0(10485760) and then passes 0x1000000|0x100400. That
-// 10 MB reserve sits on the path and is a plausible native failure point, so a4
-// is logged rather than dropped.
-//
-// Neither this nor sub_8234E290 has a single code xref — both are reached only
-// through the vtable, the same shape as the script bindings. A static call
-// graph cannot answer this question; only the runtime can.
-REX_IMPORT(__imp__sub_8234E0A8, orig_BinkMgrOpenGame, void());
-extern "C" REX_FUNC(sub_8234E0A8) {
-  const std::string name = GuestString(base, ctx.r5.u32, 260);
-  const uint32_t a4 = ctx.r6.u32;
-  const uint32_t from = static_cast<uint32_t>(ctx.lr);
-  static uint64_t s_count = 0;
-  static std::chrono::steady_clock::time_point s_last{};
-  if (BinkLogDue(++s_count, s_last, 8)) {
-    REXLOG_INFO("{}: BinkMgr::Open(game:) #{} name=\"{}\" a4=0x{:08X} from lr=0x{:08X}",
-                BinkTag(), s_count, name, a4, from);
-  }
-  orig_BinkMgrOpenGame(ctx, base);
-}
-
-// sub_8234E290 — XenonBinkVideoManager::Open, slot [2]. Same structure, but it
-// formats "%s.bik" and passes a2 — an already-built path — to BinkOpen with
-// flags 0x04100400. Both arguments are logged because a2 and a3 need not agree.
-REX_IMPORT(__imp__sub_8234E290, orig_BinkMgrOpenPath, void());
-extern "C" REX_FUNC(sub_8234E290) {
-  const std::string path = GuestString(base, ctx.r4.u32, 260);
-  const std::string name = GuestString(base, ctx.r5.u32, 260);
-  const uint32_t from = static_cast<uint32_t>(ctx.lr);
-  static uint64_t s_count = 0;
-  static std::chrono::steady_clock::time_point s_last{};
-  if (BinkLogDue(++s_count, s_last, 8)) {
-    REXLOG_INFO("{}: BinkMgr::Open(path) #{} path=\"{}\" name=\"{}\" from lr=0x{:08X}",
-                BinkTag(), s_count, path, name, from);
-  }
-  orig_BinkMgrOpenPath(ctx, base);
-}
-
-// sub_8234CBB8 — the Bink video component's init. It reads a "Texture To
-// Override" property off the descriptor in a2, then resolves the resource named
-// by "Bink Video Asset" (0x82016DF0) and requests it by fourcc 1651076715,
-// which is 0x62696E6B — 'bink'. Results land at a1[36] and a1[37].
-//
-// This fires when a video component is *created*, which is upstream of the
-// manager open. If it fires and the opens do not, the gap is between the
-// component and the manager rather than in Bink itself.
-//
-// The other "Bink Video Asset" reference, at 0x8234D090, is inside sub_8234CF80
-// and is deliberately not hooked. Hex-Rays gives up on that function after one
-// line — it opens with a call to the __noreturn sub_82ABAB98 — so what the rest
-// of it does has not actually been read, and naming a hook after a guess is the
-// mistake this file keeps re-learning. Add it once it has been decompiled.
-REX_IMPORT(__imp__sub_8234CBB8, orig_BinkAssetInit, void());
-extern "C" REX_FUNC(sub_8234CBB8) {
-  const uint32_t a1 = ctx.r3.u32;
-  const uint32_t from = static_cast<uint32_t>(ctx.lr);
-  static uint64_t s_count = 0;
-  static std::chrono::steady_clock::time_point s_last{};
-  const bool due = BinkLogDue(++s_count, s_last, 8);
-  orig_BinkAssetInit(ctx, base);
-  if (due) {
-    REXLOG_INFO("{}: BinkAsset::Init #{} a1=0x{:08X} tex=0x{:08X} asset=0x{:08X} from lr=0x{:08X}",
-                BinkTag(), s_count, a1, a1 ? REX_LOAD_U32(a1 + 36 * 4) : 0,
-                a1 ? REX_LOAD_U32(a1 + 37 * 4) : 0, from);
-  }
-}
-
-//=============================================================================
 // What is the last statement the native script layer runs?
 //=============================================================================
 // The VM stops about 1.6s into boot and everything downstream of it — the front
@@ -1050,9 +895,11 @@ extern "C" REX_FUNC(sub_82AA7638) {
   static uint64_t s_count = 0;
   static std::chrono::steady_clock::time_point s_last{};
   const uint64_t n = ++s_count;
-  // Native produces a handful in a whole run, so nothing is dropped there. The
-  // plugin runs the front end and produces many, hence the cap.
-  bool due = n <= 200;
+  // Was 200 while this was the instrument hunting the frame-pacing bug. Now
+  // that both modes run the front end it fires ~700 times a minute, so the head
+  // is small and the rest is sampled. It stays because it is the cheapest
+  // "is the front end actually running" signal there is.
+  bool due = n <= 8;
   if (!due) {
     const auto now = std::chrono::steady_clock::now();
     if ((now - s_last) >= std::chrono::seconds(5)) {
@@ -1069,38 +916,4 @@ extern "C" REX_FUNC(sub_82AA7638) {
   }
 
   orig_ScriptDispatch(ctx, base);
-}
-
-// The two VariableCollection bindings the plugin uses and native never reaches.
-// Named from the (name, func) table in .data near 0x82D1B21C, which agrees with
-// each function's own error strings ("GetVariableString" /
-// "VariableCollection_GetVariableString" in sub_824B1C20). Note the earlier
-// reading that put these in a table at 0x821A1740/0x821A1750 was wrong — that is
-// .pdata, function address plus unwind flags.
-//
-// r3 is the lua_State; the key is arg 2 on the Lua stack, which is why these log
-// only the fact of the call. The value and key already come out of the registry
-// getter probes above, with lr pointing back here.
-REX_IMPORT(__imp__sub_824B1C20, orig_GetVariableString, void());
-extern "C" REX_FUNC(sub_824B1C20) {
-  static uint64_t s_count = 0;
-  static std::chrono::steady_clock::time_point s_last{};
-  if (BinkLogDue(++s_count, s_last, 20)) {
-    REXLOG_INFO("{}: GetVariableString #{} L=0x{:08X} from lr=0x{:08X}",
-                mx::native::g_plugin_mode ? "plugin" : "native", s_count,
-                ctx.r3.u32, uint32_t(ctx.lr));
-  }
-  orig_GetVariableString(ctx, base);
-}
-
-REX_IMPORT(__imp__sub_824B1788, orig_GetVariableInt, void());
-extern "C" REX_FUNC(sub_824B1788) {
-  static uint64_t s_count = 0;
-  static std::chrono::steady_clock::time_point s_last{};
-  if (BinkLogDue(++s_count, s_last, 20)) {
-    REXLOG_INFO("{}: GetVariableInt #{} L=0x{:08X} from lr=0x{:08X}",
-                mx::native::g_plugin_mode ? "plugin" : "native", s_count,
-                ctx.r3.u32, uint32_t(ctx.lr));
-  }
-  orig_GetVariableInt(ctx, base);
 }

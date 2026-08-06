@@ -184,7 +184,9 @@ maintains `a1+56` (the 5-sample smoothing sum), **`a1+60`, total elapsed time**,
 nothing to advance on — the measured symptom was `f1` arriving at
 `RendererDispatch` as exactly `0.00` in native and varying under the plugin.
 
-`--native_timing_stub=true` restores the old behaviour.
+The stub is deleted outright rather than left behind a cvar: it was wrong, not
+a trade-off, and git has it. `legacy_mvp_tiebreak` went the same way in the same
+commit, its A/B having been settled.
 
 **Why this took so long to find, worth remembering:** the stub dates from before
 the D3D9 HLE layer, like the four other workarounds retired on 2026-08-06, and
@@ -756,7 +758,7 @@ exports clip space and the transform here is **identity**.
 
 Applied held at 88.84%.
 
-**RenderDoc A/B, frame 3000, NAT_Farm** (`legacy_mvp_tiebreak` exists so both
+**RenderDoc A/B, frame 3000, NAT_Farm** (`legacy_mvp_tiebreak` existed so both
 sides come from one binary). Captured twice: once as-is, once with
 `hide_colorless_draws=true` to remove the overpaint.
 

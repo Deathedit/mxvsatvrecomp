@@ -106,20 +106,6 @@ REXCVAR_DEFINE_BOOL(hle_main_viewport_only, false, "Debug",
                     "1280x720 D3D9 viewport. Diagnostic fallback now that "
                     "separate render targets are modelled");
 
-// A COMPARISON INSTRUMENT, not a mode. df66fd5 replaced the per-draw transform
-// contest with PA_CL_VTE_CNTL, flipping ~83% of draws from the viewport inverse
-// to identity. That is the largest behavioural change on this path and it is
-// justified entirely by guest-side evidence — the register is verified, but
-// verified is not the same as "the picture is better".
-//
-// This restores the old rule exactly, strict > and all, so both sides can be
-// captured from one binary minutes apart rather than from two builds that
-// differ by more than the branch under test. Delete it once a RenderDoc
-// before/after has settled the question.
-REXCVAR_DEFINE_BOOL(legacy_mvp_tiebreak, false, "Debug",
-                    "Restore the pre-df66fd5 output transform rule "
-                    "(identity_in_clip > viewport_in_clip) instead of reading "
-                    "PA_CL_VTE_CNTL. For A/B capture only");
 
 // Trigger a RenderDoc capture at a chosen presented frame.
 //
