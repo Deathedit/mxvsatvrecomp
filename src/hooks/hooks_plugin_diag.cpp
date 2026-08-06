@@ -68,24 +68,35 @@ extern "C" REX_FUNC(sub_82B34998) {
   }
 }
 
-// sub_82B3C7D0 — lazy-init alloc (hangs in Transition thread in native)
-REX_IMPORT(__imp__sub_82B3C7D0, orig_LazyInit, void());
+// sub_82B3C7D0 — accessor for dword_830BE190, with a null assert.
+//
+//   result = dword_830BE190;
+//   if (!dword_830BE190) sub_82AB73C0(61568);   // assert helper, line number
+//   return result;
+//
+// It was labelled "lazy-init alloc (hangs in Transition thread in native)".
+// Both halves are wrong: it allocates nothing, and a load / branch / return
+// cannot hang. The label predates the D3D9 HLE layer and was never re-derived.
+//
+// Corrected 2026-08-06 by decompiling it *and* measuring it, because reading a
+// body is how the last three stale claims in this file survived. Native run
+// mx_480: called twice, returns 0x212859A0 both times, assert path never taken.
+// It neither hangs nor is skipped.
+//
+// Kept, and made mode-neutral, for the one thing worth watching: whether
+// dword_830BE190 is ever null, which is the assert this function exists to
+// raise.
+REX_IMPORT(__imp__sub_82B3C7D0, orig_GetEngineGlobal, void());
 extern "C" REX_FUNC(sub_82B3C7D0) {
-  if (mx::native::g_plugin_mode) {
-    static int li = 0;
-    ++li;
-    if (li <= 10) {
-      REXLOG_INFO("plugin: LazyInit(sub_82B3C7D0) #{}", li);
-      LogEngSlot8(base, "LazyInit ENTER");
-    }
-    orig_LazyInit(ctx, base);
-    if (li <= 10) {
-      REXLOG_INFO("plugin: LazyInit #{} returned r3=0x{:08X}", li, ctx.r3.u32);
-      LogEngSlot8(base, "LazyInit RETURNED");
-    }
-    return;
+  static int li = 0;
+  ++li;
+  orig_GetEngineGlobal(ctx, base);
+  const bool null_global = ctx.r3.u32 == 0;
+  if (li <= 5 || null_global) {
+    REXLOG_INFO("{}: GetEngineGlobal(sub_82B3C7D0) #{} -> 0x{:08X}{}",
+                mx::native::g_plugin_mode ? "plugin" : "native", li, ctx.r3.u32,
+                null_global ? "  <-- NULL, assert path" : "");
   }
-  orig_LazyInit(ctx, base);
 }
 
 // sub_82B70370 — frame pacing: QPC delta / perf frequency -> dt at a1+24, then
@@ -133,9 +144,13 @@ extern "C" REX_FUNC(sub_82B70370) {
 }
 
 // sub_82B6D230 — called from LoaderTick's entity block @0x82B70E4C with f1=dt.
-// Frontier probe: with hook #7 off, execution reaches TexManager @0x82B70E44
-// then dies. This separates "dies in sub_82B6D230" from "dies in the entity
-// loops @0x82B70E54".
+// It iterates a vector — `n = (v[1] - v[0]) >> 2` elements — calling
+// sub_82B6A448(elem, dt) on each, so it is an entity update pass, not the
+// "frontier probe" it was labelled as.
+//
+// That label said execution "reaches TexManager @0x82B70E44 then dies" here.
+// It does not, and has not for a long time: ENTER and RETURNED balance 5/5 in
+// mx_473, mx_477 and mx_479. Corrected 2026-08-06.
 REX_IMPORT(__imp__sub_82B6D230, orig_EntityDt, void());
 extern "C" REX_FUNC(sub_82B6D230) {
   static int ed = 0;
