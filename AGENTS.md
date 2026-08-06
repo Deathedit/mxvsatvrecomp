@@ -907,6 +907,63 @@ appeared in both runs produce byte-identical bindings.
 `ps_export_mode[31:27]`. **`param_gen` is measured false** for the compositor
 shaders, so PS r0 is a real interpolator there.
 
+### Guest texture formats
+
+The guest carries its own complete 64-entry `GPUTEXTUREFORMAT` name table: a
+pointer array at **`0x82d24378`** (near-duplicate at `0x82d59d00`) indexing the
+`FMT_*` strings in `0x820a9d00`-`0x820a9fd0` and `0x8205b5ec`-`0x8205b6d0`. Both
+belong to the HLSL compiler embedded in the XEX (`sub_8263F9C0`,
+`sub_82C1BB88`), so they are guest diagnostics, not the runtime texture path --
+but the table is authoritative for the enum, and decoding it confirmed
+index-for-index, from the game's own binary rather than from Xenia, that
+`fetch.format` indexes the ordering `xenos.h` assumes. It is transcribed into
+`GuestTextureFormatName` in [d3d9_texture.cpp](src/gpu/d3d9_texture.cpp).
+Index 20 is spelled `FMT_4_5` in the guest, not `FMT_DXT4_5`; the value still
+matches `k_DXT4_5 = 20`.
+
+**The formats this game actually uses are a very short list.** Measured after
+`ac278db` made the rejection name the format, three runs per configuration:
+
+| Configuration | Formats the decoder was asked for and could not handle |
+|---|---|
+| front end, no `--force_load` | `FMT_4_4_4_4` only -- 3/3, byte-identical fetch words |
+| `--force_load=NAT_Farm` | `FMT_8` (91), `FMT_16` (4), `FMT_4_4_4_4` (2) |
+| after fixing those | `FMT_32_FLOAT` (71/90/79), which the earlier rejections had been hiding |
+
+All four are handled as of `319a5c2`; both configurations now reject nothing.
+`k_4_4_4_4` is the front end's own format and the only one it ever asks for --
+independently corroborated, since it is also the format Xenia complains about
+in plugin mode. The other three are single-channel and are decoded but never
+bound as base colour.
+
+Two traps in that decoder, both fixed, both worth remembering:
+
+- `SwapBlock` worked in 4-byte units, so **any 2-byte format got no endian swap
+  at all**. It was invisible for as long as `k_16_FLOAT` was the only 2-byte
+  format and the semantic gate refused to bind it.
+- The tiling helpers take a bytes-per-block *log2*, so a non-power-of-two block
+  (`k_32_32_32_FLOAT` is 12 bytes) would mis-address every block silently. Now
+  rejected explicitly.
+
+Fixing one format can reveal another: a rejected candidate ends the binding
+scan, so formats behind it are never reached. Re-measure after every addition
+rather than assuming the list is now empty.
+
+### Running these measurements
+
+- `--skip_intro` only ever gated **mx's own FFmpeg host player**. The guest now
+  opens its own Bink videos natively, so the intro plays regardless and eats
+  roughly the first 45 s of any run. Budget 150 s, not 60 s.
+- `--game_data_root=assets --user_data_root=userdata` are mandatory; without
+  them the process exits immediately.
+- `--hide_colorless_draws=true` on every run. Without it **no texture is
+  visible on screen at all** -- the colourless overpaint covers textured draws
+  rather than substituting for missing ones. This makes the shipped default
+  (`false`) the untested configuration; it should be flipped.
+- The front end does not always reach the UI within the window: roughly half of
+  otherwise-identical runs produce no texture uploads. Zero uploads is not
+  evidence of a regression; zero *rejections* is the signal to read.
+
 ### The `Type` dword in a vertex declaration
 
 From `PatchVertexShaderToMatchVertexDeclaration`, the function that consumes it:
