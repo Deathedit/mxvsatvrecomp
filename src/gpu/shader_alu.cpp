@@ -596,9 +596,35 @@ AluResult ExecuteVertexShader(
   // interpreter worth running: the shader reads its inputs from exactly the
   // registers its vfetch instructions named, and the export-62 decode already
   // proved those are the registers the position is built from.
+  // Seed the fetched attributes, honouring each vfetch's destination swizzle.
+  //
+  // Writing all four components unconditionally is wrong, and wrong in a way
+  // that hides: two vfetches are allowed to target the SAME register and fill
+  // different components of it, which is exactly what a position-plus-texcoord
+  // vertex does. The second fetch then overwrote the first outright. Measured
+  // in NAT_Farm: attr[1] fmt=31 -> r0 = (22.969, -16.234, 0, 1), a real
+  // texcoord, immediately replaced by attr[2] fmt=6 -> r0 = (0, 0, 0, 0). The
+  // shader then exported a zero UV and the draw sampled one texel.
+  //
+  // ucode.h FetchDestinationSwizzle, three bits per destination component:
+  //   0..3 = x/y/z/w of the fetched value, 4 = 0.0, 5 = 1.0, 7 = keep (do not
+  //   write this component).
+  // kKeep is the mechanism that lets two fetches share a register, so ignoring
+  // it is what produced the clobber.
   for (size_t i = 0; i < attrs.size() && i < attr_values.size(); ++i) {
     Vec4& d = in.temps[attrs[i].dest_reg & (kNumTemps - 1)];
-    for (int c = 0; c < 4; ++c) d[c] = attr_values[i][c];
+    const uint32_t swiz = attrs[i].dest_swizzle;
+    for (uint32_t c = 0; c < 4; ++c) {
+      switch (uc::GetFetchDestinationComponentSwizzle(swiz, c)) {
+        case uc::FetchDestinationSwizzle::kX: d[c] = attr_values[i][0]; break;
+        case uc::FetchDestinationSwizzle::kY: d[c] = attr_values[i][1]; break;
+        case uc::FetchDestinationSwizzle::kZ: d[c] = attr_values[i][2]; break;
+        case uc::FetchDestinationSwizzle::kW: d[c] = attr_values[i][3]; break;
+        case uc::FetchDestinationSwizzle::k0: d[c] = 0.0f; break;
+        case uc::FetchDestinationSwizzle::k1: d[c] = 1.0f; break;
+        default: break;  // kKeep, and the one undefined encoding
+      }
+    }
   }
 
   uint32_t executed = 0;

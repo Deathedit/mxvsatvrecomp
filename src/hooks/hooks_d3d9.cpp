@@ -1853,9 +1853,10 @@ ShaderApplyResult ApplyShaderOutputs(
           const HleStream& s = streams[attr_stream[a]];
           REXLOG_INFO(
               "d3d9:   attr[{}] stream={} slot={} off={} stride={} fmt={} "
-              "dest=r{} -> ({:.5g},{:.5g},{:.5g},{:.5g})",
+              "dest=r{} dswiz=0x{:03X} -> ({:.5g},{:.5g},{:.5g},{:.5g})",
               a, attr_stream[a], attrs[a].fetch_slot, attrs[a].offset_bytes,
-              s.stride, attrs[a].format, attrs[a].dest_reg, probe_values[a][0],
+              s.stride, attrs[a].format, attrs[a].dest_reg,
+              attrs[a].dest_swizzle, probe_values[a][0],
               probe_values[a][1], probe_values[a][2], probe_values[a][3]);
         }
         for (uint32_t e = 0; e < AluResult::kMaxInterpolators; ++e) {

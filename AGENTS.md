@@ -708,8 +708,28 @@ With `--force_load=ST_Southwest --registry_override=ReadyToLaunch=1`:
 **1482 / 1500 draws applied, 308,669 vertices**, skipping 12 stream + 6 vertex.
 Geometry reaches the screen but is scrambled.
 
-**Known defect — the compositor UV collapse.** The fullscreen post-process
-triangles sample a single texel. Their vertex shader is one instruction,
+**FIXED 2026-08-06 — the UV collapse.** Two vfetch instructions are allowed to
+target the same destination register and fill different components of it;
+`FetchDestinationSwizzle::kKeep` (7) is what marks a component as not written.
+The interpreter's attribute seeding ignored the destination swizzle and wrote
+all four components, so the second fetch overwrote the first outright. Observed
+directly: `attr[1] fmt=31 -> r0 = (22.969, -16.234, 0, 1)`, a real texcoord,
+replaced by `attr[2] fmt=6 -> r0 = (0, 0, 0, 0)`. The shader then exported a
+zero UV and the draw sampled one texel.
+
+Honouring the swizzle takes **real collapses from 26 to 0** (draws sampling a
+1024x1024 texture with a dead UV). Read the metric by texture extent or it
+misleads badly: total "collapsed" only moves 89 to 79, because the remainder are
+all **1x1** textures — the auto-exposure reduction chain, 64x64 -> 16x8 -> 4x2
+-> 1x1 — where a UV sweep is meaningless by construction and collapse is
+correct. Likewise 49 draws *left* the clean `(0,0)..(1,1)` bucket and that is
+also correct: they are the same 1024x1024 world textures, now showing tiling
+UVs beyond [0,1] instead of a perfect 0..1 sweep that only existed because the
+register had been clobbered. The fullscreen post-process passes (160x90,
+320x180, 640x360, 1280x720) keep unit range throughout.
+
+The original text follows, for the record. **The fullscreen post-process
+triangles sample a single texel.** Their vertex shader is one instruction,
 `MAD export0 = r0 * c255 + c255`, and c255 reads back `(0,0,0,0)`. The constant
 file is populated (70 live vec4 across indices 0..218) and the read offset is
 confirmed by the setter's own arithmetic, so the slot is genuinely never
