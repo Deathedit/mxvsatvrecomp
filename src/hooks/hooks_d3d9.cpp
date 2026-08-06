@@ -830,6 +830,8 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
 void ProbePixelProfileForDraw(uint32_t pixel_shader, uint32_t device,
                               uint8_t* base,
                               const mx::hle::DrawCall& dc);
+void ProbeBinkComposite(uint32_t pixel_shader, uint32_t vertex_shader,
+                        uint32_t device, uint8_t* base, uint32_t vertex_count);
 
 struct PendingHleDraw {
   mx::hle::DrawCall draw;
@@ -1060,6 +1062,9 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     dc.surface_pitch = rt.surface_info & 0x3FFFu;
   }
   ProbePixelProfileForDraw(st.ps_seen ? st.pixel_shader : 0, device, base, dc);
+  ProbeBinkComposite(st.ps_seen ? st.pixel_shader : 0,
+                     st.vs_seen ? st.vertex_shader : 0, device, base,
+                     dc.vertex_count);
   const bool have_texture =
       PrepareDrawTexture(dc, st.ps_seen ? st.pixel_shader : 0, device, base,
                          texture_binding);
@@ -2319,6 +2324,79 @@ std::string RejectedFormatSummary() {
   return out;
 }
 
+// The guest's Bink frame composite, identified from the binary rather than by
+// heuristic. sub_8234D630 (XenonBinkVideo vtable [8]) clears a render target,
+// calls sub_8234C7C0, then Resolves into a texture. sub_8234C7C0 binds three
+// plane textures to samplers 0/1/2 — Y, Cr, Cb — plus an optional alpha plane
+// on sampler 3 whose presence selects the second pixel shader. The guest keeps
+// all three shader handles in these globals, so a draw can be matched exactly.
+constexpr uint32_t kBinkPixelShaderYuv = 0x82DD7130;
+constexpr uint32_t kBinkPixelShaderYuvAlpha = 0x82DD7134;
+constexpr uint32_t kBinkVertexShader = 0x82DD7138;
+
+uint32_t ReadGuestGlobalPtr(uint8_t* base, uint32_t addr) {
+  return HostPageReadable(REX_RAW_ADDR(addr)) ? REX_LOAD_U32(addr) : 0;
+}
+
+void ProbeBinkComposite(uint32_t pixel_shader, uint32_t vertex_shader,
+                        uint32_t device, uint8_t* base, uint32_t vertex_count) {
+  const uint32_t ps_yuv = ReadGuestGlobalPtr(base, kBinkPixelShaderYuv);
+  const uint32_t ps_yuv_alpha =
+      ReadGuestGlobalPtr(base, kBinkPixelShaderYuvAlpha);
+  const uint32_t vs_bink = ReadGuestGlobalPtr(base, kBinkVertexShader);
+
+  // Report the handles themselves whether or not a draw ever matches. All
+  // three zero means the guest never created its Bink shaders — a different
+  // problem from a plane format we cannot decode, and otherwise identical from
+  // the outside, since both produce a probe that never fires.
+  static bool s_reported_live = false;
+  if (!s_reported_live && (ps_yuv || ps_yuv_alpha || vs_bink)) {
+    s_reported_live = true;
+    REXLOG_INFO("d3d9: Bink composite shaders created: ps_yuv=0x{:08X} "
+                "ps_yuv_alpha=0x{:08X} vs=0x{:08X}",
+                ps_yuv, ps_yuv_alpha, vs_bink);
+  }
+  if (!pixel_shader ||
+      (pixel_shader != ps_yuv && pixel_shader != ps_yuv_alpha)) {
+    return;
+  }
+
+  static std::map<uint32_t, uint64_t> s_hits;
+  const uint64_t n = ++s_hits[pixel_shader];
+  if (n != 1 && (n % 600) != 0) return;
+  REXLOG_INFO("d3d9: Bink composite draw #{} ps=0x{:08X} ({}) vs=0x{:08X}{} "
+              "verts={}",
+              n, pixel_shader,
+              pixel_shader == ps_yuv_alpha ? "YUV+alpha" : "YUV",
+              vertex_shader,
+              vertex_shader == vs_bink ? "" : " <-- not the Bink VS",
+              vertex_count);
+  // All four samplers, not just whichever one the binding selector would pick:
+  // the whole point is that this draw needs several at once.
+  for (uint32_t s = 0; s < 4 && s < mx::hle::kMaxSamplers; ++s) {
+    uint32_t fetch[6] = {};
+    if (!ReadLiveTextureFetch(device, base, s, fetch)) {
+      REXLOG_INFO("d3d9:   Bink sampler {}: no live fetch", s);
+      continue;
+    }
+    mx::hle::HleTextureSource src;
+    const char* why = nullptr;
+    if (mx::hle::DescribeHleTexture2D(fetch, src, &why)) {
+      REXLOG_INFO("d3d9:   Bink sampler {}: format {} ({}) {}x{} tiled={} "
+                  "pitch_blocks={} bpb={} decodes",
+                  s, src.guest_format,
+                  mx::hle::GuestTextureFormatName(src.guest_format), src.width,
+                  src.height, src.tiled, src.pitch_blocks, src.bytes_per_block);
+    } else {
+      REXLOG_INFO("d3d9:   Bink sampler {}: REJECTED ({}); format {} ({}); "
+                  "words {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
+                  s, why ? why : "?", src.guest_format,
+                  mx::hle::GuestTextureFormatName(src.guest_format), fetch[0],
+                  fetch[1], fetch[2], fetch[3], fetch[4], fetch[5]);
+    }
+  }
+}
+
 bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
                                 uint8_t* base,
                                 mx::hle::PixelTextureBinding& out) {
@@ -2568,10 +2646,19 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
     uint32_t mapped_fetch[6] = {};
     HleTextureSource mapped_source;
     const char* mapped_why = nullptr;
-    if (ReadLiveTextureFetch(device, base, binding.sampler, mapped_fetch) &&
-        DescribeHleTexture2D(mapped_fetch, mapped_source, &mapped_why)) {
-      dc.sampled_texture_width = mapped_source.width;
-      dc.sampled_texture_height = mapped_source.height;
+    if (ReadLiveTextureFetch(device, base, binding.sampler, mapped_fetch)) {
+      if (DescribeHleTexture2D(mapped_fetch, mapped_source, &mapped_why)) {
+        dc.sampled_texture_width = mapped_source.width;
+        dc.sampled_texture_height = mapped_source.height;
+      } else {
+        // This failure used to be discarded outright. Three quarters of all
+        // texture attempts take this early return, so an undecodable format
+        // arriving on a resolved target produced no log line at all — which
+        // is why "no YUV format has ever been rejected" was not evidence of
+        // anything. The branch still returns true; only its silence changes.
+        NoteRejectedTextureFormat("mapped", binding.sampler, mapped_source,
+                                  mapped_why, mapped_fetch);
+      }
     }
     // The renderer samples the live host render target identified below. Do
     // not also upload its stale/empty guest storage as an immutable texture.
