@@ -537,6 +537,36 @@ as +0x28 and `pShader[2].ReadFence` as +0x3C:
 | `*(ps + 0x40) + 0x28` | **byte offset of the CF stream inside the code allocation** | `sub_82565928`: `v22 = *((char*)v8 + v8[16] + 40) + v8[6]` |
 | `*(ps + 0x40) + 0x2C` | program length in bytes (`>> 2` for dwords) | same, `*v23 = *(... + 44) >> 2` |
 
+Vertex shader object. The same structure, different offsets, read out of
+`sub_82565928`'s VS branch (raw disassembly at 0x82566234, not the decompiler's
+folded arithmetic) and confirmed against
+`D3D_PatchVertexShaderToMatchVertexDeclaration` (0x82564C50), which indexes the
+identical `0x380 + variant*8` field:
+
+| Offset | What | Read from |
+|---|---|---|
+| `vs + 0x20` | code allocation | `lwz r8, 0x20(r30)` — added to the CF offset to form the program address |
+| `vs + 0x380 + variant*8` | offset of the info block | `slwi r10, r11, 3` with `r11 = variant + 112`, then `lwzx r11, r10, r30` |
+| `info + 0x368` | **byte offset of the CF stream inside the code allocation** | `lwz r11, 0x368(r11)` then `add r11, r11, r8` |
+| `info + 0x36C` | program length in bytes (`>> 2` for dwords) | `lwz r11, 0x36C(r11)` / `srwi r11, r11, 2` |
+| `info + 0x384` | number of patchable vfetch instructions | the patcher's `v7` |
+
+`variant` is the same 0/1 selector `sub_82565928` computes; the patcher takes it
+as its own argument.
+
+**The patched code is in the shader's own allocation, not the ring.** The
+patcher writes each fetch instruction to `a2 + 12*instruction_index`, and
+`sub_82565928` hands the GPU `*(vs + 0x20) + *(info + 0x368)`. Those two agree
+only if the patch lands in the allocation the program address points at.
+
+This matters because `CapturePatchedCode` does neither: it reads a 128-dword
+window *backwards* from the patch destination out of guest memory and then
+**searches** for an offset whose fetch decode yields exactly the expected count,
+first match winning. That is a checkable search rather than the pixel shader's
+old blind guess, but it is the same ambiguity class — and the fields above make
+it unnecessary. Not yet done; the honest next step is a probe that compares the
+field-derived offset against the search's answer before replacing it.
+
 **The CF stream does not start at the beginning of the code allocation.** Big
 shaders carry a prologue that reads as zeros; small ones start at 0. That is
 not a fixed 64-byte header to be inferred from a histogram — it is the field
