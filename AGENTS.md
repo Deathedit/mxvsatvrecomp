@@ -728,6 +728,15 @@ UVs beyond [0,1] instead of a perfect 0..1 sweep that only existed because the
 register had been clobbered. The fullscreen post-process passes (160x90,
 320x180, 640x360, 1280x720) keep unit range throughout.
 
+**Confirmed visually.** Frame 3000, NAT_Farm, `hide_colorless_draws=true`: a sky
+gradient with cloud texture, blue ground, and a tan strip — recognisable
+textured content. The same configuration produced a flat brown fill before this
+fix. A large black wedge across the middle remains, and is the next defect.
+
+Without `hide_colorless_draws` the present is unchanged, because the compositor
+passes already had unit UVs and were untouched by the swizzle change; what this
+fixed was the 1024x1024 world draws sitting underneath the overpaint.
+
 The original text follows, for the record. **The fullscreen post-process
 triangles sample a single texel.** Their vertex shader is one instruction,
 `MAD export0 = r0 * c255 + c255`, and c255 reads back `(0,0,0,0)`. The constant
@@ -837,6 +846,22 @@ LAN(3), else if `*(0x83057900)` is set (state 1 clears it), else the registry's
 package heaps only dump) and the IDA scripts. All 130 databases decode to
 `out/asset_catalog.json`, 23,183 assets indexed — that catalog is how the MXUI
 script list above was obtained.
+
+### Scripted RenderDoc captures
+
+`--rdoc_capture_frame=N` triggers a capture at presented frame N through the
+in-application API, so captures no longer depend on pressing F12 at the right
+moment ~115s into a run. The frame number is exactly what has to match for two
+captures to be comparable, so hand-timing was the weakest part of any A/B.
+
+```bash
+renderdoccmd capture -d <repo> -c <out_prefix> ./mx.exe --game_data_root=assets --user_data_root=userdata --skip_intro=true --force_load=NAT_Farm --registry_override=ReadyToLaunch=1 --rdoc_capture_frame=3000
+```
+
+RenderDoc appends the frame number, giving `<out_prefix>_frame3000.rdc`.
+`renderdoccmd thumb <file> -o out.png` extracts the embedded thumbnail, which is
+enough to compare presents without opening the UI. The cvar does nothing unless
+the process is running under RenderDoc.
 
 ### Headless IDA
 
