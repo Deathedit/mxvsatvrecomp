@@ -515,9 +515,29 @@ The register reads **0x43F**, one value across every draw: all six viewport
 enables set, `vtx_w0_fmt` set. The GPU applies the viewport, so the shader
 exports clip space and the transform here is **identity**.
 
-Applied held at 88.84%. **Not yet visually confirmed** — stageI cannot arbitrate
-this, because it classifies exported positions and the transform is applied
-downstream of them. A RenderDoc before/after is the outstanding check.
+Applied held at 88.84%.
+
+**RenderDoc A/B, frame 3000, NAT_Farm** (`legacy_mvp_tiebreak` exists so both
+sides come from one binary). Captured twice: once as-is, once with
+`hide_colorless_draws=true` to remove the overpaint.
+
+As-is, both frames are a fullscreen quad split by one diagonal, in the *same*
+place — only the colours differ. The present is dominated by the compositor, so
+it cannot see what the transform did. Comparing backbuffers was the wrong
+experiment.
+
+With colourless draws hidden, neither frame shows recognisable geometry — both
+are flat fills. But the fills differ in a way that matters: under the old rule
+the compositor's fullscreen triangles covered a **corner sliver**, and under the
+VTE-derived identity they cover the **entire viewport**, which is what a
+fullscreen pass should do. The flat colour is the separate single-texel UV
+collapse, not a transform error.
+
+So the register reading is **supported, not proven**: the fullscreen pass now
+lands full-screen, and no world geometry is visible either way because the
+compositor still paints one texel over everything. **The UV collapse is now the
+thing in front — it is what makes the frame unreadable, whichever transform is
+in use.**
 
 ### Entry points
 
