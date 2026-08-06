@@ -462,8 +462,15 @@ key in `.rdata`.
 `sub_824B1C20` is the **Lua binding `GetVariableString`**: it validates its
 arguments through the same `sub_82A9F4F8` reporter as `ExecuteScriptAsset` and
 names itself `VariableCollection_GetVariableString` in its own error strings.
-`sub_824B1788` is the int twin. They sit in a binding table at `0x821A1740`/
-`0x821A1750` — a different table from the 228-entry one at `0x8203F2E0`.
+`sub_824B1788` is the int twin, `GetVariableInt`. Both are registered in a
+second `(name, func)` table in `.data` around `0x82D1B21C`, distinct from the
+228-entry one at `0x8203F2E0`.
+
+**Correction:** an earlier version of this section put those two in a table at
+`0x821A1740`/`0x821A1750`. That is `.pdata` — function address plus unwind
+flags — not a binding table. Same mistake as reading `0x82198B50` as a vtable;
+the giveaway both times is a second dword like `0x400003A3` that is not a
+pointer. Check that before reading any address pair as `(x, func)`.
 
 So this is not a settings file being consulted. **It is the front-end script
 reading its own state**, and under the plugin it reads a recognisable boot
@@ -486,6 +493,66 @@ running (only its output pipeline had been killed) and launched a second
 `mx.exe`, so `ls -t logs/*.log | head -1` attributed *its* log to the run just
 started. Identify a run's log by diffing the directory listing, never by mtime,
 and confirm with `Get-Process mx` that exactly one is running.
+
+### Native and plugin run the same 28 script calls, then native stops (2026-08-06)
+
+`sub_82AA7638` is Lua's `luaD_precall`, and its `r4` is the `func` StkId, so the
+callee is readable before it runs:
+
+| offset | meaning |
+|---|---|
+| `*(func + 8) == 6` | `TValue.tt`, `LUA_TFUNCTION` |
+| `*(func + 0)` | the `Closure` |
+| `*(closure + 6)` | `isC` — a C binding rather than Lua bytecode |
+| `*(closure + 16)` | the C function pointer, for `isC` closures |
+
+Lua 5.1 offsets, confirmed against this binary rather than assumed: the
+function's own Lua-closure branch reads Proto fields at `+73` numparams, `+74`
+is_vararg, `+75` maxstacksize, `+12` code, and reports `"stack overflow"` at
+exactly the 20000 limit.
+
+**The old "4 VM dispatches" figure was a rate-limiting artifact.** The previous
+probe logged the first four and then one line per 5 s, so the true count was
+never seen. It is **28** natively and **203** under the plugin in a 60 s run.
+
+**The two sequences are identical for all 28 calls** — same kinds, same function
+pointers, same order, including `ExecuteScriptAsset` twice, `GetUIVariables` and
+`GetMXTableHelper`. Native then stops. The plugin continues:
+
+```
+#28  C   cfunc=0x829E8FA8                              <- native's last
+#29  lua
+#30  C   cfunc=0x829E8FA8
+#31  C   LoadUIAssetDatabasePackage  (sub_824CC218)
+#32  C   LoadUIAssetPackage          (sub_824CBF90)
+#37  C   IsUIAssetPackageLoaded      (sub_824CC120)
+```
+
+So the two bindings listed as "never fires" above are not merely absent — they
+are **the very next thing the script would do**.
+
+**Native's #28 returns.** Its thread goes on to open camera `.bxml` files and
+write vertex declarations, so the script layer is not hung inside a C binding.
+The VM is simply never entered again.
+
+**The dispatches split by thread, and that is the lead:**
+
+| | native | plugin |
+|---|---|---|
+| main VM thread | t18112 — 26 | t2936 — 163 |
+| second thread | *(none)* | t18072 — 38 |
+| early thread | t17628 — 2 | t17176 — 2 |
+
+Under the plugin `#29` runs on a **different thread** from `#28`. Native has no
+counterpart: one thread runs the prologue, returns, and nothing ever re-enters
+the VM. The question is therefore not "did the script throw" — no `lua error` or
+`lua runerror` line appears in either mode — but **what drives the VM after the
+prologue, and why that never runs natively.**
+
+Caveat on naming: `0x829E8FA8` is a bare `return 0` with hundreds of xrefs, so
+identical-code folding makes several trivial bindings share one address. A
+`cfunc` value alone cannot name such a binding; the native/plugin *sequence
+diff* is what carries the result, and it needs no names.
 
 ### Draws land outside the clip volume on z (2026-08-06)
 

@@ -603,13 +603,12 @@ MX_SCRIPT_PROBE(sub_824CD280, orig_StartWorldLoad, "StartWorldLoad")
 // different failure from "set up but never fed".
 MX_SCRIPT_PROBE(sub_824F1C98, orig_ScriptBindingRegister, "BindingRegister")
 
-// The script VM's native-call dispatcher. `ExecuteScriptAsset` was observed
-// being called from lr=0x82AA78F4, and 0x82AA78F4 lies inside `sub_82AA7638`
-// (the next definition in the recompiled sources is `sub_82AA7928`). This is
-// the discriminator: if it fires only a handful of times the VM itself is idle,
-// and if it fires continuously then scripts are running but never take the
-// branch that loads a world.
-MX_SCRIPT_PROBE(sub_82AA7638, orig_ScriptDispatch, "VMDispatch")
+// The script VM's native-call dispatcher, `sub_82AA7638`, used to be probed
+// here with MX_SCRIPT_PROBE. It answered its original question — the VM fires a
+// handful of times and goes idle, so the VM itself stops rather than looping
+// without loading a world — but it only logged the lua_State, which cannot say
+// *which* call was the last one. It now has a dedicated hook at the bottom of
+// this file that decodes the callee off the Lua stack.
 
 // The script layer is a Lua VM, so ask it directly whether it threw.
 //
@@ -931,4 +930,130 @@ extern "C" REX_FUNC(sub_8234CBB8) {
                 BinkTag(), s_count, a1, a1 ? REX_LOAD_U32(a1 + 36 * 4) : 0,
                 a1 ? REX_LOAD_U32(a1 + 37 * 4) : 0, from);
   }
+}
+
+//=============================================================================
+// What is the last statement the native script layer runs?
+//=============================================================================
+// The VM stops about 1.6s into boot and everything downstream of it — the front
+// end, the videos, the registry reads — is idle because of that. Counting script
+// assets (2 native vs 4 plugin) is too coarse to say where it stops: two assets
+// are libraries, and a library can load and then the caller die on its next
+// statement.
+//
+// sub_82AA7638 is Lua's precall. Its r4 is the `func` StkId, so the callee is
+// readable before it runs:
+//
+//   *(func + 8)  == 6      TValue.tt, LUA_TFUNCTION
+//   *(func + 0)            the Closure
+//   *(closure + 6)         isC — a C binding rather than Lua bytecode
+//   *(closure + 16)        the C function pointer, for isC closures
+//
+// The offsets are Lua 5.1's and they are confirmed against this binary rather
+// than assumed: the function's own Lua-closure branch reads Proto fields at
+// +73 numparams, +74 is_vararg, +75 maxstacksize and +12 code, and it reports
+// "stack overflow" through sub_82AA9D48 at exactly the 20000 limit.
+//
+// Every dispatch is logged up to a generous cap, so in native mode — where the
+// whole run produces a handful — the last line of the log is literally the last
+// statement the script layer reached.
+
+namespace {
+
+// The 228 (name, func) pairs at 0x8203F2E0 that sub_824F1C98 registers. There is
+// a second table of the same shape in .data around 0x82D1B21C, holding the
+// VariableCollection bindings, whose bounds have not been established — so a
+// miss here means "not in the table scanned", not "not a binding". Log the
+// address either way and resolve the rest in IDA.
+constexpr uint32_t kBindingTable = 0x8203F2E0;
+constexpr uint32_t kBindingCount = 228;
+
+std::string BindingName(uint8_t* base, uint32_t fn) {
+  if (!fn) return {};
+  for (uint32_t i = 0; i < kBindingCount; ++i) {
+    const uint32_t e = kBindingTable + i * 8;
+    if (REX_LOAD_U32(e + 4) == fn) return GuestString(base, REX_LOAD_U32(e), 64);
+  }
+  return {};
+}
+
+}  // namespace
+
+// Replaces the MX_SCRIPT_PROBE that used to sit next to the other script probes
+// above. Same function, same "is the VM idle" answer, but it also names the
+// callee, which is what turns a count into a last statement.
+REX_IMPORT(__imp__sub_82AA7638, orig_ScriptDispatch, void());
+extern "C" REX_FUNC(sub_82AA7638) {
+  const uint32_t func = ctx.r4.u32;
+  const uint32_t from = static_cast<uint32_t>(ctx.lr);
+
+  uint32_t closure = 0;
+  uint32_t cfunc = 0;
+  bool is_c = false;
+  bool is_fn = false;
+  if (func && REX_LOAD_U32(func + 8) == 6) {
+    is_fn = true;
+    closure = REX_LOAD_U32(func);
+    if (closure) {
+      is_c = REX_LOAD_U8(closure + 6) != 0;
+      if (is_c) cfunc = REX_LOAD_U32(closure + 16);
+    }
+  }
+
+  static uint64_t s_count = 0;
+  static std::chrono::steady_clock::time_point s_last{};
+  const uint64_t n = ++s_count;
+  // Native produces a handful in a whole run, so nothing is dropped there. The
+  // plugin runs the front end and produces many, hence the cap.
+  bool due = n <= 200;
+  if (!due) {
+    const auto now = std::chrono::steady_clock::now();
+    if ((now - s_last) >= std::chrono::seconds(5)) {
+      s_last = now;
+      due = true;
+    }
+  }
+  if (due) {
+    const std::string name = is_c ? BindingName(base, cfunc) : std::string();
+    REXLOG_INFO("{}: vm dispatch #{} {} cfunc=0x{:08X}{}{} from lr=0x{:08X}",
+                mx::native::g_plugin_mode ? "plugin" : "native", n,
+                !is_fn ? "non-function" : (is_c ? "C" : "lua"), cfunc,
+                name.empty() ? "" : " name=", name, from);
+  }
+
+  orig_ScriptDispatch(ctx, base);
+}
+
+// The two VariableCollection bindings the plugin uses and native never reaches.
+// Named from the (name, func) table in .data near 0x82D1B21C, which agrees with
+// each function's own error strings ("GetVariableString" /
+// "VariableCollection_GetVariableString" in sub_824B1C20). Note the earlier
+// reading that put these in a table at 0x821A1740/0x821A1750 was wrong — that is
+// .pdata, function address plus unwind flags.
+//
+// r3 is the lua_State; the key is arg 2 on the Lua stack, which is why these log
+// only the fact of the call. The value and key already come out of the registry
+// getter probes above, with lr pointing back here.
+REX_IMPORT(__imp__sub_824B1C20, orig_GetVariableString, void());
+extern "C" REX_FUNC(sub_824B1C20) {
+  static uint64_t s_count = 0;
+  static std::chrono::steady_clock::time_point s_last{};
+  if (BinkLogDue(++s_count, s_last, 20)) {
+    REXLOG_INFO("{}: GetVariableString #{} L=0x{:08X} from lr=0x{:08X}",
+                mx::native::g_plugin_mode ? "plugin" : "native", s_count,
+                ctx.r3.u32, uint32_t(ctx.lr));
+  }
+  orig_GetVariableString(ctx, base);
+}
+
+REX_IMPORT(__imp__sub_824B1788, orig_GetVariableInt, void());
+extern "C" REX_FUNC(sub_824B1788) {
+  static uint64_t s_count = 0;
+  static std::chrono::steady_clock::time_point s_last{};
+  if (BinkLogDue(++s_count, s_last, 20)) {
+    REXLOG_INFO("{}: GetVariableInt #{} L=0x{:08X} from lr=0x{:08X}",
+                mx::native::g_plugin_mode ? "plugin" : "native", s_count,
+                ctx.r3.u32, uint32_t(ctx.lr));
+  }
+  orig_GetVariableInt(ctx, base);
 }
