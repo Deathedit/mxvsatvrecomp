@@ -543,11 +543,40 @@ The VM is simply never entered again.
 | second thread | *(none)* | t18072 — 38 |
 | early thread | t17628 — 2 | t17176 — 2 |
 
-Under the plugin `#29` runs on a **different thread** from `#28`. Native has no
-counterpart: one thread runs the prologue, returns, and nothing ever re-enters
-the VM. The question is therefore not "did the script throw" — no `lua error` or
-`lua runerror` line appears in either mode — but **what drives the VM after the
-prologue, and why that never runs natively.**
+**The thread is the Transition thread**, and it exists in both modes. Under the
+plugin it is `t18072`, whose first line is `Transition #1` and which makes 38
+dispatches. Natively it is `t2408`, which runs the same `LoadStateMachine` /
+`LoaderTick` / `Timing` / `XamInputGetState` cycle and makes **zero**. The
+question is therefore not "did the script throw" — no `lua error` or
+`lua runerror` line appears in either mode — but **why the Transition thread
+never enters the VM natively.**
+
+Under the plugin the VM entry lands inside `LoaderTick`, on iteration 7, in the
+window immediately after `sub_82B34998` (RendererDispatch) returns.
+
+**Two wrong readings on the way there, both corrected by measurement:**
+
+- *"Native never calls RendererDispatch."* False. That hook logged only under
+  `g_plugin_mode` and called the original silently in native, so its absence
+  from a native log meant nothing. It is now mode-neutral. Native calls it and
+  it returns non-null (`0x21294134` / `0x212859A0`).
+- *"The plugin has a second thread calling it and native does not."* False. The
+  plugin's call numbers skip (`#1, #3, #5…`) purely because two threads
+  interleave on one counter — and **both** modes have two such threads.
+
+**Most Transition-thread probes are still plugin-only**, so do not read any
+other line-by-line difference on that thread as a finding until the probe in
+question has been checked for a `g_plugin_mode` guard.
+
+**What does differ, measured on the now-neutral probe: `f1` is exactly `0.00` on
+every native call to RendererDispatch**, while the plugin passes varying values
+(`-2.00`, `2.00`, `±3.7e19`). `f1` is the frame delta. Native's `Timing`
+(`sub_82B70370`) is **stubbed** — it writes `1/60` to `a1+24` and never calls the
+original — so a zero dt reaching this call is consistent with that stub being
+incomplete. A front end that advances on elapsed time would never advance.
+
+That is a lead, not a conclusion: dt is one measured difference on one call, and
+nothing yet connects it to the VM entry. Test it before believing it.
 
 Caveat on naming: `0x829E8FA8` is a bare `return 0` with hundreds of xrefs, so
 identical-code folding makes several trivial bindings share one address. A

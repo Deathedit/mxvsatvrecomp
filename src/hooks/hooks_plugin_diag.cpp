@@ -42,21 +42,33 @@ REXCVAR_DEFINE_STRING(force_load, "", "Debug",
 REXCVAR_DEFINE_STRING(registry_override, "", "Debug",
                       "Comma-separated key=value overrides for guest registry string reads");
 
-// sub_82B34998 — RendererDispatchBlock (fatal vtable dispatches in native)
+// sub_82B34998 — RendererDispatchBlock, called from LoaderTick on the Transition
+// thread.
+//
+// MADE MODE-NEUTRAL 2026-08-06. It used to log only under the plugin and call
+// the original silently in native, which hid the one number that matters: the
+// plugin enters the Lua VM from this thread immediately after this function
+// returns, and it returns a non-null r3 (0x21293D44) every time. Natively the
+// Transition thread never enters the VM at all. Whether that is because this
+// returns something different has never been observable — the probe was
+// one-sided.
+//
+// Beware of reading any *other* Transition-thread line difference between the
+// two modes: most of the probes on that thread are still plugin-only, so their
+// absence in a native log means nothing.
 REX_IMPORT(__imp__sub_82B34998, orig_RendererDispatch, void());
 extern "C" REX_FUNC(sub_82B34998) {
-  if (mx::native::g_plugin_mode) {
-    static int rd = 0;
-    ++rd;
-    if (rd <= 20 || (rd % 500) == 0)
-      REXLOG_INFO("plugin: RendererDispatch #{} a1=0x{:08X} f1={:.2f}",
-                  rd, ctx.r3.u32, *(float*)&ctx.f1);
-    orig_RendererDispatch(ctx, base);
-    if (rd <= 20 || (rd % 500) == 0)
-      REXLOG_INFO("plugin: RendererDispatch #{} returned r3=0x{:08X}", rd, ctx.r3.u32);
-    return;
-  }
+  const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
+  static int rd = 0;
+  ++rd;
+  const bool loud = rd <= 20 || (rd % 500) == 0;
+  const uint32_t a1 = ctx.r3.u32;
+  const float dt = *(float*)&ctx.f1;
   orig_RendererDispatch(ctx, base);
+  if (loud) {
+    REXLOG_INFO("{}: RendererDispatch #{} a1=0x{:08X} f1={:.2f} -> r3=0x{:08X}", tag,
+                rd, a1, dt, ctx.r3.u32);
+  }
 }
 
 // sub_82B3C7D0 — lazy-init alloc (hangs in Transition thread in native)
