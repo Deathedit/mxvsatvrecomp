@@ -79,8 +79,14 @@ give more.
 | `SetPixelShaderConstantF` | `0x825503F8` | `XGSetVertexDeclaration` | `0x82550A90` |
 | `PatchVertexShaderToMatch…` | `0x82564C50` | `Swap` | `0x82566B58` |
 
+| `DrawVerticesUP` | `0x82555B88` | | |
+
 IDA's auto-analysis defines no function at the two constant setters; the
 addresses are confirmed by the byte match and by their own arithmetic, below.
+
+**`DrawVerticesUP` is a third draw entry point** and is easy to miss — it does
+not call either of the other two. See the Bink section below; roughly 30
+functions across the engine draw through it.
 
 ### Device offsets
 
@@ -303,6 +309,57 @@ The guest carries a complete decoder.
 | `XenonBinkVideoManager::Open` | `sub_8234E290` | slot [2]; formats `"%s.bik"` |
 | `BinkAsset::Init` | `sub_8234CBB8` | Reads `"Texture To Override"`, then resolves `"Bink Video Asset"` via `sub_82AB8210` and requests fourcc `1651076715` = `0x62696E6B` = `'bink'` |
 | `XenonBinkVideo` vtable | `0x820172BC` | 12 entries; HBINK at object `+144`, its critical section at `+156` |
+
+### The frame composite — and the draw entry point it uses
+
+`sub_8234D630` is the `XenonBinkVideo` frame method (vtable slot [8]). Per
+frame, under the object's own critical section at `+156`:
+
+1. `D3DDevice_Clear` on a render target,
+2. `sub_8234C7C0(device, obj + 192, w, h, …)` — the composite draw,
+3. `D3DDevice_Resolve(device, 0x100, &rect, destTexture, …)`.
+
+`sub_8234C7C0` is a **YUV→RGB shader composite over separate single-channel
+planes**, not a packed-YUV texture sample:
+
+- `D3DDevice_SetTexture` on **samplers 0, 1, 2** from `a2 + 136 / 140 / 144`, a
+  32-byte-stride plane set indexed by `*(a2 + 20)` — Y, Cr, Cb.
+- An **optional alpha plane** on sampler 3 from `a2 + 148`. Its presence selects
+  the second pixel shader.
+- Draws a 4-vertex triangle strip, stride 20, then unbinds all four samplers.
+
+The three shader handles live in globals, which makes the draw identifiable at
+runtime with no heuristic:
+
+| Global | Holds |
+|---|---|
+| `0x82DD7130` | `D3DPixelShader*` — YUV, no alpha plane |
+| `0x82DD7134` | `D3DPixelShader*` — YUV + alpha plane |
+| `0x82DD7138` | `D3DVertexShader*` — the composite's vertex shader |
+
+**So `k_Cr_Y1_Cb_Y0_REP` (11) and `k_Y1_Cr_Y0_Cb_REP` (12) are never requested
+by this title.** Anyone reading "Bink" and reaching for the packed YUV formats
+is about to write dead code.
+
+### `D3DDevice_DrawVerticesUP` — a third draw entry point
+
+The composite draws through **`sub_82555B88`**, which is neither of the two
+draw entry points listed above:
+
+```
+sub_82555B88(device, primType, primCount, vertexData, stride)
+  p = sub_825556C8()                      // reserve ring space
+  sub_82BDAAF0(p, vertexData, primCount * stride)   // inline vertex copy
+  *(device + 48) = *(device + 13652)
+```
+
+It writes vertex data straight into the command buffer and **never calls
+`DrawVertices` (`0x825561B0`) or `DrawIndexedVertices` (`0x825565C8`)**.
+
+It is not a niche path: **40 xrefs from roughly 30 distinct functions**, spread
+across `0x8246Axxx`, `0x829Exxxx`, `0x82ACxxxx`-`0x82AFxxxx`, `0x82B0xxxx` and
+`0x82B1xxxx` — UI and particles as well as video. Any host layer that hooks only
+the two named draws is blind to all of it.
 
 Open flags, read statically out of `sub_8234E0A8`: `a4=1` gives `0x00102400`
 (`0x2000|0x100400`); `a4=0` gives `0x01100400`, the branch that first calls

@@ -750,6 +750,50 @@ compositor still paints one texel over everything. **The UV collapse is now the
 thing in front — it is what makes the frame unreadable, whichever transform is
 in use.**
 
+### Bink never reaches the renderer: we hook two draws, the guest has three (2026-08-07)
+
+The request was "do the YUV formats for Bink". **The guest does not use packed
+YUV texture formats** — its video path is a YUV->RGB *shader* composite over
+three single-channel plane textures (four with alpha), so `k_Cr_Y1_Cb_Y0_REP`
+and `k_Y1_Cr_Y0_Cb_REP` would have been dead code. Guest side in
+[docs/guest_binary.md](docs/guest_binary.md).
+
+The guest keeps its Bink shader handles in globals, so the composite draw can be
+matched exactly rather than guessed at. Probing it gave a result none of the
+expected outcomes covered — 3/3 runs, byte-identical:
+
+| | native |
+|---|---|
+| Bink shaders created | **yes** — both pixel shaders and the vertex shader |
+| Bink VS bound in captured draws | **24** |
+| Bink PS seen by `SetPixelShader` | yes |
+| composite draws reaching the HLE draw hook | **0** |
+| guest formats rejected on the mapped path | 0 |
+
+**The cause is `D3DDevice_DrawVerticesUP` (`sub_82555B88`), a third draw entry
+point we do not hook.** It copies inline vertex data straight into the command
+ring and never calls `DrawVertices` or `DrawIndexedVertices` — the only two
+draws hooked. So every UP draw is invisible to the renderer.
+
+**This is much bigger than Bink.** That entry point has 40 xrefs from about 30
+distinct functions across the engine — UI and particles as well as video. Any
+count of "draws the guest issues" taken from our hooks is an undercount by an
+unmeasured margin, and every such figure in this file predates knowing that.
+
+Hooking it is the next piece of work, and it is not just another hook: the
+vertices arrive as a pointer and a stride rather than through a bound stream,
+so `PrepareDrawTexture`/`ResolvePixelBindingForDraw` get their geometry from a
+different place. Bink additionally needs several textures bound at once, which
+the single-SRV root signature cannot express.
+
+**A note on why this took a probe to find.** The resolved-render-target early
+return in `PrepareDrawTexture` discarded its `DescribeHleTexture2D` failure, and
+74% of texture attempts take that branch — so an undecodable plane format would
+have logged nothing at all. "No YUV format has ever been rejected" was
+therefore not evidence of anything until that path was made to speak. It now
+feeds the same per-format tally, tagged `mapped`. Third instance in this branch
+of a probe that could not have seen the thing it was being read as ruling out.
+
 ### Entry points and device offsets
 
 The 22 guest D3D9 entry-point addresses, the device struct offsets with their
