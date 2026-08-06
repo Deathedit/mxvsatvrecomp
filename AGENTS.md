@@ -48,9 +48,10 @@ version of this file listed only the Ninja directory, and `cmake` is not on PATH
 without it. `cmake.exe` lives at
 `…\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe`.
 
-Also requires Visual Studio 2022 Clang 18+, ReXGlue SDK 0.9.0 at
-`C:\rexglue-sdk`, FFmpeg 8.0 in `ffmpeg/`, and the FFmpeg DLLs already checked
-in at the repo root.
+Also requires Visual Studio 2022 Clang 18+ and ReXGlue SDK 0.9.0 at
+`C:\rexglue-sdk`. The FFmpeg 8.0 dependency was REMOVED 2026-08-06 — neither
+the `ffmpeg/` tree nor the five av*/sw* DLLs are needed, and both are deleted.
+(`rexruntime.dll` links FFmpeg statically; it never loaded those DLLs.)
 
 ### Running
 
@@ -119,9 +120,7 @@ name their layer: `#include "gpu/pm4_parser.h"`.
 | `src/app/graphics_system.*` | `D3D12GraphicsSystem` + host render thread (Bink playlist → game frames); most debug cvars are defined here |
 | `src/gfx/d3d12_renderer.h` | `D3D12Renderer` interface, implemented across the three `.cpp` below |
 | `src/gfx/d3d12_device.cpp` | Device, adapter, swapchain, RTVs, command lists, fence, Begin/EndFrame |
-| `src/gfx/d3d12_video.cpp` | Fullscreen quad + texture sample, Bink frame upload |
 | `src/gfx/d3d12_game.cpp` | Game pipeline, per-frame draw list, game RT + depth, HLE offscreen targets, compositor |
-| `src/gfx/bink_player.*` | FFmpeg Bink video + audio |
 | `src/gpu/pm4_parser.*` | PM4 command buffer parser (Type-0/2/3, ring wrap, dump) |
 | `src/gpu/hle_types.*` | Shared HLE data model (`DrawCall`, textures, topology) + the two primitive expansions |
 | `src/gpu/xenos_gpu_state.*` | Xenos register shadow, snapshot/diff |
@@ -432,13 +431,15 @@ Its one guest-visible effect is `IsBinkPlaying()`, which makes the guest's
 Measured: a full run with the intro actually playing its 47.4s still gives 2
 script assets and 4 VM dispatches, all inside the first 3.3s.
 
-**The FFmpeg dependency is a native-mode substitute for a guest path that
-works.** `MxApp::OnPreSetup` returns before creating `D3D12GraphicsSystem` when
-a GPU plugin is set, so `RenderThreadFunc` — and with it the whole host Bink
-player — never starts in plugin mode. The intro plays fine under the plugin
-anyway (confirmed 2026-08-06), which means the guest decodes Bink itself and
-`src/gfx/bink_player.cpp`, the five FFmpeg DLLs and the `ffmpeg/` tree are
-covering for the *renderer*, not for a missing guest decoder.
+**The FFmpeg dependency was a native-mode substitute for a guest path that
+works, and is now GONE (2026-08-06, `423b1da`).** `MxApp::OnPreSetup` returns
+before creating `D3D12GraphicsSystem` when a GPU plugin is set, so
+`RenderThreadFunc` — and with it the whole host Bink player — never started in
+plugin mode, yet the intro played fine there. The guest decodes Bink itself.
+The decisive evidence was direct: with both players present the intro visibly
+played twice. Removing ours also removed the `IsBinkPlaying` gate that stood
+the guest's entire render path down for 47.4 s, and vertices per frame went
+from 96k to 1.6M.
 
 That workaround predates the D3D9 HLE layer, like the others above. It is also
 hardcoded to two English filenames (`graphics_system.h:51`) while
