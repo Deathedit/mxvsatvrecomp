@@ -780,11 +780,31 @@ distinct functions across the engine — UI and particles as well as video. Any
 count of "draws the guest issues" taken from our hooks is an undercount by an
 unmeasured margin, and every such figure in this file predates knowing that.
 
-Hooking it is the next piece of work, and it is not just another hook: the
-vertices arrive as a pointer and a stride rather than through a bound stream,
-so `PrepareDrawTexture`/`ResolvePixelBindingForDraw` get their geometry from a
-different place. Bink additionally needs several textures bound at once, which
-the single-SRV root signature cannot express.
+**Hooked in `b5073ea`.** `DrawVerticesUP` is semantically "bind stream 0 to
+this pointer with this stride and draw", so `BuildAndQueueDraw` takes an
+optional `UpVertexData` and synthesises stream 0 from it rather than carving a
+second path through `BuildHleDraw`. There is no fetch constant and so no endian
+field; 8in32 is used, which is what every bound stream in this game measurably
+carries. The vertex pointer is often a caller stack local, so it is read inside
+the call while that frame is live, bounds-checked at both ends, and copied.
+
+**It is 45-49% of all draws** — 6806/6813/7379 of a 12500-15000 total across
+three 60 s runs. Every draw count quoted anywhere else in this file predates the
+hook and is an undercount by roughly half. New geometry appears on screen with
+it in place.
+
+With the hook in, the Bink composite is fully visible and matches the decompile
+exactly, 3/3 runs identical:
+
+| | sampler 0 | sampler 1 | sampler 2 | sampler 3 |
+|---|---|---|---|---|
+| no alpha | `FMT_8` 1280x720 | `FMT_8` 640x360 | `FMT_8` 640x360 | none |
+| with alpha | `FMT_8` 640x216 | `FMT_8` 320x112 | `FMT_8` 320x112 | `FMT_8` 640x216 |
+
+Y at full resolution, chroma at half, **all `k_8`** — which `319a5c2` already
+decodes as `kR8` but deliberately semantic-rejects as "single-channel, not base
+colour". Correct for a mask, wrong for a luma plane. That gate and the
+single-SRV root signature are what still stand between this and a visible video.
 
 **A note on why this took a probe to find.** The resolved-render-target early
 return in `PrepareDrawTexture` discarded its `DescribeHleTexture2D` failure, and
