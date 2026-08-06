@@ -1302,6 +1302,16 @@ uint64_t g_aluBadStream = 0;
 // shader handle and reused, because the offset is a property of the layout.
 constexpr uint32_t kPatchWindowBack = 128;   // dwords captured before dest
 
+// Vertex shader object, read out of sub_82565928's VS branch at 0x82566234 and
+// cross-checked against the patcher at 0x82564C50. The pixel shader twin is at
+// ps + 0x18 / ps + 0x40 / info + 0x28 / info + 0x2C (see CollectPixelShaderBlob).
+constexpr uint32_t kVsCodeAllocAt = 0x20;    // code allocation pointer
+constexpr uint32_t kVsInfoOffsetAt = 0x380;  // + variant*8 -> info block offset
+constexpr uint32_t kVsInfoCodeOffset = 0x368;  // CF byte offset in the allocation
+constexpr uint32_t kVsInfoCodeSize = 0x36C;    // program length in bytes
+uint64_t g_vsWindowAgree = 0, g_vsWindowDisagree = 0, g_vsWindowNoField = 0;
+uint64_t g_vsWindowAtDest = 0, g_vsWindowEarly = 0, g_vsWindowLate = 0;
+
 struct PatchedCode {
   std::vector<uint32_t> code;   // host-endian, from dest - kPatchWindowBack*4
   uint32_t expect_fetches = 0;  // what the binding table said
@@ -3377,7 +3387,17 @@ void CapturePatchedCode(uint32_t self, uint32_t dest, uint32_t variant,
            probe.size() == expect_fetches;
   };
 
-  if (known && decodes_at(known_off)) {
+  // dest first. Measured over 24 distinct shaders: the CF stream starts exactly
+  // at the patch destination in 24 of 24, while the upward scan below lands
+  // early in 3 of them (off -3, -3, -85) because it takes the first offset that
+  // decodes and a false positive can precede the true start. Trying dest before
+  // scanning costs one decode and removes that whole failure mode.
+  //
+  // Still verified, not assumed — same rule as the cached offset below.
+  if (decodes_at(kPatchWindowBack)) {
+    pc.code_off = kPatchWindowBack;
+    pc.resolved = true;
+  } else if (known && decodes_at(known_off)) {
     pc.code_off = known_off;
     pc.resolved = true;
   } else {
@@ -3391,6 +3411,66 @@ void CapturePatchedCode(uint32_t self, uint32_t dest, uint32_t variant,
       pc.resolved = true;
       ++g_patchCodeOffsets[int32_t(s) - int32_t(kPatchWindowBack)];
       break;
+    }
+  }
+
+  // Does the guest state the answer the search just hunted for?
+  //
+  // sub_82565928's VS branch computes the program address the GPU is given as
+  // *(vs + 0x20) + *(info + 0x368), where info = vs + *(vs + 0x380 +
+  // variant*8), with the length in bytes at info + 0x36C. The patcher
+  // (0x82564C50) indexes the identical 0x380 + variant*8 field, so both agree
+  // the patched code lives in the shader's own allocation.
+  //
+  // Compared as ABSOLUTE guest addresses, which is the only common ground: the
+  // search's answer is an index into a ring window, the field's is a pointer.
+  // Reporting them any other way would compare two different coordinate
+  // systems and call the mismatch a finding.
+  //
+  // Measurement only. Nothing here changes what is captured — if the field is
+  // right, the search is still what runs until a separate change says so.
+  if (pc.resolved && REXCVAR_GET(hle_capture)) {
+    const uint32_t info_at = self + kVsInfoOffsetAt + variant * 8;
+    uint32_t field_abs = 0, field_len = 0;
+    if (HostPageReadable(REX_RAW_ADDR(info_at)) &&
+        HostPageReadable(REX_RAW_ADDR(self + kVsCodeAllocAt))) {
+      const uint32_t info = self + REX_LOAD_U32(info_at);
+      if (HostPageReadable(REX_RAW_ADDR(info + kVsInfoCodeSize))) {
+        field_abs =
+            REX_LOAD_U32(self + kVsCodeAllocAt) + REX_LOAD_U32(info + kVsInfoCodeOffset);
+        field_len = REX_LOAD_U32(info + kVsInfoCodeSize);
+      }
+    }
+    const uint32_t search_abs = start + pc.code_off * 4;
+    // Two independent questions, kept apart because they have different
+    // answers. Where the CF starts: dest, in 24 of 24 measured. Whether the
+    // shader object's own allocation is the buffer that was patched: only
+    // sometimes — 16 of 24 — so the field is NOT a drop-in source of code.
+    if (search_abs == dest) ++g_vsWindowAtDest;
+    else if (search_abs < dest) ++g_vsWindowEarly;
+    else ++g_vsWindowLate;
+    if (!field_abs) ++g_vsWindowNoField;
+    else if (field_abs == dest) ++g_vsWindowAgree;
+    else ++g_vsWindowDisagree;
+    static std::map<uint64_t, bool> s_logged;
+    const uint64_t key = (uint64_t(self) << 32) | variant;
+    if (field_abs && s_logged.size() < 24 && s_logged.emplace(key, true).second) {
+      REXLOG_INFO(
+          "d3d9: vs 0x{:08X} v{} window: search 0x{:08X} (off {}), field "
+          "0x{:08X} len {} dwords, dest 0x{:08X} — {}",
+          self, variant, search_abs, int32_t(pc.code_off) - int32_t(kPatchWindowBack),
+          field_abs, field_len / 4, dest,
+          search_abs == dest ? (field_abs == dest ? "at-dest, same buffer"
+                                                  : "at-dest, other buffer")
+                             : "SEARCH OFF DEST");
+    }
+    const uint64_t seen = g_vsWindowAtDest + g_vsWindowEarly + g_vsWindowLate;
+    if ((seen % 512) == 1) {
+      REXLOG_INFO(
+          "d3d9: vs code window: CF at dest {} early {} late {}; shader alloc "
+          "is the patched buffer {} of {} (other buffer {}, unreadable {})",
+          g_vsWindowAtDest, g_vsWindowEarly, g_vsWindowLate, g_vsWindowAgree,
+          seen, g_vsWindowDisagree, g_vsWindowNoField);
     }
   }
   // A ring-window read is inherently transient: the destination may wrap or
