@@ -47,6 +47,7 @@
 
 // Defined in src/app/graphics_system.cpp with the rest of the Debug cvars.
 REXCVAR_DECLARE(bool, hle_capture);
+REXCVAR_DECLARE(bool, legacy_mvp_tiebreak);
 REXCVAR_DECLARE(uint32_t, hle_shader_exec);
 REXCVAR_DECLARE(uint32_t, hle_shader_verts);
 
@@ -1975,7 +1976,15 @@ ShaderApplyResult ApplyShaderOutputs(
   // The register reads 0x43F, one value across every draw: all six viewport
   // enables set, vtx_w0_fmt set. The GPU applies the viewport transform, so the
   // shader exports clip space and the transform here is identity.
-  if (hw_applies_viewport) {
+  //
+  // The old rule is kept behind a cvar purely so the two can be captured from
+  // one binary minutes apart, instead of from two builds that differ by more
+  // than the branch under test. It restores the contest exactly as it was,
+  // including the strict > that sent ties to viewport.
+  const bool use_identity =
+      REXCVAR_GET(legacy_mvp_tiebreak) ? contest_says_identity
+                                       : hw_applies_viewport;
+  if (use_identity) {
     // The GPU does the viewport transform, so the export is clip space already.
     static constexpr float kIdentity[16] = {
         1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
