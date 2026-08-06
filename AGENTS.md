@@ -55,20 +55,33 @@ in at the repo root.
 ### Running
 
 ```bash
-./mx.exe --game_data_root=assets --user_data_root=userdata --skip_intro=true --hle_render=true --hide_colorless_draws=true --hle_shader_exec=1
+./mx.exe --game_data_root=assets --user_data_root=userdata --skip_intro=true --force_load=NAT_Farm --registry_override=ReadyToLaunch=1
 ```
 
 `--game_data_root` and `--user_data_root` are mandatory — without them the
 process exits immediately with code 1 and writes no useful log. Each run appends
 a new `logs/mx_NNN.log`.
 
-**The HLE render path does nothing without `--hle_render=true
---hle_shader_exec=1`.** A run with only `--skip_intro` produces D3D9 state
-tracking and resolves but zero HLE draws, which reads exactly like a regression.
+**`hle_render` is ON by default since 2026-08-06** and no longer needs a flag.
+It is the path that carries the game: 10.67M vertices in a loaded scene against
+the PM4 transcode's 15k. Pass `--hle_render=false` to fall back to PM4.
 
-To reach a loaded scene, add `--force_load=ST_Southwest
---registry_override=ReadyToLaunch=1`. **`force_load` fires about 115 seconds
-after start**, so a run shorter than ~2½ minutes never reaches it.
+The old run line here also carried `--hle_shader_exec=1` under the claim that
+**"the HLE render path does nothing without it". That was wrong.**
+`hle_shader_exec` gates only a sampled measurement, and its one use sits behind
+`hle_capture`, so passing it without `--hle_capture=true` does nothing at all —
+which is how three verification runs came to be missing every `hle-render` and
+`stageF` line. Rendering is gated on `hle_render` alone
+(`BuildAndQueueDraw` -> `ApplyShaderOutputs`, `hooks_d3d9.cpp:976`). Add
+`--hle_capture=true --hle_shader_exec=1` when you want the diagnostics, and
+expect them to cost.
+
+**Always run with `--force_load`**, and say so when reporting numbers. Without
+it a run never leaves the front end, and front-end geometry transcodes fine —
+`not-transcoded` reads 33% instead of the real 93.8%, and scene-only failures
+do not appear at all. `force_load` fires about 115 seconds after start, so a
+run shorter than ~2½ minutes never reaches it; ~400s gives a usable sample.
+`ST_Southwest` also works.
 
 ### Runtime cvars
 
@@ -376,6 +389,80 @@ hardcoded to two English filenames (`graphics_system.h:51`) while
 `assets/Videos/` holds DEU/FRA/ITA/SPA variants, so it cannot follow the
 language setting. Whether the guest's own decoder now renders through HLE is the
 test that would let the whole dependency go; it has not been run.
+
+### Draws land outside the clip volume on z (2026-08-06)
+
+A RenderDoc capture (`mx_2026.08.05_23.55.39_frame2967.rdc`, EID 831,
+`DrawIndexedInstanced(1810, 1)`) shows, on every row of the mesh viewer:
+
+| | X | Y | Z | W |
+|---|---|---|---|---|
+| VS Input `POSITION` | 11.34206 | 11.01484 | 8.23549 | — |
+| VS Output `SV_POSITION` | −0.98228 | 0.96940 | **8.23549** | **1.00** |
+
+D3D clips on `0 <= z <= w`, so the draw rasterises nothing.
+
+The shader is not at fault. `kGameVS` does `mul(mvp, float4(pos, 1.0))` and
+`BuildViewportMvp` is an **inverse viewport**: row 3 is left identity so `w` is
+always 1, and row 2 is `1/zs`, which every run reports at the `zs == 1`
+fallback. Untransformed z therefore passes straight through.
+
+The viewport is right, too. Solving `(11.34 − xo)/xs = −0.98228` and
+`(11.01 − yo)/ys = 0.96940` gives exactly `xs=640 xo=640 ys=−360 yo=360`, and
+the log prints those verbatim. **The input is what is wrong** — a 1810-vertex
+mesh whose window-space bounding box is 0.68 x 4.41 pixels in the top-left
+corner is in model space, not window space.
+
+Two independent instruments agree, from opposite ends:
+
+- `d3d9: stageI` scores `in-clip 0%` on every shader it calls `window-like
+  100%`. That metric does bound z (`hooks_d3d9.cpp`), which is why it sees
+  what the PM4 classifier could not.
+- `transcode: done 5000 passthrough 53232 (no shader 0, no position 53224,
+  read failed 8)`. **`no position` is the exit** — `PickPositionAttribute`
+  finds nothing. `no shader` and `read failed` are ~0. Position format 57 is
+  the only one that ever transcodes; `packed` colour is `0:0` on every row of
+  the colour x surface table.
+
+**The untranscoded share depends entirely on `--force_load`, so always state
+which.** Measured at equal `done 5000`: with `--force_load=NAT_Farm`,
+`passthrough` is 53232 and the class table reads **93.6-93.8% of draws and
+99.9% of vertices** not-transcoded (3/3 runs, stable to a fraction of a
+percent). Without it, `passthrough` is 2779 and the share is 33%. Passthroughs
+are a property of loaded scene content, not of the pipeline — a front-end-only
+run transcodes fine and will make this look nine times better than it is.
+
+`ClassifyTransformedDraw` computed z and threw it away, testing only x and y,
+so this draw scored `kPartial` — a clean bill of health. It now has a
+`kDepthClipped` class, and `passthrough` draws are counted as `kNotTranscoded`
+rather than being absent from the table entirely. Counted only; nothing is
+skipped unless `--skip_untransformable_draws=true`.
+
+**`kDepthClipped` reads 0 in every run, and that is correct — it is on the
+wrong path for the draw that motivated it.** `ClassifyTransformedDraw` is
+called only from `TranscodeVertices`, i.e. the PM4 path, which carries ~15k
+vertices in a loaded scene. The captured draw comes through the **HLE** path
+(`d3d9_draw.cpp`), which carries **10.67M** — `d3d9: HLE shader output ...
+applied 37018 draws / 10671287 vertices`. Do not add a second z classifier
+there: stageI's `in-clip` already bounds z on that path and already reports
+`0%`. The two paths are separately instrumented and the HLE one was never
+blind.
+
+The `kNotTranscoded` class still earned its place — it is what made the
+99.9%-of-vertices figure visible at all.
+
+**The mesh shape in RenderDoc is not evidence of anything.** Two captures of
+EID 831 that look wildly different — a figure and a twisted spike — differ only
+by the Mesh Viewer's **Axis Mapping** dropdown (`Y-up, right handed` vs `Y-up,
+left handed`). The bounding box is identical in both. Check that dropdown
+before reading a shape as a bug.
+
+**`ripgrep` skips `logs/*.log` as binary.** The Grep tool reported zero matches
+for `NDC prim=` in a file containing thirty of them, and zero for
+`transcode: done` across the whole directory when two runs have it. Every
+negative result above was re-established with `grep -a`. Use `grep -a` on these
+logs, always — a silent no-match here reads exactly like a feature that never
+ran.
 
 ---
 

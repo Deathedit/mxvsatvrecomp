@@ -68,17 +68,33 @@ REXCVAR_DEFINE_BOOL(hide_colored_draws, false, "Debug",
 // The D3D9 -> D3D12 high-level path, step one: describe every draw from the
 // API calls that produced it instead of reconstructing it from PM4.
 //
-// Capture only. It changes nothing that is submitted to D3D12 — no PSOs, no
-// uploads, no shader translation — so with it off a run is byte-identical to
-// one built before it existed. The state shadow behind it fills unconditionally
-// (state set before the first draw would otherwise read as unknown); this cvar
-// gates the per-draw scoring, the coverage report and the dump.
-REXCVAR_DEFINE_BOOL(hle_render, false, "Debug",
+// The "capture only, changes nothing submitted to D3D12" note that used to sit
+// here described hle_capture, not this cvar, and became actively wrong when
+// this one started submitting. It now lives on hle_capture below, where it is
+// true. The state shadow behind both fills unconditionally — state set before
+// the first draw would otherwise read as unknown.
+//
+// ON BY DEFAULT since 2026-08-06. The condition set above — "until this is
+// proven" — is met by volume: in a loaded scene (--force_load=NAT_Farm) this
+// path applies 37018 draws / 10671287 vertices, while the PM4 transcode reaches
+// 15k vertices and leaves 99.9% of the rest in kNotTranscoded because
+// PickPositionAttribute finds no position. PM4 is not the path that carries the
+// game; keeping it as the default only meant every real run needed a flag.
+//
+// This selects the *source* of a frame's draws, not an extra one
+// (hooks_frame.cpp). PM4 still translates every frame either way — the HLE
+// path depends on it for the patched shader microcode that arrives in the
+// IM_LOAD packets after the D3D9 draw entry points have already run.
+REXCVAR_DEFINE_BOOL(hle_render, true, "Debug",
                     "Build draws from the D3D9 description — declaration, "
                     "stream bindings and index buffer — and submit those "
-                    "instead of the PM4 translator's. Off by default: PM4 "
-                    "still owns rendering until this is proven");
+                    "instead of the PM4 translator's. On by default; pass "
+                    "--hle_render=false to fall back to PM4");
 
+// Capture only: no PSOs, no uploads, no shader translation, nothing submitted.
+// It gates the per-draw scoring, the coverage report and the dump — including
+// every `hle-render` and `stageF` line, which is why those are absent from a
+// run that passes hle_shader_exec without this.
 REXCVAR_DEFINE_BOOL(hle_capture, false, "Debug",
                     "Score every D3D9 draw against the state shadow and report "
                     "what fraction is fully described, plus the first few "
