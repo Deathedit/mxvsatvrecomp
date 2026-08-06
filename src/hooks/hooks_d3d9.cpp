@@ -669,6 +669,52 @@ bool ReadDeviceViewport(uint32_t device, uint8_t* base, float out[6]) {
 //---------------------------------------------------------------------------
 constexpr uint32_t kDeviceSqProgramCntl = 10528;
 
+// The 0x2200 register block's shadow, from the same flush pattern:
+// sub_82564768(device, 0, 8704, device + 10548), 8704 = 0x2200 =
+// RB_DEPTHCONTROL. sub_82564768 sends register base+i from shadow + i*4.
+constexpr uint32_t kDeviceRegBlock2200 = 10548;
+constexpr uint32_t kRegPaClVteCntl = 0x2206;
+constexpr uint32_t kDevicePaClVteCntl =
+    kDeviceRegBlock2200 + (kRegPaClVteCntl - 0x2200) * 4;
+
+uint64_t g_hleShaderMvpDisagree = 0;
+uint64_t g_vteSeen[4] = {};  // [0]=unreadable [1]=scale off [2]=scale on
+
+// True when the GPU applies the viewport scale itself, meaning the vertex
+// shader exported clip space. False — including when the register cannot be
+// read — means the export is window space and needs the viewport inverse,
+// which is the measured case for this game (PA_CL_VTE_CNTL = 0x300) and the
+// safe default: it is what the code did unconditionally before.
+bool VportScaleEnabled(uint32_t device, uint8_t* base) {
+  (void)base;
+  if (!device || !HostPageReadable(REX_RAW_ADDR(device + kDevicePaClVteCntl))) {
+    ++g_vteSeen[0];
+    return false;
+  }
+  const uint32_t vte = REX_LOAD_U32(device + kDevicePaClVteCntl);
+  const bool on = (vte & 1u) != 0;
+  ++g_vteSeen[on ? 2 : 1];
+  // Offset verification. The derivation says 0x2206 lands here; the captured
+  // stream says its value is 0x300. If this slot does not read 0x300 the
+  // derivation is wrong, and a dump of the surrounding block says where the
+  // register actually is. Logged once per distinct value, capped.
+  static std::map<uint32_t, bool> s_vals;
+  if (REXCVAR_GET(hle_capture) && s_vals.size() < 4 &&
+      s_vals.emplace(vte, true).second) {
+    std::string blk;
+    for (int32_t d = -32; d <= 32; ++d) {
+      const uint32_t at = device + kDevicePaClVteCntl + d * 4;
+      if (!HostPageReadable(REX_RAW_ADDR(at))) continue;
+      const uint32_t w = REX_LOAD_U32(at);
+      if (w) blk += fmt::format(" {:+d}:{:08X}", d, w);
+    }
+    REXLOG_INFO("d3d9: PA_CL_VTE_CNTL candidate at +{} = {:08X}; nonzero "
+                "neighbours (dword offsets):{}",
+                kDevicePaClVteCntl, vte, blk);
+  }
+  return on;
+}
+
 struct SqProgramCntl {
   uint32_t raw = 0;
   uint32_t vs_num_reg = 0;
@@ -1519,12 +1565,14 @@ ShaderApplyResult ApplyShaderOutputs(
       REXLOG_INFO(
           "d3d9: HLE shader output attempts {}: applied {} draws / {} "
           "vertices; skipped no-code {} decode {} stream {} constants {} "
-          "vertex {}; output transform identity {} viewport {}; live shader "
-          "resolved {} no-match {} ambiguous {} unreadable {}",
+          "vertex {}; output transform identity {} viewport {} (VTE scale-on "
+          "{} off {} unreadable {}, disagrees with old tie-break {}); live "
+          "shader resolved {} no-match {} ambiguous {} unreadable {}",
           g_hleShaderAttempts, g_hleShaderDraws, g_hleShaderVertices,
           g_hleShaderNoCode, g_hleShaderBadDecode, g_hleShaderBadStream,
           g_hleShaderBadConstants, g_hleShaderBadVertex,
-          g_hleShaderIdentityMvp, g_hleShaderViewportMvp,
+          g_hleShaderIdentityMvp, g_hleShaderViewportMvp, g_vteSeen[2],
+          g_vteSeen[1], g_vteSeen[0], g_hleShaderMvpDisagree,
           g_liveVertexResolved, g_liveVertexNoMatch, g_liveVertexAmbiguous,
           g_liveVertexUnreadable);
     }
@@ -1891,7 +1939,44 @@ ShaderApplyResult ApplyShaderOutputs(
       }
     }
   }
-  if (identity_in_clip > viewport_in_clip) {
+  // Which transform this draw needs is stated by the hardware, not decided by a
+  // contest between two candidates.
+  //
+  // PA_CL_VTE_CNTL (0x2206) says whether the GPU applies the viewport transform
+  // itself. Its shadow follows the pattern already established for
+  // SQ_PROGRAM_CNTL above: the draw-time flush issues
+  // sub_82564768(device, 0, 8704, device + 10548) with 8704 = 0x2200 =
+  // RB_DEPTHCONTROL, and sub_82564768 sends register base+i from shadow+i*4, so
+  // 0x2206 sits at device + 10548 + 6*4.
+  //
+  //   vport_x_scale_ena (bit 0) == 0 -> the GPU applies no viewport scale, so
+  //   the shader already exported window space and we must apply the inverse.
+  //   == 1 -> the GPU would transform it, so the export is clip space and the
+  //   transform here is identity.
+  //
+  // Measured 0x300 in the captured stream: scale/offset all disabled, xy and z
+  // already divided by w. That is the viewport-inverse case, for every draw.
+  //
+  // The old rule was `identity_in_clip > viewport_in_clip`, a strict > so ties
+  // went to viewport. With in-clip commonly 0 for both candidates an unknown
+  // share of viewport draws defaulted rather than won. Both counters are kept
+  // and a third records disagreement, so the register's answer can be compared
+  // against what the contest would have chosen instead of silently replacing it.
+  const bool hw_applies_viewport = VportScaleEnabled(device, base);
+  const bool contest_says_identity = identity_in_clip > viewport_in_clip;
+  if (contest_says_identity != hw_applies_viewport) ++g_hleShaderMvpDisagree;
+  // The offset was checked before being acted on, because the derivation
+  // disagreed with this file's note that PA_CL_VTE_CNTL is 0x300. A dump of the
+  // surrounding dwords settled it: 17 dwords below sits 640.0, then 640.0,
+  // -90.0, 90.0, 1.0 — PA_CL_VPORT_XSCALE/XOFFSET/YSCALE/YOFFSET/ZSCALE
+  // (0x210F..0x2113), whose own shadow base puts XSCALE exactly there. 640 is
+  // half of 1280. The offset is right and the 0x300 note is stale.
+  //
+  // The register reads 0x43F, one value across every draw: all six viewport
+  // enables set, vtx_w0_fmt set. The GPU applies the viewport transform, so the
+  // shader exports clip space and the transform here is identity.
+  if (hw_applies_viewport) {
+    // The GPU does the viewport transform, so the export is clip space already.
     static constexpr float kIdentity[16] = {
         1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     std::memcpy(dc.mvp, kIdentity, sizeof(dc.mvp));

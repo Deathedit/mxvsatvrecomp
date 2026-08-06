@@ -488,6 +488,37 @@ Entry points were located by matching COFF symbols from a genuine Xbox 360
 patterns. **FLIRT/FLAIR does not work here and is not needed** — the COFF symbol
 tables parse directly and give more.
 
+### The transform choice is a register, not a contest (2026-08-06)
+
+`ApplyShaderOutputs` used to pick between identity and the viewport inverse with
+`if (identity_in_clip > viewport_in_clip)` — a strict `>`, so ties went to
+viewport. With `in-clip` commonly 0 for both candidates, most draws defaulted
+rather than won: measured, that rule disagreed with the hardware on **87789 of
+106132 draws (82.7%)**.
+
+The hardware states the answer. **PA_CL_VTE_CNTL (0x2206)** says whether the GPU
+applies the viewport transform itself, which is exactly the question. Its shadow
+follows the pattern already established for `SQ_PROGRAM_CNTL`: the draw-time
+flush issues `sub_82564768(device, 0, 8704, device + 10548)` with 8704 = 0x2200
+= RB_DEPTHCONTROL, and `sub_82564768` sends register `base + i` from
+`shadow + i*4`, so **0x2206 lives at `device + 10572`**.
+
+That derivation contradicted this file's note that VTE_CNTL is 0x300, so it was
+checked before being acted on. Dumping the surrounding dwords settled it — 17
+dwords below `+10572` are `640.0, 640.0, -90.0, 90.0, 1.0`, which are
+`PA_CL_VPORT_XSCALE/XOFFSET/YSCALE/YOFFSET/ZSCALE` (0x210F..0x2113); the 0x2100
+block's own shadow base (`device + 10444`) puts XSCALE at `10444 + 15*4 = 10504`,
+exactly there. 640 is half of 1280. **The offset is right and the 0x300 note is
+stale.**
+
+The register reads **0x43F**, one value across every draw: all six viewport
+enables set, `vtx_w0_fmt` set. The GPU applies the viewport, so the shader
+exports clip space and the transform here is **identity**.
+
+Applied held at 88.84%. **Not yet visually confirmed** — stageI cannot arbitrate
+this, because it classifies exported positions and the transform is applied
+downstream of them. A RenderDoc before/after is the outstanding check.
+
 ### Entry points
 
 | function | address | function | address |
