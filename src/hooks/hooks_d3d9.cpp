@@ -1165,260 +1165,33 @@ void ScoreDraw(bool indexed, uint32_t first, uint32_t count,
 }
 
 //---------------------------------------------------------------------------
-// Stage A — locate the microcode *inside* the blob, by comparison.
+// Stage A is GONE (2026-08-06), and this note is its epitaph because the
+// question it answered still matters.
 //
-// `DecodeVertexShaderFetches` wants an array that starts at the control-flow
-// section ("the blob carries no header saying so", shader_ucode.cpp:396), and
-// no UCODE header parser exists anywhere — not in this tree, and not in the SDK
-// at rex/graphics/format/ucode.h. So the code's offset within the blob has to
-// be established before anything can be decoded.
+// It located the vertex microcode *inside* the blob by searching for what PM4
+// had decoded from the ring — `DecodeVertexShaderFetches` needs an array
+// starting at the control-flow section ("the blob carries no header saying
+// so", shader_ucode.cpp:396), and no UCODE header parser exists in this tree
+// or in the SDK at rex/graphics/format/ucode.h.
 //
-// **Not by guessing which header dword is an offset.** The ring already carried
-// this exact microcode and CapturedShaders() holds it, so the offset is found
-// by searching the blob for what PM4 decoded. Both sides are host-endian —
-// REX_LOAD_U32 byteswaps on the way in, and the 0x2B path is host-endian
-// already (pm4_translator.cpp:622) — so the dwords compare directly.
+// That search is unnecessary now. `CapturePatchedCode` takes the microcode
+// straight out of the command-ring destination inside the PatchVertexShader
+// hook and records `code_off` by decoding it, so the offset is known rather
+// than found by comparison — and stageG measured that route at 100% of draws
+// against the search's 0%. The vertex blob at +0x368 is no longer collected at
+// all; only the pixel-shader blob below is still read.
 //
-// A match also settles which variant is bound, for free: GetUCode(i) says the
-// object holds several patched microcodes, and the ring carried the one the
-// hardware actually ran.
-//
-// **Blobs are collected at bind time and compared at report time.** A first
-// version compared on the spot and reported 0 of 48 matching — against "0
-// captured shaders" for the first blob and "3" for the next few, because the
-// game binds a shader long before the ring loads it and each handle was only
-// searched once. That comparison ran against an almost-empty captured set and
-// said nothing about the blob. Same class of mistake as the transform report
-// eating its own counters: the instrument, not the data.
+// If a future change needs the offset again, use `g_patchedCode`, not a
+// content search. The search was only ever a way to work around not having
+// the code.
 //---------------------------------------------------------------------------
-constexpr uint32_t kVsBlobOffset = 0x368;   // CreateVertexShader copies here
-constexpr uint32_t kVsBlobSizeAt = 0x36C;
 constexpr uint32_t kMaxBlobDwords = 4096;   // 16 KB ceiling on one blob
 
-std::map<uint32_t, std::vector<uint32_t>> g_vsBlobs;
 std::map<uint32_t, std::vector<uint32_t>> g_psBlobs;
-uint64_t g_vsBlobUnreadable = 0;
 
-// SH_pPhysical per handle, for the address-key test below.
-std::map<uint32_t, uint32_t> g_vsPhys;
 
-void CollectVertexShaderBlob(uint32_t handle, uint8_t* base) {
-  (void)base;
-  if (!handle || g_vsBlobs.count(handle)) return;
-  if (!HostPageReadable(REX_RAW_ADDR(handle + kVsBlobOffset)) ||
-      !HostPageReadable(REX_RAW_ADDR(handle + kVsBlobSizeAt))) {
-    ++g_vsBlobUnreadable;
-    return;
-  }
-  const uint32_t size_bytes = REX_LOAD_U32(handle + kVsBlobSizeAt);
-  if (size_bytes == 0 || size_bytes > kMaxBlobDwords * 4) {
-    ++g_vsBlobUnreadable;
-    return;
-  }
-  const uint32_t n = size_bytes / 4;
 
-  std::vector<uint32_t> blob(n);
-  for (uint32_t i = 0; i < n; ++i) {
-    const uint32_t off = kVsBlobOffset + i * 4;
-    if ((off & (kHostPageSize - 1)) == 0 &&
-        !HostPageReadable(REX_RAW_ADDR(handle + off))) {
-      blob.resize(i);
-      break;
-    }
-    blob[i] = REX_LOAD_U32(handle + off);
-  }
-  g_vsBlobs.emplace(handle, std::move(blob));
-  if (HostPageReadable(REX_RAW_ADDR(handle + 0x20)))
-    g_vsPhys.emplace(handle, REX_LOAD_U32(handle + 0x20));
-}
-
-//---------------------------------------------------------------------------
-// Does the handle already name its own ring key?
-//
-// HandleImLoad (0x27) keys the shader cache by guest physical address,
-// `pkt.body[0] & ~3` (pm4_translator.cpp:638). SH_pPhysical is
-// `*(handle + 0x20)`. If D3D9 issues IM_LOAD for the shader it binds, then the
-// handle *is* the key and there is nothing to extract from the blob at all.
-//
-// Three forms are tried because D3D9 masks addresses on the way to the GPU and
-// the raw field is the unmasked one — the distinction that cost four access
-// violations. Three forms is not a fishing expedition: they are the raw value,
-// the physical mask D3D9 itself applies (`rlwinm r11, r11, 0, 3, 31`), and the
-// dword alignment HandleImLoad applies on top.
-//
-// Note the other door: IM_LOAD_IMMEDIATE (0x2B) carries no address, so its keys
-// are content hashes and no address can ever match them. How many keys are of
-// each kind is therefore part of the answer, not background — a miss means
-// nothing if every key in the cache is a hash.
-//---------------------------------------------------------------------------
-void ReportAddressKeyTest(uint8_t* base) {
-  const auto& captured = mx::pm4::CapturedShaders();
-  if (captured.empty() || g_vsPhys.empty()) {
-    REXLOG_INFO("d3d9: stageA  address-key test: nothing to compare ({} keys, "
-                "{} handles)", captured.size(), g_vsPhys.size());
-    return;
-  }
-
-  // A key that fits in 32 bits and lands in the guest's address range is an
-  // address; anything else is a content hash. Counting them says whether the
-  // test could have succeeded at all.
-  uint32_t addr_keys = 0, hash_keys = 0;
-  for (const auto& [key, cs] : captured) {
-    (void)cs;
-    if (key <= 0xFFFFFFFFull) ++addr_keys; else ++hash_keys;
-  }
-
-  uint32_t hit_raw = 0, hit_phys = 0, hit_aligned = 0;
-  auto& f = DeclFile();
-  uint32_t named = 0;
-  for (const auto& [handle, phys] : g_vsPhys) {
-    const uint64_t raw = phys;
-    const uint64_t masked = phys & 0x1FFFFFFFu;
-    const uint64_t aligned = masked & ~3u;
-    const bool a = captured.count(raw) != 0;
-    const bool b = captured.count(masked) != 0;
-    const bool c = captured.count(aligned) != 0;
-    hit_raw += a; hit_phys += b; hit_aligned += c;
-    if ((a || b || c) && named < 8) {
-      ++named;
-      f << "ADDRESS KEY HIT: shader 0x" << std::hex << handle
-        << " SH_pPhysical=0x" << phys << " matched as"
-        << (a ? " raw" : "") << (b ? " physical" : "")
-        << (c ? " physical-aligned" : "") << std::dec << "\n";
-    }
-  }
-  f.flush();
-
-  REXLOG_INFO(
-      "d3d9: stageA  address-key test over {} handles vs {} ring keys ({} look "
-      "like addresses, {} are content hashes): raw {} physical {} "
-      "physical-aligned {}",
-      g_vsPhys.size(), captured.size(), addr_keys, hash_keys, hit_raw, hit_phys,
-      hit_aligned);
-  // The exact test missed but most keys are addresses, so the two are probably
-  // the same region at a fixed offset — GetPhysicalMicrocode's shape is
-  // `*(variant + 0x368) + SH_pPhysical`, i.e. base plus an offset out of the
-  // header. Reporting the nearest key per handle turns "no" into a distance,
-  // and a delta that repeats is the offset.
-  if (addr_keys) {
-    std::map<int64_t, uint32_t> deltas;
-    for (const auto& [handle, phys] : g_vsPhys) {
-      (void)handle;
-      const int64_t p = int64_t(phys & 0x1FFFFFFFu);
-      int64_t best = 0;
-      bool have = false;
-      for (const auto& [key, cs] : captured) {
-        (void)cs;
-        if (key > 0xFFFFFFFFull) continue;
-        const int64_t d = int64_t(key) - p;
-        if (!have || (d < 0 ? -d : d) < (best < 0 ? -best : best)) {
-          best = d;
-          have = true;
-        }
-      }
-      if (have) ++deltas[best];
-    }
-    std::string top;
-    uint32_t shown = 0;
-    for (const auto& [d, n] : deltas) {
-      if (n < 2 || shown >= 8) continue;   // a delta seen once is a coincidence
-      ++shown;
-      char buf[48];
-      std::snprintf(buf, sizeof(buf), "%+lld:%u ", (long long)d, n);
-      top += buf;
-    }
-    REXLOG_INFO(
-        "d3d9: stageA  nearest ring key to each SH_pPhysical — {} distinct "
-        "deltas over {} handles; repeated ones: {}",
-        deltas.size(), g_vsPhys.size(), top.empty() ? "none" : top);
-
-    // **Confirm by content, not by arithmetic.** A nearest-neighbour delta can
-    // repeat for reasons that have nothing to do with the shader — if handles
-    // share a physical base, or if the allocator spaces every shader a page
-    // apart, the same delta falls out of the geometry alone. So take the
-    // candidate deltas the histogram named, read the guest at that address, and
-    // compare the dwords against the microcode the ring loaded under that key.
-    // Matching bytes are the claim; a matching subtraction is not.
-    static const int64_t kCandidateDeltas[] = {0x1040, 0x1000, -0xFC0, -0x1000};
-    for (int64_t d : kCandidateDeltas) {
-      uint32_t tried = 0, hit = 0, unreadable = 0;
-      for (const auto& [handle, phys] : g_vsPhys) {
-        (void)handle;
-        const uint64_t key = uint64_t(int64_t(phys & 0x1FFFFFFFu) + d);
-        auto it = captured.find(key);
-        if (it == captured.end() || it->second.code.empty()) continue;
-        ++tried;
-        // Read at the *unmasked* address: the guest's virtual space is where
-        // this side reads, which is the distinction that cost four AVs.
-        const uint32_t at = uint32_t(int64_t(phys) + d);
-        const uint32_t bytes = uint32_t(it->second.code.size() * 4);
-        if (!HostPageReadable(REX_RAW_ADDR(at)) ||
-            !HostPageReadable(REX_RAW_ADDR(at + bytes - 4))) {
-          ++unreadable;
-          continue;
-        }
-        bool same = true;
-        for (size_t i = 0; i < it->second.code.size() && same; ++i)
-          same = REX_LOAD_U32(at + uint32_t(i * 4)) == it->second.code[i];
-        hit += same ? 1 : 0;
-      }
-      if (tried) {
-        REXLOG_INFO(
-            "d3d9: stageA    delta {:+#x}: {} handles land on a ring key, {} of "
-            "them read back that exact microcode ({} unreadable)",
-            d, tried, hit, unreadable);
-      }
-    }
-  }
-
-  if (!hit_raw && !hit_phys && !hit_aligned && addr_keys == 0) {
-    REXLOG_INFO(
-        "d3d9: stageA  every ring key is a content hash — this title loads "
-        "shaders through IM_LOAD_IMMEDIATE, which carries no address, so no "
-        "address could have matched and the miss says nothing about the handle");
-  }
-}
-
-// Route 1: SH_pPhysical read at *draw* time rather than bind time. It was
-// sixteen zero dwords at bind; if D3D9 fills it lazily, the draw is when it
-// would be filled. Sampled once per handle so the cost is bounded.
-std::map<uint32_t, uint32_t> g_physNonzeroAtDraw;   // handle -> nonzero dwords
-// The bytes themselves, so the "is this the microcode" question is answered by
-// content and not by "it is no longer zero" — which a page of anything at all
-// would satisfy.
 constexpr uint32_t kPhysProbeDwords = 256;
-std::map<uint32_t, std::vector<uint32_t>> g_physDumpAtDraw;
-
-// handle -> {ring key, dword offset of the code in the dump, agreement %}.
-struct BestMatch { uint64_t key; uint32_t off_dwords; uint32_t pct; };
-std::map<uint32_t, BestMatch> g_bestKeyAtDraw;
-
-void ProbePhysicalAtDrawTime(uint32_t handle, uint8_t* base) {
-  (void)base;
-  if (!handle || g_physNonzeroAtDraw.count(handle)) return;
-  if (!HostPageReadable(REX_RAW_ADDR(handle + 0x20))) return;
-  const uint32_t phys = REX_LOAD_U32(handle + 0x20);
-  if (!phys || !HostPageReadable(REX_RAW_ADDR(phys)) ||
-      !HostPageReadable(REX_RAW_ADDR(phys + 0x7C))) {
-    g_physNonzeroAtDraw[handle] = 0;
-    return;
-  }
-  uint32_t nonzero = 0;
-  for (uint32_t i = 0; i < 32; ++i)
-    if (REX_LOAD_U32(phys + i * 4) != 0) ++nonzero;
-  g_physNonzeroAtDraw[handle] = nonzero;
-
-  std::vector<uint32_t> dump;
-  dump.reserve(kPhysProbeDwords);
-  for (uint32_t i = 0; i < kPhysProbeDwords; ++i) {
-    const uint32_t at = phys + i * 4;
-    if ((at & (kHostPageSize - 1)) == 0 && !HostPageReadable(REX_RAW_ADDR(at)))
-      break;
-    dump.push_back(REX_LOAD_U32(at));
-  }
-  g_physDumpAtDraw.emplace(handle, std::move(dump));
-}
-
 //---------------------------------------------------------------------------
 // Stage C — execute the shader and see where the position lands.
 //
@@ -1544,15 +1317,11 @@ std::map<int32_t, uint64_t> g_patchCodeOffsets;
 std::map<uint32_t, PatchedCode> g_patchedCode;   // shader handle -> latest
 
 uint64_t g_srcPatchHook = 0;    // draws whose code came from the patch hook
-uint64_t g_srcHeuristic = 0;    // ... from the >=90% content match
 uint64_t g_srcNone = 0;
 uint64_t g_patchDecodeOk = 0;     // decoded, and the count matched the table
 uint64_t g_patchDecodeCount = 0;  // decoded, count disagreed with the table
 uint64_t g_patchDecodeFail = 0;   // refused outright
 std::map<std::string, uint64_t> g_patchDecodeFailWhy;
-// Independent third reading: our decode of D3D9's patched output against
-// PM4's decode of the ring's copy. Same bytes by two routes.
-uint64_t g_attrAgree = 0, g_attrDisagree = 0, g_attrNoPeer = 0;
 uint64_t g_aluConstReads = 0, g_aluConstZero = 0;
 std::map<int, uint64_t> g_aluStatus;
 std::map<uint32_t, uint64_t> g_aluBlocking;
@@ -1655,181 +1424,6 @@ std::map<uint32_t, size_t> g_liveVertexFailedAtShaderCount;
 uint64_t g_liveVertexResolved = 0, g_liveVertexAmbiguous = 0;
 uint64_t g_liveVertexUnreadable = 0, g_liveVertexNoMatch = 0;
 
-const PatchedCode* ResolveLiveVertexCode(uint32_t handle,
-                                         const mx::pm4::HleStream* streams,
-                                         uint8_t* base) {
-  using namespace mx::pm4;
-  constexpr uint32_t kMaxLiveFetches = 32;
-  if (auto it = g_liveVertexCode.find(handle); it != g_liveVertexCode.end())
-    return &it->second;
-  const size_t captured_shader_count = CapturedShaders().size();
-  if (auto it = g_liveVertexFailedAtShaderCount.find(handle);
-      it != g_liveVertexFailedAtShaderCount.end() &&
-      it->second == captured_shader_count)
-    return nullptr;
-
-  if (!HostPageReadable(REX_RAW_ADDR(handle + 0x20))) {
-    ++g_liveVertexUnreadable;
-    return nullptr;
-  }
-  const uint32_t physical = REX_LOAD_U32(handle + 0x20);
-  if (!physical || !HostPageReadable(REX_RAW_ADDR(physical))) {
-    ++g_liveVertexUnreadable;
-    return nullptr;
-  }
-
-  PatchedCode live;
-  live.code.reserve(kPhysProbeDwords);
-  for (uint32_t i = 0; i < kPhysProbeDwords; ++i) {
-    const uint32_t at = physical + i * 4;
-    if ((at & (kHostPageSize - 1)) == 0 &&
-        !HostPageReadable(REX_RAW_ADDR(at)))
-      break;
-    live.code.push_back(REX_LOAD_U32(at));
-  }
-  if (live.code.size() < 32) {
-    ++g_liveVertexUnreadable;
-    return nullptr;
-  }
-
-  uint32_t matches = 0;
-  uint32_t winning_offset = 0;
-  uint32_t winning_fetches = 0;
-  bool structural_source = false;
-  std::vector<VertexAttribute> attrs;
-  for (uint32_t offset = 0; offset < live.code.size(); ++offset) {
-    attrs.clear();
-    if (!DecodeVertexShaderFetches(live.code.data() + offset,
-                                   uint32_t(live.code.size() - offset), attrs,
-                                   nullptr) ||
-        attrs.empty() || attrs.size() > kMaxLiveFetches)
-      continue;
-
-    bool streams_match = true;
-    for (const VertexAttribute& attr : attrs) {
-      const uint32_t fs = attr.fetch_slot;
-      if (fs > 95 || (95u - fs) >= kMaxStreams) {
-        streams_match = false;
-        break;
-      }
-      const HleStream& stream = streams[95u - fs];
-      if (!stream.bound || !stream.host || !stream.stride ||
-          stream.stride > 256 || stream.stride != attr.stride_bytes) {
-        streams_match = false;
-        break;
-      }
-    }
-    if (!streams_match) continue;
-    ++matches;
-    winning_offset = offset;
-    winning_fetches = uint32_t(attrs.size());
-    if (matches > 1) break;
-  }
-
-  // The resident allocation may be the unpatched template. Link that to the
-  // PM4-ready copy by exact structure, masking only fields the observed D3D9
-  // patch routine rewrites. This is deliberately attempted only when the live
-  // bytes themselves did not already yield a patched, stream-valid shader.
-  if (matches == 0) {
-    PatchedCode structural;
-    uint32_t structural_matches = 0;
-    VertexShaderStructureStats best_stats;
-    uint32_t best_total = 0;
-    uint64_t best_key = 0;
-    uint32_t best_offset = 0;
-    for (const auto& [key, captured] : CapturedShaders()) {
-      if (captured.code.empty() || captured.attrs.empty() ||
-          captured.code.size() > live.code.size())
-        continue;
-
-      bool streams_match = true;
-      for (const VertexAttribute& attr : captured.attrs) {
-        const uint32_t fs = attr.fetch_slot;
-        if (fs > 95 || (95u - fs) >= kMaxStreams) {
-          streams_match = false;
-          break;
-        }
-        const HleStream& stream = streams[95u - fs];
-        if (!stream.bound || !stream.host || !stream.stride ||
-            stream.stride > 256 || stream.stride != attr.stride_bytes) {
-          streams_match = false;
-          break;
-        }
-      }
-      for (uint32_t offset = 0;
-           offset + captured.code.size() <= live.code.size(); ++offset) {
-        VertexShaderStructureStats stats;
-        const bool exact = VertexShaderStructureMatches(
-            live.code.data() + offset, captured.code.data(),
-            uint32_t(captured.code.size()), &stats);
-        if (stats.equal_dwords > best_stats.equal_dwords) {
-          best_stats = stats;
-          best_total = uint32_t(captured.code.size());
-          best_key = key;
-          best_offset = offset;
-        }
-        if (!exact || !streams_match) continue;
-        // Several PM4 keys may carry byte-identical code. That is one shader,
-        // not an ambiguous identity.
-        if (structural_matches && structural.code == captured.code) continue;
-        ++structural_matches;
-        structural.code = captured.code;
-        structural.code_off = 0;
-        structural.expect_fetches = uint32_t(captured.attrs.size());
-        structural.resolved = true;
-        if (structural_matches > 1) break;
-      }
-      if (structural_matches > 1) break;
-    }
-    if (structural_matches == 1) {
-      live = std::move(structural);
-      matches = 1;
-      winning_offset = 0;
-      winning_fetches = live.expect_fetches;
-      structural_source = true;
-    } else if (structural_matches > 1) {
-      matches = structural_matches;
-    } else if (best_total) {
-      static uint32_t s_logged_structure_miss = 0;
-      if (s_logged_structure_miss++ < 24) {
-        REXLOG_INFO(
-            "d3d9: vertex shader 0x{:08X} best structural candidate key "
-            "0x{:X} at live+0x{:X}: {}/{} dwords equal; retained fetch "
-            "mismatches {} other mismatches {}; raw fetch xor {:08X} "
-            "{:08X} {:08X}",
-            handle, best_key, best_offset * 4, best_stats.equal_dwords,
-            best_total, best_stats.fetch_mismatches,
-            best_stats.other_mismatches, best_stats.fetch_xor[0],
-            best_stats.fetch_xor[1], best_stats.fetch_xor[2]);
-      }
-    }
-  }
-
-  if (matches != 1) {
-    g_liveVertexFailedAtShaderCount[handle] = captured_shader_count;
-    if (matches > 1)
-      ++g_liveVertexAmbiguous;
-    else
-      ++g_liveVertexNoMatch;
-    return nullptr;
-  }
-
-  live.code_off = winning_offset;
-  live.expect_fetches = winning_fetches;
-  live.resolved = true;
-  auto [it, inserted] = g_liveVertexCode.emplace(handle, std::move(live));
-  (void)inserted;
-  ++g_liveVertexResolved;
-  if (g_liveVertexResolved <= 24) {
-    REXLOG_INFO("d3d9: vertex shader 0x{:08X} resolved from {} "
-                "0x{:08X}+0x{:X}: {} fetch(es); exact unique "
-                "structure/stream match",
-                handle, structural_source ? "PM4-patched template match" :
-                                             "live allocation",
-                physical, winning_offset * 4, winning_fetches);
-  }
-  return &it->second;
-}
 
 ShaderApplyResult ApplyShaderOutputs(
     mx::pm4::DrawCall& dc, uint32_t handle,
@@ -1867,7 +1461,6 @@ ShaderApplyResult ApplyShaderOutputs(
   auto pi = g_patchedCode.find(handle);
   const PatchedCode* patchp =
       pi != g_patchedCode.end() && pi->second.resolved ? &pi->second : nullptr;
-  if (!patchp) patchp = ResolveLiveVertexCode(handle, streams, base);
   if (!patchp) {
     ++g_hleShaderNoCode;
     static uint32_t s_logged_no_code = 0;
@@ -2863,7 +2456,6 @@ void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
   uint32_t off = 0;
   static std::vector<VertexAttribute> decoded;
   const std::vector<VertexAttribute>* attrsp = nullptr;
-  const std::vector<VertexAttribute>* peer = nullptr;   // PM4's, for comparison
 
   auto pi = g_patchedCode.find(handle);
   if (pi != g_patchedCode.end() && pi->second.resolved) {
@@ -2890,45 +2482,22 @@ void ProbeShaderExecution(const mx::pm4::DrawCall& dc, uint32_t handle,
     }
   }
 
-  auto bi = g_bestKeyAtDraw.find(handle);
-  auto di = g_physDumpAtDraw.find(handle);
-  auto ci = (bi != g_bestKeyAtDraw.end())
-                ? mx::pm4::CapturedShaders().find(bi->second.key)
-                : mx::pm4::CapturedShaders().end();
-  const bool heuristic_ok =
-      bi != g_bestKeyAtDraw.end() && bi->second.pct >= 90 &&
-      di != g_physDumpAtDraw.end() &&
-      ci != mx::pm4::CapturedShaders().end() && !ci->second.attrs.empty() &&
-      bi->second.off_dwords < di->second.size();
-  if (heuristic_ok) peer = &ci->second.attrs;
-
-  if (codep) {
-    ++g_srcPatchHook;
-    if (peer) {
-      // Third independent reading of the same fact: our decode of D3D9's
-      // patched output against PM4's decode of the ring's copy. Same bytes by
-      // two routes, so they should agree.
-      bool same = peer->size() == attrsp->size();
-      for (size_t a = 0; same && a < attrsp->size(); ++a) {
-        same = (*peer)[a].fetch_slot == (*attrsp)[a].fetch_slot &&
-               (*peer)[a].format == (*attrsp)[a].format &&
-               (*peer)[a].offset_bytes == (*attrsp)[a].offset_bytes &&
-               (*peer)[a].stride_bytes == (*attrsp)[a].stride_bytes;
-      }
-      if (same) ++g_attrAgree; else ++g_attrDisagree;
-    } else {
-      ++g_attrNoPeer;
-    }
-  } else if (heuristic_ok) {
-    ++g_srcHeuristic;
-    codep = &di->second;
-    off = bi->second.off_dwords;
-    attrsp = &ci->second.attrs;
-  } else {
+  // The PM4 content-match fallback that used to sit here is REMOVED
+  // 2026-08-06, along with the cross-check that compared our decode of D3D9's
+  // patched output against PM4's decode of the ring's copy. Both had one
+  // source and it is gone.
+  //
+  // Neither is missed, and that is measured rather than assumed: stageG
+  // reported `patch hook (exact) 32212 (100%), content match >=90% 0 (0%),
+  // none 0 (0%)`. The heuristic was never once the source, so the branch it
+  // fed was dead code carrying a >=90%-similarity guess that could have picked
+  // the wrong shader if it ever had fired.
+  if (!codep) {
     ++g_srcNone;
     ++g_aluNoShader;
     return;
   }
+  ++g_srcPatchHook;
 
   const std::vector<VertexAttribute>& attrs = *attrsp;
   const std::vector<uint32_t>& code = *codep;
@@ -3489,16 +3058,16 @@ void ReportShaderExecution() {
       g_aluDrawsEntered);
   ReportClipHistogram();
 
-  // Stage G — where the executed code came from. The headline is coverage:
-  // the heuristic left 63% of draws with no shader at all, and every number
-  // above was computed on the remaining minority.
-  const uint64_t src_total = g_srcPatchHook + g_srcHeuristic + g_srcNone;
+  // Stage G — where the executed code came from. Now a two-way split: the
+  // patch hook, or nothing. The PM4 content-match column is gone with its
+  // source, having reported 0 (0%) against the patch hook's 100% over 32212
+  // draws before it was removed.
+  const uint64_t src_total = g_srcPatchHook + g_srcNone;
   if (src_total) {
     REXLOG_INFO(
-        "d3d9: stageG  shader source — patch hook (exact) {} ({}%), content "
-        "match >=90% {} ({}%), none {} ({}%) of {} draws",
-        g_srcPatchHook, (g_srcPatchHook * 100) / src_total, g_srcHeuristic,
-        (g_srcHeuristic * 100) / src_total, g_srcNone,
+        "d3d9: stageG  shader source — patch hook (exact) {} ({}%), none {} "
+        "({}%) of {} draws",
+        g_srcPatchHook, (g_srcPatchHook * 100) / src_total, g_srcNone,
         (g_srcNone * 100) / src_total, src_total);
     std::string why;
     for (const auto& [w, n] : g_patchDecodeFailWhy) {
@@ -3524,277 +3093,10 @@ void ReportShaderExecution() {
         "value across every shader means a fixed layout; assuming -16 was "
         "wrong and the decode said so)",
         offs.empty() ? "none resolved " : offs);
-    REXLOG_INFO(
-        "d3d9: stageG  attributes, our decode of D3D9's patched output vs "
-        "PM4's decode of the ring's copy — {} agree, {} disagree, {} had no "
-        "PM4 peer to compare against",
-        g_attrAgree, g_attrDisagree, g_attrNoPeer);
   }
   ReportPerShader();
 }
 
-void ReportPhysicalAtDrawTime() {
-  if (g_physNonzeroAtDraw.empty()) return;
-  uint32_t any = 0;
-  for (const auto& [h, n] : g_physNonzeroAtDraw) { (void)h; any += n ? 1 : 0; }
-  REXLOG_INFO(
-      "d3d9: stageA  SH_pPhysical at draw time: {} of {} handles had any "
-      "non-zero dword in the first 32 (it was all zeros at bind time)",
-      any, g_physNonzeroAtDraw.size());
-
-  // Same scoring as the blob search, and for the same reason: an exact compare
-  // would fail on a patched vfetch even when the code is right there, so this
-  // reports best agreement and only calls it found at 90%.
-  const auto& captured = mx::pm4::CapturedShaders();
-  uint32_t found = 0, scored = 0;
-  uint64_t pct_sum = 0;
-  std::map<uint32_t, uint32_t> offsets;
-  // Where each handle's code was located, so Stage B decodes the same bytes
-  // this scored rather than re-deriving the offset.
-  std::map<uint32_t, uint32_t> agreement_bands;   // band floor -> handles
-  auto& f = DeclFile();
-  uint32_t named = 0;
-  for (const auto& [handle, dump] : g_physDumpAtDraw) {
-    size_t best_hits = 0, best_len = 0, best_at = 0;
-    uint64_t best_key = 0;
-    for (const auto& [key, cs] : captured) {
-      if (cs.code.empty() || cs.code.size() > dump.size()) continue;
-      for (size_t at = 0; at + cs.code.size() <= dump.size(); ++at) {
-        size_t hits = 0;
-        for (size_t i = 0; i < cs.code.size(); ++i)
-          hits += dump[at + i] == cs.code[i] ? 1 : 0;
-        if (hits > best_hits) {
-          best_hits = hits; best_len = cs.code.size();
-          best_at = at; best_key = key;
-        }
-      }
-    }
-    if (!best_len) continue;
-    ++scored;
-    const uint32_t pct = uint32_t(best_hits * 100 / best_len);
-    pct_sum += pct;
-    ++agreement_bands[(pct / 20) * 20];
-    g_bestKeyAtDraw[handle] = {best_key, uint32_t(best_at), pct};
-    if (pct >= 90) {
-      ++found;
-      ++offsets[uint32_t(best_at * 4)];
-    }
-    if (named < 10) {
-      ++named;
-      f << "DRAWTIME UCODE: shader 0x" << std::hex << handle << std::dec
-        << " best " << best_hits << "/" << best_len << " at offset 0x"
-        << std::hex << uint32_t(best_at * 4) << " vs ring key 0x" << best_key
-        << std::dec << "\n";
-    }
-  }
-  f.flush();
-  if (scored) {
-    std::string offs;
-    for (const auto& [off, n] : offsets) {
-      char buf[32];
-      std::snprintf(buf, sizeof(buf), "0x%X:%u ", off, n);
-      offs += buf;
-    }
-    REXLOG_INFO(
-        "d3d9: stageA  draw-time SH_pPhysical vs the ring's microcode: {} of {} "
-        "handles matched at 90%+ (mean best {}%), at offsets {}",
-        found, scored, pct_sum / scored, offs.empty() ? "none" : offs);
-    // The shortfall, named rather than left as "19 of 33". A handle at ~0%
-    // is a shader the ring never loaded in this window; one in the middle is
-    // a real disagreement and would matter.
-    std::string spread;
-    for (const auto& [lo, n] : agreement_bands) {
-      char buf[32];
-      std::snprintf(buf, sizeof(buf), "%u-%u%%:%u ", lo, lo + 19, n);
-      spread += buf;
-    }
-    REXLOG_INFO("d3d9: stageA  agreement spread across handles: {}", spread);
-  }
-
-  //-------------------------------------------------------------------------
-  // Stage B — decode what was found, and check it against PM4's decode.
-  //
-  // This is the cross-check the plan promised and Stage 3's could not deliver:
-  // two independent paths to the same shader's vertex attributes. PM4 decoded
-  // the copy the ring carried; this decodes the copy sitting at
-  // SH_pPhysical + 0x40. If they name the same fetch slots, offsets, strides
-  // and formats, the D3D9 side can reach the shader — and that is the whole
-  // question this milestone exists to answer.
-  //-------------------------------------------------------------------------
-  {
-    uint32_t decoded = 0, decode_failed = 0, agreed = 0, disagreed = 0;
-    uint64_t attrs_same = 0, attrs_diff = 0;
-    std::map<std::string, uint32_t> fails;
-    uint32_t named_b = 0;
-    for (const auto& [handle, dump] : g_physDumpAtDraw) {
-      auto bi = g_bestKeyAtDraw.find(handle);
-      if (bi == g_bestKeyAtDraw.end()) continue;
-      const uint64_t key = bi->second.key;
-      const uint32_t off_dwords = bi->second.off_dwords;
-      const uint32_t pct = bi->second.pct;
-      if (pct < 90) continue;   // only where the code was actually located
-      auto ci = captured.find(key);
-      if (ci == captured.end()) continue;
-      if (off_dwords >= dump.size()) continue;
-
-      std::vector<mx::pm4::VertexAttribute> mine;
-      const char* fail = nullptr;
-      const bool ok = mx::pm4::DecodeVertexShaderFetches(
-          dump.data() + off_dwords, uint32_t(dump.size() - off_dwords), mine,
-          &fail);
-      if (!ok) {
-        ++decode_failed;
-        ++fails[fail ? fail : "?"];
-        continue;
-      }
-      ++decoded;
-
-      const auto& theirs = ci->second.attrs;
-      bool all_same = mine.size() == theirs.size();
-      for (size_t i = 0; i < mine.size() && i < theirs.size(); ++i) {
-        const auto& a = mine[i];
-        const auto& b = theirs[i];
-        const bool same = a.fetch_slot == b.fetch_slot &&
-                          a.offset_bytes == b.offset_bytes &&
-                          a.stride_bytes == b.stride_bytes &&
-                          a.format == b.format && a.dest_reg == b.dest_reg;
-        (same ? attrs_same : attrs_diff) += 1;
-        all_same = all_same && same;
-      }
-      (all_same ? agreed : disagreed) += 1;
-      if (!all_same && named_b < 8) {
-        ++named_b;
-        f << "ATTR DISAGREE: shader 0x" << std::hex << handle << " key 0x"
-          << key << std::dec << " — HLE " << mine.size() << " attrs, PM4 "
-          << theirs.size() << "\n";
-        for (size_t i = 0; i < mine.size() || i < theirs.size(); ++i) {
-          f << "    [" << i << "] HLE ";
-          if (i < mine.size())
-            f << "slot=" << mine[i].fetch_slot << " off=" << mine[i].offset_bytes
-              << " stride=" << mine[i].stride_bytes << " fmt=" << mine[i].format
-              << " dest=" << mine[i].dest_reg;
-          else
-            f << "(none)";
-          f << " | PM4 ";
-          if (i < theirs.size())
-            f << "slot=" << theirs[i].fetch_slot << " off="
-              << theirs[i].offset_bytes << " stride=" << theirs[i].stride_bytes
-              << " fmt=" << theirs[i].format << " dest=" << theirs[i].dest_reg;
-          else
-            f << "(none)";
-          f << "\n";
-        }
-      }
-    }
-    f.flush();
-    if (decoded || decode_failed) {
-      std::string why;
-      for (const auto& [k, n] : fails) {
-        char buf[96];
-        std::snprintf(buf, sizeof(buf), "%s:%u ", k.c_str(), n);
-        why += buf;
-      }
-      REXLOG_INFO(
-          "d3d9: stageB  decoded {} of {} located shaders ({} refused: {}) — "
-          "attribute lists identical to PM4's for {} shaders, differing for "
-          "{}; per attribute {} same {} different",
-          decoded, decoded + decode_failed, decode_failed,
-          why.empty() ? "none" : why, agreed, disagreed, attrs_same, attrs_diff);
-    }
-  }
-}
-
-void ReportBlobSearch() {
-  const auto& captured = mx::pm4::CapturedShaders();
-  uint64_t matched = 0, unmatched = 0;
-  std::map<uint32_t, uint32_t> offsets;
-  auto& f = DeclFile();
-  uint32_t named = 0;
-
-  // **Partial agreement, not memcmp.** An exact compare answers the wrong
-  // question here: PatchVertexShaderToMatchVertexDeclaration rewrites vfetch
-  // dwords, so the copy the ring carries is the *patched* one while the object
-  // may hold the original. Those two are the same shader and would never be
-  // byte-identical. Scoring the best alignment turns "no match" from a verdict
-  // into a measurement — 90% agreement at one offset says the code is there and
-  // patched; 25% everywhere says it is not there at all.
-  //
-  // The byteswapped score is a control. If it wins, the two sides simply
-  // disagree about endianness and nothing deeper is wrong.
-  uint64_t best_pct_sum = 0;
-  uint32_t scored = 0;
-  for (const auto& [handle, blob] : g_vsBlobs) {
-    size_t best_hits = 0, best_len = 0, best_at = 0, best_swapped_hits = 0;
-    uint64_t best_key = 0;
-    bool best_ok = false;
-    for (const auto& [key, cs] : captured) {
-      if (cs.code.empty() || cs.code.size() > blob.size()) continue;
-      for (size_t at = 0; at + cs.code.size() <= blob.size(); ++at) {
-        size_t hits = 0, swapped = 0;
-        for (size_t i = 0; i < cs.code.size(); ++i) {
-          const uint32_t b = blob[at + i];
-          if (b == cs.code[i]) ++hits;
-          if (__builtin_bswap32(b) == cs.code[i]) ++swapped;
-        }
-        if (hits > best_hits) {
-          best_hits = hits;
-          best_len = cs.code.size();
-          best_at = at;
-          best_key = key;
-          best_ok = cs.ok;
-        }
-        if (swapped > best_swapped_hits) best_swapped_hits = swapped;
-      }
-    }
-    if (!best_len) continue;
-    ++scored;
-    const uint32_t pct = uint32_t(best_hits * 100 / best_len);
-    best_pct_sum += pct;
-    // Treated as found only when nearly all of it agrees. A patched vfetch is a
-    // handful of dwords; a different shader is most of them.
-    if (best_hits * 100 >= best_len * 90) {
-      ++matched;
-      ++offsets[uint32_t(best_at * 4)];
-    } else {
-      ++unmatched;
-    }
-    if (named < 12) {
-      ++named;
-      f << "UCODE BEST: shader 0x" << std::hex << handle << std::dec
-        << " blob " << blob.size() << " dwords — best " << best_hits << "/"
-        << best_len << " (" << pct << "%) at blob byte offset 0x" << std::hex
-        << uint32_t(best_at * 4) << " vs ring key 0x" << best_key << std::dec
-        << " (decode " << (best_ok ? "ok" : "FAILED")
-        << "), byteswapped control best " << best_swapped_hits << "\n";
-    }
-  }
-  f.flush();
-  if (scored) {
-    REXLOG_INFO(
-        "d3d9: stageA  mean best agreement across {} blobs: {}% — a shader that "
-        "is present but patched scores high, one that is absent scores low",
-        scored, best_pct_sum / scored);
-  }
-
-  REXLOG_INFO(
-      "d3d9: stageA  shader blobs: {} of {} contained microcode the ring "
-      "loaded, against {} distinct shaders the ring captured ({} blobs "
-      "unreadable)",
-      matched, g_vsBlobs.size(), captured.size(), g_vsBlobUnreadable);
-  if (offsets.empty()) {
-    REXLOG_INFO(
-        "d3d9: stageA  NO blob contained any captured microcode — the blob at "
-        "+0x368 is not raw ucode, and nothing downstream should be built on it");
-  } else {
-    std::string offs;
-    for (const auto& [off, n] : offsets) {
-      char buf[32];
-      std::snprintf(buf, sizeof(buf), "0x%X:%u ", off, n);
-      offs += buf;
-    }
-    REXLOG_INFO("d3d9: stageA  microcode found at blob byte offsets {}", offs);
-  }
-}
 
 //---------------------------------------------------------------------------
 // The declaration-to-vfetch pairing rule, read out of
@@ -4262,11 +3564,8 @@ void ReportCoverage(uint8_t* base) {
     mx::pm4::ReportHleTransform();
   }
 
-  ReportBlobSearch();
-  ReportPhysicalAtDrawTime();
   ReportShaderExecution();
   ReportPatchRule();
-  ReportAddressKeyTest(base);
 
   //-------------------------------------------------------------------------
   // Stage 0 verdict.
@@ -4737,8 +4036,6 @@ extern "C" REX_FUNC(sub_825565C8) {
   const uint32_t device = ctx.r3.u32;
   const uint64_t n = ++g_indexed_draws;
   ++mx::pm4::D3D9DrawCounter();
-  if (REXCVAR_GET(hle_capture))
-    ProbePhysicalAtDrawTime(DeviceState().vertex_shader, base);
   ++mx::pm4::D3D9IndexedDrawCounter();
   NoteDrawDeclaration(ctx.r3.u32, base);
   if (n <= kMaxDrawsLogged) {
@@ -4786,8 +4083,6 @@ extern "C" REX_FUNC(sub_825561B0) {
   const uint32_t device = ctx.r3.u32;
   const uint64_t n = ++g_draws;
   ++mx::pm4::D3D9DrawCounter();
-  if (REXCVAR_GET(hle_capture))
-    ProbePhysicalAtDrawTime(DeviceState().vertex_shader, base);
   NoteDrawDeclaration(ctx.r3.u32, base);
   if (n <= kMaxDrawsLogged) {
     auto& f = DeclFile();
@@ -5032,7 +4327,6 @@ extern "C" REX_FUNC(sub_825508A8) {
   st.vs_seen = true;
   if (REXCVAR_GET(hle_capture)) {
     DumpVertexShaderObject(ctx.r4.u32, base);
-    CollectVertexShaderBlob(ctx.r4.u32, base);
   }
   orig_SetVertexShader(ctx, base);
 }

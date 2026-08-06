@@ -91,6 +91,23 @@ REXCVAR_DEFINE_BOOL(hle_render, true, "Debug",
                     "instead of the PM4 translator's. On by default; pass "
                     "--hle_render=false to fall back to PM4");
 
+// Step 1 of retiring the PM4 translator: does the HLE path still render with
+// the ring translation switched off entirely?
+//
+// The codebase disagrees with itself about whether it can. hooks_frame.cpp
+// calls TranslatePackets "the last route left from a D3D9 shader handle to its
+// microcode", while hooks_d3d9.cpp says the PM4 content match "is never a
+// source for pixels" and prefers CapturePatchedCode's ring-destination copy,
+// taken inside the D3D9 PatchVertexShader hook. Every run reports `live shader
+// resolved 0`, which favours the second, but that is reading and this is
+// measuring. Whichever comment is stale, this cvar is what says so.
+REXCVAR_DEFINE_BOOL(pm4_translate, true, "Debug",
+                    "Translate the PM4 ring into draw calls. Set false to run "
+                    "the HLE path with no PM4 stream at all — under "
+                    "hle_render the translator's draws are discarded anyway, "
+                    "so a collapse in HLE draws means something else in that "
+                    "call was load-bearing");
+
 // Capture only: no PSOs, no uploads, no shader translation, nothing submitted.
 // It gates the per-draw scoring, the coverage report and the dump — including
 // every `hle-render` and `stageF` line, which is why those are absent from a

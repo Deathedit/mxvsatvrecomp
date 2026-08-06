@@ -45,6 +45,7 @@
 
 // Defined in src/app/graphics_system.cpp.
 REXCVAR_DECLARE(bool, hle_render);
+REXCVAR_DECLARE(bool, pm4_translate);
 
 namespace {
 
@@ -259,8 +260,13 @@ extern "C" REX_FUNC(sub_82566B58) {
     // the swap's.
     static mx::pm4::Pm4Translator translator;
     translator.Clear();
-    translator.TranslatePackets(frame_packets, base, 0xBEDA0000);
-    translator.TranslatePackets(swap_packets, base, 0xBEDA0000);
+    // Gated for the retirement measurement — see the pm4_translate cvar. Clear()
+    // still runs, so DrawCalls() is empty rather than stale, and under
+    // hle_render that list is discarded before it reaches the renderer anyway.
+    if (REXCVAR_GET(pm4_translate)) {
+      translator.TranslatePackets(frame_packets, base, 0xBEDA0000);
+      translator.TranslatePackets(swap_packets, base, 0xBEDA0000);
+    }
     auto& draws = translator.DrawCalls();
 
     //-----------------------------------------------------------------------
