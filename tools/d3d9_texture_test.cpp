@@ -1,7 +1,11 @@
 // Standalone tests for the SDK-independent HLE texture payload contract.
-// Build with:
+// Not part of the CMake build; invoke it by hand. The tiling helpers and
+// FormatInfo::Get live in rexruntime, not rexgpu-xenos, and the matching DLL
+// must be on PATH to run:
 //   clang++ -std=c++23 -I src -I C:/rexglue-sdk/include -o d3d9_texture_test.exe \
-//     tools/d3d9_texture_test.cpp src/gpu/d3d9_texture.cpp
+//     tools/d3d9_texture_test.cpp src/gpu/d3d9_texture.cpp \
+//     C:/rexglue-sdk/lib/rexruntime.lib
+//   PATH=C:/rexglue-sdk/bin:$PATH ./d3d9_texture_test.exe
 
 #include "gpu/d3d9_texture.h"
 
@@ -23,7 +27,7 @@ void Check(bool value, const char* what) {
 }
 
 int main() {
-  using namespace mx::pm4;
+  using namespace mx::hle;
   HleTextureSource linear{};
   linear.source_bytes = 16;
   linear.width = 2;
@@ -140,6 +144,61 @@ int main() {
   Check(expanded.host_format == HostTextureFormat::kR16Float &&
             expanded.bytes_per_block == 2,
         "16_EXPAND maps to R16 float storage");
+
+  // The three formats measured live in native runs. k_4_4_4_4 is the front
+  // end's own and was the only format it was ever seen to ask for.
+  fetch16.format = rex::graphics::xenos::TextureFormat::k_4_4_4_4;
+  Check(DescribeHleTexture2D(fetch16Words, expanded, &why),
+        "4_4_4_4 descriptor accepted");
+  Check(expanded.host_format == HostTextureFormat::kBgra4 &&
+            expanded.bytes_per_block == 2,
+        "4_4_4_4 maps to BGRA4 storage");
+  Check(expanded.guest_format ==
+            uint32_t(rex::graphics::xenos::TextureFormat::k_4_4_4_4),
+        "guest format index carried out of the descriptor");
+  fetch16.format = rex::graphics::xenos::TextureFormat::k_8;
+  Check(DescribeHleTexture2D(fetch16Words, expanded, &why) &&
+            expanded.host_format == HostTextureFormat::kR8,
+        "k_8 maps to R8 storage");
+  fetch16.format = rex::graphics::xenos::TextureFormat::k_16;
+  Check(DescribeHleTexture2D(fetch16Words, expanded, &why) &&
+            expanded.host_format == HostTextureFormat::kR16,
+        "k_16 maps to R16 storage");
+
+  // A rejected descriptor must still name its format, or the reject log
+  // cannot say what to add next.
+  fetch16.format = rex::graphics::xenos::TextureFormat::k_10_11_11;
+  Check(!DescribeHleTexture2D(fetch16Words, expanded, &why),
+        "unsupported format still rejected");
+  Check(expanded.guest_format ==
+            uint32_t(rex::graphics::xenos::TextureFormat::k_10_11_11),
+        "rejected descriptor still names its guest format");
+  Check(std::strcmp(GuestTextureFormatName(15), "FMT_4_4_4_4") == 0 &&
+            std::strcmp(GuestTextureFormatName(49), "FMT_DXN") == 0 &&
+            std::strcmp(GuestTextureFormatName(6), "FMT_8_8_8_8") == 0,
+        "guest format names match the guest's own table at 0x82d24378");
+
+  // Regression: SwapBlock's dword loop skipped 2-byte blocks entirely, so
+  // every 16-bit format uploaded byte-reversed.
+  {
+    HleTextureSource narrow{};
+    narrow.source_bytes = 4;
+    narrow.width = 2;
+    narrow.height = 1;
+    narrow.pitch_blocks = 2;
+    narrow.block_width = narrow.block_height = 1;
+    narrow.bytes_per_block = 2;
+    narrow.host_format = HostTextureFormat::kBgra4;
+    narrow.endian = uint32_t(rex::graphics::xenos::Endian::k8in16);
+    const uint8_t src16[4] = {0x12, 0x34, 0x56, 0x78};
+    HleTexturePayload out16;
+    Check(DecodeHleTexture2D(narrow, src16, sizeof(src16), out16, &why),
+          "2-byte block decode");
+    Check(out16.data.size() == 4 && out16.data[0] == 0x34 &&
+              out16.data[1] == 0x12 && out16.data[2] == 0x78 &&
+              out16.data[3] == 0x56,
+          "2-byte blocks are endian-swapped");
+  }
 
   Check(!DecodeHleTexture2D(linear, rgba, sizeof(rgba) - 1, decoded, &why),
         "truncated source rejected");

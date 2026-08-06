@@ -2358,7 +2358,10 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
     if (!mapped_render_target &&
         (source.host_format == mx::hle::HostTextureFormat::kBc5 ||
          source.host_format == mx::hle::HostTextureFormat::kR16Float ||
-         source.host_format == mx::hle::HostTextureFormat::kRgba16Float))
+         source.host_format == mx::hle::HostTextureFormat::kRgba16Float ||
+         source.host_format == mx::hle::HostTextureFormat::kR8 ||
+         source.host_format == mx::hle::HostTextureFormat::kR16 ||
+         source.host_format == mx::hle::HostTextureFormat::kR32Float))
       continue;
     // A mapped render target is authoritative storage, but it is not normally
     // the visible base colour of a material. Multi-input world shaders often
@@ -2375,7 +2378,18 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
       case mx::hle::HostTextureFormat::kBc1:
       case mx::hle::HostTextureFormat::kBc2:
       case mx::hle::HostTextureFormat::kBc3:
+      // k_4_4_4_4 is a four-channel colour format and, in three front-end
+      // runs, the only format the front end asked for at all. It scores with
+      // the other colour assets or it would never win a binding.
+      case mx::hle::HostTextureFormat::kBgra4:
         score += mapped_render_target ? 40 : 200;
+        break;
+      case mx::hle::HostTextureFormat::kR8:
+      case mx::hle::HostTextureFormat::kR16:
+      case mx::hle::HostTextureFormat::kR32Float:
+        // Single-channel; decodable, but not base colour. Same rationale as
+        // the semantic gate in PrepareDrawTexture.
+        score += mapped_render_target ? 10 : 0;
         break;
       case mx::hle::HostTextureFormat::kR16Float:
       case mx::hle::HostTextureFormat::kRgba16Float:
@@ -2584,9 +2598,17 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
   }
   dc.sampled_texture_width = source.width;
   dc.sampled_texture_height = source.height;
+  // kR8 and kR16 join this list on the same reasoning as the others: they are
+  // single-channel, so binding one as visible base colour would paint the
+  // surface grey. They are decoded rather than rejected so the counters can
+  // tell "we cannot read this" apart from "we choose not to show this" — the
+  // distinction the old shared "unsupported" string destroyed.
   if (source.host_format == HostTextureFormat::kBc5 ||
       source.host_format == HostTextureFormat::kR16Float ||
-      source.host_format == HostTextureFormat::kRgba16Float) {
+      source.host_format == HostTextureFormat::kRgba16Float ||
+      source.host_format == HostTextureFormat::kR8 ||
+      source.host_format == HostTextureFormat::kR16 ||
+      source.host_format == HostTextureFormat::kR32Float) {
     ++s_semantic_reject;
     if (s_semantic_reject <= 12) {
       // Named in guest terms as well: this drop is a policy choice about a

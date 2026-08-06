@@ -313,9 +313,43 @@ bool D3D12Renderer::EnsureGameTexture(
     case mx::hle::HostTextureFormat::kRgba16Float:
       format = DXGI_FORMAT_R16G16B16A16_FLOAT;
       break;
+    case mx::hle::HostTextureFormat::kBgra4:
+      format = DXGI_FORMAT_B4G4R4A4_UNORM;
+      break;
+    case mx::hle::HostTextureFormat::kR8:
+      format = DXGI_FORMAT_R8_UNORM;
+      break;
+    case mx::hle::HostTextureFormat::kR16:
+      format = DXGI_FORMAT_R16_UNORM;
+      break;
+    case mx::hle::HostTextureFormat::kR32Float:
+      format = DXGI_FORMAT_R32_FLOAT;
+      break;
   }
   if (format == DXGI_FORMAT_UNKNOWN || !texture->width || !texture->height)
     return false;
+
+  // B4G4R4A4_UNORM is an optional D3D12 format, so support is a question the
+  // driver answers rather than one to assume. Asked once per format and
+  // logged, so an unsupported host produces one clear line instead of an
+  // opaque CreateCommittedResource failure.
+  {
+    static std::map<DXGI_FORMAT, bool> s_supported;
+    auto it = s_supported.find(format);
+    if (it == s_supported.end()) {
+      D3D12_FEATURE_DATA_FORMAT_SUPPORT fs = {};
+      fs.Format = format;
+      const bool ok =
+          SUCCEEDED(m_device->CheckFeatureSupport(
+              D3D12_FEATURE_FORMAT_SUPPORT, &fs, sizeof(fs))) &&
+          (fs.Support1 & D3D12_FORMAT_SUPPORT1_TEXTURE2D) &&
+          (fs.Support1 & D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE);
+      it = s_supported.emplace(format, ok).first;
+      REXLOG_INFO("[D3D12Renderer] texture format {} sample support: {}",
+                  uint32_t(format), ok ? "yes" : "NO — textures dropped");
+    }
+    if (!it->second) return false;
+  }
 
   GameTexture entry;
   D3D12_RESOURCE_DESC td = {};

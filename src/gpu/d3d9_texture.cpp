@@ -14,6 +14,15 @@ namespace xenos = rex::graphics::xenos;
 namespace tu = rex::graphics::texture_util;
 
 void SwapBlock(uint8_t* p, uint32_t bytes, xenos::Endian endian) {
+  // A 2-byte block never entered the dword loop below, so every 16-bit format
+  // was uploaded byte-reversed. That was invisible while k_16_FLOAT was the
+  // only such format and the semantic gate refused to bind it; k_4_4_4_4 and
+  // k_16 are both 2 bytes and both measured live, so it is load-bearing now.
+  if (bytes == 2) {
+    if (endian == xenos::Endian::k8in16 || endian == xenos::Endian::k8in32)
+      std::swap(p[0], p[1]);
+    return;
+  }
   for (uint32_t i = 0; i + 4 <= bytes; i += 4) {
     uint32_t v;
     std::memcpy(&v, p + i, 4);
@@ -126,11 +135,33 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
     case xenos::TextureFormat::k_16_16_16_16_FLOAT:
       out.host_format = HostTextureFormat::kRgba16Float;
       break;
+    // Measured, not assumed. k_4_4_4_4 is the front end's texture format and
+    // the only one it was ever seen to ask for; B4G4R4A4_UNORM is the same bit
+    // layout, so the existing untile-and-swap path carries it unchanged and
+    // the fetch swizzle still resolves component order in the SRV.
+    case xenos::TextureFormat::k_4_4_4_4:
+      out.host_format = HostTextureFormat::kBgra4;
+      break;
+    // Both single-channel, and both seen only in the farm scene.
+    case xenos::TextureFormat::k_8:
+      out.host_format = HostTextureFormat::kR8;
+      break;
+    case xenos::TextureFormat::k_16:
+      out.host_format = HostTextureFormat::kR16;
+      break;
+    case xenos::TextureFormat::k_32_FLOAT:
+      out.host_format = HostTextureFormat::kR32Float;
+      break;
     default:
       return reject("unsupported texture format");
   }
   const auto* fi = rex::graphics::FormatInfo::Get(format);
   if (!fi || !fi->bytes_per_block()) return reject("invalid format metadata");
+  // Both tiling helpers take a bytes_per_block *log2*, so a block size that is
+  // not a power of two (k_32_32_32_FLOAT is 12 bytes) would silently address
+  // every block wrongly. Refuse it instead, so the failure is a log line.
+  if (fi->bytes_per_block() & (fi->bytes_per_block() - 1))
+    return reject("non-power-of-two block size");
 
   out.width = fetch.size_2d.width + 1;
   out.height = fetch.size_2d.height + 1;
