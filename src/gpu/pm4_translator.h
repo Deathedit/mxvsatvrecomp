@@ -597,8 +597,22 @@ class Pm4Translator {
     // draws and 1.5% of vertices, far too little to explain a white screen, so
     // this is where the smear actually comes from.
     kMixedOrigin,
+    // x and y land but z does not. BuildViewportMvp leaves row 3 identity, so
+    // w is always 1, and it only scales z by 1/zs — which every run so far
+    // reports as the zs=1 fallback. A position that arrives untransformed
+    // therefore keeps its raw z, and D3D clips on 0 <= z <= w. RenderDoc frame
+    // 2967 EID 831 is the worked example: SV_POSITION (-0.98, 0.97, 8.235, 1).
+    // Its x/y are comfortably inside, so without this class it scored kPartial
+    // — a clean bill of health for a draw that renders nothing.
+    kDepthClipped,
+    // Never reached the transcode at all: one of TranscodeVertices' early
+    // exits fired and the guest layout was left alone. These keep the guest
+    // stride and the renderer's stride-28 gate drops them, so they reach no
+    // pixels. They were invisible here before, because the classifier runs
+    // after a successful transcode — and they are ~91% of all draws.
+    kNotTranscoded,
   };
-  static constexpr int kDrawClassCount = 4;
+  static constexpr int kDrawClassCount = 6;
   // `verts` is the transcoded buffer: kOutStride bytes per vertex, position in
   // the leading 12. Judged against BuildViewportMvp, the same transform
   // FinalizeDraw will attach to the draw.

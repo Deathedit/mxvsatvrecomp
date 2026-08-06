@@ -54,7 +54,8 @@ REXCVAR_DEFINE_BOOL(alu_execute, false, "Debug",
 // white. The bulk terrain (2.3M vertices) is untouched.
 REXCVAR_DEFINE_BOOL(skip_untransformable_draws, false, "Debug",
                     "Do not submit draws whose transcoded positions come out "
-                    "degenerate, entirely outside the clip volume, or with only "
+                    "degenerate, entirely outside the clip volume, clipped on "
+                    "depth alone, or with only "
                     "some vertices collapsed to the origin. A mitigation, not a "
                     "fix: these draws are wrong and this stops them painting "
                     "over the ones that are right");
@@ -1278,6 +1279,7 @@ Pm4Translator::DrawClass Pm4Translator::ClassifyTransformedDraw(
   bool all_origin = true;
   bool any_origin = false;
   bool any_near = false;
+  bool any_depth = false;
   for (uint32_t v = 0; v < count; ++v) {
     float in[4] = {0, 0, 0, 1};
     std::memcpy(in, verts.data() + size_t(v) * stride, 12);
@@ -1302,6 +1304,14 @@ Pm4Translator::DrawClass Pm4Translator::ClassifyTransformedDraw(
         o[3] != 0.0f) {
       const float lim = std::fabs(o[3]) * 4.0f;
       if (std::fabs(o[0]) <= lim && std::fabs(o[1]) <= lim) any_near = true;
+      // z was computed here all along and thrown away, which is why a draw
+      // clipped purely on depth scored kPartial. Same generosity as x/y, and
+      // deliberately symmetric about zero rather than the true [0, w]: the
+      // question is still "could this draw possibly be right", and D3D9's
+      // z range is not something to be strict about on the evidence of a
+      // transform we already suspect. A vertex only fails this when its z is
+      // more than four times w away from the volume in either direction.
+      if (std::isfinite(o[2]) && std::fabs(o[2]) <= lim) any_depth = true;
     }
   }
 
@@ -1310,6 +1320,11 @@ Pm4Translator::DrawClass Pm4Translator::ClassifyTransformedDraw(
   // does not survive into the transcoded buffer to be tested directly.
   if (all_origin) return DrawClass::kDegenerate;
   if (!any_near) return DrawClass::kOutOfRange;
+  // After out-of-range, which subsumes it: a draw that misses on x and y as
+  // well is better described as wholly out than as a depth problem. What is
+  // left here is the specific case RenderDoc caught — x and y land, z does
+  // not, and the draw is submitted and rasterises nothing.
+  if (!any_depth) return DrawClass::kDepthClipped;
   // Checked last so it only claims draws that would otherwise have passed as
   // ordinary. A draw with some vertices at exactly the origin and some not is
   // a transform that failed for part of its vertices, and it is the shape that
@@ -1328,9 +1343,12 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
   // whether the formats the guess got wrong are the ones the shader disagrees
   // about.
   static std::map<uint32_t, uint32_t> s_exportFormats;
-  // Draw classification, indexed by DrawClass: partial / degenerate / out of
-  // range. Kept beside the transcode counters so one log line says both what
-  // was produced and how much of it could not possibly draw.
+  // Draw classification, indexed by DrawClass. Kept beside the transcode
+  // counters so one log line says both what was produced and how much of it
+  // could not possibly draw. kNotTranscoded is filled by `passthrough` below
+  // rather than by the classifier, which is the only class the classifier
+  // never returns — without it the table described 6% of draws in a loaded
+  // scene and read as if that were the whole population.
   static uint64_t s_class[kDrawClassCount] = {},
                   s_classVerts[kDrawClassCount] = {};
   static std::map<uint32_t, uint32_t> s_classByFormat[kDrawClassCount];
@@ -1338,7 +1356,17 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
 
   // Leave the guest layout and the stride the caller already set alone. The
   // renderer's stride-28 gate then decides, exactly as before this existed.
-  auto passthrough = [&] { ++s_passthrough; };
+  // Also class the draw, so the class table below accounts for every draw
+  // rather than only the 6% that transcode in a loaded scene (--force_load;
+  // without it the front end transcodes fine and this reads 67%). These are
+  // the draws the renderer's stride-28 gate silently drops; leaving them out
+  // of the table made the remaining classes look like the whole population.
+  auto passthrough = [&] {
+    ++s_passthrough;
+    const int ci = int(DrawClass::kNotTranscoded);
+    ++s_class[ci];
+    s_classVerts[ci] += dc.vertex_count;
+  };
   (void)fetch;
 
   if (!REXCVAR_GET(vertex_transcode)) { passthrough(); return; }
@@ -1601,25 +1629,35 @@ void Pm4Translator::TranscodeVertices(DrawCall& dc, const VertexFetch& fetch) {
       oof += fmt::format("{}:{} ", f, n);
     for (const auto& [f, n] : s_classByFormat[int(DrawClass::kMixedOrigin)])
       mxf += fmt::format("{}:{} ", f, n);
+    std::string dcf;
+    for (const auto& [f, n] : s_classByFormat[int(DrawClass::kDepthClipped)])
+      dcf += fmt::format("{}:{} ", f, n);
     uint64_t tot = 0, vtot = 0;
     for (int i = 0; i < kDrawClassCount; ++i) { tot += s_class[i]; vtot += s_classVerts[i]; }
-    const uint64_t bad = s_class[1] + s_class[2] + s_class[3];
-    const uint64_t badv = s_classVerts[1] + s_classVerts[2] + s_classVerts[3];
+    // Everything except kPartial. Summed over the enum rather than a hand-
+    // written list, so adding a class cannot quietly leave it out of the
+    // percentage the way kDepthClipped would have been.
+    uint64_t bad = 0, badv = 0;
+    for (int i = 1; i < kDrawClassCount; ++i) { bad += s_class[i]; badv += s_classVerts[i]; }
     REXLOG_INFO("transcode class: partial {} ({} vtx) | degenerate {} ({} vtx) "
                 "by format {}| out-of-range {} ({} vtx) by format {}| "
-                "mixed-origin {} ({} vtx) by format {}— {:.1f}% of draws and "
-                "{:.1f}% of vertices could not draw correctly",
+                "mixed-origin {} ({} vtx) by format {}| depth-clipped {} ({} "
+                "vtx) by format {}| not-transcoded {} ({} vtx) — {:.1f}% of "
+                "draws and {:.1f}% of vertices could not draw correctly",
                 s_class[0], s_classVerts[0], s_class[1], s_classVerts[1],
                 dgf.empty() ? "none " : dgf, s_class[2], s_classVerts[2],
                 oof.empty() ? "none " : oof, s_class[3], s_classVerts[3],
-                mxf.empty() ? "none " : mxf,
+                mxf.empty() ? "none " : mxf, s_class[4], s_classVerts[4],
+                dcf.empty() ? "none " : dcf, s_class[5], s_classVerts[5],
                 tot ? 100.0 * double(bad) / double(tot) : 0.0,
                 vtot ? 100.0 * double(badv) / double(vtot) : 0.0);
     REXLOG_INFO("transcode skip: {} (degenerate {} out-of-range {} "
-                "mixed-origin {}) — mitigation only, these draws are still "
-                "wrong and are merely not drawn",
-                s_skippedClass[1] + s_skippedClass[2] + s_skippedClass[3],
-                s_skippedClass[1], s_skippedClass[2], s_skippedClass[3]);
+                "mixed-origin {} depth-clipped {}) — mitigation only, these "
+                "draws are still wrong and are merely not drawn",
+                s_skippedClass[1] + s_skippedClass[2] + s_skippedClass[3] +
+                    s_skippedClass[4],
+                s_skippedClass[1], s_skippedClass[2], s_skippedClass[3],
+                s_skippedClass[4]);
   }
 }
 
