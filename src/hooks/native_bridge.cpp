@@ -49,12 +49,12 @@ void NativeGraphics::EndFrame() {
   m_renderer->EndFrame();
 }
 
-void NativeGraphics::SetDrawCalls(const std::vector<mx::pm4::DrawCall>& calls) {
+void NativeGraphics::SetDrawCalls(const std::vector<mx::hle::DrawCall>& calls) {
   std::lock_guard<std::mutex> lock(m_drawMutex);
   m_drawCalls = calls;
 }
 
-std::vector<mx::pm4::DrawCall> NativeGraphics::GetDrawCalls() {
+std::vector<mx::hle::DrawCall> NativeGraphics::GetDrawCalls() {
   std::lock_guard<std::mutex> lock(m_drawMutex);
   return std::move(m_drawCalls);
 }

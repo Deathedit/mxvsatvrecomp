@@ -17,24 +17,24 @@
 
 #include "gfx/d3d12_internal.h"
 #include "gfx/d3d12_shaders.h"
-#include "gpu/pm4_translator.h"
+#include "gpu/hle_types.h"
 
 #include <cstring>
 #include <algorithm>
 #include <unordered_set>
 #include <utility>
 
-// mx::pm4::HostTopology carries D3D_PRIMITIVE_TOPOLOGY values so the translator
+// mx::hle::HostTopology carries D3D_PRIMITIVE_TOPOLOGY values so the translator
 // need not include <d3dcommon.h>. That only holds while these agree.
-static_assert(static_cast<int>(mx::pm4::HostTopology::kPointList) ==
+static_assert(static_cast<int>(mx::hle::HostTopology::kPointList) ==
                   D3D_PRIMITIVE_TOPOLOGY_POINTLIST &&
-              static_cast<int>(mx::pm4::HostTopology::kLineList) ==
+              static_cast<int>(mx::hle::HostTopology::kLineList) ==
                   D3D_PRIMITIVE_TOPOLOGY_LINELIST &&
-              static_cast<int>(mx::pm4::HostTopology::kLineStrip) ==
+              static_cast<int>(mx::hle::HostTopology::kLineStrip) ==
                   D3D_PRIMITIVE_TOPOLOGY_LINESTRIP &&
-              static_cast<int>(mx::pm4::HostTopology::kTriangleList) ==
+              static_cast<int>(mx::hle::HostTopology::kTriangleList) ==
                   D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST &&
-              static_cast<int>(mx::pm4::HostTopology::kTriangleStrip) ==
+              static_cast<int>(mx::hle::HostTopology::kTriangleStrip) ==
                   D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
               "HostTopology has drifted from D3D_PRIMITIVE_TOPOLOGY");
 
@@ -274,7 +274,7 @@ bool D3D12Renderer::CreateGamePipeline() {
 }
 
 bool D3D12Renderer::EnsureGameTexture(
-    const std::shared_ptr<const mx::pm4::HleTexturePayload>& texture,
+    const std::shared_ptr<const mx::hle::HleTexturePayload>& texture,
     uint32_t& descriptorIndex) {
   if (!texture || texture->data.empty() || !m_gameSrvHeap) return false;
   if (auto it = m_gameTextures.find(texture->key); it != m_gameTextures.end()) {
@@ -292,25 +292,25 @@ bool D3D12Renderer::EnsureGameTexture(
 
   DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
   switch (texture->format) {
-    case mx::pm4::HostTextureFormat::kRgba8:
+    case mx::hle::HostTextureFormat::kRgba8:
       format = DXGI_FORMAT_R8G8B8A8_UNORM;
       break;
-    case mx::pm4::HostTextureFormat::kBc1:
+    case mx::hle::HostTextureFormat::kBc1:
       format = DXGI_FORMAT_BC1_UNORM;
       break;
-    case mx::pm4::HostTextureFormat::kBc2:
+    case mx::hle::HostTextureFormat::kBc2:
       format = DXGI_FORMAT_BC2_UNORM;
       break;
-    case mx::pm4::HostTextureFormat::kBc3:
+    case mx::hle::HostTextureFormat::kBc3:
       format = DXGI_FORMAT_BC3_UNORM;
       break;
-    case mx::pm4::HostTextureFormat::kBc5:
+    case mx::hle::HostTextureFormat::kBc5:
       format = DXGI_FORMAT_BC5_UNORM;
       break;
-    case mx::pm4::HostTextureFormat::kR16Float:
+    case mx::hle::HostTextureFormat::kR16Float:
       format = DXGI_FORMAT_R16_FLOAT;
       break;
-    case mx::pm4::HostTextureFormat::kRgba16Float:
+    case mx::hle::HostTextureFormat::kRgba16Float:
       format = DXGI_FORMAT_R16G16B16A16_FLOAT;
       break;
   }
@@ -681,7 +681,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t idxCount, const float* mvp,
                                  uint32_t topology, bool depthEnable,
                                  bool depthWrite, bool colorWrite,
-                                 std::shared_ptr<const mx::pm4::HleTexturePayload> texture,
+                                 std::shared_ptr<const mx::hle::HleTexturePayload> texture,
                                  uint32_t targetObject, uint32_t targetWidth,
                                  uint32_t targetHeight,
                                  uint32_t sampledTargetObject) {

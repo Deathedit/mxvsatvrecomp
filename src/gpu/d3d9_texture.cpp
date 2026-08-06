@@ -8,7 +8,7 @@
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/xenos.h>
 
-namespace mx::pm4 {
+namespace mx::hle {
 namespace {
 namespace xenos = rex::graphics::xenos;
 namespace tu = rex::graphics::texture_util;
@@ -178,4 +178,4 @@ bool DecodeHleTexture2D(const HleTextureSource& source,
   return true;
 }
 
-}  // namespace mx::pm4
+}  // namespace mx::hle

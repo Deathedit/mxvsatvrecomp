@@ -25,7 +25,7 @@
 
 #include <dxgiformat.h>
 
-namespace mx::pm4 {
+namespace mx::hle {
 
 constexpr uint32_t kHostVertexStride = 36;  // float3 position + float4 colour + float2 UV
 
@@ -228,4 +228,4 @@ bool ReadHleElement(const uint8_t* vertex_base, uint32_t vertex_bytes,
                     const HleInputElement& element, uint32_t endian,
                     float out[4]);
 
-}  // namespace mx::pm4
+}  // namespace mx::hle

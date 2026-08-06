@@ -20,7 +20,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace mx::pm4 {
+namespace mx::hle {
 
 // One attribute a vertex shader fetches. Raw values throughout; `format` is the
 // 6-bit xenos::VertexFormat value rather than the enum so this header stays
@@ -208,4 +208,4 @@ const VertexAttribute* PickPositionAttribute(
 const VertexAttribute* PickColorAttribute(
     const std::vector<VertexAttribute>& attrs);
 
-}  // namespace mx::pm4
+}  // namespace mx::hle

@@ -11,7 +11,7 @@
 
 #include "gpu/shader_ucode.h"   // ApplyFetchEndian
 
-namespace mx::pm4 {
+namespace mx::hle {
 
 const char* HleSkipName(HleSkip s) {
   switch (s) {
@@ -84,7 +84,7 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
       in.prim_type == uint32_t(PrimitiveType::kRectangleList);
   const bool expand_quads = in.prim_type == uint32_t(PrimitiveType::kQuadList);
 
-  const HostTopology topo = Pm4Translator::MapTopology(in.prim_type);
+  const HostTopology topo = MapTopology(in.prim_type);
   if (topo == HostTopology::kUndefined && !expand_rects && !expand_quads) {
     skip = HleSkip::kBadTopology;
     return false;
@@ -261,12 +261,12 @@ bool FinalizeHleTopology(DrawCall& draw, HleSkip& skip) {
   skip = HleSkip::kNone;
   const auto prim = static_cast<PrimitiveType>(draw.prim_type);
   if (prim == PrimitiveType::kRectangleList) {
-    if (Pm4Translator::ExpandRectangleList(draw) == 0) {
+    if (ExpandRectangleList(draw) == 0) {
       skip = HleSkip::kBadTopology;
       return false;
     }
   } else if (prim == PrimitiveType::kQuadList) {
-    if (Pm4Translator::ExpandQuadList(draw) == 0) {
+    if (ExpandQuadList(draw) == 0) {
       skip = HleSkip::kBadTopology;
       return false;
     }
@@ -566,4 +566,4 @@ void ReportHleTransform() {
   }
 }
 
-}  // namespace mx::pm4
+}  // namespace mx::hle

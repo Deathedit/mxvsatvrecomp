@@ -13,7 +13,7 @@
 // an unbounded read by accident. Every range is bounded by the buffer size the
 // hook recorded from the object D3D9 itself read.
 //
-// The output is the existing mx::pm4::DrawCall, so the whole downstream path —
+// The output is the existing mx::hle::DrawCall, so the whole downstream path —
 // NativeGraphics::SetDrawCalls, the render thread's filter loop, AddGameDraw —
 // is reused unchanged and no gfx code moves.
 
@@ -21,9 +21,9 @@
 
 #include "gpu/d3d9_layout.h"
 #include "gpu/d3d9_state.h"
-#include "gpu/pm4_translator.h"
+#include "gpu/hle_types.h"
 
-namespace mx::pm4 {
+namespace mx::hle {
 
 // One bound stream, already resolved to a host pointer by the caller.
 struct HleStream {
@@ -163,4 +163,4 @@ void ScoreHleTransform(const DrawCall& dc, const float* consts,
 // that merely beats nothing is visible as such.
 void ReportHleTransform();
 
-}  // namespace mx::pm4
+}  // namespace mx::hle

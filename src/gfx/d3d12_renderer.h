@@ -22,7 +22,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace mx::pm4 { struct HleTexturePayload; }
+namespace mx::hle { struct HleTexturePayload; }
 
 class D3D12Renderer {
  public:
@@ -45,7 +45,7 @@ void UploadVideoFrame(const uint8_t* rgba, uint32_t width, uint32_t height);
 // Append one translated draw to this frame's list. `mvp` is the 16-float
 // row-major transform the PM4 translator recovered (DrawCall::mvp); pass
 // nullptr to fall back to the identity placeholder. `topology` is a
-// D3D_PRIMITIVE_TOPOLOGY value, matching mx::pm4::HostTopology.
+// D3D_PRIMITIVE_TOPOLOGY value, matching mx::hle::HostTopology.
 //
 // This replaced SetGameDrawData, which held exactly one draw — so however many
 // draws a frame translated, at most one could ever be submitted.
@@ -53,7 +53,7 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  const uint8_t* indices, uint32_t idxBytes, bool idx16,
                  uint32_t idxCount, const float* mvp, uint32_t topology,
                  bool depthEnable, bool depthWrite, bool colorWrite,
-                 std::shared_ptr<const mx::pm4::HleTexturePayload> texture = {},
+                 std::shared_ptr<const mx::hle::HleTexturePayload> texture = {},
                  uint32_t targetObject = 0, uint32_t targetWidth = 0,
                  uint32_t targetHeight = 0,
                  uint32_t sampledTargetObject = 0);
@@ -106,7 +106,7 @@ void ClearGameDraws();
 
   bool CreateGamePipeline();
   bool CreateGameRenderTargets();
-  bool EnsureGameTexture(const std::shared_ptr<const mx::pm4::HleTexturePayload>& texture,
+  bool EnsureGameTexture(const std::shared_ptr<const mx::hle::HleTexturePayload>& texture,
                          uint32_t& descriptorIndex);
   struct GameRenderTarget;
   GameRenderTarget* EnsureGameRenderTarget(uint32_t object, uint32_t width,
@@ -190,7 +190,7 @@ void ClearGameDraws();
     bool depthEnable = false;
     bool depthWrite = false;
     bool colorWrite = true;
-    std::shared_ptr<const mx::pm4::HleTexturePayload> texture;
+    std::shared_ptr<const mx::hle::HleTexturePayload> texture;
     uint32_t targetObject = 0;
     uint32_t targetWidth = 0;
     uint32_t targetHeight = 0;

@@ -24,7 +24,7 @@
 
 #include <cstdint>
 
-namespace mx::pm4 {
+namespace mx::hle {
 
 constexpr uint32_t kMaxStreams  = 4;
 constexpr uint32_t kMaxSamplers = 16;
@@ -291,4 +291,4 @@ uint64_t& D3D9IndexedDrawCounter();
 uint64_t& D3D9FrameCount();
 uint64_t& D3D9FrameNanos();
 
-}  // namespace mx::pm4
+}  // namespace mx::hle

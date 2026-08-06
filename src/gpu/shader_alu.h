@@ -23,7 +23,7 @@
 
 #include "gpu/shader_ucode.h"
 
-namespace mx::pm4 {
+namespace mx::hle {
 
 // Why a shader could not be executed. Anything but kOk means the caller should
 // count the gap rather than use the result.
@@ -100,4 +100,4 @@ AluResult ExecuteVertexShader(const uint32_t* dwords, uint32_t dword_count,
                               const std::vector<std::array<float, 4>>& attr_values,
                               const AluInputs& inputs);
 
-}  // namespace mx::pm4
+}  // namespace mx::hle

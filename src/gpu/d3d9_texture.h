@@ -3,9 +3,9 @@
 #include <cstddef>
 #include <cstdint>
 
-#include "gpu/pm4_translator.h"
+#include "gpu/hle_types.h"
 
-namespace mx::pm4 {
+namespace mx::hle {
 
 struct HleTextureSource {
   uint32_t address = 0;
@@ -38,4 +38,4 @@ uint64_t HleTextureKey(const uint32_t fetch_words[6]);
 bool HleTextureHasNonzeroData(const HleTexturePayload& texture,
                               size_t* nonzero_bytes = nullptr);
 
-}  // namespace mx::pm4
+}  // namespace mx::hle

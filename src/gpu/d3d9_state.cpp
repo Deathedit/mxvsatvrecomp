@@ -1,6 +1,6 @@
 #include "gpu/d3d9_state.h"
 
-namespace mx::pm4 {
+namespace mx::hle {
 
 D3D9DeviceState& DeviceState() {
   static D3D9DeviceState s;
@@ -59,4 +59,4 @@ uint64_t& D3D9FrameNanos() {
   return n;
 }
 
-}  // namespace mx::pm4
+}  // namespace mx::hle

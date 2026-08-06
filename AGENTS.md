@@ -62,16 +62,17 @@ in at the repo root.
 process exits immediately with code 1 and writes no useful log. Each run appends
 a new `logs/mx_NNN.log`.
 
-**`hle_render` is ON by default since 2026-08-06** and no longer needs a flag.
-It is the path that carries the game: 10.67M vertices in a loaded scene against
-the PM4 transcode's 15k. Pass `--hle_render=false` to fall back to PM4.
+**HLE is the only render path since 2026-08-06.** `hle_render` and
+`pm4_translate` were cvars for one week and are now gone with the translator
+they selected between — there is no PM4 fallback to pass a flag for. The D3D9
+description is the sole source of draws.
 
 The old run line here also carried `--hle_shader_exec=1` under the claim that
 **"the HLE render path does nothing without it". That was wrong.**
 `hle_shader_exec` gates only a sampled measurement, and its one use sits behind
 `hle_capture`, so passing it without `--hle_capture=true` does nothing at all —
 which is how three verification runs came to be missing every `hle-render` and
-`stageF` line. Rendering is gated on `hle_render` alone
+`stageF` line. Rendering is unconditional
 (`BuildAndQueueDraw` -> `ApplyShaderOutputs`, `hooks_d3d9.cpp:976`). Add
 `--hle_capture=true --hle_shader_exec=1` when you want the diagnostics, and
 expect them to cost.
@@ -88,12 +89,15 @@ run shorter than ~2½ minutes never reaches it; ~400s gives a usable sample.
 `mx.toml` or `--flag=value`. Defined in `src/app/graphics_system.cpp` and
 `src/hooks/hooks_d3d9.cpp`:
 
-`alu_execute`, `clear_magenta`, `force_load`, `hide_colored_draws`,
-`hide_colorless_draws`, `hle_capture`, `hle_main_viewport_only`, `hle_render`,
-`hle_shader_exec`, `hle_shader_verts`, `main_surface_only`, `registry_override`,
-`skip_intro`, `skip_untransformable_draws`, `tint_by_color_source`,
+`clear_magenta`, `d3d9_hooks_passthrough`, `d3d9_page_cache_verify`,
+`force_load`, `hide_colored_draws`, `hide_colorless_draws`, `hle_capture`,
+`hle_main_viewport_only`, `hle_shader_exec`, `hle_shader_verts`,
+`registry_override`, `skip_intro`.
+
+Seven more (`alu_execute`, `skip_untransformable_draws`, `tint_by_color_source`,
 `transcode_confirmed_formats_only`, `transcode_trust_export`,
-`vertex_transcode`, `vfetch_use_shader_slot`.
+`vertex_transcode`, `vfetch_use_shader_slot`) were defined in the PM4 translator
+and went with it, as did `hle_render`, `pm4_translate` and `main_surface_only`.
 
 `force_load` and `registry_override` are **diagnostic levers, not fixes** — see
 "Why there is no menu" below.
@@ -119,7 +123,7 @@ name their layer: `#include "gpu/pm4_parser.h"`.
 | `src/gfx/d3d12_game.cpp` | Game pipeline, per-frame draw list, game RT + depth, HLE offscreen targets, compositor |
 | `src/gfx/bink_player.*` | FFmpeg Bink video + audio |
 | `src/gpu/pm4_parser.*` | PM4 command buffer parser (Type-0/2/3, ring wrap, dump) |
-| `src/gpu/pm4_translator.*` | PM4 → `DrawCall`; shadows fetch constants and context registers |
+| `src/gpu/hle_types.*` | Shared HLE data model (`DrawCall`, textures, topology) + the two primitive expansions |
 | `src/gpu/xenos_gpu_state.*` | Xenos register shadow, snapshot/diff |
 | `src/gpu/d3d9_layout.*` | Guest `D3DVERTEXELEMENT9` array → host input layout |
 | `src/gpu/d3d9_draw.*` | HLE draw assembly from bound streams |
@@ -275,8 +279,8 @@ of the actual blocker. Whatever native mode is missing, plugin mode has it.
 `hooks_d3d9.cpp` is the native renderer, but until 2026-08-06 all 14 of its
 hooks ran in **both** modes — the only hooks file without `g_plugin_mode`
 guards (`hooks_boot.cpp` 9/9, `hooks_frame.cpp` 8/8, `hooks_gameloop.cpp` 2/2).
-`hle_render` and `hle_shader_exec` default off, so the transcode and CPU-shader
-paths were not running; the per-draw bookkeeping alone was enough, at ~1,480
+`hle_render` and `hle_shader_exec` defaulted off then, so the transcode and
+CPU-shader paths were not running; the per-draw bookkeeping alone was enough, at ~1,480
 draws a frame in a Debug build.
 
 Measured cost: plugin-mode `MainLoop` fell from **~17.6/s** (2026-08-03, before

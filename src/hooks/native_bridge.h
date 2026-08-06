@@ -13,7 +13,7 @@
 #include <rex/logging.h>
 
 #include "gfx/d3d12_renderer.h"
-#include "gpu/pm4_translator.h"
+#include "gpu/hle_types.h"
 
 namespace mx::native {
 
@@ -42,8 +42,8 @@ class NativeGraphics {
   uint8_t* GetGuestMemory() const { return m_guest_base; }
   D3D12Renderer* GetRenderer() const { return m_renderer; }
 
-  void SetDrawCalls(const std::vector<mx::pm4::DrawCall>& calls);
-  std::vector<mx::pm4::DrawCall> GetDrawCalls();
+  void SetDrawCalls(const std::vector<mx::hle::DrawCall>& calls);
+  std::vector<mx::hle::DrawCall> GetDrawCalls();
   void ClearDrawCalls();
 
  private:
@@ -52,7 +52,7 @@ class NativeGraphics {
   uint8_t* m_guest_base = nullptr;
 
   std::mutex m_drawMutex;
-  std::vector<mx::pm4::DrawCall> m_drawCalls;
+  std::vector<mx::hle::DrawCall> m_drawCalls;
 };
 
 }  // namespace mx::native

@@ -1,10 +1,11 @@
 // Frame-lifecycle hooks.
 //
-// VdSwap is the interesting one: it is where the guest's PM4 command ring is
-// parsed, applied to the Xenos register shadow, and translated into draw calls
-// for the D3D12 renderer. The rest are the guest's Begin/End frame entry
-// points, which the native path stubs out because there is no Xenos GPU behind
-// them.
+// VdSwap is the interesting one: it is the frame boundary. The guest's PM4
+// command ring is still parsed and applied to the Xenos register shadow here,
+// but purely as diagnostics — the translation to draw calls is gone, and the
+// frame's draws now come from the D3D9 HLE path. The rest are the guest's
+// Begin/End frame entry points, which the native path stubs out because there
+// is no Xenos GPU behind them.
 //
 // Two ranges, and the distinction matters more than anything else in this file:
 //
@@ -43,16 +44,11 @@
 // state we need. Only the name was wrong.
 //=============================================================================
 
-// Defined in src/app/graphics_system.cpp.
-REXCVAR_DECLARE(bool, hle_render);
-REXCVAR_DECLARE(bool, pm4_translate);
-
 namespace {
 
 // Type3 opcode histogram for a parsed range. This is what says whether draws
 // are inline (0x22/0x34/0x35/0x36), hidden behind INDIRECT_BUFFER (0x3F/0x37),
-// or simply absent — the translator ignores IB dispatches today, so a range
-// full of them would read as "no draws" without this.
+// or simply absent. Diagnostic only now that nothing translates the ring.
 void LogOpcodeHistogram(const char* tag, const char* range, int swap_count,
                         const std::vector<mx::pm4::Pm4Packet>& packets) {
   uint32_t counts[128] = {};
@@ -106,8 +102,8 @@ extern "C" REX_FUNC(sub_82566B58) {
     static std::chrono::steady_clock::time_point s_last{};
     const auto now = std::chrono::steady_clock::now();
     if (s_last.time_since_epoch().count() != 0) {
-      ++mx::pm4::D3D9FrameCount();
-      mx::pm4::D3D9FrameNanos() +=
+      ++mx::hle::D3D9FrameCount();
+      mx::hle::D3D9FrameNanos() +=
           uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                        now - s_last)
                        .count());
@@ -255,19 +251,11 @@ extern "C" REX_FUNC(sub_82566B58) {
       REXLOG_INFO("{}: ApplyPackets done, {} regs", tag, gpu_state.Registers().size());
     }
 
-    // One translator, both ranges, frame first — that is the order the guest
-    // wrote them, and state-setting packets in the frame must be seen before
-    // the swap's.
-    static mx::pm4::Pm4Translator translator;
-    translator.Clear();
-    // Gated for the retirement measurement — see the pm4_translate cvar. Clear()
-    // still runs, so DrawCalls() is empty rather than stale, and under
-    // hle_render that list is discarded before it reaches the renderer anyway.
-    if (REXCVAR_GET(pm4_translate)) {
-      translator.TranslatePackets(frame_packets, base, 0xBEDA0000);
-      translator.TranslatePackets(swap_packets, base, 0xBEDA0000);
-    }
-    auto& draws = translator.DrawCalls();
+    // The PM4 translator used to run here, building draws from the ring. It is
+    // gone: the ring reached ~15k vertices a frame and left 99.9% of them
+    // untranscoded, while the D3D9 HLE path carries 27.4M. The packets are
+    // still parsed above, but only as diagnostics — nothing downstream of this
+    // point consumes them to produce pixels.
 
     //-----------------------------------------------------------------------
     // Does the ring carry the same number of draws D3D9 was asked for?
@@ -313,8 +301,8 @@ extern "C" REX_FUNC(sub_82566B58) {
       const uint64_t ring = op[0] + op[1] + op[2] + op[3];
 
       static uint64_t s_lastD3d9 = 0, s_lastIndexed = 0;
-      const uint64_t now = mx::pm4::D3D9DrawCounter();
-      const uint64_t now_idx = mx::pm4::D3D9IndexedDrawCounter();
+      const uint64_t now = mx::hle::D3D9DrawCounter();
+      const uint64_t now_idx = mx::hle::D3D9IndexedDrawCounter();
       const uint64_t d3d9 = now - s_lastD3d9;
       const uint64_t d3d9_idx = now_idx - s_lastIndexed;
       s_lastD3d9 = now;
@@ -350,40 +338,30 @@ extern "C" REX_FUNC(sub_82566B58) {
       }
     }
 
-    // The first swap that produces a draw is the whole point of this round, so
-    // it is logged unconditionally however sparse the schedule is.
-    static bool s_loggedFirstDraw = false;
-    if (!draws.empty() && !s_loggedFirstDraw) {
-      s_loggedFirstDraw = true;
-      REXLOG_INFO("{}: FIRST DRAWS at swap #{} — {} draw calls "
-                  "(frame {} packets, swap {} packets)",
-                  tag, swap_count, draws.size(), frame_packets.size(),
-                  swap_packets.size());
-      LogOpcodeHistogram(tag, "frame", swap_count, frame_packets);
-    }
     if (log_this_swap) {
-      REXLOG_INFO("{}: PM4 #{}: frame {} packets, swap {} packets, {} draw calls",
-                  tag, swap_count, frame_packets.size(), swap_packets.size(),
-                  draws.size());
+      REXLOG_INFO("{}: PM4 #{}: frame {} packets, swap {} packets",
+                  tag, swap_count, frame_packets.size(), swap_packets.size());
     }
 
     // Always propagate, even when empty: empty list clears the renderer's stale
     // draw data so frames without a VdSwap don't replay the last captured draws.
     if (!is_plugin) {
-      // hle_render selects the *source* of the frame's draws, not an extra
-      // one. Both paths publish through the same handoff, so letting both run
-      // would make whichever finished last win at random.
-      if (REXCVAR_GET(hle_render)) {
-        // D3D9 draw entry points precede the PM4 IM_LOAD packets that expose
-        // the patched shader for this frame. Retry only those same-frame draws
-        // now that TranslatePackets has populated CapturedShaders().
-        FinalizePendingD3D9Draws(base);
-        auto& hle = mx::pm4::HleFrameDraws();
-        mx::native::NativeGraphics::Get().SetDrawCalls(hle);
-        hle.clear();
-      } else {
-        mx::native::NativeGraphics::Get().SetDrawCalls(draws);
-      }
+      // Drains draws parked with ShaderApplyResult::kNoCode. This used to be
+      // the retry that mattered: TranslatePackets had just populated
+      // CapturedShaders() from the ring, so a draw that preceded its shader's
+      // IM_LOAD could be resolved here. That route is gone, and the code now
+      // comes from CapturePatchedCode inside the PatchVertexShader hook, which
+      // runs before the draw it patches.
+      //
+      // Kept as a drain, not as a working retry: `skipped no-code` reads 0 and
+      // the deferred-draw line never prints across mx_434-436, so the queue is
+      // empty every time. It stays because kNoCode is still reachable and a
+      // parked draw with nothing to drain it would leak, not because it is
+      // known to recover anything.
+      FinalizePendingD3D9Draws(base);
+      auto& hle = mx::hle::HleFrameDraws();
+      mx::native::NativeGraphics::Get().SetDrawCalls(hle);
+      hle.clear();
     }
   }
 

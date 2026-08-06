@@ -4,7 +4,7 @@
 // is the one the PM4 path has been using all along.
 #include "gpu/shader_ucode.h"
 
-namespace mx::pm4 {
+namespace mx::hle {
 namespace {
 
 //---------------------------------------------------------------------------
@@ -333,4 +333,4 @@ bool ReadHleElement(const uint8_t* vertex_base, uint32_t vertex_bytes,
   return true;
 }
 
-}  // namespace mx::pm4
+}  // namespace mx::hle

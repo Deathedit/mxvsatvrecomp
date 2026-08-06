@@ -7,7 +7,7 @@
 
 namespace uc = rex::graphics::ucode;
 
-namespace mx::pm4 {
+namespace mx::hle {
 
 const char* AluStatusName(AluStatus s) {
   switch (s) {
@@ -606,4 +606,4 @@ AluResult ExecuteVertexShader(
   return finish();
 }
 
-}  // namespace mx::pm4
+}  // namespace mx::hle

@@ -30,7 +30,7 @@ set(MX_SOURCES
 
     # gpu — Xenos PM4 parse / translate / register shadow
     src/gpu/pm4_parser.cpp
-    src/gpu/pm4_translator.cpp
+    src/gpu/hle_types.cpp
     src/gpu/shader_ucode.cpp
     src/gpu/shader_alu.cpp
     src/gpu/xenos_gpu_state.cpp

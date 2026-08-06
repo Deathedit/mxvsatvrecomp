@@ -13,33 +13,15 @@
 #include <vector>
 
 #include "gfx/bink_player.h"
-#include "gpu/pm4_translator.h"
+#include "gpu/hle_types.h"
 #include "gpu/d3d9_layout.h"
 #include "hooks/native_bridge.h"
 
 // The one vertex stride the game PSO's input layout actually describes —
 // POSITION float3 at offset 0 plus COLOR float4 at offset 12. See the gate in
 // RenderThreadFunc.
-static constexpr uint32_t kSupportedStride = mx::pm4::kHostVertexStride;
+static constexpr uint32_t kSupportedStride = mx::hle::kHostVertexStride;
 
-// RB_SURFACE_INFO pitch of the guest's main scene target, matching the 1280x720
-// output. A frame also renders into ~15 other colour surfaces at pitches 0, 80,
-// 160, 320, 400, 640, 800 and 2609; with one host render target those all
-// overpaint each other. See the gate in RenderThreadFunc.
-static constexpr uint32_t kMainSurfacePitch = 1280;
-
-// Default OFF — this was tried at true and made things worse, measurably.
-// Gating on pitch 1280 dropped submitted draws from 85-89/frame to 5, because
-// the stride-28 draws we can actually render mostly do NOT live on the
-// pitch-1280 surface; the 62884 draws counted there are overwhelmingly strides
-// we reject anyway. It also destabilised the run: 2 of 4 gated runs took an
-// access violation on the translator thread during load, against 0 of 4
-// ungated, most likely because a render thread doing 5 draws instead of 85
-// spins far faster and shifts the timing of a known race.
-//
-// Kept, off, because the mechanism is right and the selector is wrong: the fix
-// is to honour the surface binding (render passes to separate targets, present
-// the one the guest swaps), not to guess one surface by pitch.
 // Two halves of one diagnostic: show the frame without the overpaint, and show
 // the overpaint by itself.
 //
@@ -65,48 +47,18 @@ REXCVAR_DEFINE_BOOL(hide_colored_draws, false, "Debug",
                     "the colourless ones remain. A diagnostic: it shows the "
                     "shape of the overpaint on its own, not a fix");
 
-// The D3D9 -> D3D12 high-level path, step one: describe every draw from the
-// API calls that produced it instead of reconstructing it from PM4.
+// The D3D9 -> D3D12 path describes every draw from the API calls that produced
+// it, rather than reconstructing it from the PM4 ring.
 //
-// The "capture only, changes nothing submitted to D3D12" note that used to sit
-// here described hle_capture, not this cvar, and became actively wrong when
-// this one started submitting. It now lives on hle_capture below, where it is
-// true. The state shadow behind both fills unconditionally — state set before
-// the first draw would otherwise read as unknown.
+// hle_render and pm4_translate were the cvars that selected between the two
+// sources. Both are gone with the translator (2026-08-06): the D3D9 description
+// is the only source of draws, so there is nothing to select and no fallback.
 //
-// ON BY DEFAULT since 2026-08-06. The condition set above — "until this is
-// proven" — is met by volume: in a loaded scene (--force_load=NAT_Farm) this
-// path applies 37018 draws / 10671287 vertices, while the PM4 transcode reaches
-// 15k vertices and leaves 99.9% of the rest in kNotTranscoded because
-// PickPositionAttribute finds no position. PM4 is not the path that carries the
-// game; keeping it as the default only meant every real run needed a flag.
-//
-// This selects the *source* of a frame's draws, not an extra one
-// (hooks_frame.cpp). PM4 still translates every frame either way — the HLE
-// path depends on it for the patched shader microcode that arrives in the
-// IM_LOAD packets after the D3D9 draw entry points have already run.
-REXCVAR_DEFINE_BOOL(hle_render, true, "Debug",
-                    "Build draws from the D3D9 description — declaration, "
-                    "stream bindings and index buffer — and submit those "
-                    "instead of the PM4 translator's. On by default; pass "
-                    "--hle_render=false to fall back to PM4");
-
-// Step 1 of retiring the PM4 translator: does the HLE path still render with
-// the ring translation switched off entirely?
-//
-// The codebase disagrees with itself about whether it can. hooks_frame.cpp
-// calls TranslatePackets "the last route left from a D3D9 shader handle to its
-// microcode", while hooks_d3d9.cpp says the PM4 content match "is never a
-// source for pixels" and prefers CapturePatchedCode's ring-destination copy,
-// taken inside the D3D9 PatchVertexShader hook. Every run reports `live shader
-// resolved 0`, which favours the second, but that is reading and this is
-// measuring. Whichever comment is stale, this cvar is what says so.
-REXCVAR_DEFINE_BOOL(pm4_translate, true, "Debug",
-                    "Translate the PM4 ring into draw calls. Set false to run "
-                    "the HLE path with no PM4 stream at all — under "
-                    "hle_render the translator's draws are discarded anyway, "
-                    "so a collapse in HLE draws means something else in that "
-                    "call was load-bearing");
+// What retired them: with pm4_translate=false the HLE path held 87.66-87.67%
+// applied and 309.3 verts/draw against PM4-on's 87.71%/308.9, and the one
+// dependency that gate missed — the pixel shader CF offset — was replaced by
+// the field the guest's own emitter reads (sub_82565928), which decodes more
+// shaders than the ring ever did (40/49 against 37/61, 0 ambiguous).
 
 // Capture only: no PSOs, no uploads, no shader translation, nothing submitted.
 // It gates the per-draw scoring, the coverage report and the dump — including
@@ -142,16 +94,10 @@ REXCVAR_DEFINE_UINT32(hle_shader_verts, 8, "Debug",
                       "guest vertex shader on. Only has effect when "
                       "hle_shader_exec is non-zero");
 
-REXCVAR_DEFINE_BOOL(main_surface_only, false, "Debug",
-                    "Submit only draws targeting the guest's main colour "
-                    "surface by PM4 pitch. Known to make PM4 rendering worse; "
-                    "see the note above");
-
 // HLE does not yet create a host target for every guest render target. Until
 // it does, mixing the 129x129 shadow pass and other off-screen viewports into
 // the 1280x720 scene produces the long white wedges seen in ST_Southwest.
-// Unlike main_surface_only's PM4 pitch guess, this selector comes from D3D9's
-// resolved, render-target-clamped viewport and is enabled only for HLE.
+// This selector comes from D3D9's resolved, render-target-clamped viewport.
 REXCVAR_DEFINE_BOOL(hle_main_viewport_only, false, "Debug",
                     "In HLE rendering, submit only draws using the resolved "
                     "1280x720 D3D9 viewport. Diagnostic fallback now that "
@@ -261,7 +207,6 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       // histogram below is now a list of those gaps rather than of the guest's
       // strides.
       static std::map<uint32_t, uint32_t> s_skippedStrides;
-      static std::map<uint64_t, uint32_t> s_skippedSurfaces;
       static std::map<uint64_t, uint32_t> s_skippedViewports;
       static uint64_t s_skippedUntransformable = 0;
       static uint64_t s_skippedByColor = 0;
@@ -269,12 +214,12 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       // know the new frame has something in it — a frame whose draws were all
       // skipped for stride would otherwise blank the screen just as surely as a
       // frame that never arrived.
-      std::vector<const mx::pm4::DrawCall*> submittable;
+      std::vector<const mx::hle::DrawCall*> submittable;
       for (const auto& d : draws) {
         // vertices are only populated when the translator resolved a vertex
         // fetch constant; index-only draws have nothing to bind.
         if (!d.valid || d.vertices.empty() || d.index_count == 0) continue;
-        if (d.topology == mx::pm4::HostTopology::kUndefined) {
+        if (d.topology == mx::hle::HostTopology::kUndefined) {
           ++skipped;
           continue;
         }
@@ -291,7 +236,7 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
         // reason so a screenshot taken with either one on can be read honestly
         // against the draw counts.
         {
-          using CS = mx::pm4::DrawCall::ColorSource;
+          using CS = mx::hle::DrawCall::ColorSource;
           // Spelled out rather than using !colorless, which would also catch
           // kNotTranscoded — those resolved no colour at all and are neither
           // population. The stride gate below drops them regardless.
@@ -311,33 +256,22 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
           continue;
         }
         // A frame touches ~16 distinct guest colour surfaces (measured) and we
-        // have one host render target, so without this every off-screen pass —
-        // the pitch-80/160 buffers, the pitch-800 pass — overpaints the main
-        // scene, and whichever one happens to be last decides what is on screen.
-        // That is what made the window cycle through colours. Draw only the
-        // surface whose pitch matches the 1280x720 output, which is also the one
-        // carrying the plurality of draws by a wide margin (~63000 of ~140000).
+        // have one host render target, so without a filter every off-screen
+        // pass overpaints the main scene and whichever runs last decides what
+        // is on screen. That is what made the window cycle through colours.
         //
-        // Skipped entirely under hle_render: the surface a draw targets comes
-        // from RB_SURFACE_INFO, which is a PM4 register the D3D9 path never
-        // sees. Leaving the filter on would drop every HLE draw for having
-        // pitch 0 — silently, and looking exactly like "HLE produced nothing".
-        // Modelling render targets is a later step; pretending to know the
-        // pitch here would be worse than admitting the gap.
-        if (REXCVAR_GET(hle_render)) {
-          if (REXCVAR_GET(hle_main_viewport_only) &&
-              (d.viewport_width != 1280 || d.viewport_height != 720)) {
-            ++skipped;
-            ++s_skippedViewports[(uint64_t(d.viewport_width) << 32) |
-                                 d.viewport_height];
-            continue;
-          }
-        } else if (REXCVAR_GET(main_surface_only) &&
-                   d.surface_pitch != kMainSurfacePitch) {
-            ++skipped;
-            ++s_skippedSurfaces[(uint64_t(d.surface_base) << 32) |
-                                d.surface_pitch];
-            continue;
+        // The surface filter this used to run was main_surface_only, keyed on
+        // RB_SURFACE_INFO — a PM4 register the D3D9 path never sees, so it is
+        // gone with the translator. The viewport extent is the stand-in until
+        // render targets are modelled from D3D9 state; it is a weaker signal
+        // and it is off by default, because dropping draws on a guess would be
+        // indistinguishable from "HLE produced nothing".
+        if (REXCVAR_GET(hle_main_viewport_only) &&
+            (d.viewport_width != 1280 || d.viewport_height != 720)) {
+          ++skipped;
+          ++s_skippedViewports[(uint64_t(d.viewport_width) << 32) |
+                               d.viewport_height];
+          continue;
         }
         submittable.push_back(&d);
         ++submitted;
@@ -389,22 +323,17 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
         std::string hist;
         for (const auto& [stride, count] : s_skippedStrides)
           hist += fmt::format("{}:{} ", stride, count);
-        std::string surf;
-        for (const auto& [key, count] : s_skippedSurfaces)
-          surf += fmt::format("{:03X}/{}:{} ", uint32_t(key >> 32),
-                              uint32_t(key & 0xFFFFFFFF), count);
         std::string viewports;
         for (const auto& [key, count] : s_skippedViewports)
           viewports += fmt::format("{}x{}:{} ", uint32_t(key >> 32),
                                    uint32_t(key & 0xFFFFFFFF), count);
         REXLOG_INFO("RenderThread: frame #{} submitted {} draws, skipped {} "
                     "— skipped strides (cumulative) {} — host ticks with/without "
-                    "new draws {}/{} — skipped surfaces {} — skipped viewports {} — skipped "
+                    "new draws {}/{} — skipped viewports {} — skipped "
                     "untransformable (cumulative) {} — skipped by colour "
                     "source (cumulative) {}",
                     s_frame, submitted, skipped, hist.empty() ? "none" : hist,
                     s_ticksWithDraws, s_ticksEmpty,
-                    surf.empty() ? "none" : surf,
                     viewports.empty() ? "none" : viewports,
                     s_skippedUntransformable,
                     s_skippedByColor);

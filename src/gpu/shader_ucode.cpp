@@ -13,7 +13,7 @@
 
 namespace uc = rex::graphics::ucode;
 
-namespace mx::pm4 {
+namespace mx::hle {
 
 namespace {
 
@@ -764,4 +764,4 @@ bool DecodeSingleTexturePixelShader(const uint32_t* dwords,
   return true;
 }
 
-}  // namespace mx::pm4
+}  // namespace mx::hle
