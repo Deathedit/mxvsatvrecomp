@@ -423,6 +423,10 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameRenderTarget(
   if (auto it = m_gameRenderTargets.find(object);
       it != m_gameRenderTargets.end()) {
     if (it->second.width != width || it->second.height != height) {
+      // A guest heap address reused at a different size. The entry cannot be
+      // resized in place (its RTV/SRV descriptors are baked), and there is no
+      // eviction, so this object is unroutable for the rest of the run.
+      ++m_rtRejectResized;
       static bool s_logged = false;
       if (!s_logged) {
         s_logged = true;
@@ -432,9 +436,16 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameRenderTarget(
     }
     return &it->second;
   }
+  // Budget exhausted. Counted separately from every other refusal because the
+  // consequence is invisible: the caller falls back to the main target and the
+  // draw overpaints the scene, which is exactly the bug offscreen routing was
+  // built to fix. m_gameRenderTargets is never evicted, so once this trips it
+  // stays tripped.
   if (m_gameRenderTargets.size() >= kMaxGameRenderTargets ||
-      m_nextGameSrvDescriptor >= kMaxGameTextures)
+      m_nextGameSrvDescriptor >= kMaxGameTextures) {
+    ++m_rtRejectBudget;
     return nullptr;
+  }
 
   GameRenderTarget entry;
   entry.width = width;
@@ -533,11 +544,20 @@ void D3D12Renderer::RenderGameFrame() {
     GameRenderTarget* drawTarget = nullptr;
     const bool feedsLaterDraw =
         d.targetObject && sampledTargets.contains(d.targetObject);
-    if (d.targetObject && d.targetWidth && d.targetHeight &&
-        (feedsLaterDraw || d.targetWidth != 1280 || d.targetHeight != 720)) {
+    const bool wantsOffscreen =
+        d.targetObject && d.targetWidth && d.targetHeight &&
+        (feedsLaterDraw || d.targetWidth != 1280 || d.targetHeight != 720);
+    if (wantsOffscreen) {
       drawTarget = EnsureGameRenderTarget(d.targetObject, d.targetWidth,
                                           d.targetHeight);
     }
+    // The three populations, kept apart on purpose. A draw that never wanted an
+    // offscreen target and one that wanted it and was refused both end up on
+    // the main render target, and a single "drew on main" count cannot tell
+    // them apart — but only the second is a silent regression to overpainting.
+    if (!wantsOffscreen) ++m_rtDrawsMain;
+    else if (drawTarget) ++m_rtDrawsOffscreen;
+    else ++m_rtDrawsOverpaint;
     if (drawTarget) {
       if (drawTarget->state != D3D12_RESOURCE_STATE_RENDER_TARGET) {
         D3D12_RESOURCE_BARRIER barrier = {};
@@ -640,6 +660,26 @@ void D3D12Renderer::RenderGameFrame() {
     m_commandList->IASetVertexBuffers(0, 1, &d.vbv);
     m_commandList->IASetIndexBuffer(&d.ibv);
     m_commandList->DrawIndexedInstanced(d.indexCount, 1, 0, 0, 0);
+  }
+
+  // Cumulative, every 100th frame that drew anything. Distinct live targets is
+  // reported alongside the cap because the two together say whether the budget
+  // is comfortable or about to be exhausted — the count alone does not.
+  static uint32_t s_rtFrame = 0;
+  if (!m_gameDraws.empty() && (++s_rtFrame % 100) == 1) {
+    char message[300];
+    std::snprintf(message, sizeof(message),
+                  "game RT routing: offscreen %llu, main %llu, OVERPAINT %llu "
+                  "(refused: budget %llu, resized %llu); live targets %u/%u, "
+                  "srv %u/%u",
+                  static_cast<unsigned long long>(m_rtDrawsOffscreen),
+                  static_cast<unsigned long long>(m_rtDrawsMain),
+                  static_cast<unsigned long long>(m_rtDrawsOverpaint),
+                  static_cast<unsigned long long>(m_rtRejectBudget),
+                  static_cast<unsigned long long>(m_rtRejectResized),
+                  uint32_t(m_gameRenderTargets.size()), kMaxGameRenderTargets,
+                  m_nextGameSrvDescriptor, kMaxGameTextures);
+    LogInfo(message);
   }
 }
 

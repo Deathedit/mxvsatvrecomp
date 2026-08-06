@@ -231,6 +231,14 @@ void ClearGameDraws();
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_gameDsvHeap;
   uint32_t m_gameRtvDescriptorSize = 0;
   static constexpr uint32_t kMaxGameRenderTargets = 64;
+  // Offscreen render-target routing counters. Reported by RenderGameDraws.
+  // m_rtDrawsOverpaint is the one that matters: a draw that asked for its own
+  // target, was refused, and therefore painted onto the main scene instead.
+  uint64_t m_rtDrawsMain = 0;
+  uint64_t m_rtDrawsOffscreen = 0;
+  uint64_t m_rtDrawsOverpaint = 0;
+  uint64_t m_rtRejectBudget = 0;
+  uint64_t m_rtRejectResized = 0;
   struct GameRenderTarget {
     Microsoft::WRL::ComPtr<ID3D12Resource> resource;
     uint32_t width = 0;
