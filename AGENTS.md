@@ -554,18 +554,28 @@ identical `0x380 + variant*8` field:
 `variant` is the same 0/1 selector `sub_82565928` computes; the patcher takes it
 as its own argument.
 
-**The patched code is in the shader's own allocation, not the ring.** The
-patcher writes each fetch instruction to `a2 + 12*instruction_index`, and
-`sub_82565928` hands the GPU `*(vs + 0x20) + *(info + 0x368)`. Those two agree
-only if the patch lands in the allocation the program address points at.
+**The patched code is usually NOT in the shader's own allocation.** An earlier
+version of this section claimed the opposite, reasoning that the patcher writes
+to `a2 + 12*instruction_index` while `sub_82565928` hands the GPU
+`*(vs + 0x20) + *(info + 0x368)`, so the two had to be the same buffer.
+Measured: **the shader's allocation is the patched buffer in only 41 of 2561
+captures.** The rest patch into the command ring or another pool. The field is
+therefore the *canonical* program, not the live patched code, and cannot be
+used as a source for it.
 
-This matters because `CapturePatchedCode` does neither: it reads a 128-dword
-window *backwards* from the patch destination out of guest memory and then
-**searches** for an offset whose fetch decode yields exactly the expected count,
-first match winning. That is a checkable search rather than the pixel shader's
-old blind guess, but it is the same ambiguity class — and the fields above make
-it unnecessary. Not yet done; the honest next step is a probe that compares the
-field-derived offset against the search's answer before replacing it.
+**What is universally true is that the CF stream starts exactly at the patch
+destination** — 24 of 24 distinct shaders, then 2561 of 2561 captures, with the
+fetch decode succeeding at that offset every time.
+
+`CapturePatchedCode` used to read a 128-dword window backwards from that
+destination and scan *upward* for the first offset whose fetch decode yielded
+the expected count, so any false positive before the true start won. That cost
+3 of 24 shaders (offsets -3, -3, -85). Trying `dest` first — still verified by
+the same decode, not assumed — removed the failure mode: **off-dest resolutions
+3/24 -> 0/2561, applied 87.62% -> 88.82%, `skipped stream` 8270 -> 0.**
+
+It did **not** explain the c255 read. Shaders whose ALU probe reads index 255
+went 91/136 to 81/128, which is noise. That stays open.
 
 **The CF stream does not start at the beginning of the code allocation.** Big
 shaders carry a prologue that reads as zeros; small ones start at 0. That is
