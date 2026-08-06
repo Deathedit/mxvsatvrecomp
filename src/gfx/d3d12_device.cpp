@@ -96,11 +96,6 @@ bool D3D12Renderer::Initialize(HWND hwnd) {
 
   CreateViewportAndScissor();
 
-  if (!CreateVideoPipeline()) {
-    LogError("Initialize: CreateVideoPipeline failed");
-    return false;
-  }
-
   if (!CreateGamePipeline()) {
     LogError("Initialize: CreateGamePipeline failed");
     return false;
@@ -128,11 +123,6 @@ void D3D12Renderer::Shutdown() {
     m_fenceEvent = nullptr;
   }
 
-  m_videoTexture.Reset();
-  m_videoUploadBuffer.Reset();
-  m_videoSrvHeap.Reset();
-  m_videoPipelineState.Reset();
-  m_videoRootSignature.Reset();
 
   for (auto& pso : m_gamePSOs) pso.Reset();
   m_gameRootSig.Reset();
@@ -257,23 +247,13 @@ void D3D12Renderer::BeginFrame() {
   m_commandList->ClearRenderTargetView(rtvHandle, GameClearColor(), 1,
                                        &m_scissorRect);
 
-  if (m_hasVideoFrame) {
-    RenderVideoFrame();
-    m_hasVideoFrame = false;
-  } else {
-    RenderGameFrame();
-  }
+  RenderGameFrame();
 }
 
 void D3D12Renderer::EndFrame() {
   assert(m_initialized);
 
-  // Only present game frame when Bink video is NOT playing — during Bink we
-  // only render the video quad and the game RT may not be in RENDER_TARGET
-  // state, so transitioning it would cause D3D12 device removal.
-  if (!m_hasVideoFrame) {
-    PresentGameFrame();
-  }
+  PresentGameFrame();
 
   D3D12_RESOURCE_BARRIER barrier = {};
   barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;

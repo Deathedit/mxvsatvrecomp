@@ -1,33 +1,13 @@
 #pragma once
 
-// HLSL source for the two pipelines owned by D3D12Renderer.
-//   - kVideoVS / kVideoPS : fullscreen triangle + texture sample (Bink frames)
-//   - kGameVS  / kGamePS  : position+color vertex layout with an MVP constant
-//                           buffer (currently the placeholder triangle, and the
-//                           target for translated PM4 draw calls)
+// HLSL source for the pipeline owned by D3D12Renderer.
+//   - kGameVS / kGamePS : position+color+uv vertex layout with an MVP constant
+//                         buffer, the target for translated guest draw calls.
+//
+// The kVideoVS / kVideoPS fullscreen-blit pair was REMOVED 2026-08-06 with the
+// host FFmpeg intro player; the guest decodes and draws its own video.
 
 namespace mx::gfx::shaders {
-
-inline constexpr const char* kVideoVS = R"(
-struct VSOutput {
-  float4 pos : SV_Position;
-  float2 uv  : TEXCOORD0;
-};
-VSOutput main(uint vid : SV_VertexID) {
-  VSOutput o;
-  o.uv = float2((vid << 1) & 2, vid & 2);
-  o.pos = float4(o.uv * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 1.0f);
-  return o;
-}
-)";
-
-inline constexpr const char* kVideoPS = R"(
-Texture2D    g_tex : register(t0);
-SamplerState g_smp : register(s0);
-float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {
-  return g_tex.Sample(g_smp, uv);
-}
-)";
 
 inline constexpr const char* kGameVS = R"(
 struct VSInput {

@@ -40,7 +40,6 @@ class D3D12Renderer {
   void BeginFrame();
   void EndFrame();
 
-void UploadVideoFrame(const uint8_t* rgba, uint32_t width, uint32_t height);
 
 // Append one translated draw to this frame's list. `mvp` is the 16-float
 // row-major transform the PM4 translator recovered (DrawCall::mvp); pass
@@ -89,7 +88,6 @@ void ClearGameDraws();
   // PresentGameFrame a second time in between BeginFrame and EndFrame.
   void RenderGameFrame();
   void PresentGameFrame();
-  void RenderVideoFrame();
 
   bool CreateFactory();
   bool CreateDevice();
@@ -102,7 +100,6 @@ void ClearGameDraws();
   bool CreateFence();
   void CreateViewportAndScissor();
 
-  bool CreateVideoPipeline();
 
   bool CreateGamePipeline();
   bool CreateGameRenderTargets();
@@ -143,14 +140,6 @@ void ClearGameDraws();
   D3D12_VIEWPORT m_viewport = {};
   D3D12_RECT m_scissorRect = {};
 
-  Microsoft::WRL::ComPtr<ID3D12RootSignature> m_videoRootSignature;
-  Microsoft::WRL::ComPtr<ID3D12PipelineState> m_videoPipelineState;
-  Microsoft::WRL::ComPtr<ID3D12Resource> m_videoTexture;
-  Microsoft::WRL::ComPtr<ID3D12Resource> m_videoUploadBuffer;
-  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_videoSrvHeap;
-  bool m_hasVideoFrame = false;
-  uint32_t m_videoWidth = 0;
-  uint32_t m_videoHeight = 0;
 
   Microsoft::WRL::ComPtr<ID3D12RootSignature> m_gameRootSig;
   // Indexed by depth-enable bit 0, depth-write bit 1, no-colour bit 2,

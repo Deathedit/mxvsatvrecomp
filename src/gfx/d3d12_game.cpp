@@ -764,7 +764,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   // than once per frame, so the allocation rate scales with the draw count —
   // which is why kMaxGameDraws caps it. The proper fix is a ring of upload
   // buffers recycled after MoveToNextFrame's fence sync. Same TODO applies to
-  // UploadVideoFrame's m_videoUploadBuffer.
+  // the former UploadVideoFrame staging buffer.
   //
   // This comment used to claim "D3D12's internal command-list tracking keeps
   // the underlying memory alive until the GPU finishes the last command using

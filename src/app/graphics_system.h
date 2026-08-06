@@ -25,8 +25,7 @@ namespace rex {
 namespace system {
 
 // The graphics system ReXGlue hands control of presentation to. Owns the
-// D3D12 renderer and the host render thread, which plays the Bink intros and
-// then falls through to presenting game frames.
+// D3D12 renderer and the host render thread, which presents game frames.
 class D3D12GraphicsSystem final : public IGraphicsSystem {
  public:
   D3D12GraphicsSystem() = default;
@@ -48,10 +47,6 @@ class D3D12GraphicsSystem final : public IGraphicsSystem {
   void RenderThreadFunc();
 
  private:
-  static constexpr const char* kIntroVideos[] = {
-      "assets\\Videos\\THQ_Logo_wSound.bik",
-      "assets\\Videos\\Attract.ENG.bik",
-  };
   HWND m_hwnd = nullptr;
   std::unique_ptr<D3D12Renderer> m_renderer;
   std::thread m_renderThread;

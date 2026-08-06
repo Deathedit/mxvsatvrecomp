@@ -55,7 +55,7 @@ in at the repo root.
 ### Running
 
 ```bash
-./mx.exe --game_data_root=assets --user_data_root=userdata --skip_intro=true --force_load=NAT_Farm --registry_override=ReadyToLaunch=1
+./mx.exe --game_data_root=assets --user_data_root=userdata --hide_colorless_draws=true --force_load=NAT_Farm --registry_override=ReadyToLaunch=1
 ```
 
 `--game_data_root` and `--user_data_root` are mandatory — without them the
@@ -92,7 +92,7 @@ run shorter than ~2½ minutes never reaches it; ~400s gives a usable sample.
 `clear_magenta`, `d3d9_hooks_passthrough`, `d3d9_page_cache_verify`,
 `force_load`, `hide_colored_draws`, `hide_colorless_draws`, `hle_capture`,
 `hle_main_viewport_only`, `hle_shader_exec`, `hle_shader_verts`,
-`registry_override`, `skip_intro`.
+`registry_override`, `hide_colorless_draws`.
 
 Seven more (`alu_execute`, `skip_untransformable_draws`, `tint_by_color_source`,
 `transcode_confirmed_formats_only`, `transcode_trust_export`,
@@ -951,9 +951,13 @@ rather than assuming the list is now empty.
 
 ### Running these measurements
 
-- `--skip_intro` only ever gated **mx's own FFmpeg host player**. The guest now
-  opens its own Bink videos natively, so the intro plays regardless and eats
-  roughly the first 45 s of any run. Budget 150 s, not 60 s.
+- **`--skip_intro` no longer exists.** It only ever gated mx's own FFmpeg host
+  player, which was REMOVED 2026-08-06 along with the whole `ffmpeg/`
+  dependency -- the guest opens and decodes its own Bink videos, and while both
+  existed the intro visibly played twice. The guest intro plays regardless and
+  eats roughly the first 45 s of any run, so budget 150 s, not 60 s. Unknown
+  cvars are tolerated, so an old command line with `--skip_intro=true` still
+  runs; the flag simply does nothing.
 - `--game_data_root=assets --user_data_root=userdata` are mandatory; without
   them the process exits immediately.
 - `--hide_colorless_draws=true` on every run. Without it **no texture is
@@ -1153,7 +1157,7 @@ moment ~115s into a run. The frame number is exactly what has to match for two
 captures to be comparable, so hand-timing was the weakest part of any A/B.
 
 ```bash
-renderdoccmd capture -d <repo> -c <out_prefix> ./mx.exe --game_data_root=assets --user_data_root=userdata --skip_intro=true --force_load=NAT_Farm --registry_override=ReadyToLaunch=1 --rdoc_capture_frame=3000
+renderdoccmd capture -d <repo> -c <out_prefix> ./mx.exe --game_data_root=assets --user_data_root=userdata --hide_colorless_draws=true --force_load=NAT_Farm --registry_override=ReadyToLaunch=1 --rdoc_capture_frame=3000
 ```
 
 RenderDoc appends the frame number, giving `<out_prefix>_frame3000.rdc`.

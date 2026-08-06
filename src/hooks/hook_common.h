@@ -17,11 +17,6 @@
 
 namespace mx::native {
 
-// True while the host render thread is presenting Bink video and therefore
-// owns the D3D12 swapchain. The RenderPipeline hook reads this to avoid
-// letting the guest drive VdSwap concurrently. Written by SetBinkPlaying.
-bool IsBinkPlaying();
-
 }  // namespace mx::native
 
 namespace {

@@ -178,13 +178,6 @@ extern "C" REX_FUNC(sub_82B70578) {
   }
   static int rp = 0;
   ++rp;
-  // Skip orig_RenderPipeline while Bink is playing — the host render thread
-  // owns the D3D12 swapchain for Bink video. Calling guest VdSwap concurrently
-  // would conflict with the host renderer's Present.
-  if (mx::native::IsBinkPlaying()) {
-    if (rp == 1) REXLOG_INFO("native: RenderPipeline #{} — skipped (Bink playing)", rp);
-    return;
-  }
   if (rp == 1 || (rp % 600) == 0)
     REXLOG_INFO("native: RenderPipeline #{} — calling orig", rp);
   const auto t0 = std::chrono::steady_clock::now();

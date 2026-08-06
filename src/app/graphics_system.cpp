@@ -15,7 +15,6 @@
 #include <windows.h>
 #include <renderdoc/renderdoc_app.h>
 
-#include "gfx/bink_player.h"
 #include "gpu/hle_types.h"
 #include "gpu/d3d9_layout.h"
 #include "hooks/native_bridge.h"
@@ -164,13 +163,6 @@ void MaybeTriggerRenderDocCapture() {
 }
 }  // namespace
 
-// The intro playlist runs 47.4s (THQ 9.5s + Attract 37.9s) and the RenderPipeline
-// hook stands down for its whole duration, so the guest render path cannot run
-// until it finishes. Set `skip_intro = true` in mx.toml (or pass --skip_intro)
-// to jump straight to the game-frame loop when iterating on rendering.
-REXCVAR_DEFINE_BOOL(skip_intro, false, "Debug",
-                    "Skip the Bink intro videos and go straight to game frames");
-
 namespace rex {
 namespace system {
 
@@ -198,37 +190,10 @@ void D3D12GraphicsSystem::Shutdown() {
 
 void D3D12GraphicsSystem::RenderThreadFunc() {
   using namespace mx;
-  const bool skipIntro = REXCVAR_GET(skip_intro);
-  REXLOG_INFO("RenderThread: skip_intro={}", skipIntro);
-  BinkPlayer bink;
-  for (size_t i = 0; i < std::size(kIntroVideos) && m_running && !skipIntro; ++i) {
-    if (!bink.Open(kIntroVideos[i])) continue;
-    native::SetBinkPlaying(true);
-    std::vector<uint8_t> rgba;
-    int frameMs = bink.GetFrameDurationMs();
-    if (frameMs <= 0) frameMs = 33;  // ~30fps fallback
-    while (m_running) {
-      auto t0 = std::chrono::steady_clock::now();
-      if (!bink.DecodeNextFrame(rgba)) break;
-      if (!rgba.empty() && m_renderer)
-        m_renderer->UploadVideoFrame(rgba.data(), bink.GetVideoWidth(), bink.GetVideoHeight());
-      if (m_renderer) {
-        // BeginFrame dispatches to RenderVideoFrame itself when a video frame
-        // has been uploaded, and EndFrame does the present. Calling either
-        // again here is not idempotent — see the note in the game loop below.
-        m_renderer->BeginFrame();
-        MaybeTriggerRenderDocCapture();
-        m_renderer->EndFrame();
-      }
-      // Pace to video frame rate (Bink has no internal clock sync).
-      auto t1 = std::chrono::steady_clock::now();
-      int elapsed = static_cast<int>(
-          std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
-      int sleep = frameMs - elapsed;
-      if (sleep > 0) std::this_thread::sleep_for(std::chrono::milliseconds(sleep));
-    }
-    native::SetBinkPlaying(false);
-  }
+  // The host FFmpeg intro player was REMOVED 2026-08-06. The guest opens and
+  // decodes its own Bink videos natively — proven by hooking BinkOpen, and
+  // visible as the intro playing twice while both existed. Nothing here needs
+  // to own the swapchain before the guest starts.
   while (m_running) {
     if (m_renderer) {
       // Hand any PM4 geometry the VdSwap hook translated this frame to the game
@@ -402,7 +367,7 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       }
       // BeginFrame and EndFrame own the whole frame: BeginFrame opens the
       // command list, transitions and clears the targets and then calls
-      // RenderGameFrame (or RenderVideoFrame) itself; EndFrame calls
+      // RenderGameFrame itself; EndFrame calls
       // PresentGameFrame and then swaps. This loop used to call
       // RenderGameFrame and PresentGameFrame again in between, which was not a
       // harmless repeat — PresentGameFrame's barriers are directional. Its

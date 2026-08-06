@@ -9,13 +9,8 @@ bool g_plugin_mode = false;
 namespace {
 
 HWND g_native_hwnd = nullptr;
-bool g_bink_playing = false;
 
 }  // namespace
-
-bool IsBinkPlaying() {
-  return g_bink_playing;
-}
 
 NativeGraphics& NativeGraphics::Get() {
   static NativeGraphics instance;
@@ -29,10 +24,6 @@ void SetRenderer(D3D12Renderer* renderer) {
 
 void SetWindowHandle(HWND hwnd) {
   g_native_hwnd = hwnd;
-}
-
-void SetBinkPlaying(bool playing) {
-  g_bink_playing = playing;
 }
 
 void NativeGraphics::Shutdown() {

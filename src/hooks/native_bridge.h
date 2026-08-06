@@ -24,7 +24,6 @@ extern bool g_plugin_mode;
 
 void SetWindowHandle(HWND hwnd);
 void SetRenderer(D3D12Renderer* renderer);
-void SetBinkPlaying(bool playing);
 
 class NativeGraphics {
  public:
