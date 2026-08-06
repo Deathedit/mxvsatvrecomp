@@ -394,6 +394,77 @@ hardcoded to two English filenames (`graphics_system.h:51`) while
 language setting. Whether the guest's own decoder now renders through HLE is the
 test that would let the whole dependency go; it has not been run.
 
+**That inference was right, and is now measured — see below.**
+
+### The guest opens Bink under the plugin and never natively (2026-08-06)
+
+Bink is statically linked into the XEX the same way D3D9 is: a `BINKCONS` data
+segment at `0x821CD1D0` and library code from about `0x82CEB650` to `0x82CF0508`.
+The guest carries a complete decoder.
+
+| Symbol | Address | How it was identified |
+|---|---|---|
+| `BinkOpen(path, flags)` | `sub_82CEB7C8` | Owns `"Not a Bink file."` (`0x82144B9C`) and `"Error reading Bink header."` (`0x82144B28`), referenced nowhere else. Two callers total, so it is *the* choke point |
+| `XenonBinkVideoManager::Open` | `sub_8234E0A8` | vtable `0x82017510` slot [1]; formats `"game:\%s.bik"` |
+| `XenonBinkVideoManager::Open` | `sub_8234E290` | slot [2]; formats `"%s.bik"` |
+| `BinkAsset::Init` | `sub_8234CBB8` | Reads `"Texture To Override"`, then resolves `"Bink Video Asset"` and requests fourcc `1651076715` = `0x62696E6B` = `'bink'` |
+| `XenonBinkVideo` vtable | `0x820172BC` | 12 entries; HBINK at object `+144`, its critical section at `+156` |
+
+Probes on the first four are in `hooks_plugin_diag.cpp` and are mode-neutral.
+**4 native runs, 2 plugin runs, `--skip_intro=true`, no `--force_load`:**
+
+| | native 4/4 | plugin 2/2 |
+|---|---|---|
+| `BinkOpen` | **0** | 3, all returning a live HBINK |
+| `BinkMgr::Open` | **0** | 5–6 |
+| `BinkAsset::Init` | 1 | 1 |
+| → resolved asset handle | **`0x00000000`** | `0x2345D2A0` |
+| script assets executed | 2 | 4 |
+| registry keys read | 1 | 4 |
+
+Under the plugin the guest opens `game:\Videos\THQ_Logo_wSound.bik`,
+`Attract.ENG.bik` and `FE_Smoke.bik` itself, in that order, roughly 3 s in. The
+flags confirm the static read of `sub_8234E0A8`: `a4=1` gives `0x00102400`
+(`0x2000|0x100400`) and `a4=0` gives `0x01100400`, the branch that first calls
+`sub_82CEB3F0(10485760)`.
+
+**Natively not one video is ever opened.** `BinkAsset::Init` still fires — which
+is what proves the probe is live rather than absent — but its asset handle comes
+back null, meaning `sub_82AB8210("Bink Video Asset")` returned nothing, so the
+`'bink'` request in that function never happens.
+
+`FE_Smoke` is a *front-end* video. Together with the registry keys below, that
+puts the plugin inside the front end and native nowhere near it, so **Bink is
+downstream of the script-layer divergence, not a cause of it.** It is, however,
+a far sharper marker of that divergence than the script-asset count.
+
+**Registry reads are the sharpest marker of all.** Native reads exactly one
+string key in a whole run; the plugin reads four:
+
+| Key | native | plugin |
+|---|---|---|
+| `PlayerMode` | ✓ | ✓ |
+| `GameContentInstall` | — | ✓ `"installed"` |
+| `IntroMode` | — | ✓ `"full"` |
+| `GameSessionNotification` | — | ✓ |
+
+The three extra keys are all defaults registered by `sub_823526D8`, but that
+function registers ~35 keys and only these three are *read*, so the readers have
+not been identified. The registry-get probe does not log `lr`; adding it is one
+line and would name those callers directly instead of by inference. Do that
+before drawing any conclusion from this table.
+
+**A process-hygiene warning, learned the expensive way.** The first pass at this
+measurement reported "zero Bink calls in both modes" and was wrong twice over.
+First, the build writes `out/build/win-amd64-debug/mx.exe` and nothing copies it
+to the repo root, so `./mx.exe` ran a stale binary that did not contain the
+probes at all — check with `grep -c "<a new format string>" mx.exe` before
+believing any new probe's silence. Second, a cancelled background run script kept
+running (only its output pipeline had been killed) and launched a second
+`mx.exe`, so `ls -t logs/*.log | head -1` attributed *its* log to the run just
+started. Identify a run's log by diffing the directory listing, never by mtime,
+and confirm with `Get-Process mx` that exactly one is running.
+
 ### Draws land outside the clip volume on z (2026-08-06)
 
 A RenderDoc capture (`mx_2026.08.05_23.55.39_frame2967.rdc`, EID 831,

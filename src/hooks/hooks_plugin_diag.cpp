@@ -788,3 +788,137 @@ extern "C" REX_FUNC(sub_82B38558) {
   }
   orig_VtableCtor(ctx, base);
 }
+
+//=============================================================================
+// Does the guest load Bink itself?
+//=============================================================================
+// Bink is statically linked into the XEX, the same way D3D9 is: there is a
+// BINKCONS data segment at 0x821CD1D0 and the library code runs from about
+// 0x82CEB650 to 0x82CF0508. The guest has a complete decoder and needs nothing
+// from the host player in src/gfx/bink_player.cpp.
+//
+// It also demonstrably uses it. The intro plays under --gpu_plugin, and in
+// plugin mode MxApp::OnPreSetup returns before creating D3D12GraphicsSystem, so
+// RenderThreadFunc and the FFmpeg BinkPlayer never start at all. Something in
+// the guest decoded and presented that video.
+//
+// Natively, nothing has ever measured whether it even tries. Across 1,035 logs
+// the only lines matching /bink/ are mx's own "RenderPipeline #1 — skipped
+// (Bink playing)". That is not a negative result — no hook has ever existed on
+// the guest path — which is what these four add.
+//
+// Deliberately mode-neutral: comparing native against plugin is the entire
+// point, so every hook logs in both modes and calls the original. Nothing here
+// changes guest behaviour.
+
+namespace {
+
+// First `head` hits verbatim, then at most one line per 5s, matching the audio
+// and RequestLoad probes above. A looping video would otherwise flood the log.
+bool BinkLogDue(uint64_t count, std::chrono::steady_clock::time_point& last,
+                uint64_t head) {
+  if (count <= head) return true;
+  const auto now = std::chrono::steady_clock::now();
+  if ((now - last) < std::chrono::seconds(5)) return false;
+  last = now;
+  return true;
+}
+
+const char* BinkTag() { return mx::native::g_plugin_mode ? "plugin" : "native"; }
+
+}  // namespace
+
+// sub_82CEB7C8 — BinkOpen(path, flags). Named from its own error strings, not
+// from the call shape: "Not a Bink file." (0x82144B9C) and "Error reading Bink
+// header." (0x82144B28) are referenced from this function and nowhere else. It
+// has exactly two callers, both of them the manager opens below, so it is the
+// single choke point for every video the guest plays.
+//
+// The return is the line that matters. It separates "the guest never asked"
+// from "the guest asked and was refused" — two completely different problems.
+// 0 is failure, so failures get a much larger unrate-limited head.
+REX_IMPORT(__imp__sub_82CEB7C8, orig_BinkOpen, void());
+extern "C" REX_FUNC(sub_82CEB7C8) {
+  const uint32_t flags = ctx.r4.u32;
+  const uint32_t from = static_cast<uint32_t>(ctx.lr);
+  const std::string path = GuestString(base, ctx.r3.u32, 260);
+  orig_BinkOpen(ctx, base);
+  const uint32_t hbink = ctx.r3.u32;
+  static uint64_t s_count = 0;
+  static std::chrono::steady_clock::time_point s_last{};
+  if (BinkLogDue(++s_count, s_last, hbink ? 8 : 64)) {
+    REXLOG_INFO(
+        "{}: BinkOpen #{} \"{}\" flags=0x{:08X} -> hbink=0x{:08X} {} from lr=0x{:08X}",
+        BinkTag(), s_count, path, flags, hbink, hbink ? "OK" : "FAILED", from);
+  }
+}
+
+// sub_8234E0A8 — XenonBinkVideoManager::Open, slot [1] of the vtable at
+// 0x82017510. Formats "game:\%s.bik" from a3 and hands it to BinkOpen. a4 picks
+// the branch: non-zero passes flags 0x2000|0x100400 straight through, zero
+// first calls sub_82CEB3F0(10485760) and then passes 0x1000000|0x100400. That
+// 10 MB reserve sits on the path and is a plausible native failure point, so a4
+// is logged rather than dropped.
+//
+// Neither this nor sub_8234E290 has a single code xref — both are reached only
+// through the vtable, the same shape as the script bindings. A static call
+// graph cannot answer this question; only the runtime can.
+REX_IMPORT(__imp__sub_8234E0A8, orig_BinkMgrOpenGame, void());
+extern "C" REX_FUNC(sub_8234E0A8) {
+  const std::string name = GuestString(base, ctx.r5.u32, 260);
+  const uint32_t a4 = ctx.r6.u32;
+  const uint32_t from = static_cast<uint32_t>(ctx.lr);
+  static uint64_t s_count = 0;
+  static std::chrono::steady_clock::time_point s_last{};
+  if (BinkLogDue(++s_count, s_last, 8)) {
+    REXLOG_INFO("{}: BinkMgr::Open(game:) #{} name=\"{}\" a4=0x{:08X} from lr=0x{:08X}",
+                BinkTag(), s_count, name, a4, from);
+  }
+  orig_BinkMgrOpenGame(ctx, base);
+}
+
+// sub_8234E290 — XenonBinkVideoManager::Open, slot [2]. Same structure, but it
+// formats "%s.bik" and passes a2 — an already-built path — to BinkOpen with
+// flags 0x04100400. Both arguments are logged because a2 and a3 need not agree.
+REX_IMPORT(__imp__sub_8234E290, orig_BinkMgrOpenPath, void());
+extern "C" REX_FUNC(sub_8234E290) {
+  const std::string path = GuestString(base, ctx.r4.u32, 260);
+  const std::string name = GuestString(base, ctx.r5.u32, 260);
+  const uint32_t from = static_cast<uint32_t>(ctx.lr);
+  static uint64_t s_count = 0;
+  static std::chrono::steady_clock::time_point s_last{};
+  if (BinkLogDue(++s_count, s_last, 8)) {
+    REXLOG_INFO("{}: BinkMgr::Open(path) #{} path=\"{}\" name=\"{}\" from lr=0x{:08X}",
+                BinkTag(), s_count, path, name, from);
+  }
+  orig_BinkMgrOpenPath(ctx, base);
+}
+
+// sub_8234CBB8 — the Bink video component's init. It reads a "Texture To
+// Override" property off the descriptor in a2, then resolves the resource named
+// by "Bink Video Asset" (0x82016DF0) and requests it by fourcc 1651076715,
+// which is 0x62696E6B — 'bink'. Results land at a1[36] and a1[37].
+//
+// This fires when a video component is *created*, which is upstream of the
+// manager open. If it fires and the opens do not, the gap is between the
+// component and the manager rather than in Bink itself.
+//
+// The other "Bink Video Asset" reference, at 0x8234D090, is inside sub_8234CF80
+// and is deliberately not hooked. Hex-Rays gives up on that function after one
+// line — it opens with a call to the __noreturn sub_82ABAB98 — so what the rest
+// of it does has not actually been read, and naming a hook after a guess is the
+// mistake this file keeps re-learning. Add it once it has been decompiled.
+REX_IMPORT(__imp__sub_8234CBB8, orig_BinkAssetInit, void());
+extern "C" REX_FUNC(sub_8234CBB8) {
+  const uint32_t a1 = ctx.r3.u32;
+  const uint32_t from = static_cast<uint32_t>(ctx.lr);
+  static uint64_t s_count = 0;
+  static std::chrono::steady_clock::time_point s_last{};
+  const bool due = BinkLogDue(++s_count, s_last, 8);
+  orig_BinkAssetInit(ctx, base);
+  if (due) {
+    REXLOG_INFO("{}: BinkAsset::Init #{} a1=0x{:08X} tex=0x{:08X} asset=0x{:08X} from lr=0x{:08X}",
+                BinkTag(), s_count, a1, a1 ? REX_LOAD_U32(a1 + 36 * 4) : 0,
+                a1 ? REX_LOAD_U32(a1 + 37 * 4) : 0, from);
+  }
+}
