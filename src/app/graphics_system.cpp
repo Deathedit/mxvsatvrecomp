@@ -12,6 +12,9 @@
 #include <string>
 #include <vector>
 
+#include <windows.h>
+#include <renderdoc/renderdoc_app.h>
+
 #include "gfx/bink_player.h"
 #include "gpu/hle_types.h"
 #include "gpu/d3d9_layout.h"
@@ -118,6 +121,63 @@ REXCVAR_DEFINE_BOOL(legacy_mvp_tiebreak, false, "Debug",
                     "(identity_in_clip > viewport_in_clip) instead of reading "
                     "PA_CL_VTE_CNTL. For A/B capture only");
 
+// Trigger a RenderDoc capture at a chosen presented frame.
+//
+// Captures were hand-timed before this: launch under RenderDoc, wait for
+// --force_load to fire at ~115s, and press F12 at the right moment. That makes
+// an A/B depend on hitting the same frame twice by hand, and the frame number
+// is exactly what has to match for two captures to be comparable.
+//
+// Does nothing unless the process is running under RenderDoc, since the module
+// handle is only present when its layer is loaded.
+REXCVAR_DEFINE_UINT32(rdoc_capture_frame, 0, "Debug",
+                      "Trigger a RenderDoc capture at this presented frame "
+                      "number (0 = off). Only has effect when running under "
+                      "RenderDoc");
+
+namespace {
+RENDERDOC_API_1_0_0* RenderDocApi() {
+  static RENDERDOC_API_1_0_0* api = [] () -> RENDERDOC_API_1_0_0* {
+    HMODULE module = GetModuleHandleA("renderdoc.dll");
+    if (!module) return nullptr;
+    auto get_api =
+        reinterpret_cast<pRENDERDOC_GetAPI>(GetProcAddress(module, "RENDERDOC_GetAPI"));
+    RENDERDOC_API_1_0_0* out = nullptr;
+    if (get_api && get_api(eRENDERDOC_API_Version_1_0_0,
+                           reinterpret_cast<void**>(&out)) == 1)
+      return out;
+    return nullptr;
+  }();
+  return api;
+}
+
+// Counts presented frames and fires once. TriggerCapture records the *next*
+// frame to begin, so the capture lands on the frame after the trigger; the
+// number that matters is that both sides of an A/B use the same cvar value.
+void MaybeTriggerRenderDocCapture() {
+  const uint32_t want = REXCVAR_GET(rdoc_capture_frame);
+  if (!want) return;
+  static uint64_t s_presented = 0;
+  static bool s_fired = false;
+  ++s_presented;
+  if (s_fired || s_presented < want) return;
+  RENDERDOC_API_1_0_0* api = RenderDocApi();
+  if (!api) {
+    static bool s_warned = false;
+    if (!s_warned) {
+      s_warned = true;
+      REXLOG_INFO("rdoc: capture requested at frame {} but RenderDoc is not "
+                  "attached — launch under renderdoccmd or the UI",
+                  want);
+    }
+    return;
+  }
+  s_fired = true;
+  api->TriggerCapture();
+  REXLOG_INFO("rdoc: triggered capture at presented frame {}", s_presented);
+}
+}  // namespace
+
 // The intro playlist runs 47.4s (THQ 9.5s + Attract 37.9s) and the RenderPipeline
 // hook stands down for its whole duration, so the guest render path cannot run
 // until it finishes. Set `skip_intro = true` in mx.toml (or pass --skip_intro)
@@ -171,6 +231,7 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
         // has been uploaded, and EndFrame does the present. Calling either
         // again here is not idempotent — see the note in the game loop below.
         m_renderer->BeginFrame();
+        MaybeTriggerRenderDocCapture();
         m_renderer->EndFrame();
       }
       // Pace to video frame rate (Bink has no internal clock sync).
@@ -364,6 +425,7 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       // not in it, an invalid transition, on top of drawing and copying the
       // whole frame twice.
       m_renderer->BeginFrame();
+      MaybeTriggerRenderDocCapture();
       m_renderer->EndFrame();
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(16));
