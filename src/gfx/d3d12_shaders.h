@@ -50,4 +50,41 @@ float4 main(float4 pos : SV_POSITION, float4 col : COLOR) : SV_TARGET {
 }
 )";
 
+// Bink's frame composite. The guest binds three single-channel planes — Y at
+// full resolution, Cr and Cb at half — and optionally a fourth alpha plane,
+// then runs its own YUV->RGB shader. Measured 3/3 runs; see
+// docs/guest_binary.md for the guest side.
+//
+// All four planes sample with the same normalized uv: the chroma planes being
+// half-size is handled by the sampler, not by scaling the coordinates.
+//
+// BT.601 with the usual 16-235 luma and 16-240 chroma ranges, which is what
+// Bink encodes. If video comes out washed out or too contrasty, this range
+// handling is the first suspect, not the coefficients.
+inline constexpr const char* kGameYuvPS = R"(
+Texture2D    g_y     : register(t0);
+Texture2D    g_cr    : register(t1);
+Texture2D    g_cb    : register(t2);
+Texture2D    g_alpha : register(t3);
+SamplerState g_smp   : register(s0);
+float4 main(float4 pos : SV_POSITION, float4 col : COLOR,
+            float2 uv : TEXCOORD0) : SV_TARGET {
+  float y  = g_y.Sample(g_smp, uv).r;
+  float cr = g_cr.Sample(g_smp, uv).r;
+  float cb = g_cb.Sample(g_smp, uv).r;
+  y  = (y - 0.0627451) * 1.164383;
+  cr = cr - 0.5;
+  cb = cb - 0.5;
+  float3 rgb;
+  rgb.r = saturate(y + 1.596027 * cr);
+  rgb.g = saturate(y - 0.391762 * cb - 0.812968 * cr);
+  rgb.b = saturate(y + 2.017232 * cb);
+  // t3 is always bound: a 1x1 white texture stands in when the guest supplies
+  // no alpha plane, which is cheaper than a second PSO variant or an extra
+  // root parameter carrying a flag.
+  float a = g_alpha.Sample(g_smp, uv).r;
+  return float4(rgb, a) * col;
+}
+)";
+
 }  // namespace mx::gfx::shaders

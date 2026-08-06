@@ -833,6 +833,10 @@ void ProbePixelProfileForDraw(uint32_t pixel_shader, uint32_t device,
                               const mx::hle::DrawCall& dc);
 void ProbeBinkComposite(uint32_t pixel_shader, uint32_t vertex_shader,
                         uint32_t device, uint8_t* base, uint32_t vertex_count);
+bool IsBinkCompositeDraw(uint32_t pixel_shader, uint8_t* base);
+bool PrepareBinkPlanes(mx::hle::DrawCall& dc, uint32_t device, uint8_t* base);
+bool CopyTexturePhysical(const mx::hle::HleTextureSource& source, uint8_t* base,
+                         std::vector<uint8_t>& out);
 
 struct PendingHleDraw {
   mx::hle::DrawCall draw;
@@ -946,6 +950,68 @@ bool FinishHleDraw(mx::hle::DrawCall& dc) {
 
 void FinalizePendingD3D9DrawsImpl(uint8_t* base);
 
+// D3DDevice_SetFVF (sub_82552420) stores the FVF code at device + 12608 and
+// never builds a vertex declaration, so a draw that uses it has no layout for
+// BuildHleDraw to read and is dropped as kNoLayout. The Bink composite is
+// exactly this case: it sets FVF 0x102 and draws through DrawVerticesUP.
+//
+// Only the bits this game was measured to use are decoded. An FVF carrying
+// anything else returns false rather than guessing, so the draw is still
+// counted as kNoLayout and stays visible in the skip histogram.
+constexpr uint32_t kDeviceFvf = 12608;
+
+bool BuildFvfLayout(uint32_t fvf, mx::hle::HleInputLayout& out,
+                    uint32_t& stride) {
+  using namespace mx::hle;
+  out = {};
+  stride = 0;
+  // D3DFVF_XYZ. XYZRHW (0x004) is pre-transformed and would need a different
+  // position pipeline, so it is refused rather than silently mistreated.
+  if ((fvf & 0x00Eu) != 0x002u) return false;
+  {
+    HleInputElement e;
+    e.semantic_name = "POSITION";
+    e.format = DXGI_FORMAT_R32G32B32_FLOAT;
+    e.offset = 0;
+    e.size_bytes = 12;
+    e.usage = 0;  // D3DDECLUSAGE_POSITION
+    e.xenos_format = 57;  // xenos::VertexFormat::k_32_32_32_FLOAT
+    e.swizzle = 0;
+    out.elements.push_back(e);
+    stride = 12;
+  }
+  if (fvf & 0x040u) {  // D3DFVF_DIFFUSE
+    HleInputElement e;
+    e.semantic_name = "COLOR";
+    e.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    e.offset = stride;
+    e.size_bytes = 4;
+    e.usage = 10;  // D3DDECLUSAGE_COLOR
+    e.xenos_format = 6;  // xenos::VertexFormat::k_8_8_8_8
+    e.is_normalized = true;
+    out.elements.push_back(e);
+    stride += 4;
+  }
+  // Texture coordinate count lives in bits 8..11; only the single float2 set
+  // the composite uses is handled.
+  const uint32_t tex_count = (fvf >> 8) & 0xFu;
+  if (tex_count > 1) return false;
+  if (tex_count == 1) {
+    HleInputElement e;
+    e.semantic_name = "TEXCOORD";
+    e.format = DXGI_FORMAT_R32G32_FLOAT;
+    e.offset = stride;
+    e.size_bytes = 8;
+    e.usage = 5;  // D3DDECLUSAGE_TEXCOORD
+    e.xenos_format = 37;  // xenos::VertexFormat::k_32_32_FLOAT
+    out.elements.push_back(e);
+    stride += 8;
+  }
+  out.max_stream = 0;
+  out.min_stride[0] = stride;
+  return true;
+}
+
 // Vertex data supplied inline by D3DDevice_DrawVerticesUP rather than through
 // a bound stream. That call is semantically "bind stream 0 to this pointer with
 // this stride and draw", so it is modelled as exactly that below instead of
@@ -968,6 +1034,17 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   // of mistake has cost this branch a round.
   ProbeBinkComposite(st.ps_seen ? st.pixel_shader : 0,
                      st.vs_seen ? st.vertex_shader : 0, device, base, count);
+  // Whether this is the video composite has to be known here, not where the
+  // planes are gathered, because every early return below is a place the draw
+  // can be lost before it gets there. Naming which one is the whole point.
+  const bool is_bink =
+      IsBinkCompositeDraw(st.ps_seen ? st.pixel_shader : 0, base);
+  auto bink_lost = [&](const char* where) {
+    if (!is_bink) return;
+    static std::map<std::string, uint64_t> s_lost;
+    if (++s_lost[where] == 1)
+      REXLOG_INFO("d3d9: Bink composite draw dropped at {}", where);
+  };
 
   HleDrawInputs in;
   in.indexed = indexed;
@@ -978,6 +1055,30 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
 
   const int id = g_currentDecl;
   if (id >= 0 && g_declLayoutOk[id]) in.layout = &g_declLayout[id];
+
+  // A UP draw usually has no declaration — it uses SetFVF instead — so fall
+  // back to a layout derived from the FVF the device is holding. Only when a
+  // declaration did not already supply one, so nothing that works today
+  // changes path.
+  mx::hle::HleInputLayout fvf_layout;
+  if (up && !in.layout && device &&
+      HostPageReadable(REX_RAW_ADDR(device + kDeviceFvf))) {
+    const uint32_t fvf = REX_LOAD_U32(device + kDeviceFvf);
+    uint32_t fvf_stride = 0;
+    if (BuildFvfLayout(fvf, fvf_layout, fvf_stride)) {
+      static std::map<uint32_t, uint64_t> s_fvf;
+      if (++s_fvf[fvf] == 1) {
+        REXLOG_INFO("d3d9: UP draw FVF 0x{:03X} -> {} elements, stride {} "
+                    "(draw stride {})",
+                    fvf, fvf_layout.elements.size(), fvf_stride, up->stride);
+      }
+      in.layout = &fvf_layout;
+    } else {
+      static std::map<uint32_t, uint64_t> s_bad;
+      if (++s_bad[fvf] == 1)
+        REXLOG_INFO("d3d9: UP draw FVF 0x{:03X} not decoded", fvf);
+    }
+  }
 
   HleStream streams[kMaxStreams];
   if (up) {
@@ -1029,7 +1130,10 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   // PA_CL_VTE_CNTL disables the hardware X/Y scale and offset for these draws,
   // so a shader output without the inverse viewport cannot be submitted under
   // identity. Unknown is not a usable viewport.
-  if (!have_vp) return;
+  if (!have_vp) {
+    bink_lost("no viewport");
+    return;
+  }
   if (have_vp) in.mvp = vp;
 
   DrawCall dc;
@@ -1041,6 +1145,13 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     // needing expansion or a wrong prim-type argument.
     if (skip == HleSkip::kBadTopology && prim_type < 64) {
       ++g_badPrimType[prim_type];
+    }
+    if (is_bink) {
+      static uint64_t s_first = 0;
+      if (++s_first == 1)
+        REXLOG_INFO("d3d9: Bink composite draw dropped in BuildHleDraw, skip={}"
+                    " prim={} count={} stride={}",
+                    uint32_t(skip), prim_type, count, up ? up->stride : 0u);
     }
     return;
   }
@@ -1097,9 +1208,13 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     dc.surface_pitch = rt.surface_info & 0x3FFFu;
   }
   ProbePixelProfileForDraw(st.ps_seen ? st.pixel_shader : 0, device, base, dc);
+  // The Bink composite needs its whole plane set, so it takes its own path
+  // rather than competing in the single-winner binding contest.
+  const uint32_t bound_ps = st.ps_seen ? st.pixel_shader : 0;
+  if (IsBinkCompositeDraw(bound_ps, base)) PrepareBinkPlanes(dc, device, base);
   const bool have_texture =
-      PrepareDrawTexture(dc, st.ps_seen ? st.pixel_shader : 0, device, base,
-                         texture_binding);
+      !dc.yuv_composite &&
+      PrepareDrawTexture(dc, bound_ps, device, base, texture_binding);
   if (have_texture && texture_binding.sampler < kMaxSamplers) {
     const auto& sampled_texture = st.texture[texture_binding.sampler];
     const uint32_t texture_object = sampled_texture.object;
@@ -2370,6 +2485,14 @@ uint32_t ReadGuestGlobalPtr(uint8_t* base, uint32_t addr) {
   return HostPageReadable(REX_RAW_ADDR(addr)) ? REX_LOAD_U32(addr) : 0;
 }
 
+// Exact identity: the guest's own two Bink composite pixel shaders, read from
+// its globals. Not a heuristic on texture count or draw shape.
+bool IsBinkCompositeDraw(uint32_t pixel_shader, uint8_t* base) {
+  if (!pixel_shader) return false;
+  return pixel_shader == ReadGuestGlobalPtr(base, kBinkPixelShaderYuv) ||
+         pixel_shader == ReadGuestGlobalPtr(base, kBinkPixelShaderYuvAlpha);
+}
+
 void ProbeBinkComposite(uint32_t pixel_shader, uint32_t vertex_shader,
                         uint32_t device, uint8_t* base, uint32_t vertex_count) {
   const uint32_t ps_yuv = ReadGuestGlobalPtr(base, kBinkPixelShaderYuv);
@@ -2427,6 +2550,67 @@ void ProbeBinkComposite(uint32_t pixel_shader, uint32_t vertex_shader,
                   fetch[1], fetch[2], fetch[3], fetch[4], fetch[5]);
     }
   }
+}
+
+// Decode the Bink composite's plane set into the DrawCall. Deliberately
+// separate from PrepareDrawTexture rather than folded into it:
+//
+//  - it must bind *several* textures, which the single-winner binding contest
+//    in ResolvePixelBindingForDraw cannot express;
+//  - the planes are k_8, which the semantic gate correctly refuses as base
+//    colour for a mask but wrongly for a luma plane. Here the guest's own
+//    shader identity says what they are, so the gate is not consulted;
+//  - it must not touch g_hleCpuTextures. The planes are new guest memory every
+//    video frame, so caching them by payload key would grow the cache without
+//    bound; at 30 fps that is ~90 dead entries a second.
+bool PrepareBinkPlanes(mx::hle::DrawCall& dc, uint32_t device, uint8_t* base) {
+  using namespace mx::hle;
+  uint32_t decoded = 0;
+  for (uint32_t s = 0; s < DrawCall::kMaxPlanes && s < kMaxSamplers; ++s) {
+    uint32_t fetch[6] = {};
+    if (!ReadLiveTextureFetch(device, base, s, fetch)) break;
+    HleTextureSource source;
+    const char* why = nullptr;
+    if (!DescribeHleTexture2D(fetch, source, &why)) {
+      NoteRejectedTextureFormat("bink", s, source, why, fetch);
+      return false;
+    }
+    std::vector<uint8_t> guest;
+    if (!CopyTexturePhysical(source, base, guest)) return false;
+    auto payload = std::make_shared<HleTexturePayload>();
+    if (!DecodeHleTexture2D(source, guest.data(), guest.size(), *payload, &why))
+      return false;
+    // An all-zero plane is normal for a video that has not decoded its first
+    // frame yet, so unlike the immutable path this is not memoised as empty —
+    // the same descriptor will carry real pixels a frame later.
+    payload->key = HleTextureKey(fetch);
+    dc.planes[decoded++] = std::move(payload);
+  }
+  // Y, Cr and Cb are always present; the fourth is the alpha plane and its
+  // presence is what selects the guest's alpha-capable pixel shader.
+  if (decoded < 3) return false;
+  dc.plane_count = decoded;
+  dc.yuv_has_alpha = decoded >= 4;
+  dc.yuv_composite = true;
+  // The composite samples the full frame, so its logical extent is the luma
+  // plane's; the chroma planes are half-size and the shader normalises.
+  dc.sampled_texture_width = dc.planes[0]->width;
+  dc.sampled_texture_height = dc.planes[0]->height;
+  static uint64_t s_ok = 0;
+  if (++s_ok <= 4 || (s_ok % 600) == 0) {
+    // Nonzero byte counts per plane. Green output from the YUV shader is what
+    // all-zero planes produce, so "did the guest actually decode a frame" and
+    // "did our upload work" have to be told apart here rather than guessed at
+    // from the colour on screen.
+    size_t nz[DrawCall::kMaxPlanes] = {};
+    for (uint32_t i = 0; i < decoded; ++i)
+      HleTextureHasNonzeroData(*dc.planes[i], &nz[i]);
+    REXLOG_INFO("d3d9: Bink planes ready #{}: {} planes, luma {}x{}, alpha {};"
+                " nonzero bytes Y={} Cr={} Cb={} A={}",
+                s_ok, decoded, dc.planes[0]->width, dc.planes[0]->height,
+                dc.yuv_has_alpha, nz[0], nz[1], nz[2], nz[3]);
+  }
+  return true;
 }
 
 bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,

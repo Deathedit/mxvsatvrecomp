@@ -267,7 +267,12 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
           // Spelled out rather than using !colorless, which would also catch
           // kNotTranscoded — those resolved no colour at all and are neither
           // population. The stride gate below drops them regardless.
-          const bool colorless = d.color_source == CS::kNone && !d.texture;
+          // `!d.texture` alone was wrong once draws could carry a plane set
+          // instead: the Bink composite has no vertex colour and no single
+          // texture, so it read as colourless and was filtered out entirely.
+          // It is textured — its textures just live in `planes`.
+          const bool colorless =
+              d.color_source == CS::kNone && !d.texture && !d.yuv_composite;
           const bool colored = d.color_source == CS::kPacked ||
                                d.color_source == CS::kFallback;
           if ((REXCVAR_GET(hide_colorless_draws) && colorless) ||
@@ -330,7 +335,9 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   d->texture, d->render_target_object,
                                   d->render_target_width,
                                   d->render_target_height,
-                                  d->sampled_render_target_object);
+                                  d->sampled_render_target_object,
+                                  d->planes.data(), d->plane_count,
+                                  d->yuv_has_alpha);
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;

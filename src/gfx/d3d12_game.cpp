@@ -20,6 +20,7 @@
 #include "gpu/hle_types.h"
 
 #include <cstring>
+#include <string>
 #include <algorithm>
 #include <unordered_set>
 #include <utility>
@@ -38,6 +39,9 @@ static_assert(static_cast<int>(mx::hle::HostTopology::kPointList) ==
                   D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP,
               "HostTopology has drifted from D3D_PRIMITIVE_TOPOLOGY");
 
+static_assert(kMaxDrawPlanes == mx::hle::DrawCall::kMaxPlanes,
+              "renderer plane budget has drifted from DrawCall::kMaxPlanes");
+
 using mx::gfx::CompileShader;
 using mx::gfx::LogError;
 using mx::gfx::LogInfo;
@@ -49,7 +53,9 @@ bool D3D12Renderer::CreateGamePipeline() {
   auto psBlob = CompileShader(mx::gfx::shaders::kGamePS, "ps_5_0", "main");
   auto texturePsBlob = CompileShader(mx::gfx::shaders::kGameTexturePS,
                                      "ps_5_0", "main");
-  if (!vsBlob || !psBlob || !texturePsBlob) {
+  auto yuvPsBlob = CompileShader(mx::gfx::shaders::kGameYuvPS, "ps_5_0",
+                                 "main");
+  if (!vsBlob || !psBlob || !texturePsBlob || !yuvPsBlob) {
     LogError("CreateGamePipeline: shader compilation failed");
     return false;
   }
@@ -57,7 +63,11 @@ bool D3D12Renderer::CreateGamePipeline() {
 
   D3D12_DESCRIPTOR_RANGE srvRange = {};
   srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-  srvRange.NumDescriptors = 1;
+  // Four, for Bink's Y/Cr/Cb + alpha plane set. Single-texture draws still
+  // point the table at their own descriptor and read only t0; the three slots
+  // that follow belong to other textures and are never sampled, so they only
+  // have to exist inside the heap.
+  srvRange.NumDescriptors = kMaxDrawPlanes;
   srvRange.BaseShaderRegister = 0;
   srvRange.RegisterSpace = 0;
   srvRange.OffsetInDescriptorsFromTableStart = 0;
@@ -143,10 +153,14 @@ bool D3D12Renderer::CreateGamePipeline() {
     const bool depth_write = depth_enable && (i & 2u) != 0;
     const bool color_write = (i & 4u) == 0;
     const bool textured = (i & 8u) != 0;
-    pso.PS.pShaderBytecode = textured ? texturePsBlob->GetBufferPointer()
-                                      : psBlob->GetBufferPointer();
-    pso.PS.BytecodeLength = textured ? texturePsBlob->GetBufferSize()
-                                     : psBlob->GetBufferSize();
+    const bool yuv = (i & 16u) != 0;
+    // A YUV variant that is not also textured would have no descriptor table
+    // bound, so it is never selected and is skipped rather than created.
+    if (yuv && !textured) continue;
+    ID3DBlob* ps = yuv ? yuvPsBlob.Get()
+                       : (textured ? texturePsBlob.Get() : psBlob.Get());
+    pso.PS.pShaderBytecode = ps->GetBufferPointer();
+    pso.PS.BytecodeLength = ps->GetBufferSize();
     pso.DepthStencilState = {};
     pso.DepthStencilState.DepthEnable = depth_enable;
     pso.DepthStencilState.DepthWriteMask = depth_write
@@ -203,6 +217,11 @@ bool D3D12Renderer::CreateGamePipeline() {
       return false;
     m_gameSrvDescriptorSize = m_device->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    // Descriptors 0..kMaxPlanes-1 belong to the video plane set, which is
+    // rewritten every frame rather than cached; the general allocator starts
+    // above them.
+    m_nextGameSrvDescriptor =
+        kYuvPlaneDescriptorBase + kMaxDrawPlanes;
   }
 
   UINT ibSize = sizeof(idx);
@@ -270,6 +289,160 @@ bool D3D12Renderer::CreateGamePipeline() {
 
   m_hasGamePipeline = true;
   LogInfo("CreateGamePipeline: done");
+  return true;
+}
+
+// Uploads Bink's plane set into reusable host textures and writes their SRVs
+// into the reserved descriptors at the head of the heap. A plane's resource is
+// recreated only when its dimensions change, so steady-state playback creates
+// nothing per frame; only the staging copy happens each time.
+bool D3D12Renderer::EnsureYuvPlanes(const GameDraw& draw) {
+  if (!m_gameSrvHeap || draw.planeCount < 3) return false;
+  const uint32_t kPlanes = kMaxDrawPlanes;
+
+  for (uint32_t i = 0; i < kPlanes; ++i) {
+    // Slot 3 with no alpha plane gets a 1x1 white stand-in so the shader can
+    // sample t3 unconditionally. It is built as a one-pixel payload rather
+    // than special-cased through the whole upload path below.
+    std::shared_ptr<const mx::hle::HleTexturePayload> src;
+    if (i < draw.planeCount && draw.planes[i]) {
+      src = draw.planes[i];
+    } else {
+      static std::shared_ptr<const mx::hle::HleTexturePayload> s_white = [] {
+        auto p = std::make_shared<mx::hle::HleTexturePayload>();
+        p->width = p->height = 1;
+        p->row_pitch = 1;
+        p->format = mx::hle::HostTextureFormat::kR8;
+        p->data.assign(1, uint8_t(0xFF));
+        return p;
+      }();
+      src = s_white;
+    }
+    if (src->data.empty()) return false;
+
+    auto& plane = m_yuvPlanes[i];
+    const DXGI_FORMAT format = DXGI_FORMAT_R8_UNORM;
+    if (!plane.resource || plane.width != src->width ||
+        plane.height != src->height || plane.format != format) {
+      // Retire the old resources through the deferred-release list rather than
+      // dropping them here: the GPU may still be reading last frame's plane.
+      // See RetiredFrame in the header — a command list does not keep the
+      // resources it references alive.
+      RetiredFrame& r =
+          (!m_retired.empty() && m_retired.back().fence == m_fenceValue)
+              ? m_retired.back()
+              : m_retired.emplace_back(RetiredFrame{m_fenceValue, {}});
+      if (plane.resource) r.res.push_back(std::move(plane.resource));
+      for (auto& up : plane.upload) {
+        if (up) r.res.push_back(std::move(up));
+        up.Reset();
+      }
+      plane.resource.Reset();
+
+      D3D12_RESOURCE_DESC td = {};
+      td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+      td.Width = src->width;
+      td.Height = src->height;
+      td.DepthOrArraySize = 1;
+      td.MipLevels = 1;
+      td.Format = format;
+      td.SampleDesc.Count = 1;
+      td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+      D3D12_HEAP_PROPERTIES defaultHeap = {};
+      defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+      if (FAILED(m_device->CreateCommittedResource(
+              &defaultHeap, D3D12_HEAP_FLAG_NONE, &td,
+              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+              IID_PPV_ARGS(&plane.resource))))
+        return false;
+      plane.width = src->width;
+      plane.height = src->height;
+      plane.format = format;
+
+      D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+      srv.Format = format;
+      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      srv.Texture2D.MipLevels = 1;
+      auto cpu = m_gameSrvHeap->GetCPUDescriptorHandleForHeapStart();
+      cpu.ptr += SIZE_T(kYuvPlaneDescriptorBase + i) * m_gameSrvDescriptorSize;
+      m_device->CreateShaderResourceView(plane.resource.Get(), &srv, cpu);
+    }
+
+    D3D12_RESOURCE_DESC td = plane.resource->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+    UINT rows = 0;
+    UINT64 rowBytes = 0, uploadBytes = 0;
+    m_device->GetCopyableFootprints(&td, 0, 1, 0, &footprint, &rows, &rowBytes,
+                                    &uploadBytes);
+    auto& upload = plane.upload[m_frameIndex];
+    if (!upload) {
+      D3D12_RESOURCE_DESC bd = {};
+      bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+      bd.Width = uploadBytes;
+      bd.Height = 1;
+      bd.DepthOrArraySize = 1;
+      bd.MipLevels = 1;
+      bd.Format = DXGI_FORMAT_UNKNOWN;
+      bd.SampleDesc.Count = 1;
+      bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+      D3D12_HEAP_PROPERTIES uploadHeap = {};
+      uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+      if (FAILED(m_device->CreateCommittedResource(
+              &uploadHeap, D3D12_HEAP_FLAG_NONE, &bd,
+              D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+              IID_PPV_ARGS(&upload))))
+        return false;
+    }
+    uint8_t* mapped = nullptr;
+    if (FAILED(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped))))
+      return false;
+    const uint32_t copyRows =
+        std::min<uint32_t>(rows, src->row_pitch
+                                     ? uint32_t(src->data.size() / src->row_pitch)
+                                     : 0);
+    const size_t copyBytes = std::min<size_t>(src->row_pitch, size_t(rowBytes));
+    for (uint32_t y = 0; y < copyRows; ++y) {
+      std::memcpy(
+          mapped + footprint.Offset + size_t(y) * footprint.Footprint.RowPitch,
+          src->data.data() + size_t(y) * src->row_pitch, copyBytes);
+    }
+    upload->Unmap(0, nullptr);
+
+    D3D12_RESOURCE_BARRIER toCopy = {};
+    toCopy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    toCopy.Transition.pResource = plane.resource.Get();
+    toCopy.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    toCopy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    toCopy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    m_commandList->ResourceBarrier(1, &toCopy);
+
+    D3D12_TEXTURE_COPY_LOCATION dst = {};
+    dst.pResource = plane.resource.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+    srcLoc.pResource = upload.Get();
+    srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    srcLoc.PlacedFootprint = footprint;
+    m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &srcLoc, nullptr);
+
+    D3D12_RESOURCE_BARRIER toRead = toCopy;
+    toRead.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    toRead.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    m_commandList->ResourceBarrier(1, &toRead);
+  }
+
+  static uint64_t s_frames = 0;
+  if (++s_frames <= 4 || (s_frames % 300) == 0) {
+    char message[192];
+    std::snprintf(message, sizeof(message),
+                  "yuv planes uploaded %llu: %ux%u luma, %u planes, alpha %d",
+                  static_cast<unsigned long long>(s_frames), m_yuvPlanes[0].width,
+                  m_yuvPlanes[0].height, draw.planeCount,
+                  draw.yuvHasAlpha ? 1 : 0);
+    LogInfo(message);
+  }
   return true;
 }
 
@@ -666,6 +839,14 @@ void D3D12Renderer::RenderGameFrame() {
         }
       }
     }
+    // Bink's plane set takes precedence: it is several textures at once and
+    // cannot go through the single-descriptor path below.
+    bool yuv = false;
+    if (d.yuvComposite && EnsureYuvPlanes(d)) {
+      yuv = true;
+      textured = true;
+      textureDescriptor = kYuvPlaneDescriptorBase;
+    }
     if (!textured)
       textured = EnsureGameTexture(d.texture, textureDescriptor);
 
@@ -678,7 +859,8 @@ void D3D12Renderer::RenderGameFrame() {
     const uint32_t pso_index = (depthEnable ? 1u : 0u) |
                                (depthWrite ? 2u : 0u) |
                                (d.colorWrite ? 0u : 4u) |
-                               (textured ? 8u : 0u);
+                               (textured ? 8u : 0u) |
+                               (yuv ? 16u : 0u);
     m_commandList->SetPipelineState(m_gamePSOs[pso_index].Get());
     // Each translated draw brings its own transform; a draw whose cb failed to
     // allocate falls back to the identity matrix rather than being dropped.
@@ -686,8 +868,13 @@ void D3D12Renderer::RenderGameFrame() {
     m_commandList->SetGraphicsRootConstantBufferView(0,
                                                      cb->GetGPUVirtualAddress());
     if (textured) {
+      // The table declares kMaxPlanes descriptors, so its base must leave that
+      // many inside the heap. A single-texture draw reads only the first.
+      const uint32_t maxBase =
+          kMaxGameTextures - kMaxDrawPlanes;
       auto gpu = m_gameSrvHeap->GetGPUDescriptorHandleForHeapStart();
-      gpu.ptr += UINT64(textureDescriptor) * m_gameSrvDescriptorSize;
+      gpu.ptr += UINT64(std::min(textureDescriptor, maxBase)) *
+                 m_gameSrvDescriptorSize;
       m_commandList->SetGraphicsRootDescriptorTable(1, gpu);
     }
     m_commandList->IASetPrimitiveTopology(d.topology);
@@ -758,7 +945,9 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  std::shared_ptr<const mx::hle::HleTexturePayload> texture,
                                  uint32_t targetObject, uint32_t targetWidth,
                                  uint32_t targetHeight,
-                                 uint32_t sampledTargetObject) {
+                                 uint32_t sampledTargetObject,
+                                 const std::shared_ptr<const mx::hle::HleTexturePayload>* planes,
+                                 uint32_t planeCount, bool yuvHasAlpha) {
   // PERF(per-frame-allocs): this creates three ID3D12Resource's per call (VB +
   // IB + CB) on the UPLOAD heap, and is called once per submitted draw rather
   // than once per frame, so the allocation rate scales with the draw count —
@@ -828,6 +1017,13 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.targetWidth = targetWidth;
   d.targetHeight = targetHeight;
   d.sampledTargetObject = sampledTargetObject;
+  if (planes && planeCount >= 3) {
+    d.planeCount = std::min<uint32_t>(planeCount,
+                                      kMaxDrawPlanes);
+    for (uint32_t i = 0; i < d.planeCount; ++i) d.planes[i] = planes[i];
+    d.yuvHasAlpha = yuvHasAlpha;
+    d.yuvComposite = true;
+  }
 
   // Carry the translator's transform. Without this the draw renders under the
   // identity matrix baked into m_gameCB, which makes a correct transform and a

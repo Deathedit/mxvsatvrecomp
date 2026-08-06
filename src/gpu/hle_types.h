@@ -3,6 +3,7 @@
 #include "gpu/shader_alu.h"
 #include "gpu/shader_ucode.h"
 
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -144,6 +145,25 @@ struct DrawCall {
   uint32_t sampled_texture_width = 0;
   uint32_t sampled_texture_height = 0;
   std::shared_ptr<const HleTexturePayload> texture;
+
+  // The Bink frame composite binds several textures at once — Y, Cr and Cb
+  // planes plus an optional alpha plane — which the single `texture` above
+  // cannot express. Measured shape, 3/3 runs: Y at full resolution, chroma at
+  // half, every plane k_8.
+  //
+  // These deliberately bypass the g_hleCpuTextures cache: the planes are new
+  // guest memory every video frame, so caching them by payload key would grow
+  // the cache and the renderer's descriptor heap without bound. They are
+  // decoded fresh per frame and uploaded into reusable host textures.
+  static constexpr uint32_t kMaxPlanes = 4;
+  std::array<std::shared_ptr<const HleTexturePayload>, kMaxPlanes> planes;
+  uint32_t plane_count = 0;
+  // Set only when the bound pixel shader is one of the guest's own two Bink
+  // composite shaders, read from its globals — an exact identity, not a guess.
+  bool yuv_composite = false;
+  // True when the guest bound a fourth plane, which selects its alpha-capable
+  // pixel shader.
+  bool yuv_has_alpha = false;
 
   // Where TranscodeVertices got this draw's vertex colour, so LogSurface can
   // cross-tabulate it against the surface. Carried on the draw rather than

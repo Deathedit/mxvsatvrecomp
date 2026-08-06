@@ -24,6 +24,12 @@
 
 namespace mx::hle { struct HleTexturePayload; }
 
+// Bink's Y/Cr/Cb + optional alpha plane set: the largest number of textures a
+// single draw binds. Declared here rather than including hle_types.h, which
+// this header deliberately does not; d3d12_game.cpp static_asserts that the
+// two agree.
+inline constexpr uint32_t kMaxDrawPlanes = 4;
+
 class D3D12Renderer {
  public:
   D3D12Renderer() = default;
@@ -55,7 +61,10 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  std::shared_ptr<const mx::hle::HleTexturePayload> texture = {},
                  uint32_t targetObject = 0, uint32_t targetWidth = 0,
                  uint32_t targetHeight = 0,
-                 uint32_t sampledTargetObject = 0);
+                 uint32_t sampledTargetObject = 0,
+                 const std::shared_ptr<const mx::hle::HleTexturePayload>* planes
+                     = nullptr,
+                 uint32_t planeCount = 0, bool yuvHasAlpha = false);
 
 // Drop the previous frame's draws and retire the startup placeholder. Called
 // when a real guest-frame handoff arrives, including one whose draws are all
@@ -103,6 +112,13 @@ void ClearGameDraws();
 
   bool CreateGamePipeline();
   bool CreateGameRenderTargets();
+  // Uploads the Bink plane set into reusable host textures and writes their
+  // SRVs into the four descriptors reserved at the head of the heap. Separate
+  // from EnsureGameTexture because these planes are new content every video
+  // frame: the keyed cache would grow without bound, and the descriptor heap
+  // with it.
+  struct GameDraw;
+  bool EnsureYuvPlanes(const GameDraw& draw);
   bool EnsureGameTexture(const std::shared_ptr<const mx::hle::HleTexturePayload>& texture,
                          uint32_t& descriptorIndex);
   struct GameRenderTarget;
@@ -143,8 +159,8 @@ void ClearGameDraws();
 
   Microsoft::WRL::ComPtr<ID3D12RootSignature> m_gameRootSig;
   // Indexed by depth-enable bit 0, depth-write bit 1, no-colour bit 2,
-  // textured bit 3.
-  std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, 16> m_gamePSOs;
+  // textured bit 3, YUV composite bit 4.
+  std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, 32> m_gamePSOs;
   Microsoft::WRL::ComPtr<ID3D12Resource> m_gameVB;
   Microsoft::WRL::ComPtr<ID3D12Resource> m_gameIB;
   Microsoft::WRL::ComPtr<ID3D12Resource> m_gameCB;
@@ -159,6 +175,20 @@ void ClearGameDraws();
     uint32_t descriptorIndex = 0;
   };
   std::unordered_map<uint64_t, GameTexture> m_gameTextures;
+  // Descriptors 0..kMaxPlanes-1 are reserved for the video plane set, so the
+  // general allocator starts above them.
+  static constexpr uint32_t kYuvPlaneDescriptorBase = 0;
+  struct YuvPlane {
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    // One staging buffer per frame in flight: the plane is rewritten every
+    // frame, and MoveToNextFrame only guarantees the frame kFrameCount ago has
+    // retired.
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kFrameCount> upload;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+  };
+  std::array<YuvPlane, kMaxDrawPlanes> m_yuvPlanes;
   D3D12_VERTEX_BUFFER_VIEW m_gameVbv = {};
   D3D12_INDEX_BUFFER_VIEW m_gameIbv = {};
   uint32_t m_gameIndexCount = 0;
@@ -184,6 +214,12 @@ void ClearGameDraws();
     uint32_t targetWidth = 0;
     uint32_t targetHeight = 0;
     uint32_t sampledTargetObject = 0;
+    // Bink's Y/Cr/Cb (+ optional alpha) plane set, bound together.
+    std::array<std::shared_ptr<const mx::hle::HleTexturePayload>,
+               kMaxDrawPlanes> planes;
+    uint32_t planeCount = 0;
+    bool yuvHasAlpha = false;
+    bool yuvComposite = false;
   };
   // Bounded because each entry costs three CreateCommittedResource calls — see
   // the PERF(per-frame-allocs) note in d3d12_game.cpp.
