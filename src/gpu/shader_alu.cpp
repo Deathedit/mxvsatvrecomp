@@ -145,20 +145,33 @@ class Interpreter {
   // so this stays a read accessor.
   Vec4 Const(uint32_t index) const {
     Vec4 r;
-    ++const_reads;
-    if (index < const_min_index) const_min_index = index;
-    if (index > const_max_index) const_max_index = index;
     const uint32_t base = index * 4;
-    if (!in_.alu_consts || base + 4 > in_.alu_const_dwords) {
-      ++const_zero_reads;
-      return r;
+    const bool out_of_range = !in_.alu_consts || base + 4 > in_.alu_const_dwords;
+    if (!out_of_range) {
+      for (int i = 0; i < 4; ++i)
+        std::memcpy(&r[i], &in_.alu_consts[base + i], 4);
     }
-    for (int i = 0; i < 4; ++i) std::memcpy(&r[i], &in_.alu_consts[base + i], 4);
-    if (r[0] == 0.0f && r[1] == 0.0f && r[2] == 0.0f && r[3] == 0.0f)
-      ++const_zero_reads;
+    // The value is produced either way; only the accounting is conditional.
+    if (counting_) {
+      ++const_reads;
+      if (index < const_min_index) const_min_index = index;
+      if (index > const_max_index) const_max_index = index;
+      if (out_of_range ||
+          (r[0] == 0.0f && r[1] == 0.0f && r[2] == 0.0f && r[3] == 0.0f))
+        ++const_zero_reads;
+    }
     return r;
   }
 
+  // Whether a constant read should be counted. NOT whether it happens — the
+  // value is still produced, this only governs the instrumentation.
+  //
+  // An operand the opcode does not consume still has a register field, holding
+  // whatever the assembler left there, and 0xFF is common. Counting those is
+  // what produced a long-running "this shader reads c255 and gets zero" signal:
+  // c255 is genuinely unwritten (nothing publishes it, see AGENTS.md), so every
+  // unused operand looked like a real read returning zero.
+  mutable bool counting_ = true;
   mutable uint32_t const_reads = 0;
   mutable uint32_t const_zero_reads = 0;
   mutable uint32_t const_min_index = 0xFFFFFFFF;
@@ -243,12 +256,32 @@ class Interpreter {
     return ClampAddress(std::floor(f + 0.5f));
   }
 
+  // Vector opcodes reading src1 only. src2 is still evaluated below — the
+  // result is discarded — but must not be counted as a constant read.
+  static bool VectorOpUsesSrc2(uc::AluVectorOpcode op) {
+    using Op = uc::AluVectorOpcode;
+    switch (op) {
+      case Op::kFrc:
+      case Op::kTrunc:
+      case Op::kFloor:
+      case Op::kMax4:
+        return false;
+      default:
+        // kMaxA and kDst do read src2, as does everything else handled here.
+        return true;
+    }
+  }
+
   Vec4 VectorOp(const uc::AluInstruction& alu) {
     Vec4 r;
-    const Vec4 a = Src(alu, 1);
-    const Vec4 b = Src(alu, 2);
     using Op = uc::AluVectorOpcode;
     const Op op = alu.vector_opcode();
+    const Vec4 a = Src(alu, 1);
+    const bool count_src2 = counting_ && VectorOpUsesSrc2(op);
+    const bool outer = counting_;
+    counting_ = count_src2;
+    const Vec4 b = Src(alu, 2);
+    counting_ = outer;
     // src3 is only read where the opcode actually has a third operand — the
     // same discipline the export tracer needed, for the same reason.
     switch (op) {
@@ -446,9 +479,20 @@ class Interpreter {
     // Evaluate both halves. They read the register file before either writes,
     // which is the co-issue semantics.
     Vec4 vres;
+    bool in_counting = true;
     float sres = ps_;
     const bool has_vector = vmask != 0 || alu.is_export();
-    if (has_vector) vres = VectorOp(alu);
+    if (has_vector) {
+      // VectorOp still runs when vmask is 0 and this is an export — kMaxA's
+      // address-register side effect depends on it. But nothing consumes vres
+      // in that case (the write loop only takes it under `vmask & bit`), so the
+      // operands are not counted. An export writing only constant 0/1, such as
+      // position.w = 1, is exactly this shape and is very common.
+      in_counting = counting_;
+      counting_ = vmask != 0;
+      vres = VectorOp(alu);
+      counting_ = in_counting;
+    }
     if (smask != 0) sres = ScalarOp(alu);
     if (status != AluStatus::kOk) return;
 

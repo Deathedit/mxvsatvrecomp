@@ -1311,12 +1311,14 @@ constexpr uint32_t kVsInfoCodeOffset = 0x368;  // CF byte offset in the allocati
 constexpr uint32_t kVsInfoCodeSize = 0x36C;    // program length in bytes
 uint64_t g_vsWindowAgree = 0, g_vsWindowDisagree = 0, g_vsWindowNoField = 0;
 uint64_t g_vsWindowAtDest = 0, g_vsWindowEarly = 0, g_vsWindowLate = 0;
+uint64_t g_vsWindowLenRejected = 0;
 
 struct PatchedCode {
   std::vector<uint32_t> code;   // host-endian, from dest - kPatchWindowBack*4
   uint32_t expect_fetches = 0;  // what the binding table said
   uint32_t variant = 0;
   uint32_t code_off = 0;        // dwords into `code` where the CF section is
+  uint32_t code_len_dwords = 0;  // real program length, 0 = unknown
   bool     resolved = false;    // code_off was found by decoding, not assumed
 };
 
@@ -3429,9 +3431,17 @@ void CapturePatchedCode(uint32_t self, uint32_t dest, uint32_t variant,
   //
   // Measurement only. Nothing here changes what is captured — if the field is
   // right, the search is still what runs until a separate change says so.
-  if (pc.resolved && REXCVAR_GET(hle_capture)) {
+  // The program length, read unconditionally — it bounds the code handed to the
+  // decoders and so is not a diagnostic. Only the reporting below is gated.
+  //
+  // The length is the canonical program's, and 2520 of 2561 captures patch into
+  // a buffer other than the shader's own allocation. Taken as applying to the
+  // patched copy anyway: patching rewrites fetch instructions in place and
+  // cannot change the instruction count. If that were wrong the bound would cut
+  // a shader short and the fetch decode would fail loudly rather than silently.
+  uint32_t field_abs = 0, field_len = 0;
+  {
     const uint32_t info_at = self + kVsInfoOffsetAt + variant * 8;
-    uint32_t field_abs = 0, field_len = 0;
     if (HostPageReadable(REX_RAW_ADDR(info_at)) &&
         HostPageReadable(REX_RAW_ADDR(self + kVsCodeAllocAt))) {
       const uint32_t info = self + REX_LOAD_U32(info_at);
@@ -3441,6 +3451,23 @@ void CapturePatchedCode(uint32_t self, uint32_t dest, uint32_t variant,
         field_len = REX_LOAD_U32(info + kVsInfoCodeSize);
       }
     }
+  }
+  // Trim the captured window to the real program. Without this the ALU
+  // interpreter and the fetch decoder are handed everything to the end of the
+  // capture — 256 dwords past dest — while measured programs run 24 to 174, so
+  // a walk that does not stop on its own continues into the next shader in the
+  // ring.
+  if (pc.resolved && field_len && (field_len & 3) == 0) {
+    const size_t want = pc.code_off + field_len / 4;
+    if (want >= 8 && want <= pc.code.size()) {
+      pc.code.resize(want);
+      pc.code_len_dwords = field_len / 4;
+    } else {
+      ++g_vsWindowLenRejected;
+    }
+  }
+
+  if (pc.resolved && REXCVAR_GET(hle_capture)) {
     const uint32_t search_abs = start + pc.code_off * 4;
     // Two independent questions, kept apart because they have different
     // answers. Where the CF starts: dest, in 24 of 24 measured. Whether the
@@ -3468,9 +3495,10 @@ void CapturePatchedCode(uint32_t self, uint32_t dest, uint32_t variant,
     if ((seen % 512) == 1) {
       REXLOG_INFO(
           "d3d9: vs code window: CF at dest {} early {} late {}; shader alloc "
-          "is the patched buffer {} of {} (other buffer {}, unreadable {})",
+          "is the patched buffer {} of {} (other buffer {}, unreadable {}); "
+          "length rejected {}",
           g_vsWindowAtDest, g_vsWindowEarly, g_vsWindowLate, g_vsWindowAgree,
-          seen, g_vsWindowDisagree, g_vsWindowNoField);
+          seen, g_vsWindowDisagree, g_vsWindowNoField, g_vsWindowLenRejected);
     }
   }
   // A ring-window read is inherently transient: the destination may wrap or

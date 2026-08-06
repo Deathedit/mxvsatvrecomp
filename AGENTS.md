@@ -577,6 +577,27 @@ the same decode, not assumed — removed the failure mode: **off-dest resolution
 It did **not** explain the c255 read. Shaders whose ALU probe reads index 255
 went 91/136 to 81/128, which is noise. That stays open.
 
+**The c255 reads are real, and the ALU index decode is not at fault.** Checked
+in this order and all negative: the index is `src_reg & 0xFF` off the SDK's
+Xenia-derived accessors, which are correct; the exec walk honours the sequence
+bits so fetches are not decoded as ALU; and two genuine over-counting paths were
+found and fixed (`Src(alu, 2)` evaluated for the src1-only opcodes kFrc/kTrunc/
+kFloor/kMax4, and `VectorOp` running under `is_export()` with `vmask == 0`,
+where nothing consumes the result). Fixing both moved incidence 81/128 to
+72/128 — i.e. not at all.
+
+What the measurement does show is that the index range is **bimodal**, with only
+two values across 128 probes: `76..79` (56 shaders, ordinary) and `255..255`
+(72 shaders, reading exactly one constant and nothing else). The second
+population is the one-instruction compositor shader this file describes. So
+those shaders really do read c255, which nothing writes, and hardware would have
+read zero from it too.
+
+That makes the remaining possibilities narrow: either c255 is published by a
+D3D9 path that writes the ring directly rather than the device shadow (the
+flush in `sub_82565928` does make such writes), or the constant file the
+interpreter is handed is not the one those draws execute against.
+
 **The CF stream does not start at the beginning of the code allocation.** Big
 shaders carry a prologue that reads as zeros; small ones start at 0. That is
 not a fixed 64-byte header to be inferred from a histogram — it is the field
