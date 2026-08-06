@@ -87,6 +87,7 @@ constexpr uint32_t kD3d9ConstRegs = 256;
 
 uint64_t g_indexed_draws = 0;
 uint64_t g_draws = 0;
+uint64_t g_up_draws = 0;
 uint64_t g_decls = 0;
 uint64_t g_patchCalls = 0;
 
@@ -945,11 +946,28 @@ bool FinishHleDraw(mx::hle::DrawCall& dc) {
 
 void FinalizePendingD3D9DrawsImpl(uint8_t* base);
 
+// Vertex data supplied inline by D3DDevice_DrawVerticesUP rather than through
+// a bound stream. That call is semantically "bind stream 0 to this pointer with
+// this stride and draw", so it is modelled as exactly that below instead of
+// carving a second path through BuildHleDraw.
+struct UpVertexData {
+  uint32_t address = 0;
+  uint32_t stride = 0;
+  uint32_t size_bytes = 0;
+};
+
 void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
                        uint32_t count, int32_t base_vertex, uint32_t device,
-                       uint8_t* base) {
+                       uint8_t* base, const UpVertexData* up = nullptr) {
   using namespace mx::hle;
   const auto& st = DeviceState();
+
+  // Before any early return. This probe previously sat after BuildHleDraw, so
+  // a draw that failed to translate never reached it — the probe was gated on
+  // the very thing it exists to diagnose, which is the third time that shape
+  // of mistake has cost this branch a round.
+  ProbeBinkComposite(st.ps_seen ? st.pixel_shader : 0,
+                     st.vs_seen ? st.vertex_shader : 0, device, base, count);
 
   HleDrawInputs in;
   in.indexed = indexed;
@@ -962,15 +980,32 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   if (id >= 0 && g_declLayoutOk[id]) in.layout = &g_declLayout[id];
 
   HleStream streams[kMaxStreams];
-  for (uint32_t i = 0; i < kMaxStreams; ++i) {
-    const auto& b = st.stream[i];
-    if (!b.bound || !b.address || !b.size_bytes) continue;
-    streams[i].host = reinterpret_cast<const uint8_t*>(REX_RAW_ADDR(b.address));
-    streams[i].size_bytes = b.size_bytes;
-    streams[i].stride = b.stride;
-    streams[i].offset_bytes = b.offset_bytes;
-    streams[i].endian = b.endian;
-    streams[i].bound = true;
+  if (up) {
+    // No fetch constant exists for a UP draw, so there is no endian field to
+    // read. The bytes were written by the guest CPU and are therefore
+    // big-endian; 8in32 is the swap every bound stream in this game carries
+    // (measured: endian=2 on all of them), and 32-bit position/colour data is
+    // what this path feeds. Stated here rather than buried so that a UP draw
+    // rendering as noise has an obvious first suspect.
+    streams[0].host =
+        reinterpret_cast<const uint8_t*>(REX_RAW_ADDR(up->address));
+    streams[0].size_bytes = up->size_bytes;
+    streams[0].stride = up->stride;
+    streams[0].offset_bytes = 0;
+    streams[0].endian = 2;
+    streams[0].bound = true;
+  } else {
+    for (uint32_t i = 0; i < kMaxStreams; ++i) {
+      const auto& b = st.stream[i];
+      if (!b.bound || !b.address || !b.size_bytes) continue;
+      streams[i].host =
+          reinterpret_cast<const uint8_t*>(REX_RAW_ADDR(b.address));
+      streams[i].size_bytes = b.size_bytes;
+      streams[i].stride = b.stride;
+      streams[i].offset_bytes = b.offset_bytes;
+      streams[i].endian = b.endian;
+      streams[i].bound = true;
+    }
   }
   in.streams = streams;
 
@@ -1062,9 +1097,6 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     dc.surface_pitch = rt.surface_info & 0x3FFFu;
   }
   ProbePixelProfileForDraw(st.ps_seen ? st.pixel_shader : 0, device, base, dc);
-  ProbeBinkComposite(st.ps_seen ? st.pixel_shader : 0,
-                     st.vs_seen ? st.vertex_shader : 0, device, base,
-                     dc.vertex_count);
   const bool have_texture =
       PrepareDrawTexture(dc, st.ps_seen ? st.pixel_shader : 0, device, base,
                          texture_binding);
@@ -4206,15 +4238,20 @@ void ReportDeclHistogram() {
   }
 }
 
-// Both draw entry points report through here so the two counters are always
+// All three draw entry points report through here so the counters are always
 // read together. A 150s run reaches 5000-10000 transcoded draws, so a coarser
 // cadence than 2500 reports nothing at all — the first output-merger probe was
 // lost to exactly that.
+//
+// DrawVerticesUP was added 2026-08-07. It had been unhooked since the start,
+// so every draw total this project has ever quoted excluded it — including the
+// Bink video composite, which is why no video ever reached the screen.
 void ReportDrawCounts(uint8_t* base) {
-  const uint64_t total = g_indexed_draws + g_draws;
+  const uint64_t total = g_indexed_draws + g_draws + g_up_draws;
   if ((total % kDrawReportEvery) != 0) return;
-  REXLOG_INFO("d3d9: draws — DrawIndexedVertices={} DrawVertices={} total={}",
-              g_indexed_draws, g_draws, total);
+  REXLOG_INFO("d3d9: draws — DrawIndexedVertices={} DrawVertices={} "
+              "DrawVerticesUP={} total={}",
+              g_indexed_draws, g_draws, g_up_draws, total);
   ReportDeclHistogram();
   if (REXCVAR_GET(hle_capture)) ReportCoverage(base);
 }
@@ -4543,6 +4580,71 @@ extern "C" REX_FUNC(sub_825561B0) {
   // vertex shader observable for this same draw.
   BuildAndQueueDraw(/*indexed=*/false, primitive_type, start_vertex,
                     vertex_count, 0, device, base);
+  ReportDrawCounts(base);
+}
+
+//-----------------------------------------------------------------------------
+// 0x82555B88 — D3DDevice_DrawVerticesUP(D3DDevice*, D3DPRIMITIVETYPE,
+//                  UINT VertexCount, const void* pVertexStreamZeroData,
+//                  UINT VertexStreamZeroStride)
+//
+// The third draw entry point, and the one this port had never hooked. It does
+// not call either of the other two: it reserves ring space via sub_825556C8,
+// memcpys VertexCount*Stride bytes of inline vertex data into it, and returns.
+// So no bound stream describes its geometry and nothing downstream would ever
+// have seen these draws.
+//
+// About 30 functions across the engine draw through it — UI, particles, and
+// the Bink frame composite sub_8234C7C0, which is what made its absence
+// visible. See docs/guest_binary.md.
+//
+// The data pointer is frequently a caller stack local (it is in the Bink
+// case), so the bytes are read here, inside the call, while that frame is
+// still live. BuildHleDraw copies them into the DrawCall; nothing retains the
+// pointer.
+//-----------------------------------------------------------------------------
+REX_IMPORT(__imp__sub_82555B88, orig_DrawVerticesUP, void());
+extern "C" REX_FUNC(sub_82555B88) {
+  MX_D3D9_PLUGIN_PASSTHROUGH(orig_DrawVerticesUP);
+  const uint32_t device = ctx.r3.u32;
+  const uint32_t primitive_type = ctx.r4.u32;
+  const uint32_t vertex_count = ctx.r5.u32;
+  const uint32_t vertex_data = ctx.r6.u32;
+  const uint32_t stride = ctx.r7.u32;
+  const uint64_t n = ++g_up_draws;
+  ++mx::hle::D3D9DrawCounter();
+  NoteDrawDeclaration(device, base);
+  if (n <= kMaxDrawsLogged) {
+    auto& f = DeclFile();
+    f << "DrawVerticesUP #" << n << " dev=0x" << std::hex << device << std::dec
+      << " prim=" << primitive_type << " vertex_count=" << vertex_count
+      << " data=0x" << std::hex << vertex_data << std::dec
+      << " stride=" << stride << "\n";
+    f.flush();
+  }
+  if (REXCVAR_GET(hle_capture)) {
+    DeviceState().NoteDevice(device, mx::hle::kEpDraw);
+    SampleFetchConstantFile(device, base);
+  }
+  orig_DrawVerticesUP(ctx, base);
+  // Same ordering as the other two: the original call performs D3D9's lazy
+  // vertex-shader patching, so translating after it returns lets a shader's
+  // first draw use the code captured during this call.
+  const uint64_t bytes = uint64_t(vertex_count) * stride;
+  if (vertex_data && stride && vertex_count && bytes <= 16u * 1024u * 1024u &&
+      HostPageReadable(REX_RAW_ADDR(vertex_data)) &&
+      HostPageReadable(REX_RAW_ADDR(vertex_data + bytes - 1))) {
+    UpVertexData up{vertex_data, stride, uint32_t(bytes)};
+    BuildAndQueueDraw(/*indexed=*/false, primitive_type, /*first=*/0,
+                      vertex_count, 0, device, base, &up);
+  } else {
+    static uint64_t s_unreadable = 0;
+    if (++s_unreadable <= 8) {
+      REXLOG_INFO("d3d9: DrawVerticesUP #{} skipped — data=0x{:08X} count={} "
+                  "stride={} not readable",
+                  n, vertex_data, vertex_count, stride);
+    }
+  }
   ReportDrawCounts(base);
 }
 
