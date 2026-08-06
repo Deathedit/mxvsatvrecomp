@@ -1852,20 +1852,62 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
 void CollectPixelShaderBlob(uint32_t handle, uint8_t* base) {
   (void)base;
   if (!handle || g_psBlobs.count(handle)) return;
-  // D3DDevice_CreatePixelShader copies the source header to object+0x28,
-  // allocates pFunction[2] code bytes separately, and sub_825506B0 stores that
-  // allocation at object+0x18. Thus +0x30 is the exact code size; pixel shader
-  // objects do not share the vertex shader's inline +0x368 representation.
+  // D3DDevice_CreatePixelShader (0x82552148) copies the source header to
+  // object+0x28, allocates pFunction[2] code bytes separately, and
+  // sub_825506B0 stores that allocation at object+0x18. Pixel shader objects
+  // do not share the vertex shader's inline +0x368 representation.
+  //
+  // **The CF stream does not start at the beginning of that allocation.** Big
+  // shaders carry a prologue — the first dwords read as zeros — and only the
+  // small ones begin at dword 0. This used to be worked around by searching
+  // the blob for what PM4 had loaded, and failing that by trying every offset
+  // and accepting a unique valid decode, which left 14 shaders on
+  // "ambiguous CF offset" and no texture bindings at all.
+  //
+  // Neither is needed: the object states where the code begins. From the
+  // shader flush sub_82565928, which is what actually programs the GPU:
+  //
+  //     v22 = *((char *)v8 + v8[16] + 40) + v8[6];        // program base
+  //     *v23 = *((char *)v8 + v8[16] + 44) >> 2;          // size in dwords
+  //
+  // with v8 the shader object, v8[6] = +0x18 (the code allocation) and
+  // v8[16] = +0x40 (the offset of an info block within the object). So the
+  // address D3D9 hands the hardware is
+  //
+  //     *(object+0x18) + *(object + *(object+0x40) + 0x28)
+  //
+  // and its length is *(object + *(object+0x40) + 0x2C). Read out of the
+  // consuming code, never guessed — same rule as every offset in AGENTS.md's
+  // device table. +0x30 is the *allocation* size and is kept only as a bound.
   constexpr uint32_t kPsCodePointerAt = 0x18;
-  constexpr uint32_t kPsCodeSizeAt = 0x30;
+  constexpr uint32_t kPsAllocSizeAt = 0x30;
+  constexpr uint32_t kPsInfoOffsetAt = 0x40;
+  constexpr uint32_t kPsInfoCodeOffset = 0x28;
+  constexpr uint32_t kPsInfoCodeSize = 0x2C;
   if (!HostPageReadable(REX_RAW_ADDR(handle + kPsCodePointerAt)) ||
-      !HostPageReadable(REX_RAW_ADDR(handle + kPsCodeSizeAt)))
+      !HostPageReadable(REX_RAW_ADDR(handle + kPsAllocSizeAt)) ||
+      !HostPageReadable(REX_RAW_ADDR(handle + kPsInfoOffsetAt)))
     return;
-  const uint32_t code = REX_LOAD_U32(handle + kPsCodePointerAt);
-  const uint32_t size_bytes = REX_LOAD_U32(handle + kPsCodeSizeAt);
+  uint32_t code = REX_LOAD_U32(handle + kPsCodePointerAt);
+  uint32_t size_bytes = REX_LOAD_U32(handle + kPsAllocSizeAt);
   if (!size_bytes || size_bytes > kMaxBlobDwords * 4 || (size_bytes & 3))
     return;
   if (!code || !HostPageReadable(REX_RAW_ADDR(code))) return;
+
+  // Narrow the allocation to the program the hardware is actually given. Both
+  // fields are bounds-checked against the allocation rather than trusted: a
+  // bad info offset must degrade to the old whole-allocation behaviour, not
+  // read off the end.
+  const uint32_t info = REX_LOAD_U32(handle + kPsInfoOffsetAt);
+  if (info && info < 0x10000 &&
+      HostPageReadable(REX_RAW_ADDR(handle + info + kPsInfoCodeSize))) {
+    const uint32_t off = REX_LOAD_U32(handle + info + kPsInfoCodeOffset);
+    const uint32_t len = REX_LOAD_U32(handle + info + kPsInfoCodeSize);
+    if ((off & 3) == 0 && (len & 3) == 0 && len && off + len <= size_bytes) {
+      code += off;
+      size_bytes = len;
+    }
+  }
   std::vector<uint32_t> blob(size_bytes / 4);
   for (uint32_t i = 0; i < blob.size(); ++i) {
     const uint32_t at = code + i * 4;

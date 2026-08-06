@@ -424,6 +424,15 @@ Two independent instruments agree, from opposite ends:
   the only one that ever transcodes; `packed` colour is `0:0` on every row of
   the colour x surface table.
 
+**A gate that measures one subsystem does not clear the others.** The run above
+was read as "PM4 contributes nothing to HLE rendering". That was true of
+geometry and **false of pixel shaders**, which had a separate PM4 dependency
+through `CapturedPixelShaders()` — 14 shaders decoded only with the ring live,
+all 14 via its exact key. It was caught only by checking a counter the gate had
+not been designed around. When retiring a subsystem, enumerate its consumers
+first and measure each; a headline number from one of them proves nothing about
+the rest. (That dependency is now gone — see the pixel shader object table.)
+
 **The untranscoded share depends entirely on `--force_load`, so always state
 which.** Measured at equal `done 5000`: with `--force_load=NAT_Farm`,
 `passthrough` is 53232 and the class table reads **93.6-93.8% of draws and
@@ -509,6 +518,32 @@ All read out of the consuming code, never guessed:
 | `device + 10528` | `SQ_PROGRAM_CNTL` (0x2180) shadow | `DrawVertices`: `sub_82564768(device, 0, 8576, device + 10528)` |
 | `device + 1920` / `+ 6016` | VS / PS constant flush shadows | `DrawVertices`: `sub_82564B00(device, dirty, 0x4000, device + 1920)` |
 | `device + 1152 + off` | register shadow patched by shader objects | both shader setters walk an AND/OR list from the shader object |
+
+Pixel shader object (not the device — the `D3DPixelShader*`). `D3DPixelShader`
+is only the 24-byte `D3DResource` base, so IDA renders `pShader[1].Identifier`
+as +0x28 and `pShader[2].ReadFence` as +0x3C:
+
+| Offset | What | Read from |
+|---|---|---|
+| `ps + 0x18` | code allocation | `sub_825506B0` stores it there; `CreatePixelShader` (`0x82552148`) copies `a1[2]` bytes from `a1 + a1[1]` into it |
+| `ps + 0x28` | copy of the source header | `CreatePixelShader`: `sub_82BFB9D8(v7 + 5, a1, a1[1])` |
+| `ps + 0x30` | code **allocation** size — a bound, not the program length | |
+| `ps + 0x3C` | offset of the constant-patch list within the +0x28 header | `SetPixelShader` walks `(ps + 0x28) + *(ps + 0x3C)` |
+| `ps + 0x40` | offset of the program info block | shader flush `sub_82565928` |
+| `*(ps + 0x40) + 0x28` | **byte offset of the CF stream inside the code allocation** | `sub_82565928`: `v22 = *((char*)v8 + v8[16] + 40) + v8[6]` |
+| `*(ps + 0x40) + 0x2C` | program length in bytes (`>> 2` for dwords) | same, `*v23 = *(... + 44) >> 2` |
+
+**The CF stream does not start at the beginning of the code allocation.** Big
+shaders carry a prologue that reads as zeros; small ones start at 0. That is
+not a fixed 64-byte header to be inferred from a histogram — it is the field
+above, and `sub_82565928` is what hands the resulting address to the hardware.
+
+This replaced two workarounds: searching the blob for what PM4 had loaded, and
+failing that, trying every offset and accepting a unique valid decode. Result
+with PM4 off entirely: **40 of 49 pixel shaders decoded against PM4's 37 of
+61, zero "ambiguous CF offset" (was 14), and every remaining rejection is a
+genuine "no texture fetch"**. The seven previously-PM4-only shaders that
+appeared in both runs produce byte-identical bindings.
 
 `SQ_PROGRAM_CNTL` bits: `vs_num_reg[5:0]`, `ps_num_reg[13:8]`, `param_gen[18]`,
 `gen_index_pix[19]`, `vs_export_count[23:20]`, `vs_export_mode[26:24]`,
