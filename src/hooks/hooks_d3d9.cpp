@@ -4411,12 +4411,18 @@ extern "C" REX_FUNC(sub_825508A8) {
   st.NoteDevice(device, mx::hle::kEpSetVertexShader);
   st.vertex_shader = shader;
   st.vs_seen = true;
-  if (REXCVAR_GET(hle_capture)) {
+  const bool capture = REXCVAR_GET(hle_capture);
+  if (capture) {
     DumpVertexShaderObject(shader, base);
   }
   uint32_t before[4] = {};
+  // Behind hle_capture like every other diagnostic here. It is one-shot per
+  // shader and capped, so the cost is small — but "small" is not the rule this
+  // flag enforces. A measurement that runs when nobody asked for it is how a
+  // default run stops being the thing being measured.
   const uint32_t c255_addr = device + kConstantsBase + kC255Offset;
-  const bool probe = shader && HostPageReadable(REX_RAW_ADDR(c255_addr));
+  const bool probe =
+      capture && shader && HostPageReadable(REX_RAW_ADDR(c255_addr));
   if (probe) {
     for (uint32_t i = 0; i < 4; ++i) before[i] = REX_LOAD_U32(c255_addr + i * 4);
   }
