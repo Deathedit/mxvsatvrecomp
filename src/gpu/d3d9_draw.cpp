@@ -103,6 +103,11 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
   // convention the PM4 path uses, and it is recorded so a screenshot can be
   // read against the count.
   const HleInputElement* col = FindUsage(*in.layout, kUsageColor, 0);
+  // Likewise the first texcoord set. Optional for the same reason, and it
+  // defaults to (0,0) — but only untextured draws should ever see that default.
+  // This used to be hardcoded to (0,0) for every vertex of every draw, so every
+  // textured draw sampled one corner texel and came out a flat colour.
+  const HleInputElement* tex = FindUsage(*in.layout, kUsageTexcoord, 0);
 
   auto stream_ok = [&](const HleInputElement* e) -> HleSkip {
     if (!e) return HleSkip::kNone;
@@ -116,6 +121,10 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
   if ((skip = stream_ok(col)) != HleSkip::kNone) {
     // A missing colour stream is not worth losing the geometry over.
     col = nullptr;
+    skip = HleSkip::kNone;
+  }
+  if ((skip = stream_ok(tex)) != HleSkip::kNone) {
+    tex = nullptr;
     skip = HleSkip::kNone;
   }
 
@@ -229,10 +238,19 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
       }
     }
 
+    float t[4] = {0, 0, 0, 0};
+    if (tex) {
+      const HleStream& s = in.streams[tex->stream];
+      if (s.stride <= sizeof(vtx) && CopyVertex(s, src_index, vtx, sizeof(vtx))) {
+        if (!ReadHleElement(vtx, s.stride, *tex, s.endian, t)) {
+          t[0] = t[1] = 0.0f;
+        }
+      }
+    }
+
     std::memcpy(dst + 0, p, 12);       // float3 POSITION
     std::memcpy(dst + 12, c, 16);      // float4 COLOR
-    const float uv[2] = {0.0f, 0.0f};
-    std::memcpy(dst + 28, uv, sizeof(uv));
+    std::memcpy(dst + 28, t, 8);       // float2 TEXCOORD0
   }
 
   if (in.mvp) {
