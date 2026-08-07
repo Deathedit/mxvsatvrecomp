@@ -1905,11 +1905,22 @@ ShaderApplyResult ApplyShaderOutputs(
       return ShaderApplyResult::kFailed;
     }
 
-    // PA_CL_VTE_CNTL is 0x300 in the captured stream: XYZ are already
-    // multiplied by 1/W0. Preserve those post-divide values; reconstructing a
-    // homogeneous W from the export was tested against ST_Southwest and clipped
-    // the entire coloured scene away, so it is not the value D3D12 needs here.
-    const float p[3] = {r.position[0], r.position[1], r.position[2]};
+    // The position export is homogeneous clip space, passed through to the
+    // host untouched. This used to drop w on the claim that PA_CL_VTE_CNTL was
+    // 0x300 — XYZ already multiplied by 1/W0. Measured, that register lives at
+    // device+10572 and reads 0x400 or 0x43F, never 0x300, and bits 8 and 9
+    // (VTX_XY_FMT, VTX_Z_FMT) — the ones that would mean "already divided" —
+    // are clear in every sample. Dropping w scaled all 3D geometry by whatever
+    // it should have divided by, which is why the front end's pre-transformed
+    // 2D (w = 1) was unaffected while everything else blew up.
+    //
+    // Dividing here instead is not enough either, and the earlier note about
+    // this "clipping the entire coloured scene away" is the reason: 1.2 million
+    // vertices per run carry w <= 0, behind the eye. A negative w mirrors the
+    // vertex through the origin rather than removing it, so those triangles
+    // must be clipped against the near plane *before* any divide. D3D12 does
+    // exactly that, in hardware, given clip space — so give it clip space.
+    const float p[4] = {r.position[0], r.position[1], r.position[2], w};
     std::memcpy(transformed.data() + size_t(v) * dc.vertex_stride, p,
                 sizeof(p));
     // Resolved render-target samples intentionally carry no CPU texture
@@ -1939,7 +1950,7 @@ ShaderApplyResult ApplyShaderOutputs(
         }
       }
       if (uv_valid && std::isfinite(uv[0]) && std::isfinite(uv[1])) {
-        std::memcpy(transformed.data() + size_t(v) * dc.vertex_stride + 28,
+        std::memcpy(transformed.data() + size_t(v) * dc.vertex_stride + 32,
                     uv, sizeof(uv));
         uv_min[0] = std::min(uv_min[0], uv[0]);
         uv_min[1] = std::min(uv_min[1], uv[1]);

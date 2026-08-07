@@ -27,7 +27,18 @@
 
 namespace mx::hle {
 
-constexpr uint32_t kHostVertexStride = 36;  // float3 position + float4 colour + float2 UV
+// float4 clip-space position + float4 colour + float2 UV.
+//
+// The position is four components, not three, and that is load-bearing. The
+// guest vertex shader exports homogeneous clip space — PA_CL_VTE_CNTL reads
+// 0x400/0x43F at device+10572, and bits 8/9 (VTX_XY_FMT, VTX_Z_FMT), the ones
+// that would mean "already divided by W0", are clear in every sample. Handing
+// D3D12 clip space lets it clip against the near plane in hardware and do the
+// perspective divide itself. Dividing on the CPU instead cannot represent the
+// w <= 0 vertices at all — measured, 1.2 million of them — because a negative
+// w mirrors the vertex through the origin rather than putting it behind the
+// eye, and it loses perspective-correct interpolation of the UVs as well.
+constexpr uint32_t kHostVertexStride = 40;
 
 //===========================================================================
 // The guest element, as D3D9 on Xenon lays it out.

@@ -248,9 +248,12 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
       }
     }
 
-    std::memcpy(dst + 0, p, 12);       // float3 POSITION
-    std::memcpy(dst + 12, c, 16);      // float4 COLOR
-    std::memcpy(dst + 28, t, 8);       // float2 TEXCOORD0
+    // p[3] is 1 for a declaration position, which is what an untransformed or
+    // pre-transformed vertex needs. ApplyShaderOutputs overwrites all four
+    // components with the shader's own clip-space export where it runs.
+    std::memcpy(dst + 0, p, 16);       // float4 POSITION (clip space)
+    std::memcpy(dst + 16, c, 16);      // float4 COLOR
+    std::memcpy(dst + 32, t, 8);       // float2 TEXCOORD0
   }
 
   if (in.mvp) {

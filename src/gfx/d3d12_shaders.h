@@ -11,7 +11,10 @@ namespace mx::gfx::shaders {
 
 inline constexpr const char* kGameVS = R"(
 struct VSInput {
-  float3 pos : POSITION;
+  // Clip space, straight from the guest vertex shader's position export. The
+  // w component is not decoration: the rasteriser needs it to clip against the
+  // near plane and to interpolate perspective-correctly.
+  float4 pos : POSITION;
   float4 col : COLOR;
   float2 uv  : TEXCOORD0;
 };
@@ -28,7 +31,7 @@ cbuffer GameCB : register(b0) {
 };
 VSOutput main(VSInput input) {
   VSOutput o;
-  o.pos = mul(mvp, float4(input.pos, 1.0));
+  o.pos = mul(mvp, input.pos);
   o.col = input.col;
   o.uv = input.uv;
   return o;
