@@ -1868,6 +1868,38 @@ ShaderApplyResult ApplyShaderOutputs(
   AluResult probe{};
   std::vector<std::array<float, 4>> probe_values;
   bool have_probe = false;
+
+  // Does a VS export feed this interpolator at all, or does the rasterizer
+  // generate it?
+  //
+  // SQ_PROGRAM_CNTL bit 18 (`param_gen`) makes the hardware synthesise an
+  // interpolator holding the screen-space position. It is APPENDED after the
+  // vertex shader's own exports — at register `vs_export_count` — so no export
+  // feeds it and reading exports[] at that index is off the end of what the
+  // shader wrote. The register was already read and logged here; nothing acted
+  // on it, so the UV path indexed straight through and got zeros.
+  //
+  // Measured on the draws that were broken: param_gen=true, vs_export_count=2,
+  // and the fetch names exactly r2. Every vertex read (0,0), so the fullscreen
+  // quad sampled a single texel, every post-process stage output a flat colour,
+  // and the chain converged on a uniform grey.
+  //
+  // The two rejected alternatives are recorded because both looked right:
+  //   - indexing straight through (exports[2]) reads past the shader's exports
+  //     and yields exactly zero;
+  //   - shifting down by one (exports[1]) finds real data, but measuring its
+  //     raw range gives x -1..1, y -1..1, z 16..16, w 16..16 — clip-space
+  //     position and two constants. There is no texture coordinate in the
+  //     exports at all, which is what says the coordinate must be generated.
+  uint32_t uv_export_reg = texture_binding ? texture_binding->src_reg : 0;
+  bool uv_generated = false;
+  if (texture_binding) {
+    SqProgramCntl pc{};
+    if (ReadSqProgramCntl(device, base, &pc) && pc.param_gen &&
+        texture_binding->src_reg == pc.vs_export_count) {
+      uv_generated = true;
+    }
+  }
   for (uint32_t v = 0; v < dc.vertex_count; ++v) {
     if (!referenced[v]) continue;
     const uint64_t src = uint64_t(dc.first_vertex) + v;
@@ -1931,10 +1963,38 @@ ShaderApplyResult ApplyShaderOutputs(
     // are shader outputs and must be populated for both resource paths. The old
     // `dc.texture` guard left every resolved sample at BuildHleDraw's default
     // (0,0), which explains the flat single-texel compositor wedges.
-    if (texture_binding &&
-        texture_binding->src_reg < AluResult::kMaxInterpolators &&
-        (r.export_mask & (1u << texture_binding->src_reg))) {
-      const auto& e = r.exports[texture_binding->src_reg];
+    if (texture_binding && uv_generated) {
+      // The rasterizer's parameter, reconstructed. Its screen-space position is
+      // exactly the viewport transform of the clip-space position this vertex
+      // already carries, so it needs no export and no guesswork: NDC x maps to
+      // u, and NDC y maps to v inverted, because screen y runs downward.
+      //
+      // Written normalized and NOT divided by the texture extent. The fetch is
+      // unnormalized and the hardware parameter is in pixels, but that pixel
+      // count is the render target's, not the sampled texture's — the divide
+      // below uses the sampled extent, and the two are only incidentally equal.
+      // Normalizing here is the same result without depending on that.
+      float uv[2] = {0.0f, 0.0f};
+      const float pw = p[3];
+      if (std::isfinite(pw) && std::abs(pw) > 1.0e-12f) {
+        uv[0] = (p[0] / pw) * 0.5f + 0.5f;
+        uv[1] = 0.5f - (p[1] / pw) * 0.5f;
+      }
+      if (std::isfinite(uv[0]) && std::isfinite(uv[1])) {
+        std::memcpy(transformed.data() + size_t(v) * dc.vertex_stride + 32, uv,
+                    sizeof(uv));
+        uv_min[0] = std::min(uv_min[0], uv[0]);
+        uv_min[1] = std::min(uv_min[1], uv[1]);
+        uv_max[0] = std::max(uv_max[0], uv[0]);
+        uv_max[1] = std::max(uv_max[1], uv[1]);
+        ++uv_vertices;
+      } else {
+        ++uv_missing_export;
+      }
+    } else if (texture_binding &&
+        uv_export_reg < AluResult::kMaxInterpolators &&
+        (r.export_mask & (1u << uv_export_reg))) {
+      const auto& e = r.exports[uv_export_reg];
       const uint32_t sx = (texture_binding->src_swizzle >> 0) & 3u;
       const uint32_t sy = (texture_binding->src_swizzle >> 2) & 3u;
       float uv[2] = {e[sx], e[sy]};
@@ -2008,10 +2068,11 @@ ShaderApplyResult ApplyShaderOutputs(
     if (collapsed_due) s_last_collapsed = now;
     if (++s_uv_reports <= 32 || collapsed_due || (s_uv_reports % 1000) == 0) {
       REXLOG_INFO(
-          "d3d9: HLE UV r{} swiz=0x{:02X} denorm={} wrote {}/{} missing {}; "
-          "range ({:.5g},{:.5g})..({:.5g},{:.5g}) collapsed={} cpu={} "
-          "resolved=0x{:08X} extent={}x{}",
-          texture_binding->src_reg, texture_binding->src_swizzle,
+          "d3d9: HLE UV r{}->e{}{} swiz=0x{:02X} denorm={} wrote {}/{} "
+          "missing {}; range ({:.5g},{:.5g})..({:.5g},{:.5g}) collapsed={} "
+          "cpu={} resolved=0x{:08X} extent={}x{}",
+          texture_binding->src_reg, uv_export_reg,
+          uv_generated ? " GENERATED" : "", texture_binding->src_swizzle,
           texture_binding->unnormalized, uv_vertices, applied_vertices,
           uv_missing_export, uv_min[0], uv_min[1], uv_max[0], uv_max[1],
           collapsed, bool(dc.texture), dc.sampled_render_target_object,
