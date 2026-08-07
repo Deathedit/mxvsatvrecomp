@@ -61,6 +61,13 @@ float4 main(float4 pos : SV_POSITION, float4 col : COLOR) : SV_TARGET {
 // All four planes sample with the same normalized uv: the chroma planes being
 // half-size is handled by the sampler, not by scaling the coordinates.
 //
+// That holds only because PrepareBinkPlanes crops the chroma planes to exactly
+// half the luma extent first. The guest rounds their allocation up — half of a
+// 216-row luma arrives as a 320x112 descriptor — and sampling the padding rows
+// gave zero chroma, which the conversion below turns into a saturated green
+// line along the bottom edge of every video. Do not remove that crop without
+// scaling the chroma uv here instead.
+//
 // BT.601 with the usual 16-235 luma and 16-240 chroma ranges, which is what
 // Bink encodes. If video comes out washed out or too contrasty, this range
 // handling is the first suspect, not the coefficients.

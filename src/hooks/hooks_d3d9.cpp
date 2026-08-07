@@ -2614,6 +2614,37 @@ bool PrepareBinkPlanes(mx::hle::DrawCall& dc, uint32_t device, uint8_t* base) {
     // frame yet, so unlike the immutable path this is not memoised as empty —
     // the same descriptor will carry real pixels a frame later.
     payload->key = HleTextureKey(fetch);
+    // Crop the chroma planes to their logical extent, while the payload is
+    // still local and mutable.
+    //
+    // The guest allocates them with the dimensions rounded up, so half of a
+    // 216-row luma arrives as a 320x112 descriptor rather than 320x108. The
+    // composite shader samples every plane with the same normalized uv and
+    // leaves the half-size difference to the sampler, which is only correct
+    // when chroma is *exactly* half: with four rows of padding, uv.y = 1.0
+    // reads past the image into zeros, and zero chroma over white luma decodes
+    // through BT.601 to (0.29, 1.0, 0.08) — the saturated green line seen
+    // across the bottom edge of the video. Measured on the 640x216 overlay;
+    // the luma plane itself has no padding (137888 of 138240 bytes nonzero,
+    // under one row).
+    //
+    // Cropping rather than scaling uv in the shader keeps the sampler's
+    // normalized mapping right by construction and costs no constant-buffer
+    // plumbing. Only ever shrinks, so a plane already at or under the logical
+    // size is left alone. Planes 1 and 2 are Cr and Cb; plane 0 is luma and
+    // plane 3 the alpha, both full resolution.
+    if ((s == 1 || s == 2) && dc.planes[0]) {
+      const uint32_t chroma_w = (dc.planes[0]->width + 1) / 2;
+      const uint32_t chroma_h = (dc.planes[0]->height + 1) / 2;
+      if (chroma_w && payload->width > chroma_w) payload->width = chroma_w;
+      if (chroma_h && payload->height > chroma_h) {
+        payload->height = chroma_h;
+        if (payload->row_pitch) {
+          const size_t used = size_t(chroma_h) * payload->row_pitch;
+          if (used < payload->data.size()) payload->data.resize(used);
+        }
+      }
+    }
     dc.planes[decoded++] = std::move(payload);
   }
   // Y, Cr and Cb are always present; the fourth is the alpha plane and its
