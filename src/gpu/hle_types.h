@@ -208,6 +208,19 @@ struct DrawCall {
   // that report it, and storing raw keeps a misread visible.
   uint32_t colour_mask = 0;    // RB_COLOR_MASK    0x2104, bits 0-3 = RGBA of RT0
   uint32_t depth_control = 0;  // RB_DEPTHCONTROL  0x2200
+
+  // Alpha blending, as the guest's own D3DRS_* values. Raw for the same reason
+  // as the two above: the translation to host enums belongs in the renderer,
+  // and keeping the guest's numbers here means a wrong mapping shows up as a
+  // wrong number rather than as a plausible blend nobody asked for.
+  //
+  // Everything was drawn opaque before this, so anything the guest expected to
+  // blend covered what was underneath it — the front end's fullscreen overlays
+  // painted flat over the whole scene.
+  uint32_t blend_enable = 0;   // D3DRS_ALPHABLENDENABLE
+  uint32_t src_blend = 0;      // D3DRS_SRCBLEND,  a D3DBLEND
+  uint32_t dest_blend = 0;     // D3DRS_DESTBLEND, a D3DBLEND
+  uint32_t blend_op = 0;       // D3DRS_BLENDOP,   a D3DBLENDOP
   uint32_t blend_control = 0;  // RB_BLENDCONTROL0 0x2201
   uint32_t colour_control = 0; // RB_COLORCONTROL  0x2202, bit 3 = alpha test
   uint32_t mode_control = 0;   // RB_MODECONTROL   0x2208, bits 0-2 = edram_mode

@@ -340,7 +340,13 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   d->render_target_height,
                                   d->sampled_render_target_object,
                                   d->planes.data(), d->plane_count,
-                                  d->yuv_has_alpha);
+                                  d->yuv_has_alpha,
+                                  // Only blend when the guest said so — a draw
+                                  // that never set ALPHABLENDENABLE keeps the
+                                  // opaque path it has always had.
+                                  (d->om_seen & (1u << 2)) != 0 &&
+                                      d->blend_enable != 0,
+                                  d->src_blend, d->dest_blend, d->blend_op);
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;

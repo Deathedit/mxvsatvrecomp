@@ -64,7 +64,9 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  uint32_t sampledTargetObject = 0,
                  const std::shared_ptr<const mx::hle::HleTexturePayload>* planes
                      = nullptr,
-                 uint32_t planeCount = 0, bool yuvHasAlpha = false);
+                 uint32_t planeCount = 0, bool yuvHasAlpha = false,
+                 bool blendEnable = false, uint32_t srcBlend = 0,
+                 uint32_t destBlend = 0, uint32_t blendOp = 0);
 
 // Drop the previous frame's draws. Called when a real guest-frame handoff
 // arrives, including one whose draws are all filtered; an empty render-thread
@@ -166,8 +168,46 @@ void ClearGameDraws();
 
   Microsoft::WRL::ComPtr<ID3D12RootSignature> m_gameRootSig;
   // Indexed by depth-enable bit 0, depth-write bit 1, no-colour bit 2,
-  // textured bit 3, YUV composite bit 4.
+  // textured bit 3, YUV composite bit 4. Opaque draws only.
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, 32> m_gamePSOs;
+
+  // Blended draws, built on demand and keyed by the state they need.
+  //
+  // Not more bits in the array above: src factor, dest factor and op are three
+  // guest enums, and enumerating their product up front would be thousands of
+  // pipelines to cover the handful a frame actually uses. Blend modes repeat
+  // heavily within a frame, so a cache converges after the first few and costs
+  // a hash lookup per draw thereafter.
+  struct BlendKey {
+    uint32_t pso_index = 0;   // the five bits above
+    uint32_t src = 0;         // D3DBLEND
+    uint32_t dest = 0;        // D3DBLEND
+    uint32_t op = 0;          // D3DBLENDOP
+    bool operator==(const BlendKey& o) const noexcept {
+      return pso_index == o.pso_index && src == o.src && dest == o.dest &&
+             op == o.op;
+    }
+  };
+  struct BlendKeyHash {
+    size_t operator()(const BlendKey& k) const noexcept {
+      return (size_t(k.pso_index) << 24) ^ (size_t(k.src) << 16) ^
+             (size_t(k.dest) << 8) ^ size_t(k.op);
+    }
+  };
+  // Bounded so an unrecognised state cannot grow this without limit; past the
+  // cap a draw falls back to its opaque PSO rather than being dropped.
+  static constexpr size_t kMaxBlendPSOs = 128;
+  std::unordered_map<BlendKey, Microsoft::WRL::ComPtr<ID3D12PipelineState>,
+                     BlendKeyHash>
+      m_blendPSOs;
+  // Returns the blended pipeline for this draw, or nullptr to draw it opaque.
+  ID3D12PipelineState* BlendedPSO(const BlendKey& key);
+  // Retained so BlendedPSO can rebuild a variant; the description is identical
+  // to the opaque one apart from the blend state.
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC m_gamePsoTemplate = {};
+  std::vector<D3D12_INPUT_ELEMENT_DESC> m_gameInputLayout;
+  Microsoft::WRL::ComPtr<ID3DBlob> m_gameVsBlob;
+  std::array<Microsoft::WRL::ComPtr<ID3DBlob>, 3> m_gamePsBlobs;  // plain/tex/yuv
   // The fallback transform: an identity matrix, used by any translated draw
   // whose own constant buffer failed to allocate. Bound as a root CBV, so it
   // needs no descriptor heap.
@@ -229,6 +269,11 @@ void ClearGameDraws();
     bool depthEnable = false;
     bool depthWrite = false;
     bool colorWrite = true;
+    // The guest's D3DRS_* blend state, translated in BlendedPSO.
+    bool blendEnable = false;
+    uint32_t srcBlend = 0;
+    uint32_t destBlend = 0;
+    uint32_t blendOp = 0;
     std::shared_ptr<const mx::hle::HleTexturePayload> texture;
     uint32_t targetObject = 0;
     uint32_t targetWidth = 0;

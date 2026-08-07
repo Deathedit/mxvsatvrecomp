@@ -1249,6 +1249,19 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     if (st.render_state.value[kRsZEnable]) dc.depth_control = (1u << 1) | (1u << 2);
     dc.om_seen |= 1u << 1;
   }
+  // Blending. Only meaningful when the guest actually enabled it, so the
+  // factors are read but not defaulted: a draw with no ALPHABLENDENABLE seen
+  // stays opaque, which is what it was before this existed.
+  if (st.render_state.Seen(kRsAlphaBlendEnable)) {
+    dc.blend_enable = st.render_state.value[kRsAlphaBlendEnable];
+    dc.om_seen |= 1u << 2;
+  }
+  if (st.render_state.Seen(kRsSrcBlend))
+    dc.src_blend = st.render_state.value[kRsSrcBlend];
+  if (st.render_state.Seen(kRsDestBlend))
+    dc.dest_blend = st.render_state.value[kRsDestBlend];
+  if (st.render_state.Seen(kRsBlendOp))
+    dc.blend_op = st.render_state.value[kRsBlendOp];
 
   const uint32_t vertex_shader = st.vs_seen ? st.vertex_shader : 0;
   const ShaderApplyResult applied = ApplyShaderOutputs(

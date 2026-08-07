@@ -177,6 +177,17 @@ bool D3D12Renderer::CreateGamePipeline() {
       return false;
     }
   }
+
+  // Keep everything BlendedPSO needs to rebuild a variant. The blobs have to be
+  // retained too: the description holds bare pointers into them, and they would
+  // otherwise be released when this function returns.
+  m_gameVsBlob = vsBlob;
+  m_gamePsBlobs = {psBlob, texturePsBlob, yuvPsBlob};
+  m_gameInputLayout.assign(std::begin(inputLayout), std::end(inputLayout));
+  m_gamePsoTemplate = pso;
+  m_gamePsoTemplate.InputLayout.pInputElementDescs = m_gameInputLayout.data();
+  m_gamePsoTemplate.InputLayout.NumElements =
+      UINT(m_gameInputLayout.size());
   LogInfo("CreateGamePipeline: PSO variants created");
 
   {
@@ -222,6 +233,144 @@ bool D3D12Renderer::CreateGamePipeline() {
   m_hasGamePipeline = true;
   LogInfo("CreateGamePipeline: done");
   return true;
+}
+
+namespace {
+
+// Guest blend factor -> D3D12_BLEND.
+//
+// These are the Xenos hardware values, NOT the PC D3D9 D3DBLEND enum. Measured:
+// the front end sets src 6, dest 7, op 0. Under the PC enum that reads
+// INVSRCALPHA / DESTALPHA / an op that does not exist — D3DBLENDOP starts at 1,
+// so a zero op alone rules that enum out. Under the Xenos values it is
+// SRC_ALPHA / ONE_MINUS_SRC_ALPHA / ADD, which is ordinary UI alpha blending
+// and what the overlays plainly want.
+//
+// Returns false for anything not listed rather than substituting a default: a
+// wrong blend factor still draws, so a silent fallback would be a visible bug
+// with nothing in the log pointing at it. An unmapped factor leaves the draw
+// opaque — what it was before blending existed — and is counted.
+bool ToD3D12Blend(uint32_t guest, bool alpha_channel, D3D12_BLEND& out) {
+  switch (guest) {
+    case 0:  out = D3D12_BLEND_ZERO; return true;
+    case 1:  out = D3D12_BLEND_ONE; return true;
+    // The *_COLOR factors are illegal in the alpha equation, so the alpha
+    // channel takes the matching alpha factor.
+    case 4:  out = alpha_channel ? D3D12_BLEND_SRC_ALPHA
+                                 : D3D12_BLEND_SRC_COLOR; return true;
+    case 5:  out = alpha_channel ? D3D12_BLEND_INV_SRC_ALPHA
+                                 : D3D12_BLEND_INV_SRC_COLOR; return true;
+    case 6:  out = D3D12_BLEND_SRC_ALPHA; return true;
+    case 7:  out = D3D12_BLEND_INV_SRC_ALPHA; return true;
+    case 8:  out = alpha_channel ? D3D12_BLEND_DEST_ALPHA
+                                 : D3D12_BLEND_DEST_COLOR; return true;
+    case 9:  out = alpha_channel ? D3D12_BLEND_INV_DEST_ALPHA
+                                 : D3D12_BLEND_INV_DEST_COLOR; return true;
+    case 10: out = D3D12_BLEND_DEST_ALPHA; return true;
+    case 11: out = D3D12_BLEND_INV_DEST_ALPHA; return true;
+    case 12: out = D3D12_BLEND_BLEND_FACTOR; return true;
+    case 13: out = D3D12_BLEND_INV_BLEND_FACTOR; return true;
+    case 16: out = D3D12_BLEND_SRC_ALPHA_SAT; return true;
+    default: return false;
+  }
+}
+
+// Guest blend op -> D3D12_BLEND_OP, same enum family and same contract.
+bool ToD3D12BlendOp(uint32_t guest, D3D12_BLEND_OP& out) {
+  switch (guest) {
+    case 0: out = D3D12_BLEND_OP_ADD; return true;
+    case 1: out = D3D12_BLEND_OP_SUBTRACT; return true;
+    case 2: out = D3D12_BLEND_OP_MIN; return true;
+    case 3: out = D3D12_BLEND_OP_MAX; return true;
+    case 4: out = D3D12_BLEND_OP_REV_SUBTRACT; return true;
+    default: return false;
+  }
+}
+
+uint64_t g_blendUnmapped = 0;   // draws whose state did not translate
+uint64_t g_blendBudget = 0;     // draws refused because the cache was full
+
+}  // namespace
+
+ID3D12PipelineState* D3D12Renderer::BlendedPSO(const BlendKey& key) {
+  if (auto it = m_blendPSOs.find(key); it != m_blendPSOs.end())
+    return it->second.Get();
+
+  D3D12_BLEND src{}, dest{};
+  D3D12_BLEND src_a{}, dest_a{};
+  D3D12_BLEND_OP op{};
+  if (!ToD3D12Blend(key.src, false, src) ||
+      !ToD3D12Blend(key.dest, false, dest) ||
+      !ToD3D12Blend(key.src, true, src_a) ||
+      !ToD3D12Blend(key.dest, true, dest_a) ||
+      !ToD3D12BlendOp(key.op, op)) {
+    if (++g_blendUnmapped <= 8) {
+      char message[160];
+      std::snprintf(message, sizeof(message),
+                    "blend state not translated: src %u dest %u op %u — drawn "
+                    "opaque",
+                    key.src, key.dest, key.op);
+      LogInfo(message);
+    }
+    return nullptr;
+  }
+  if (m_blendPSOs.size() >= kMaxBlendPSOs) {
+    if (++g_blendBudget <= 4)
+      LogInfo("blend PSO cache full — remaining blended draws are opaque");
+    return nullptr;
+  }
+
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = m_gamePsoTemplate;
+  const bool depth_enable = (key.pso_index & 1u) != 0;
+  const bool depth_write = depth_enable && (key.pso_index & 2u) != 0;
+  const bool color_write = (key.pso_index & 4u) == 0;
+  const bool textured = (key.pso_index & 8u) != 0;
+  const bool yuv = (key.pso_index & 16u) != 0;
+  ID3DBlob* ps = yuv ? m_gamePsBlobs[2].Get()
+                     : (textured ? m_gamePsBlobs[1].Get()
+                                 : m_gamePsBlobs[0].Get());
+  pso.PS.pShaderBytecode = ps->GetBufferPointer();
+  pso.PS.BytecodeLength = ps->GetBufferSize();
+  pso.DepthStencilState = {};
+  pso.DepthStencilState.DepthEnable = depth_enable;
+  pso.DepthStencilState.DepthWriteMask =
+      depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+  pso.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+
+  auto& rt = pso.BlendState.RenderTarget[0];
+  rt = {};
+  rt.BlendEnable = TRUE;
+  rt.SrcBlend = src;
+  rt.DestBlend = dest;
+  rt.BlendOp = op;
+  rt.SrcBlendAlpha = src_a;
+  rt.DestBlendAlpha = dest_a;
+  // D3DRS_BLENDOPALPHA is only consulted under SEPARATEALPHABLENDENABLE, which
+  // is hooked but not carried on the draw yet; until it is, alpha follows the
+  // colour equation, which is what D3D9 does when separate alpha is off.
+  rt.BlendOpAlpha = op;
+  rt.RenderTargetWriteMask =
+      color_write ? D3D12_COLOR_WRITE_ENABLE_ALL : 0;
+
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> created;
+  if (FAILED(m_device->CreateGraphicsPipelineState(&pso,
+                                                   IID_PPV_ARGS(&created)))) {
+    LogError("BlendedPSO: pipeline creation failed — drawing opaque");
+    return nullptr;
+  }
+  // Each distinct blend mode the guest uses, once. A frame that renders wrong
+  // and logs nothing here is a frame where no draw asked to blend at all, which
+  // is a different problem from a blend that came out wrong.
+  {
+    char message[176];
+    std::snprintf(message, sizeof(message),
+                  "blend PSO: src %u dest %u op %u (pso %u) — %zu cached",
+                  key.src, key.dest, key.op, key.pso_index,
+                  m_blendPSOs.size() + 1);
+    LogInfo(message);
+  }
+  auto [it, _] = m_blendPSOs.emplace(key, std::move(created));
+  return it->second.Get();
 }
 
 // Uploads Bink's plane set into reusable host textures and writes their SRVs
@@ -795,7 +944,15 @@ void D3D12Renderer::RenderGameFrame() {
                                (d.colorWrite ? 0u : 4u) |
                                (textured ? 8u : 0u) |
                                (yuv ? 16u : 0u);
-    m_commandList->SetPipelineState(m_gamePSOs[pso_index].Get());
+    // A blended draw takes a pipeline built for its exact blend state; anything
+    // that cannot be translated falls back to the opaque one it used before.
+    ID3D12PipelineState* pipeline = nullptr;
+    if (d.blendEnable) {
+      pipeline = BlendedPSO(BlendKey{pso_index, d.srcBlend, d.destBlend,
+                                     d.blendOp});
+    }
+    if (!pipeline) pipeline = m_gamePSOs[pso_index].Get();
+    m_commandList->SetPipelineState(pipeline);
     // Each translated draw brings its own transform; a draw whose cb failed to
     // allocate falls back to the identity matrix rather than being dropped.
     ID3D12Resource* cb = d.cb ? d.cb.Get() : m_gameCB.Get();
@@ -877,7 +1034,9 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t targetHeight,
                                  uint32_t sampledTargetObject,
                                  const std::shared_ptr<const mx::hle::HleTexturePayload>* planes,
-                                 uint32_t planeCount, bool yuvHasAlpha) {
+                                 uint32_t planeCount, bool yuvHasAlpha,
+                                 bool blendEnable, uint32_t srcBlend,
+                                 uint32_t destBlend, uint32_t blendOp) {
   // PERF(per-frame-allocs): this creates three ID3D12Resource's per call (VB +
   // IB + CB) on the UPLOAD heap, and is called once per submitted draw rather
   // than once per frame, so the allocation rate scales with the draw count —
@@ -947,6 +1106,10 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.targetWidth = targetWidth;
   d.targetHeight = targetHeight;
   d.sampledTargetObject = sampledTargetObject;
+  d.blendEnable = blendEnable;
+  d.srcBlend = srcBlend;
+  d.destBlend = destBlend;
+  d.blendOp = blendOp;
   if (planes && planeCount >= 3) {
     d.planeCount = std::min<uint32_t>(planeCount,
                                       kMaxDrawPlanes);
