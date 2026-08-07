@@ -156,6 +156,9 @@ void ClearGameDraws();
   // no video-mode export is hooked — so this is the shape the image must keep
   // however wide the host window is.
   static constexpr float kGuestAspect = 16.0f / 9.0f;
+  // The resolution the guest actually renders, for drawing it unscaled.
+  static constexpr float kGuestWidth = 1280.0f;
+  static constexpr float kGuestHeight = 720.0f;
 
   D3D12_VIEWPORT m_viewport = {};
   D3D12_RECT m_scissorRect = {};

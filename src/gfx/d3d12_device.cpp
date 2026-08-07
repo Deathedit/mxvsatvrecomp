@@ -23,6 +23,12 @@
 // because the two failure modes a screenshot has to tell apart look identical
 // against the dark blue default: "nothing was drawn at all" and "something was
 // drawn over the whole target in black". Against magenta they do not.
+// On by default while the frame is being brought up: an unscaled image means a
+// screenshot shows the guest's own pixels, with no magnification in the way.
+REXCVAR_DEFINE_BOOL(native_res_viewport, true, "Debug",
+                    "Draw the guest's 1280x720 at 1:1 in the centre of the "
+                    "window instead of scaling it up to fit");
+
 REXCVAR_DEFINE_BOOL(clear_magenta, false, "Debug",
                     "Clear the game render target to magenta instead of the "
                     "default dark blue, to make undrawn areas obvious");
@@ -525,6 +531,17 @@ void D3D12Renderer::CreateViewportAndScissor() {
       draw_h = win_w / kGuestAspect;   // taller — bars top and bottom
     }
   }
+  // Draw the guest's 1280x720 at 1:1 when the window is larger, rather than
+  // scaling it up to fill the pillarboxed area. Nothing is stretched, filtered
+  // or resampled, so what reaches the screen is exactly what the guest
+  // produced — which is what you want while the frame itself is still being
+  // brought up. Off restores the fitted image.
+  if (REXCVAR_GET(native_res_viewport) && win_w >= kGuestWidth &&
+      win_h >= kGuestHeight) {
+    draw_w = kGuestWidth;
+    draw_h = kGuestHeight;
+  }
+
   const float off_x = (win_w - draw_w) * 0.5f;
   const float off_y = (win_h - draw_h) * 0.5f;
 
