@@ -976,7 +976,11 @@ bool BuildFvfLayout(uint32_t fvf, mx::hle::HleInputLayout& out,
     e.size_bytes = 12;
     e.usage = 0;  // D3DDECLUSAGE_POSITION
     e.xenos_format = 57;  // xenos::VertexFormat::k_32_32_32_FLOAT
-    e.swizzle = 0;
+    // The identity swizzle for this component count, as the guest's own
+    // decoder produces it — see the table in d3d9_layout.h. Zero is NOT the
+    // identity: every selector reads component x, so the element comes back
+    // splatted. That is what left the composite's texcoord as (u,u).
+    e.swizzle = 0xA88;  // (x,y,z,1)
     out.elements.push_back(e);
     stride = 12;
   }
@@ -989,6 +993,7 @@ bool BuildFvfLayout(uint32_t fvf, mx::hle::HleInputLayout& out,
     e.usage = 10;  // D3DDECLUSAGE_COLOR
     e.xenos_format = 6;  // xenos::VertexFormat::k_8_8_8_8
     e.is_normalized = true;
+    e.swizzle = 0x60A;  // (z,y,x,w) — D3DCOLOR is BGRA, wanted as RGBA
     out.elements.push_back(e);
     stride += 4;
   }
@@ -1004,6 +1009,7 @@ bool BuildFvfLayout(uint32_t fvf, mx::hle::HleInputLayout& out,
     e.size_bytes = 8;
     e.usage = 5;  // D3DDECLUSAGE_TEXCOORD
     e.xenos_format = 37;  // xenos::VertexFormat::k_32_32_FLOAT
+    e.swizzle = 0xB08;  // (x,y,0,1)
     out.elements.push_back(e);
     stride += 8;
   }
