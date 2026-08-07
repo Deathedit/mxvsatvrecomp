@@ -831,12 +831,6 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
 void ProbePixelProfileForDraw(uint32_t pixel_shader, uint32_t device,
                               uint8_t* base,
                               const mx::hle::DrawCall& dc);
-// TEMP #32 PROBE. 96% of colourless draws have the guest's colour mask on and
-// are expected to write colour (measured, see hle_types.h). They have no colour
-// attribute and no texture, so the colour has to come from the pixel shader.
-// This asks which shader, and whether it fetches anything at all.
-void ProbeColourlessDraw(uint32_t pixel_shader, uint32_t device, uint8_t* base,
-                         const mx::hle::DrawCall& dc, bool have_texture);
 void ProbeBinkComposite(uint32_t pixel_shader, uint32_t vertex_shader,
                         uint32_t device, uint8_t* base, uint32_t vertex_count);
 bool IsBinkCompositeDraw(uint32_t pixel_shader, uint8_t* base);
@@ -1268,12 +1262,6 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     dc.dest_blend = st.render_state.value[kRsDestBlend];
   if (st.render_state.Seen(kRsBlendOp))
     dc.blend_op = st.render_state.value[kRsBlendOp];
-
-  // Deliberately below the output-merger block above, not next to the texture
-  // resolve it also reads. Placed with PrepareDrawTexture first time round, it
-  // saw colour_mask and om_seen before they were assigned, so its depth-only
-  // filter compared against zeros and excluded nothing.
-  ProbeColourlessDraw(bound_ps, device, base, dc, have_texture);
 
   const uint32_t vertex_shader = st.vs_seen ? st.vertex_shader : 0;
   const ShaderApplyResult applied = ApplyShaderOutputs(
@@ -2697,25 +2685,10 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
   uint64_t best_texels = 0;
   mx::hle::HleTextureSource best_source;
   bool found = false;
-  // TEMP #32 PROBE. When this returns false the draw has no texture, and the
-  // transcode paints it opaque white over the scene. Four shaders were measured
-  // failing here for every candidate; these count which filter is responsible,
-  // because the filters have very different fixes and one of them (the <=64
-  // texel rule) was added by us in d1f8e6c.
-  enum Reason { kBadSampler, kNoFetch, kFormat, kEmpty, kHostFormat, kTiny,
-                kOutscored, kReasonCount };
-  uint32_t why[kReasonCount] = {};
-  // The two buckets a count alone cannot act on: which guest formats our own
-  // policy is discarding, and where the all-zero payloads live.
-  std::string policy_detail;
-  std::string empty_detail;
   for (const auto& candidate : profile->bindings) {
-    if (candidate.sampler >= mx::hle::kMaxSamplers) { ++why[kBadSampler]; continue; }
+    if (candidate.sampler >= mx::hle::kMaxSamplers) continue;
     uint32_t fetch[6];
-    if (!ReadLiveTextureFetch(device, base, candidate.sampler, fetch)) {
-      ++why[kNoFetch];
-      continue;
-    }
+    if (!ReadLiveTextureFetch(device, base, candidate.sampler, fetch)) continue;
     mx::hle::HleTextureSource source;
     const char* candidate_why = nullptr;
     if (!mx::hle::DescribeHleTexture2D(fetch, source, &candidate_why)) {
@@ -2724,7 +2697,6 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
       // rejections in any run were invisible.
       NoteRejectedTextureFormat("select", candidate.sampler, source,
                                 candidate_why, fetch);
-      ++why[kFormat];
       continue;
     }
 
@@ -2737,60 +2709,16 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
         texture_state.object &&
         g_resolvedTextureTargets.contains(texture_state.object);
     const uint64_t candidate_key = mx::hle::HleTextureKey(fetch);
-    if (!mapped_render_target && g_hleEmptyTextures.contains(candidate_key)) {
-      ++why[kEmpty];
-      // The address is the point. These decoded to zeros at a readable guest
-      // address, so the next question is what was supposed to write there —
-      // which is a guest-side question and needs the address to answer.
-      empty_detail += fmt::format("s{} {} {}x{} @0x{:08X}; ", candidate.sampler,
-                                  mx::hle::GuestTextureFormatName(
-                                      source.guest_format),
-                                  source.width, source.height, source.address);
-      // TEMP #32 PROBE. g_hleEmptyTextures is permanent, so a texture streamed
-      // in after its first sample would never be retried and we could not tell
-      // that from one the CPU never writes at all. Re-read the raw guest bytes
-      // on a slow cadence and report how many are non-zero. The two answers
-      // need opposite fixes: if this ever moves off zero the fix is
-      // invalidation (the Bink path already declines to memoise for exactly
-      // this reason); if it never does, nothing on the CPU side writes the
-      // atlas and the question moves to the guest.
-      {
-        static std::map<uint32_t, uint64_t> s_probeHits;
-        uint64_t& hits = s_probeHits[source.address];
-        if ((++hits % 600) == 1) {
-          std::vector<uint8_t> raw;
-          uint64_t nonzero = 0;
-          const bool readable = CopyTexturePhysical(source, base, raw);
-          if (readable)
-            for (size_t i = 0; i < raw.size(); i += 64)
-              if (raw[i]) ++nonzero;
-          REXLOG_INFO("d3d9: #32 empty-retry @0x{:08X} hit {} — readable {}, "
-                      "{} of {} sampled bytes non-zero",
-                      source.address, hits, readable, nonzero,
-                      readable ? (raw.size() + 63) / 64 : 0);
-        }
-      }
+    if (!mapped_render_target && g_hleEmptyTextures.contains(candidate_key))
       continue;
-    }
     if (!mapped_render_target &&
         (source.host_format == mx::hle::HostTextureFormat::kBc5 ||
          source.host_format == mx::hle::HostTextureFormat::kR16Float ||
          source.host_format == mx::hle::HostTextureFormat::kRgba16Float ||
          source.host_format == mx::hle::HostTextureFormat::kR8 ||
          source.host_format == mx::hle::HostTextureFormat::kR16 ||
-         source.host_format == mx::hle::HostTextureFormat::kR32Float)) {
-      ++why[kHostFormat];
-      // This bucket is entirely OUR policy — every format in the list is one we
-      // can decode and choose not to treat as a base colour. Distinct from
-      // kFormat above, which is a real gap. Naming the guest format is what
-      // says whether the policy is wrong for any of them, rather than leaving
-      // eight rejections behind one number.
-      policy_detail += fmt::format("s{} {} {}x{}; ", candidate.sampler,
-                                   mx::hle::GuestTextureFormatName(
-                                       source.guest_format),
-                                   source.width, source.height);
+         source.host_format == mx::hle::HostTextureFormat::kR32Float))
       continue;
-    }
     // An 8x8 immutable texture is a lookup table, not a material. Both that
     // this front end owns are ordered-dither matrices the guest thresholds
     // against for stipple transparency (RenderDoc texture 1316, 8x8 BC1, and
@@ -2802,10 +2730,8 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
     // the colour-only pipeline is the honest answer. Cut measured, not
     // guessed: across a front-end run the smallest immutable winner other
     // than these two is 64x8.
-    if (!mapped_render_target && uint64_t(source.width) * source.height <= 64) {
-      ++why[kTiny];
+    if (!mapped_render_target && uint64_t(source.width) * source.height <= 64)
       continue;
-    }
     // A mapped render target is authoritative storage, but it is not normally
     // the visible base colour of a material. Multi-input world shaders often
     // combine one or more scene/intermediate targets with immutable colour
@@ -2854,40 +2780,15 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
     // 400). Between two candidates the descriptor cannot otherwise separate,
     // the larger one is the material and the smaller one is a lookup table.
     const uint64_t texels = uint64_t(source.width) * source.height;
-    if (score < best_score || (score == best_score && texels <= best_texels)) {
-      ++why[kOutscored];
+    if (score < best_score || (score == best_score && texels <= best_texels))
       continue;
-    }
     best_score = score;
     best_texels = texels;
     out = candidate;
     best_source = source;
     found = true;
   }
-  if (!found) {
-    // TEMP #32 PROBE. Once per shader: every candidate lost, so this draw is
-    // about to be painted opaque white. kOutscored cannot appear here — it only
-    // fires after something has already won — so a non-zero count in it would
-    // mean the tally itself is wrong.
-    static std::map<uint32_t, bool> s_failed;
-    if (s_failed.size() < 32 && s_failed.emplace(handle, true).second) {
-      REXLOG_INFO("d3d9: #32 NO CANDIDATE ps=0x{:08X} of {} fetches — "
-                  "bad-sampler {}, unreadable-fetch {}, format {}, "
-                  "all-zero {}, host-format {}, <=64texels {}, outscored {}",
-                  handle, profile->bindings.size(), why[kBadSampler],
-                  why[kNoFetch], why[kFormat], why[kEmpty], why[kHostFormat],
-                  why[kTiny], why[kOutscored]);
-      // Split out because they are the two actionable buckets: the policy list
-      // is ours to change, and the all-zero addresses are what IDA needs.
-      if (!policy_detail.empty())
-        REXLOG_INFO("d3d9: #32 ps=0x{:08X} our policy discarded: {}", handle,
-                    policy_detail);
-      if (!empty_detail.empty())
-        REXLOG_INFO("d3d9: #32 ps=0x{:08X} all-zero payloads: {}", handle,
-                    empty_detail);
-    }
-    return false;
-  }
+  if (!found) return false;
   static std::map<uint32_t, bool> s_logged;
   if (s_logged.size() < 32 && s_logged.emplace(handle, true).second) {
     const auto& selected_state = DeviceState().texture[out.sampler];
@@ -2947,81 +2848,6 @@ void ProbePixelProfileForDraw(uint32_t pixel_shader, uint32_t device,
     REXLOG_INFO("d3d9: pixel profile inputs ps=0x{:08X}:{}", pixel_shader,
                 inputs.empty() ? " none" : inputs);
   }
-}
-
-// TEMP #32 PROBE. See the forward declaration for why.
-//
-// Reports, per pixel shader that a colourless untextured draw uses: how many
-// such draws it serves, how many texture fetches its microcode declares, and
-// the first dwords of that microcode so it can be disassembled offline. A
-// shader with zero fetches computes its colour from the ALU constant file,
-// which is the value the transcode is currently substituting white for.
-void ProbeColourlessDraw(uint32_t pixel_shader, uint32_t device, uint8_t* base,
-                         const mx::hle::DrawCall& dc, bool have_texture) {
-  using CS = mx::hle::DrawCall::ColorSource;
-  // Exactly the population counted in graphics_system.cpp, and for the same
-  // reason: a draw with a texture or a plane set already has a colour source.
-  if (dc.color_source != CS::kNone || have_texture || dc.yuv_composite) return;
-  // Only the draws the guest wants visible. A genuine depth-only pass writes no
-  // colour and needs none, and mixing the two is what made the original
-  // depth-pre-pass reading look plausible.
-  if ((dc.om_seen & (1u << 0)) != 0 && (dc.colour_mask & 0xFu) == 0) return;
-
-  if (!pixel_shader && device &&
-      HostPageReadable(REX_RAW_ADDR(device + 0x3244))) {
-    pixel_shader = REX_LOAD_U32(device + 0x3244);
-  }
-  struct Seen {
-    uint64_t draws = 0;
-    uint32_t fetches = 0;
-    bool decoded = false;
-    bool dumped = false;
-  };
-  static std::map<uint32_t, Seen> s_shaders;
-  static uint64_t s_noShader = 0;
-  if (!pixel_shader) {
-    // Counted rather than dropped: "no pixel shader bound at all" is a
-    // different answer from "a shader that reads constants", and it would be
-    // invisible if these returned early.
-    if ((++s_noShader % 2000) == 1)
-      REXLOG_INFO("d3d9: #32 colourless draw with NO pixel shader bound x{}",
-                  s_noShader);
-    return;
-  }
-  if (s_shaders.size() >= 32 && !s_shaders.count(pixel_shader)) return;
-  Seen& seen = s_shaders[pixel_shader];
-  ++seen.draws;
-  if (seen.dumped) {
-    if ((seen.draws % 4000) == 0)
-      REXLOG_INFO("d3d9: #32 ps=0x{:08X} now x{} colourless draws",
-                  pixel_shader, seen.draws);
-    return;
-  }
-  CollectPixelShaderBlob(pixel_shader, base);
-  const ResolvedPixelBinding* profile = ResolvePixelProfile(pixel_shader);
-  if (!profile) return;
-  seen.decoded = profile->decoded;
-  seen.fetches = uint32_t(profile->bindings.size());
-  seen.dumped = true;
-
-  const auto bi = g_psBlobs.find(pixel_shader);
-  std::string code;
-  if (bi != g_psBlobs.end()) {
-    const uint32_t n = std::min<uint32_t>(24, uint32_t(bi->second.size()));
-    for (uint32_t i = 0; i < n; ++i)
-      code += fmt::format("{:08X} ", bi->second[i]);
-    code += fmt::format("({} dwords total, code at +{})",
-                        bi->second.size(), profile->code_offset_dwords);
-  }
-  REXLOG_INFO("d3d9: #32 colourless ps=0x{:08X} fetches={}{} target=0x{:08X} "
-              "{}x{} verts={} topology={} mask=0x{:X}",
-              pixel_shader, seen.fetches,
-              profile->decoded ? "" : " (UNDECODED)",
-              dc.render_target_object, dc.render_target_width,
-              dc.render_target_height, uint32_t(dc.vertices.size()),
-              uint32_t(dc.topology), dc.colour_mask);
-  REXLOG_INFO("d3d9: #32 colourless ps=0x{:08X} code: {}", pixel_shader,
-              code.empty() ? "<no blob>" : code);
 }
 
 // IDA proves D3DDevice_SetPixelShader stores the live shader at device+0x3244
