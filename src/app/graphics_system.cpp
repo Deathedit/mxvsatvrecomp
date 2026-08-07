@@ -338,7 +338,13 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   // not data. Harmless when a texture
                                   // modulates it; opaque white when nothing
                                   // does.
-                                  static_cast<uint8_t>(d->color_source));
+                                  static_cast<uint8_t>(d->color_source),
+                                  // Xenos address modes: 0 repeat and 1
+                                  // mirrored repeat wrap, everything above
+                                  // clamps. Mirroring is not modelled, so a
+                                  // mirrored mode takes the nearer of the two.
+                                  (d->clamp_x >= 2 ? 1u : 0u) |
+                                      (d->clamp_y >= 2 ? 2u : 0u));
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;

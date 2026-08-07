@@ -184,6 +184,13 @@ struct DrawCall {
   // needed even for resolved render-target samples, which deliberately have no
   // CPU texture payload, because an unnormalized tfetch still needs conversion
   // to the normalized coordinates consumed by the host sampler.
+  // The guest's texture address mode for the sampled texture, straight off the
+  // fetch constant. Carried for BOTH resource paths — a resolved render-target
+  // sample has no CPU payload to hang it on, and those are exactly the
+  // fullscreen passes where wrapping shows up as a seam at the surface edge.
+  // Xenos numbering: 0 repeat, 1 mirrored repeat, everything above clamps.
+  uint8_t clamp_x = 0;
+  uint8_t clamp_y = 0;
   uint32_t sampled_texture_width = 0;
   uint32_t sampled_texture_height = 0;
   std::shared_ptr<const HleTexturePayload> texture;

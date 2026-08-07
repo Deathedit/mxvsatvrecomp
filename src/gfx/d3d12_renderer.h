@@ -69,7 +69,7 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  uint32_t planeCount = 0, bool yuvHasAlpha = false,
                  bool blendEnable = false, uint32_t srcBlend = 0,
                  uint32_t destBlend = 0, uint32_t blendOp = 0,
-                 uint8_t colorSource = 0);
+                 uint8_t colorSource = 0, uint32_t samplerIndex = 0);
 
 // Append a resolve to this frame's list, in order with the draws around it.
 //
@@ -110,6 +110,12 @@ void ClearGameDraws();
   // three places that must agree — the resource, its clear value, and the PSO's
   // DSVFormat — and the PSO's copy was the one that got left out.
   static constexpr DXGI_FORMAT kGameDepthFormat = DXGI_FORMAT_D32_FLOAT;
+  // Sampler variants, indexed by these bits. The guest's per-texture address
+  // mode reaches the renderer on HleTexturePayload (clamp_x/clamp_y) and used
+  // to be discarded in favour of one static WRAP sampler.
+  static constexpr uint32_t kSamplerClampU = 1;
+  static constexpr uint32_t kSamplerClampV = 2;
+  static constexpr uint32_t kSamplerVariantCount = 4;
 
   // Frame internals. BeginFrame picks between the two Render* and EndFrame
   // calls PresentGameFrame, so nothing outside this class should ever invoke
@@ -250,6 +256,8 @@ void ClearGameDraws();
   uint32_t m_presentSourceObject = 0;
   bool CreatePresentQuad();
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_gameSrvHeap;
+  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_samplerHeap;
+  uint32_t m_samplerDescriptorSize = 0;
   uint32_t m_gameSrvDescriptorSize = 0;
   uint32_t m_nextGameSrvDescriptor = 0;
   static constexpr uint32_t kMaxGameTextures = 1024;
@@ -320,6 +328,8 @@ void ClearGameDraws();
     // textured shader. If such a draw is not textured, that value is emitted
     // literally as opaque white and is pure fabrication. See RenderGameFrame.
     uint8_t colorSource = 0;  // mx::hle::DrawCall::ColorSource
+    // kSamplerClampU/V, from the guest's fetch constant.
+    uint32_t samplerIndex = 0;
     uint32_t sampledTargetObject = 0;
     // Which resolve result to sample, where sampledTargetObject only says which
     // surface produced it. Several textures resolve out of one shared target.

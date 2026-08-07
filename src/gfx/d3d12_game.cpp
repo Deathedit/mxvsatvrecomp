@@ -77,7 +77,25 @@ bool D3D12Renderer::CreateGamePipeline() {
   srvRange.RegisterSpace = 0;
   srvRange.OffsetInDescriptorsFromTableStart = 0;
 
-  D3D12_ROOT_PARAMETER rootParams[2] = {};
+  // The sampler is chosen PER DRAW, from a heap, rather than baked in as a
+  // static one. The guest's address mode is per texture: d3d9_texture.cpp
+  // decodes clamp_x/clamp_y off the fetch constant and carries them all the way
+  // to HleTexturePayload, and the renderer used to discard them and sample
+  // everything WRAP. A fullscreen post-process pass reaching a hair past the
+  // edge then wrapped to the opposite side and linearly blended across the
+  // seam - measured as a symmetric ramp to black over the last 13 of 720 rows.
+  //
+  // A descriptor table costs one root parameter and keeps the pixel shader and
+  // the PSO table untouched; encoding the mode as PSO bits would have
+  // multiplied an already 32-entry table that is built up front.
+  D3D12_DESCRIPTOR_RANGE samplerRange = {};
+  samplerRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+  samplerRange.NumDescriptors = 1;
+  samplerRange.BaseShaderRegister = 0;
+  samplerRange.RegisterSpace = 0;
+  samplerRange.OffsetInDescriptorsFromTableStart = 0;
+
+  D3D12_ROOT_PARAMETER rootParams[3] = {};
   rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
   rootParams[0].Descriptor.ShaderRegister = 0;
   rootParams[0].Descriptor.RegisterSpace = 0;
@@ -88,25 +106,16 @@ bool D3D12Renderer::CreateGamePipeline() {
   rootParams[1].DescriptorTable.pDescriptorRanges = &srvRange;
   rootParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-  D3D12_STATIC_SAMPLER_DESC sampler = {};
-  sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-  sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-  sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-  sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-  sampler.MipLODBias = 0.0f;
-  sampler.MaxAnisotropy = 1;
-  sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-  sampler.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
-  sampler.MinLOD = 0.0f;
-  sampler.MaxLOD = 0.0f;
-  sampler.ShaderRegister = 0;
-  sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+  rootParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  rootParams[2].DescriptorTable.NumDescriptorRanges = 1;
+  rootParams[2].DescriptorTable.pDescriptorRanges = &samplerRange;
+  rootParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
   D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
-  rootDesc.NumParameters = 2;
+  rootDesc.NumParameters = 3;
   rootDesc.pParameters = rootParams;
-  rootDesc.NumStaticSamplers = 1;
-  rootDesc.pStaticSamplers = &sampler;
+  rootDesc.NumStaticSamplers = 0;
+  rootDesc.pStaticSamplers = nullptr;
   rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
   Microsoft::WRL::ComPtr<ID3DBlob> sigBlob;
@@ -122,6 +131,43 @@ bool D3D12Renderer::CreateGamePipeline() {
                                       IID_PPV_ARGS(&m_gameRootSig));
   if (FAILED(hr)) return false;
   LogInfo("CreateGamePipeline: root signature created");
+
+  // One sampler per (U,V) address-mode combination, indexed by
+  // kSamplerClampU/kSamplerClampV. Xenos has more modes than these two; every
+  // mode that is not plain repeat is treated as clamp-to-edge, which is the
+  // distinction that matters at a surface edge. Mirror and border are not
+  // modelled and would need their own entries.
+  {
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+    hd.NumDescriptors = kSamplerVariantCount;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(m_device->CreateDescriptorHeap(&hd,
+                                              IID_PPV_ARGS(&m_samplerHeap)))) {
+      LogError("CreateGamePipeline: sampler heap failed");
+      return false;
+    }
+    m_samplerDescriptorSize = m_device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    auto cpu = m_samplerHeap->GetCPUDescriptorHandleForHeapStart();
+    for (uint32_t i = 0; i < kSamplerVariantCount; ++i) {
+      D3D12_SAMPLER_DESC sd = {};
+      sd.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+      sd.AddressU = (i & kSamplerClampU)
+                        ? D3D12_TEXTURE_ADDRESS_MODE_CLAMP
+                        : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+      sd.AddressV = (i & kSamplerClampV)
+                        ? D3D12_TEXTURE_ADDRESS_MODE_CLAMP
+                        : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+      sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+      sd.MaxAnisotropy = 1;
+      sd.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+      sd.MinLOD = 0.0f;
+      sd.MaxLOD = 0.0f;
+      m_device->CreateSampler(&sd, cpu);
+      cpu.ptr += SIZE_T(m_samplerDescriptorSize);
+    }
+  }
 
   D3D12_INPUT_ELEMENT_DESC inputLayout[] = {
     // Four-component position: the guest exports clip space, and the hardware
@@ -1083,8 +1129,8 @@ void D3D12Renderer::RenderGameFrame() {
   m_commandList->SetGraphicsRootSignature(m_gameRootSig.Get());
   m_commandList->SetPipelineState(m_gamePSOs[0].Get());
 
-  ID3D12DescriptorHeap* heaps[] = {m_gameSrvHeap.Get()};
-  m_commandList->SetDescriptorHeaps(1, heaps);
+  ID3D12DescriptorHeap* heaps[] = {m_gameSrvHeap.Get(), m_samplerHeap.Get()};
+  m_commandList->SetDescriptorHeaps(2, heaps);
   // Composite draws take their plane descriptor blocks in order within a frame.
   m_yuvDrawsThisFrame = 0;
   for (auto& [object, target] : m_gameRenderTargets)
@@ -1467,6 +1513,13 @@ void D3D12Renderer::RenderGameFrame() {
       gpu.ptr += UINT64(std::min(textureDescriptor, maxBase)) *
                  m_gameSrvDescriptorSize;
       m_commandList->SetGraphicsRootDescriptorTable(1, gpu);
+      // The guest's own address mode for this texture, rather than WRAP for
+      // everything. Only meaningful for a textured draw; the untextured PSO
+      // never samples.
+      auto samp = m_samplerHeap->GetGPUDescriptorHandleForHeapStart();
+      samp.ptr += UINT64(std::min(d.samplerIndex, kSamplerVariantCount - 1)) *
+                  m_samplerDescriptorSize;
+      m_commandList->SetGraphicsRootDescriptorTable(2, samp);
     }
     m_commandList->IASetPrimitiveTopology(d.topology);
     m_commandList->IASetVertexBuffers(0, 1, &d.vbv);
@@ -1562,7 +1615,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t planeCount, bool yuvHasAlpha,
                                  bool blendEnable, uint32_t srcBlend,
                                  uint32_t destBlend, uint32_t blendOp,
-                                 uint8_t colorSource) {
+                                 uint8_t colorSource, uint32_t samplerIndex) {
   // PERF(per-frame-allocs): this creates three ID3D12Resource's per call (VB +
   // IB + CB) on the UPLOAD heap, and is called once per submitted draw rather
   // than once per frame, so the allocation rate scales with the draw count —
@@ -1634,6 +1687,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.sampledTargetObject = sampledTargetObject;
   d.sampledTextureObject = sampledTextureObject;
   d.colorSource = colorSource;
+  d.samplerIndex = samplerIndex;
   d.blendEnable = blendEnable;
   d.srcBlend = srcBlend;
   d.destBlend = destBlend;
@@ -1763,8 +1817,9 @@ void D3D12Renderer::PresentGameFrame() {
       m_commandList->RSSetViewports(1, &m_viewport);
       m_commandList->RSSetScissorRects(1, &m_scissorRect);
       m_commandList->SetGraphicsRootSignature(m_gameRootSig.Get());
-      ID3D12DescriptorHeap* heaps[] = {m_gameSrvHeap.Get()};
-      m_commandList->SetDescriptorHeaps(1, heaps);
+      ID3D12DescriptorHeap* heaps[] = {m_gameSrvHeap.Get(),
+                                       m_samplerHeap.Get()};
+      m_commandList->SetDescriptorHeaps(2, heaps);
       // Textured, no depth, colour write on. See the pso_index bits in
       // CreateGamePipeline.
       m_commandList->SetPipelineState(m_gamePSOs[8].Get());
@@ -1775,6 +1830,12 @@ void D3D12Renderer::PresentGameFrame() {
       auto gpu = m_gameSrvHeap->GetGPUDescriptorHandleForHeapStart();
       gpu.ptr += UINT64(src.srvIndex) * m_gameSrvDescriptorSize;
       m_commandList->SetGraphicsRootDescriptorTable(1, gpu);
+      // Clamped: the blit samples a finished frame edge to edge, and wrapping
+      // the opposite side in is exactly the seam this change exists to remove.
+      auto samp = m_samplerHeap->GetGPUDescriptorHandleForHeapStart();
+      samp.ptr += UINT64(kSamplerClampU | kSamplerClampV) *
+                  m_samplerDescriptorSize;
+      m_commandList->SetGraphicsRootDescriptorTable(2, samp);
       m_commandList->IASetVertexBuffers(0, 1, &m_presentVbv);
       m_commandList->DrawInstanced(3, 1, 0, 0);
       // m_gameRT is untouched on this path, so it must still end in

@@ -3025,6 +3025,8 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
       if (DescribeHleTexture2D(mapped_fetch, mapped_source, &mapped_why)) {
         dc.sampled_texture_width = mapped_source.width;
         dc.sampled_texture_height = mapped_source.height;
+        dc.clamp_x = uint8_t(mapped_source.clamp_x);
+        dc.clamp_y = uint8_t(mapped_source.clamp_y);
       } else {
         // This failure used to be discarded outright. Three quarters of all
         // texture attempts take this early return, so an undecodable format
@@ -3060,6 +3062,8 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
   }
   dc.sampled_texture_width = source.width;
   dc.sampled_texture_height = source.height;
+  dc.clamp_x = uint8_t(source.clamp_x);
+  dc.clamp_y = uint8_t(source.clamp_y);
   // kR8 and kR16 join this list on the same reasoning as the others: they are
   // single-channel, so binding one as visible base colour would paint the
   // surface grey. They are decoded rather than rejected so the counters can
