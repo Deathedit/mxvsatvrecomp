@@ -20,8 +20,8 @@
 #include "hooks/native_bridge.h"
 
 // The one vertex stride the game PSO's input layout actually describes —
-// POSITION float3 at offset 0 plus COLOR float4 at offset 12. See the gate in
-// RenderThreadFunc.
+// POSITION float3 at offset 0, COLOR float4 at offset 12, TEXCOORD float2 at
+// offset 28, so 36 bytes. See the gate in RenderThreadFunc.
 static constexpr uint32_t kSupportedStride = mx::hle::kHostVertexStride;
 
 // Two halves of one diagnostic: show the frame without the overpaint, and show
@@ -212,18 +212,19 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       // the last frame we did get, not a cleared screen: GetDrawCalls
       // moves-and-clears, so an unconditional ClearGameDraws here threw away
       // the only geometry we had every time the two rates disagreed. Combined
-      // with the placeholder-triangle fallback in RenderGameFrame, that made
-      // the post-load screen alternate between guest geometry and the
-      // placeholder — invisible while the render target accumulated, a visible
-      // flash once the clear was fixed.
+      // with the placeholder-triangle fallback that used to sit in
+      // RenderGameFrame, that made the post-load screen alternate between guest
+      // geometry and the placeholder — invisible while the render target
+      // accumulated, a visible flash once the clear was fixed. The placeholder
+      // is gone; the re-present rule below is not, and still carries the frame.
       static uint64_t s_ticksWithDraws = 0, s_ticksEmpty = 0;
       if (draws.empty()) ++s_ticksEmpty; else ++s_ticksWithDraws;
 
       uint32_t submitted = 0, skipped = 0;
-      // Stride 28 is the input layout the game PSO declares — POSITION float3
-      // @0, COLOR float4 @12 — and anything else would be reinterpreted as
-      // position+colour and drawn as noise, so it is still counted rather than
-      // drawn.
+      // kSupportedStride (36) is the input layout the game PSO declares —
+      // POSITION float3 @0, COLOR float4 @12, TEXCOORD float2 @28 — and
+      // anything else would be reinterpreted as that layout and drawn as noise,
+      // so it is still counted rather than drawn.
       //
       // What changed is what reaches here: the translator now transcodes guest
       // vertices into this layout using the shader's own declared formats, so a
@@ -310,11 +311,13 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       }
 
       // A non-empty handoff is a real guest frame even when every draw is
-      // filtered. Retire the previous frame and, crucially, retire the baked
-      // placeholder triangle. Previously ClearGameDraws only ran when a draw
-      // survived filtering, so hide_colorless_draws filtered all 14 startup
-      // draws and left m_hasEverDrawnGame false forever: the guest kept
-      // swapping while the host visibly replayed its placeholder.
+      // filtered, so the previous frame is retired here rather than inside the
+      // submittable check below. That distinction used to matter twice over:
+      // ClearGameDraws also retired the baked placeholder triangle, and running
+      // it only when a draw survived filtering meant hide_colorless_draws could
+      // filter all 14 startup draws and leave the host replaying the
+      // placeholder while the guest swapped. The placeholder is gone; retiring
+      // on handoff is still correct.
       if (!draws.empty()) {
         m_renderer->ClearGameDraws();
       }

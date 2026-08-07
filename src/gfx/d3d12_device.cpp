@@ -126,10 +126,7 @@ void D3D12Renderer::Shutdown() {
 
   for (auto& pso : m_gamePSOs) pso.Reset();
   m_gameRootSig.Reset();
-  m_gameVB.Reset();
-  m_gameIB.Reset();
   m_gameCB.Reset();
-  m_gameCbvHeap.Reset();
   m_gameTextures.clear();
   m_gameRenderTargets.clear();
   m_gameSrvHeap.Reset();
@@ -141,7 +138,6 @@ void D3D12Renderer::Shutdown() {
   // WaitForGpu above has already drained the queue, so nothing here is still in
   // flight and the retirement list can be dropped outright.
   m_retired.clear();
-  m_hasEverDrawnGame = false;
 
   m_gameRT.Reset();
   m_gameDepth.Reset();
@@ -225,8 +221,9 @@ void D3D12Renderer::BeginFrame() {
   // any renderer that started successfully the middle arm always won and the
   // clear was dead code. m_gameRT had therefore been accumulating every frame
   // ever drawn — which is what the control screenshot was showing when it
-  // displayed the placeholder triangle and a guest quad from different frames
-  // at the same time. No screenshot before 2026-08-02 showed a single frame.
+  // displayed the startup placeholder triangle (since removed) and a guest quad
+  // from different frames at the same time. No screenshot before 2026-08-02
+  // showed a single frame.
   //
   // This cannot fight the guest's own clear. That arrives as a RectangleList
   // *draw*, lands in m_gameDraws, and is replayed inside RenderGameFrame — so

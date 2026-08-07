@@ -1,12 +1,14 @@
 // D3D12Renderer — game pipeline, offscreen game render target, and present.
 //
-// The game PSO takes a position+color vertex layout with an MVP constant
-// buffer. It draws either the placeholder triangle baked in by
-// CreateGamePipeline, or, once AddGameDraw has been fed translated PM4 draws,
-// the guest's own vertex/index data — every draw the frame produced, each with
-// its own transform and topology. Geometry renders into a dedicated 1280x720
-// render target + D32 depth buffer, which PresentGameFrame copies to the
-// current swapchain backbuffer.
+// The game PSO takes a position+color+uv vertex layout with an MVP constant
+// buffer. It draws the guest's own vertex/index data as fed to AddGameDraw —
+// every draw the frame produced, each with its own transform and topology.
+// Geometry renders into a dedicated 1280x720 render target + D32 depth buffer,
+// which PresentGameFrame copies to the current swapchain backbuffer.
+//
+// CreateGamePipeline used to bake in a placeholder triangle, drawn until the
+// guest produced geometry of its own. It was a startup output check and is gone
+// as of 2026-08-07; a frame with nothing to draw now shows the clear colour.
 //
 // Note the PSO leaves DepthStencilState zeroed, so depth test is off and guest
 // geometry at z = 1.0 is not rejected. DSVFormat is set anyway, to match the
@@ -177,36 +179,6 @@ bool D3D12Renderer::CreateGamePipeline() {
   }
   LogInfo("CreateGamePipeline: PSO variants created");
 
-  struct Vertex { float x, y, z, r, g, b, a, u, v; };
-  Vertex verts[] = {
-    { 0.0f,  0.6f, 0.0f, 1.0f, 0.2f, 0.2f, 1.0f, 0.5f, 0.0f},
-    { 0.6f, -0.6f, 0.0f, 0.2f, 1.0f, 0.2f, 1.0f, 1.0f, 1.0f},
-    {-0.6f, -0.6f, 0.0f, 0.2f, 0.2f, 1.0f, 1.0f, 0.0f, 1.0f},
-  };
-  uint16_t idx[] = {0, 1, 2};
-  m_gameIndexCount = 3;
-
-  UINT vbSize = sizeof(verts);
-  {
-    D3D12_HEAP_PROPERTIES hp = {};
-    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
-    D3D12_RESOURCE_DESC rd = {};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rd.Width = vbSize; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
-    rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1;
-    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    if (FAILED(m_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_gameVB))))
-      return false;
-    void* m = nullptr;
-    m_gameVB->Map(0, nullptr, &m);
-    memcpy(m, verts, vbSize);
-    m_gameVB->Unmap(0, nullptr);
-    m_gameVbv.BufferLocation = m_gameVB->GetGPUVirtualAddress();
-    m_gameVbv.StrideInBytes = sizeof(Vertex);
-    m_gameVbv.SizeInBytes = vbSize;
-  }
-
   {
     D3D12_DESCRIPTOR_HEAP_DESC hd = {};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -224,27 +196,10 @@ bool D3D12Renderer::CreateGamePipeline() {
         kYuvPlaneDescriptorBase + kMaxDrawPlanes;
   }
 
-  UINT ibSize = sizeof(idx);
-  {
-    D3D12_HEAP_PROPERTIES hp = {};
-    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
-    D3D12_RESOURCE_DESC rd = {};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rd.Width = ibSize; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
-    rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1;
-    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    if (FAILED(m_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&m_gameIB))))
-      return false;
-    void* m = nullptr;
-    m_gameIB->Map(0, nullptr, &m);
-    memcpy(m, idx, ibSize);
-    m_gameIB->Unmap(0, nullptr);
-    m_gameIbv.BufferLocation = m_gameIB->GetGPUVirtualAddress();
-    m_gameIbv.Format = DXGI_FORMAT_R16_UINT;
-    m_gameIbv.SizeInBytes = ibSize;
-  }
-
+  // The fallback transform for a draw whose own constant buffer failed to
+  // allocate. Bound as a root CBV (rootParams[0]), so it needs no descriptor
+  // heap — there used to be an m_gameCbvHeap here holding two views of this
+  // buffer, and nothing ever bound it.
   {
     float mvp[16] = {
       1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1
@@ -263,28 +218,6 @@ bool D3D12Renderer::CreateGamePipeline() {
     m_gameCB->Map(0, nullptr, &m);
     memcpy(m, mvp, sizeof(mvp));
     m_gameCB->Unmap(0, nullptr);
-  }
-
-  {
-    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = 2;
-    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-    if (FAILED(m_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&m_gameCbvHeap))))
-      return false;
-
-    D3D12_CONSTANT_BUFFER_VIEW_DESC cbv = {};
-    cbv.BufferLocation = m_gameCB->GetGPUVirtualAddress();
-    cbv.SizeInBytes = 256;
-    m_device->CreateConstantBufferView(&cbv,
-        m_gameCbvHeap->GetCPUDescriptorHandleForHeapStart());
-
-    D3D12_CONSTANT_BUFFER_VIEW_DESC cbv2 = {};
-    cbv2.BufferLocation = m_gameCB->GetGPUVirtualAddress();
-    cbv2.SizeInBytes = 256;
-    auto h = m_gameCbvHeap->GetCPUDescriptorHandleForHeapStart();
-    h.ptr += m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    m_device->CreateConstantBufferView(&cbv2, h);
   }
 
   m_hasGamePipeline = true;
@@ -717,22 +650,6 @@ void D3D12Renderer::RenderGameFrame() {
   for (auto& [object, target] : m_gameRenderTargets)
     target.usedThisFrame = false;
 
-  if (m_gameDraws.empty() && !m_hasEverDrawnGame) {
-    // Placeholder triangle, under the identity matrix in m_gameCB. Only until
-    // the guest has drawn something once — see m_hasEverDrawnGame. This branch
-    // used to be taken on every host tick that fell between two guest swaps,
-    // which is most of them, so the triangle was being drawn at roughly half
-    // the frames even in the post-load state. That was invisible while the
-    // render target accumulated; with the clear fixed it reads as a flash.
-    m_commandList->SetGraphicsRootConstantBufferView(
-        0, m_gameCB->GetGPUVirtualAddress());
-    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-    m_commandList->IASetVertexBuffers(0, 1, &m_gameVbv);
-    m_commandList->IASetIndexBuffer(&m_gameIbv);
-    m_commandList->DrawIndexedInstanced(m_gameIndexCount, 1, 0, 0, 0);
-    return;
-  }
-
   uint32_t boundTargetObject = 0;  // zero is the final m_gameRT.
   static const float kOffscreenClear[4] = {0, 0, 0, 0};
   std::unordered_set<uint32_t> sampledTargets;
@@ -905,10 +822,6 @@ void D3D12Renderer::RenderGameFrame() {
 }
 
 void D3D12Renderer::ClearGameDraws() {
-  // ClearGameDraws is called when the render thread receives a real guest
-  // frame, even if filtering leaves it with zero submittable draws. Receipt of
-  // that frame permanently retires the startup placeholder triangle.
-  m_hasEverDrawnGame = true;
   if (m_gameDraws.empty()) return;
 
   // Hand the buffers to the retirement list rather than releasing them here.
@@ -1026,7 +939,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   }
 
   // Carry the translator's transform. Without this the draw renders under the
-  // identity matrix baked into m_gameCB, which makes a correct transform and a
+  // fallback identity matrix in m_gameCB, which makes a correct transform and a
   // broken one look identical on screen. A null mvp, or a CB that fails to
   // allocate, falls back to that identity rather than dropping the draw.
   if (mvp && createBuffer(d.cb, 256)) {
@@ -1040,7 +953,6 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   }
 
   m_gameDraws.push_back(std::move(d));
-  m_hasEverDrawnGame = true;
 }
 
 bool D3D12Renderer::CreateGameRenderTargets() {

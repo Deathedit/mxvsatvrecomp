@@ -296,7 +296,7 @@ extract structured content from heap payload at offset 33:
 | Priority | Type | Count | Why needed |
 |----------|------|-------|------------|
 | High | texture | 7611 | DXT-compressed GPU textures — feed into D3D12 renderer |
-| High | model | 1833 | Vertex+index buffers — real bike/track geometry replacing the triangle placeholder |
+| High | model | 1833 | Vertex+index buffers — real bike/track geometry |
 | High | shader | 2481 | Compiled Xbox 360 GPU microcode (Xenos shader ISA) — needs recompilation to DX12 |
 | High | anim | 1595 | Skeletal animation keyframes |
 | High | collis | 545 | Collision hulls |

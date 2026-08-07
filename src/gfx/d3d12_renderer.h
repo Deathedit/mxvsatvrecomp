@@ -49,7 +49,7 @@ class D3D12Renderer {
 
 // Append one translated draw to this frame's list. `mvp` is the 16-float
 // row-major transform the PM4 translator recovered (DrawCall::mvp); pass
-// nullptr to fall back to the identity placeholder. `topology` is a
+// nullptr to fall back to the identity matrix in m_gameCB. `topology` is a
 // D3D_PRIMITIVE_TOPOLOGY value, matching mx::hle::HostTopology.
 //
 // This replaced SetGameDrawData, which held exactly one draw — so however many
@@ -66,9 +66,9 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                      = nullptr,
                  uint32_t planeCount = 0, bool yuvHasAlpha = false);
 
-// Drop the previous frame's draws and retire the startup placeholder. Called
-// when a real guest-frame handoff arrives, including one whose draws are all
-// filtered; an empty render-thread tick still re-presents the previous frame.
+// Drop the previous frame's draws. Called when a real guest-frame handoff
+// arrives, including one whose draws are all filtered; an empty render-thread
+// tick still re-presents the previous frame.
 void ClearGameDraws();
 
   [[nodiscard]] ID3D12Device* GetDevice() const noexcept { return m_device.Get(); }
@@ -161,10 +161,10 @@ void ClearGameDraws();
   // Indexed by depth-enable bit 0, depth-write bit 1, no-colour bit 2,
   // textured bit 3, YUV composite bit 4.
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, 32> m_gamePSOs;
-  Microsoft::WRL::ComPtr<ID3D12Resource> m_gameVB;
-  Microsoft::WRL::ComPtr<ID3D12Resource> m_gameIB;
+  // The fallback transform: an identity matrix, used by any translated draw
+  // whose own constant buffer failed to allocate. Bound as a root CBV, so it
+  // needs no descriptor heap.
   Microsoft::WRL::ComPtr<ID3D12Resource> m_gameCB;
-  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_gameCbvHeap;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_gameSrvHeap;
   uint32_t m_gameSrvDescriptorSize = 0;
   uint32_t m_nextGameSrvDescriptor = 0;
@@ -189,15 +189,11 @@ void ClearGameDraws();
     DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
   };
   std::array<YuvPlane, kMaxDrawPlanes> m_yuvPlanes;
-  D3D12_VERTEX_BUFFER_VIEW m_gameVbv = {};
-  D3D12_INDEX_BUFFER_VIEW m_gameIbv = {};
-  uint32_t m_gameIndexCount = 0;
   bool m_hasGamePipeline = false;
 
-  // One translated draw. The CB is separate from m_gameCB so a translated
-  // transform never overwrites the placeholder triangle's identity matrix, and
-  // so a per-draw buffer is not rewritten while the GPU may still be reading
-  // the previous frame's value.
+  // One translated draw. The CB is per-draw rather than one shared buffer so it
+  // is not rewritten while the GPU may still be reading the previous frame's
+  // value.
   struct GameDraw {
     Microsoft::WRL::ComPtr<ID3D12Resource> vb;
     Microsoft::WRL::ComPtr<ID3D12Resource> ib;
@@ -243,12 +239,6 @@ void ClearGameDraws();
 
   // Release everything the GPU has finished with. Cheap and called per frame.
   void DrainRetired();
-
-  // Latched true by the first AddGameDraw and never cleared until Shutdown.
-  // Once the guest has produced real geometry the placeholder triangle is
-  // retired for good: a later frame that translates nothing (or whose draws are
-  // all skipped for stride) must show an empty scene, not the placeholder.
-  bool m_hasEverDrawnGame = false;
 
   Microsoft::WRL::ComPtr<ID3D12Resource> m_gameRT;
   Microsoft::WRL::ComPtr<ID3D12Resource> m_gameDepth;
