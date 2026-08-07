@@ -159,35 +159,11 @@ float HalfToFloat(uint16_t h) {
   return f;
 }
 
-uint32_t VertexFormatUnitBytes(uint32_t format) {
-  switch (format) {
-    // The 16-bit-component formats: two components share every dword, so the
-    // dword is not the unit.
-    case 25:  // k_16_16
-    case 26:  // k_16_16_16_16
-    case 31:  // k_16_16_FLOAT
-    case 32:  // k_16_16_16_16_FLOAT
-      return 2;
-    // Everything else this decoder handles is packed in dwords, including the
-    // byte and sub-byte formats â€” a k_8_8_8_8 is one big-endian dword.
-    case 6: case 7: case 16: case 17: case 33: case 34: case 35:
-    case 36: case 37: case 38: case 57:
-      return 4;
-    default:
-      return 0;  // unrecognised â€” the caller refuses the format anyway
-  }
-}
-
-void ApplyFetchEndianFor(uint8_t* data, size_t bytes, uint32_t endian,
-                         uint32_t format) {
+void ApplyFetchEndianFor(uint8_t* data, size_t bytes, uint32_t endian) {
   if (!data || endian == 0) return;
-  // The mode's nominal width, narrowed to the format's own packed unit. This
-  // narrowing is the fix: an 8in32 swap over 16-bit components exchanges the
-  // components as well as their bytes.
-  uint32_t unit = (endian == 1) ? 2u : 4u;
-  const uint32_t packed = VertexFormatUnitBytes(format);
-  if (packed && packed < unit) unit = packed;
-  if (unit < 2) return;
+  // The mode's width, applied literally. It does not depend on the format: see
+  // the header for why the format-narrowed version was wrong.
+  const uint32_t unit = (endian == 1) ? 2u : 4u;
   for (size_t i = 0; i + unit <= bytes; i += unit) {
     for (uint32_t a = 0, b = unit - 1; a < b; ++a, --b) {
       std::swap(data[i + a], data[i + b]);
@@ -243,14 +219,13 @@ bool ReadVertexAttributeAs(const uint8_t* vertex_base, uint32_t vertex_bytes,
   if (size_bytes == 0) return false;
   if (offset_bytes + size_bytes > vertex_bytes) return false;
 
-  // The endian swap happens here rather than once over the whole vertex,
-  // because its width depends on the format and one vertex mixes formats. The
+  // The endian swap happens on a copy so the guest's buffer is left alone. The
   // copy is bounded by the largest format this decoder handles (16 bytes).
   uint8_t swapped[16];
   const uint8_t* p = vertex_base + offset_bytes;
   if (endian != 0 && size_bytes <= sizeof(swapped)) {
     std::memcpy(swapped, p, size_bytes);
-    ApplyFetchEndianFor(swapped, size_bytes, endian, format);
+    ApplyFetchEndianFor(swapped, size_bytes, endian);
     p = swapped;
   }
 

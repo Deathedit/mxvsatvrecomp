@@ -124,33 +124,37 @@ uint32_t VertexFormatSizeBytes(uint32_t format, uint32_t* out_components);
 // IEEE half -> float.
 float HalfToFloat(uint16_t h);
 
-// The width of the unit a format's bits are packed into, which is the unit the
-// endian swap has to operate on — 2 for the 16-bit-component formats, 4 for
-// everything else (a k_8_8_8_8 colour is one big-endian dword, not four
-// independent bytes). 0 for a format not recognised.
-//
-// This is not the same as the per-component width and must not be confused with
-// it: k_8_8_8_8 has 1-byte components packed in a 4-byte unit.
-uint32_t VertexFormatUnitBytes(uint32_t format);
-
 // Apply the vertex fetch constant's endian swap in place, turning guest bytes
 // into GPU-native little-endian.
 //   endian: 0 = none, 1 = 8in16, 2 = 8in32
-//   format: the xenos::VertexFormat those bytes hold
 //
-// The mode alone does not determine the swap width. Reversing all four bytes of
-// a dword that holds *two* 16-bit components byte-swaps each component **and
-// exchanges the pair** — so an 8in32 request over a 16-bit format has to be
-// performed as a 2-byte reversal. Applying the mode literally is what turned
-// every (x, y, z, w=1) position into (y, x, w=1, z) and left the interpreter
-// reading a constant 1.0 as the z coordinate. See AGENTS.md, "The position input
-// is (x, y, z, 1) read as (x, y, 1, z)".
+// The mode is applied literally, and the format is deliberately not consulted.
+// Reversing all four bytes of a dword that holds *two* 16-bit components does
+// byte-swap each component **and exchange the pair** — but that exchange is the
+// hardware's real behaviour, not a defect, and the shader compiler already
+// compensates for it in the vfetch destination swizzle.
 //
-// Because the right width depends on the format, this cannot be applied once
-// over a whole vertex: a single vertex mixes 16-bit positions with 32-bit
-// colours. It is applied per attribute, inside the read.
-void ApplyFetchEndianFor(uint8_t* data, size_t bytes, uint32_t endian,
-                         uint32_t format);
+// This once narrowed the unit to 2 for the 16-bit formats to suppress the
+// exchange. That was wrong, and cost several rounds. The narrowing was derived
+// from staring at the decoded attribute — which does read (y, x, 1, z) for a
+// (x, y, z, 1) position — without following it through the swizzle that comes
+// next. What settles it is the swizzle each format actually carries, counted
+// over a front-end run:
+//
+//   16-bit units:  fmt 32 -> 0x4C1 (x935), fmt 26 -> 0x4C1, fmt 31 -> 0xFC1
+//                  (x913). All pairwise exchanges.
+//   32-bit units:  fmt 37 -> 0xB08 (x2322), fmt 7 -> 0xE88 (x1718),
+//                  fmt 57 -> 0xA88, fmt 38 -> 0x688. All identity.
+//
+// 1851 fetches, no exceptions: every 16-bit format asks for the pair to be
+// exchanged back, and no 32-bit format does. The compiler emits that permutation
+// for one reason. Suppress the swap and the swizzle scrambles good data instead
+// of restoring it — which is what put the homogeneous 1 in slot z and left the
+// model matrix's w row reading the model-space z.
+//
+// Applied per attribute rather than once over the vertex only because the read
+// works on one attribute at a time; the width no longer depends on the format.
+void ApplyFetchEndianFor(uint8_t* data, size_t bytes, uint32_t endian);
 
 // How a format's raw bits are interpreted. The layout of a format says how many
 // bits each component gets; this says what they mean, and the two are
