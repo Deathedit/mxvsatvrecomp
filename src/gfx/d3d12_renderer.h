@@ -117,8 +117,12 @@ void ClearGameDraws();
   // from EnsureGameTexture because these planes are new content every video
   // frame: the keyed cache would grow without bound, and the descriptor heap
   // with it.
+  //
+  // Returns the descriptor index the draw's table must point at. That block is
+  // per frame-in-flight and per composite draw, and never reused inside the
+  // window the GPU may still be reading — see kYuvPlaneDescriptorCount.
   struct GameDraw;
-  bool EnsureYuvPlanes(const GameDraw& draw);
+  bool EnsureYuvPlanes(const GameDraw& draw, uint32_t& descriptorBase);
   bool EnsureGameTexture(const std::shared_ptr<const mx::hle::HleTexturePayload>& texture,
                          uint32_t& descriptorIndex);
   struct GameRenderTarget;
@@ -175,9 +179,26 @@ void ClearGameDraws();
     uint32_t descriptorIndex = 0;
   };
   std::unordered_map<uint64_t, GameTexture> m_gameTextures;
-  // Descriptors 0..kMaxPlanes-1 are reserved for the video plane set, so the
-  // general allocator starts above them.
+  // The video plane descriptors sit at the head of the heap; the general
+  // allocator starts above them.
+  //
+  // One block of kMaxDrawPlanes per composite draw per frame in flight, rather
+  // than a single shared block. A shared block has to be rewritten every frame,
+  // because the planes are new resources whenever the video's dimensions change
+  // — and rewriting a descriptor the GPU may still be reading is undefined in
+  // D3D12. It read as zero on this hardware, so the composite sampled black
+  // from four correctly-populated textures. Cached textures never hit this:
+  // their descriptor is written once and never touched again.
+  //
+  // Frame-index striping is the same guarantee the per-frame upload buffers
+  // already rely on — MoveToNextFrame waits out the frame kFrameCount ago
+  // before its slots come round again.
   static constexpr uint32_t kYuvPlaneDescriptorBase = 0;
+  static constexpr uint32_t kMaxYuvDrawsPerFrame = 4;
+  static constexpr uint32_t kYuvPlaneDescriptorCount =
+      kFrameCount * kMaxYuvDrawsPerFrame * kMaxDrawPlanes;
+  // Composite draws recorded so far this frame; picks the block above.
+  uint32_t m_yuvDrawsThisFrame = 0;
   struct YuvPlane {
     Microsoft::WRL::ComPtr<ID3D12Resource> resource;
     // One staging buffer per frame in flight: the plane is rewritten every

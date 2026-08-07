@@ -189,11 +189,10 @@ bool D3D12Renderer::CreateGamePipeline() {
       return false;
     m_gameSrvDescriptorSize = m_device->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-    // Descriptors 0..kMaxPlanes-1 belong to the video plane set, which is
-    // rewritten every frame rather than cached; the general allocator starts
-    // above them.
+    // The video plane blocks live at the head of the heap and are rewritten as
+    // the video plays; the general allocator starts above all of them.
     m_nextGameSrvDescriptor =
-        kYuvPlaneDescriptorBase + kMaxDrawPlanes;
+        kYuvPlaneDescriptorBase + kYuvPlaneDescriptorCount;
   }
 
   // The fallback transform for a draw whose own constant buffer failed to
@@ -229,9 +228,18 @@ bool D3D12Renderer::CreateGamePipeline() {
 // into the reserved descriptors at the head of the heap. A plane's resource is
 // recreated only when its dimensions change, so steady-state playback creates
 // nothing per frame; only the staging copy happens each time.
-bool D3D12Renderer::EnsureYuvPlanes(const GameDraw& draw) {
+bool D3D12Renderer::EnsureYuvPlanes(const GameDraw& draw,
+                                    uint32_t& descriptorBase) {
   if (!m_gameSrvHeap || draw.planeCount < 3) return false;
   const uint32_t kPlanes = kMaxDrawPlanes;
+  // One block per composite draw per frame in flight. Beyond the budget the
+  // draw is refused rather than aliasing an earlier draw's descriptors, which
+  // is the failure this striping exists to prevent.
+  if (m_yuvDrawsThisFrame >= kMaxYuvDrawsPerFrame) return false;
+  descriptorBase =
+      kYuvPlaneDescriptorBase +
+      (m_frameIndex * kMaxYuvDrawsPerFrame + m_yuvDrawsThisFrame) * kPlanes;
+  ++m_yuvDrawsThisFrame;
 
   for (uint32_t i = 0; i < kPlanes; ++i) {
     // Slot 3 with no alpha plane gets a 1x1 white stand-in so the shader can
@@ -291,14 +299,20 @@ bool D3D12Renderer::EnsureYuvPlanes(const GameDraw& draw) {
       plane.width = src->width;
       plane.height = src->height;
       plane.format = format;
+    }
 
+    // Written every frame, not only when the resource is recreated: this
+    // draw's block is its own, so there is nothing to preserve in it, and the
+    // resource it must name may have been recreated since the block was last
+    // used three frames ago.
+    {
       D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
       srv.Format = format;
       srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
       srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
       srv.Texture2D.MipLevels = 1;
       auto cpu = m_gameSrvHeap->GetCPUDescriptorHandleForHeapStart();
-      cpu.ptr += SIZE_T(kYuvPlaneDescriptorBase + i) * m_gameSrvDescriptorSize;
+      cpu.ptr += SIZE_T(descriptorBase + i) * m_gameSrvDescriptorSize;
       m_device->CreateShaderResourceView(plane.resource.Get(), &srv, cpu);
     }
 
@@ -647,6 +661,8 @@ void D3D12Renderer::RenderGameFrame() {
 
   ID3D12DescriptorHeap* heaps[] = {m_gameSrvHeap.Get()};
   m_commandList->SetDescriptorHeaps(1, heaps);
+  // Composite draws take their plane descriptor blocks in order within a frame.
+  m_yuvDrawsThisFrame = 0;
   for (auto& [object, target] : m_gameRenderTargets)
     target.usedThisFrame = false;
 
@@ -759,10 +775,11 @@ void D3D12Renderer::RenderGameFrame() {
     // Bink's plane set takes precedence: it is several textures at once and
     // cannot go through the single-descriptor path below.
     bool yuv = false;
-    if (d.yuvComposite && EnsureYuvPlanes(d)) {
+    uint32_t yuvDescriptorBase = kYuvPlaneDescriptorBase;
+    if (d.yuvComposite && EnsureYuvPlanes(d, yuvDescriptorBase)) {
       yuv = true;
       textured = true;
-      textureDescriptor = kYuvPlaneDescriptorBase;
+      textureDescriptor = yuvDescriptorBase;
     }
     if (!textured)
       textured = EnsureGameTexture(d.texture, textureDescriptor);
