@@ -183,7 +183,8 @@ struct DrawCall {
     // never rewritten, so they keep the guest stride and the renderer's
     // stride-28 gate drops them — they reach no pixels either way.
     kNotTranscoded = 0,
-    kNone,          // no colour attribute found — written opaque white
+    kNone,          // no colour attribute — seeded {1,1,1,1}, a modulation
+                    // identity for the textured shader, not a colour
     kPacked,        // format 6 or 7, a real packed colour
     kFallback,      // first 4-component non-position attribute, i.e. a guess
   };
@@ -191,18 +192,15 @@ struct DrawCall {
 
   // The guest's output-merger state as of this draw, captured raw.
   //
-  // Nothing in this renderer has ever read one of these. CreateGamePipeline
-  // sets a write mask and a rasterizer state and stops: BlendEnable is FALSE,
-  // DepthStencilState is zeroed, and D3D12 has no alpha test to leave off. So
-  // every guest draw is composited fully opaque, in draw order, writing all
-  // four channels — the entire back end of the guest pipeline is missing, and
-  // it has stayed invisible because it still produces plausible geometry.
+  // These ARE read now, and the note claiming otherwise was stale: since
+  // 1007a99 CreateGamePipeline sets BlendEnable TRUE with the guest's own
+  // factors, and depth enable/write come from depth_control. What is still
+  // missing is the alpha test, which D3D12 has no fixed-function equivalent for.
   //
-  // Captured rather than acted on. A draw whose shader exports only a position
-  // has no colour attribute, so the transcode writes {1,1,1,1} opaque white —
-  // and a depth pre-pass is exactly that draw, covering the world while writing
-  // no colour at all on the guest. If that is what the 12760 colourless draws
-  // are, colour_mask reads zero for them and NoteOutputMerger will say so.
+  // The depth-pre-pass theory this field was added to test is settled and was
+  // wrong: only 175 colourless draws have colour_mask 0, against 4024 that want
+  // colour. They are fullscreen compositor passes, not pre-passes — 4.3 verts,
+  // raw extent 2.01 ndc, 91.5% sampling a render target (51f3c80).
   //
   // Raw dwords, not decoded fields: the decode belongs next to the counters
   // that report it, and storing raw keeps a misread visible.

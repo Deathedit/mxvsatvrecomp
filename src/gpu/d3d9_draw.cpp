@@ -99,9 +99,9 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
     skip = HleSkip::kNoPosition;
     return false;
   }
-  // Colour is optional: a declaration without one draws opaque white, the same
-  // convention the PM4 path uses, and it is recorded so a screenshot can be
-  // read against the count.
+  // Colour is optional: a declaration without one seeds the modulation identity
+  // (see the seed below — it is a factor, not a colour), and it is recorded so
+  // a screenshot can be read against the count.
   const HleInputElement* col = FindUsage(*in.layout, kUsageColor, 0);
   // Likewise the first texcoord set. Optional for the same reason, and it
   // defaults to (0,0) — but only untextured draws should ever see that default.
@@ -228,6 +228,24 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
       }
     }
 
+    // One, and it is a modulation identity rather than a colour. The textured
+    // pixel shader is `g_tex.Sample(g_smp, uv) * col` (d3d12_shaders.h), so for
+    // a declaration with no COLOR element this is what passes the texture
+    // through unchanged.
+    //
+    // Measured, 2026-08-07: setting this to {0,0,0,0} made the logo disappear
+    // and left the frame at the clear colour, because it multiplies every
+    // texture by zero. Do not do it again. The reasoning that motivated it was
+    // sound about the guest and wrong about us — D3D9 really does answer a
+    // missing interpolator by NOPing the pixel shader instructions that read it
+    // (sub_82565278, from the merge join in sub_82565400, writes
+    // {0xC8000000, 0, 0x02000000}: kRetainPrev / kMax with both write masks and
+    // export_data clear). But that is about a shader we do not run. Here the
+    // value is a factor in someone else's multiply, and 1 is its identity.
+    //
+    // The white overpaint is therefore NOT this constant. It is the untextured
+    // path, where `col` is the output rather than a factor, and the compositor
+    // passes whose render target has no content (see AGENTS.md).
     float c[4] = {1, 1, 1, 1};
     if (col) {
       const HleStream& s = in.streams[col->stream];
