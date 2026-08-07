@@ -77,9 +77,21 @@ uint32_t ExpandRectangleList(DrawCall& dc) {
     const uint32_t base = r * 4;
     verts.insert(verts.end(), src, src + size_t(3) * stride);
 
-    // v3 = v0 + v2 - v1 for every host interpolant. Position, colour and UV
-    // describe the same affine plane; copying v2's UV makes textured rectangles
-    // collapse one edge into a smear.
+    // The three supplied vertices are three corners of the rectangle, and the
+    // fourth is derived:
+    //
+    //     v0 ---- v1
+    //      |       |
+    //     v2 ---- (v3)
+    //
+    // so v3 is the corner opposite v0: v3 = v1 + v2 - v0, for every host
+    // interpolant. Position, colour and UV describe the same affine plane;
+    // copying v2's UV makes textured rectangles collapse one edge into a smear.
+    //
+    // This was v0 + v2 - v1, which is a different corner entirely — measured on
+    // a menu quad whose corners came out (-1,1) (1,1) (-1,-1) and (-3,-1). The
+    // second triangle then lay wholly off-screen and the first was left painting
+    // a diagonal wedge across half the frame.
     verts.insert(verts.end(), src + size_t(2) * stride,
                  src + size_t(3) * stride);
     uint8_t* v3 = verts.data() + (size_t(base) + 3) * stride;
@@ -89,11 +101,14 @@ uint32_t ExpandRectangleList(DrawCall& dc) {
       std::memcpy(&p0, src + c * 4, 4);
       std::memcpy(&p1, src + stride + c * 4, 4);
       std::memcpy(&p2, src + size_t(2) * stride + c * 4, 4);
-      const float p3 = p0 + p2 - p1;
+      const float p3 = p1 + p2 - p0;
       std::memcpy(v3 + c * 4, &p3, 4);
     }
 
-    const uint32_t order[6] = {0, 1, 2, 0, 2, 3};
+    // v0..v3 do not run round the perimeter — v3 is opposite v0 — so the two
+    // triangles share the v1-v2 diagonal rather than v0-v2. Both wind the same
+    // way, which the {0,1,2, 0,2,3} order did not once v3 moved.
+    const uint32_t order[6] = {0, 1, 2, 2, 1, 3};
     for (uint32_t i = 0; i < 6; ++i) idx.push_back(base + order[i]);
   }
 
