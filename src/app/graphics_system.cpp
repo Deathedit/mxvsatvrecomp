@@ -6,7 +6,9 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 
+#include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <iterator>
 #include <map>
 #include <string>
@@ -225,6 +227,18 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       static std::map<uint32_t, uint32_t> s_skippedStrides;
       static std::map<uint64_t, uint32_t> s_skippedViewports;
       static uint64_t s_skippedUntransformable = 0;
+      // TEMP OVERPAINT PROBE. See the block below the viewport gate.
+      struct Coverage {
+        uint64_t draws = 0;
+        uint64_t verts = 0;
+        uint64_t behind = 0;
+        uint64_t over_half = 0;
+        uint64_t raw_huge = 0;
+        uint64_t samples_rt = 0;
+        double coverage = 0.0;
+        double raw_extent = 0.0;
+      };
+      static Coverage s_covColorless, s_covColored;
       // Filter first, bind second. The renderer's list is only replaced once we
       // know the new frame has something in it — a frame whose draws were all
       // skipped for stride would otherwise blank the screen just as surely as a
@@ -269,6 +283,69 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
           ++s_skippedViewports[(uint64_t(d.viewport_width) << 32) |
                                d.viewport_height];
           continue;
+        }
+        // TEMP OVERPAINT PROBE. The case for "colourless draws are small
+        // geometry smeared across the viewport by a bad transform" rests on one
+        // measurement — 16 vertices averaging 52% viewport coverage against
+        // 0.45% for coloured draws, 6581 of them over half the screen. That
+        // number predates BOTH transform fixes on this branch (the homogeneous
+        // w landing in slot z, and the vfetch endian pair exchange), so it
+        // cannot be trusted to describe the current build. Remeasure it.
+        //
+        // The host position is float4 clip space at offset 0 (kHostVertexStride
+        // = 40), so this is a divide, not a transform — nothing is being
+        // guessed at. Vertices with w <= 0 are behind the eye and cannot be
+        // divided; they are counted rather than folded into the box, because a
+        // proper clip against the near plane is not what this question needs
+        // and pretending otherwise would inflate exactly the number under test.
+        {
+          using CS = mx::hle::DrawCall::ColorSource;
+          const bool colorless =
+              d.color_source == CS::kNone && !d.texture && !d.yuv_composite;
+          float min_x = 1e30f, max_x = -1e30f, min_y = 1e30f, max_y = -1e30f;
+          uint32_t behind = 0, ahead = 0;
+          const uint32_t count = uint32_t(d.vertices.size() / kSupportedStride);
+          for (uint32_t v = 0; v < count; ++v) {
+            float p[4];
+            std::memcpy(p, d.vertices.data() + size_t(v) * kSupportedStride,
+                        sizeof(p));
+            if (!(p[3] > 1e-6f)) { ++behind; continue; }
+            ++ahead;
+            const float x = p[0] / p[3];
+            const float y = p[1] / p[3];
+            min_x = std::min(min_x, x); max_x = std::max(max_x, x);
+            min_y = std::min(min_y, y); max_y = std::max(max_y, y);
+          }
+          if (ahead) {
+            // The clamped coverage below cannot tell a legitimate fullscreen
+            // quad from geometry blown far outside the screen — both read as
+            // 100%. The RAW extent separates them: a real fullscreen quad spans
+            // about 2 NDC units, a bad transform spans orders of magnitude more.
+            const double raw = std::max(double(max_x) - min_x,
+                                        double(max_y) - min_y);
+            auto& rb = colorless ? s_covColorless : s_covColored;
+            rb.raw_extent += raw;
+            if (raw > 4.0) ++rb.raw_huge;
+            // Clamped to the NDC cube: geometry that runs off screen covers the
+            // screen, not more than it.
+            const float w = std::max(0.0f, std::min(max_x, 1.0f) -
+                                               std::max(min_x, -1.0f));
+            const float h = std::max(0.0f, std::min(max_y, 1.0f) -
+                                               std::max(min_y, -1.0f));
+            const double frac = double(w) * h / 4.0;
+            auto& b = colorless ? s_covColorless : s_covColored;
+            ++b.draws;
+            b.verts += count;
+            b.coverage += frac;
+            b.behind += behind;
+            if (frac > 0.5) ++b.over_half;
+            // The linchpin. A fullscreen quad that samples a render target is a
+            // compositor pass, and its colour was supposed to come from that
+            // target — so if this share is high, the white is a symptom of the
+            // target contents being unavailable, not of a colour-resolution
+            // bug in the draw itself.
+            if (d.sampled_render_target_object) ++b.samples_rt;
+          }
         }
         submittable.push_back(&d);
         ++submitted;
@@ -340,6 +417,34 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                     s_ticksWithDraws, s_ticksEmpty,
                     viewports.empty() ? "none" : viewports,
                     s_skippedUntransformable);
+        // TEMP OVERPAINT PROBE. The comparison is the whole point, so both
+        // populations are reported on one line — a coverage figure for the
+        // colourless draws alone says nothing without the coloured baseline.
+        auto pct = [](const Coverage& c) {
+          return c.draws ? 100.0 * c.coverage / double(c.draws) : 0.0;
+        };
+        auto avg = [](uint64_t n, uint64_t d) {
+          return d ? double(n) / double(d) : 0.0;
+        };
+        auto rawavg = [](const Coverage& c) {
+          return c.draws ? c.raw_extent / double(c.draws) : 0.0;
+        };
+        REXLOG_INFO("overpaint: colourless {} draws, {:.1f} verts, {:.2f}% mean "
+                    "coverage, {} over half, raw extent {:.2f} ndc ({} over 4), "
+                    "{} sample an RT, {} verts behind eye — coloured {} draws, "
+                    "{:.1f} verts, "
+                    "{:.2f}% mean coverage, {} over half, raw extent {:.2f} ndc "
+                    "({} over 4), {} behind",
+                    s_covColorless.draws,
+                    avg(s_covColorless.verts, s_covColorless.draws),
+                    pct(s_covColorless), s_covColorless.over_half,
+                    rawavg(s_covColorless), s_covColorless.raw_huge,
+                    s_covColorless.samples_rt,
+                    s_covColorless.behind, s_covColored.draws,
+                    avg(s_covColored.verts, s_covColored.draws),
+                    pct(s_covColored), s_covColored.over_half,
+                    rawavg(s_covColored), s_covColored.raw_huge,
+                    s_covColored.behind);
       }
       // BeginFrame and EndFrame own the whole frame: BeginFrame opens the
       // command list, transitions and clears the targets and then calls
