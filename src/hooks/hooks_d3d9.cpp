@@ -1227,6 +1227,9 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     if (const auto it = g_resolvedTextureTargets.find(texture_object);
         it != g_resolvedTextureTargets.end()) {
       dc.sampled_render_target_object = it->second;
+      // Which resolve result, not just which surface produced it. See the field
+      // comment: several textures resolve out of one shared target.
+      dc.sampled_texture_object = texture_object;
       static uint64_t s_resolved_samples = 0;
       if (++s_resolved_samples <= 16 || (s_resolved_samples % 1000) == 0) {
         REXLOG_INFO("d3d9: draw samples resolved texture 0x{:08X} from "
@@ -2181,6 +2184,17 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
   const size_t count = g_pendingHleDraws.size();
   uint64_t applied = 0, dropped = 0;
   for (PendingHleDraw& pending : g_pendingHleDraws) {
+    // A resolve carries no geometry, so it has no shader to run and no topology
+    // to finalize — both would refuse it and it would be counted as a dropped
+    // draw. It still has to keep its slot in the frame's ordered list: the
+    // snapshot it stands for is the target's contents *at this point*, and
+    // every draw after it must sample that rather than the surface's later
+    // state.
+    if (pending.draw.resolve_dest_texture) {
+      mx::hle::HleFrameDraws().push_back(std::move(pending.draw));
+      ++applied;
+      continue;
+    }
     const ShaderApplyResult result = ApplyShaderOutputs(
         pending.draw, pending.vertex_shader, pending.streams.data(),
         pending.device, base,
@@ -5345,6 +5359,29 @@ extern "C" REX_FUNC(sub_8255CE98) {
   st.NoteDevice(ctx.r3.u32, mx::hle::kEpResolve);
   const uint32_t source_slot = ctx.r4.u32 & 7u;
   const uint32_t dest_texture = ctx.r6.u32;
+  // Decompiled signature (default.xex.probe.i64):
+  //   D3DDevice_Resolve(pDevice, Flags, pSourceRect, pDestTexture, pDestPoint,
+  //                     DestLevel, DestSliceOrFace, pClearColor, ...)
+  // so r5 is the source rectangle and r7 the destination point. Both are LONG
+  // pairs/quads (D3DRECT{x1,y1,x2,y2}, D3DPOINT{x,y}) and both may be null.
+  const uint32_t source_rect_ptr = ctx.r5.u32;
+  const uint32_t dest_point_ptr = ctx.r7.u32;
+  int32_t src_rect[4] = {0, 0, 0, 0};
+  bool have_src_rect = false;
+  if (source_rect_ptr && HostPageReadable(REX_RAW_ADDR(source_rect_ptr)) &&
+      HostPageReadable(REX_RAW_ADDR(source_rect_ptr + 12))) {
+    for (uint32_t i = 0; i < 4; ++i)
+      src_rect[i] = int32_t(REX_LOAD_U32(source_rect_ptr + i * 4));
+    have_src_rect = src_rect[2] > src_rect[0] && src_rect[3] > src_rect[1];
+  }
+  int32_t dest_point[2] = {0, 0};
+  bool have_dest_point = false;
+  if (dest_point_ptr && HostPageReadable(REX_RAW_ADDR(dest_point_ptr)) &&
+      HostPageReadable(REX_RAW_ADDR(dest_point_ptr + 4))) {
+    dest_point[0] = int32_t(REX_LOAD_U32(dest_point_ptr));
+    dest_point[1] = int32_t(REX_LOAD_U32(dest_point_ptr + 4));
+    have_dest_point = dest_point[0] >= 0 && dest_point[1] >= 0;
+  }
   const mx::hle::RenderTargetBinding* source = nullptr;
   if (source_slot < 4)
     source = &st.render_target[source_slot];
@@ -5353,6 +5390,43 @@ extern "C" REX_FUNC(sub_8255CE98) {
 
   if (dest_texture && source && source->valid) {
     g_resolvedTextureTargets[dest_texture] = source->object;
+    // Queue the resolve itself, not just the relationship.
+    //
+    // Recording the mapping alone left the renderer binding the source target's
+    // one live surface to every draw that sampled any texture resolved out of
+    // it. One guest surface is a shared scratch buffer — six distinct textures
+    // were measured resolving from a single target in one run — so all of them
+    // aliased one resource and each showed whatever had been drawn most
+    // recently. Queuing it here, in the same ordered list as draws, is what
+    // lets the renderer take a snapshot at the right moment.
+    //
+    // Subject to the same cap and drop accounting as a draw: a full queue that
+    // silently swallowed resolves would leave stale snapshots, which looks like
+    // a partial fix rather than a failure.
+    if (g_pendingHleDraws.size() < kMaxPendingHleDraws) {
+      PendingHleDraw pending{};
+      pending.draw.resolve_dest_texture = dest_texture;
+      pending.draw.resolve_source_object = source->object;
+      // Without an explicit destination point, the source rectangle's origin is
+      // the best available answer: a banded resolve names the band's place in
+      // the full image there. Zero when neither is supplied, which is the whole
+      // -surface case and correct for it.
+      pending.draw.resolve_dest_x =
+          have_dest_point ? dest_point[0] : (have_src_rect ? src_rect[0] : 0);
+      pending.draw.resolve_dest_y =
+          have_dest_point ? dest_point[1] : (have_src_rect ? src_rect[1] : 0);
+      if (have_src_rect) {
+        pending.draw.resolve_src_x1 = src_rect[0];
+        pending.draw.resolve_src_y1 = src_rect[1];
+        pending.draw.resolve_src_x2 = src_rect[2];
+        pending.draw.resolve_src_y2 = src_rect[3];
+      }
+      pending.device = ctx.r3.u32;
+      g_pendingHleDraws.push_back(std::move(pending));
+      ++g_pendingQueued;
+    } else {
+      ++g_pendingDropped;
+    }
     static std::map<uint64_t, uint64_t> s_resolves;
     const uint64_t key = (uint64_t(source->object) << 32) | dest_texture;
     const bool first = s_resolves.emplace(key, 0).second;
@@ -5363,9 +5437,11 @@ extern "C" REX_FUNC(sub_8255CE98) {
         fetch0 = REX_LOAD_U32(dest_texture + 0x1C);
       REXLOG_INFO(
           "d3d9: resolve slot {} target 0x{:08X} {}x{} -> texture "
-          "0x{:08X} fetch0=0x{:08X}",
+          "0x{:08X} fetch0=0x{:08X} rect={} ({},{})..({},{}) point={} ({},{})",
           source_slot, source->object, source->width, source->height,
-          dest_texture, fetch0);
+          dest_texture, fetch0, have_src_rect, src_rect[0], src_rect[1],
+          src_rect[2], src_rect[3], have_dest_point, dest_point[0],
+          dest_point[1]);
     }
   }
   // sub_82AFCA38 calls Resolve four times and is where the native frame time

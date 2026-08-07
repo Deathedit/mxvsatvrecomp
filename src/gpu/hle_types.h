@@ -138,6 +138,48 @@ struct DrawCall {
   // from the CPU texture payload because a resolve is an ordered GPU operation,
   // not immutable guest-memory content.
   uint32_t sampled_render_target_object = 0;
+  // The D3D9 texture object the pixel fetch selected, when that texture was
+  // populated by a resolve.
+  //
+  // The source object above cannot identify *which* resolve result to bind: one
+  // guest surface is a shared scratch buffer that the scene and every video
+  // render into in turn, and six distinct textures were measured resolving out
+  // of a single target in one run. Keying host storage by the source target
+  // makes all six alias one resource, so every draw sampling any of them sees
+  // whatever was drawn most recently. This field is the one that tells them
+  // apart.
+  uint32_t sampled_texture_object = 0;
+  // A resolve event rather than a draw. Carries no geometry: `dest_texture` is
+  // the D3D9 texture the guest resolved into and `source_object` the render
+  // target it copied out of.
+  //
+  // It rides in the same ordered queue as draws instead of a parallel list
+  // because a resolve is only meaningful in sequence — it snapshots the target
+  // as of that moment, and every draw recorded after it must see the snapshot,
+  // not the surface's later contents. Sharing the queue keeps that ordering for
+  // free.
+  uint32_t resolve_dest_texture = 0;
+  uint32_t resolve_source_object = 0;
+  // Where in the destination texture this resolve lands, and which part of the
+  // source it takes — D3DDevice_Resolve's pDestPoint (r7) and pSourceRect (r5).
+  //
+  // Not optional detail: the scene is resolved as two EDRAM *bands*, not once.
+  // A 1280x720 colour+depth surface does not fit in 10MB of EDRAM, so the guest
+  // splits it — measured as render targets 0x2123CA94 (1280x640) and 0x2123CAC4
+  // (1280x80) sharing one surface descriptor 0x14000500, base 0x2D0, pitch
+  // 1280, both resolving into the single 1280x720 texture 0x2123CA60, 1432
+  // times in one run. Discarding these two arguments made every band look like
+  // a whole surface, so the second one replaced the first and the scene
+  // snapshot became an 80-line strip stretched over the screen.
+  //
+  // `resolve_src_x2 == 0` means no rectangle was supplied: take the whole
+  // source.
+  int32_t resolve_dest_x = 0;
+  int32_t resolve_dest_y = 0;
+  int32_t resolve_src_x1 = 0;
+  int32_t resolve_src_y1 = 0;
+  int32_t resolve_src_x2 = 0;
+  int32_t resolve_src_y2 = 0;
   // Extent of the D3D9 texture object selected by the pixel fetch. This is
   // needed even for resolved render-target samples, which deliberately have no
   // CPU texture payload, because an unnormalized tfetch still needs conversion

@@ -20,6 +20,7 @@
 #include <deque>
 #include <memory>
 #include <unordered_map>
+#include <string>
 #include <vector>
 
 namespace mx::hle { struct HleTexturePayload; }
@@ -62,11 +63,30 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  uint32_t targetObject = 0, uint32_t targetWidth = 0,
                  uint32_t targetHeight = 0,
                  uint32_t sampledTargetObject = 0,
+                 uint32_t sampledTextureObject = 0,
                  const std::shared_ptr<const mx::hle::HleTexturePayload>* planes
                      = nullptr,
                  uint32_t planeCount = 0, bool yuvHasAlpha = false,
                  bool blendEnable = false, uint32_t srcBlend = 0,
-                 uint32_t destBlend = 0, uint32_t blendOp = 0);
+                 uint32_t destBlend = 0, uint32_t blendOp = 0,
+                 uint8_t colorSource = 0);
+
+// Append a resolve to this frame's list, in order with the draws around it.
+//
+// D3DDevice_Resolve copies a render target into a texture. It used to be
+// recorded as a relationship only, which left every draw sampling any texture
+// resolved out of a given target bound to that target's single live surface —
+// and one guest surface is a shared scratch buffer that the scene and every
+// video render into in turn (six distinct textures measured resolving from one
+// target in a single run). They all aliased one resource and each showed
+// whatever had been drawn most recently.
+//
+// Ordering is the whole point: the snapshot is the target's contents at this
+// position in the frame, so this shares the draw list rather than being
+// collected separately.
+void AddGameResolve(uint32_t destTexture, uint32_t sourceObject,
+                    int32_t destX, int32_t destY, int32_t srcX1, int32_t srcY1,
+                    int32_t srcX2, int32_t srcY2);
 
 // Drop the previous frame's draws. Called when a real guest-frame handoff
 // arrives, including one whose draws are all filtered; an empty render-thread
@@ -212,6 +232,23 @@ void ClearGameDraws();
   // whose own constant buffer failed to allocate. Bound as a root CBV, so it
   // needs no descriptor heap.
   Microsoft::WRL::ComPtr<ID3D12Resource> m_gameCB;
+  // Present blit. Once resolve sources render into their own guest-sized
+  // offscreen targets, the final scene is 1280x720 and the backbuffer is
+  // window-sized, so PresentGameFrame can no longer be a CopyTextureRegion —
+  // that requires matching dimensions. It becomes a fullscreen triangle drawn
+  // through the ordinary game pipeline, which is already a textured-quad
+  // pipeline with an MVP root CBV and an SRV at t0. Reusing it rather than
+  // adding a present pipeline keeps the scaling on a proven path, and m_gameCB
+  // already holds the identity matrix the blit wants.
+  //
+  // Three vertices, not four: a triangle that overhangs the viewport covers it
+  // with no seam down the diagonal.
+  Microsoft::WRL::ComPtr<ID3D12Resource> m_presentVB;
+  D3D12_VERTEX_BUFFER_VIEW m_presentVbv = {};
+  // Which offscreen target holds the finished frame, or 0 for m_gameRT. Set
+  // during RenderGameFrame, consumed by PresentGameFrame.
+  uint32_t m_presentSourceObject = 0;
+  bool CreatePresentQuad();
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_gameSrvHeap;
   uint32_t m_gameSrvDescriptorSize = 0;
   uint32_t m_nextGameSrvDescriptor = 0;
@@ -278,7 +315,28 @@ void ClearGameDraws();
     uint32_t targetObject = 0;
     uint32_t targetWidth = 0;
     uint32_t targetHeight = 0;
+    // The vertex declaration carried no COLOR element, so the {1,1,1,1} in the
+    // vertex buffer is a seed rather than data — a modulation identity for the
+    // textured shader. If such a draw is not textured, that value is emitted
+    // literally as opaque white and is pure fabrication. See RenderGameFrame.
+    uint8_t colorSource = 0;  // mx::hle::DrawCall::ColorSource
     uint32_t sampledTargetObject = 0;
+    // Which resolve result to sample, where sampledTargetObject only says which
+    // surface produced it. Several textures resolve out of one shared target.
+    uint32_t sampledTextureObject = 0;
+    // Non-zero marks this entry a resolve rather than a draw: snapshot
+    // `resolveSource`'s target into the texture `resolveDest` names, here, in
+    // draw order. It carries no geometry.
+    uint32_t resolveDest = 0;
+    uint32_t resolveSource = 0;
+    // Placement of this band within the destination, and the sub-rectangle of
+    // the source it takes. `resolveSrcX2 == 0` means the whole source.
+    int32_t resolveDestX = 0;
+    int32_t resolveDestY = 0;
+    int32_t resolveSrcX1 = 0;
+    int32_t resolveSrcY1 = 0;
+    int32_t resolveSrcX2 = 0;
+    int32_t resolveSrcY2 = 0;
     // Bink's Y/Cr/Cb (+ optional alpha) plane set, bound together.
     std::array<std::shared_ptr<const mx::hle::HleTexturePayload>,
                kMaxDrawPlanes> planes;
@@ -288,7 +346,13 @@ void ClearGameDraws();
   };
   // Bounded because each entry costs three CreateCommittedResource calls — see
   // the PERF(per-frame-allocs) note in d3d12_game.cpp.
-  static constexpr size_t kMaxGameDraws = 256;
+  //
+  // Raised from 256 once resolves began sharing this list. They are interleaved
+  // through the stream and mostly land in its tail, so an overrunning frame lost
+  // them first: measured 340 resolves dropped in one run, which froze every
+  // snapshot at its last contents while draws went on sampling them. The cap now
+  // has to cover draws AND resolves for the whole frame, not draws alone.
+  static constexpr size_t kMaxGameDraws = 4096;
   std::vector<GameDraw> m_gameDraws;
 
   // Resources whose last GPU use was in the frame that signalled `fence`.
@@ -323,6 +387,28 @@ void ClearGameDraws();
   uint64_t m_rtDrawsOverpaint = 0;
   uint64_t m_rtRejectBudget = 0;
   uint64_t m_rtRejectResized = 0;
+  // Resolve snapshots. m_snapshotFallbacks is the one that matters: a draw that
+  // wanted a snapshot, found none, and fell back to sampling the source
+  // target's live surface — which is the old aliasing behaviour, so a large
+  // steady count means resolves are being dropped upstream rather than that the
+  // fix is working.
+  uint64_t m_snapshotCopies = 0;
+  uint64_t m_snapshotHits = 0;
+  uint64_t m_snapshotFallbacks = 0;
+  // Draws that wanted a resolved-target sample and had nothing to bind. These
+  // used to fall through to the untextured PSO and paint fabricated opaque
+  // white over the frame; they are now skipped. See RenderGameFrame.
+  uint64_t m_sampleMissSkipped = 0;
+  // Resolves whose source target has never been drawn into: the snapshot they
+  // produce is blank by construction.
+  uint64_t m_snapshotBlankSource = 0;
+  uint64_t m_snapshotMissingSource = 0;
+  // Resolves lost because the frame's draw list was already full, and snapshot
+  // resources that failed to create. Both exist to tell a fix that stopped
+  // working apart from one that never ran, and both have been non-zero for real
+  // reasons.
+  uint64_t m_resolvesDroppedFull = 0;
+  uint64_t m_snapshotCreateFailed = 0;
   struct GameRenderTarget {
     Microsoft::WRL::ComPtr<ID3D12Resource> resource;
     uint32_t width = 0;
@@ -331,6 +417,22 @@ void ClearGameDraws();
     uint32_t srvIndex = 0;
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     bool usedThisFrame = false;
+    // Whether anything has EVER been drawn into this target. A resolve whose
+    // source has never been drawn into is copying a surface that holds only its
+    // creation clear — the snapshot is then blank, and a compositor quad paints
+    // that blank over the frame.
+    bool everDrawn = false;
   };
   std::unordered_map<uint32_t, GameRenderTarget> m_gameRenderTargets;
+  // Resolve snapshots, keyed by DESTINATION TEXTURE object rather than by the
+  // source target — that distinction is the entire fix. Same struct and same
+  // budget as the offscreen targets above, so exhaustion is reported through
+  // the existing refusal counters.
+  std::unordered_map<uint32_t, GameRenderTarget> m_gameSnapshots;
+  // `width`/`height` are the REQUIRED MINIMUM extent, not the exact size: a
+  // snapshot is assembled from one or more resolve bands and must cover the
+  // union of them. An existing snapshot that is already at least this large is
+  // returned untouched; a smaller one grows, preserving what it holds.
+  GameRenderTarget* EnsureGameSnapshot(uint32_t destTexture, uint32_t width,
+                                       uint32_t height);
 };

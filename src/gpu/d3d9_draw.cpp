@@ -236,12 +236,20 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
     // Measured, 2026-08-07: setting this to {0,0,0,0} made the logo disappear
     // and left the frame at the clear colour, because it multiplies every
     // texture by zero. Do not do it again. The reasoning that motivated it was
-    // sound about the guest and wrong about us — D3D9 really does answer a
-    // missing interpolator by NOPing the pixel shader instructions that read it
-    // (sub_82565278, from the merge join in sub_82565400, writes
-    // {0xC8000000, 0, 0x02000000}: kRetainPrev / kMax with both write masks and
-    // export_data clear). But that is about a shader we do not run. Here the
-    // value is a factor in someone else's multiply, and 1 is its identity.
+    // sound about the guest and wrong about us — D3D9 really does answer an
+    // unmatched interpolator by NOPing instructions (sub_82565278, from the
+    // merge join in sub_82565400, writes {0xC8000000, 0, 0x02000000}:
+    // kRetainPrev / kMax with both write masks and export_data clear). But that
+    // is about a shader we do not run. Here the value is a factor in someone
+    // else's multiply, and 1 is its identity.
+    //
+    // Corrected 2026-08-07: the shader it patches is the VERTEX shader, not the
+    // pixel shader as this said. sub_82565928 passes the vertex shader (the one
+    // it hands to D3D_PatchVertexShaderToMatchVertexDeclaration) as the patched
+    // side, so sub_82565278 eliminates vertex EXPORTS the pixel shader does not
+    // read, and sub_82565348 rewrites an export's register to the one the pixel
+    // shader expects. The direction matters if anyone revisits interpolator
+    // linkage: a remap keyed the other way is a no-op, measured.
     //
     // The white overpaint is therefore NOT this constant. It is the untextured
     // path, where `col` is the output rather than a factor, and the compositor

@@ -19,11 +19,14 @@
 
 #include "gfx/d3d12_internal.h"
 #include "gfx/d3d12_shaders.h"
+#include "gpu/d3d9_layout.h"
 #include "gpu/hle_types.h"
 
+#include <chrono>
 #include <cstring>
 #include <string>
 #include <algorithm>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -232,8 +235,49 @@ bool D3D12Renderer::CreateGamePipeline() {
     m_gameCB->Unmap(0, nullptr);
   }
 
+  if (!CreatePresentQuad()) return false;
+
   m_hasGamePipeline = true;
   LogInfo("CreateGamePipeline: done");
+  return true;
+}
+
+// The fullscreen triangle PresentGameFrame blits with. Clip space, so the
+// identity MVP in m_gameCB passes it through untouched; white vertex colour
+// because kGameTexturePS multiplies the sample by it.
+//
+// The overhang (y=3, x=3) is deliberate: one triangle covering the viewport has
+// no diagonal seam, and the parts outside clip are discarded before they cost
+// anything. uv runs to 2 to match, so the visible region still maps 0..1.
+bool D3D12Renderer::CreatePresentQuad() {
+  struct V { float pos[4]; float col[4]; float uv[2]; };
+  static_assert(sizeof(V) == mx::hle::kHostVertexStride,
+                "present quad must match the game input layout stride");
+  const V verts[3] = {
+    {{-1.0f, -1.0f, 0.0f, 1.0f}, {1, 1, 1, 1}, {0.0f, 1.0f}},
+    {{-1.0f,  3.0f, 0.0f, 1.0f}, {1, 1, 1, 1}, {0.0f, -1.0f}},
+    {{ 3.0f, -1.0f, 0.0f, 1.0f}, {1, 1, 1, 1}, {2.0f, 1.0f}},
+  };
+  D3D12_HEAP_PROPERTIES hp = {};
+  hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+  D3D12_RESOURCE_DESC rd = {};
+  rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  rd.Width = sizeof(verts); rd.Height = 1; rd.DepthOrArraySize = 1;
+  rd.MipLevels = 1; rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1;
+  rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  if (FAILED(m_device->CreateCommittedResource(
+          &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
+          nullptr, IID_PPV_ARGS(&m_presentVB)))) {
+    LogError("CreatePresentQuad: vertex buffer creation failed");
+    return false;
+  }
+  void* mapped = nullptr;
+  if (FAILED(m_presentVB->Map(0, nullptr, &mapped))) return false;
+  memcpy(mapped, verts, sizeof(verts));
+  m_presentVB->Unmap(0, nullptr);
+  m_presentVbv.BufferLocation = m_presentVB->GetGPUVirtualAddress();
+  m_presentVbv.SizeInBytes = sizeof(verts);
+  m_presentVbv.StrideInBytes = sizeof(V);
   return true;
 }
 
@@ -725,29 +769,44 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameRenderTarget(
   if (!object || !width || !height || width > 8192 || height > 8192 ||
       !m_gameRtvHeap || !m_gameSrvHeap)
     return nullptr;
+  uint32_t reuseRtvIndex = UINT32_MAX;
+  uint32_t reuseSrvIndex = UINT32_MAX;
   if (auto it = m_gameRenderTargets.find(object);
       it != m_gameRenderTargets.end()) {
     if (it->second.width != width || it->second.height != height) {
-      // A guest heap address reused at a different size. The entry cannot be
-      // resized in place (its RTV/SRV descriptors are baked), and there is no
-      // eviction, so this object is unroutable for the rest of the run.
+      // A guest heap address reused at a different size. This used to refuse,
+      // which made the object unroutable for the REST OF THE RUN — every later
+      // draw onto it fell back to the main target and overpainted the scene,
+      // which is the exact bug offscreen routing exists to prevent. Measured
+      // 271 such refusals in one run.
+      //
+      // Replace instead. Both descriptor slots are reusable in place; only the
+      // resource changes. The old one goes through the retirement list because
+      // the GPU may still be reading it — releasing inline made every later
+      // create of that size fail (see the snapshot path).
       ++m_rtRejectResized;
-      static bool s_logged = false;
-      if (!s_logged) {
-        s_logged = true;
-        LogError("game render-target object changed dimensions");
+      reuseRtvIndex = it->second.rtvIndex;
+      reuseSrvIndex = it->second.srvIndex;
+      if (it->second.resource) {
+        RetiredFrame& r =
+            (!m_retired.empty() && m_retired.back().fence == m_fenceValue)
+                ? m_retired.back()
+                : m_retired.emplace_back(RetiredFrame{m_fenceValue, {}});
+        r.res.push_back(std::move(it->second.resource));
       }
-      return nullptr;
+      m_gameRenderTargets.erase(it);
+    } else {
+      return &it->second;
     }
-    return &it->second;
   }
   // Budget exhausted. Counted separately from every other refusal because the
   // consequence is invisible: the caller falls back to the main target and the
   // draw overpaints the scene, which is exactly the bug offscreen routing was
   // built to fix. m_gameRenderTargets is never evicted, so once this trips it
   // stays tripped.
-  if (m_gameRenderTargets.size() >= kMaxGameRenderTargets ||
-      m_nextGameSrvDescriptor >= kMaxGameTextures) {
+  if (reuseSrvIndex == UINT32_MAX &&
+      (m_gameRenderTargets.size() >= kMaxGameRenderTargets ||
+       m_nextGameSrvDescriptor >= kMaxGameTextures)) {
     ++m_rtRejectBudget;
     return nullptr;
   }
@@ -755,8 +814,9 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameRenderTarget(
   GameRenderTarget entry;
   entry.width = width;
   entry.height = height;
-  entry.rtvIndex = uint32_t(m_gameRenderTargets.size()) + 1;
-  entry.srvIndex = m_nextGameSrvDescriptor++;
+  entry.rtvIndex = reuseRtvIndex != UINT32_MAX
+                       ? reuseRtvIndex
+                       : uint32_t(m_gameRenderTargets.size()) + 1;
 
   D3D12_HEAP_PROPERTIES hp = {};
   hp.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -781,10 +841,41 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameRenderTarget(
           D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv,
           IID_PPV_ARGS(&entry.resource))))
     return nullptr;
+  // Claimed only once the resource exists. Claiming before the call leaks a
+  // descriptor on every failure, and the caller retries the same object every
+  // frame — see the snapshot path for the run where that drained the heap.
+  entry.srvIndex = reuseSrvIndex != UINT32_MAX ? reuseSrvIndex
+                                               : m_nextGameSrvDescriptor++;
 
   auto rtv = m_gameRtvHeap->GetCPUDescriptorHandleForHeapStart();
   rtv.ptr += SIZE_T(entry.rtvIndex) * m_gameRtvDescriptorSize;
   m_device->CreateRenderTargetView(entry.resource.Get(), nullptr, rtv);
+
+  // Clear once, HERE, at creation — not only when a draw first lands on it.
+  //
+  // The per-frame clear below is gated on usedThisFrame, deliberately, so a
+  // target carries its contents across frames; that is what a resolve source
+  // needs. But it means a target that is created and never drawn into is never
+  // cleared at all, and CreateCommittedResource does not guarantee zeroed
+  // memory. The resolve branch copies such a target into a snapshot regardless,
+  // and a compositor quad then paints that snapshot over the frame — so
+  // undefined GPU memory reaches the screen, which is both a real defect and
+  // exactly the kind of thing that shows up as a flat uniform colour.
+  {
+    D3D12_RESOURCE_BARRIER toRt = {};
+    toRt.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    toRt.Transition.pResource = entry.resource.Get();
+    toRt.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    toRt.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    toRt.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    m_commandList->ResourceBarrier(1, &toRt);
+    static const float kZero[4] = {0, 0, 0, 0};
+    m_commandList->ClearRenderTargetView(rtv, kZero, 0, nullptr);
+    D3D12_RESOURCE_BARRIER back = toRt;
+    back.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    back.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    m_commandList->ResourceBarrier(1, &back);
+  }
 
   D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
   srv.Format = kBackBufferFormat;
@@ -805,6 +896,188 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameRenderTarget(
   return &it->second;
 }
 
+// A snapshot is an offscreen surface like any other — same struct, same
+// creation, same budget — so this defers to EnsureGameRenderTarget's storage
+// rather than duplicating it. The only difference is the key: destination
+// texture object, not source target object. That is what stops six resolves out
+// of one shared scratch surface from aliasing each other.
+D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameSnapshot(
+    uint32_t destTexture, uint32_t width, uint32_t height) {
+  if (!destTexture || !width || !height) return nullptr;
+  // GROW to cover, never resize to match. A snapshot is assembled from one or
+  // more resolve bands: the scene arrives as 1280x640 then 1280x80 at y=640,
+  // two EDRAM bands of one 1280x720 surface (see hle_types.h). Sizing to the
+  // band that happened to arrive last is what produced the white screen — the
+  // 640-line band was destroyed microseconds after being copied and the whole
+  // scene became an 80-line strip, stretched over every compositor quad.
+  //
+  // An entry that already covers the request is returned untouched, so the
+  // steady state after the first frame is no allocation at all. That also ends
+  // the 2x-per-frame create-and-destroy of a 3.5MB committed resource — 2711
+  // of them in one run — which was the RenderPipeline stall.
+  uint32_t reuseSrvIndex = UINT32_MAX;
+  Microsoft::WRL::ComPtr<ID3D12Resource> growFrom;
+  D3D12_RESOURCE_STATES growFromState = D3D12_RESOURCE_STATE_COMMON;
+  uint32_t growWidth = 0, growHeight = 0;
+  if (auto it = m_gameSnapshots.find(destTexture); it != m_gameSnapshots.end()) {
+    if (it->second.width >= width && it->second.height >= height)
+      return &it->second;
+    ++m_rtRejectResized;
+    reuseSrvIndex = it->second.srvIndex;
+    // The union, so a later band cannot shrink away an earlier one.
+    growWidth = it->second.width;
+    growHeight = it->second.height;
+    width = std::max(width, growWidth);
+    height = std::max(height, growHeight);
+    growFrom = it->second.resource;
+    growFromState = it->second.state;
+    // Retire the old resource rather than releasing it here. It was referenced
+    // by the command list submitted for the previous frame and the GPU may
+    // still be reading it; a command list does not keep its resources alive.
+    // Dropping it inline made every subsequent CreateCommittedResource for that
+    // size fail — 1834 failures in one run.
+    if (it->second.resource) {
+      RetiredFrame& r =
+          (!m_retired.empty() && m_retired.back().fence == m_fenceValue)
+              ? m_retired.back()
+              : m_retired.emplace_back(RetiredFrame{m_fenceValue, {}});
+      r.res.push_back(std::move(it->second.resource));
+    }
+    m_gameSnapshots.erase(it);
+  }
+  if (reuseSrvIndex == UINT32_MAX &&
+      (m_gameSnapshots.size() + m_gameRenderTargets.size() >=
+           kMaxGameRenderTargets ||
+       m_nextGameSrvDescriptor >= kMaxGameTextures)) {
+    ++m_rtRejectBudget;
+    return nullptr;
+  }
+
+  GameRenderTarget entry;
+  entry.width = width;
+  entry.height = height;
+  // No RTV: a snapshot is only ever a copy destination and a shader resource.
+  // Sharing the RTV heap's index space would eat slots the offscreen targets
+  // need, and nothing renders into it.
+  entry.rtvIndex = 0;
+
+  D3D12_HEAP_PROPERTIES hp = {};
+  hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC rd = {};
+  rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  rd.Width = width;
+  rd.Height = height;
+  rd.DepthOrArraySize = 1;
+  rd.MipLevels = 1;
+  rd.Format = kBackBufferFormat;
+  rd.SampleDesc.Count = 1;
+  rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  rd.Flags = D3D12_RESOURCE_FLAG_NONE;
+  if (FAILED(m_device->CreateCommittedResource(
+          &hp, D3D12_HEAP_FLAG_NONE, &rd,
+          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
+          IID_PPV_ARGS(&entry.resource)))) {
+    // Loudly, and without having spent a descriptor. Claiming the index before
+    // this call leaked one on every failure — silently, because this path used
+    // to return with no log — and the caller retries the same texture next
+    // frame, so it drained the heap to 1024/1024 in about twenty seconds and
+    // every snapshot after that was refused for budget.
+    ++m_snapshotCreateFailed;
+    static bool s_logged = false;
+    if (!s_logged) {
+      s_logged = true;
+      char failure[160];
+      std::snprintf(failure, sizeof(failure),
+                    "resolve snapshot: creation FAILED for %ux%u — snapshots "
+                    "for this size are unavailable", width, height);
+      LogError(failure);
+    }
+    return nullptr;
+  }
+  entry.srvIndex = reuseSrvIndex != UINT32_MAX ? reuseSrvIndex
+                                               : m_nextGameSrvDescriptor++;
+
+  // Carry the old contents forward. Growing must not discard the bands already
+  // resolved into this texture — the band that triggered the growth covers only
+  // its own slice, so without this the rest of the image would be undefined
+  // memory every time the extent changes. The old resource is already retired,
+  // so it stays alive until the fence passes; leaving it in COPY_SOURCE is fine
+  // because nothing will read it again.
+  if (growFrom) {
+    D3D12_RESOURCE_BARRIER pre[2] = {};
+    pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    pre[0].Transition.pResource = growFrom.Get();
+    pre[0].Transition.StateBefore = growFromState;
+    pre[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    pre[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    pre[1] = pre[0];
+    pre[1].Transition.pResource = entry.resource.Get();
+    pre[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    pre[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    m_commandList->ResourceBarrier(2, pre);
+
+    D3D12_TEXTURE_COPY_LOCATION dst = {};
+    dst.pResource = entry.resource.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION src = dst;
+    src.pResource = growFrom.Get();
+    D3D12_BOX box = {};
+    box.right = growWidth;
+    box.bottom = growHeight;
+    box.back = 1;
+    m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+
+    D3D12_RESOURCE_BARRIER post = pre[1];
+    post.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    post.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    m_commandList->ResourceBarrier(1, &post);
+  }
+
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+  srv.Format = kBackBufferFormat;
+  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv.Texture2D.MipLevels = 1;
+  auto cpu = m_gameSrvHeap->GetCPUDescriptorHandleForHeapStart();
+  cpu.ptr += SIZE_T(entry.srvIndex) * m_gameSrvDescriptorSize;
+  m_device->CreateShaderResourceView(entry.resource.Get(), &srv, cpu);
+
+  auto [it, inserted] = m_gameSnapshots.emplace(destTexture, std::move(entry));
+  if (!inserted) return nullptr;
+  char message[192];
+  std::snprintf(message, sizeof(message),
+                "resolve snapshot: texture 0x%08X %ux%u cache %zu",
+                destTexture, width, height, m_gameSnapshots.size());
+  LogInfo(message);
+  return &it->second;
+}
+
+void D3D12Renderer::AddGameResolve(uint32_t destTexture, uint32_t sourceObject,
+                                   int32_t destX, int32_t destY, int32_t srcX1,
+                                   int32_t srcY1, int32_t srcX2,
+                                   int32_t srcY2) {
+  if (!destTexture || !sourceObject) return;
+  // Counted, not silent. Resolves are interleaved through the stream, so a
+  // frame that overruns kMaxGameDraws loses the tail — and the tail is mostly
+  // resolves. A silent drop here looks exactly like a working fix whose
+  // snapshots have simply stopped updating.
+  if (m_gameDraws.size() >= kMaxGameDraws) {
+    ++m_resolvesDroppedFull;
+    return;
+  }
+  GameDraw d;
+  d.resolveDest = destTexture;
+  d.resolveSource = sourceObject;
+  d.resolveDestX = destX;
+  d.resolveDestY = destY;
+  d.resolveSrcX1 = srcX1;
+  d.resolveSrcY1 = srcY1;
+  d.resolveSrcX2 = srcX2;
+  d.resolveSrcY2 = srcY2;
+  m_gameDraws.push_back(std::move(d));
+}
+
 void D3D12Renderer::RenderGameFrame() {
   if (!m_hasGamePipeline) return;
   m_commandList->SetGraphicsRootSignature(m_gameRootSig.Get());
@@ -821,12 +1094,142 @@ void D3D12Renderer::RenderGameFrame() {
   static const float kOffscreenClear[4] = {0, 0, 0, 0};
   std::unordered_set<uint32_t> sampledTargets;
   sampledTargets.reserve(m_gameDraws.size());
+  std::unordered_set<uint32_t> resolveSources;
   for (const auto& d : m_gameDraws) {
     if (d.sampledTargetObject &&
         d.sampledTargetObject != d.targetObject)
       sampledTargets.insert(d.sampledTargetObject);
+    if (d.resolveDest && d.resolveSource) resolveSources.insert(d.resolveSource);
   }
+  // Reset per frame: if nothing is drawn offscreen at guest-backbuffer size
+  // this frame, present must fall back to m_gameRT rather than blit a target
+  // that belongs to an earlier frame.
+  m_presentSourceObject = 0;
   for (const auto& d : m_gameDraws) {
+    // A resolve: snapshot the source target as it stands right now, so draws
+    // recorded after this point sample these contents rather than whatever the
+    // shared surface holds by the end of the frame. Draws nothing.
+    if (d.resolveDest) {
+      // Where the source actually rendered. Resolve sources are routed
+      // offscreen (isResolveSource, below), so this normally finds a surface of
+      // the source's own — which is the point: offscreen targets are only
+      // cleared when something draws into them, so they carry their contents
+      // across frames. A resolve needs exactly that.
+      ID3D12Resource* srcRes = nullptr;
+      GameRenderTarget* srcEntry = nullptr;
+      uint32_t srcWidth = 0, srcHeight = 0;
+      D3D12_RESOURCE_STATES srcState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+      if (auto it = m_gameRenderTargets.find(d.resolveSource);
+          it != m_gameRenderTargets.end()) {
+        srcEntry = &it->second;
+        srcRes = srcEntry->resource.Get();
+        srcWidth = srcEntry->width;
+        srcHeight = srcEntry->height;
+        srcState = srcEntry->state;
+      }
+      if (!srcRes) {
+        // The source has no offscreen surface — it was refused one (budget or a
+        // size change), so it rendered into m_gameRT with everything else.
+        //
+        // Do NOT copy from m_gameRT as a fallback. It is cleared every frame and
+        // accumulates every logical surface, so it does not hold the source's
+        // contents at resolve time: measured, 25 of 33 resolves in a frame have
+        // sources with no draws at all that frame, their contents established
+        // earlier. Copying from it was tried and captured the clear colour —
+        // the logo screen turned {0.05, 0.08, 0.18}.
+        //
+        // Refusing leaves the draw on the old aliased path, which is wrong but
+        // is what it had before. A steady non-zero count here means targets are
+        // being refused offscreen surfaces upstream — read the routing line.
+        ++m_snapshotMissingSource;
+        continue;
+      }
+      // Snapshotting a target nothing has ever drawn into copies a blank
+      // surface. The copy still happens — refusing it would freeze the previous
+      // snapshot, which is worse — but it is counted, because a large number
+      // here means compositor quads are painting blanks over the frame and the
+      // real defect is upstream, in whatever should have rendered that target.
+      if (srcEntry && !srcEntry->everDrawn) ++m_snapshotBlankSource;
+      // Which part of the source this band takes. The guest's rectangle is in
+      // the coordinates of the full image, not of the band's own surface, so a
+      // band at y 640..720 arrives as a rectangle our 1280x80 source resource
+      // cannot contain. Clamping and then falling back to the whole source is
+      // what makes both conventions land correctly: a genuine sub-rectangle
+      // survives the clamp, an out-of-range band one does not and takes its
+      // whole surface — which is exactly the band.
+      uint32_t sx = 0, sy = 0, copyW = srcWidth, copyH = srcHeight;
+      if (d.resolveSrcX2 > d.resolveSrcX1 && d.resolveSrcY2 > d.resolveSrcY1 &&
+          uint32_t(d.resolveSrcX2) <= srcWidth &&
+          uint32_t(d.resolveSrcY2) <= srcHeight && d.resolveSrcX1 >= 0 &&
+          d.resolveSrcY1 >= 0) {
+        sx = uint32_t(d.resolveSrcX1);
+        sy = uint32_t(d.resolveSrcY1);
+        copyW = uint32_t(d.resolveSrcX2) - sx;
+        copyH = uint32_t(d.resolveSrcY2) - sy;
+      }
+      const uint32_t dx = d.resolveDestX > 0 ? uint32_t(d.resolveDestX) : 0;
+      const uint32_t dy = d.resolveDestY > 0 ? uint32_t(d.resolveDestY) : 0;
+      // The snapshot must cover this band's placement, not merely match the
+      // band's size — that conflation is what made the scene an 80-line strip.
+      GameRenderTarget* snap =
+          EnsureGameSnapshot(d.resolveDest, dx + copyW, dy + copyH);
+      if (!snap) continue;
+      D3D12_RESOURCE_BARRIER pre[2] = {};
+      pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      pre[0].Transition.pResource = srcRes;
+      pre[0].Transition.StateBefore = srcState;
+      pre[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+      pre[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      pre[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      pre[1].Transition.pResource = snap->resource.Get();
+      pre[1].Transition.StateBefore = snap->state;
+      pre[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+      pre[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      m_commandList->ResourceBarrier(2, pre);
+      // A placed region copy, not CopyResource. CopyResource demands identical
+      // dimensions, so it could only ever express "this band IS the whole
+      // texture" — and the snapshot had to be resized to the band to satisfy
+      // it, which is the bug. Copying the band to its own offset lets the two
+      // bands of a tiled resolve assemble into one image.
+      D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+      dstLoc.pResource = snap->resource.Get();
+      dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+      dstLoc.SubresourceIndex = 0;
+      D3D12_TEXTURE_COPY_LOCATION srcLoc = dstLoc;
+      srcLoc.pResource = srcRes;
+      D3D12_BOX srcBox = {};
+      srcBox.left = sx;
+      srcBox.top = sy;
+      srcBox.right = sx + copyW;
+      srcBox.bottom = sy + copyH;
+      srcBox.back = 1;
+      m_commandList->CopyTextureRegion(&dstLoc, dx, dy, 0, &srcLoc, &srcBox);
+      // Back to shader-resource for both: the source may be rendered into again
+      // later in the same frame, and the snapshot is about to be sampled.
+      // Put the source back where it was. An offscreen entry can go to
+      // shader-resource and be transitioned again on demand, but m_gameRT must
+      // return to RENDER_TARGET: the rest of the frame keeps drawing into it,
+      // and PresentGameFrame's own RT->COPY_SOURCE barrier declares that as the
+      // before-state. The snapshot goes to shader-resource either way — being
+      // sampled is all it exists for.
+      D3D12_RESOURCE_BARRIER post[2] = {pre[0], pre[1]};
+      post[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+      post[0].Transition.StateAfter =
+          srcEntry ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE
+                   : D3D12_RESOURCE_STATE_RENDER_TARGET;
+      post[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+      post[1].Transition.StateAfter =
+          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+      m_commandList->ResourceBarrier(2, post);
+      if (srcEntry)
+        srcEntry->state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+      snap->state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+      // The target is bound again by whichever draw follows; forcing a rebind
+      // keeps that from being skipped because boundTargetObject still matches.
+      boundTargetObject = 0xFFFFFFFFu;
+      ++m_snapshotCopies;
+      continue;
+    }
     // Keep only the unsampled final 1280x720 surface on m_gameRT so
     // PresentGameFrame remains an exact-size copy. A full-size scene target
     // that a later compositor samples is still offscreen and needs its own SRV;
@@ -835,12 +1238,43 @@ void D3D12Renderer::RenderGameFrame() {
     GameRenderTarget* drawTarget = nullptr;
     const bool feedsLaterDraw =
         d.targetObject && sampledTargets.contains(d.targetObject);
+    // A resolve source needs storage that outlives the frame. Measured: of 33
+    // resolves in one frame, 25 had sources with no draws at all that frame —
+    // their contents were established earlier. m_gameRT is cleared every frame,
+    // so it can never hold them at resolve time, which is why snapshotting from
+    // it produced the clear colour. Offscreen targets are only cleared when
+    // something actually draws into them (usedThisFrame below), so they carry
+    // contents forward, which is exactly the semantics a resolve source needs.
+    // This was disabled for a while to isolate a white-screen regression. That
+    // regression has since been traced to something else entirely — exempting
+    // sampled_render_target_object from the colourless filter, which admitted
+    // 4000 fullscreen quads that still painted opaque white (51f3c80). That
+    // filter no longer exists, and this routing was never the cause.
+    // A resolve source needs storage that outlives the frame. Measured: of 33
+    // resolves in one frame, 25 had sources with no draws at all that frame —
+    // their contents were established earlier. m_gameRT is cleared every frame
+    // so it can never hold them at resolve time, which is why snapshotting from
+    // it produced the clear colour. Offscreen targets are cleared only when
+    // something draws into them, so they carry contents forward.
+    //
+    // This was bisected off while chasing a 3s/frame stall. The stall was a
+    // descriptor leak in the snapshot path, not this — measured with routing
+    // off and the stall still present.
+    const bool isResolveSource =
+        d.targetObject && resolveSources.contains(d.targetObject);
     const bool wantsOffscreen =
         d.targetObject && d.targetWidth && d.targetHeight &&
-        (feedsLaterDraw || d.targetWidth != 1280 || d.targetHeight != 720);
+        (feedsLaterDraw || isResolveSource ||
+         d.targetWidth != 1280 || d.targetHeight != 720);
     if (wantsOffscreen) {
       drawTarget = EnsureGameRenderTarget(d.targetObject, d.targetWidth,
                                           d.targetHeight);
+      // The last guest-backbuffer-sized target drawn into this frame is the
+      // finished scene, and what present should show. Tracked by last write
+      // rather than by object identity because which surface ends up on screen
+      // is a property of draw order, not of any particular target.
+      if (drawTarget && d.targetWidth == 1280 && d.targetHeight == 720)
+        m_presentSourceObject = d.targetObject;
     }
     // The three populations, kept apart on purpose. A draw that never wanted an
     // offscreen target and one that wanted it and was refused both end up on
@@ -880,6 +1314,7 @@ void D3D12Renderer::RenderGameFrame() {
         rtv.ptr += SIZE_T(drawTarget->rtvIndex) * m_gameRtvDescriptorSize;
         m_commandList->ClearRenderTargetView(rtv, kOffscreenClear, 0, nullptr);
         drawTarget->usedThisFrame = true;
+        drawTarget->everDrawn = true;
       }
     } else if (boundTargetObject != 0) {
       auto rtv = m_gameRtvHeap->GetCPUDescriptorHandleForHeapStart();
@@ -893,11 +1328,38 @@ void D3D12Renderer::RenderGameFrame() {
 
     uint32_t textureDescriptor = 0;
     bool textured = false;
-    if (d.sampledTargetObject &&
-        d.sampledTargetObject != d.targetObject) {
-      if (auto it = m_gameRenderTargets.find(d.sampledTargetObject);
-          it != m_gameRenderTargets.end()) {
-        auto& sampled = it->second;
+    if (d.sampledTargetObject) {
+      // Prefer the snapshot taken when the guest resolved into this specific
+      // texture.
+      //
+      // The snapshot lookup deliberately runs even when the draw's own target
+      // is the one that was resolved from. The old `sampled != target` guard
+      // existed because a resource cannot be read and written in the same
+      // draw — but a snapshot is a separate resource captured earlier, so that
+      // hazard is gone, and the guard was rejecting the common case: one shared
+      // scratch surface is both what the draw renders into and what it samples
+      // a previous resolve of. With the guard in place this measured hits 0.
+      //
+      // The fallback keeps the old live-surface path, under the old guard,
+      // because it is still a read-write hazard. It is wrong whenever more than
+      // one texture resolves out of that target, but it is what draws got
+      // before snapshots existed, so it beats binding nothing and turning them
+      // black. A large steady m_snapshotFallbacks means resolves are being
+      // dropped upstream.
+      GameRenderTarget* sampledPtr = nullptr;
+      if (auto snap = m_gameSnapshots.find(d.sampledTextureObject);
+          d.sampledTextureObject && snap != m_gameSnapshots.end()) {
+        sampledPtr = &snap->second;
+        ++m_snapshotHits;
+      } else if (d.sampledTargetObject != d.targetObject) {
+        if (auto it = m_gameRenderTargets.find(d.sampledTargetObject);
+            it != m_gameRenderTargets.end()) {
+          sampledPtr = &it->second;
+          ++m_snapshotFallbacks;
+        }
+      }
+      if (sampledPtr) {
+        auto& sampled = *sampledPtr;
         if (sampled.state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
           D3D12_RESOURCE_BARRIER barrier = {};
           barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -934,6 +1396,42 @@ void D3D12Renderer::RenderGameFrame() {
     }
     if (!textured)
       textured = EnsureGameTexture(d.texture, textureDescriptor);
+
+    // Fabricated colour with no texture to modulate: do not draw it at all.
+    //
+    // This is what paints the screen white. The untextured PSO returns the
+    // vertex colour unmodified, and a draw whose colour was meant to come from
+    // a texture has no COLOR element in its declaration, so BuildHleDraw seeds
+    // {1,1,1,1} (d3d9_draw.cpp). That seed is correct as a MODULATION IDENTITY
+    // — kGameTexturePS computes tex * col, and zeroing it killed the logo
+    // (0f66860) — but when the multiply never happens it is emitted literally,
+    // as opaque white. These draws are geometrically exact fullscreen quads
+    // (measured: 4.3 verts, 100% coverage, 2.01 ndc extent, 51f3c80), so each
+    // is a white rectangle over the whole frame.
+    //
+    // The gate is the FABRICATION, not the reason the texture is missing. A
+    // first attempt keyed on sampledTargetObject — "meant to sample a resolve
+    // result, found none" — and it was too narrow by an order of magnitude:
+    // measured in the menu, 123 draws land on the presented surface, 94 of them
+    // untextured, but only about 4 per frame carry a sampled target. The other
+    // ninety have no texture of any kind, mostly because the guest format was
+    // rejected upstream, and they went on painting white.
+    //
+    // kPacked and kFallback colours are real vertex data and are left alone
+    // even when untextured; only kNone is invented here.
+    //
+    // The comment above reasons that binding nothing turns such draws black. It
+    // does not — colourless means white — which is why this read as an
+    // overpaint problem for so long.
+    //
+    // Skipping shows what is underneath: incomplete, but honest. A steady count
+    // is a real upstream defect (a dropped resolve, a rejected texture format),
+    // and this only stops that defect from being painted over everything.
+    if (d.colorSource ==
+            uint8_t(mx::hle::DrawCall::ColorSource::kNone) && !textured) {
+      ++m_sampleMissSkipped;
+      continue;
+    }
 
     // Offscreen targets do not yet have per-surface depth resources. The
     // post-processing/resolve chain observed in ST_Southwest is colour-only;
@@ -974,6 +1472,7 @@ void D3D12Renderer::RenderGameFrame() {
     m_commandList->IASetVertexBuffers(0, 1, &d.vbv);
     m_commandList->IASetIndexBuffer(&d.ibv);
     m_commandList->DrawIndexedInstanced(d.indexCount, 1, 0, 0, 0);
+
   }
 
   // Cumulative, every 100th frame that drew anything. Distinct live targets is
@@ -993,6 +1492,29 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_rtRejectResized),
                   uint32_t(m_gameRenderTargets.size()), kMaxGameRenderTargets,
                   m_nextGameSrvDescriptor, kMaxGameTextures);
+    LogInfo(message);
+    // Separate line rather than a longer format: the snapshot numbers answer a
+    // different question (which resolve result a draw sampled) from the routing
+    // ones (where a draw landed), and fallbacks are the figure to watch.
+    std::snprintf(message, sizeof(message),
+                  "resolve snapshots: copies %llu, hits %llu, FALLBACKS %llu, "
+                  "source-not-offscreen %llu, WHITE-SKIPPED %llu, "
+                  "BLANK-SOURCE %llu; live snapshots %u",
+                  static_cast<unsigned long long>(m_snapshotCopies),
+                  static_cast<unsigned long long>(m_snapshotHits),
+                  static_cast<unsigned long long>(m_snapshotFallbacks),
+                  static_cast<unsigned long long>(m_snapshotMissingSource),
+                  static_cast<unsigned long long>(m_sampleMissSkipped),
+                  static_cast<unsigned long long>(m_snapshotBlankSource),
+                  uint32_t(m_gameSnapshots.size()));
+    LogInfo(message);
+    // Both of these have been non-zero for real reasons — a draw-list cap that
+    // dropped resolves, and a descriptor leak that made every creation fail —
+    // and both were invisible until they were counted. Kept reported.
+    std::snprintf(message, sizeof(message),
+                  "resolve budget: dropped-list-full %llu, create-failed %llu",
+                  static_cast<unsigned long long>(m_resolvesDroppedFull),
+                  static_cast<unsigned long long>(m_snapshotCreateFailed));
     LogInfo(message);
   }
 }
@@ -1035,10 +1557,12 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t targetObject, uint32_t targetWidth,
                                  uint32_t targetHeight,
                                  uint32_t sampledTargetObject,
+                                 uint32_t sampledTextureObject,
                                  const std::shared_ptr<const mx::hle::HleTexturePayload>* planes,
                                  uint32_t planeCount, bool yuvHasAlpha,
                                  bool blendEnable, uint32_t srcBlend,
-                                 uint32_t destBlend, uint32_t blendOp) {
+                                 uint32_t destBlend, uint32_t blendOp,
+                                 uint8_t colorSource) {
   // PERF(per-frame-allocs): this creates three ID3D12Resource's per call (VB +
   // IB + CB) on the UPLOAD heap, and is called once per submitted draw rather
   // than once per frame, so the allocation rate scales with the draw count —
@@ -1108,6 +1632,8 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.targetWidth = targetWidth;
   d.targetHeight = targetHeight;
   d.sampledTargetObject = sampledTargetObject;
+  d.sampledTextureObject = sampledTextureObject;
+  d.colorSource = colorSource;
   d.blendEnable = blendEnable;
   d.srcBlend = srcBlend;
   d.destBlend = destBlend;
@@ -1208,6 +1734,63 @@ bool D3D12Renderer::CreateGameRenderTargets() {
 
 void D3D12Renderer::PresentGameFrame() {
   if (!m_gameRT) return;
+
+  // Blit path: the finished scene lives in a guest-sized offscreen target, so
+  // it has to be scaled to the backbuffer rather than copied. m_viewport already
+  // carries the pillarbox, so drawing through it puts the image in the same
+  // place the copy path did.
+  if (m_presentSourceObject && m_hasGamePipeline && m_presentVB) {
+    auto it = m_gameRenderTargets.find(m_presentSourceObject);
+    if (it != m_gameRenderTargets.end() && it->second.resource) {
+      GameRenderTarget& src = it->second;
+      if (src.state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
+        D3D12_RESOURCE_BARRIER toSrv = {};
+        toSrv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toSrv.Transition.pResource = src.resource.Get();
+        toSrv.Transition.StateBefore = src.state;
+        toSrv.Transition.StateAfter =
+            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        toSrv.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        m_commandList->ResourceBarrier(1, &toSrv);
+        src.state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+      }
+      // The backbuffer is already RENDER_TARGET here — EndFrame's RT→PRESENT
+      // barrier depends on it still being so when this returns, which is why
+      // this path adds no barrier on it at all.
+      auto rtv = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+      rtv.ptr += SIZE_T(m_frameIndex) * m_rtvDescriptorSize;
+      m_commandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+      m_commandList->RSSetViewports(1, &m_viewport);
+      m_commandList->RSSetScissorRects(1, &m_scissorRect);
+      m_commandList->SetGraphicsRootSignature(m_gameRootSig.Get());
+      ID3D12DescriptorHeap* heaps[] = {m_gameSrvHeap.Get()};
+      m_commandList->SetDescriptorHeaps(1, heaps);
+      // Textured, no depth, colour write on. See the pso_index bits in
+      // CreateGamePipeline.
+      m_commandList->SetPipelineState(m_gamePSOs[8].Get());
+      m_commandList->IASetPrimitiveTopology(
+          D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      m_commandList->SetGraphicsRootConstantBufferView(
+          0, m_gameCB->GetGPUVirtualAddress());
+      auto gpu = m_gameSrvHeap->GetGPUDescriptorHandleForHeapStart();
+      gpu.ptr += UINT64(src.srvIndex) * m_gameSrvDescriptorSize;
+      m_commandList->SetGraphicsRootDescriptorTable(1, gpu);
+      m_commandList->IASetVertexBuffers(0, 1, &m_presentVbv);
+      m_commandList->DrawInstanced(3, 1, 0, 0);
+      // m_gameRT is untouched on this path, so it must still end in
+      // PIXEL_SHADER_RESOURCE for the next BeginFrame's PSR→RT barrier to be
+      // valid — the same postcondition the copy path below establishes.
+      D3D12_RESOURCE_BARRIER rtToSrv = {};
+      rtToSrv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      rtToSrv.Transition.pResource = m_gameRT.Get();
+      rtToSrv.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+      rtToSrv.Transition.StateAfter =
+          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+      rtToSrv.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      m_commandList->ResourceBarrier(1, &rtToSrv);
+      return;
+    }
+  }
 
   // Forward barriers: m_gameRT RT→COPY_SOURCE (valid copy source), backbuf
   // RT→COPY_DEST (valid copy destination).

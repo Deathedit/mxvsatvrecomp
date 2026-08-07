@@ -237,6 +237,16 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       // frame that never arrived.
       std::vector<const mx::hle::DrawCall*> submittable;
       for (const auto& d : draws) {
+        // A resolve is not a draw. It has no geometry, so every gate below
+        // would reject it — the first one silently, without even counting it —
+        // and a dropped resolve leaves a stale snapshot, which looks like a
+        // partial fix rather than a failure. It keeps its slot in
+        // `submittable` because the snapshot must be taken at this point in the
+        // draw order, not at the end of the frame.
+        if (d.resolve_dest_texture) {
+          submittable.push_back(&d);
+          continue;
+        }
         // vertices are only populated when the translator resolved a vertex
         // fetch constant; index-only draws have nothing to bind.
         if (!d.valid || d.vertices.empty() || d.index_count == 0) continue;
@@ -291,6 +301,13 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       }
       if (!submittable.empty()) {
         for (const auto* d : submittable) {
+          if (d->resolve_dest_texture) {
+            m_renderer->AddGameResolve(
+                d->resolve_dest_texture, d->resolve_source_object,
+                d->resolve_dest_x, d->resolve_dest_y, d->resolve_src_x1,
+                d->resolve_src_y1, d->resolve_src_x2, d->resolve_src_y2);
+            continue;
+          }
           m_renderer->AddGameDraw(d->vertices.data(),
                                   static_cast<uint32_t>(d->vertices.size()),
                                   d->vertex_stride, d->indices.data(),
@@ -307,6 +324,7 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   d->render_target_width,
                                   d->render_target_height,
                                   d->sampled_render_target_object,
+                                  d->sampled_texture_object,
                                   d->planes.data(), d->plane_count,
                                   d->yuv_has_alpha,
                                   // Only blend when the guest said so — a draw
@@ -314,7 +332,13 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   // opaque path it has always had.
                                   (d->om_seen & (1u << 2)) != 0 &&
                                       d->blend_enable != 0,
-                                  d->src_blend, d->dest_blend, d->blend_op);
+                                  d->src_blend, d->dest_blend, d->blend_op,
+                                  // No COLOR element in the declaration, so the
+                                  // {1,1,1,1} in the vertex buffer is a seed,
+                                  // not data. Harmless when a texture
+                                  // modulates it; opaque white when nothing
+                                  // does.
+                                  static_cast<uint8_t>(d->color_source));
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;
