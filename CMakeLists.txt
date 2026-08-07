@@ -30,6 +30,7 @@ set(MX_SOURCES
     src/gpu/hle_types.cpp
     src/gpu/shader_ucode.cpp
     src/gpu/shader_alu.cpp
+    src/gpu/shader_hlsl.cpp
     src/gpu/xenos_gpu_state.cpp
     src/gpu/d3d9_layout.cpp
     src/gpu/d3d9_draw.cpp
