@@ -17,33 +17,22 @@
 #include <dxgidebug.h>
 #pragma comment(lib, "dxguid.lib")
 
-#include <rex/cvar.h>
-
-// The game render target is cleared to this every frame. Magenta is available
-// because the two failure modes a screenshot has to tell apart look identical
-// against the dark blue default: "nothing was drawn at all" and "something was
-// drawn over the whole target in black". Against magenta they do not.
-// On by default while the frame is being brought up: an unscaled image means a
-// screenshot shows the guest's own pixels, with no magnification in the way.
-REXCVAR_DEFINE_BOOL(native_res_viewport, true, "Debug",
-                    "Draw the guest's 1280x720 at 1:1 in the centre of the "
-                    "window instead of scaling it up to fit");
-
-REXCVAR_DEFINE_BOOL(clear_magenta, false, "Debug",
-                    "Clear the game render target to magenta instead of the "
-                    "default dark blue, to make undrawn areas obvious");
+// clear_magenta and native_res_viewport were bring-up cvars and are gone
+// (2026-08-07). The magenta clear existed to tell "nothing was drawn at all"
+// apart from "something was drawn over the whole target in black", which look
+// identical against the dark blue; nobody ran it, and the two clears below make
+// the same distinction by keeping the bars black. native_res_viewport was on by
+// default throughout, so the 1:1 path it selected is simply what this does now.
 
 using mx::gfx::kAdapterNamePrefix;
 using mx::gfx::LogError;
 using mx::gfx::LogInfo;
 
 namespace {
+// Ours, not the guest's — see the two clears in BeginFrame.
 const float* GameClearColor() {
   static const float kDarkBlue[4] = {0.05f, 0.08f, 0.18f, 1.0f};
-  static const float kMagenta[4] = {1.0f, 0.0f, 1.0f, 1.0f};
-  static const float* const kChosen =
-      REXCVAR_GET(clear_magenta) ? kMagenta : kDarkBlue;
-  return kChosen;
+  return kDarkBlue;
 }
 }  // namespace
 
@@ -534,10 +523,11 @@ void D3D12Renderer::CreateViewportAndScissor() {
   // Draw the guest's 1280x720 at 1:1 when the window is larger, rather than
   // scaling it up to fill the pillarboxed area. Nothing is stretched, filtered
   // or resampled, so what reaches the screen is exactly what the guest
-  // produced — which is what you want while the frame itself is still being
-  // brought up. Off restores the fitted image.
-  if (REXCVAR_GET(native_res_viewport) && win_w >= kGuestWidth &&
-      win_h >= kGuestHeight) {
+  // produced, and a screenshot pixel maps to a guest pixel.
+  //
+  // The size guard is not optional: below 720p there is no 1:1 image to draw
+  // and the fitted region computed above is the only correct answer.
+  if (win_w >= kGuestWidth && win_h >= kGuestHeight) {
     draw_w = kGuestWidth;
     draw_h = kGuestHeight;
   }

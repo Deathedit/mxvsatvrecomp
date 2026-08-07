@@ -63,7 +63,7 @@ the `ffmpeg/` tree nor the five av*/sw* DLLs are needed, and both are deleted.
 ### Running
 
 ```bash
-./mx.exe --game_data_root=assets --user_data_root=userdata --hide_colorless_draws=true --force_load=NAT_Farm --registry_override=ReadyToLaunch=1
+./mx.exe --game_data_root=assets --user_data_root=userdata --force_load=NAT_Farm --registry_override=ReadyToLaunch=1
 ```
 
 `--game_data_root` and `--user_data_root` are mandatory — without them the
@@ -97,15 +97,28 @@ run shorter than ~2½ minutes never reaches it; ~400s gives a usable sample.
 `mx.toml` or `--flag=value`. Defined in `src/app/graphics_system.cpp` and
 `src/hooks/hooks_d3d9.cpp`:
 
-`clear_magenta`, `d3d9_hooks_passthrough`, `d3d9_page_cache_verify`,
-`force_load`, `hide_colored_draws`, `hide_colorless_draws`, `hle_capture`,
-`hle_main_viewport_only`, `hle_shader_exec`, `hle_shader_verts`,
-`registry_override`, `hide_colorless_draws`.
+`d3d9_hooks_passthrough`, `d3d9_page_cache_verify`, `force_load`,
+`hle_capture`, `hle_main_viewport_only`, `hle_shader_exec`,
+`hle_shader_verts`, `registry_override`.
 
 Seven more (`alu_execute`, `skip_untransformable_draws`, `tint_by_color_source`,
 `transcode_confirmed_formats_only`, `transcode_trust_export`,
 `vertex_transcode`, `vfetch_use_shader_slot`) were defined in the PM4 translator
 and went with it, as did `hle_render`, `pm4_translate` and `main_surface_only`.
+
+Four bring-up cvars were retired on **2026-08-07**, each freezing the one
+behaviour it was always run with: `native_res_viewport` (the guest's 1280x720
+now always drawn 1:1 in the centre of the window, pillarboxed, whenever the
+window is at least that big) and `clear_magenta` (the dark blue clear is the
+only one), plus `hide_colorless_draws` and `hide_colored_draws` — **frozen in
+the *submit* direction**, so every draw now reaches the renderer regardless of
+colour source. That last pair is the important one: see the colourless
+overpaint below.
+
+**Unknown cvars are tolerated.** An old command line carrying
+`--hide_colorless_draws=true` still runs and the flag silently does nothing —
+which changes what the run renders. Check run lines against this list before
+trusting a result.
 
 `force_load` and `registry_override` are **diagnostic levers, not fixes** — see
 "Why there is no menu" below.
@@ -171,7 +184,10 @@ Those are the plugin's numbers. **The native/plugin divergence is closed.**
 
 With `--hide_colorless_draws=true` the front end renders 11,250 draws / 33,750
 vertices with **every skip counter at zero** — no-code 0, decode 0, stream 0,
-constants 0, vertex 0.
+constants 0, vertex 0. *(Measured under a configuration that no longer exists:
+that cvar was retired 2026-08-07 and every draw is now submitted. The skip
+counters are the point here and are unaffected; the draw count is not
+reproducible as written.)*
 
 **Both hazards the stub was written for are false**, read out of `sub_82B70370`
 rather than assumed:
@@ -730,7 +746,9 @@ Applied held at 88.84%.
 
 **RenderDoc A/B, frame 3000, NAT_Farm** (`legacy_mvp_tiebreak` existed so both
 sides come from one binary). Captured twice: once as-is, once with
-`hide_colorless_draws=true` to remove the overpaint.
+`hide_colorless_draws=true` to remove the overpaint. *That cvar was retired
+2026-08-07, so the second capture cannot be reproduced as written — the
+conclusion below survives, the method does not.*
 
 As-is, both frames are a fullscreen quad split by one diagonal, in the *same*
 place — only the colours differ. The present is dominated by the compositor, so
@@ -930,10 +948,15 @@ rather than assuming the list is now empty.
   runs; the flag simply does nothing.
 - `--game_data_root=assets --user_data_root=userdata` are mandatory; without
   them the process exits immediately.
-- `--hide_colorless_draws=true` on every run. Without it **no texture is
-  visible on screen at all** -- the colourless overpaint covers textured draws
-  rather than substituting for missing ones. This makes the shipped default
-  (`false`) the untested configuration; it should be flipped.
+- **The colourless overpaint is an open defect, and since 2026-08-07 it is no
+  longer hidden.** Draws whose binding scan rejected every candidate are written
+  opaque white and paint *over* textured draws rather than substituting for
+  missing ones, so **no texture is visible on screen** in a default run. This
+  used to be worked around with `--hide_colorless_draws=true`, passed on every
+  run; that cvar is retired and the workaround is gone, because it made the
+  frame look better without making anything correct. A white frame is the known
+  defect, not a regression -- read runs against the draw counters, and fix it in
+  the transcode.
 - The front end does not always reach the UI within the window: roughly half of
   otherwise-identical runs produce no texture uploads. Zero uploads is not
   evidence of a regression; zero *rejections* is the signal to read.
@@ -994,6 +1017,11 @@ register had been clobbered. The fullscreen post-process passes (160x90,
 gradient with cloud texture, blue ground, and a tan strip — recognisable
 textured content. The same configuration produced a flat brown fill before this
 fix. A large black wedge across the middle remains, and is the next defect.
+
+*That cvar was retired 2026-08-07, so this is no longer visible on screen — the
+overpaint now covers it. The textured content is still there underneath and is
+still what the fix produced; confirming it again needs RenderDoc on the draws
+themselves, not a screenshot.*
 
 Without `hide_colorless_draws` the present is unchanged, because the compositor
 passes already had unit UVs and were untouched by the swizzle change; what this
@@ -1085,7 +1113,7 @@ moment ~115s into a run. The frame number is exactly what has to match for two
 captures to be comparable, so hand-timing was the weakest part of any A/B.
 
 ```bash
-renderdoccmd capture -d <repo> -c <out_prefix> ./mx.exe --game_data_root=assets --user_data_root=userdata --hide_colorless_draws=true --force_load=NAT_Farm --registry_override=ReadyToLaunch=1 --rdoc_capture_frame=3000
+renderdoccmd capture -d <repo> -c <out_prefix> ./mx.exe --game_data_root=assets --user_data_root=userdata --force_load=NAT_Farm --registry_override=ReadyToLaunch=1 --rdoc_capture_frame=3000
 ```
 
 RenderDoc appends the frame number, giving `<out_prefix>_frame3000.rdc`.

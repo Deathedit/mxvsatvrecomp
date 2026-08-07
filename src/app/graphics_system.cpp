@@ -24,30 +24,18 @@
 // offset 28, so 36 bytes. See the gate in RenderThreadFunc.
 static constexpr uint32_t kSupportedStride = mx::hle::kHostVertexStride;
 
-// Two halves of one diagnostic: show the frame without the overpaint, and show
-// the overpaint by itself.
+// hide_colorless_draws and hide_colored_draws were two halves of one
+// diagnostic, splitting the frame by colour source so a screenshot could show
+// the scene without the colourless overpaint, or the overpaint on its own. Both
+// are gone (2026-08-07): every draw is submitted regardless of colour source.
 //
-// Measured: draws with no colour attribute average 16 vertices yet their
-// transformed bounding box covers 52% of the viewport, against 0.45% for draws
-// carrying a real packed colour — a 115x difference on a hundredth of the
-// vertices. 6581 of them cover more than half the screen each. That is not a
-// fullscreen pass (which would be a handful of draws); it is small geometry
-// smeared across the viewport by a bad transform.
-//
-// hide_colorless_draws asks whether a real scene is underneath.
-// hide_colored_draws shows the shape of the smear on its own.
-//
-// DIAGNOSTICS, not rendering modes — the hidden draws are still produced and
-// still wrong. Never set both: that submits almost nothing and is not a
-// configuration worth reporting.
-REXCVAR_DEFINE_BOOL(hide_colorless_draws, false, "Debug",
-                    "Do not submit draws whose shader has no colour attribute "
-                    "(written opaque white). A diagnostic: it says whether a "
-                    "real scene is hidden under the overpaint, not a fix");
-REXCVAR_DEFINE_BOOL(hide_colored_draws, false, "Debug",
-                    "Do not submit draws that resolved a vertex colour, so only "
-                    "the colourless ones remain. A diagnostic: it shows the "
-                    "shape of the overpaint on its own, not a fix");
+// What retired them: they hid a defect rather than fixing it. Draws with no
+// colour attribute are written opaque white and paint *over* textured draws
+// instead of substituting for missing ones, so `hide_colorless_draws=true` was
+// passed on every run and the shipped default was the untested configuration.
+// Keeping the filter would have made that permanent. The overpaint is a
+// transcode bug — small geometry smeared across the viewport by a bad transform
+// — and belongs in the transcode.
 
 // The D3D9 -> D3D12 path describes every draw from the API calls that produced
 // it, rather than reconstructing it from the PM4 ring.
@@ -237,7 +225,6 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       static std::map<uint32_t, uint32_t> s_skippedStrides;
       static std::map<uint64_t, uint32_t> s_skippedViewports;
       static uint64_t s_skippedUntransformable = 0;
-      static uint64_t s_skippedByColor = 0;
       // Filter first, bind second. The renderer's list is only replaced once we
       // know the new frame has something in it — a frame whose draws were all
       // skipped for stride would otherwise blank the screen just as surely as a
@@ -259,29 +246,6 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
           ++skipped;
           ++s_skippedUntransformable;
           continue;
-        }
-        // Colour-source diagnostics. Counted separately from every other skip
-        // reason so a screenshot taken with either one on can be read honestly
-        // against the draw counts.
-        {
-          using CS = mx::hle::DrawCall::ColorSource;
-          // Spelled out rather than using !colorless, which would also catch
-          // kNotTranscoded — those resolved no colour at all and are neither
-          // population. The stride gate below drops them regardless.
-          // `!d.texture` alone was wrong once draws could carry a plane set
-          // instead: the Bink composite has no vertex colour and no single
-          // texture, so it read as colourless and was filtered out entirely.
-          // It is textured — its textures just live in `planes`.
-          const bool colorless =
-              d.color_source == CS::kNone && !d.texture && !d.yuv_composite;
-          const bool colored = d.color_source == CS::kPacked ||
-                               d.color_source == CS::kFallback;
-          if ((REXCVAR_GET(hide_colorless_draws) && colorless) ||
-              (REXCVAR_GET(hide_colored_draws) && colored)) {
-            ++skipped;
-            ++s_skippedByColor;
-            continue;
-          }
         }
         if (d.vertex_stride != kSupportedStride) {
           ++skipped;
@@ -312,12 +276,10 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
 
       // A non-empty handoff is a real guest frame even when every draw is
       // filtered, so the previous frame is retired here rather than inside the
-      // submittable check below. That distinction used to matter twice over:
-      // ClearGameDraws also retired the baked placeholder triangle, and running
-      // it only when a draw survived filtering meant hide_colorless_draws could
-      // filter all 14 startup draws and leave the host replaying the
-      // placeholder while the guest swapped. The placeholder is gone; retiring
-      // on handoff is still correct.
+      // submittable check below. Otherwise a frame whose draws were all skipped
+      // — for stride, or for the viewport gate — leaves the host replaying the
+      // previous frame's draw list while the guest swaps, which reads as a
+      // frozen picture rather than as an empty one.
       if (!draws.empty()) {
         m_renderer->ClearGameDraws();
       }
@@ -373,13 +335,11 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
         REXLOG_INFO("RenderThread: frame #{} submitted {} draws, skipped {} "
                     "— skipped strides (cumulative) {} — host ticks with/without "
                     "new draws {}/{} — skipped viewports {} — skipped "
-                    "untransformable (cumulative) {} — skipped by colour "
-                    "source (cumulative) {}",
+                    "untransformable (cumulative) {}",
                     s_frame, submitted, skipped, hist.empty() ? "none" : hist,
                     s_ticksWithDraws, s_ticksEmpty,
                     viewports.empty() ? "none" : viewports,
-                    s_skippedUntransformable,
-                    s_skippedByColor);
+                    s_skippedUntransformable);
       }
       // BeginFrame and EndFrame own the whole frame: BeginFrame opens the
       // command list, transitions and clears the targets and then calls
