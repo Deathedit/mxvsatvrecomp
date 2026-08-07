@@ -2651,6 +2651,7 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
   if (!profile || !profile->decoded || profile->bindings.empty()) return false;
 
   int best_score = -1;
+  uint64_t best_texels = 0;
   mx::hle::HleTextureSource best_source;
   bool found = false;
   for (const auto& candidate : profile->bindings) {
@@ -2686,6 +2687,19 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
          source.host_format == mx::hle::HostTextureFormat::kR8 ||
          source.host_format == mx::hle::HostTextureFormat::kR16 ||
          source.host_format == mx::hle::HostTextureFormat::kR32Float))
+      continue;
+    // An 8x8 immutable texture is a lookup table, not a material. Both that
+    // this front end owns are ordered-dither matrices the guest thresholds
+    // against for stipple transparency (RenderDoc texture 1316, 8x8 BC1, and
+    // the 8x8 k_4_4_4_4 at s12 of shader 0x216A8C20), and the generic host
+    // pixel shader has no threshold step — it samples whatever wins and shows
+    // it, which is how a Bayer checkerboard ended up painted across the main
+    // menu. The tie-break below covers the case where a real texture is also
+    // present; this covers the case where it is not, and falling through to
+    // the colour-only pipeline is the honest answer. Cut measured, not
+    // guessed: across a front-end run the smallest immutable winner other
+    // than these two is 64x8.
+    if (!mapped_render_target && uint64_t(source.width) * source.height <= 64)
       continue;
     // A mapped render target is authoritative storage, but it is not normally
     // the visible base colour of a material. Multi-input world shaders often
@@ -2728,8 +2742,17 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
         score += mapped_render_target ? 10 : 0;
         break;
     }
-    if (score <= best_score) continue;
+    // Ties were previously broken by fetch program order, which is not
+    // evidence of anything, and it lost a 2048x2048 colour atlas to an 8x8
+    // ordered-dither matrix that happened to be fetched first (shader
+    // 0x216A8C20: s12 8x8 k_4_4_4_4 and s11 2048x2048 RGBA8, both scoring
+    // 400). Between two candidates the descriptor cannot otherwise separate,
+    // the larger one is the material and the smaller one is a lookup table.
+    const uint64_t texels = uint64_t(source.width) * source.height;
+    if (score < best_score || (score == best_score && texels <= best_texels))
+      continue;
     best_score = score;
+    best_texels = texels;
     out = candidate;
     best_source = source;
     found = true;
