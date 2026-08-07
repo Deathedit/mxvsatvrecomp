@@ -949,14 +949,12 @@ rather than assuming the list is now empty.
 - `--game_data_root=assets --user_data_root=userdata` are mandatory; without
   them the process exits immediately.
 - **The colourless overpaint is an open defect, and since 2026-08-07 it is no
-  longer hidden.** Draws whose binding scan rejected every candidate are written
-  opaque white and paint *over* textured draws rather than substituting for
-  missing ones, so **no texture is visible on screen** in a default run. This
-  used to be worked around with `--hide_colorless_draws=true`, passed on every
-  run; that cvar is retired and the workaround is gone, because it made the
-  frame look better without making anything correct. A white frame is the known
-  defect, not a regression -- read runs against the draw counters, and fix it in
-  the transcode.
+  longer hidden.** Draws that resolve no colour are written opaque white and
+  paint *over* the scene, so **no texture is visible on screen** in a default
+  run. This used to be worked around with `--hide_colorless_draws=true`, passed
+  on every run; that cvar is retired and the workaround is gone, because it made
+  the frame look better without making anything correct. A white frame is the
+  known defect, not a regression. **What it is** is below.
 - The front end does not always reach the UI within the window: roughly half of
   otherwise-identical runs produce no texture uploads. Zero uploads is not
   evidence of a regression; zero *rejections* is the signal to read.
@@ -970,6 +968,50 @@ Its bit layout, and the guest's own format size table, are in
 Signed-normalized `k_2_10_10_10` (used for `NORMAL` and `TANGENT`) has no DXGI
 equivalent. It passes through as `R10G10B10A2_UINT` with
 `Unpack::kSnorm2_10_10_10` so the shader finishes the conversion.
+
+### The overpaint — measured 2026-08-07, and it is not what it was called
+
+Probes in `46404e1`, removed in `7394f22`; recover by hash if they are wanted
+again. Measured on a plain front-end run with no `--force_load`.
+
+|            | draws | verts | coverage | raw NDC extent | outside the cube |
+|------------|-------|-------|----------|----------------|------------------|
+| colourless | 1824  | 4.3   | 100.00%  | **2.01**       | 0                |
+| coloured   | 338   | 4.0   | 75.92%   | **705.28**     | 186              |
+
+**The colourless draws are geometrically exact.** A raw extent of 2.01 NDC is a
+fullscreen quad to two decimals, and not one of the 1824 falls outside the clip
+cube. **1669 of 1824 — 91.5% — sample a render target.** They are compositor
+passes; their colour was always going to come from that target, and they paint
+white because the target is empty.
+
+**So the fix is the resolve snapshot, not the transcode.** Two long-standing
+claims are wrong and should not be repeated:
+
+- *"Colourless draws are 16 vertices averaging 52% coverage, small geometry
+  smeared across the viewport by a bad transform; a fullscreen pass would be a
+  handful of draws."* Every part of that is refuted above. It predated both
+  transform fixes on this branch (`fd96c50`, `332eda4`) and was never
+  remeasured.
+- *"#32 before #30 — until those draws have a real colour, #30's snapshots have
+  no visible consumer."* **Inverted.** #30 is what gives them the colour.
+
+**Read raw extent, not coverage.** A clamped coverage figure cannot tell a
+legitimate fullscreen quad from geometry blown far outside the screen — both
+report 100%. That ambiguity is how the original measurement was misread.
+
+Two side findings, both dead ends for the overpaint but worth not re-deriving:
+
+- The `ps=0x216A8C20` binding census closes itself. All eight `host-format`
+  rejections are 32x32 `FMT_8`/`FMT_16` on s9/s10 — single-channel lookups
+  correctly excluded as base colours, so that bucket is policy working, not a
+  gap. The other four are one 2048x2048 `FMT_8_8_8_8` atlas at `0x1A2E3000`,
+  which is **readable and entirely zero** (0 of 262144 sampled bytes) on first
+  touch — not a streaming race, so invalidating the empty memoisation changes
+  nothing.
+- **186 of 338 coloured draws carry raw extents up to 1280**, i.e. screen space
+  passing through untransformed. A real defect, unrelated to the overpaint, and
+  not what whites out the screen.
 
 ### Render targets — done, and instrumented
 

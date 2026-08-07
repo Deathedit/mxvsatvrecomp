@@ -33,9 +33,15 @@ static constexpr uint32_t kSupportedStride = mx::hle::kHostVertexStride;
 // colour attribute are written opaque white and paint *over* textured draws
 // instead of substituting for missing ones, so `hide_colorless_draws=true` was
 // passed on every run and the shipped default was the untested configuration.
-// Keeping the filter would have made that permanent. The overpaint is a
-// transcode bug — small geometry smeared across the viewport by a bad transform
-// — and belongs in the transcode.
+// Keeping the filter would have made that permanent.
+//
+// The overpaint is NOT a transform bug, though this comment claimed it was
+// until the claim was measured (46404e1). Colourless draws are 4-vertex
+// fullscreen quads with a raw NDC extent of 2.01 and none outside the cube —
+// geometrically exact, not "small geometry smeared across the viewport". 91.5%
+// of them sample a render target: they are compositor passes whose colour was
+// always going to come from that target, and they paint white because the
+// target is empty. The fix is the resolve snapshot, not anything here.
 
 // The D3D9 -> D3D12 path describes every draw from the API calls that produced
 // it, rather than reconstructing it from the PM4 ring.
