@@ -528,7 +528,7 @@ bool D3D12Renderer::CreateTranslatedRootSignature() {
 bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
                                            D3D12_GPU_DESCRIPTOR_HANDLE& out) {
   if (!m_translatedSrvHeap || !d.pixelSamplerCount) return false;
-  if (m_translatedBlockNext >= kMaxTranslatedBlocks) {
+  if (m_translatedBlockNext >= m_translatedBlockLimit) {
     ++m_translatedBlockExhausted;
     return false;
   }
@@ -1473,6 +1473,11 @@ void D3D12Renderer::RenderGameFrame() {
   // Composite draws take their plane descriptor blocks in order within a frame.
   m_yuvDrawsThisFrame = 0;
   ++m_gameFrame;
+  // This frame in flight takes its own slice of the descriptor blocks, so the
+  // window resets every host frame rather than only when the guest hands off a
+  // new draw list. See kTranslatedBlocksPerFrame.
+  m_translatedBlockNext = m_frameIndex * kTranslatedBlocksPerFrame;
+  m_translatedBlockLimit = m_translatedBlockNext + kTranslatedBlocksPerFrame;
   for (auto& [object, target] : m_gameRenderTargets)
     target.usedThisFrame = false;
 
@@ -2086,11 +2091,9 @@ void D3D12Renderer::ClearGameDraws() {
     if (d.cb) r.res.push_back(std::move(d.cb));
   }
   m_gameDraws.clear();
-  // The descriptor blocks are consumed by the frame that wrote them. Reset once
-  // the frame's draws are retired, which is the same point their resources are
-  // handed to the fenced retirement list — so a block is never rewritten while
-  // the GPU may still be reading it.
-  m_translatedBlockNext = 0;
+  // The descriptor block window is NOT reset here. This runs on guest handoff,
+  // not per host frame, and blocks are consumed per host frame — which is what
+  // exhausted the ring. RenderGameFrame opens each frame's own slice instead.
 }
 
 void D3D12Renderer::DrainRetired() {

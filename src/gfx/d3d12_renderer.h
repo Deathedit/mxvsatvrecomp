@@ -355,9 +355,25 @@ void ClearGameDraws();
   // descriptor the GPU may still be reading is undefined — the video-plane
   // block above was moved off a shared block for exactly this reason, and it
   // read as zero on this hardware rather than failing.
-  static constexpr uint32_t kMaxTranslatedBlocks = 2048;
+  // Per-draw descriptor blocks, PARTITIONED BY FRAME IN FLIGHT: frame f owns
+  // [f*kTranslatedBlocksPerFrame, (f+1)*kTranslatedBlocksPerFrame). The ring
+  // used to be one shared range reset in ClearGameDraws, which runs only when
+  // the guest hands off a new draw list — while blocks are consumed by
+  // RenderGameFrame, which runs every HOST frame and replays the previous list
+  // when the guest has not handed off. Blocks therefore accumulated across
+  // every replay: measured, ~125 translated draws a frame exhausted 2048 after
+  // roughly sixteen frames, and block-exhausted became the dominant reason a
+  // translatable draw fell back (7789 against 381 for every other cause).
+  //
+  // Slicing per frame lets the window reset every host frame while still only
+  // rewriting blocks the GPU finished with kFrameCount frames ago, which is
+  // what putting the reset in ClearGameDraws was protecting.
+  static constexpr uint32_t kMaxTranslatedBlocks = 4096;
+  static constexpr uint32_t kTranslatedBlocksPerFrame =
+      kMaxTranslatedBlocks / kFrameCount;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_translatedSrvHeap;
   uint32_t m_translatedBlockNext = 0;
+  uint32_t m_translatedBlockLimit = kTranslatedBlocksPerFrame;
   uint64_t m_translatedBlockExhausted = 0;
   // Why a draw with a translated shader fell back to the stand-in anyway. All
   // four used to be a silent `return false`, which made "translated 17243,
