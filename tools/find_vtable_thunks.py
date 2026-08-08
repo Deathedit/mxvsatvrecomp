@@ -246,25 +246,39 @@ def report(found, config_path, config_note, known_count):
         print("Nothing missing.")
         return ""
 
-    # Contiguous runs are the interesting unit: a table found whole is a table
-    # that will not come back one crash at a time.
+    # Group into contiguous runs. A run of one is just a thunk and needs no
+    # annotation; a run of several is a table, and saying so is the point —
+    # a table found whole is a table that will not come back one crash at a
+    # time. Annotating singletons buries that signal in noise.
+    runs = []
+    for ea, size, kind, _, _ in missing:
+        if runs and ea == runs[-1][-1][0] + runs[-1][-1][1]:
+            runs[-1].append((ea, size, kind))
+        else:
+            runs.append([(ea, size, kind)])
+
     lines = []
     print("")
     print("--- MISSING, as TOML ---")
-    run_start = None
-    prev_end = None
-    for ea, size, kind, _, _ in missing:
-        if prev_end is not None and ea != prev_end:
-            print("  # table 0x%08X..0x%08X" % (run_start, prev_end - 1))
-            run_start = None
-        if run_start is None:
-            run_start = ea
-        line = "0x%08X = { size = 0x%X }" % (ea, size)
-        lines.append(line)
-        print("  " + line)
-        prev_end = ea + size
-    if run_start is not None:
-        print("  # table 0x%08X..0x%08X" % (run_start, prev_end - 1))
+    for run in runs:
+        if len(run) > 1:
+            last = run[-1]
+            header = "# table 0x%08X..0x%08X, %d entries" % (
+                run[0][0],
+                last[0] + last[1] - 1,
+                len(run),
+            )
+            lines.append(header)
+            print("  " + header)
+        for ea, size, _kind in run:
+            line = "0x%08X = { size = 0x%X }" % (ea, size)
+            lines.append(line)
+            print("  " + line)
+
+    tables = sum(1 for r in runs if len(r) > 1)
+    print("")
+    print("  %d entries in %d runs (%d of them multi-entry tables)"
+          % (len(missing), len(runs), tables))
 
     return "\n".join(lines) + "\n"
 
