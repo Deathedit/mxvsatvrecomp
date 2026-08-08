@@ -14,3 +14,4 @@ gamecontrollerdb.txt
 pm4_dump_*.txt
 d3d9_dump_*.txt
 gpu_state_diff_*.txt
+launch.bat
