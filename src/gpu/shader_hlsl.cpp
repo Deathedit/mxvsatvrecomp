@@ -148,6 +148,9 @@ class Emitter {
   // cannot be the register number.
   uint32_t sampler_count = 0;
   uint32_t slot_guest[HlslShader::kMaxSamplerSlots] = {};
+  // kCube needs scratch that does not fold into an expression. Declared only
+  // when used, so the common shader carries none.
+  bool uses_cube = false;
   std::string body;
 
   // Returns the compact slot for a guest sampler, allocating one on first use.
@@ -313,6 +316,48 @@ class Emitter {
         r = "float4(1.0, (" + a + ").y * (" + b + ").y, (" + a + ").z, (" + b +
             ").w)";
         break;
+      // Cube map coordinate generation. Transcribed from the hardware
+      // definition in ucode.h (kCube), not approximated:
+      //
+      //   dest.x = T, dest.y = S, dest.z = 2 * major axis, dest.w = FaceID
+      //
+      // The direction vector is NOT src0 verbatim. The instruction expects the
+      // shader to have swizzled src0 to .zzxy (and src1 to .yxzz), so after our
+      // Src() applies that swizzle the components land as
+      //
+      //   z = src0.x   x = src0.z   y = src0.w
+      //
+      // which is where the indices below come from. src1 carries the same three
+      // values in a different order and is redundant once src0 is unpacked; it
+      // is still evaluated, because the hardware reads it and because an
+      // operand skipped here would corrupt the constant-read accounting.
+      //
+      // Emitted as statements rather than one expression: the three-way major
+      // axis selection does not fold into anything readable, and readability is
+      // what lets this be checked against the hardware doc line by line.
+      case Op::kCube: {
+        uses_cube = true;
+        Line("xe_cube = float3((" + a + ").z, (" + a + ").w, (" + a + ").x);");
+        Line("xe_cube_a = abs(xe_cube);");
+        Line("if (xe_cube_a.z >= xe_cube_a.x && xe_cube_a.z >= xe_cube_a.y) {");
+        Line("  xe_cube_r = float4(-xe_cube.y,");
+        Line("                     xe_cube.z < 0.0 ? -xe_cube.x : xe_cube.x,");
+        Line("                     2.0 * xe_cube.z,");
+        Line("                     xe_cube.z < 0.0 ? 5.0 : 4.0);");
+        Line("} else if (xe_cube_a.y >= xe_cube_a.x) {");
+        Line("  xe_cube_r = float4(xe_cube.y < 0.0 ? -xe_cube.z : xe_cube.z,");
+        Line("                     xe_cube.x,");
+        Line("                     2.0 * xe_cube.y,");
+        Line("                     xe_cube.y < 0.0 ? 3.0 : 2.0);");
+        Line("} else {");
+        Line("  xe_cube_r = float4(-xe_cube.y,");
+        Line("                     xe_cube.x < 0.0 ? xe_cube.z : -xe_cube.z,");
+        Line("                     2.0 * xe_cube.x,");
+        Line("                     xe_cube.x < 0.0 ? 1.0 : 0.0);");
+        Line("}");
+        r = "xe_cube_r";
+        break;
+      }
       // The kill family is a pixel-shader operation and has no vertex meaning.
       // Emitting discard in a vertex shader would not compile, so it is refused
       // there rather than silently dropped.
@@ -770,6 +815,10 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   src += "  float4 xe_v = float4(0, 0, 0, 0);\n";
   src += "  float xe_s = 0.0, xe_ps = 0.0;\n";
   src += "  int xe_a0 = 0;\n";
+  if (em.uses_cube) {
+    src += "  float3 xe_cube = float3(0, 0, 0), xe_cube_a = float3(0, 0, 0);\n";
+    src += "  float4 xe_cube_r = float4(0, 0, 0, 0);\n";
+  }
 
   if (stage == HlslStage::kPixel) {
     // Interpolators arrive in the low temp registers, which is the linkage the
