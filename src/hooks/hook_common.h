@@ -17,6 +17,15 @@
 
 namespace mx::native {
 
+// Guest-stall watchdog. The slow-wait detector in hooks_wait.cpp logs only
+// AFTER the wait returns, so a thread parked forever is invisible to it — which
+// is precisely the case we need to see. These record waits at entry instead,
+// and a watchdog thread reports what is still outstanding once the guest's
+// MainLoop stops ticking.
+void GuestWaitEnter(uint32_t handle, uint32_t timeout, uint32_t lr);
+void GuestWaitLeave();
+void GuestTick();  // MainLoop calls this once per iteration.
+
 }  // namespace mx::native
 
 namespace {

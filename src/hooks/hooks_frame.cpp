@@ -379,6 +379,46 @@ extern "C" REX_FUNC(sub_82BFBF30) {
     return;
   }
   REX_STORE_U32(0x83144208, REX_LOAD_U32(0x82D21818));
+
+  // Retire the GPU fence. This is the body of the command-buffer spin loop in
+  // the parallel record worker (sub_82AC8CC8 at 0x82AC8D70):
+  //
+  //   if (use_count && sub_82559A70(cmdbuf))
+  //     do sub_82BFBF30(0); while (sub_82559A70(cmdbuf));
+  //
+  // and sub_82559A70 -> sub_825599E0 (0x825599E0) decides "still in flight" as
+  //
+  //   device = *(*VdGlobalDevice)              ; 0x820007DC
+  //   return (*(device+0x2A9C) - fence)        ; CPU-submitted fence
+  //        < (*(device+0x2A9C) - **(device+0x2A90))   ; GPU-retired fence
+  //
+  // *(device+0x2A90) points at the counter the Xenos writes as it consumes
+  // command buffers. There is no Xenos here, so it never moves: the first time
+  // the 12-slot ring (dword_830B3354 % 0xC) wraps back onto a slot that has
+  // been used once, the fence sits ahead of it and the test is true forever.
+  // The worker spins — no wait, no log — and the main thread parks in the join
+  // at 0x82AC8BCC waiting on three done-events that will never be set. That is
+  // the freeroam hang: the menu never submits enough to wrap the ring, and
+  // freeroam wraps it within a second or two of entry.
+  //
+  // Our HLE consumes each draw list synchronously at handoff, so by the time
+  // the guest asks, the work really is done — retiring to the submitted value
+  // is the honest answer, not an optimistic one. The store above is kept as it
+  // was; it writes a different pair of globals and predates this.
+  const uint32_t device_slot = REX_LOAD_U32(0x820007DC);
+  if (!device_slot) return;
+  const uint32_t device = REX_LOAD_U32(device_slot);
+  if (!device) return;
+  const uint32_t retired_ptr = REX_LOAD_U32(device + 0x2A90);
+  if (!retired_ptr) return;
+  const uint32_t submitted = REX_LOAD_U32(device + 0x2A9C);
+  if (REX_LOAD_U32(retired_ptr) != submitted) {
+    static uint64_t n = 0;
+    if (++n <= 8 || (n % 20000) == 0)
+      REXLOG_INFO("native: fence retire #{} {} -> {} (device 0x{:08X})", n,
+                  REX_LOAD_U32(retired_ptr), submitted, device);
+    REX_STORE_U32(retired_ptr, submitted);
+  }
 }
 
 //=============================================================================
@@ -459,4 +499,60 @@ extern "C" REX_FUNC(sub_8255CFE0) {
   if (mx::native::g_plugin_mode) { orig_FramePendingPoll(ctx, base); return; }
   // Native: no GPU to poll — always "not pending".
   ctx.r3.u32 = 0;
+}
+
+//=============================================================================
+// Parallel command-buffer recording — fork / worker / join
+//=============================================================================
+// The freeroam hang (2026-08-08) is the guest main thread parked forever in
+// sub_82AC8B68 at 0x82AC8BCC: Wait(unk_830B0C34[i], INFINITE) for i in 0..2.
+// That is the JOIN of a three-way parallel scene record:
+//
+//   sub_82AC8A18  fork    allocates 5 D3D9 command buffers (sub_8254B970 x4,
+//                         sub_8254B9B8), clears each done-event, then
+//                         NtSetEvent(dword_830B0C28[i]) to release worker i
+//   sub_82AC8CC8  worker  Wait(dword_830B0C28[i], INFINITE), record, signal
+//                         done-event unk_830B0C34[i]
+//   sub_82AC8B68  join    Wait(unk_830B0C34[i], INFINITE) x3, release buffers
+//
+// All three are guarded by the same `if (counters != 0)`, which is why the menu
+// survives and freeroam does not: the parallel path only engages once the scene
+// has content to record.
+//
+// The stall watchdog showed NO thread waiting at the worker's own go-event
+// (that would report lr=0x82AC8CF8), so the workers were released and are
+// blocked or lost inside the work rather than waiting for a kick. These probes
+// are pure passthrough — they establish which of the three halves runs and
+// which worker fails to come back, and nothing else.
+
+REX_IMPORT(__imp__sub_82AC8A18, orig_RecordFork, void());
+extern "C" REX_FUNC(sub_82AC8A18) {
+  if (mx::native::g_plugin_mode) { orig_RecordFork(ctx, base); return; }
+  static uint64_t n = 0;
+  ++n;
+  const bool loud = n <= 24 || (n % 300) == 0;
+  if (loud) REXLOG_INFO("native: RecordFork #{} ENTER", n);
+  orig_RecordFork(ctx, base);
+  if (loud) REXLOG_INFO("native: RecordFork #{} RETURNED", n);
+}
+
+REX_IMPORT(__imp__sub_82AC8CC8, orig_RecordWorker, void());
+extern "C" REX_FUNC(sub_82AC8CC8) {
+  if (mx::native::g_plugin_mode) { orig_RecordWorker(ctx, base); return; }
+  // r3 points at the worker's index; the proc reads it as `lwz r31, 0(r3)`.
+  const uint32_t idx = ctx.r3.u32 ? REX_LOAD_U32(ctx.r3.u32) : 0xFFFFFFFF;
+  REXLOG_INFO("native: RecordWorker[{}] ENTER", idx);
+  orig_RecordWorker(ctx, base);
+  REXLOG_INFO("native: RecordWorker[{}] RETURNED", idx);
+}
+
+REX_IMPORT(__imp__sub_82AC8B68, orig_RecordJoin, void());
+extern "C" REX_FUNC(sub_82AC8B68) {
+  if (mx::native::g_plugin_mode) { orig_RecordJoin(ctx, base); return; }
+  static uint64_t n = 0;
+  ++n;
+  const bool loud = n <= 24 || (n % 300) == 0;
+  if (loud) REXLOG_INFO("native: RecordJoin #{} ENTER", n);
+  orig_RecordJoin(ctx, base);
+  if (loud) REXLOG_INFO("native: RecordJoin #{} RETURNED", n);
 }

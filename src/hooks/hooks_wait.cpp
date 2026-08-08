@@ -6,7 +6,113 @@
 
 #include "hooks/hook_common.h"
 
+#include <windows.h>
+
+#include <atomic>
 #include <chrono>
+#include <map>
+#include <mutex>
+#include <thread>
+
+//=============================================================================
+// Guest-stall watchdog
+//=============================================================================
+// The freeroam hang (2026-08-08) presents as the guest main thread emitting no
+// log line of any kind while the render thread goes on replaying the last draw
+// list. Nothing in the existing probes can see it: the slow-wait detector below
+// only reports once orig_Wait RETURNS, and the Wait(INFINITE) entry log is
+// capped at the first five, all of which fire during boot on other threads. So
+// a thread parked forever produces silence, which is exactly what we observe
+// and exactly what we cannot distinguish from a spin.
+//
+// This records every wait at ENTRY and clears it on return. When MainLoop stops
+// ticking, the watchdog prints what is still outstanding. Two outcomes, both
+// decisive: the guest main thread appears in the list with a caller address to
+// look up in IDA, or it does not appear at all and the hang is not a wait.
+
+namespace mx::native {
+namespace {
+
+struct WaitRec {
+  uint32_t handle;
+  uint32_t timeout;
+  uint32_t lr;
+  std::chrono::steady_clock::time_point t0;
+};
+
+std::mutex g_waitMu;
+std::map<uint32_t, WaitRec> g_inFlight;  // thread id -> outstanding wait
+std::atomic<uint64_t> g_ticks{0};
+std::atomic<int64_t> g_lastTickMs{0};
+
+int64_t NowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+void WatchdogBody() {
+  bool reported = false;
+  int64_t reportedAt = 0;
+  for (;;) {
+    ::Sleep(1000);
+    const int64_t last = g_lastTickMs.load(std::memory_order_relaxed);
+    if (!last) continue;  // MainLoop has not started yet
+    const int64_t stalled = NowMs() - last;
+    if (stalled < 5000) {
+      reported = false;
+      continue;
+    }
+    // Re-report every 30s so a persistent stall stays visible without flooding.
+    if (reported && (NowMs() - reportedAt) < 30000) continue;
+    reported = true;
+    reportedAt = NowMs();
+
+    REXLOG_INFO(
+        "native: STALL — MainLoop has not ticked for {}ms (tick #{}); "
+        "outstanding guest waits follow",
+        stalled, g_ticks.load(std::memory_order_relaxed));
+    std::lock_guard<std::mutex> lock(g_waitMu);
+    if (g_inFlight.empty()) {
+      REXLOG_INFO(
+          "native: STALL — no thread is inside a guest wait. The stall is a "
+          "spin or a block outside NtWaitForSingleObjectEx.");
+      continue;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    for (const auto& [tid, w] : g_inFlight) {
+      const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           now - w.t0)
+                           .count();
+      REXLOG_INFO(
+          "native: STALL — thread t{} waiting {}ms handle=0x{:08X} "
+          "timeout=0x{:08X} from lr=0x{:08X}",
+          tid, age, w.handle, w.timeout, w.lr);
+    }
+  }
+}
+
+}  // namespace
+
+void GuestWaitEnter(uint32_t handle, uint32_t timeout, uint32_t lr) {
+  std::lock_guard<std::mutex> lock(g_waitMu);
+  g_inFlight[::GetCurrentThreadId()] = {handle, timeout, lr,
+                                        std::chrono::steady_clock::now()};
+}
+
+void GuestWaitLeave() {
+  std::lock_guard<std::mutex> lock(g_waitMu);
+  g_inFlight.erase(::GetCurrentThreadId());
+}
+
+void GuestTick() {
+  g_ticks.fetch_add(1, std::memory_order_relaxed);
+  g_lastTickMs.store(NowMs(), std::memory_order_relaxed);
+  static std::once_flag once;
+  std::call_once(once, [] { std::thread(WatchdogBody).detach(); });
+}
+
+}  // namespace mx::native
 
 //=============================================================================
 // sub_82BFB740 — NtWaitForSingleObjectEx
@@ -48,7 +154,9 @@ extern "C" REX_FUNC(sub_82BFB740) {
   const uint32_t timeout = ctx.r4.u32;
   const uint32_t lr = uint32_t(ctx.lr);
   const auto t0 = std::chrono::steady_clock::now();
+  mx::native::GuestWaitEnter(handle, timeout, lr);
   orig_Wait(ctx, base);
+  mx::native::GuestWaitLeave();
   const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                       std::chrono::steady_clock::now() - t0)
                       .count();

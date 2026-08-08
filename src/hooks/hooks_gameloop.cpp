@@ -50,6 +50,7 @@ extern "C" REX_FUNC(sub_82B70760) {
   }
   static int ml = 0;
   ++ml;
+  mx::native::GuestTick();  // arms the stall watchdog in hooks_wait.cpp
 
   // byte_82D57994 gates MainLoop's call to RenderPipeline: at 0x82B707B0 and
   // again at 0x82B7080C a zero here jumps straight to the vt[36] tail, so the
