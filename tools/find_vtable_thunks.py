@@ -39,14 +39,23 @@ import os
 
 import ida_bytes
 import ida_funcs
-import ida_idaapi
+import ida_kernwin
 import ida_segment
 import ida_ua
 import idautils
 
 # --- configuration ----------------------------------------------------------
 
-# Existing recompiler config, to suppress addresses already listed. Optional.
+# Existing recompiler config, to suppress addresses already listed.
+#
+# Left empty, an interactive IDA session ASKS for it with a file picker and the
+# report prints the absolute path it settled on. Comparing against the wrong
+# config is the one failure that looks exactly like success — it prints a tidy
+# list of "missing" entries that are already there, or worse, stays quiet about
+# entries that are not — so the path is chosen deliberately and always shown,
+# never guessed from the working directory.
+#
+# Set FIND_THUNKS_TOML to skip the prompt (headless runs need this).
 CONFIG_TOML = os.environ.get("FIND_THUNKS_TOML", "")
 
 # Where to write the emitted TOML. Empty = console only.
@@ -138,6 +147,33 @@ MATCHERS = (
 # --- scan -------------------------------------------------------------------
 
 
+def resolve_config():
+    """Decide which config to compare against, and say so out loud.
+
+    Returns (path, note) where note explains the choice for the report. An
+    empty path means "compare against nothing" — a legitimate answer, but one
+    the report has to state plainly, because every thunk then looks missing.
+    """
+    if CONFIG_TOML:
+        path = os.path.abspath(CONFIG_TOML)
+        if not os.path.exists(path):
+            return "", "set to %s, but that file does not exist" % path
+        return path, "from FIND_THUNKS_TOML"
+
+    if not ida_kernwin.is_idaq():
+        return "", "not set (headless; set FIND_THUNKS_TOML)"
+
+    picked = ida_kernwin.ask_file(
+        False, "*.toml", "Recompiler config to compare against (Cancel = none)"
+    )
+    if not picked:
+        return "", "none chosen — every thunk below is reported as missing"
+    path = os.path.abspath(picked)
+    if not os.path.exists(path):
+        return "", "chosen file does not exist: %s" % path
+    return path, "chosen in the file picker"
+
+
 def load_existing(path):
     """Addresses already present in a recompiler config."""
     known = set()
@@ -155,8 +191,7 @@ def load_existing(path):
     return known
 
 
-def scan():
-    known = load_existing(CONFIG_TOML)
+def scan(known):
     found = []  # (ea, size, kind, already_defined, already_listed)
 
     for seg_ea in idautils.Segments():
@@ -181,16 +216,23 @@ def scan():
     return found
 
 
-def report(found):
+def report(found, config_path, config_note, known_count):
     missing = [f for f in found if not f[3] and not f[4]]
     listed = [f for f in found if f[4]]
     defined = [f for f in found if f[3] and not f[4]]
 
     print("")
     print("=== vtable / adjustor thunk scan ===")
+    print("  config: %s" % (config_path or "<none>"))
+    print("          (%s)" % config_note)
+    print("          %d addresses parsed from it" % known_count)
+    if config_path and known_count == 0:
+        print("          ^^ WARNING: parsed nothing. Wrong file, or the")
+        print("             entries are not `0x... = ...` lines?")
+    print("")
     print("  %5d matched" % len(found))
     print("  %5d already a defined function (no entry needed)" % len(defined))
-    print("  %5d already in %s" % (len(listed), CONFIG_TOML or "<no config>"))
+    print("  %5d already in the config above" % len(listed))
     print("  %5d MISSING — recompiler will not emit these" % len(missing))
 
     if SHOW_ALREADY_DEFINED and defined:
@@ -228,8 +270,10 @@ def report(found):
 
 
 def main():
-    found = scan()
-    text = report(found)
+    config_path, config_note = resolve_config()
+    known = load_existing(config_path)
+    found = scan(known)
+    text = report(found, config_path, config_note, len(known))
     if OUT_PATH and text:
         with open(OUT_PATH, "w", encoding="utf-8") as f:
             f.write(text)

@@ -126,6 +126,29 @@ memchr = 0x82BDEEB0
 0x82327D68 = { size = 0x10 }
 0x82327D80 = { size = 0x10 }
 
+# The other thunk clusters. An image-wide search for the same four-instruction
+# pattern returns 41 hits: the 24 above, one already a defined function
+# (0x82B09B18), 0x82B09B28 which was already listed, and these 15, none of
+# which IDA calls a function. Every one is a crash waiting for the right vtable
+# slot to be dispatched, so they are taken together rather than one run at a
+# time — 0x82B09B28 being listed while its own neighbour 0x82B09B18 was not is
+# what that costs.
+0x822D8A00 = { size = 0x10 }
+0x823735B8 = { size = 0x10 }
+0x823735C8 = { size = 0x10 }
+0x82373640 = { size = 0x10 }
+0x82373650 = { size = 0x10 }
+0x825AB818 = { size = 0x10 }
+0x825AB828 = { size = 0x10 }
+0x825AB838 = { size = 0x10 }
+0x825AB848 = { size = 0x10 }
+0x825AB858 = { size = 0x10 }
+0x825AB868 = { size = 0x10 }
+0x825AB878 = { size = 0x10 }
+0x825AB888 = { size = 0x10 }
+0x825AB898 = { size = 0x10 }
+0x825AB8A8 = { size = 0x10 }
+
 #IDA
 0x821D8360 = { size = 0x1CC }
 0x821D8A50 = { size = 0x25C }
