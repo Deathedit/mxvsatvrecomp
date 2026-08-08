@@ -54,6 +54,9 @@ static_assert(kMaxDrawPlanes == mx::hle::DrawCall::kMaxPlanes,
 static_assert(D3D12Renderer::TranslatedInterpolatorLinkage() ==
                   mx::hle::kHlslInterpolatorLinkage,
               "translated VS/PS interpolator linkage has drifted");
+static_assert(D3D12Renderer::TranslatedSamplerTableWidth() ==
+                  mx::hle::HlslShader::kMaxSamplerSlots,
+              "translated sampler table is narrower than the emitter declares");
 
 using mx::gfx::CompileShader;
 using mx::gfx::LogError;

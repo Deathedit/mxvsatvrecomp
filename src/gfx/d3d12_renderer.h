@@ -110,6 +110,10 @@ void ClearGameDraws();
   [[nodiscard]] static constexpr uint32_t TranslatedInterpolatorLinkage() {
     return kTranslatedInterpolators;
   }
+  // Likewise against mx::hle::HlslShader::kMaxSamplerSlots.
+  [[nodiscard]] static constexpr uint32_t TranslatedSamplerTableWidth() {
+    return kTranslatedSamplerSlots;
+  }
 
  private:
   static constexpr uint32_t kFrameCount = 3;
@@ -258,7 +262,17 @@ void ClearGameDraws();
   // changing the layout the working path depends on, to suit a path that does
   // not render yet.
   //=========================================================================
-  static constexpr uint32_t kTranslatedSamplerSlots = 16;
+  // Width of the translated pipeline's texture and sampler tables. Must equal
+  // mx::hle::HlslShader::kMaxSamplerSlots: the emitter declares its textures
+  // contiguously from t0 up to that cap, and a table narrower than the
+  // registers a shader declares is invalid. static_asserted in d3d12_game.cpp.
+  //
+  // Small on purpose. Guest sampler indices are remapped to compact slots
+  // precisely so this stays narrow — binding at the guest index would make the
+  // 14-fetch shader's s8-s12 need a thirteen-wide table to deliver five
+  // textures, and one block that size per draw exhausts the heap within a
+  // frame.
+  static constexpr uint32_t kTranslatedSamplerSlots = 8;
   // The VS-to-PS linkage width. MUST equal mx::hle::kHlslInterpolatorLinkage:
   // the emitted pixel shader declares its input struct with that many
   // interpolators, and a vertex stage offering a different count produces two

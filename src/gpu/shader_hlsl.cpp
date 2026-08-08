@@ -17,6 +17,7 @@ const char* HlslStatusName(HlslStatus s) {
     case HlslStatus::kUnsupportedVectorOp: return "unsupported vector op";
     case HlslStatus::kUnsupportedScalarOp: return "unsupported scalar op";
     case HlslStatus::kUnsupportedFetch: return "unsupported texture fetch";
+    case HlslStatus::kTooManySamplers: return "too many distinct samplers";
     case HlslStatus::kLoopRelative: return "aL-relative (loop)";
     case HlslStatus::kInstructionCap: return "instruction cap";
     case HlslStatus::kNoOutput: return "no position/colour export";
@@ -142,7 +143,26 @@ class Emitter {
   bool reads_constants = false;
   std::vector<PixelTextureBinding> fetches;
   uint32_t sampler_mask = 0;
+  // Guest sampler -> compact register slot, assigned in order of first fetch.
+  // See the note on HlslShader::sampler_slot_guest for why the guest index
+  // cannot be the register number.
+  uint32_t sampler_count = 0;
+  uint32_t slot_guest[HlslShader::kMaxSamplerSlots] = {};
   std::string body;
+
+  // Returns the compact slot for a guest sampler, allocating one on first use.
+  // Sets status and returns 0 when the shader needs more distinct samplers than
+  // a descriptor table is sized for.
+  uint32_t SamplerSlot(uint32_t guest) {
+    for (uint32_t i = 0; i < sampler_count; ++i)
+      if (slot_guest[i] == guest) return i;
+    if (sampler_count >= HlslShader::kMaxSamplerSlots) {
+      status = HlslStatus::kTooManySamplers;
+      return 0;
+    }
+    slot_guest[sampler_count] = guest;
+    return sampler_count++;
+  }
 
   bool pixel() const { return stage_ == HlslStage::kPixel; }
 
@@ -547,6 +567,8 @@ class Emitter {
     binding.unnormalized = tf.unnormalized_coordinates();
     fetches.push_back(binding);
     sampler_mask |= 1u << (sampler & 31);
+    const uint32_t slot = SamplerSlot(sampler);
+    if (status != HlslStatus::kOk) return;
 
     // The fetch source swizzle is ABSOLUTE, two bits per component — unlike an
     // ALU swizzle, which is component-relative. Reading it the ALU way sends
@@ -561,10 +583,9 @@ class Emitter {
       // The guest addresses this texture in texels; the host sampler wants
       // normalized coordinates. The extent is a per-draw property of the bound
       // texture, not of the shader, so it arrives as a constant.
-      coord = "(" + coord + " * xe_texsize[" + std::to_string(sampler) +
-              "].xy)";
+      coord = "(" + coord + " * xe_texsize[" + std::to_string(slot) + "].xy)";
     }
-    const std::string s = std::to_string(sampler);
+    const std::string s = std::to_string(slot);
     Line("xe_v = xe_tex" + s + ".Sample(xe_smp" + s + ", " + coord + ");");
 
     // The destination swizzle is three bits per component: 0-3 select x/y/z/w
@@ -695,10 +716,13 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   src += "// Generated from Xenos microcode by EmitShaderHlsl.\n";
   src += "cbuffer XeShaderConstants : register(b1) {\n";
   src += "  float4 xe_c[256];\n";
-  src += "  float4 xe_texsize[32];\n";
+  // Indexed by compact slot, not by guest sampler — same remap as the textures.
+  src += "  float4 xe_texsize[" + std::to_string(HlslShader::kMaxSamplerSlots) +
+         "];\n";
   src += "};\n";
-  for (uint32_t s = 0; s < 32; ++s) {
-    if (!(em.sampler_mask & (1u << s))) continue;
+  // Declared for EVERY slot up to sampler_count, contiguously from t0/s0, so
+  // the registers match a descriptor table of exactly that width.
+  for (uint32_t s = 0; s < em.sampler_count; ++s) {
     const std::string n = std::to_string(s);
     src += "Texture2D<float4> xe_tex" + n + " : register(t" + n + ");\n";
     src += "SamplerState xe_smp" + n + " : register(s" + n + ");\n";
@@ -796,6 +820,9 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   out.source = std::move(src);
   out.fetches = std::move(em.fetches);
   out.sampler_mask = em.sampler_mask;
+  out.sampler_count = em.sampler_count;
+  for (uint32_t i = 0; i < em.sampler_count; ++i)
+    out.sampler_slot_guest[i] = em.slot_guest[i];
   out.input_mask = em.input_mask;
   out.export_mask = stage == HlslStage::kPixel ? em.color_mask : em.export_mask;
   out.writes_position = em.writes_position;

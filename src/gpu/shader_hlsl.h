@@ -70,6 +70,7 @@ enum class HlslStatus : uint8_t {
   kUnsupportedVectorOp,
   kUnsupportedScalarOp,
   kUnsupportedFetch,      // relative or non-2D texture fetch
+  kTooManySamplers,       // more distinct samplers than kMaxSamplerSlots
   kLoopRelative,          // aL-relative index; no honest value for aL
   kInstructionCap,
   kNoOutput,              // executed, but never wrote position (VS) or colour (PS)
@@ -92,10 +93,29 @@ struct HlslShader {
   // renderer's binding code does not need a second shape to understand.
   std::vector<PixelTextureBinding> fetches;
 
-  // Bit i set = sampler i is read by this shader. Derived from `fetches`;
+  // Bit i set = GUEST sampler i is read by this shader. Derived from `fetches`;
   // carried separately because the renderer binds per sampler slot, not per
   // fetch, and one sampler is commonly fetched many times.
   uint32_t sampler_mask = 0;
+
+  // Guest sampler indices are NOT used as shader register numbers. They are
+  // remapped to a compact 0-based slot, in order of first fetch, and the shader
+  // declares `xe_tex<slot> : register(t<slot>)`.
+  //
+  // Not cosmetic. A descriptor table is a contiguous range, so emitting at the
+  // guest index would force every table to span t0..t<max guest index> — the
+  // 14-fetch shader binds s8-s12, which would need thirteen descriptor slots to
+  // deliver five textures, and one block that size per draw would exhaust the
+  // heap within a frame. Compact slots mean a table only as wide as the shader
+  // has distinct samplers, and the overwhelmingly common single-sampler case
+  // needs exactly one.
+  //
+  // `sampler_slot_guest[i]` is the guest sampler that slot i was assigned, for
+  // the first `sampler_count` slots. The renderer uses it to decide which
+  // texture to place at each descriptor.
+  static constexpr uint32_t kMaxSamplerSlots = 8;
+  uint32_t sampler_count = 0;
+  uint32_t sampler_slot_guest[kMaxSamplerSlots] = {};
 
   // Bit i set = register i is read before this shader ever writes it, i.e. it
   // arrives as an input. For a pixel shader these are the interpolators the
