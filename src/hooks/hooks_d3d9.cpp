@@ -3522,44 +3522,44 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   return true;
 }
 
-bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
-                        uint32_t device, uint8_t* base,
-                        mx::hle::PixelTextureBinding& binding) {
+// Attach the guest's own translated pixel shader to a draw: its source, its
+// constant bank, and one texture per sampler slot it declares.
+//
+// Extracted so it can run BEFORE the single-texture binding contest as well
+// as after it. The contest answers a different question -- which one texture
+// the tex*col stand-in should sample -- and used to gate this, which meant a
+// shader fetching no texture at all never got here.
+void AttachTranslatedPixelShader(mx::hle::DrawCall& dc, uint32_t handle,
+                                 uint32_t device, uint8_t* base) {
   using namespace mx::hle;
-  static uint64_t s_attempts = 0, s_ready = 0, s_no_shader = 0;
-  static uint64_t s_no_binding = 0, s_bad_desc = 0, s_unreadable = 0;
-  static uint64_t s_mapped = 0, s_empty = 0, s_semantic_reject = 0;
-  ++s_attempts;
-  // Driven by attempts, not by successes: the summary further down only fires
-  // once a texture is ready, so a run in which every descriptor is rejected —
-  // precisely the run this tally exists to characterise — would print nothing.
-  if ((s_attempts % 2500) == 0 && !g_hleRejectedFormats.empty()) {
-    REXLOG_INFO("d3d9: HLE rejected guest texture formats after {} attempts: {}",
-                s_attempts, RejectedFormatSummary());
-  }
-  if ((!pixel_shader ||
-       !ResolvePixelBindingForDraw(pixel_shader, device, base, binding)) &&
-      !ReadBoundPixelShader(device, base, pixel_shader, binding)) {
-    ++s_no_shader;
-    if (s_no_shader <= 8 || (s_attempts % 2500) == 0) {
-      const uint32_t direct =
-          device && HostPageReadable(REX_RAW_ADDR(device + 0x3244))
-              ? REX_LOAD_U32(device + 0x3244)
-              : 0;
-      REXLOG_INFO("d3d9: HLE texture fallback: no eligible pixel shader "
-                  "(attempt {}, setter=0x{:08X}, device=0x{:08X})",
-                  s_attempts, pixel_shader, direct);
+  dc.pixel_shader_handle = handle;
+  // Draws whose bound shader has no translation at all -- the other half of the
+  // stand-in population, the half slot-filling cannot explain. Counted per
+  // HANDLE because coverage is measured per shader and the picture is painted
+  // per draw: 23 untranslated shaders out of 256 is a small share of the
+  // former and may be a large share of the latter, and only this says which.
+  if (!TranslatedPixelShader(handle)) {
+    static std::map<uint32_t, uint64_t> s_byHandle;
+    static uint64_t s_total = 0;
+    ++s_total;
+    ++s_byHandle[handle];
+    // Every 500, not 5000: at 5000 this printed NOTHING across a 1943-frame run
+    // while 25,359 draws took the stand-in -- silence that reads identically to
+    // zero, and which sent the search to the wrong place until the arithmetic
+    // was checked against the earlier exit.
+    if ((s_total % 500) == 0) {
+      std::vector<std::pair<uint64_t, uint32_t>> top;
+      for (const auto& [h, n] : s_byHandle) top.emplace_back(n, h);
+      std::sort(top.rbegin(), top.rend());
+      std::string worst;
+      for (size_t i = 0; i < top.size() && i < 6; ++i)
+        worst += fmt::format(" 0x{:08X}={}", top[i].second, top[i].first);
+      REXLOG_INFO("d3d9: draws with an UNTRANSLATED pixel shader: {} over {} "
+                  "handles; worst:{}",
+                  s_total, s_byHandle.size(), worst);
     }
-    return false;
   }
-  // The shader is resolved by here — `pixel_shader` may have been rewritten by
-  // ReadBoundPixelShader — so this is the first point at which the draw knows
-  // which guest program it is running. Attaching the translation here rather
-  // than at the call site keeps the "which shader is really bound" logic in one
-  // place; a draw whose shader did not translate simply carries nothing and
-  // keeps the tex*col stand-in.
-  dc.pixel_shader_handle = pixel_shader;
-  if (const TranslatedShader* t = TranslatedPixelShader(pixel_shader)) {
+  if (const TranslatedShader* t = TranslatedPixelShader(handle)) {
     dc.pixel_shader_hlsl = t->source;
     dc.pixel_sampler_count = t->sampler_count;
     // The PIXEL constant bank, ALU constants 256-511 at device+0x1780. Captured
@@ -3608,6 +3608,91 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
                     kPixelConstBase);
     }
   }
+}
+
+bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
+                        uint32_t device, uint8_t* base,
+                        mx::hle::PixelTextureBinding& binding) {
+  using namespace mx::hle;
+  static uint64_t s_attempts = 0, s_ready = 0, s_no_shader = 0;
+  static uint64_t s_no_binding = 0, s_bad_desc = 0, s_unreadable = 0;
+  static uint64_t s_mapped = 0, s_empty = 0, s_semantic_reject = 0;
+  static uint64_t s_no_shader_no_setter = 0;
+  ++s_attempts;
+  // Driven by attempts, not by successes: the summary further down only fires
+  // once a texture is ready, so a run in which every descriptor is rejected —
+  // precisely the run this tally exists to characterise — would print nothing.
+  if ((s_attempts % 2500) == 0 && !g_hleRejectedFormats.empty()) {
+    REXLOG_INFO("d3d9: HLE rejected guest texture formats after {} attempts: {}",
+                s_attempts, RejectedFormatSummary());
+  }
+  // WHICH shader is bound is a separate question from WHICH ONE TEXTURE the
+  // stand-in should sample, and conflating them cost 63,207 draws in mx_709 --
+  // 27.8% of every draw attempted, the largest single cause of stand-in draws
+  // by a wide margin.
+  //
+  // Both resolutions below end in ResolvePixelBindingForDraw, which gives up
+  // when `profile->bindings.empty()`. A pixel shader that fetches no texture at
+  // all has exactly that -- no bindings -- so it was reported as "no eligible
+  // pixel shader" and the draw kept the tex*col stand-in. For a TRANSLATED
+  // shader that is precisely backwards: a shader sampling nothing needs no
+  // texture, and the stand-in it fell back to is the one thing that does.
+  //
+  // So resolve the handle first, from the setter or from the device field, and
+  // attach the translation on its own terms. The single-binding contest still
+  // runs below, unchanged, because the stand-in still needs a winner -- but it
+  // can no longer veto a draw that was never going to use its answer.
+  uint32_t resolved = pixel_shader;
+  if (!resolved && device &&
+      HostPageReadable(REX_RAW_ADDR(device + 0x3244)))
+    resolved = REX_LOAD_U32(device + 0x3244);
+  if (resolved) {
+    // Normally reached via ReadBoundPixelShader, which is below the contest and
+    // therefore never ran for these draws -- so their microcode was never
+    // collected and they could not have translated even in principle.
+    CollectPixelShaderBlob(resolved, base);
+    AttachTranslatedPixelShader(dc, resolved, device, base);
+  }
+
+  if ((!pixel_shader ||
+       !ResolvePixelBindingForDraw(pixel_shader, device, base, binding)) &&
+      !ReadBoundPixelShader(device, base, pixel_shader, binding)) {
+    ++s_no_shader;
+    // The COUNT, not just a sample. This exit was logged only as "attempt N"
+    // with a handle, which said it happens without ever saying how often --
+    // and it turns out to be the largest single reason a draw keeps the
+    // tex*col stand-in, larger than untranslated shaders and slot-filling put
+    // together. A cap of 8 plus a sample every 2500 attempts looked like a
+    // quiet failure while it was in fact the dominant one.
+    //
+    // Split by which of the two resolutions was even possible: no setter
+    // handle at all is a different defect from a setter we cannot follow.
+    if (!pixel_shader) ++s_no_shader_no_setter;
+    if (s_no_shader <= 8 || (s_attempts % 2500) == 0) {
+      const uint32_t direct =
+          device && HostPageReadable(REX_RAW_ADDR(device + 0x3244))
+              ? REX_LOAD_U32(device + 0x3244)
+              : 0;
+      REXLOG_INFO("d3d9: HLE texture fallback: NO ELIGIBLE PIXEL SHADER "
+                  "{} of {} attempts ({} with no setter handle at all); "
+                  "this one setter=0x{:08X}, device+0x3244=0x{:08X}",
+                  s_no_shader, s_attempts, s_no_shader_no_setter, pixel_shader,
+                  direct);
+    }
+    return false;
+  }
+  // The shader is resolved by here — `pixel_shader` may have been rewritten by
+  // ReadBoundPixelShader — so this is the first point at which the draw knows
+  // which guest program it is running. Attaching the translation here rather
+  // than at the call site keeps the "which shader is really bound" logic in one
+  // place; a draw whose shader did not translate simply carries nothing and
+  // keeps the tex*col stand-in.
+  // The contest may have rewritten `pixel_shader` to the device's own handle,
+  // which is the authoritative answer. If it differs from the one attached
+  // before the contest, attach again for the shader actually bound.
+  if (pixel_shader != resolved)
+    AttachTranslatedPixelShader(dc, pixel_shader, device, base);
+  dc.pixel_shader_handle = pixel_shader;
 
   if (binding.sampler >= kMaxSamplers) {
     ++s_no_binding;
