@@ -55,6 +55,33 @@ class D3D12Renderer {
 //
 // This replaced SetGameDrawData, which held exactly one draw — so however many
 // draws a frame translated, at most one could ever be submitted.
+
+// The guest vertex stage, when this draw runs it on the GPU. Grouped into a
+// struct rather than added as six more positional arguments to a call that
+// already takes thirty: `AddGameDraw(..., nullptr, 0, nullptr, 0, ...)` is not
+// something a reader can check.
+//
+// All-or-nothing. A null pointer, or any member missing, keeps the draw on the
+// CPU interpreter — which is the path for every draw whose vertex or pixel
+// shader did not translate, and will be for as long as that is true of any of
+// them.
+struct GpuVertexStage {
+  uint32_t handle = 0;
+  std::shared_ptr<const std::string> hlsl;
+  // One float4 per declared register per vertex, in `regs` order.
+  const uint8_t* inputs = nullptr;
+  uint32_t inputBytes = 0;
+  // The registers the shader reads, ascending. Element i of the input layout
+  // carries register regs[i] at TEXCOORD<regs[i]> — the semantic index is the
+  // register number, which is what EmitShaderHlsl declares.
+  const uint8_t* regs = nullptr;
+  uint32_t regCount = 0;
+  // The VERTEX ALU constant bank, constants 0-255 at device+0x780. A different
+  // bank from the pixel one; each stage indexes its own from 0.
+  const uint32_t* constants = nullptr;
+  uint32_t constDwords = 0;
+};
+
 void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  const uint8_t* indices, uint32_t idxBytes, bool idx16,
                  uint32_t idxCount, const float* mvp, uint32_t topology,
@@ -79,7 +106,8 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  uint32_t pixelSamplerCount = 0,
                  const std::shared_ptr<const mx::hle::HleTexturePayload>*
                      pixelTextures = nullptr,
-                 const uint32_t* pixelSampledObjects = nullptr);
+                 const uint32_t* pixelSampledObjects = nullptr,
+                 const GpuVertexStage* vertexStage = nullptr);
 
 // Append a resolve to this frame's list, in order with the draws around it.
 //
@@ -311,17 +339,23 @@ void ClearGameDraws();
   // translated draw that ignored it was a regression, not a translation error.
   struct TranslatedKey {
     uint32_t handle = 0;
+    // The guest vertex shader paired with it, or 0 for the passthrough stage
+    // that forwards CPU-interpreted results. Part of the key because the two
+    // stages are linked into one pipeline: the same pixel shader under a
+    // different vertex shader is a different PSO with a different input layout.
+    uint32_t vsHandle = 0;
     uint32_t src = 0, dest = 0, op = 0;
     uint8_t flags = 0;  // 1 depth, 2 depth write, 4 no colour, 8 blend
     bool operator==(const TranslatedKey& o) const noexcept {
-      return handle == o.handle && src == o.src && dest == o.dest &&
-             op == o.op && flags == o.flags;
+      return handle == o.handle && vsHandle == o.vsHandle && src == o.src &&
+             dest == o.dest && op == o.op && flags == o.flags;
     }
   };
   struct TranslatedKeyHash {
     size_t operator()(const TranslatedKey& k) const noexcept {
-      return (size_t(k.handle) << 20) ^ (size_t(k.src) << 12) ^
-             (size_t(k.dest) << 6) ^ (size_t(k.op) << 3) ^ size_t(k.flags);
+      return (size_t(k.handle) << 20) ^ (size_t(k.vsHandle) << 28) ^
+             (size_t(k.src) << 12) ^ (size_t(k.dest) << 6) ^
+             (size_t(k.op) << 3) ^ size_t(k.flags);
     }
   };
   std::unordered_map<TranslatedKey, TranslatedPipeline, TranslatedKeyHash>
@@ -329,8 +363,15 @@ void ClearGameDraws();
   // Compile `hlsl` and build a pipeline for it, or return null. Caches both
   // outcomes against the key, so a shader that fails is not recompiled once per
   // draw for the rest of the run.
+  //
+  // `draw` supplies the vertex stage: its translated VS source and the register
+  // list the input layout is built from, when key.vsHandle is non-zero.
   ID3D12PipelineState* TranslatedPSO(const TranslatedKey& key,
-                                     const std::string& hlsl);
+                                     const std::string& hlsl,
+                                     const GameDraw& draw);
+  // Compiled bytecode per VERTEX shader handle, alongside the pixel one below.
+  std::unordered_map<uint32_t, Microsoft::WRL::ComPtr<ID3DBlob>>
+      m_translatedVsBlobs;
   // Compiled bytecode per shader handle, so one shader used with several blend
   // states is compiled once rather than once per state.
   std::unordered_map<uint32_t, Microsoft::WRL::ComPtr<ID3DBlob>>
@@ -344,6 +385,9 @@ void ClearGameDraws();
   // of it.
   uint64_t m_translatedDraws = 0;
   uint64_t m_standInDraws = 0;
+  // Of the translated draws, how many also ran the guest's VERTEX shader. This
+  // is the one that says whether the CPU interpreter is still the frame.
+  uint64_t m_gpuVertexDraws = 0;
 
   // A shader's textures have to sit in ONE contiguous descriptor range, and the
   // cached per-texture descriptors in m_gameSrvHeap are scattered — a texture
@@ -535,6 +579,27 @@ void ClearGameDraws();
                kTranslatedSamplerSlots> pixelTextures;
     std::array<uint32_t, kTranslatedSamplerSlots> pixelSampledObjects = {};
     bool translated = false;
+
+    // The guest VERTEX shader on the GPU. `gpuVertex` is only set once every
+    // piece is present, on the same all-or-nothing rule as `translated`: a
+    // vertex stage missing its attribute stream or its constant bank computes
+    // from undefined inputs, and geometry built from that is a confident wrong
+    // answer rather than a visible failure.
+    //
+    // When set, `vsvb` REPLACES the CPU-transformed `vb` at slot 0 and the
+    // interpolator stream at slot 1 is not bound at all — the rasterizer
+    // interpolates what the vertex stage exports, which is the entire point.
+    uint32_t vertexShaderHandle = 0;
+    std::shared_ptr<const std::string> vertexShaderHlsl;
+    Microsoft::WRL::ComPtr<ID3D12Resource> vsvb;
+    D3D12_VERTEX_BUFFER_VIEW vsvbv = {};
+    Microsoft::WRL::ComPtr<ID3D12Resource> vscb;
+    // The registers the translated vertex shader reads, ascending — the input
+    // layout the PSO must be built with. Carried per draw and not derived from
+    // the handle because the PSO cache is what turns it back into a layout.
+    std::array<uint8_t, 32> vertexInputRegs = {};
+    uint32_t vertexInputCount = 0;
+    bool gpuVertex = false;
   };
   // Bounded because each entry costs three CreateCommittedResource calls — see
   // the PERF(per-frame-allocs) note in d3d12_game.cpp.

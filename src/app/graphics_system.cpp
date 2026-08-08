@@ -308,6 +308,23 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                 d->resolve_src_y1, d->resolve_src_x2, d->resolve_src_y2);
             continue;
           }
+          // The guest vertex stage, when the hooks built one for this draw.
+          // Pass-through only: every decision about whether a draw qualifies
+          // was made where the microcode and the attributes are.
+          D3D12Renderer::GpuVertexStage vertexStage;
+          if (d->vertex_shader_hlsl && !d->vertex_inputs.empty() &&
+              d->vertex_input_count && !d->vertex_constants.empty()) {
+            vertexStage.handle = d->vertex_shader_handle;
+            vertexStage.hlsl = d->vertex_shader_hlsl;
+            vertexStage.inputs = d->vertex_inputs.data();
+            vertexStage.inputBytes =
+                static_cast<uint32_t>(d->vertex_inputs.size());
+            vertexStage.regs = d->vertex_input_regs.data();
+            vertexStage.regCount = d->vertex_input_count;
+            vertexStage.constants = d->vertex_constants.data();
+            vertexStage.constDwords =
+                static_cast<uint32_t>(d->vertex_constants.size());
+          }
           m_renderer->AddGameDraw(d->vertices.data(),
                                   static_cast<uint32_t>(d->vertices.size()),
                                   d->vertex_stride, d->indices.data(),
@@ -355,7 +372,8 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                       d->pixel_constants.size()),
                                   d->pixel_sampler_count,
                                   d->pixel_textures.data(),
-                                  d->pixel_sampled_objects.data());
+                                  d->pixel_sampled_objects.data(),
+                                  vertexStage.handle ? &vertexStage : nullptr);
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;

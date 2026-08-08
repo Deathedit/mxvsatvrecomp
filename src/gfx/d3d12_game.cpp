@@ -612,7 +612,8 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
 }
 
 ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
-                                                  const std::string& hlsl) {
+                                                  const std::string& hlsl,
+                                                  const GameDraw& draw) {
   if (auto it = m_translatedPSOs.find(key); it != m_translatedPSOs.end())
     return it->second.failed ? nullptr : it->second.pso.Get();
   if (!m_translatedRootSig || !m_translatedVsBlob) return nullptr;
@@ -638,28 +639,49 @@ ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
     return nullptr;
   }
 
-  // Two streams, matching XeVsIn above and the two buffers the draw binds.
+  // The vertex stage, and the input layout that feeds it.
   //
-  // Slot 0 is the stand-in vertex, read only for its position — the transcode
-  // still builds it and the CPU interpreter still fills it, so the translated
-  // path takes the position from where it already is rather than duplicating
-  // it. Slot 1 is the interpolator stream, one float4 per linkage slot.
+  // Two shapes, because the migration is per draw. With the guest's own vertex
+  // shader, one stream of float4s — one per register the shader reads, at
+  // TEXCOORD<register>, which is the semantic EmitShaderHlsl declares. Without
+  // it, the passthrough stage over two streams: slot 0 the stand-in vertex read
+  // only for its CPU-transformed position, slot 1 the interpolator stream the
+  // interpreter filled.
   //
-  // Keeping them separate is what lets the stand-in layout stay untouched: a
-  // single interleaved stream would mean rebuilding the vertex the working path
-  // depends on.
+  // The second shape keeps the stand-in vertex layout untouched, which is why
+  // it was two streams to begin with: interleaving would have meant rebuilding
+  // the vertex the working path depends on.
+  ID3DBlob* vsBlob = m_translatedVsBlob.Get();
   std::vector<D3D12_INPUT_ELEMENT_DESC> layout;
-  layout.push_back({"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
-                    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0});
-  for (uint32_t i = 0; i < kTranslatedInterpolators; ++i) {
-    layout.push_back({"TEXCOORD", i, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, i * 16,
+  if (key.vsHandle) {
+    auto& cachedVs = m_translatedVsBlobs[key.vsHandle];
+    if (!cachedVs && draw.vertexShaderHlsl)
+      cachedVs = CompileShader(draw.vertexShaderHlsl->c_str(), "vs_5_0", "main");
+    if (!cachedVs) {
+      LogError("TranslatedPSO: vertex shader failed to compile in the renderer");
+      ++m_translatedFailed;
+      m_translatedPSOs[key] = entry;
+      return nullptr;
+    }
+    vsBlob = cachedVs.Get();
+    for (uint32_t i = 0; i < draw.vertexInputCount; ++i) {
+      layout.push_back({"TEXCOORD", draw.vertexInputRegs[i],
+                        DXGI_FORMAT_R32G32B32A32_FLOAT, 0, i * 16,
+                        D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0});
+    }
+  } else {
+    layout.push_back({"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
                       D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0});
+    for (uint32_t i = 0; i < kTranslatedInterpolators; ++i) {
+      layout.push_back({"TEXCOORD", i, DXGI_FORMAT_R32G32B32A32_FLOAT, 1,
+                        i * 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0});
+    }
   }
 
   D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
   pso.pRootSignature = m_translatedRootSig.Get();
-  pso.VS.pShaderBytecode = m_translatedVsBlob->GetBufferPointer();
-  pso.VS.BytecodeLength = m_translatedVsBlob->GetBufferSize();
+  pso.VS.pShaderBytecode = vsBlob->GetBufferPointer();
+  pso.VS.BytecodeLength = vsBlob->GetBufferSize();
   pso.PS.pShaderBytecode = ps->GetBufferPointer();
   pso.PS.BytecodeLength = ps->GetBufferSize();
   pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
@@ -1882,6 +1904,7 @@ void D3D12Renderer::RenderGameFrame() {
     if (d.translated) {
       TranslatedKey key;
       key.handle = d.pixelShaderHandle;
+      key.vsHandle = d.gpuVertex ? d.vertexShaderHandle : 0;
       key.src = d.srcBlend;
       key.dest = d.destBlend;
       key.op = d.blendOp;
@@ -1889,7 +1912,7 @@ void D3D12Renderer::RenderGameFrame() {
                           (tDepthWrite ? 2u : 0u) |
                           (d.colorWrite ? 0u : 4u) |
                           (d.blendEnable ? 8u : 0u));
-      translatedPso = TranslatedPSO(key, *d.pixelShaderHlsl);
+      translatedPso = TranslatedPSO(key, *d.pixelShaderHlsl, d);
     }
     // Every texture the shader reads must be bindable, or the draw falls back:
     // a shader sampling a descriptor that was never written reads whatever is
@@ -1905,9 +1928,14 @@ void D3D12Renderer::RenderGameFrame() {
                                         m_samplerHeap.Get()};
       m_commandList->SetDescriptorHeaps(2, theaps);
       m_commandList->SetPipelineState(translatedPso);
-      // b0 vertex: the same transform the stand-in pipeline uses, since the
-      // passthrough VS is still fed CPU-transformed positions.
-      ID3D12Resource* tcb = d.cb ? d.cb.Get() : m_gameCB.Get();
+      // b0 vertex. Two different buffers for the two vertex stages, at the one
+      // register each declares: the guest's own VERTEX constant bank when its
+      // shader is running, and the per-draw transform when the passthrough
+      // stage is — that one does not read b0 at all, but the root signature
+      // requires a bound CBV either way.
+      ID3D12Resource* tcb = d.gpuVertex   ? d.vscb.Get()
+                            : d.cb        ? d.cb.Get()
+                                          : m_gameCB.Get();
       m_commandList->SetGraphicsRootConstantBufferView(
           0, tcb->GetGPUVirtualAddress());
       // b1 pixel: the guest's own pixel constant bank.
@@ -1918,11 +1946,20 @@ void D3D12Renderer::RenderGameFrame() {
       samp.ptr += UINT64(std::min(d.samplerIndex, kSamplerVariantCount - 1)) *
                   m_samplerDescriptorSize;
       m_commandList->SetGraphicsRootDescriptorTable(3, samp);
-      // Two streams: the stand-in vertex for position, the interpolator stream
-      // for everything the pixel shader reads.
-      const D3D12_VERTEX_BUFFER_VIEW views[2] = {d.vbv, d.ivbv};
       m_commandList->IASetPrimitiveTopology(d.topology);
-      m_commandList->IASetVertexBuffers(0, 2, views);
+      if (d.gpuVertex) {
+        // One stream: the guest's raw attributes. No stand-in vertex and no
+        // interpolator stream, because neither exists for this draw — the
+        // vertex shader produces the position and the rasterizer interpolates
+        // what it exports.
+        m_commandList->IASetVertexBuffers(0, 1, &d.vsvbv);
+        ++m_gpuVertexDraws;
+      } else {
+        // Two streams: the stand-in vertex for position, the interpolator
+        // stream for everything the pixel shader reads.
+        const D3D12_VERTEX_BUFFER_VIEW views[2] = {d.vbv, d.ivbv};
+        m_commandList->IASetVertexBuffers(0, 2, views);
+      }
       m_commandList->IASetIndexBuffer(&d.ibv);
       m_commandList->DrawIndexedInstanced(d.indexCount, 1, 0, 0, 0);
       ++m_translatedDraws;
@@ -2009,9 +2046,11 @@ void D3D12Renderer::RenderGameFrame() {
     // count alone cannot distinguish "the frame runs guest shaders" from "four
     // draws in a corner do".
     std::snprintf(message, sizeof(message),
-                  "guest pixel shaders: %llu draws TRANSLATED, %llu stand-in; "
+                  "guest shaders: %llu draws TRANSLATED (%llu of them running "
+                  "the guest VERTEX shader too), %llu stand-in; "
                   "%llu pipelines built, %llu failed",
                   static_cast<unsigned long long>(m_translatedDraws),
+                  static_cast<unsigned long long>(m_gpuVertexDraws),
                   static_cast<unsigned long long>(m_standInDraws),
                   static_cast<unsigned long long>(m_translatedOk),
                   static_cast<unsigned long long>(m_translatedFailed));
@@ -2131,7 +2170,8 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t pixelConstDwords,
                                  uint32_t pixelSamplerCount,
                                  const std::shared_ptr<const mx::hle::HleTexturePayload>* pixelTextures,
-                                 const uint32_t* pixelSampledObjects) {
+                                 const uint32_t* pixelSampledObjects,
+                                 const GpuVertexStage* vertexStage) {
   // PERF(per-frame-allocs): this creates three ID3D12Resource's per call (VB +
   // IB + CB) on the UPLOAD heap, and is called once per submitted draw rather
   // than once per frame, so the allocation rate scales with the draw count —
@@ -2265,6 +2305,62 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
     if (!d.translated) {
       d.ivb.Reset();
       d.pscb.Reset();
+    }
+  }
+
+  // The guest's own vertex shader, on the GPU. Only offered for a draw whose
+  // pixel shader also translated — the hooks side enforces that, and it is
+  // re-checked here through `d.translated` because the two conditions are
+  // decided in different processes' worth of code and a mismatch would show up
+  // as geometry rather than as a message.
+  //
+  // Everything the CPU path derives on the side is REPLACED rather than lost:
+  // the position buffer is what this stage now produces, the interpolator copy
+  // is what the rasterizer does natively, and the param_gen UV becomes
+  // SV_Position in a pixel shader that reads it. So there is nothing to carry
+  // across — only something to stop doing.
+  if (d.translated && vertexStage && vertexStage->handle && vertexStage->hlsl &&
+      vertexStage->inputs && vertexStage->inputBytes && vertexStage->regs &&
+      vertexStage->regCount && vertexStage->regCount <= 32 &&
+      vertexStage->constants && vertexStage->constDwords) {
+    // The emitted cbuffer is xe_c[256] followed by xe_texsize[slots] in BOTH
+    // stages, so the buffer has to cover both here too. Sizing it to the
+    // constant bank alone leaves the shader reading past the end of the
+    // resource — the same trap the pixel path documents above, and it does not
+    // stop applying because this stage never samples.
+    const uint32_t vsConstBytes =
+        ((vertexStage->constDwords * 4 + kTranslatedSamplerSlots * 16) + 255u) &
+        ~255u;
+    if (createBuffer(d.vsvb, vertexStage->inputBytes) &&
+        createBuffer(d.vscb, vsConstBytes)) {
+      void* p = nullptr;
+      D3D12_RANGE none = {0, 0};
+      if (SUCCEEDED(d.vsvb->Map(0, &none, &p)) && p) {
+        std::memcpy(p, vertexStage->inputs, vertexStage->inputBytes);
+        d.vsvb->Unmap(0, nullptr);
+        d.vsvbv.BufferLocation = d.vsvb->GetGPUVirtualAddress();
+        d.vsvbv.SizeInBytes = vertexStage->inputBytes;
+        d.vsvbv.StrideInBytes = vertexStage->regCount * 16;
+        p = nullptr;
+        if (SUCCEEDED(d.vscb->Map(0, &none, &p)) && p) {
+          // Zeroed first: the shader's cbuffer is xe_c[256] plus xe_texsize,
+          // and the vertex bank is 256 constants, so the tail past the bank
+          // must read zero rather than whatever the upload heap held.
+          std::memset(p, 0, vsConstBytes);
+          std::memcpy(p, vertexStage->constants, vertexStage->constDwords * 4);
+          d.vscb->Unmap(0, nullptr);
+          d.vertexShaderHandle = vertexStage->handle;
+          d.vertexShaderHlsl = vertexStage->hlsl;
+          d.vertexInputCount = vertexStage->regCount;
+          for (uint32_t i = 0; i < vertexStage->regCount; ++i)
+            d.vertexInputRegs[i] = vertexStage->regs[i];
+          d.gpuVertex = true;
+        }
+      }
+    }
+    if (!d.gpuVertex) {
+      d.vsvb.Reset();
+      d.vscb.Reset();
     }
   }
   d.blendEnable = blendEnable;

@@ -759,7 +759,14 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   // ---- Assemble the translation unit -------------------------------------
   std::string src;
   src += "// Generated from Xenos microcode by EmitShaderHlsl.\n";
-  src += "cbuffer XeShaderConstants : register(b1) {\n";
+  // b0 for the vertex stage, b1 for the pixel stage — because the two banks are
+  // different memory (ALU constants 0-255 at device+0x780 and 256-511 at
+  // device+0x1780) and a root CBV binds one buffer per register per pipeline.
+  // Emitting both at b1 would mean the vertex stage reading the pixel bank, or
+  // the two stages fighting over one binding.
+  src += "cbuffer XeShaderConstants : register(";
+  src += stage == HlslStage::kPixel ? "b1" : "b0";
+  src += ") {\n";
   src += "  float4 xe_c[256];\n";
   // Indexed by compact slot, not by guest sampler — same remap as the textures.
   src += "  float4 xe_texsize[" + std::to_string(HlslShader::kMaxSamplerSlots) +

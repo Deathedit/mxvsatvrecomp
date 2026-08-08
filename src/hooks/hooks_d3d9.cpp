@@ -1946,8 +1946,22 @@ ShaderApplyResult ApplyShaderOutputs(
   // The layout is one element per REGISTER, not per attribute: 5.4% of draws
   // have two vfetches sharing a register with complementary destination
   // swizzles, and one element each would clobber rather than merge.
+  //  - The vertex shader must read no textures. The translated root signature
+  //    gives its SRV and sampler tables PIXEL visibility only, so a vertex
+  //    fetch would fail pipeline creation rather than render wrongly — but
+  //    refusing here keeps the draw on a path that works instead of on one that
+  //    silently produces no pipeline.
+  //  - PA_CL_VTE_CNTL must say the hardware applies the viewport transform, so
+  //    the shader's position export is clip space and dc.mvp is identity. The
+  //    translated pipeline's vertex stage does not apply mvp at all — neither
+  //    the passthrough one nor the guest's — so a draw needing the viewport
+  //    inverse has nowhere to apply it. Measured, the register reads 0x43F on
+  //    every draw in this game, so this refuses nothing today; it is here so
+  //    that if it ever does not, the draw falls back rather than moves.
   const TranslatedShader* vs_translated = TranslatedVertexShader(handle);
   bool gpu_vertex = vs_translated && vs_translated->source &&
+                    vs_translated->sampler_count == 0 &&
+                    VportScaleEnabled(device, base) &&
                     dc.pixel_shader_hlsl != nullptr;
   if (gpu_vertex) {
     for (const auto& a : attrs) {
