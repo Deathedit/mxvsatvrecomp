@@ -1867,6 +1867,21 @@ ShaderApplyResult ApplyShaderOutputs(
   }
   uint8_t vtx[kMaxStreams][256];
   std::vector<std::array<float, 4>> values(attrs.size());
+
+  // The interpolator stream for a translated pixel shader. Allocated only when
+  // this draw has one: it is 128 bytes per vertex and a frame carries six
+  // figures of vertices.
+  //
+  // ExecuteVertexShader already returns all 16 exports per vertex, and this
+  // function has always discarded every one except the interpolator the texture
+  // profile named. Reusing that discarded work is what makes the translated
+  // pixel path affordable without moving the vertex shader to the GPU first.
+  constexpr uint32_t kInterpStride =
+      mx::hle::kHlslInterpolatorLinkage * 4 * uint32_t(sizeof(float));
+  const bool want_interpolators = dc.pixel_shader_hlsl != nullptr;
+  if (want_interpolators)
+    dc.interpolators.assign(size_t(dc.vertex_count) * kInterpStride, 0);
+
   uint64_t applied_vertices = 0;
   uint64_t identity_in_clip = 0, viewport_in_clip = 0;
   uint64_t uv_vertices = 0, uv_missing_export = 0;
@@ -1970,6 +1985,27 @@ ShaderApplyResult ApplyShaderOutputs(
     const float p[4] = {r.position[0], r.position[1], r.position[2], w};
     std::memcpy(transformed.data() + size_t(v) * dc.vertex_stride, p,
                 sizeof(p));
+
+    // The shader's own interpolators, verbatim, for the translated pixel path.
+    // No reconstruction and no viewport transform: these are the values the
+    // pixel shader's registers are seeded with on the hardware, and the
+    // rasterizer interpolates them. The param_gen synthesis further down is a
+    // separate thing — it fabricates the ONE interpolator the hardware
+    // generates rather than the shader exporting, and only the stand-in path
+    // needs it.
+    if (want_interpolators) {
+      uint8_t* dst = dc.interpolators.data() + size_t(v) * kInterpStride;
+      for (uint32_t i = 0; i < mx::hle::kHlslInterpolatorLinkage; ++i) {
+        float e[4] = {0, 0, 0, 0};
+        if (i < r.exports.size()) {
+          for (uint32_t c = 0; c < 4; ++c) {
+            const float f = r.exports[i][c];
+            e[c] = std::isfinite(f) ? f : 0.0f;
+          }
+        }
+        std::memcpy(dst + size_t(i) * 16, e, sizeof(e));
+      }
+    }
     // Resolved render-target samples intentionally carry no CPU texture
     // payload: the renderer samples the ordered target resource instead. UVs
     // are shader outputs and must be populated for both resource paths. The old
@@ -2332,6 +2368,7 @@ struct TranslatedShader {
   std::shared_ptr<const std::string> source;  // null unless emitted AND compiled
   uint32_t input_mask = 0;
   uint32_t sampler_mask = 0;
+  uint32_t sampler_count = 0;
   uint32_t max_const_index = 0;
 };
 std::map<uint32_t, TranslatedShader> g_translatedPs;
@@ -2393,6 +2430,7 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
       t.source = std::make_shared<const std::string>(std::move(out.source));
       t.input_mask = out.input_mask;
       t.sampler_mask = out.sampler_mask;
+      t.sampler_count = out.sampler_count;
       t.max_const_index = out.max_const_index;
     }
   } else {
@@ -3163,8 +3201,31 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
   // place; a draw whose shader did not translate simply carries nothing and
   // keeps the tex*col stand-in.
   dc.pixel_shader_handle = pixel_shader;
-  if (const TranslatedShader* t = TranslatedPixelShader(pixel_shader))
+  if (const TranslatedShader* t = TranslatedPixelShader(pixel_shader)) {
     dc.pixel_shader_hlsl = t->source;
+    dc.pixel_sampler_count = t->sampler_count;
+    // The PIXEL constant bank, ALU constants 256-511 at device+0x1780. Captured
+    // per draw because the guest rewrites it between draws, and captured only
+    // for a shader that will use it. Its base is applied here so the shader can
+    // index from 0 — see DrawCall::pixel_constants.
+    constexpr uint32_t kPixelConstBase = 0x1780;
+    constexpr uint32_t kPixelConstRegs = 256;
+    if (HostPageReadable(REX_RAW_ADDR(device + kPixelConstBase)) &&
+        HostPageReadable(
+            REX_RAW_ADDR(device + kPixelConstBase + kPixelConstRegs * 16 - 4))) {
+      dc.pixel_constants.resize(kPixelConstRegs * 4);
+      for (uint32_t i = 0; i < kPixelConstRegs * 4; ++i)
+        dc.pixel_constants[i] = REX_LOAD_U32(device + kPixelConstBase + i * 4);
+    } else {
+      // Without its constants the shader would compute from zeros, which is a
+      // confident wrong answer. Drop the translation and keep the stand-in.
+      dc.pixel_shader_hlsl.reset();
+      static uint32_t s_logged = 0;
+      if (s_logged++ < 4)
+        REXLOG_INFO("d3d9: pixel constant bank unreadable at device+0x{:X}",
+                    kPixelConstBase);
+    }
+  }
 
   if (binding.sampler >= kMaxSamplers) {
     ++s_no_binding;

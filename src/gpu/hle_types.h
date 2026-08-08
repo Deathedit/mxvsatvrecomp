@@ -208,6 +208,34 @@ struct DrawCall {
   // a later frame can still be compiled.
   uint32_t pixel_shader_handle = 0;
   std::shared_ptr<const std::string> pixel_shader_hlsl;
+  // How many distinct samplers the translated shader reads, and the guest
+  // sampler each compact slot was assigned. See HlslShader::sampler_slot_guest.
+  uint32_t pixel_sampler_count = 0;
+
+  // The interpolators the translated pixel shader reads, one float4 per
+  // linkage slot per vertex, in a buffer parallel to `vertices`.
+  //
+  // A second vertex stream rather than a wider vertex: `vertices` is built by
+  // the transcode at a fixed stride that the stand-in pipeline depends on, and
+  // widening it would change the layout of the path that currently renders the
+  // game in order to serve the path that does not yet. Two streams cost one
+  // extra buffer and leave the working layout untouched.
+  //
+  // The data was already being computed and thrown away. ExecuteVertexShader
+  // returns all 16 exports for every vertex; only the one the texture profile
+  // selected was ever read.
+  std::vector<uint8_t> interpolators;
+
+  // The guest's PIXEL ALU constant bank, as raw dwords, indexed the way the
+  // shader indexes it: constant i is pixel_constants[i * 4].
+  //
+  // This is ALU constants 256-511, read from device+0x1780 — a different bank
+  // from the vertex one at device+0x780, and one nothing has ever read.
+  // D3DDevice_DrawVertices flushes them separately, passing Xenos register base
+  // 0x4000 for the vertex bank and 0x4400 for this one (0x4400 = 0x4000 + 1024
+  // dwords = constant 256). The rebase happens here, at capture, so the emitted
+  // shader can index its own bank from 0.
+  std::vector<uint32_t> pixel_constants;
 
   // The Bink frame composite binds several textures at once — Y, Cr and Cb
   // planes plus an optional alpha plane — which the single `texture` above

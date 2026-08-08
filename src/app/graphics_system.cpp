@@ -346,7 +346,14 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   (d->clamp_x >= 2 ? 1u : 0u) |
                                       (d->clamp_y >= 2 ? 2u : 0u),
                                   d->pixel_shader_handle,
-                                  d->pixel_shader_hlsl);
+                                  d->pixel_shader_hlsl,
+                                  d->interpolators.data(),
+                                  static_cast<uint32_t>(
+                                      d->interpolators.size()),
+                                  d->pixel_constants.data(),
+                                  static_cast<uint32_t>(
+                                      d->pixel_constants.size()),
+                                  d->pixel_sampler_count);
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;

@@ -514,9 +514,9 @@ bool D3D12Renderer::CreateTranslatedRootSignature() {
   return true;
 }
 
-ID3D12PipelineState* D3D12Renderer::TranslatedPSO(uint32_t handle,
+ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
                                                   const std::string& hlsl) {
-  if (auto it = m_translatedPSOs.find(handle); it != m_translatedPSOs.end())
+  if (auto it = m_translatedPSOs.find(key); it != m_translatedPSOs.end())
     return it->second.failed ? nullptr : it->second.pso.Get();
   if (!m_translatedRootSig || !m_translatedVsBlob) return nullptr;
   // Past the cap a draw falls back to the stand-in rather than being dropped,
@@ -526,25 +526,37 @@ ID3D12PipelineState* D3D12Renderer::TranslatedPSO(uint32_t handle,
   TranslatedPipeline entry;
   entry.failed = true;
 
-  auto ps = CompileShader(hlsl.c_str(), "ps_5_0", "main");
+  // Compiled once per shader, not once per blend state: one shader commonly
+  // appears under several states, and FXC is the expensive part.
+  auto& cached = m_translatedPsBlobs[key.handle];
+  if (!cached) cached = CompileShader(hlsl.c_str(), "ps_5_0", "main");
+  auto ps = cached;
   if (!ps) {
     // The hooks-side probe already compiles what it emits, so reaching here
     // means the two compilers disagreed — worth saying plainly rather than
     // counting silently.
     LogError("TranslatedPSO: pixel shader failed to compile in the renderer");
     ++m_translatedFailed;
-    m_translatedPSOs[handle] = entry;
+    m_translatedPSOs[key] = entry;
     return nullptr;
   }
 
-  // POSITION plus one float4 per interpolator, matching XeVsIn above.
+  // Two streams, matching XeVsIn above and the two buffers the draw binds.
+  //
+  // Slot 0 is the stand-in vertex, read only for its position — the transcode
+  // still builds it and the CPU interpreter still fills it, so the translated
+  // path takes the position from where it already is rather than duplicating
+  // it. Slot 1 is the interpolator stream, one float4 per linkage slot.
+  //
+  // Keeping them separate is what lets the stand-in layout stay untouched: a
+  // single interleaved stream would mean rebuilding the vertex the working path
+  // depends on.
   std::vector<D3D12_INPUT_ELEMENT_DESC> layout;
   layout.push_back({"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
                     D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0});
   for (uint32_t i = 0; i < kTranslatedInterpolators; ++i) {
-    layout.push_back({"TEXCOORD", i, DXGI_FORMAT_R32G32B32A32_FLOAT, 0,
-                      16 + i * 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
-                      0});
+    layout.push_back({"TEXCOORD", i, DXGI_FORMAT_R32G32B32A32_FLOAT, 1, i * 16,
+                      D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0});
   }
 
   D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
@@ -561,23 +573,52 @@ ID3D12PipelineState* D3D12Renderer::TranslatedPSO(uint32_t handle,
   pso.RTVFormats[0] = kBackBufferFormat;
   pso.DSVFormat = kGameDepthFormat;
   pso.SampleDesc.Count = 1;
-  pso.BlendState.RenderTarget[0].RenderTargetWriteMask =
-      D3D12_COLOR_WRITE_ENABLE_ALL;
   pso.InputLayout.pInputElementDescs = layout.data();
   pso.InputLayout.NumElements = UINT(layout.size());
+
+  // The guest's output-merger state, exactly as the stand-in path applies it.
+  // Ignoring it is what made every translated overlay an opaque rectangle.
+  const bool depthEnable = (key.flags & 1u) != 0;
+  const bool depthWrite = (key.flags & 2u) != 0;
+  const bool colorWrite = (key.flags & 4u) == 0;
+  pso.DepthStencilState.DepthEnable = depthEnable;
+  pso.DepthStencilState.DepthWriteMask =
+      depthWrite ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+  pso.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+  auto& rt = pso.BlendState.RenderTarget[0];
+  rt.RenderTargetWriteMask =
+      colorWrite ? D3D12_COLOR_WRITE_ENABLE_ALL : 0;
+  if (key.flags & 8u) {
+    D3D12_BLEND src{}, dest{}, srcA{}, destA{};
+    D3D12_BLEND_OP op{};
+    // A state that does not translate falls back to opaque rather than being
+    // approximated — the same rule BlendedPSO follows.
+    if (ToD3D12Blend(key.src, false, src) &&
+        ToD3D12Blend(key.dest, false, dest) &&
+        ToD3D12Blend(key.src, true, srcA) &&
+        ToD3D12Blend(key.dest, true, destA) && ToD3D12BlendOp(key.op, op)) {
+      rt.BlendEnable = TRUE;
+      rt.SrcBlend = src;
+      rt.DestBlend = dest;
+      rt.BlendOp = op;
+      rt.SrcBlendAlpha = srcA;
+      rt.DestBlendAlpha = destA;
+      rt.BlendOpAlpha = op;
+    }
+  }
 
   const HRESULT hr =
       m_device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&entry.pso));
   if (FAILED(hr)) {
     LogError("TranslatedPSO: CreateGraphicsPipelineState failed");
     ++m_translatedFailed;
-    m_translatedPSOs[handle] = entry;
+    m_translatedPSOs[key] = entry;
     return nullptr;
   }
   entry.failed = false;
   ++m_translatedOk;
   ID3D12PipelineState* result = entry.pso.Get();
-  m_translatedPSOs[handle] = std::move(entry);
+  m_translatedPSOs[key] = std::move(entry);
   {
     const std::string msg =
         "TranslatedPSO: built pipeline for guest pixel shader (" +
@@ -1683,21 +1724,71 @@ void D3D12Renderer::RenderGameFrame() {
       continue;
     }
 
-    // Build the translated pipeline for this draw's guest pixel shader, but do
-    // NOT render with it yet: the vertex buffer still carries the stand-in
-    // layout (position, colour, UV), not the eight interpolators the emitted
-    // shader reads, so binding it here would sample undefined inputs. This
-    // proves the pipeline can be created — the compile, the root signature and
-    // the VS/PS linkage — before anything depends on it being correct.
-    if (d.pixelShaderHlsl && d.pixelShaderHandle)
-      (void)TranslatedPSO(d.pixelShaderHandle, *d.pixelShaderHlsl);
+    // Depth state is decided the same way for both paths, so it is computed
+    // before the split rather than duplicated inside it.
+    const bool tDepthEnable = !drawTarget && d.depthEnable;
+    const bool tDepthWrite = tDepthEnable && d.depthWrite;
+
+    // Run the guest's own pixel shader, when this draw has everything it needs:
+    // a translated shader, its interpolators, and its constant bank. Anything
+    // missing keeps the tex*col stand-in rather than rendering a guess.
+    ID3D12PipelineState* translatedPso = nullptr;
+    if (d.translated) {
+      TranslatedKey key;
+      key.handle = d.pixelShaderHandle;
+      key.src = d.srcBlend;
+      key.dest = d.destBlend;
+      key.op = d.blendOp;
+      key.flags = uint8_t((tDepthEnable ? 1u : 0u) |
+                          (tDepthWrite ? 2u : 0u) |
+                          (d.colorWrite ? 0u : 4u) |
+                          (d.blendEnable ? 8u : 0u));
+      translatedPso = TranslatedPSO(key, *d.pixelShaderHlsl);
+    }
+    if (translatedPso) {
+      m_commandList->SetGraphicsRootSignature(m_translatedRootSig.Get());
+      m_commandList->SetPipelineState(translatedPso);
+      // b0 vertex: the same transform the stand-in pipeline uses, since the
+      // passthrough VS is still fed CPU-transformed positions.
+      ID3D12Resource* tcb = d.cb ? d.cb.Get() : m_gameCB.Get();
+      m_commandList->SetGraphicsRootConstantBufferView(
+          0, tcb->GetGPUVirtualAddress());
+      // b1 pixel: the guest's own pixel constant bank.
+      m_commandList->SetGraphicsRootConstantBufferView(
+          1, d.pscb->GetGPUVirtualAddress());
+      if (textured) {
+        const uint32_t maxBase = kMaxGameTextures - kTranslatedSamplerSlots;
+        auto gpu = m_gameSrvHeap->GetGPUDescriptorHandleForHeapStart();
+        gpu.ptr += UINT64(std::min(textureDescriptor, maxBase)) *
+                   m_gameSrvDescriptorSize;
+        m_commandList->SetGraphicsRootDescriptorTable(2, gpu);
+        auto samp = m_samplerHeap->GetGPUDescriptorHandleForHeapStart();
+        samp.ptr += UINT64(std::min(d.samplerIndex, kSamplerVariantCount - 1)) *
+                    m_samplerDescriptorSize;
+        m_commandList->SetGraphicsRootDescriptorTable(3, samp);
+      }
+      // Two streams: the stand-in vertex for position, the interpolator stream
+      // for everything the pixel shader reads.
+      const D3D12_VERTEX_BUFFER_VIEW views[2] = {d.vbv, d.ivbv};
+      m_commandList->IASetPrimitiveTopology(d.topology);
+      m_commandList->IASetVertexBuffers(0, 2, views);
+      m_commandList->IASetIndexBuffer(&d.ibv);
+      m_commandList->DrawIndexedInstanced(d.indexCount, 1, 0, 0, 0);
+      ++m_translatedDraws;
+      // The root signature was swapped, so the next stand-in draw has to put
+      // its own back. Restored here rather than at the top of the loop so the
+      // cost falls on the translated draw that caused it.
+      m_commandList->SetGraphicsRootSignature(m_gameRootSig.Get());
+      continue;
+    }
+    ++m_standInDraws;
 
     // Offscreen targets do not yet have per-surface depth resources. The
     // post-processing/resolve chain observed in ST_Southwest is colour-only;
     // keep depth disabled there rather than bind the 1280x720 DSV against a
     // smaller RTV, which is invalid D3D12 state.
-    const bool depthEnable = !drawTarget && d.depthEnable;
-    const bool depthWrite = depthEnable && d.depthWrite;
+    const bool depthEnable = tDepthEnable;
+    const bool depthWrite = tDepthWrite;
     const uint32_t pso_index = (depthEnable ? 1u : 0u) |
                                (depthWrite ? 2u : 0u) |
                                (d.colorWrite ? 0u : 4u) |
@@ -1758,6 +1849,18 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_rtRejectResized),
                   uint32_t(m_gameRenderTargets.size()), kMaxGameRenderTargets,
                   m_nextGameSrvDescriptor, kMaxGameTextures);
+    LogInfo(message);
+    // The figure that says whether the guest's own shaders are actually
+    // carrying the picture. Translated against stand-in, because the translated
+    // count alone cannot distinguish "the frame runs guest shaders" from "four
+    // draws in a corner do".
+    std::snprintf(message, sizeof(message),
+                  "guest pixel shaders: %llu draws TRANSLATED, %llu stand-in; "
+                  "%llu pipelines built, %llu failed",
+                  static_cast<unsigned long long>(m_translatedDraws),
+                  static_cast<unsigned long long>(m_standInDraws),
+                  static_cast<unsigned long long>(m_translatedOk),
+                  static_cast<unsigned long long>(m_translatedFailed));
     LogInfo(message);
     // Separate line rather than a longer format: the snapshot numbers answer a
     // different question (which resolve result a draw sampled) from the routing
@@ -1830,7 +1933,12 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t destBlend, uint32_t blendOp,
                                  uint8_t colorSource, uint32_t samplerIndex,
                                  uint32_t pixelShaderHandle,
-                                 std::shared_ptr<const std::string> pixelShaderHlsl) {
+                                 std::shared_ptr<const std::string> pixelShaderHlsl,
+                                 const uint8_t* interpolators,
+                                 uint32_t interpBytes,
+                                 const uint32_t* pixelConstants,
+                                 uint32_t pixelConstDwords,
+                                 uint32_t pixelSamplerCount) {
   // PERF(per-frame-allocs): this creates three ID3D12Resource's per call (VB +
   // IB + CB) on the UPLOAD heap, and is called once per submitted draw rather
   // than once per frame, so the allocation rate scales with the draw count —
@@ -1905,6 +2013,61 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.samplerIndex = samplerIndex;
   d.pixelShaderHandle = pixelShaderHandle;
   d.pixelShaderHlsl = std::move(pixelShaderHlsl);
+  d.pixelSamplerCount = pixelSamplerCount;
+
+  // The translated path needs all of its inputs or none of them. A shader run
+  // without its interpolators reads undefined registers, and one run without
+  // its constants computes from zeros — both produce a confident wrong picture
+  // rather than a visible failure, which is worse than keeping the stand-in.
+  //
+  // The sampler limit is the honest current boundary: a descriptor block per
+  // draw is not built yet, so only a shader reading a single texture can be
+  // bound correctly, using the descriptor this draw already has. Multi-sampler
+  // shaders keep the stand-in until that lands.
+  if (d.pixelShaderHlsl && d.pixelShaderHandle && interpolators &&
+      interpBytes && pixelConstants && pixelConstDwords &&
+      pixelSamplerCount <= 1) {
+    // The shader's cbuffer is xe_c[256] followed by xe_texsize[slots], so the
+    // buffer must cover BOTH. Sizing it to the constant bank alone would leave
+    // the shader reading past the end of the resource for every unnormalized
+    // fetch. Rounded up to 256 bytes, the constant-buffer granularity.
+    const uint32_t bankBytes = pixelConstDwords * 4;
+    const uint32_t texSizeBytes = kTranslatedSamplerSlots * 16;
+    const uint32_t constBytes = ((bankBytes + texSizeBytes) + 255u) & ~255u;
+    if (createBuffer(d.ivb, interpBytes) && createBuffer(d.pscb, constBytes)) {
+      void* p = nullptr;
+      D3D12_RANGE none = {0, 0};
+      if (SUCCEEDED(d.ivb->Map(0, &none, &p)) && p) {
+        std::memcpy(p, interpolators, interpBytes);
+        d.ivb->Unmap(0, nullptr);
+        d.ivbv.BufferLocation = d.ivb->GetGPUVirtualAddress();
+        d.ivbv.SizeInBytes = interpBytes;
+        d.ivbv.StrideInBytes =
+            kTranslatedInterpolators * 4 * uint32_t(sizeof(float));
+        p = nullptr;
+        if (SUCCEEDED(d.pscb->Map(0, &none, &p)) && p) {
+          std::memset(p, 0, constBytes);
+          std::memcpy(p, pixelConstants, bankBytes);
+          // xe_texsize, immediately after the bank. An unnormalized fetch
+          // multiplies its coordinate by this, so it must be the extent of the
+          // texture actually bound at that slot — with one sampler that is this
+          // draw's texture. Left zero when there is none, which makes such a
+          // fetch read texel 0 rather than something plausible.
+          if (d.texture) {
+            float ts[4] = {float(d.texture->width), float(d.texture->height),
+                           0.0f, 0.0f};
+            std::memcpy(static_cast<uint8_t*>(p) + bankBytes, ts, sizeof(ts));
+          }
+          d.pscb->Unmap(0, nullptr);
+          d.translated = true;
+        }
+      }
+    }
+    if (!d.translated) {
+      d.ivb.Reset();
+      d.pscb.Reset();
+    }
+  }
   d.blendEnable = blendEnable;
   d.srcBlend = srcBlend;
   d.destBlend = destBlend;

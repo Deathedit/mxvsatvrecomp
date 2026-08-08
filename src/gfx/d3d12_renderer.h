@@ -71,7 +71,12 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  uint32_t destBlend = 0, uint32_t blendOp = 0,
                  uint8_t colorSource = 0, uint32_t samplerIndex = 0,
                  uint32_t pixelShaderHandle = 0,
-                 std::shared_ptr<const std::string> pixelShaderHlsl = {});
+                 std::shared_ptr<const std::string> pixelShaderHlsl = {},
+                 const uint8_t* interpolators = nullptr,
+                 uint32_t interpBytes = 0,
+                 const uint32_t* pixelConstants = nullptr,
+                 uint32_t pixelConstDwords = 0,
+                 uint32_t pixelSamplerCount = 0);
 
 // Append a resolve to this frame's list, in order with the draws around it.
 //
@@ -292,14 +297,48 @@ void ClearGameDraws();
     Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
     bool failed = false;  // compiled or created badly; do not retry every draw
   };
-  std::unordered_map<uint32_t, TranslatedPipeline> m_translatedPSOs;
+  // Keyed on the shader AND the output-merger state, not the shader alone.
+  //
+  // Keying on the shader alone is what turned every translated overlay into an
+  // opaque rectangle: the pipeline was built with the default blend state, so a
+  // blended draw — text, UI, anything alpha — painted its whole quad. The
+  // stand-in path has always honoured this state via BlendedPSO, and a
+  // translated draw that ignored it was a regression, not a translation error.
+  struct TranslatedKey {
+    uint32_t handle = 0;
+    uint32_t src = 0, dest = 0, op = 0;
+    uint8_t flags = 0;  // 1 depth, 2 depth write, 4 no colour, 8 blend
+    bool operator==(const TranslatedKey& o) const noexcept {
+      return handle == o.handle && src == o.src && dest == o.dest &&
+             op == o.op && flags == o.flags;
+    }
+  };
+  struct TranslatedKeyHash {
+    size_t operator()(const TranslatedKey& k) const noexcept {
+      return (size_t(k.handle) << 20) ^ (size_t(k.src) << 12) ^
+             (size_t(k.dest) << 6) ^ (size_t(k.op) << 3) ^ size_t(k.flags);
+    }
+  };
+  std::unordered_map<TranslatedKey, TranslatedPipeline, TranslatedKeyHash>
+      m_translatedPSOs;
   // Compile `hlsl` and build a pipeline for it, or return null. Caches both
-  // outcomes against `handle`, so a shader that fails is not recompiled once
-  // per draw for the rest of the run.
-  ID3D12PipelineState* TranslatedPSO(uint32_t handle, const std::string& hlsl);
+  // outcomes against the key, so a shader that fails is not recompiled once per
+  // draw for the rest of the run.
+  ID3D12PipelineState* TranslatedPSO(const TranslatedKey& key,
+                                     const std::string& hlsl);
+  // Compiled bytecode per shader handle, so one shader used with several blend
+  // states is compiled once rather than once per state.
+  std::unordered_map<uint32_t, Microsoft::WRL::ComPtr<ID3DBlob>>
+      m_translatedPsBlobs;
   bool CreateTranslatedRootSignature();
   uint64_t m_translatedOk = 0;
   uint64_t m_translatedFailed = 0;
+  // Per-frame split of draws that ran the guest's own pixel shader against
+  // those that kept the stand-in. Reported together, because the translated
+  // count alone cannot say whether the path is carrying the frame or a corner
+  // of it.
+  uint64_t m_translatedDraws = 0;
+  uint64_t m_standInDraws = 0;
   // The fallback transform: an identity matrix, used by any translated draw
   // whose own constant buffer failed to allocate. Bound as a root CBV, so it
   // needs no descriptor heap.
@@ -424,6 +463,16 @@ void ClearGameDraws();
     // the source is only read the first time a shader is seen.
     uint32_t pixelShaderHandle = 0;
     std::shared_ptr<const std::string> pixelShaderHlsl;
+    // The guest interpolator stream, as a second vertex buffer, and the guest's
+    // pixel constant bank. Both are required for the translated path: without
+    // them the shader would read undefined inputs and compute from zeros, which
+    // is a confident wrong answer rather than a visible failure. `translated`
+    // is only set once every piece is present.
+    Microsoft::WRL::ComPtr<ID3D12Resource> ivb;
+    D3D12_VERTEX_BUFFER_VIEW ivbv = {};
+    Microsoft::WRL::ComPtr<ID3D12Resource> pscb;
+    uint32_t pixelSamplerCount = 0;
+    bool translated = false;
   };
   // Bounded because each entry costs three CreateCommittedResource calls — see
   // the PERF(per-frame-allocs) note in d3d12_game.cpp.
