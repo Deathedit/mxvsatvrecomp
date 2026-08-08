@@ -1952,6 +1952,62 @@ ShaderApplyResult ApplyShaderOutputs(
       uv_generated = true;
     }
   }
+  // Step 3 feasibility, measured once per draw before any of it is wired.
+  //
+  // Moving the vertex shader to the GPU means feeding the emitted XeVsIn, whose
+  // elements are `float4 vN : TEXCOORDN` with N the vfetch DESTINATION REGISTER
+  // (shader_hlsl.cpp:800). The decoded `values[a]` below is already exactly that
+  // data, so the switch is a layout, not a rewrite -- but only if the mapping is
+  // one attribute to one declared register. Two attributes sharing a dest_reg
+  // cannot both be an input element, and an attribute writing a register the
+  // shader never reads has nowhere to go.
+  //
+  // Neither has been checked, and guessing was wrong twice today. Count instead.
+  {
+    static uint64_t s_vsMappable = 0, s_vsCollision = 0, s_vsUndeclared = 0,
+                    s_vsNoTranslation = 0;
+    // handle -> input_mask, or absent when the shader does not translate.
+    // Emitted once per handle: this is a feasibility probe, not the eventual
+    // cache, so it keeps only the mask the layout would be built from.
+    static std::map<uint32_t, uint32_t> s_vsInputMask;
+    static std::map<uint32_t, bool> s_vsSeen;
+    if (s_vsSeen.emplace(handle, true).second) {
+      mx::hle::HlslShader vs;
+      if (mx::hle::EmitShaderHlsl(patch.code.data() + patch.code_off,
+                                  uint32_t(patch.code.size() - patch.code_off),
+                                  mx::hle::HlslStage::kVertex,
+                                  mx::hle::kHlslInterpolatorLinkage, vs) &&
+          vs.status == mx::hle::HlslStatus::kOk) {
+        s_vsInputMask.emplace(handle, vs.input_mask);
+      }
+    }
+    const auto mi = s_vsInputMask.find(handle);
+    if (mi == s_vsInputMask.end()) {
+      ++s_vsNoTranslation;
+    } else {
+      const uint32_t input_mask = mi->second;
+      uint32_t seen = 0;
+      bool collision = false, undeclared = false;
+      for (const auto& a : attrs) {
+        const uint32_t bit = 1u << (a.dest_reg & 31);
+        if (a.dest_reg >= 32 || !(input_mask & bit)) undeclared = true;
+        else if (seen & bit) collision = true;
+        seen |= bit;
+      }
+      if (collision) ++s_vsCollision;
+      else if (undeclared) ++s_vsUndeclared;
+      else ++s_vsMappable;
+    }
+    const uint64_t total =
+        s_vsMappable + s_vsCollision + s_vsUndeclared + s_vsNoTranslation;
+    if ((total % 5000) == 0) {
+      REXLOG_INFO(
+          "d3d9: VS->GPU feasibility: {} draws mappable, {} dest_reg collision, "
+          "{} undeclared reg, {} no translation",
+          s_vsMappable, s_vsCollision, s_vsUndeclared, s_vsNoTranslation);
+    }
+  }
+
   for (uint32_t v = 0; v < dc.vertex_count; ++v) {
     if (!referenced[v]) continue;
     const uint64_t src = uint64_t(dc.first_vertex) + v;
