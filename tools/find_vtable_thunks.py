@@ -144,6 +144,41 @@ MATCHERS = (
     ("adjustor", match_adjustor_thunk),
 )
 
+
+def reachable_by_fallthrough(ea):
+    """True if execution can fall into `ea` from the instruction before it.
+
+    A function entry point cannot be fallen into, so this is what separates a
+    real thunk from a byte sequence that merely looks like one. It matters most
+    for the adjustor shape, which is only `addi r3, r3, N` followed by a
+    branch — a perfectly ordinary way to end a real function. Two of the first
+    three adjustor hits checked by hand on another title were exactly that:
+
+        li   r5, 0x160
+        li   r4, 0
+        addi r3, r3, 0x5C     <- matched here
+        b    sub_82702DD0
+
+    Registering that address would emit a function entered below its own
+    argument setup, calling through with garbage in r4 and r5. The genuine
+    thunks are always preceded by a terminator, because something else ends
+    just before them.
+    """
+    prev = ida_bytes.get_dword(ea - 4)
+    if prev is None or prev == 0xFFFFFFFF:
+        return False
+    if prev == 0:  # alignment padding
+        return False
+    if prev == 0x4E800020:  # blr
+        return False
+    if prev == 0x4E800420:  # bctr
+        return False
+    # Unconditional relative branch: primary opcode 18 with LK clear. `bl`
+    # (LK set) returns, so it DOES fall through.
+    if (prev >> 26) == 18 and (prev & 1) == 0:
+        return False
+    return True
+
 # --- scan -------------------------------------------------------------------
 
 
@@ -193,6 +228,7 @@ def load_existing(path):
 
 def scan(known):
     found = []  # (ea, size, kind, already_defined, already_listed)
+    rejected = []  # matched the shape but is reachable by fall-through
 
     for seg_ea in idautils.Segments():
         seg = ida_segment.getseg(seg_ea)
@@ -211,12 +247,20 @@ def scan(known):
                 ea += 4
                 continue
             defined = ida_funcs.get_func(ea) is not None
+            # An address IDA already calls a function is an entry point by
+            # definition; otherwise it has to be unreachable by fall-through to
+            # be one. Step by 4 on rejection, not by size — the bytes we just
+            # rejected are ordinary code and may contain a real match.
+            if not defined and reachable_by_fallthrough(ea):
+                rejected.append((ea, size, kind))
+                ea += 4
+                continue
             found.append((ea, size, kind, defined, ea in known))
             ea += size
-    return found
+    return found, rejected
 
 
-def report(found, config_path, config_note, known_count):
+def report(found, rejected, config_path, config_note, known_count):
     missing = [f for f in found if not f[3] and not f[4]]
     listed = [f for f in found if f[4]]
     defined = [f for f in found if f[3] and not f[4]]
@@ -231,6 +275,9 @@ def report(found, config_path, config_note, known_count):
         print("             entries are not `0x... = ...` lines?")
     print("")
     print("  %5d matched" % len(found))
+    print("  %5d rejected: shape matched but reachable by fall-through,"
+          % len(rejected))
+    print("        so mid-function code, not an entry point")
     print("  %5d already a defined function (no entry needed)" % len(defined))
     print("  %5d already in the config above" % len(listed))
     print("  %5d MISSING — recompiler will not emit these" % len(missing))
@@ -286,8 +333,8 @@ def report(found, config_path, config_note, known_count):
 def main():
     config_path, config_note = resolve_config()
     known = load_existing(config_path)
-    found = scan(known)
-    text = report(found, config_path, config_note, len(known))
+    found, rejected = scan(known)
+    text = report(found, rejected, config_path, config_note, len(known))
     if OUT_PATH and text:
         with open(OUT_PATH, "w", encoding="utf-8") as f:
             f.write(text)
