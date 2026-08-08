@@ -113,12 +113,7 @@ struct HlslShader {
   // `sampler_slot_guest[i]` is the guest sampler that slot i was assigned, for
   // the first `sampler_count` slots. The renderer uses it to decide which
   // texture to place at each descriptor.
-  // Measured at 144 distinct shaders: 8 slots refused 5 of them outright
-  // ("too many distinct samplers"). Must equal DrawCall::kMaxPixelTextures and
-  // the renderer's kTranslatedSamplerSlots -- that last one is the width of the
-  // descriptor table, so the three are one number wearing three names and
-  // d3d12_game.cpp static_asserts them together.
-  static constexpr uint32_t kMaxSamplerSlots = 16;
+  static constexpr uint32_t kMaxSamplerSlots = 8;
   uint32_t sampler_count = 0;
   uint32_t sampler_slot_guest[kMaxSamplerSlots] = {};
 

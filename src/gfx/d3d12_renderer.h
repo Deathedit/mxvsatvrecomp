@@ -280,9 +280,7 @@ void ClearGameDraws();
   // 14-fetch shader's s8-s12 need a thirteen-wide table to deliver five
   // textures, and one block that size per draw exhausts the heap within a
   // frame.
-  // The descriptor table width. Every block costs this many descriptors, so it
-  // multiplies against kMaxTranslatedBlocks into the heap size — see there.
-  static constexpr uint32_t kTranslatedSamplerSlots = 16;
+  static constexpr uint32_t kTranslatedSamplerSlots = 8;
   // The VS-to-PS linkage width. MUST equal mx::hle::kHlslInterpolatorLinkage:
   // the emitted pixel shader declares its input struct with that many
   // interpolators, and a vertex stage offering a different count produces two
@@ -370,13 +368,7 @@ void ClearGameDraws();
   // Slicing per frame lets the window reset every host frame while still only
   // rewriting blocks the GPU finished with kFrameCount frames ago, which is
   // what putting the reset in ClearGameDraws was protecting.
-  // 3072 rather than 4096 because the slot count doubled to 16: the heap is
-  // kMaxTranslatedBlocks * kTranslatedSamplerSlots descriptors, and 4096 * 16
-  // would be 65536 — exactly the Resource Binding Tier 1 cap for a
-  // shader-visible CBV/SRV/UAV heap, with no margin. 3072 * 16 = 49152 keeps
-  // headroom, and 1024 blocks per frame in flight is still eight times the
-  // measured per-frame demand of ~125.
-  static constexpr uint32_t kMaxTranslatedBlocks = 3072;
+  static constexpr uint32_t kMaxTranslatedBlocks = 4096;
   static constexpr uint32_t kTranslatedBlocksPerFrame =
       kMaxTranslatedBlocks / kFrameCount;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_translatedSrvHeap;

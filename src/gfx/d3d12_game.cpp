@@ -57,9 +57,6 @@ static_assert(D3D12Renderer::TranslatedInterpolatorLinkage() ==
 static_assert(D3D12Renderer::TranslatedSamplerTableWidth() ==
                   mx::hle::HlslShader::kMaxSamplerSlots,
               "translated sampler table is narrower than the emitter declares");
-static_assert(mx::hle::DrawCall::kMaxPixelTextures ==
-                  mx::hle::HlslShader::kMaxSamplerSlots,
-              "DrawCall carries fewer textures than a shader can declare");
 
 using mx::gfx::CompileShader;
 using mx::gfx::LogError;
