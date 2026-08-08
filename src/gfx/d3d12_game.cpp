@@ -1523,6 +1523,13 @@ void D3D12Renderer::RenderGameFrame() {
   m_presentSourceObject = 0;
   std::unordered_set<uint32_t> fullSizeTargets;
   uint32_t fullSizeDraws = 0;
+  // Per surface, in the order first drawn into. "Two surfaces, 8 draws" cannot
+  // say whether one is the scene and the other a one-draw overlay, or whether
+  // the work is split evenly -- and presenting the LAST one written is only
+  // right in the first case. The order matters as much as the counts: a
+  // compositor writes its output last, a UI layer is written last over a scene
+  // that was finished earlier, and those want opposite choices.
+  std::vector<std::pair<uint32_t, uint32_t>> fullSizeOrder;
   for (const auto& d : m_gameDraws) {
     // A resolve: snapshot the source target as it stands right now, so draws
     // recorded after this point sample these contents rather than whatever the
@@ -1712,7 +1719,10 @@ void D3D12Renderer::RenderGameFrame() {
         // and composites them, presenting one of them shows a single layer --
         // which is what a white frame with content on one band looks like.
         // Count the distinct ones per frame rather than assume either way.
-        fullSizeTargets.insert(d.targetObject);
+        if (fullSizeTargets.insert(d.targetObject).second)
+          fullSizeOrder.emplace_back(d.targetObject, 0);
+        for (auto& e : fullSizeOrder)
+          if (e.first == d.targetObject) ++e.second;
         ++fullSizeDraws;
       }
     }
@@ -2094,6 +2104,19 @@ void D3D12Renderer::RenderGameFrame() {
                   m_presentSourceObject, uint32_t(fullSizeTargets.size()),
                   fullSizeDraws);
     LogInfo(message);
+    {
+      std::string order;
+      char one[64];
+      for (const auto& e : fullSizeOrder) {
+        std::snprintf(one, sizeof(one), " 0x%08X=%u", e.first, e.second);
+        order += one;
+      }
+      std::snprintf(message, sizeof(message),
+                    "full-size surfaces this frame, in draw order:%s "
+                    "(presenting the last)",
+                    order.empty() ? " none" : order.c_str());
+      LogInfo(message);
+    }
     // Age of a full-screen snapshot when a draw samples it. The 100+ bucket is
     // the one that matters: those are whole leftover frames being composited.
     std::snprintf(message, sizeof(message),
@@ -2326,10 +2349,25 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
         // texel 0 rather than something plausible — and is why this is stored
         // reciprocated here instead of divided in the shader, where a zero
         // extent would produce infinity.
-        if (d.texture && d.texture->width && d.texture->height) {
-          float ts[4] = {1.0f / float(d.texture->width),
-                         1.0f / float(d.texture->height), 0.0f, 0.0f};
-          std::memcpy(static_cast<uint8_t*>(p) + bankBytes, ts, sizeof(ts));
+        // EVERY slot, not just the first. xe_texinv is declared
+        // kTranslatedSamplerSlots wide and was filled at index 0 only, so an
+        // unnormalized fetch on any slot above the first multiplied its
+        // coordinate by ZERO -- sampling texel 0 and painting that single
+        // texel's colour flat across the primitive. On a full-screen quad that
+        // is a wash, which is what it looks like.
+        //
+        // The per-slot payloads were already carried here; only this fill was
+        // still single-texture. Slot 0 falls back to d.texture because the
+        // single-texture path populates that and not the array.
+        for (uint32_t s = 0; s < kTranslatedSamplerSlots; ++s) {
+          const auto& tex = s < d.pixelTextures.size() && d.pixelTextures[s]
+                                ? d.pixelTextures[s]
+                                : (s == 0 ? d.texture : nullptr);
+          if (!tex || !tex->width || !tex->height) continue;
+          const float ts[4] = {1.0f / float(tex->width),
+                               1.0f / float(tex->height), 0.0f, 0.0f};
+          std::memcpy(static_cast<uint8_t*>(p) + bankBytes + s * 16, ts,
+                      sizeof(ts));
         }
         d.pscb->Unmap(0, nullptr);
         d.translated = true;
