@@ -17,6 +17,10 @@ const char* HlslStatusName(HlslStatus s) {
     case HlslStatus::kUnsupportedVectorOp: return "unsupported vector op";
     case HlslStatus::kUnsupportedScalarOp: return "unsupported scalar op";
     case HlslStatus::kUnsupportedFetch: return "unsupported texture fetch";
+    case HlslStatus::kFetchRelative: return "relative texture fetch";
+    case HlslStatus::kFetchCube: return "cube texture fetch";
+    case HlslStatus::kFetch1D: return "1D texture fetch";
+    case HlslStatus::kFetch3D: return "3D/stacked texture fetch";
     case HlslStatus::kTooManySamplers: return "too many distinct samplers";
     case HlslStatus::kLoopRelative: return "aL-relative (loop)";
     case HlslStatus::kInstructionCap: return "instruction cap";
@@ -595,12 +599,18 @@ class Emitter {
 
   void EmitTextureFetch(const uc::TextureFetchInstruction& tf) {
     if (tf.is_src_relative() || tf.is_dest_relative()) {
-      status = HlslStatus::kUnsupportedFetch;
+      status = HlslStatus::kFetchRelative;
       blocking_opcode = uint32_t(tf.opcode());
       return;
     }
-    if (tf.dimension() != rex::graphics::xenos::FetchOpDimension::k2D) {
-      status = HlslStatus::kUnsupportedFetch;
+    // 1D joins 2D: a single-row texture samples correctly through an ordinary
+    // 2D binding, so it needs no new resource type -- only the v coordinate
+    // pinned to the row, below. Cube and 3D still need a real TextureCube /
+    // Texture3D and are refused by name.
+    using Dim = rex::graphics::xenos::FetchOpDimension;
+    if (tf.dimension() != Dim::k2D && tf.dimension() != Dim::k1D) {
+      status = tf.dimension() == Dim::kCube ? HlslStatus::kFetchCube
+                                            : HlslStatus::kFetch3D;
       blocking_opcode = uint32_t(tf.opcode());
       return;
     }
@@ -619,16 +629,29 @@ class Emitter {
     // ALU swizzle, which is component-relative. Reading it the ALU way sends
     // every fetch to the wrong coordinate pair.
     const uint32_t swiz = tf.src_swizzle();
+    const bool is_1d = tf.dimension() == rex::graphics::xenos::FetchOpDimension::k1D;
     std::string uv;
     uv += kComponent[swiz & 3];
-    uv += kComponent[(swiz >> 2) & 3];
+    if (!is_1d) uv += kComponent[(swiz >> 2) & 3];
 
     std::string coord = Temp(tf.src()) + "." + uv;
     if (tf.unnormalized_coordinates()) {
-      // The guest addresses this texture in texels; the host sampler wants
-      // normalized coordinates. The extent is a per-draw property of the bound
-      // texture, not of the shader, so it arrives as a constant.
-      coord = "(" + coord + " * xe_texsize[" + std::to_string(slot) + "].xy)";
+      // `tx_coord_denorm` means the guest addresses this texture in TEXELS;
+      // the host sampler wants normalized coordinates, so this divides by the
+      // extent. It arrives pre-reciprocated as xe_texinv, both to keep the
+      // divide off the per-pixel path and so that "no texture bound" can be
+      // encoded as 0 — which reads texel 0, rather than the infinity a
+      // division by a zero extent would produce.
+      //
+      // This used to MULTIPLY by the extent, leaving every unnormalized fetch
+      // wrong by the square of the texture size.
+      coord = "(" + coord + " * xe_texinv[" + std::to_string(slot) +
+              (is_1d ? "].x)" : "].xy)");
+    }
+    if (is_1d) {
+      // A Xenos 1D texture is one row, described to the host as width x 1, so
+      // the row centre is v = 0.5 in normalized space whatever the width.
+      coord = "float2(" + coord + ", 0.5)";
     }
     const std::string s = std::to_string(slot);
     Line("xe_v = xe_tex" + s + ".Sample(xe_smp" + s + ", " + coord + ");");
@@ -769,7 +792,9 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   src += ") {\n";
   src += "  float4 xe_c[256];\n";
   // Indexed by compact slot, not by guest sampler — same remap as the textures.
-  src += "  float4 xe_texsize[" + std::to_string(HlslShader::kMaxSamplerSlots) +
+  // Holds the RECIPROCAL of the bound texture's extent (0 when none); see the
+  // unnormalized-coordinate note in EmitTextureFetch.
+  src += "  float4 xe_texinv[" + std::to_string(HlslShader::kMaxSamplerSlots) +
          "];\n";
   src += "};\n";
   // Declared for EVERY slot up to sampler_count, contiguously from t0/s0, so

@@ -2285,7 +2285,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
       (hasVertexStage || (interpolators && interpBytes)) && pixelConstants &&
       pixelConstDwords && pixelSamplerCount &&
       pixelSamplerCount <= kTranslatedSamplerSlots) {
-    // The shader's cbuffer is xe_c[256] followed by xe_texsize[slots], so the
+    // The shader's cbuffer is xe_c[256] followed by xe_texinv[slots], so the
     // buffer must cover BOTH. Sizing it to the constant bank alone would leave
     // the shader reading past the end of the resource for every unnormalized
     // fetch. Rounded up to 256 bytes, the constant-buffer granularity.
@@ -2314,14 +2314,21 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
       if (SUCCEEDED(d.pscb->Map(0, &none, &p)) && p) {
         std::memset(p, 0, constBytes);
         std::memcpy(p, pixelConstants, bankBytes);
-        // xe_texsize, immediately after the bank. An unnormalized fetch
-        // multiplies its coordinate by this, so it must be the extent of the
-        // texture actually bound at that slot — with one sampler that is this
-        // draw's texture. Left zero when there is none, which makes such a
-        // fetch read texel 0 rather than something plausible.
-        if (d.texture) {
-          float ts[4] = {float(d.texture->width), float(d.texture->height),
-                         0.0f, 0.0f};
+        // xe_texinv, immediately after the bank. An unnormalized fetch
+        // addresses the texture in TEXELS, so the shader multiplies by this to
+        // normalize — it is therefore 1/extent of the texture actually bound at
+        // that slot, which with one sampler is this draw's texture.
+        //
+        // It held the extent itself until the emitter's divide was corrected,
+        // which made every unnormalized fetch wrong by the size squared.
+        //
+        // Left zero when there is no texture, which makes such a fetch read
+        // texel 0 rather than something plausible — and is why this is stored
+        // reciprocated here instead of divided in the shader, where a zero
+        // extent would produce infinity.
+        if (d.texture && d.texture->width && d.texture->height) {
+          float ts[4] = {1.0f / float(d.texture->width),
+                         1.0f / float(d.texture->height), 0.0f, 0.0f};
           std::memcpy(static_cast<uint8_t*>(p) + bankBytes, ts, sizeof(ts));
         }
         d.pscb->Unmap(0, nullptr);
@@ -2346,7 +2353,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   // SV_Position in a pixel shader that reads it. So there is nothing to carry
   // across — only something to stop doing.
   if (d.translated && hasVertexStage) {
-    // The emitted cbuffer is xe_c[256] followed by xe_texsize[slots] in BOTH
+    // The emitted cbuffer is xe_c[256] followed by xe_texinv[slots] in BOTH
     // stages, so the buffer has to cover both here too. Sizing it to the
     // constant bank alone leaves the shader reading past the end of the
     // resource — the same trap the pixel path documents above, and it does not
@@ -2366,7 +2373,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
         d.vsvbv.StrideInBytes = vertexStage->regCount * 16;
         p = nullptr;
         if (SUCCEEDED(d.vscb->Map(0, &none, &p)) && p) {
-          // Zeroed first: the shader's cbuffer is xe_c[256] plus xe_texsize,
+          // Zeroed first: the shader's cbuffer is xe_c[256] plus xe_texinv,
           // and the vertex bank is 256 constants, so the tail past the bank
           // must read zero rather than whatever the upload heap held.
           std::memset(p, 0, vsConstBytes);

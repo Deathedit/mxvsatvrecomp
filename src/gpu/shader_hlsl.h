@@ -70,6 +70,14 @@ enum class HlslStatus : uint8_t {
   kUnsupportedVectorOp,
   kUnsupportedScalarOp,
   kUnsupportedFetch,      // relative or non-2D texture fetch
+  // The three causes the one status above used to hide. They need different
+  // fixes -- a cube fetch needs a TextureCube binding and a direction
+  // reconstruction, a relative fetch needs an index we do not have -- so a
+  // combined count could not say which work would pay.
+  kFetchRelative,         // src or dest indexed by a register
+  kFetchCube,             // dimension kCube
+  kFetch1D,               // dimension k1D
+  kFetch3D,               // dimension k3DOrStacked
   kTooManySamplers,       // more distinct samplers than kMaxSamplerSlots
   kLoopRelative,          // aL-relative index; no honest value for aL
   kInstructionCap,

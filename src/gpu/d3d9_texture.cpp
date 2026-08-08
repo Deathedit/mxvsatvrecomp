@@ -101,7 +101,15 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
   std::memcpy(&fetch, fetch_words, sizeof(fetch));
   if (fetch.type != xenos::FetchConstantType::kTexture)
     return reject("fetch constant is not a texture");
-  if (fetch.dimension != xenos::DataDimension::k2DOrStacked || fetch.stacked)
+  // A 1D texture is one row, and every size/pitch/extent computation below
+  // generalises to height 1 unchanged — so it is described as a width x 1 2D
+  // texture and binds through the ordinary 2D path. The shader side pins v to
+  // the row centre. Its extent lives in a different union member (size_1d has
+  // 24 bits of width, size_2d only 13), so reading it the 2D way would truncate
+  // any row wider than 8192.
+  const bool one_d = fetch.dimension == xenos::DataDimension::k1D;
+  if (!one_d &&
+      (fetch.dimension != xenos::DataDimension::k2DOrStacked || fetch.stacked))
     return reject("texture is not plain 2D");
   if (!fetch.base_address) return reject("texture has no base level");
 
@@ -163,8 +171,8 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
   if (fi->bytes_per_block() & (fi->bytes_per_block() - 1))
     return reject("non-power-of-two block size");
 
-  out.width = fetch.size_2d.width + 1;
-  out.height = fetch.size_2d.height + 1;
+  out.width = (one_d ? fetch.size_1d.width : fetch.size_2d.width) + 1;
+  out.height = one_d ? 1u : fetch.size_2d.height + 1;
   out.block_width = fi->block_width;
   out.block_height = fi->block_height;
   out.bytes_per_block = fi->bytes_per_block();
