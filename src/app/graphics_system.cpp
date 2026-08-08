@@ -344,7 +344,9 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   // clamps. Mirroring is not modelled, so a
                                   // mirrored mode takes the nearer of the two.
                                   (d->clamp_x >= 2 ? 1u : 0u) |
-                                      (d->clamp_y >= 2 ? 2u : 0u));
+                                      (d->clamp_y >= 2 ? 2u : 0u),
+                                  d->pixel_shader_handle,
+                                  d->pixel_shader_hlsl);
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;

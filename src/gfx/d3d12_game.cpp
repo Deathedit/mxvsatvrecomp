@@ -21,6 +21,7 @@
 #include "gfx/d3d12_shaders.h"
 #include "gpu/d3d9_layout.h"
 #include "gpu/hle_types.h"
+#include "gpu/shader_hlsl.h"  // kHlslInterpolatorLinkage, for the static_assert
 
 #include <chrono>
 #include <cstring>
@@ -46,6 +47,13 @@ static_assert(static_cast<int>(mx::hle::HostTopology::kPointList) ==
 
 static_assert(kMaxDrawPlanes == mx::hle::DrawCall::kMaxPlanes,
               "renderer plane budget has drifted from DrawCall::kMaxPlanes");
+
+// The one number the vertex and pixel stages of a translated draw must agree
+// on. When they disagreed, every CreateGraphicsPipelineState call failed and
+// D3D12 reported nothing — so this drift is caught at build time instead.
+static_assert(D3D12Renderer::TranslatedInterpolatorLinkage() ==
+                  mx::hle::kHlslInterpolatorLinkage,
+              "translated VS/PS interpolator linkage has drifted");
 
 using mx::gfx::CompileShader;
 using mx::gfx::LogError;
@@ -284,6 +292,11 @@ bool D3D12Renderer::CreateGamePipeline() {
   if (!CreatePresentQuad()) return false;
 
   m_hasGamePipeline = true;
+  // Non-fatal: a failure here costs the translated path, not the stand-in one,
+  // so the game still renders exactly as it did.
+  if (!CreateTranslatedRootSignature())
+    LogError("CreateGamePipeline: translated pipeline unavailable");
+
   LogInfo("CreateGamePipeline: done");
   return true;
 }
@@ -383,6 +396,194 @@ uint64_t g_blendUnmapped = 0;   // draws whose state did not translate
 uint64_t g_blendBudget = 0;     // draws refused because the cache was full
 
 }  // namespace
+
+//===========================================================================
+// The translated-shader pipeline.
+//
+// Separate from the stand-in pipeline in every respect that matters: its own
+// root signature, its own vertex shader, its own input layout. That separation
+// is the point — the stand-in path renders the game today, and the translated
+// path is not allowed to change the layout it depends on in order to exist.
+//===========================================================================
+bool D3D12Renderer::CreateTranslatedRootSignature() {
+  // One texture and one sampler per guest sampler slot, at the registers the
+  // emitter names: EmitShaderHlsl writes `xe_texN : register(tN)` with N the
+  // guest fetch-constant index, so the ranges must start at t0/s0 and be
+  // contiguous. Sixteen covers every sampler seen in this game's profiles
+  // (the widest was s8-s12).
+  D3D12_DESCRIPTOR_RANGE srvRange = {};
+  srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+  srvRange.NumDescriptors = kTranslatedSamplerSlots;
+  srvRange.BaseShaderRegister = 0;
+  srvRange.OffsetInDescriptorsFromTableStart = 0;
+
+  D3D12_DESCRIPTOR_RANGE samplerRange = {};
+  samplerRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+  samplerRange.NumDescriptors = kTranslatedSamplerSlots;
+  samplerRange.BaseShaderRegister = 0;
+  samplerRange.OffsetInDescriptorsFromTableStart = 0;
+
+  D3D12_ROOT_PARAMETER rootParams[3] = {};
+  // b0, vertex: the same transform CBV the stand-in vertex shader takes, so the
+  // passthrough VS below can share the per-draw constant buffer already built.
+  rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+  rootParams[0].Descriptor.ShaderRegister = 0;
+  rootParams[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+  // b1, pixel: the guest's own ALU constant bank plus the per-sampler texture
+  // extents an unnormalized fetch needs. The bank is the PIXEL half, ALU
+  // constants 256-511 at device+0x1780 — the emitter indexes it from 0, so the
+  // rebase happens at upload, not in the shader.
+  rootParams[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+  rootParams[1].Descriptor.ShaderRegister = 1;
+  rootParams[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+  D3D12_DESCRIPTOR_RANGE ranges[2] = {srvRange, samplerRange};
+  rootParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  rootParams[2].DescriptorTable.NumDescriptorRanges = 1;
+  rootParams[2].DescriptorTable.pDescriptorRanges = &ranges[0];
+  rootParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+  // Samplers live in their own heap type, so they cannot share a table with the
+  // SRVs and need a fourth parameter.
+  D3D12_ROOT_PARAMETER params[4] = {rootParams[0], rootParams[1], rootParams[2],
+                                    {}};
+  params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  params[3].DescriptorTable.NumDescriptorRanges = 1;
+  params[3].DescriptorTable.pDescriptorRanges = &ranges[1];
+  params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+  D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
+  rootDesc.NumParameters = 4;
+  rootDesc.pParameters = params;
+  rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+  Microsoft::WRL::ComPtr<ID3DBlob> sigBlob, errBlob;
+  HRESULT hr = D3D12SerializeRootSignature(
+      &rootDesc, D3D_ROOT_SIGNATURE_VERSION_1, &sigBlob, &errBlob);
+  if (FAILED(hr)) {
+    if (errBlob)
+      LogError(static_cast<const char*>(errBlob->GetBufferPointer()));
+    return false;
+  }
+  hr = m_device->CreateRootSignature(0, sigBlob->GetBufferPointer(),
+                                     sigBlob->GetBufferSize(),
+                                     IID_PPV_ARGS(&m_translatedRootSig));
+  if (FAILED(hr)) {
+    LogError("CreateTranslatedRootSignature: CreateRootSignature failed");
+    return false;
+  }
+
+  // The passthrough vertex shader. The guest vertex shader is not on the GPU
+  // yet — the CPU interpreter still transforms every vertex — so this stage
+  // only forwards the position and the interpolators the interpreter already
+  // computed. Its output signature is exactly the XeInterpolants struct
+  // EmitShaderHlsl declares for the pixel stage, which is what makes the two
+  // link: same order, same count, same semantics.
+  std::string vs =
+      "struct XeInterpolants {\n"
+      "  float4 pos : SV_Position;\n";
+  for (uint32_t i = 0; i < kTranslatedInterpolators; ++i) {
+    const std::string n = std::to_string(i);
+    vs += "  float4 i" + n + " : TEXCOORD" + n + ";\n";
+  }
+  vs += "};\nstruct XeVsIn {\n  float4 pos : POSITION;\n";
+  for (uint32_t i = 0; i < kTranslatedInterpolators; ++i) {
+    const std::string n = std::to_string(i);
+    vs += "  float4 i" + n + " : TEXCOORD" + n + ";\n";
+  }
+  vs +=
+      "};\n"
+      "XeInterpolants main(XeVsIn v) {\n"
+      "  XeInterpolants o;\n"
+      "  o.pos = v.pos;\n";
+  for (uint32_t i = 0; i < kTranslatedInterpolators; ++i) {
+    const std::string n = std::to_string(i);
+    vs += "  o.i" + n + " = v.i" + n + ";\n";
+  }
+  vs += "  return o;\n}\n";
+
+  m_translatedVsBlob = CompileShader(vs.c_str(), "vs_5_0", "main");
+  if (!m_translatedVsBlob) {
+    LogError("CreateTranslatedRootSignature: passthrough VS failed to compile");
+    return false;
+  }
+  LogInfo("CreateTranslatedRootSignature: ready");
+  return true;
+}
+
+ID3D12PipelineState* D3D12Renderer::TranslatedPSO(uint32_t handle,
+                                                  const std::string& hlsl) {
+  if (auto it = m_translatedPSOs.find(handle); it != m_translatedPSOs.end())
+    return it->second.failed ? nullptr : it->second.pso.Get();
+  if (!m_translatedRootSig || !m_translatedVsBlob) return nullptr;
+  // Past the cap a draw falls back to the stand-in rather than being dropped,
+  // and nothing is cached, so the cap bounds memory without hiding shaders.
+  if (m_translatedPSOs.size() >= kMaxTranslatedPSOs) return nullptr;
+
+  TranslatedPipeline entry;
+  entry.failed = true;
+
+  auto ps = CompileShader(hlsl.c_str(), "ps_5_0", "main");
+  if (!ps) {
+    // The hooks-side probe already compiles what it emits, so reaching here
+    // means the two compilers disagreed — worth saying plainly rather than
+    // counting silently.
+    LogError("TranslatedPSO: pixel shader failed to compile in the renderer");
+    ++m_translatedFailed;
+    m_translatedPSOs[handle] = entry;
+    return nullptr;
+  }
+
+  // POSITION plus one float4 per interpolator, matching XeVsIn above.
+  std::vector<D3D12_INPUT_ELEMENT_DESC> layout;
+  layout.push_back({"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
+                    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0});
+  for (uint32_t i = 0; i < kTranslatedInterpolators; ++i) {
+    layout.push_back({"TEXCOORD", i, DXGI_FORMAT_R32G32B32A32_FLOAT, 0,
+                      16 + i * 16, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+                      0});
+  }
+
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
+  pso.pRootSignature = m_translatedRootSig.Get();
+  pso.VS.pShaderBytecode = m_translatedVsBlob->GetBufferPointer();
+  pso.VS.BytecodeLength = m_translatedVsBlob->GetBufferSize();
+  pso.PS.pShaderBytecode = ps->GetBufferPointer();
+  pso.PS.BytecodeLength = ps->GetBufferSize();
+  pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  pso.SampleMask = UINT_MAX;
+  pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pso.NumRenderTargets = 1;
+  pso.RTVFormats[0] = kBackBufferFormat;
+  pso.DSVFormat = kGameDepthFormat;
+  pso.SampleDesc.Count = 1;
+  pso.BlendState.RenderTarget[0].RenderTargetWriteMask =
+      D3D12_COLOR_WRITE_ENABLE_ALL;
+  pso.InputLayout.pInputElementDescs = layout.data();
+  pso.InputLayout.NumElements = UINT(layout.size());
+
+  const HRESULT hr =
+      m_device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&entry.pso));
+  if (FAILED(hr)) {
+    LogError("TranslatedPSO: CreateGraphicsPipelineState failed");
+    ++m_translatedFailed;
+    m_translatedPSOs[handle] = entry;
+    return nullptr;
+  }
+  entry.failed = false;
+  ++m_translatedOk;
+  ID3D12PipelineState* result = entry.pso.Get();
+  m_translatedPSOs[handle] = std::move(entry);
+  {
+    const std::string msg =
+        "TranslatedPSO: built pipeline for guest pixel shader (" +
+        std::to_string(m_translatedOk) + " ok, " +
+        std::to_string(m_translatedFailed) + " failed)";
+    LogInfo(msg.c_str());
+  }
+  return result;
+}
 
 ID3D12PipelineState* D3D12Renderer::BlendedPSO(const BlendKey& key) {
   if (auto it = m_blendPSOs.find(key); it != m_blendPSOs.end())
@@ -1479,6 +1680,15 @@ void D3D12Renderer::RenderGameFrame() {
       continue;
     }
 
+    // Build the translated pipeline for this draw's guest pixel shader, but do
+    // NOT render with it yet: the vertex buffer still carries the stand-in
+    // layout (position, colour, UV), not the eight interpolators the emitted
+    // shader reads, so binding it here would sample undefined inputs. This
+    // proves the pipeline can be created — the compile, the root signature and
+    // the VS/PS linkage — before anything depends on it being correct.
+    if (d.pixelShaderHlsl && d.pixelShaderHandle)
+      (void)TranslatedPSO(d.pixelShaderHandle, *d.pixelShaderHlsl);
+
     // Offscreen targets do not yet have per-surface depth resources. The
     // post-processing/resolve chain observed in ST_Southwest is colour-only;
     // keep depth disabled there rather than bind the 1280x720 DSV against a
@@ -1615,7 +1825,9 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t planeCount, bool yuvHasAlpha,
                                  bool blendEnable, uint32_t srcBlend,
                                  uint32_t destBlend, uint32_t blendOp,
-                                 uint8_t colorSource, uint32_t samplerIndex) {
+                                 uint8_t colorSource, uint32_t samplerIndex,
+                                 uint32_t pixelShaderHandle,
+                                 std::shared_ptr<const std::string> pixelShaderHlsl) {
   // PERF(per-frame-allocs): this creates three ID3D12Resource's per call (VB +
   // IB + CB) on the UPLOAD heap, and is called once per submitted draw rather
   // than once per frame, so the allocation rate scales with the draw count —
@@ -1688,6 +1900,8 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.sampledTextureObject = sampledTextureObject;
   d.colorSource = colorSource;
   d.samplerIndex = samplerIndex;
+  d.pixelShaderHandle = pixelShaderHandle;
+  d.pixelShaderHlsl = std::move(pixelShaderHlsl);
   d.blendEnable = blendEnable;
   d.srcBlend = srcBlend;
   d.destBlend = destBlend;

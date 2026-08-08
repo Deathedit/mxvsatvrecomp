@@ -46,6 +46,18 @@ enum class HlslStage : uint8_t {
 // point of the work is to retire it.
 inline constexpr uint32_t kMaxHlslInterpolators = 16;
 
+// The linkage width actually used, and the one number both stages MUST agree
+// on: the emitted pixel shader declares its input struct with exactly this many
+// interpolators, so a vertex stage offering a different count produces two
+// signatures that cannot link and CreateGraphicsPipelineState fails with no
+// message. That is not hypothetical — emitting at kMaxHlslInterpolators while
+// the renderer's vertex shader carried 8 is exactly how it first failed.
+//
+// Eight because the widest input_mask measured in this game is 0xFF (r0-r7),
+// from the 14-fetch shader 0x216A8C20. Raising it costs vertex bandwidth on
+// every translated draw; lowering it would silently drop interpolators.
+inline constexpr uint32_t kHlslInterpolatorLinkage = 8;
+
 // Why a shader could not be emitted. Mirrors AluStatus, and for the same
 // reason: a gap must be countable by cause, not collapse into one opaque
 // failure. Anything but kOk means `source` is empty and the caller must fall

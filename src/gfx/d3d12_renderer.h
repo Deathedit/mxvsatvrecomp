@@ -69,7 +69,9 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  uint32_t planeCount = 0, bool yuvHasAlpha = false,
                  bool blendEnable = false, uint32_t srcBlend = 0,
                  uint32_t destBlend = 0, uint32_t blendOp = 0,
-                 uint8_t colorSource = 0, uint32_t samplerIndex = 0);
+                 uint8_t colorSource = 0, uint32_t samplerIndex = 0,
+                 uint32_t pixelShaderHandle = 0,
+                 std::shared_ptr<const std::string> pixelShaderHlsl = {});
 
 // Append a resolve to this frame's list, in order with the draws around it.
 //
@@ -102,6 +104,12 @@ void ClearGameDraws();
   }
   [[nodiscard]] uint32_t GetWidth() const noexcept { return m_width; }
   [[nodiscard]] uint32_t GetHeight() const noexcept { return m_height; }
+
+  // Exposed only so d3d12_game.cpp can static_assert it against the emitter's
+  // mx::hle::kHlslInterpolatorLinkage. See kTranslatedInterpolators.
+  [[nodiscard]] static constexpr uint32_t TranslatedInterpolatorLinkage() {
+    return kTranslatedInterpolators;
+  }
 
  private:
   static constexpr uint32_t kFrameCount = 3;
@@ -234,6 +242,50 @@ void ClearGameDraws();
   std::vector<D3D12_INPUT_ELEMENT_DESC> m_gameInputLayout;
   Microsoft::WRL::ComPtr<ID3DBlob> m_gameVsBlob;
   std::array<Microsoft::WRL::ComPtr<ID3DBlob>, 3> m_gamePsBlobs;  // plain/tex/yuv
+
+  //=========================================================================
+  // Translated guest pixel shaders.
+  //
+  // A guest pixel shader that EmitShaderHlsl accepted arrives on the draw as
+  // HLSL source. It is compiled and turned into a pipeline once per shader
+  // handle and cached here — a frame issues ~158 draws across a few dozen
+  // shaders, so compiling per draw would cost more than the translation saves.
+  //
+  // Deliberately a SEPARATE root signature from m_gameRootSig. The emitted
+  // shaders declare their own resource layout — a constant bank at b1 and one
+  // texture/sampler pair per guest sampler slot — which does not fit the
+  // stand-in pipeline's four-plane table. Sharing one signature would mean
+  // changing the layout the working path depends on, to suit a path that does
+  // not render yet.
+  //=========================================================================
+  static constexpr uint32_t kTranslatedSamplerSlots = 16;
+  // The VS-to-PS linkage width. MUST equal mx::hle::kHlslInterpolatorLinkage:
+  // the emitted pixel shader declares its input struct with that many
+  // interpolators, and a vertex stage offering a different count produces two
+  // signatures that cannot link — CreateGraphicsPipelineState then fails with
+  // no message at all, which is exactly how this first went wrong.
+  //
+  // Restated rather than included, following kMaxDrawPlanes above: this header
+  // deliberately does not include the hle headers. d3d12_game.cpp
+  // static_asserts that the two agree.
+  static constexpr uint32_t kTranslatedInterpolators = 8;
+  // Bounded for the same reason as m_blendPSOs: a shader set that grew without
+  // limit would otherwise grow this without limit.
+  static constexpr size_t kMaxTranslatedPSOs = 256;
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> m_translatedRootSig;
+  Microsoft::WRL::ComPtr<ID3DBlob> m_translatedVsBlob;
+  struct TranslatedPipeline {
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pso;
+    bool failed = false;  // compiled or created badly; do not retry every draw
+  };
+  std::unordered_map<uint32_t, TranslatedPipeline> m_translatedPSOs;
+  // Compile `hlsl` and build a pipeline for it, or return null. Caches both
+  // outcomes against `handle`, so a shader that fails is not recompiled once
+  // per draw for the rest of the run.
+  ID3D12PipelineState* TranslatedPSO(uint32_t handle, const std::string& hlsl);
+  bool CreateTranslatedRootSignature();
+  uint64_t m_translatedOk = 0;
+  uint64_t m_translatedFailed = 0;
   // The fallback transform: an identity matrix, used by any translated draw
   // whose own constant buffer failed to allocate. Bound as a root CBV, so it
   // needs no descriptor heap.
@@ -353,6 +405,11 @@ void ClearGameDraws();
     uint32_t planeCount = 0;
     bool yuvHasAlpha = false;
     bool yuvComposite = false;
+    // The guest pixel shader translated to HLSL, when it translated. Null keeps
+    // this draw on the tex*col stand-in. The handle is the PSO cache key, so
+    // the source is only read the first time a shader is seen.
+    uint32_t pixelShaderHandle = 0;
+    std::shared_ptr<const std::string> pixelShaderHlsl;
   };
   // Bounded because each entry costs three CreateCommittedResource calls — see
   // the PERF(per-frame-allocs) note in d3d12_game.cpp.

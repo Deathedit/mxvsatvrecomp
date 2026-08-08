@@ -2325,6 +2325,22 @@ std::string HlslCoverageSummary(const HlslCoverage& c) {
   return s;
 }
 
+// The emitted source, kept per shader handle. Shared with every draw that binds
+// the shader, so a frame's ~158 draws across a few dozen shaders copy a pointer
+// rather than a few kilobytes of text each.
+struct TranslatedShader {
+  std::shared_ptr<const std::string> source;  // null unless emitted AND compiled
+  uint32_t input_mask = 0;
+  uint32_t sampler_mask = 0;
+  uint32_t max_const_index = 0;
+};
+std::map<uint32_t, TranslatedShader> g_translatedPs;
+
+const TranslatedShader* TranslatedPixelShader(uint32_t handle) {
+  const auto it = g_translatedPs.find(handle);
+  return it == g_translatedPs.end() ? nullptr : &it->second;
+}
+
 void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
                         const uint32_t* code, uint32_t count) {
   auto& seen = stage == mx::hle::HlslStage::kPixel ? g_hlslReportedPs
@@ -2333,11 +2349,11 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
   auto& cov = stage == mx::hle::HlslStage::kPixel ? g_hlslPs : g_hlslVs;
 
   mx::hle::HlslShader out;
-  // The linkage width is not yet negotiated between the stages — that is the
-  // wiring's job. 16 is the widest the emitter builds, so it cannot be the
-  // reason a shader is refused here.
-  mx::hle::EmitShaderHlsl(code, count, stage, mx::hle::kMaxHlslInterpolators,
-                          out);
+  // MUST match the width the renderer's vertex stage offers, or the two
+  // signatures cannot link and pipeline creation fails with no message. See
+  // kHlslInterpolatorLinkage.
+  mx::hle::EmitShaderHlsl(code, count, stage,
+                          mx::hle::kHlslInterpolatorLinkage, out);
 
   // Emitting is only half the claim. Source FXC rejects is exactly as useless
   // as a shader the emitter refused, and the two failures have entirely
@@ -2361,11 +2377,24 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
     }
   }
 
+  // Read before the move below; the report prints it.
+  const size_t source_size = out.source.size();
+
   if (out.status != mx::hle::HlslStatus::kOk) {
     ++cov.failures[mx::hle::HlslStatusName(out.status)];
     if (out.blocking_opcode) ++cov.blocking_opcode[out.blocking_opcode];
   } else if (compiled) {
     ++cov.ok;
+    // Retained only for shaders that both emitted and compiled. A source the
+    // compiler rejects must never reach the renderer, which would only discover
+    // the same failure later and with less context.
+    if (stage == mx::hle::HlslStage::kPixel) {
+      TranslatedShader& t = g_translatedPs[handle];
+      t.source = std::make_shared<const std::string>(std::move(out.source));
+      t.input_mask = out.input_mask;
+      t.sampler_mask = out.sampler_mask;
+      t.max_const_index = out.max_const_index;
+    }
   } else {
     ++cov.compile_failed;
   }
@@ -2390,7 +2419,7 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
                 out.input_mask, out.export_mask, out.sampler_mask,
                 out.max_const_index,
                 out.status == mx::hle::HlslStatus::kOk
-                    ? fmt::format("{} bytes", out.source.size())
+                    ? fmt::format("{} bytes", source_size)
                     : fmt::format("opcode {}", out.blocking_opcode));
   }
   if ((seen.size() % 16) == 0 || seen.size() <= 6) {
@@ -3127,6 +3156,16 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
     }
     return false;
   }
+  // The shader is resolved by here — `pixel_shader` may have been rewritten by
+  // ReadBoundPixelShader — so this is the first point at which the draw knows
+  // which guest program it is running. Attaching the translation here rather
+  // than at the call site keeps the "which shader is really bound" logic in one
+  // place; a draw whose shader did not translate simply carries nothing and
+  // keeps the tex*col stand-in.
+  dc.pixel_shader_handle = pixel_shader;
+  if (const TranslatedShader* t = TranslatedPixelShader(pixel_shader))
+    dc.pixel_shader_hlsl = t->source;
+
   if (binding.sampler >= kMaxSamplers) {
     ++s_no_binding;
     if (s_no_binding <= 8)

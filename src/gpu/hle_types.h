@@ -8,6 +8,7 @@
 #include <cstring>
 #include <map>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace mx::hle {
@@ -194,6 +195,19 @@ struct DrawCall {
   uint32_t sampled_texture_width = 0;
   uint32_t sampled_texture_height = 0;
   std::shared_ptr<const HleTexturePayload> texture;
+
+  // The guest pixel shader, translated to HLSL, when EmitShaderHlsl accepted
+  // it. Null means it did not, and the draw keeps the `tex * col` stand-in.
+  //
+  // Carried as a shared_ptr to one cached string rather than by value: the
+  // source is emitted once per shader handle and a frame issues ~158 draws
+  // across a few dozen shaders, so copying it per draw would dominate the
+  // translation it exists to enable. The renderer compiles it once per handle
+  // and keys its PSO cache on `pixel_shader_handle`, so after the first sight
+  // the string is never read again — it is kept only so a shader first seen in
+  // a later frame can still be compiled.
+  uint32_t pixel_shader_handle = 0;
+  std::shared_ptr<const std::string> pixel_shader_hlsl;
 
   // The Bink frame composite binds several textures at once — Y, Cr and Cb
   // planes plus an optional alpha plane — which the single `texture` above
