@@ -1724,6 +1724,97 @@ struct PatchedCode {
 std::map<int32_t, uint64_t> g_patchCodeOffsets;
 std::map<uint32_t, PatchedCode> g_patchedCode;   // shader handle -> latest
 
+uint32_t ReadPatchFetchCount(uint32_t self, uint32_t variant, uint8_t* base);
+
+// The shader's OWN microcode, for shaders the patch hook never saw.
+//
+// The patch hook was our only source, and it fires once per upload -- not per
+// draw -- so any shader uploaded before we were watching had no program at
+// all. That was 41% of draws in mx_711 (164,648 of 401,750), and those draws
+// were not merely shaded wrong: ApplyShaderOutputs refused them, so they were
+// dropped before the renderer ever saw them (82,324 of 129,004 deferred).
+//
+// The address is the one this file already computed as `field_abs` and used
+// only for reporting. It was verified over 28,000 shaders in mx_715 against
+// captures the decode had already proved: every one readable, every one
+// agreeing on its first eight dwords, and none differing in more than half its
+// program. An earlier reading -- blob rather than *blob -- matched ZERO, which
+// is what makes the confirmed one worth trusting rather than merely plausible.
+//
+// The variant is not known at draw time, so each is tried and accepted only if
+// its program decodes to exactly the fetch count the shader's own binding table
+// states. That is the same self-verifying rule the ring-window search uses: a
+// wrong variant does not produce a slightly-off answer, it fails to decode.
+//
+// LIMITATION, deliberately not papered over: the guest patches the RING copy,
+// so the shader's own allocation keeps the UNPATCHED template. Its vfetch
+// instructions carry the template's constants, not ones rewritten to match the
+// bound vertex declaration. For these draws that is still strictly better than
+// no program at all -- but it is not equivalent to a patch-hook capture, and a
+// draw whose declaration disagrees with the template will decode its attributes
+// wrongly rather than not at all.
+const PatchedCode* CodeFromShaderObject(uint32_t shader, uint8_t* base) {
+  if (!shader) return nullptr;
+  static std::map<uint32_t, PatchedCode> s_cache;
+  static std::map<uint32_t, bool> s_failed;
+  if (const auto it = s_cache.find(shader); it != s_cache.end())
+    return &it->second;
+  if (s_failed.contains(shader)) return nullptr;
+
+  static uint64_t s_tried = 0, s_built = 0;
+  ++s_tried;
+  for (uint32_t variant = 0; variant < 4; ++variant) {
+    const uint32_t info_at = shader + kVsInfoOffsetAt + variant * 8;
+    if (!HostPageReadable(REX_RAW_ADDR(info_at)) ||
+        !HostPageReadable(REX_RAW_ADDR(shader + kVsCodeAllocAt)))
+      continue;
+    const uint32_t info = shader + REX_LOAD_U32(info_at);
+    if (!HostPageReadable(REX_RAW_ADDR(info + kVsInfoCodeSize))) continue;
+    const uint32_t addr =
+        REX_LOAD_U32(shader + kVsCodeAllocAt) + REX_LOAD_U32(info + kVsInfoCodeOffset);
+    const uint32_t len = REX_LOAD_U32(info + kVsInfoCodeSize);
+    if (!addr || !len || (len & 3) || len > 64u * 1024u) continue;
+
+    const uint32_t want = ReadPatchFetchCount(shader, variant, base);
+    if (!want) continue;
+
+    PatchedCode pc;
+    pc.variant = variant;
+    pc.expect_fetches = want;
+    pc.code.reserve(len / 4);
+    for (uint32_t i = 0; i < len / 4; ++i) {
+      const uint32_t at = addr + i * 4;
+      if ((at & (kHostPageSize - 1)) == 0 && !HostPageReadable(REX_RAW_ADDR(at)))
+        break;
+      pc.code.push_back(REX_LOAD_U32(at));
+    }
+    if (pc.code.size() < 8 || pc.code.size() != len / 4) continue;
+
+    // The program starts here -- confirmed by the first-8-dword agreement over
+    // 28,000 shaders -- so unlike the ring window there is no offset to hunt.
+    // The decode still has to agree with the binding table, or this is refused.
+    pc.code_off = 0;
+    std::vector<mx::hle::VertexAttribute> attrs;
+    const char* why = nullptr;
+    if (!DecodeVertexShaderFetches(pc.code.data(), uint32_t(pc.code.size()),
+                                   attrs, &why) ||
+        attrs.size() != want)
+      continue;
+    pc.resolved = true;
+    ++s_built;
+    if (s_built <= 8 || (s_built % 500) == 0) {
+      REXLOG_INFO("d3d9: VS code from the shader object: 0x{:08X} variant {} "
+                  "{} dwords, {} fetches; {} built of {} shaders tried",
+                  shader, variant, uint32_t(pc.code.size()), want, s_built,
+                  s_tried);
+    }
+    return &(s_cache[shader] = std::move(pc));
+  }
+  s_failed.emplace(shader, true);
+  return nullptr;
+}
+
+
 uint64_t g_srcPatchHook = 0;    // draws whose code came from the patch hook
 uint64_t g_srcNone = 0;
 uint64_t g_patchDecodeOk = 0;     // decoded, and the count matched the table
@@ -1880,6 +1971,7 @@ ShaderApplyResult ApplyShaderOutputs(
   auto pi = g_patchedCode.find(handle);
   const PatchedCode* patchp =
       pi != g_patchedCode.end() && pi->second.resolved ? &pi->second : nullptr;
+  if (!patchp) patchp = CodeFromShaderObject(handle, base);
   if (!patchp) {
     ++g_hleShaderNoCode;
     static uint32_t s_logged_no_code = 0;
@@ -3424,6 +3516,7 @@ bool CopyTexturePhysical(const mx::hle::HleTextureSource& source, uint8_t* base,
 uint64_t g_slotFailRange = 0, g_slotFailFetch = 0, g_slotFailDescribe = 0;
 uint64_t g_slotFailCopy = 0, g_slotFailDecode = 0;
 uint64_t g_slotBoundZero = 0;   // all-zero, and bound anyway -- see below
+uint64_t g_slotBoundUnbound = 0;  // sampler the guest never bound; sampled zero
 // Which guest sampler had no readable fetch constant. The open question this
 // answers is whether the shaders' samplers 8-15 index the bank the same way
 // 0-7 do: a failure spread evenly over low samplers means genuinely unbound
@@ -3437,11 +3530,11 @@ void ReportSlotFailures() {
   std::string by;
   for (const auto& [sampler, n] : g_slotFailFetchBySampler)
     by += fmt::format(" s{}={}", sampler, n);
-  REXLOG_INFO("d3d9: slot fill failures {}: range {} fetch-unreadable {} "
-              "describe {} copy {} decode {}; all-zero BOUND {}; "
-              "unreadable by sampler:{}",
-              total, g_slotFailRange, g_slotFailFetch, g_slotFailDescribe,
-              g_slotFailCopy, g_slotFailDecode, g_slotBoundZero,
+  REXLOG_INFO("d3d9: slot fill outcomes {}: range {} describe {} copy {} "
+              "decode {} (these still fail the draw); BOUND anyway: all-zero "
+              "{}, unbound-sampler {}; unbound by sampler:{}",
+              total, g_slotFailRange, g_slotFailDescribe, g_slotFailCopy,
+              g_slotFailDecode, g_slotBoundZero, g_slotBoundUnbound,
               by.empty() ? " none" : by);
 }
 
@@ -3469,7 +3562,33 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     ++g_slotFailFetch;
     ++g_slotFailFetchBySampler[guest_sampler];
     ReportSlotFailures();
-    return false;
+    // The guest never bound anything to this sampler, and the shader reads it
+    // anyway. Measured over mx_710 the failures fall s5=2420 s6=304 s7=2420
+    // s8=2429 s9=2420 s13=4, with samplers 0-4 never failing once -- one shader
+    // family reading four slots this title does not bind. It is NOT the
+    // thread-local device state losing a binding, which would fail every
+    // sampler on the affected thread together rather than the same four.
+    //
+    // Zero is what the hardware returns for a fetch constant whose type is not
+    // kTexture, so an unbound slot samples zero. Refusing instead sent the
+    // whole draw to the tex*col stand-in, discarding every OTHER slot's real
+    // shading over a slot whose value the shader may not even use -- the same
+    // trade already settled for all-zero textures, which cost 10,890 draws.
+    //
+    // This is a bound zero, not a fabricated colour: nothing here invents a
+    // plausible texture, it supplies the value an unbound fetch actually has.
+    static const auto s_unbound = [] {
+      auto p = std::make_shared<mx::hle::HleTexturePayload>();
+      p->width = p->height = 1;
+      p->row_pitch = 4;
+      p->format = mx::hle::HostTextureFormat::kRgba8;
+      p->linear_filter = false;
+      p->data.assign(4, 0);
+      return p;
+    }();
+    dc.pixel_textures[slot] = s_unbound;
+    ++g_slotBoundUnbound;
+    return true;
   }
   HleTextureSource source;
   const char* why = nullptr;
@@ -3673,9 +3792,15 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
           device && HostPageReadable(REX_RAW_ADDR(device + 0x3244))
               ? REX_LOAD_U32(device + 0x3244)
               : 0;
-      REXLOG_INFO("d3d9: HLE texture fallback: NO ELIGIBLE PIXEL SHADER "
-                  "{} of {} attempts ({} with no setter handle at all); "
-                  "this one setter=0x{:08X}, device+0x3244=0x{:08X}",
+      // Named for what it now means. This used to read "NO ELIGIBLE PIXEL
+      // SHADER", which was true when the contest also decided whether the draw
+      // could run its guest shader at all -- it no longer does, and a draw
+      // reaching here may well be running a translated shader with every slot
+      // bound. Left as it was, the next reader would diagnose 80,000 lost
+      // draws that are not lost.
+      REXLOG_INFO("d3d9: stand-in has no single texture to sample: {} of {} "
+                  "attempts ({} with no setter handle at all); this one "
+                  "setter=0x{:08X}, device+0x3244=0x{:08X}",
                   s_no_shader, s_attempts, s_no_shader_no_setter, pixel_shader,
                   direct);
     }
@@ -4748,6 +4873,126 @@ uint32_t ReadPatchFetchCount(uint32_t self, uint32_t variant, uint8_t* base) {
 // Copies the patched microcode out of the destination, keyed by shader handle.
 // Must run immediately after the original: the destination is in the command
 // ring and will be overwritten.
+// Does the shader OBJECT carry its own microcode, and if so where?
+//
+// This matters because the patch hook is our only source of vertex microcode,
+// and it only fires for shaders D3D9 needs to patch. Everything else is
+// reported as "no-code": 164,648 of 401,750 draws in mx_711 (41%), which are
+// the same draws as the 82,324 of 129,004 dropped before reaching the renderer.
+// They are not a rendering fault -- they never had a program to run.
+//
+// The offset is SEARCHED rather than assumed, against code already proven by
+// the patch hook's own decode. If one offset explains every shader, it is a
+// property of the layout and can be relied on; if the histogram is spread, the
+// premise is wrong and this says so instead of producing plausible garbage.
+// Same discipline as the CF-start search this file already documents.
+// Where a vertex shader's own microcode lives, and how long it is.
+//
+// Both transcribed from sub_82565550, the routine that uploads a shader: it
+// allocates ring space, copies the code in, and only THEN calls
+// PatchVertexShaderToMatchVertexDeclaration on the ring copy.
+//
+//   v17 = *(*(self + (variant+0x70)*8) + self + 876)   // size in BYTES
+//   v23 = *(*(self + (variant+0x70)*8) + self + 872) + *(self + 0x20)
+//   v24 = (((v23 >> 20) + 512) & 0x1000) + (v23 & 0x1FFFFFFF) - 0x40000000
+//   memcpy(dest, v24, v17)
+//
+// 872 is kUCodeBlobDelta and 876 is the dword after it, so the size sits at
+// blob+4 -- beside the fetch count at blob+0x1C this file already reads. The
+// code itself is at blob + *(self+0x20), through an address fixup that clears
+// the 0x40000000 segment bit. Searching a window around the blob found NOTHING
+// in 36,000 shaders, which is exactly right: the fixup moves it out of range.
+uint32_t ShaderObjectBlob(uint32_t self, uint32_t variant, uint8_t* base) {
+  const uint32_t slot = self + (variant + kUCodePtrTable) * 8;
+  if (!self || !HostPageReadable(REX_RAW_ADDR(slot))) return 0;
+  return self + REX_LOAD_U32(slot) + kUCodeBlobDelta;
+}
+
+uint32_t ShaderObjectCodeBytes(uint32_t self, uint32_t variant, uint8_t* base) {
+  const uint32_t blob = ShaderObjectBlob(self, variant, base);
+  if (!blob || !HostPageReadable(REX_RAW_ADDR(blob + 4))) return 0;
+  return REX_LOAD_U32(blob + 4);
+}
+
+uint32_t ShaderObjectCodeAddress(uint32_t self, uint32_t variant,
+                                 uint8_t* base) {
+  const uint32_t blob = ShaderObjectBlob(self, variant, base);
+  if (!blob || !HostPageReadable(REX_RAW_ADDR(self + 0x20))) return 0;
+  // *(blob), not blob. The decompilation reads
+  //   v23 = *(_DWORD *)(*(...) + a3 + 872) + *(_DWORD *)(a3 + 32)
+  // and that outer dereference is easy to drop, because the very similar
+  // expression in PatchVertexShaderToMatchVertexDeclaration uses the same
+  // address WITHOUT one (as the base for the fetch table). Taking blob itself
+  // put the read 0 of 28,000 shaders' first eight dwords -- caught only
+  // because the probe checked alignment separately from content.
+  if (!HostPageReadable(REX_RAW_ADDR(blob))) return 0;
+  const uint32_t v23 = REX_LOAD_U32(blob) + REX_LOAD_U32(self + 0x20);
+  const uint32_t addr =
+      (((v23 >> 20) + 512) & 0x1000) + (v23 & 0x1FFFFFFF) - 0x40000000u;
+  return HostPageReadable(REX_RAW_ADDR(addr)) ? addr : 0;
+}
+
+void ProbeShaderObjectCode(uint32_t self, uint32_t variant,
+                           const PatchedCode& known, uint8_t* base) {
+  if (!known.resolved || known.code.size() <= known.code_off + 8) return;
+  static std::map<int64_t, uint64_t> s_offsets;
+  static uint64_t s_probed = 0, s_found = 0;
+  ++s_probed;
+
+  const uint32_t src = ShaderObjectCodeAddress(self, variant, base);
+  if (!src) return;
+  const uint32_t size = ShaderObjectCodeBytes(self, variant, base);
+  if (!size || size > 64u * 1024u) return;
+
+  // The ring copy this capture came from IS this memory, byte for byte, at the
+  // moment of the copy -- dest was memcpy'd from here. So every dword should
+  // agree EXCEPT the vfetch fields the patch then rewrote in the ring. A
+  // handful of differing dwords confirms the address; wholesale disagreement
+  // means it is the wrong buffer, and the count is what tells them apart.
+  const uint32_t have = uint32_t(known.code.size());
+  uint32_t compared = 0, differ = 0;
+  for (uint32_t i = 0; i < size / 4; ++i) {
+    const uint32_t at = kPatchWindowBack + i;
+    if (at >= have) break;
+    if ((at & (kHostPageSize - 1)) == 0 &&
+        !HostPageReadable(REX_RAW_ADDR(src + i * 4)))
+      break;
+    ++compared;
+    if (REX_LOAD_U32(src + i * 4) != known.code[at]) ++differ;
+  }
+  if (!compared) return;
+  ++s_found;
+
+  // As a SHARE of the shader, not an absolute count. 226 differing dwords is
+  // 11% of a 2000-dword program and 95% of a 237-dword one, and those mean
+  // opposite things -- the first is the patch rewriting fetches, the second is
+  // the wrong buffer. The absolute histogram could not tell them apart.
+  const uint32_t pct = differ * 100 / compared;
+  ++s_offsets[pct < 1 ? 0 : pct < 5 ? 5 : pct < 10 ? 10 : pct < 25 ? 25
+              : pct < 50 ? 50 : 100];
+
+  // Independently: does the program START at this address? The copy was
+  // byte-for-byte, so a correct address agrees on the leading dwords unless a
+  // fetch sits at instruction 0. Alignment is a separate claim from content.
+  static uint64_t s_headMatch = 0;
+  bool head = true;
+  for (uint32_t i = 0; i < 8 && head; ++i)
+    head = REX_LOAD_U32(src + i * 4) == known.code[kPatchWindowBack + i];
+  if (head) ++s_headMatch;
+
+  if ((s_probed % 2000) == 0) {
+    std::string hist;
+    for (const auto& [b, n] : s_offsets)
+      hist += b == 100   ? fmt::format(" >=50%={}", n)
+              : b == 0   ? fmt::format(" 0%={}", n)
+                         : fmt::format(" <{}%={}", b, n);
+    REXLOG_INFO("d3d9: shader-object code probe: {} of {} readable at "
+                "blob+[self+0x20], {} with a matching first 8 dwords; share "
+                "of dwords differing from the patched ring copy:{}",
+                s_found, s_probed, s_headMatch, hist.empty() ? " none" : hist);
+  }
+}
+
 void CapturePatchedCode(uint32_t self, uint32_t dest, uint32_t variant,
                         uint32_t expect_fetches, uint8_t* base) {
   if (!self || !dest || dest < kPatchWindowBack * 4) return;
@@ -4910,6 +5155,9 @@ void CapturePatchedCode(uint32_t self, uint32_t dest, uint32_t variant,
   const bool capture_resolved = pc.resolved;
   if (capture_resolved) {
     g_patchedCode[self] = std::move(pc);
+    // Only ever against a capture the decode already proved, so a match here
+    // is evidence about the LAYOUT rather than about this one shader.
+    ProbeShaderObjectCode(self, variant, g_patchedCode[self], base);
     ++s_capture_resolved;
   } else if (same_variant_as_known) {
     ++s_capture_preserved;
