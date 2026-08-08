@@ -5207,11 +5207,21 @@ REXCVAR_DEFINE_BOOL(d3d9_hooks_passthrough, false, "Debug",
                     "in native mode too. Breaks rendering; isolates whether "
                     "native frame time is spent in this layer");
 
+// Every hook below takes the HLE lock for its whole body, including across the
+// call to the guest original. The guest's three record workers drive their own
+// devices and never take a lock that our hooks could be holding, so the only
+// effect is that the workers queue through this layer one at a time — which is
+// what the ~30 shared globals in this file require. See HleGlobalMutex.
+//
+// Passthrough returns BEFORE the lock is taken, so --d3d9_hooks_passthrough=1
+// remains a genuine bypass of this layer and stays usable for clearing it of
+// blame.
 #define MX_D3D9_PLUGIN_PASSTHROUGH(orig)                                 \
   if (mx::native::g_plugin_mode || REXCVAR_GET(d3d9_hooks_passthrough)) { \
     orig(ctx, base);                                                     \
     return;                                                              \
-  }
+  }                                                                      \
+  std::lock_guard<std::recursive_mutex> _hle_lock(mx::hle::HleGlobalMutex())
 
 //=============================================================================
 // 0x82550B80 — D3DVertexDeclaration* D3DDevice_CreateVertexDeclaration(

@@ -23,6 +23,7 @@
 #include "hooks/hooks_d3d9.h"
 
 #include <chrono>
+#include <mutex>
 
 #include "gpu/d3d9_draw.h"
 #include "gpu/d3d9_state.h"
@@ -358,6 +359,10 @@ extern "C" REX_FUNC(sub_82566B58) {
       // empty every time. It stays because kNoCode is still reachable and a
       // parked draw with nothing to drain it would leak, not because it is
       // known to recover anything.
+      // Same lock the D3D9 hooks take: FinalizePendingD3D9Draws drains
+      // g_pendingHleDraws and reads the shader caches, all of which a record
+      // worker may be writing at this instant.
+      std::lock_guard<std::recursive_mutex> lock(mx::hle::HleGlobalMutex());
       FinalizePendingD3D9Draws(base);
       auto& hle = mx::hle::HleFrameDraws();
       mx::native::NativeGraphics::Get().SetDrawCalls(hle);

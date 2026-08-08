@@ -353,6 +353,11 @@ ThreadDrawList& LocalList() {
 
 }  // namespace
 
+std::recursive_mutex& HleGlobalMutex() {
+  static std::recursive_mutex m;
+  return m;
+}
+
 std::vector<DrawCall>& HleFrameDraws() { return LocalList().draws; }
 
 void HleSetThreadRecordIndex(uint32_t index) { LocalList().index = index; }

@@ -18,6 +18,7 @@
 // is reused unchanged and no gfx code moves.
 
 #include <cstdint>
+#include <mutex>
 
 #include "gpu/d3d9_layout.h"
 #include "gpu/d3d9_state.h"
@@ -118,6 +119,22 @@ bool FinalizeHleTopology(DrawCall& draw, HleSkip& skip);
 // device (dword_830B2C60[0..2]), so one shared list interleaved three devices'
 // draws in thread-arrival order. HleMergeWorkerDraws puts that right.
 std::vector<DrawCall>& HleFrameDraws();
+
+// The HLE layer's big lock.
+//
+// Per-thread draw lists and device state removed the two structural races, but
+// the D3D9 hooks carry roughly thirty more shared globals — mostly std::map
+// caches and diagnostic tallies keyed by shader handle — and every one of them
+// is written from the draw path. Concurrent insertion into a red-black tree
+// corrupts it, and mx_701 still died at frame 2726 with the same signature: a
+// host-side heap write and a read of 0xFFFFFFFFFFFFFFFF.
+//
+// Serialising the hooks is the honest fix. It costs the parallelism the guest
+// intended, but we were never exploiting it — our own HLE work is nearly the
+// whole frame, so the three workers were contending on this layer anyway. Once
+// it is stable, individual caches can be made thread-local to win it back,
+// with a measurement to justify each one.
+std::recursive_mutex& HleGlobalMutex();
 
 // Tag this thread as parallel record worker `index` (0..2). Called from the
 // worker hook so the merge below can order the batches the way the guest's own
