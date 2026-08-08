@@ -100,10 +100,36 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip);
 bool FinalizeHleTopology(DrawCall& draw, HleSkip& skip);
 
 // The frame's draws, accumulated by the D3D9 draw hooks and taken by the swap
-// hook. No lock: every D3D9 entry point in this title arrives on one thread,
-// which was measured rather than assumed — each `d3d9: draws` line within a run
-// carries a single thread id, and the swap hook runs on that same thread.
+// hook. THIS THREAD's draws — the list is thread-local.
+//
+// It used to be one global vector, on the grounds that "every D3D9 entry point
+// in this title arrives on one thread, which was measured rather than assumed".
+// The measurement was real and the conclusion was wrong: it was taken while the
+// guest's three parallel record workers (sub_82AC8CC8) were deadlocked in the
+// fence spin, so they recorded nothing and the traffic really did arrive on one
+// thread. Retiring the fence (hooks_frame.cpp) woke them, and the first run
+// with all four threads recording crashed inside 20 seconds — a host-side heap
+// write and two threads dereferencing 0xFFFFFFFFFFFFFFFF, which is what
+// concurrent push_back into one vector of DrawCall (two vectors and a
+// shared_ptr apiece) looks like.
+//
+// Per-thread lists remove the race without a lock on the hot path, and they
+// also fix a correctness bug that predates it: each worker drives its OWN D3D9
+// device (dword_830B2C60[0..2]), so one shared list interleaved three devices'
+// draws in thread-arrival order. HleMergeWorkerDraws puts that right.
 std::vector<DrawCall>& HleFrameDraws();
+
+// Tag this thread as parallel record worker `index` (0..2). Called from the
+// worker hook so the merge below can order the batches the way the guest's own
+// join consumes them, rather than by whichever thread happened to finish first.
+void HleSetThreadRecordIndex(uint32_t index);
+
+// Append the workers' draws to the calling thread's list, in worker-index
+// order, and empty theirs. Call from the join (sub_82AC8B68) — by then every
+// worker has signalled its done-event and parked on its next go-event, so the
+// guest's own fork/join discipline is what makes this safe. We inherit it
+// rather than adding a lock of our own.
+void HleMergeWorkerDraws();
 
 // Why draws did not build, by reason. Indexed by HleSkip.
 uint64_t* HleSkipCounts();

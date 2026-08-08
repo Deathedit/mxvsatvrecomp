@@ -1,9 +1,12 @@
 #include "gpu/d3d9_draw.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -321,9 +324,57 @@ bool FinalizeHleTopology(DrawCall& draw, HleSkip& skip) {
   return true;
 }
 
-std::vector<DrawCall>& HleFrameDraws() {
-  static std::vector<DrawCall> v;
-  return v;
+namespace {
+
+// One record list per thread. Registered in a global table so the join can find
+// the workers' lists; the table is touched only on first use per thread and at
+// merge time, never on the per-draw path.
+constexpr uint32_t kNotAWorker = 0xFFFFFFFFu;
+struct ThreadDrawList {
+  std::vector<DrawCall> draws;
+  uint32_t index = kNotAWorker;
+};
+
+std::mutex g_listsMutex;
+std::vector<ThreadDrawList*> g_lists;
+thread_local ThreadDrawList* t_list = nullptr;
+
+ThreadDrawList& LocalList() {
+  if (!t_list) {
+    // Deliberately leaked: these threads live for the life of the process, and
+    // a list outliving its thread is harmless where freeing it under a merge
+    // would not be.
+    t_list = new ThreadDrawList();
+    std::lock_guard<std::mutex> lock(g_listsMutex);
+    g_lists.push_back(t_list);
+  }
+  return *t_list;
+}
+
+}  // namespace
+
+std::vector<DrawCall>& HleFrameDraws() { return LocalList().draws; }
+
+void HleSetThreadRecordIndex(uint32_t index) { LocalList().index = index; }
+
+void HleMergeWorkerDraws() {
+  auto& dst = LocalList();
+  std::vector<ThreadDrawList*> workers;
+  {
+    std::lock_guard<std::mutex> lock(g_listsMutex);
+    for (auto* l : g_lists)
+      if (l != &dst && l->index != kNotAWorker && !l->draws.empty())
+        workers.push_back(l);
+  }
+  std::sort(workers.begin(), workers.end(),
+            [](const ThreadDrawList* a, const ThreadDrawList* b) {
+              return a->index < b->index;
+            });
+  for (auto* w : workers) {
+    dst.draws.insert(dst.draws.end(), std::make_move_iterator(w->draws.begin()),
+                     std::make_move_iterator(w->draws.end()));
+    w->draws.clear();
+  }
 }
 
 uint64_t* HleSkipCounts() {

@@ -2,8 +2,17 @@
 
 namespace mx::hle {
 
+// Thread-local, because the guest's parallel record path gives each of its
+// three workers its OWN D3D9 device (dword_830B2C60[0..2]) on its own thread.
+// A single shared instance meant worker 1's SetTexture / SetRenderTarget /
+// SetViewport overwrote worker 0's between that worker's bind and its draw —
+// a data race, and wrong even without one. Each thread owning the state of the
+// device it drives is both the fix and the accurate model.
+//
+// The workers never migrate threads (sub_82AC8CC8 is their thread proc, and it
+// loops for the life of the process), so thread-local is exactly per-device.
 D3D9DeviceState& DeviceState() {
-  static D3D9DeviceState s;
+  static thread_local D3D9DeviceState s;
   return s;
 }
 

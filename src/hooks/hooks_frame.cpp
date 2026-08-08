@@ -542,6 +542,9 @@ extern "C" REX_FUNC(sub_82AC8CC8) {
   // r3 points at the worker's index; the proc reads it as `lwz r31, 0(r3)`.
   const uint32_t idx = ctx.r3.u32 ? REX_LOAD_U32(ctx.r3.u32) : 0xFFFFFFFF;
   REXLOG_INFO("native: RecordWorker[{}] ENTER", idx);
+  // Tag the thread before the proc records anything, so its draws land in a
+  // list the join can order by worker index.
+  if (idx < 3) mx::hle::HleSetThreadRecordIndex(idx);
   orig_RecordWorker(ctx, base);
   REXLOG_INFO("native: RecordWorker[{}] RETURNED", idx);
 }
@@ -554,5 +557,11 @@ extern "C" REX_FUNC(sub_82AC8B68) {
   const bool loud = n <= 24 || (n % 300) == 0;
   if (loud) REXLOG_INFO("native: RecordJoin #{} ENTER", n);
   orig_RecordJoin(ctx, base);
+  // After the original returns, all three workers have signalled done and are
+  // parked on their next go-event. Their lists are quiescent, so this is the
+  // one point where they can be merged without a lock — and it is the same
+  // point at which the guest itself consumes the three command buffers, so the
+  // resulting draw order is the guest's, not thread-arrival order.
+  mx::hle::HleMergeWorkerDraws();
   if (loud) REXLOG_INFO("native: RecordJoin #{} RETURNED", n);
 }

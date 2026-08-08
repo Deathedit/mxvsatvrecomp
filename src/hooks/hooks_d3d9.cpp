@@ -366,18 +366,51 @@ REXCVAR_DEFINE_BOOL(d3d9_page_cache_verify, false, "Debug",
                     "VirtualQuery and log mismatches. Slow; correctness check "
                     "for the region cache");
 
+// Measured in real gameplay for the first time in mx_698: 33,043 calls a frame
+// collapse to 39-79 VirtualQuery, so the cache works — but those few cost
+// 143-298ms of a ~450ms frame, ~3.7ms each. The cost is per CALL, so the only
+// thing that helps is missing less often.
+//
+// Two changes, 2026-08-08. The cache was 8 entries shared by every thread:
+//
+//  - 8 was too few. The parallel record path (three workers plus the main
+//    thread) touches more distinct regions than that, so the round-robin
+//    thrashed and re-queried regions it had just evicted.
+//  - Shared was unsafe. The three record workers only began running when the
+//    fence-retire fix landed (hooks_frame.cpp), and this cache has no lock: a
+//    torn read of {base, size, ok} can return a stale positive for a
+//    decommitted page, which is the exact crash the function exists to stop.
+//
+// Per-thread caches fix both at once — no lock, no sharing, and each thread's
+// working set is smaller than the union. Invalidation still has to reach every
+// thread, so it bumps a generation counter that each thread notices on its next
+// call rather than trying to reach into other threads' caches.
 struct HostRegionCacheEntry {
   const uint8_t* base = nullptr;
   size_t size = 0;
   bool ok = false;
 };
-constexpr size_t kHostRegionCacheSize = 8;
-HostRegionCacheEntry g_hprCache[kHostRegionCacheSize];
-size_t g_hprCacheCount = 0;
-size_t g_hprCacheNext = 0;
-uint64_t g_hprCalls = 0;
-uint64_t g_hprQueries = 0;
-uint64_t g_hprNanos = 0;
+constexpr size_t kHostRegionCacheSize = 64;
+thread_local HostRegionCacheEntry t_hprCache[kHostRegionCacheSize];
+thread_local size_t t_hprCacheCount = 0;
+thread_local size_t t_hprCacheNext = 0;
+thread_local uint64_t t_hprGeneration = 0;
+std::atomic<uint64_t> g_hprGeneration{1};
+std::atomic<uint64_t> g_hprCalls{0};
+std::atomic<uint64_t> g_hprQueries{0};
+std::atomic<uint64_t> g_hprNanos{0};
+
+// Retention. The per-frame clear exists so that a decommit underneath the cache
+// is picked up within a frame: a stale POSITIVE on a decommitted page is a
+// crash. But it also means every frame pays first-touch misses for every region
+// it uses, which is the whole remaining cost. Guest allocations cluster at load
+// and the arena is not torn down mid-scene, so retention across frames is
+// cheap and very probably safe — "probably" is why it is a flag and why the
+// backstop clear below still runs.
+REXCVAR_DEFINE_BOOL(d3d9_page_cache_persist, true, "Debug",
+                    "Keep the page-readability cache across frames instead of "
+                    "clearing it every swap. Off restores the per-frame clear");
+constexpr uint64_t kHostPageCacheBackstopFrames = 300;
 
 bool UncachedHostPageReadable(const void* p) {
   MEMORY_BASIC_INFORMATION mbi = {};
@@ -388,10 +421,18 @@ bool UncachedHostPageReadable(const void* p) {
 }
 
 bool HostPageReadable(const void* p) {
-  ++g_hprCalls;
+  g_hprCalls.fetch_add(1, std::memory_order_relaxed);
+  // Someone invalidated since this thread last looked. Drop our cache rather
+  // than reaching into anyone else's.
+  const uint64_t gen = g_hprGeneration.load(std::memory_order_relaxed);
+  if (t_hprGeneration != gen) {
+    t_hprGeneration = gen;
+    t_hprCacheCount = 0;
+    t_hprCacheNext = 0;
+  }
   const auto* addr = static_cast<const uint8_t*>(p);
-  for (size_t i = 0; i < g_hprCacheCount; ++i) {
-    const auto& e = g_hprCache[i];
+  for (size_t i = 0; i < t_hprCacheCount; ++i) {
+    const auto& e = t_hprCache[i];
     if (addr >= e.base && addr < e.base + e.size) {
       // Paranoid mode: ask the OS anyway and compare. This is the correctness
       // argument for the cache, run rather than asserted. Slow by design.
@@ -412,12 +453,14 @@ bool HostPageReadable(const void* p) {
   }
 
   const auto _t0 = std::chrono::steady_clock::now();
-  ++g_hprQueries;
+  g_hprQueries.fetch_add(1, std::memory_order_relaxed);
   MEMORY_BASIC_INFORMATION mbi = {};
   const bool queried = VirtualQuery(p, &mbi, sizeof(mbi)) == sizeof(mbi);
-  g_hprNanos += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                             std::chrono::steady_clock::now() - _t0)
-                             .count());
+  g_hprNanos.fetch_add(
+      uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now() - _t0)
+                   .count()),
+      std::memory_order_relaxed);
   if (!queried) return false;  // no region to cache
 
   constexpr DWORD kNoRead = PAGE_NOACCESS | PAGE_GUARD;
@@ -425,19 +468,25 @@ bool HostPageReadable(const void* p) {
                   (mbi.Protect & kNoRead) == 0;
 
   if (mbi.RegionSize) {
-    const size_t slot = g_hprCacheCount < kHostRegionCacheSize
-                            ? g_hprCacheCount++
-                            : (g_hprCacheNext =
-                                   (g_hprCacheNext + 1) % kHostRegionCacheSize);
-    g_hprCache[slot] = {static_cast<const uint8_t*>(mbi.BaseAddress),
+    const size_t slot = t_hprCacheCount < kHostRegionCacheSize
+                            ? t_hprCacheCount++
+                            : (t_hprCacheNext =
+                                   (t_hprCacheNext + 1) % kHostRegionCacheSize);
+    t_hprCache[slot] = {static_cast<const uint8_t*>(mbi.BaseAddress),
                         mbi.RegionSize, ok};
   }
   return ok;
 }
 
 void InvalidateHostPageCache() {
-  g_hprCacheCount = 0;
-  g_hprCacheNext = 0;
+  // Called once per swap. With persistence on, the backstop still runs so a
+  // decommit cannot stay hidden indefinitely.
+  static uint64_t s_frames = 0;
+  ++s_frames;
+  if (REXCVAR_GET(d3d9_page_cache_persist) &&
+      (s_frames % kHostPageCacheBackstopFrames) != 0)
+    return;
+  g_hprGeneration.fetch_add(1, std::memory_order_relaxed);
 }
 
 // One bit per dword offset. Starts all-set and is intersected; anything still
@@ -5107,12 +5156,15 @@ void FinalizePendingD3D9Draws(uint8_t* base) {
 
 void ReportHostPageQueryStats() {
   static uint64_t s_calls = 0, s_queries = 0, s_nanos = 0;
-  const uint64_t calls = g_hprCalls - s_calls;
-  const uint64_t queries = g_hprQueries - s_queries;
-  const uint64_t nanos = g_hprNanos - s_nanos;
-  s_calls = g_hprCalls;
-  s_queries = g_hprQueries;
-  s_nanos = g_hprNanos;
+  const uint64_t now_calls = g_hprCalls.load(std::memory_order_relaxed);
+  const uint64_t now_queries = g_hprQueries.load(std::memory_order_relaxed);
+  const uint64_t now_nanos = g_hprNanos.load(std::memory_order_relaxed);
+  const uint64_t calls = now_calls - s_calls;
+  const uint64_t queries = now_queries - s_queries;
+  const uint64_t nanos = now_nanos - s_nanos;
+  s_calls = now_calls;
+  s_queries = now_queries;
+  s_nanos = now_nanos;
   static uint64_t s_frame = 0;
   ++s_frame;
   static std::chrono::steady_clock::time_point s_last{};
@@ -5123,7 +5175,7 @@ void ReportHostPageQueryStats() {
     REXLOG_INFO(
         "d3d9: page checks this frame — {} calls, {} VirtualQuery, {}ms "
         "(total {} queries)",
-        calls, queries, nanos / 1000000, g_hprQueries);
+        calls, queries, nanos / 1000000, now_queries);
   }
   // Bound the staleness: see the note on HostPageReadable.
   InvalidateHostPageCache();
