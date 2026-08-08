@@ -2016,7 +2016,10 @@ ShaderApplyResult ApplyShaderOutputs(
   // pixel path affordable without moving the vertex shader to the GPU first.
   constexpr uint32_t kInterpStride =
       mx::hle::kHlslInterpolatorLinkage * 4 * uint32_t(sizeof(float));
-  const bool want_interpolators = dc.pixel_shader_hlsl != nullptr;
+  // Not for a draw on the GPU vertex path: its pixel stage reads what the
+  // rasterizer interpolates from the vertex stage's own exports, so this stream
+  // would be built at 128 bytes a vertex and then never bound.
+  const bool want_interpolators = dc.pixel_shader_hlsl != nullptr && !gpu_vertex;
   if (want_interpolators)
     dc.interpolators.assign(size_t(dc.vertex_count) * kInterpStride, 0);
 
@@ -2115,6 +2118,25 @@ ShaderApplyResult ApplyShaderOutputs(
           }
         }
       }
+
+      // The interpreter is done for this vertex, because nothing below it is
+      // still needed:
+      //
+      //   - the transformed position it writes is what the vertex stage now
+      //     produces;
+      //   - the interpolator copy exists so the rasterizer can interpolate the
+      //     shader's exports, which the rasterizer does natively;
+      //   - the param_gen UV reconstructs the hardware's screen-space
+      //     parameter, which in a pixel shader that reads it IS SV_Position;
+      //   - the finite/NaN rejection guards against an INTERPRETER emitting
+      //     garbage, and there is no interpreter here to emit any;
+      //   - the in-clip scoring only feeds g_hleShaderMvpDisagree, and this
+      //     path already requires the register that contest was replaced by.
+      //
+      // This is the whole point of the migration: 112,700 vertices x 4.9us was
+      // 550ms, which was the entire frame.
+      ++applied_vertices;
+      continue;
     }
 
     const AluResult r = ExecuteVertexShader(
