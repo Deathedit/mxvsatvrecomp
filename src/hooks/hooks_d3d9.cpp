@@ -37,11 +37,18 @@
 #include <vector>
 #include <fstream>
 
+// For the emitter coverage probe only: emitting HLSL the compiler then rejects
+// is exactly as useless as refusing to emit, so the probe compiles what it
+// emits. Nothing else in this file touches D3D.
+#include <d3dcompiler.h>
+#include <wrl/client.h>
+
 #include "gpu/d3d9_draw.h"
 #include "gpu/d3d9_layout.h"
 #include "gpu/d3d9_texture.h"
 #include "gpu/shader_ucode.h"   // DecodeVertexShaderFetches, VertexAttribute
 #include "gpu/shader_alu.h"     // ExecuteVertexShader
+#include "gpu/shader_hlsl.h"    // EmitShaderHlsl
 #include <cmath>
 #include "gpu/d3d9_state.h"
 
@@ -828,6 +835,8 @@ ShaderApplyResult ApplyShaderOutputs(
 bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
                         uint32_t device, uint8_t* base,
                         mx::hle::PixelTextureBinding& binding);
+void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
+                        const uint32_t* code, uint32_t count);
 void ProbePixelProfileForDraw(uint32_t pixel_shader, uint32_t device,
                               uint8_t* base,
                               const mx::hle::DrawCall& dc);
@@ -1781,6 +1790,9 @@ ShaderApplyResult ApplyShaderOutputs(
     ++g_hleShaderBadDecode;
     return ShaderApplyResult::kFailed;
   }
+  ReportHlslCoverage(mx::hle::HlslStage::kVertex, handle,
+                     patch.code.data() + patch.code_off,
+                     uint32_t(patch.code.size() - patch.code_off));
 
   std::vector<VertexAttribute> attrs;
   const char* why = nullptr;
@@ -2277,6 +2289,116 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
   }
 }
 
+//===========================================================================
+// Emitter coverage.
+//
+// Measured before anything renders through it, because the whole plan rests on
+// a claim that has not been tested: that a straight-line HLSL emitter can carry
+// this game's shaders. If most of them refuse, the wiring downstream is worth
+// nothing and the design has to change — so the cheap decisive number comes
+// first.
+//
+// Per distinct shader handle, not per draw: the question is how much of the
+// game's shader set is covered, and a hot shader translating 12,000 times would
+// otherwise drown out a cold one that fails.
+//===========================================================================
+struct HlslCoverage {
+  uint64_t ok = 0;              // emitted AND compiled
+  uint64_t compile_failed = 0;  // emitted, but FXC rejected the source
+  std::map<std::string, uint64_t> failures;      // status name -> shaders
+  std::map<uint32_t, uint64_t> blocking_opcode;  // opcode -> shaders
+};
+HlslCoverage g_hlslVs, g_hlslPs;
+// map rather than set only because <map> is already included here and <set> is
+// not; the value is unused.
+std::map<uint32_t, bool> g_hlslReportedVs, g_hlslReportedPs;
+
+std::string HlslCoverageSummary(const HlslCoverage& c) {
+  std::string s = fmt::format("{} translated+compiled", c.ok);
+  if (c.compile_failed) s += fmt::format(", FXC-REJECTED={}", c.compile_failed);
+  for (const auto& [why, n] : c.failures) s += fmt::format(", {}={}", why, n);
+  if (!c.blocking_opcode.empty()) {
+    s += "; blocking opcodes";
+    for (const auto& [op, n] : c.blocking_opcode)
+      s += fmt::format(" {}x{}", op, n);
+  }
+  return s;
+}
+
+void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
+                        const uint32_t* code, uint32_t count) {
+  auto& seen = stage == mx::hle::HlslStage::kPixel ? g_hlslReportedPs
+                                                   : g_hlslReportedVs;
+  if (!seen.emplace(handle, true).second) return;
+  auto& cov = stage == mx::hle::HlslStage::kPixel ? g_hlslPs : g_hlslVs;
+
+  mx::hle::HlslShader out;
+  // The linkage width is not yet negotiated between the stages — that is the
+  // wiring's job. 16 is the widest the emitter builds, so it cannot be the
+  // reason a shader is refused here.
+  mx::hle::EmitShaderHlsl(code, count, stage, mx::hle::kMaxHlslInterpolators,
+                          out);
+
+  // Emitting is only half the claim. Source FXC rejects is exactly as useless
+  // as a shader the emitter refused, and the two failures have entirely
+  // different causes — so they are counted apart and the compiler's own message
+  // is logged, since "it did not compile" without the reason is not a finding.
+  std::string compile_error;
+  bool compiled = false;
+  if (out.status == mx::hle::HlslStatus::kOk) {
+    Microsoft::WRL::ComPtr<ID3DBlob> blob, errors;
+    const char* target =
+        stage == mx::hle::HlslStage::kPixel ? "ps_5_0" : "vs_5_0";
+    const HRESULT hr = D3DCompile(
+        out.source.data(), out.source.size(), nullptr, nullptr, nullptr,
+        "main", target, D3DCOMPILE_OPTIMIZATION_LEVEL0, 0, &blob, &errors);
+    compiled = SUCCEEDED(hr) && blob;
+    if (!compiled && errors) {
+      compile_error.assign(
+          static_cast<const char*>(errors->GetBufferPointer()),
+          errors->GetBufferSize());
+      if (compile_error.size() > 400) compile_error.resize(400);
+    }
+  }
+
+  if (out.status != mx::hle::HlslStatus::kOk) {
+    ++cov.failures[mx::hle::HlslStatusName(out.status)];
+    if (out.blocking_opcode) ++cov.blocking_opcode[out.blocking_opcode];
+  } else if (compiled) {
+    ++cov.ok;
+  } else {
+    ++cov.compile_failed;
+  }
+
+  const char* tag = stage == mx::hle::HlslStage::kPixel ? "PS" : "VS";
+  // Every compile failure, not just the first few: this is the one outcome that
+  // means the emitter produced something plausible-looking and wrong, and each
+  // distinct message is a separate defect to fix.
+  if (!compile_error.empty()) {
+    static uint32_t s_logged = 0;
+    if (s_logged++ < 12) {
+      REXLOG_INFO("d3d9: HLSL {} 0x{:08X} FXC REJECTED: {}", tag, handle,
+                  compile_error);
+    }
+  }
+  // The first few in full, so a failure can be read rather than inferred from a
+  // count, and the source itself can be eyeballed for obvious nonsense.
+  if (seen.size() <= 6) {
+    REXLOG_INFO("d3d9: HLSL {} 0x{:08X}: {} ({} dwords) inputs 0x{:X} "
+                "exports 0x{:X} samplers 0x{:X} consts<={} {}",
+                tag, handle, mx::hle::HlslStatusName(out.status), count,
+                out.input_mask, out.export_mask, out.sampler_mask,
+                out.max_const_index,
+                out.status == mx::hle::HlslStatus::kOk
+                    ? fmt::format("{} bytes", out.source.size())
+                    : fmt::format("opcode {}", out.blocking_opcode));
+  }
+  if ((seen.size() % 16) == 0 || seen.size() <= 6) {
+    REXLOG_INFO("d3d9: HLSL {} coverage over {} shaders: {}", tag, seen.size(),
+                HlslCoverageSummary(cov));
+  }
+}
+
 void CollectPixelShaderBlob(uint32_t handle, uint8_t* base) {
   (void)base;
   if (!handle || g_psBlobs.count(handle)) return;
@@ -2384,6 +2506,7 @@ const ResolvedPixelBinding* ResolvePixelProfile(uint32_t handle) {
   ResolvedPixelBinding resolved;
   const uint32_t* code = bi->second.data();
   uint32_t code_count = uint32_t(bi->second.size());
+  ReportHlslCoverage(mx::hle::HlslStage::kPixel, handle, code, code_count);
   resolved.decoded = mx::hle::DecodePixelTextureFetches(
       code, code_count, resolved.bindings, &resolved.fail);
   if (!resolved.decoded) {
