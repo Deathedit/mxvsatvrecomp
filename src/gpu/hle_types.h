@@ -311,7 +311,26 @@ struct DrawCall {
   uint32_t dest_blend = 0;     // D3DRS_DESTBLEND, a D3DBLEND
   uint32_t blend_op = 0;       // D3DRS_BLENDOP,   a D3DBLENDOP
   uint32_t blend_control = 0;  // RB_BLENDCONTROL0 0x2201
-  uint32_t colour_control = 0; // RB_COLORCONTROL  0x2202, bit 3 = alpha test
+  // RB_COLORCONTROL 0x2202: bits 0-2 the alpha comparison, bit 3 its enable.
+  // With the reference value below, this is the alpha test — the one piece of
+  // output-merger state D3D12 has no fixed-function equivalent for, and the
+  // classic reason glyph quads render as filled blocks.
+  //
+  // Both are read from the device's register shadow rather than the render
+  // state shadow, which covers only eight output-merger leaves and has no alpha
+  // entries. Their locations come from D3DDevice_DrawVertices' own flush, which
+  // names both block base and register base:
+  //
+  //     addi r6, r31, 0x2934 ; li r5, 0x2200   m_ControlPacket
+  //     addi r6, r31, 0x28CC ; li r5, 0x2100   m_ValuesPacket
+  //
+  // so 0x2202 sits at device+0x2934 + (0x2202-0x2200)*4 = device+0x293C, and
+  // 0x210E at device+0x28CC + (0x210E-0x2100)*4 = device+0x2904. Both offsets
+  // fall inside the packet sizes the IDB's D3DDevice type gives (48 and 84
+  // bytes), which is the cross-check that they are the right blocks.
+  uint32_t colour_control = 0;
+  float alpha_ref = 0.0f;      // RB_ALPHA_REF 0x210E
+  bool alpha_state_seen = false;
   uint32_t mode_control = 0;   // RB_MODECONTROL   0x2208, bits 0-2 = edram_mode
 
   // Which of the five above had actually been written this frame, at the time

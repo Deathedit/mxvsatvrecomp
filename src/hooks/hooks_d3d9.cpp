@@ -1275,6 +1275,31 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   if (st.render_state.Seen(kRsBlendOp))
     dc.blend_op = st.render_state.value[kRsBlendOp];
 
+  // The alpha test, from the device's Xenos register shadow. See the note on
+  // DrawCall::colour_control for where these two offsets come from.
+  {
+    constexpr uint32_t kRbColorControl = 0x293C;  // RB_COLORCONTROL 0x2202
+    constexpr uint32_t kRbAlphaRef = 0x2904;      // RB_ALPHA_REF    0x210E
+    if (device && HostPageReadable(REX_RAW_ADDR(device + kRbColorControl)) &&
+        HostPageReadable(REX_RAW_ADDR(device + kRbAlphaRef))) {
+      dc.colour_control = REX_LOAD_U32(device + kRbColorControl);
+      const uint32_t bits = REX_LOAD_U32(device + kRbAlphaRef);
+      std::memcpy(&dc.alpha_ref, &bits, 4);
+      dc.alpha_state_seen = true;
+      // Logged before anything depends on it: an offset derived from a
+      // disassembly is a hypothesis until the values it produces look like the
+      // thing they are supposed to be. A reference outside [0,1] or a func
+      // above 7 means the offsets are wrong, not that the game is unusual.
+      static uint32_t s_logged = 0;
+      if (s_logged++ < 6) {
+        REXLOG_INFO("d3d9: alpha test RB_COLORCONTROL=0x{:08X} (enable {}, "
+                    "func {}) ref={}",
+                    dc.colour_control, (dc.colour_control >> 3) & 1u,
+                    dc.colour_control & 7u, dc.alpha_ref);
+      }
+    }
+  }
+
   const uint32_t vertex_shader = st.vs_seen ? st.vertex_shader : 0;
   const ShaderApplyResult applied = ApplyShaderOutputs(
       dc, vertex_shader, streams, device, base,
