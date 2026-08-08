@@ -1515,6 +1515,16 @@ void D3D12Renderer::RenderGameFrame() {
         // is what it had before. A steady non-zero count here means targets are
         // being refused offscreen surfaces upstream — read the routing line.
         ++m_snapshotMissingSource;
+        // The guest asked for this image to be refreshed and it was not. Any
+        // snapshot already held for this destination is now a stale earlier
+        // frame; mark it so the sampling path refuses it rather than blitting a
+        // previous frame over this one. Measured as the intro overlap: ~600
+        // dropped refreshes per sample window with ZERO offscreen refusals, so
+        // these are sources we have no entry for at all, not budget drops.
+        if (auto st = m_gameSnapshots.find(d.resolveDest);
+            st != m_gameSnapshots.end()) {
+          st->second.stale = true;
+        }
         continue;
       }
       // Snapshotting a target nothing has ever drawn into copies a blank
@@ -1597,6 +1607,8 @@ void D3D12Renderer::RenderGameFrame() {
       if (srcEntry)
         srcEntry->state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
       snap->state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+      // Refreshed: whatever earlier drop marked this stale is now irrelevant.
+      snap->stale = false;
       // The target is bound again by whichever draw follows; forcing a rebind
       // keeps that from being skipped because boundTargetObject still matches.
       boundTargetObject = 0xFFFFFFFFu;
@@ -1720,10 +1732,21 @@ void D3D12Renderer::RenderGameFrame() {
       // black. A large steady m_snapshotFallbacks means resolves are being
       // dropped upstream.
       GameRenderTarget* sampledPtr = nullptr;
+      //
+      // A STALE snapshot is refused outright. It holds a complete earlier frame
+      // at full screen size, so binding it does not degrade the draw — it
+      // replaces the frame. Falling through to the untextured path instead lets
+      // the fabricated-colour gate below drop the draw, which shows what is
+      // underneath: incomplete, but not a previous frame painted over the
+      // current one.
       if (auto snap = m_gameSnapshots.find(d.sampledTextureObject);
-          d.sampledTextureObject && snap != m_gameSnapshots.end()) {
+          d.sampledTextureObject && snap != m_gameSnapshots.end() &&
+          !snap->second.stale) {
         sampledPtr = &snap->second;
         ++m_snapshotHits;
+      } else if (d.sampledTextureObject &&
+                 m_gameSnapshots.count(d.sampledTextureObject)) {
+        ++m_snapshotStaleRefused;
       } else if (d.sampledTargetObject != d.targetObject) {
         if (auto it = m_gameRenderTargets.find(d.sampledTargetObject);
             it != m_gameRenderTargets.end()) {
@@ -1958,13 +1981,14 @@ void D3D12Renderer::RenderGameFrame() {
     std::snprintf(message, sizeof(message),
                   "resolve snapshots: copies %llu, hits %llu, FALLBACKS %llu, "
                   "source-not-offscreen %llu, WHITE-SKIPPED %llu, "
-                  "BLANK-SOURCE %llu; live snapshots %u",
+                  "BLANK-SOURCE %llu, STALE-REFUSED %llu; live snapshots %u",
                   static_cast<unsigned long long>(m_snapshotCopies),
                   static_cast<unsigned long long>(m_snapshotHits),
                   static_cast<unsigned long long>(m_snapshotFallbacks),
                   static_cast<unsigned long long>(m_snapshotMissingSource),
                   static_cast<unsigned long long>(m_sampleMissSkipped),
                   static_cast<unsigned long long>(m_snapshotBlankSource),
+                  static_cast<unsigned long long>(m_snapshotStaleRefused),
                   uint32_t(m_gameSnapshots.size()));
     LogInfo(message);
     // Both of these have been non-zero for real reasons — a draw-list cap that

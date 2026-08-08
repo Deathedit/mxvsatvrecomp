@@ -563,6 +563,10 @@ void ClearGameDraws();
   // Resolves whose source target has never been drawn into: the snapshot they
   // produce is blank by construction.
   uint64_t m_snapshotBlankSource = 0;
+  // Draws that wanted a snapshot which exists but was left unrefreshed by a
+  // dropped resolve. Each one is a full previous frame NOT painted over this
+  // one. A large count means the drop upstream is the defect, not this refusal.
+  uint64_t m_snapshotStaleRefused = 0;
   uint64_t m_snapshotMissingSource = 0;
   // Resolves lost because the frame's draw list was already full, and snapshot
   // resources that failed to create. Both exist to tell a fix that stopped
@@ -583,6 +587,13 @@ void ClearGameDraws();
     // creation clear — the snapshot is then blank, and a compositor quad paints
     // that blank over the frame.
     bool everDrawn = false;
+    // Snapshots only. Set when the guest asked to resolve into this texture and
+    // we could not perform the copy, so the contents are a KNOWN-WRONG earlier
+    // frame rather than merely an old one. Snapshots legitimately persist across
+    // frames — static compositor content is resolved once and sampled for many
+    // frames — so age is not evidence of staleness, but a dropped refresh is.
+    // Binding one paints a whole previous frame over the current one.
+    bool stale = false;
   };
   std::unordered_map<uint32_t, GameRenderTarget> m_gameRenderTargets;
   // Resolve snapshots, keyed by DESTINATION TEXTURE object rather than by the
