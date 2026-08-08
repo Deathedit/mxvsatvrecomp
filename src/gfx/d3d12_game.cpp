@@ -510,7 +510,89 @@ bool D3D12Renderer::CreateTranslatedRootSignature() {
     LogError("CreateTranslatedRootSignature: passthrough VS failed to compile");
     return false;
   }
+  {
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = kMaxTranslatedBlocks * kTranslatedSamplerSlots;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    if (FAILED(m_device->CreateDescriptorHeap(&hd,
+                                              IID_PPV_ARGS(&m_translatedSrvHeap)))) {
+      LogError("CreateTranslatedRootSignature: descriptor block heap failed");
+      return false;
+    }
+  }
   LogInfo("CreateTranslatedRootSignature: ready");
+  return true;
+}
+
+bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
+                                           D3D12_GPU_DESCRIPTOR_HANDLE& out) {
+  if (!m_translatedSrvHeap || !d.pixelSamplerCount) return false;
+  if (m_translatedBlockNext >= kMaxTranslatedBlocks) {
+    ++m_translatedBlockExhausted;
+    return false;
+  }
+  const uint32_t block = m_translatedBlockNext;
+
+  // Resolve every slot BEFORE claiming the block, so a draw that cannot be
+  // fully bound does not consume one and does not leave a half-written range
+  // that a later draw might read.
+  struct Slot {
+    ID3D12Resource* resource = nullptr;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    uint32_t swizzle = 0;
+    bool useSwizzle = false;
+  };
+  Slot slots[kTranslatedSamplerSlots];
+  for (uint32_t i = 0; i < d.pixelSamplerCount; ++i) {
+    if (const uint32_t object = d.pixelSampledObjects[i]) {
+      // A resolve result: sample the snapshot the guest resolved into, which is
+      // the same resource the stand-in path samples for this object.
+      auto it = m_gameSnapshots.find(object);
+      if (it == m_gameSnapshots.end() || !it->second.resource) return false;
+      slots[i].resource = it->second.resource.Get();
+      slots[i].format = kBackBufferFormat;
+      continue;
+    }
+    const auto& tex = d.pixelTextures[i];
+    if (!tex) return false;
+    uint32_t unusedDescriptor = 0;
+    // Uploads the texture and gives it its cached descriptor. That descriptor
+    // is not the one bound here — it lives in a different heap — but the upload
+    // and the resource it creates are exactly what this needs.
+    if (!EnsureGameTexture(tex, unusedDescriptor)) return false;
+    auto it = m_gameTextures.find(tex->key);
+    if (it == m_gameTextures.end() || !it->second.resource) return false;
+    slots[i].resource = it->second.resource.Get();
+    slots[i].format = it->second.resource->GetDesc().Format;
+    slots[i].swizzle = tex->swizzle;
+    slots[i].useSwizzle = true;
+  }
+
+  auto cpu = m_translatedSrvHeap->GetCPUDescriptorHandleForHeapStart();
+  cpu.ptr += SIZE_T(block) * kTranslatedSamplerSlots * m_gameSrvDescriptorSize;
+  for (uint32_t i = 0; i < kTranslatedSamplerSlots; ++i) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srv.Texture2D.MipLevels = 1;
+    // Slots past what the shader declares still need a valid descriptor: the
+    // table's range covers all of them whether or not they are sampled. They
+    // repeat slot 0 rather than being left undefined.
+    const Slot& s = slots[i < d.pixelSamplerCount ? i : 0];
+    srv.Format = s.format;
+    srv.Shader4ComponentMapping =
+        s.useSwizzle
+            ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
+                  (s.swizzle >> 0) & 7u, (s.swizzle >> 3) & 7u,
+                  (s.swizzle >> 6) & 7u, (s.swizzle >> 9) & 7u)
+            : UINT(D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+    m_device->CreateShaderResourceView(s.resource, &srv, cpu);
+    cpu.ptr += SIZE_T(m_gameSrvDescriptorSize);
+  }
+
+  ++m_translatedBlockNext;
+  out = m_translatedSrvHeap->GetGPUDescriptorHandleForHeapStart();
+  out.ptr += UINT64(block) * kTranslatedSamplerSlots * m_gameSrvDescriptorSize;
   return true;
 }
 
@@ -1745,8 +1827,19 @@ void D3D12Renderer::RenderGameFrame() {
                           (d.blendEnable ? 8u : 0u));
       translatedPso = TranslatedPSO(key, *d.pixelShaderHlsl);
     }
+    // Every texture the shader reads must be bindable, or the draw falls back:
+    // a shader sampling a descriptor that was never written reads whatever is
+    // there, which is a confident wrong answer rather than a visible failure.
+    D3D12_GPU_DESCRIPTOR_HANDLE translatedSrvTable = {};
+    if (translatedPso && !BindTranslatedTextures(d, translatedSrvTable))
+      translatedPso = nullptr;
     if (translatedPso) {
       m_commandList->SetGraphicsRootSignature(m_translatedRootSig.Get());
+      // The block heap is a different heap from the stand-in path's, so it has
+      // to be bound alongside the sampler heap for this draw.
+      ID3D12DescriptorHeap* theaps[] = {m_translatedSrvHeap.Get(),
+                                        m_samplerHeap.Get()};
+      m_commandList->SetDescriptorHeaps(2, theaps);
       m_commandList->SetPipelineState(translatedPso);
       // b0 vertex: the same transform the stand-in pipeline uses, since the
       // passthrough VS is still fed CPU-transformed positions.
@@ -1756,17 +1849,11 @@ void D3D12Renderer::RenderGameFrame() {
       // b1 pixel: the guest's own pixel constant bank.
       m_commandList->SetGraphicsRootConstantBufferView(
           1, d.pscb->GetGPUVirtualAddress());
-      if (textured) {
-        const uint32_t maxBase = kMaxGameTextures - kTranslatedSamplerSlots;
-        auto gpu = m_gameSrvHeap->GetGPUDescriptorHandleForHeapStart();
-        gpu.ptr += UINT64(std::min(textureDescriptor, maxBase)) *
-                   m_gameSrvDescriptorSize;
-        m_commandList->SetGraphicsRootDescriptorTable(2, gpu);
-        auto samp = m_samplerHeap->GetGPUDescriptorHandleForHeapStart();
-        samp.ptr += UINT64(std::min(d.samplerIndex, kSamplerVariantCount - 1)) *
-                    m_samplerDescriptorSize;
-        m_commandList->SetGraphicsRootDescriptorTable(3, samp);
-      }
+      m_commandList->SetGraphicsRootDescriptorTable(2, translatedSrvTable);
+      auto samp = m_samplerHeap->GetGPUDescriptorHandleForHeapStart();
+      samp.ptr += UINT64(std::min(d.samplerIndex, kSamplerVariantCount - 1)) *
+                  m_samplerDescriptorSize;
+      m_commandList->SetGraphicsRootDescriptorTable(3, samp);
       // Two streams: the stand-in vertex for position, the interpolator stream
       // for everything the pixel shader reads.
       const D3D12_VERTEX_BUFFER_VIEW views[2] = {d.vbv, d.ivbv};
@@ -1775,9 +1862,12 @@ void D3D12Renderer::RenderGameFrame() {
       m_commandList->IASetIndexBuffer(&d.ibv);
       m_commandList->DrawIndexedInstanced(d.indexCount, 1, 0, 0, 0);
       ++m_translatedDraws;
-      // The root signature was swapped, so the next stand-in draw has to put
-      // its own back. Restored here rather than at the top of the loop so the
-      // cost falls on the translated draw that caused it.
+      // The root signature AND the heaps were swapped, so the next stand-in
+      // draw has to have its own put back. Restored here rather than at the top
+      // of the loop so the cost falls on the translated draw that caused it.
+      ID3D12DescriptorHeap* heaps[] = {m_gameSrvHeap.Get(),
+                                       m_samplerHeap.Get()};
+      m_commandList->SetDescriptorHeaps(2, heaps);
       m_commandList->SetGraphicsRootSignature(m_gameRootSig.Get());
       continue;
     }
@@ -1906,6 +1996,11 @@ void D3D12Renderer::ClearGameDraws() {
     if (d.cb) r.res.push_back(std::move(d.cb));
   }
   m_gameDraws.clear();
+  // The descriptor blocks are consumed by the frame that wrote them. Reset once
+  // the frame's draws are retired, which is the same point their resources are
+  // handed to the fenced retirement list — so a block is never rewritten while
+  // the GPU may still be reading it.
+  m_translatedBlockNext = 0;
 }
 
 void D3D12Renderer::DrainRetired() {
@@ -1938,7 +2033,9 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t interpBytes,
                                  const uint32_t* pixelConstants,
                                  uint32_t pixelConstDwords,
-                                 uint32_t pixelSamplerCount) {
+                                 uint32_t pixelSamplerCount,
+                                 const std::shared_ptr<const mx::hle::HleTexturePayload>* pixelTextures,
+                                 const uint32_t* pixelSampledObjects) {
   // PERF(per-frame-allocs): this creates three ID3D12Resource's per call (VB +
   // IB + CB) on the UPLOAD heap, and is called once per submitted draw rather
   // than once per frame, so the allocation rate scales with the draw count —
@@ -2014,6 +2111,12 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.pixelShaderHandle = pixelShaderHandle;
   d.pixelShaderHlsl = std::move(pixelShaderHlsl);
   d.pixelSamplerCount = pixelSamplerCount;
+  if (pixelTextures && pixelSampledObjects) {
+    for (uint32_t i = 0; i < kTranslatedSamplerSlots; ++i) {
+      d.pixelTextures[i] = pixelTextures[i];
+      d.pixelSampledObjects[i] = pixelSampledObjects[i];
+    }
+  }
 
   // The translated path needs all of its inputs or none of them. A shader run
   // without its interpolators reads undefined registers, and one run without
@@ -2025,8 +2128,8 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   // bound correctly, using the descriptor this draw already has. Multi-sampler
   // shaders keep the stand-in until that lands.
   if (d.pixelShaderHlsl && d.pixelShaderHandle && interpolators &&
-      interpBytes && pixelConstants && pixelConstDwords &&
-      pixelSamplerCount <= 1) {
+      interpBytes && pixelConstants && pixelConstDwords && pixelSamplerCount &&
+      pixelSamplerCount <= kTranslatedSamplerSlots) {
     // The shader's cbuffer is xe_c[256] followed by xe_texsize[slots], so the
     // buffer must cover BOTH. Sizing it to the constant bank alone would leave
     // the shader reading past the end of the resource for every unnormalized

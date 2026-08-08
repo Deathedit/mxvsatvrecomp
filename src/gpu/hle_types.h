@@ -212,6 +212,24 @@ struct DrawCall {
   // sampler each compact slot was assigned. See HlslShader::sampler_slot_guest.
   uint32_t pixel_sampler_count = 0;
 
+  // One texture per compact sampler slot, in the order the emitted shader
+  // declares them: slot i is the texture the shader reads as xe_texi.
+  //
+  // This is what lets a shader with more than one texture run at all. Binding
+  // only one meant every multi-sampler shader — which is most of them — fell
+  // back to the stand-in, and the stand-in picks a single arbitrary fetch. A
+  // rider shader sampling diffuse + normal + detail would render whichever one
+  // that happened to be, which is why the jersey looked like a dark misaligned
+  // texture rather than yellow: it was the normal map.
+  //
+  // A slot may instead name a resolved render target, for the post-process
+  // chain, which samples resolve results rather than guest memory. The two are
+  // parallel arrays because a slot has exactly one or the other.
+  static constexpr uint32_t kMaxPixelTextures = 8;
+  std::array<std::shared_ptr<const HleTexturePayload>, kMaxPixelTextures>
+      pixel_textures;
+  std::array<uint32_t, kMaxPixelTextures> pixel_sampled_objects = {};
+
   // The interpolators the translated pixel shader reads, one float4 per
   // linkage slot per vertex, in a buffer parallel to `vertices`.
   //

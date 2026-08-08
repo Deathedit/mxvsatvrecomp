@@ -2394,6 +2394,7 @@ struct TranslatedShader {
   uint32_t input_mask = 0;
   uint32_t sampler_mask = 0;
   uint32_t sampler_count = 0;
+  uint32_t slot_guest[mx::hle::HlslShader::kMaxSamplerSlots] = {};
   uint32_t max_const_index = 0;
 };
 std::map<uint32_t, TranslatedShader> g_translatedPs;
@@ -2456,6 +2457,8 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
       t.input_mask = out.input_mask;
       t.sampler_mask = out.sampler_mask;
       t.sampler_count = out.sampler_count;
+      for (uint32_t i = 0; i < out.sampler_count; ++i)
+        t.slot_guest[i] = out.sampler_slot_guest[i];
       t.max_const_index = out.max_const_index;
     }
   } else {
@@ -3189,6 +3192,69 @@ bool CopyTexturePhysical(const mx::hle::HleTextureSource& source, uint8_t* base,
   return false;
 }
 
+// Resolve the texture a translated shader reads at one compact sampler slot.
+//
+// Deliberately NOT PrepareDrawTexture's logic. That function applies a policy
+// gate — kR8, kR16, kBc5 and the float formats are decoded and then refused as
+// "not an immutable colour asset" — which is correct for the stand-in shader,
+// where a single-channel texture bound as base colour would paint the surface
+// grey. It is wrong here. The guest's own shader knows that channel is a
+// coverage mask or a normal map and says so in its arithmetic; refusing to bind
+// it leaves the shader sampling nothing.
+//
+// FMT_8 is the format fonts use, which is why glyph quads came out as filled
+// blocks: the texture decoded fine and was then withheld from the shader that
+// knew what to do with it.
+//
+// Fills exactly one of the two per-slot outputs: a resolved render target if
+// the guest bound one there, otherwise a decoded CPU payload. Returns false
+// when neither could be produced, and the caller decides whether that is fatal.
+bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
+                             uint32_t guest_sampler, uint32_t device,
+                             uint8_t* base) {
+  using namespace mx::hle;
+  if (slot >= DrawCall::kMaxPixelTextures || guest_sampler >= kMaxSamplers)
+    return false;
+
+  // A slot the guest points at a resolve result: the renderer samples the live
+  // host target, exactly as the single-texture path already does.
+  const auto& texture_state = DeviceState().texture[guest_sampler];
+  if (texture_state.object &&
+      g_resolvedTextureTargets.contains(texture_state.object)) {
+    dc.pixel_sampled_objects[slot] = texture_state.object;
+    return true;
+  }
+
+  uint32_t fetch[6] = {};
+  if (!ReadLiveTextureFetch(device, base, guest_sampler, fetch)) return false;
+  HleTextureSource source;
+  const char* why = nullptr;
+  if (!DescribeHleTexture2D(fetch, source, &why)) {
+    NoteRejectedTextureFormat("slot", guest_sampler, source, why, fetch);
+    return false;
+  }
+  const uint64_t key = HleTextureKey(fetch);
+  if (g_hleEmptyTextures.contains(key)) return false;
+  if (auto cached = g_hleCpuTextures.find(key);
+      cached != g_hleCpuTextures.end()) {
+    dc.pixel_textures[slot] = cached->second;
+    return true;
+  }
+  std::vector<uint8_t> guest;
+  if (!CopyTexturePhysical(source, base, guest)) return false;
+  auto payload = std::make_shared<HleTexturePayload>();
+  if (!DecodeHleTexture2D(source, guest.data(), guest.size(), *payload, &why))
+    return false;
+  if (!HleTextureHasNonzeroData(*payload)) {
+    g_hleEmptyTextures.emplace(key, true);
+    return false;
+  }
+  payload->key = key;
+  dc.pixel_textures[slot] = payload;
+  g_hleCpuTextures.emplace(key, std::move(payload));
+  return true;
+}
+
 bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
                         uint32_t device, uint8_t* base,
                         mx::hle::PixelTextureBinding& binding) {
@@ -3241,6 +3307,30 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
       dc.pixel_constants.resize(kPixelConstRegs * 4);
       for (uint32_t i = 0; i < kPixelConstRegs * 4; ++i)
         dc.pixel_constants[i] = REX_LOAD_U32(device + kPixelConstBase + i * 4);
+
+      // One texture per slot the shader declares. A shader whose slots cannot
+      // all be filled keeps the stand-in: running it with a missing texture
+      // would sample whatever descriptor happened to be at that index, which is
+      // a confident wrong answer rather than a visible failure.
+      uint32_t filled = 0;
+      for (uint32_t s = 0; s < t->sampler_count &&
+                           s < mx::hle::DrawCall::kMaxPixelTextures; ++s) {
+        if (ResolvePixelSlotTexture(dc, s, t->slot_guest[s], device, base))
+          ++filled;
+      }
+      static uint64_t s_slotOk = 0, s_slotShort = 0;
+      if (filled < t->sampler_count) {
+        ++s_slotShort;
+        dc.pixel_shader_hlsl.reset();
+        dc.pixel_textures = {};
+        dc.pixel_sampled_objects = {};
+      } else {
+        ++s_slotOk;
+      }
+      if (((s_slotOk + s_slotShort) % 5000) == 0) {
+        REXLOG_INFO("d3d9: translated texture slots: {} draws bound, {} short",
+                    s_slotOk, s_slotShort);
+      }
     } else {
       // Without its constants the shader would compute from zeros, which is a
       // confident wrong answer. Drop the translation and keep the stand-in.

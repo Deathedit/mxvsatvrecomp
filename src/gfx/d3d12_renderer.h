@@ -76,7 +76,10 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  uint32_t interpBytes = 0,
                  const uint32_t* pixelConstants = nullptr,
                  uint32_t pixelConstDwords = 0,
-                 uint32_t pixelSamplerCount = 0);
+                 uint32_t pixelSamplerCount = 0,
+                 const std::shared_ptr<const mx::hle::HleTexturePayload>*
+                     pixelTextures = nullptr,
+                 const uint32_t* pixelSampledObjects = nullptr);
 
 // Append a resolve to this frame's list, in order with the draws around it.
 //
@@ -339,6 +342,28 @@ void ClearGameDraws();
   // of it.
   uint64_t m_translatedDraws = 0;
   uint64_t m_standInDraws = 0;
+
+  // A shader's textures have to sit in ONE contiguous descriptor range, and the
+  // cached per-texture descriptors in m_gameSrvHeap are scattered — a texture
+  // gets its slot when it is first uploaded, not when a shader binds it. So a
+  // translated draw gets a fresh block here and its views are created into it.
+  //
+  // Not a copy from m_gameSrvHeap: D3D12 forbids CopyDescriptors from a
+  // shader-visible heap, so the views are created directly.
+  //
+  // Ring-allocated and never rewritten within a frame, because overwriting a
+  // descriptor the GPU may still be reading is undefined — the video-plane
+  // block above was moved off a shared block for exactly this reason, and it
+  // read as zero on this hardware rather than failing.
+  static constexpr uint32_t kMaxTranslatedBlocks = 2048;
+  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_translatedSrvHeap;
+  uint32_t m_translatedBlockNext = 0;
+  uint64_t m_translatedBlockExhausted = 0;
+  // Points `out` at a block holding this draw's textures. False when a block
+  // could not be allocated or a slot had no resource, in which case the draw
+  // must fall back rather than sample an undefined descriptor.
+  bool BindTranslatedTextures(const GameDraw& d,
+                              D3D12_GPU_DESCRIPTOR_HANDLE& out);
   // The fallback transform: an identity matrix, used by any translated draw
   // whose own constant buffer failed to allocate. Bound as a root CBV, so it
   // needs no descriptor heap.
@@ -472,6 +497,12 @@ void ClearGameDraws();
     D3D12_VERTEX_BUFFER_VIEW ivbv = {};
     Microsoft::WRL::ComPtr<ID3D12Resource> pscb;
     uint32_t pixelSamplerCount = 0;
+    // One texture per compact sampler slot, in the order the shader declares
+    // them. Parallel arrays: a slot names either a CPU payload or a resolved
+    // render target, never both.
+    std::array<std::shared_ptr<const mx::hle::HleTexturePayload>,
+               kTranslatedSamplerSlots> pixelTextures;
+    std::array<uint32_t, kTranslatedSamplerSlots> pixelSampledObjects = {};
     bool translated = false;
   };
   // Bounded because each entry costs three CreateCommittedResource calls — see

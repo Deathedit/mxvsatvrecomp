@@ -353,7 +353,9 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   d->pixel_constants.data(),
                                   static_cast<uint32_t>(
                                       d->pixel_constants.size()),
-                                  d->pixel_sampler_count);
+                                  d->pixel_sampler_count,
+                                  d->pixel_textures.data(),
+                                  d->pixel_sampled_objects.data());
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;
