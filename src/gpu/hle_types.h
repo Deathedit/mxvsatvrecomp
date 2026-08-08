@@ -46,6 +46,15 @@ struct HleTexturePayload {
   uint8_t clamp_x = 0;
   uint8_t clamp_y = 0;
   bool linear_filter = true;
+  // Bumped when the same guest texture is decoded again because its CONTENTS
+  // changed underneath a stable fetch constant. The cache key hashes the six
+  // fetch dwords -- address, size, format -- so a texture the guest rewrites in
+  // place keeps its key, and the renderer, which also caches on that key, would
+  // keep serving the bytes it uploaded the first time. Scaleform's raster glyph
+  // cache does exactly that: it repacks glyphs into one atlas as strings come
+  // and go, which froze the menu text as whatever the atlas held when it was
+  // first sampled. Zero means never rewritten.
+  uint32_t content_version = 0;
   std::vector<uint8_t> data;
 };
 

@@ -65,6 +65,44 @@ using mx::gfx::CompileShader;
 using mx::gfx::LogError;
 using mx::gfx::LogInfo;
 
+// One sampler variant, from the three bits that describe it: clamp on U, clamp
+// on V, and point rather than linear filtering. Xenos has more address modes
+// than these; every mode that is not plain repeat is treated as clamp-to-edge,
+// which is the distinction that matters at a surface edge. Mirror and border
+// are not modelled.
+//
+// MaxLOD is pinned to 0 because only the base mip is ever uploaded, so there is
+// no mip chain for a filter to select from.
+D3D12_SAMPLER_DESC D3D12Renderer::SamplerVariantDesc(uint32_t variant) {
+  variant &= kSamplerClampU | kSamplerClampV | kSamplerPoint;
+  D3D12_SAMPLER_DESC sd = {};
+  sd.Filter = (variant & kSamplerPoint) ? D3D12_FILTER_MIN_MAG_MIP_POINT
+                                        : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+  sd.AddressU = (variant & kSamplerClampU) ? D3D12_TEXTURE_ADDRESS_MODE_CLAMP
+                                           : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+  sd.AddressV = (variant & kSamplerClampV) ? D3D12_TEXTURE_ADDRESS_MODE_CLAMP
+                                           : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
+  sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  sd.MaxAnisotropy = 1;
+  sd.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+  sd.MinLOD = 0.0f;
+  sd.MaxLOD = 0.0f;
+  return sd;
+}
+
+// The variant a decoded guest texture asks for. Xenos address modes 0 and 1 are
+// repeat and mirrored repeat; anything higher clamps. The filter comes from the
+// guest's own min/mag filter, which reached the renderer on the payload and was
+// read by nothing until now.
+uint32_t D3D12Renderer::SamplerVariantFor(
+    const mx::hle::HleTexturePayload& tex) {
+  uint32_t variant = 0;
+  if (tex.clamp_x >= 2) variant |= kSamplerClampU;
+  if (tex.clamp_y >= 2) variant |= kSamplerClampV;
+  if (!tex.linear_filter) variant |= kSamplerPoint;
+  return variant;
+}
+
 bool D3D12Renderer::CreateGamePipeline() {
   LogInfo("CreateGamePipeline: starting");
 
@@ -154,7 +192,7 @@ bool D3D12Renderer::CreateGamePipeline() {
   {
     D3D12_DESCRIPTOR_HEAP_DESC hd = {};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
-    hd.NumDescriptors = kSamplerVariantCount;
+    hd.NumDescriptors = kSamplerHeapSize;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(m_device->CreateDescriptorHeap(&hd,
                                               IID_PPV_ARGS(&m_samplerHeap)))) {
@@ -163,21 +201,11 @@ bool D3D12Renderer::CreateGamePipeline() {
     }
     m_samplerDescriptorSize = m_device->GetDescriptorHandleIncrementSize(
         D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+    // The reserved first block. The stand-in path indexes these directly by
+    // variant; the translated path copies them into its own per-slot blocks.
     auto cpu = m_samplerHeap->GetCPUDescriptorHandleForHeapStart();
-    for (uint32_t i = 0; i < kSamplerVariantCount; ++i) {
-      D3D12_SAMPLER_DESC sd = {};
-      sd.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
-      sd.AddressU = (i & kSamplerClampU)
-                        ? D3D12_TEXTURE_ADDRESS_MODE_CLAMP
-                        : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-      sd.AddressV = (i & kSamplerClampV)
-                        ? D3D12_TEXTURE_ADDRESS_MODE_CLAMP
-                        : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
-      sd.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
-      sd.MaxAnisotropy = 1;
-      sd.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
-      sd.MinLOD = 0.0f;
-      sd.MaxLOD = 0.0f;
+    for (uint32_t i = 0; i < kSamplerBlockSlots; ++i) {
+      const D3D12_SAMPLER_DESC sd = SamplerVariantDesc(i);
       m_device->CreateSampler(&sd, cpu);
       cpu.ptr += SIZE_T(m_samplerDescriptorSize);
     }
@@ -611,6 +639,58 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
   return true;
 }
 
+bool D3D12Renderer::BindTranslatedSamplers(const GameDraw& d,
+                                           D3D12_GPU_DESCRIPTOR_HANDLE& out) {
+  if (!m_samplerHeap) return false;
+
+  // The configuration first, as a key. Slots past what the shader declares
+  // repeat slot 0, matching how BindTranslatedTextures fills the SRV table --
+  // the range covers all sixteen whether or not the shader samples them, so
+  // every one needs a defined descriptor.
+  uint32_t variants[kSamplerBlockSlots] = {};
+  uint64_t key = 0;
+  for (uint32_t i = 0; i < kSamplerBlockSlots; ++i) {
+    const uint32_t slot = i < d.pixelSamplerCount ? i : 0;
+    // A resolve snapshot is a host render target, not a guest texture: there is
+    // no fetch constant to read a mode off, and it is sampled 1:1, so it takes
+    // the clamped point variant rather than inheriting slot 0's.
+    if (slot < d.pixelSampledObjects.size() && d.pixelSampledObjects[slot]) {
+      variants[i] = kSamplerClampU | kSamplerClampV | kSamplerPoint;
+    } else if (slot < d.pixelTextures.size() && d.pixelTextures[slot]) {
+      variants[i] = SamplerVariantFor(*d.pixelTextures[slot]);
+    }
+    key |= uint64_t(variants[i] & 7u) << (i * 3);
+  }
+
+  if (auto it = m_samplerBlocks.find(key); it != m_samplerBlocks.end()) {
+    out = m_samplerHeap->GetGPUDescriptorHandleForHeapStart();
+    out.ptr += UINT64(it->second) * kSamplerBlockSlots * m_samplerDescriptorSize;
+    return true;
+  }
+  if (m_samplerBlockNext >= kSamplerBlockCount) {
+    // Out of distinct configurations. Fall back to the reserved first block
+    // rather than failing the draw: its slot 0 is the plain linear-wrap variant,
+    // which is what every slot got before this function existed.
+    ++m_samplerBlockExhausted;
+    out = m_samplerHeap->GetGPUDescriptorHandleForHeapStart();
+    return true;
+  }
+
+  // Block 0 is the reserved variant block, so the caches start at 1.
+  const uint32_t block = 1 + m_samplerBlockNext++;
+  auto cpu = m_samplerHeap->GetCPUDescriptorHandleForHeapStart();
+  cpu.ptr += SIZE_T(block) * kSamplerBlockSlots * m_samplerDescriptorSize;
+  for (uint32_t i = 0; i < kSamplerBlockSlots; ++i) {
+    const D3D12_SAMPLER_DESC sd = SamplerVariantDesc(variants[i]);
+    m_device->CreateSampler(&sd, cpu);
+    cpu.ptr += SIZE_T(m_samplerDescriptorSize);
+  }
+  m_samplerBlocks.emplace(key, block);
+  out = m_samplerHeap->GetGPUDescriptorHandleForHeapStart();
+  out.ptr += UINT64(block) * kSamplerBlockSlots * m_samplerDescriptorSize;
+  return true;
+}
+
 ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
                                                   const std::string& hlsl,
                                                   const GameDraw& draw) {
@@ -998,12 +1078,109 @@ bool D3D12Renderer::EnsureYuvPlanes(const GameDraw& draw,
   return true;
 }
 
+// Fills an existing game-texture resource from a decoded payload, and records
+// which content_version it now holds.
+//
+// Split out of EnsureGameTexture so the first fill and every later refill are
+// the same code. Refills exist because Scaleform repacks its glyph atlas under
+// a stable cache key -- see HleTexturePayload::content_version.
+//
+// The upload buffer is per frame in flight: a refill recorded this frame must
+// not write over the staging bytes an earlier frame's CopyTextureRegion may
+// still be reading. The destination resource needs no such care because the
+// copies are ordered against each other on the same queue.
+bool D3D12Renderer::UploadGameTexture(GameTexture& entry,
+                                      const mx::hle::HleTexturePayload& src) {
+  if (!entry.resource || src.data.empty() || !src.row_pitch) return false;
+  const D3D12_RESOURCE_DESC td = entry.resource->GetDesc();
+
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+  UINT rows = 0;
+  UINT64 rowBytes = 0;
+  UINT64 uploadBytes = 0;
+  m_device->GetCopyableFootprints(&td, 0, 1, 0, &footprint, &rows, &rowBytes,
+                                  &uploadBytes);
+
+  auto& upload = entry.upload[m_frameIndex % kFrameCount];
+  if (!upload || upload->GetDesc().Width < uploadBytes) {
+    D3D12_RESOURCE_DESC bd = {};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = uploadBytes;
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.Format = DXGI_FORMAT_UNKNOWN;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    D3D12_HEAP_PROPERTIES uploadHeap = {};
+    uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+    if (upload) {
+      // Retire rather than release: a command list does not keep the resources
+      // it references alive. Same list the YUV planes use.
+      RetiredFrame& r =
+          (!m_retired.empty() && m_retired.back().fence == m_fenceValue)
+              ? m_retired.back()
+              : m_retired.emplace_back(RetiredFrame{m_fenceValue, {}});
+      r.res.push_back(std::move(upload));
+      upload.Reset();
+    }
+    if (FAILED(m_device->CreateCommittedResource(
+            &uploadHeap, D3D12_HEAP_FLAG_NONE, &bd,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+            IID_PPV_ARGS(&upload))))
+      return false;
+  }
+
+  uint8_t* mapped = nullptr;
+  if (FAILED(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped))))
+    return false;
+  const uint32_t copyRows =
+      std::min<uint32_t>(rows, uint32_t(src.data.size() / src.row_pitch));
+  const size_t copyBytes = std::min<size_t>(src.row_pitch, size_t(rowBytes));
+  for (uint32_t y = 0; y < copyRows; ++y) {
+    std::memcpy(
+        mapped + footprint.Offset + size_t(y) * footprint.Footprint.RowPitch,
+        src.data.data() + size_t(y) * src.row_pitch, copyBytes);
+  }
+  upload->Unmap(0, nullptr);
+
+  D3D12_RESOURCE_BARRIER barrier = {};
+  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  barrier.Transition.pResource = entry.resource.Get();
+  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+  barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  m_commandList->ResourceBarrier(1, &barrier);
+
+  D3D12_TEXTURE_COPY_LOCATION dst = {};
+  dst.pResource = entry.resource.Get();
+  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  dst.SubresourceIndex = 0;
+  D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+  srcLoc.pResource = upload.Get();
+  srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  srcLoc.PlacedFootprint = footprint;
+  m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &srcLoc, nullptr);
+
+  std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+  m_commandList->ResourceBarrier(1, &barrier);
+
+  entry.uploadedVersion = src.content_version;
+  return true;
+}
+
 bool D3D12Renderer::EnsureGameTexture(
     const std::shared_ptr<const mx::hle::HleTexturePayload>& texture,
     uint32_t& descriptorIndex) {
   if (!texture || texture->data.empty() || !m_gameSrvHeap) return false;
   if (auto it = m_gameTextures.find(texture->key); it != m_gameTextures.end()) {
     descriptorIndex = it->second.descriptorIndex;
+    // The guest repacked this texture under a stable key -- a Scaleform glyph
+    // atlas. Refill the existing resource rather than making a new one: the
+    // key does not change, so a new resource would leak one per repack, and
+    // the descriptor already published in the heap points here.
+    if (it->second.uploadedVersion != texture->content_version)
+      UploadGameTexture(it->second, *texture);
     return true;
   }
   if (m_nextGameSrvDescriptor >= kMaxGameTextures) {
@@ -1088,65 +1265,14 @@ bool D3D12Renderer::EnsureGameTexture(
   td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
   D3D12_HEAP_PROPERTIES defaultHeap = {};
   defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  // Created in the state UploadGameTexture expects to find it in, so the one
+  // upload path serves both the first fill and every later refill.
   if (FAILED(m_device->CreateCommittedResource(
           &defaultHeap, D3D12_HEAP_FLAG_NONE, &td,
-          D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
           IID_PPV_ARGS(&entry.resource))))
     return false;
-
-  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
-  UINT rows = 0;
-  UINT64 rowBytes = 0;
-  UINT64 uploadBytes = 0;
-  m_device->GetCopyableFootprints(&td, 0, 1, 0, &footprint, &rows,
-                                  &rowBytes, &uploadBytes);
-  D3D12_RESOURCE_DESC bd = {};
-  bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-  bd.Width = uploadBytes;
-  bd.Height = 1;
-  bd.DepthOrArraySize = 1;
-  bd.MipLevels = 1;
-  bd.Format = DXGI_FORMAT_UNKNOWN;
-  bd.SampleDesc.Count = 1;
-  bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-  D3D12_HEAP_PROPERTIES uploadHeap = {};
-  uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
-  if (FAILED(m_device->CreateCommittedResource(
-          &uploadHeap, D3D12_HEAP_FLAG_NONE, &bd,
-          D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
-          IID_PPV_ARGS(&entry.upload))))
-    return false;
-
-  uint8_t* mapped = nullptr;
-  if (FAILED(entry.upload->Map(0, nullptr,
-                               reinterpret_cast<void**>(&mapped))))
-    return false;
-  const uint32_t copyRows = std::min<uint32_t>(rows,
-      uint32_t(texture->data.size() / texture->row_pitch));
-  const size_t copyBytes = std::min<size_t>(texture->row_pitch, size_t(rowBytes));
-  for (uint32_t y = 0; y < copyRows; ++y) {
-    std::memcpy(mapped + footprint.Offset + size_t(y) * footprint.Footprint.RowPitch,
-                texture->data.data() + size_t(y) * texture->row_pitch,
-                copyBytes);
-  }
-  entry.upload->Unmap(0, nullptr);
-
-  D3D12_TEXTURE_COPY_LOCATION dst = {};
-  dst.pResource = entry.resource.Get();
-  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  dst.SubresourceIndex = 0;
-  D3D12_TEXTURE_COPY_LOCATION src = {};
-  src.pResource = entry.upload.Get();
-  src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  src.PlacedFootprint = footprint;
-  m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-  D3D12_RESOURCE_BARRIER barrier = {};
-  barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-  barrier.Transition.pResource = entry.resource.Get();
-  barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-  barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-  barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-  m_commandList->ResourceBarrier(1, &barrier);
+  if (!UploadGameTexture(entry, *texture)) return false;
 
   if (m_nextGameSrvDescriptor >= kMaxGameTextures) return false;
   entry.descriptorIndex = m_nextGameSrvDescriptor++;
@@ -1952,10 +2078,13 @@ void D3D12Renderer::RenderGameFrame() {
       m_commandList->SetGraphicsRootConstantBufferView(
           1, d.pscb->GetGPUVirtualAddress());
       m_commandList->SetGraphicsRootDescriptorTable(2, translatedSrvTable);
-      auto samp = m_samplerHeap->GetGPUDescriptorHandleForHeapStart();
-      samp.ptr += UINT64(std::min(d.samplerIndex, kSamplerVariantCount - 1)) *
-                  m_samplerDescriptorSize;
-      m_commandList->SetGraphicsRootDescriptorTable(3, samp);
+      // One sampler per slot. This used to offset a four-descriptor heap by a
+      // single per-draw variant index while the root signature's sampler range
+      // declared sixteen — so slot 1 of a multi-sampler shader read the next
+      // variant along and slot 4 onwards read off the end of the heap.
+      D3D12_GPU_DESCRIPTOR_HANDLE samp = {};
+      if (BindTranslatedSamplers(d, samp))
+        m_commandList->SetGraphicsRootDescriptorTable(3, samp);
       m_commandList->IASetPrimitiveTopology(d.topology);
       if (d.gpuVertex) {
         // One stream: the guest's raw attributes. No stand-in vertex and no
@@ -2021,8 +2150,14 @@ void D3D12Renderer::RenderGameFrame() {
       // The guest's own address mode for this texture, rather than WRAP for
       // everything. Only meaningful for a textured draw; the untextured PSO
       // never samples.
+      //
+      // The address bits arrive on the draw; the filter is read here off the
+      // texture itself, so graphics_system stays a pass-through and the two
+      // paths agree on what a variant index means.
+      uint32_t variant = d.samplerIndex & (kSamplerClampU | kSamplerClampV);
+      if (d.texture && !d.texture->linear_filter) variant |= kSamplerPoint;
       auto samp = m_samplerHeap->GetGPUDescriptorHandleForHeapStart();
-      samp.ptr += UINT64(std::min(d.samplerIndex, kSamplerVariantCount - 1)) *
+      samp.ptr += UINT64(std::min(variant, kSamplerVariantCount - 1)) *
                   m_samplerDescriptorSize;
       m_commandList->SetGraphicsRootDescriptorTable(2, samp);
     }
@@ -2073,11 +2208,14 @@ void D3D12Renderer::RenderGameFrame() {
     // the hooks rather than at anything here.
     std::snprintf(message, sizeof(message),
                   "translated bind failures: block-exhausted %llu, "
-                  "no-snapshot %llu, no-texture %llu, upload-failed %llu",
+                  "no-snapshot %llu, no-texture %llu, upload-failed %llu; "
+                  "sampler blocks %zu of %u, exhausted %llu",
                   static_cast<unsigned long long>(m_translatedBlockExhausted),
                   static_cast<unsigned long long>(m_translatedNoSnapshot),
                   static_cast<unsigned long long>(m_translatedNoTexture),
-                  static_cast<unsigned long long>(m_translatedUploadFailed));
+                  static_cast<unsigned long long>(m_translatedUploadFailed),
+                  m_samplerBlocks.size(), kSamplerBlockCount,
+                  static_cast<unsigned long long>(m_samplerBlockExhausted));
     LogInfo(message);
     // Separate line rather than a longer format: the snapshot numbers answer a
     // different question (which resolve result a draw sampled) from the routing

@@ -18,6 +18,7 @@
 #include <array>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
 #include <unordered_map>
 #include <string>
@@ -161,9 +162,34 @@ void ClearGameDraws();
   // Sampler variants, indexed by these bits. The guest's per-texture address
   // mode reaches the renderer on HleTexturePayload (clamp_x/clamp_y) and used
   // to be discarded in favour of one static WRAP sampler.
+  // kSamplerPoint carries the guest's own min/mag filter, decoded onto
+  // HleTexturePayload::linear_filter and, until this bit existed, thrown away:
+  // every texture was sampled MIN_MAG_MIP_LINEAR whatever the guest asked for.
+  // A UI font atlas blitted one texel to one pixel is exactly the case that
+  // asks for point, and filtering it linearly blends each glyph edge with its
+  // neighbour in both axes -- the smeared menu text.
   static constexpr uint32_t kSamplerClampU = 1;
   static constexpr uint32_t kSamplerClampV = 2;
-  static constexpr uint32_t kSamplerVariantCount = 4;
+  static constexpr uint32_t kSamplerPoint = 4;
+  static constexpr uint32_t kSamplerVariantCount = 8;
+
+  // A shader-visible sampler heap is capped at 2048 descriptors, which is what
+  // sizes everything below. The first block holds the single-descriptor
+  // variants the stand-in path indexes directly; the remaining blocks are
+  // kTranslatedSamplerSlots wide, because the translated root signature's
+  // sampler range is that wide and a table must be contiguous.
+  //
+  // Blocks are CACHED by their slot configuration rather than allocated per
+  // draw: the configuration is a tuple of 3-bit variants, and this game uses a
+  // handful of distinct ones, so a ring sized for draws was never needed.
+  static constexpr uint32_t kSamplerBlockSlots = 16;
+  static constexpr uint32_t kSamplerBlockCount = 127;
+  static constexpr uint32_t kSamplerHeapSize =
+      kSamplerBlockSlots * (1 + kSamplerBlockCount);
+  static_assert(kSamplerVariantCount <= kSamplerBlockSlots,
+                "the variants must fit in the reserved first block");
+  static_assert(kSamplerHeapSize <= 2048,
+                "a shader-visible sampler heap is capped at 2048 descriptors");
 
   // Frame internals. BeginFrame picks between the two Render* and EndFrame
   // calls PresentGameFrame, so nothing outside this class should ever invoke
@@ -311,6 +337,8 @@ void ClearGameDraws();
   // The descriptor table width. Every block costs this many descriptors, so it
   // multiplies against kMaxTranslatedBlocks into the heap size — see there.
   static constexpr uint32_t kTranslatedSamplerSlots = 16;
+  static_assert(kTranslatedSamplerSlots == kSamplerBlockSlots,
+                "one sampler per texture slot, in one contiguous table");
   // The VS-to-PS linkage width. MUST equal mx::hle::kHlslInterpolatorLinkage:
   // the emitted pixel shader declares its input struct with that many
   // interpolators, and a vertex stage offering a different count produces two
@@ -443,6 +471,25 @@ void ClearGameDraws();
   // must fall back rather than sample an undefined descriptor.
   bool BindTranslatedTextures(const GameDraw& d,
                               D3D12_GPU_DESCRIPTOR_HANDLE& out);
+  // Points `out` at a block holding one sampler per texture slot, matching the
+  // per-slot filter and address mode the guest asked for.
+  //
+  // The translated root signature's sampler range has always been
+  // kTranslatedSamplerSlots wide, but the bind pointed at a four-descriptor
+  // heap offset by a single per-draw variant index -- so slot 1 of any
+  // multi-sampler shader read the next variant along, and slot 4 onwards read
+  // off the end of the heap entirely. This makes the table as wide as the range
+  // that describes it.
+  bool BindTranslatedSamplers(const GameDraw& d,
+                              D3D12_GPU_DESCRIPTOR_HANDLE& out);
+  // Sampler blocks, keyed by their slot configuration -- 3 bits per slot, so
+  // 48 bits of key. Distinct configurations, not draws: the cache is what keeps
+  // 16-wide blocks inside a 2048-descriptor heap.
+  std::map<uint64_t, uint32_t> m_samplerBlocks;
+  uint32_t m_samplerBlockNext = 0;
+  uint64_t m_samplerBlockExhausted = 0;
+  static D3D12_SAMPLER_DESC SamplerVariantDesc(uint32_t variant);
+  static uint32_t SamplerVariantFor(const mx::hle::HleTexturePayload& tex);
   // The fallback transform: an identity matrix, used by any translated draw
   // whose own constant buffer failed to allocate. Bound as a root CBV, so it
   // needs no descriptor heap.
@@ -472,10 +519,19 @@ void ClearGameDraws();
   static constexpr uint32_t kMaxGameTextures = 1024;
   struct GameTexture {
     Microsoft::WRL::ComPtr<ID3D12Resource> resource;
-    Microsoft::WRL::ComPtr<ID3D12Resource> upload;
+    // One upload buffer per frame in flight. A texture whose contents the
+    // guest rewrites is re-uploaded while earlier frames may still be copying
+    // out of their own buffer, so they cannot share one.
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kFrameCount> upload;
     uint32_t descriptorIndex = 0;
+    // The payload content_version this resource was last filled from. A
+    // mismatch means the guest repacked the texture under a stable key and the
+    // resource is showing stale bytes -- see HleTexturePayload::content_version.
+    uint32_t uploadedVersion = 0;
   };
   std::unordered_map<uint64_t, GameTexture> m_gameTextures;
+  bool UploadGameTexture(GameTexture& entry,
+                         const mx::hle::HleTexturePayload& src);
   // The video plane descriptors sit at the head of the heap; the general
   // allocator starts above them.
   //

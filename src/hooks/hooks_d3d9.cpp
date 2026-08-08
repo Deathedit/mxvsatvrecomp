@@ -32,7 +32,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -63,6 +65,7 @@ REXCVAR_DECLARE(bool, hle_capture);
 REXCVAR_DECLARE(uint32_t, hle_shader_exec);
 REXCVAR_DECLARE(uint32_t, hle_shader_verts);
 REXCVAR_DECLARE(bool, hle_gpu_vertex);
+REXCVAR_DECLARE(bool, hle_dump_textures);
 
 namespace {
 
@@ -2884,7 +2887,120 @@ struct ResolvedPixelBinding {
 std::map<uint32_t, ResolvedPixelBinding> g_resolvedPixelBindings;
 std::map<uint64_t, std::shared_ptr<const mx::hle::HleTexturePayload>>
     g_hleCpuTextures;
-std::map<uint64_t, bool> g_hleEmptyTextures;
+// Keys whose decode came out entirely zero. This used to be a set-and-forget
+// flag, which made "blank" permanent: a texture sampled once while the guest
+// was still streaming into it could never be reconsidered, because the key
+// hashes the six fetch dwords -- where the texture lives and what shape it is
+// -- and never its contents.
+//
+// Retrying is what lets a streamed texture appear, but it cannot be free.
+// Measured on the attract sequence, the blank set is three FMT_8_8_8_8
+// surfaces, one 2048x2048 and two at 1280x720 -- the game's render resolution,
+// so they are surfaces the GPU rendered into whose guest copy is legitimately
+// empty and will never fill in. Re-untiling ~9 MB of those every frame forever
+// is pure waste, so each retry that comes back blank doubles the wait before
+// the next one, up to a cap. A texture that is about to arrive is retried
+// almost immediately; one that never arrives settles into costing nothing.
+struct BlankState {
+  uint64_t last_frame = 0;
+  uint32_t strikes = 0;
+};
+std::map<uint64_t, BlankState> g_hleEmptyTextures;
+
+// How many frames to wait after `strikes` consecutive blank decodes.
+uint64_t BlankRetryDelay(uint32_t strikes) {
+  constexpr uint32_t kMaxShift = 7;  // 128 frames, ~2s at 60fps
+  return uint64_t(1) << std::min(strikes, kMaxShift);
+}
+
+// True when a key found blank before is due another look. Unknown keys are due
+// by definition -- they have not been tried.
+bool BlankRetryDue(uint64_t key) {
+  auto it = g_hleEmptyTextures.find(key);
+  if (it == g_hleEmptyTextures.end()) return true;
+  const uint64_t now = mx::hle::D3D9FrameCount();
+  return now >= it->second.last_frame + BlankRetryDelay(it->second.strikes);
+}
+
+//===========================================================================
+// Scaleform's raster glyph cache, and why a texture cache keyed on the fetch
+// constant cannot see it change.
+//
+// The UI is Scaleform GFx 3.x ("Warning: Increase raster glyph cache capacity
+// - TextureConfig." at 0x820D98D8). It keeps ONE 512x512 FMT_8 atlas per font
+// and repacks it at runtime as strings appear and disappear -- dumping the
+// decoded payload three times in one run caught it holding "Loading" /
+// "Press START", then "PHOENIX...", then nearly empty mid-rewrite.
+//
+// The guest side, from the IDB:
+//
+//   sub_8293E720  rasterises one glyph into the cache. It writes rows straight
+//                 into the cache buffer -- `sub_82BDB3C0(row, 0, w)` to clear
+//                 and `sub_82BDAAF0(dst, src, w)` to copy, addressed as
+//                 `(y)*tex[5] + tex[6]` where tex = *(cache+696), [5] is the
+//                 pitch and [6] the base -- then records a dirty rect through
+//                 sub_8293DA08.
+//   sub_8293C778  FLUSHES those rects: it walks the texture slots at +56
+//                 (stride 5, matching sub_8293A888's `cache[5*i + 14]`),
+//                 gathers the rects belonging to each, calls the texture's
+//                 vtable slot 3 -- GTexture::Update(level, n, rects, image) --
+//                 and then clears the count at +28.
+//
+// So sub_8293C778 is the exact moment the atlas contents change, and the
+// pending-rect count at +28 says whether this call will change anything. That
+// is the signal, and it costs nothing on frames where no glyph moved -- which
+// is why it is worth decompiling for rather than hashing every texture every
+// frame.
+//
+// It does NOT say which host texture changed, only that the glyph atlases did.
+// Invalidating every cached single-channel texture is precise enough: kR8 is
+// the glyph format, and the only other kR8 textures in a run are two 32x32
+// ones, so the over-invalidation costs two trivial re-decodes.
+//===========================================================================
+uint32_t g_glyphCacheGeneration = 1;
+uint64_t g_glyphCacheFlushes = 0;
+
+bool IsGlyphCacheFormat(mx::hle::HostTextureFormat format) {
+  return format == mx::hle::HostTextureFormat::kR8;
+}
+
+// True when this cached payload predates the newest glyph-cache flush and so
+// may be showing glyphs that have since been repacked.
+bool GlyphCacheStale(const mx::hle::HleTexturePayload& payload) {
+  return IsGlyphCacheFormat(payload.format) &&
+         payload.content_version != g_glyphCacheGeneration;
+}
+
+// Writes each distinct decoded texture to disk once, as raw host bytes with the
+// geometry in the filename, so the decode can be LOOKED AT rather than reasoned
+// about. Off by default and never hit unless asked for: the question it answers
+// -- is a blurred glyph blurred in the atlas, or only on screen -- cannot be
+// answered from counters, and the two causes need opposite fixes.
+void DumpDecodedTexture(uint64_t key, const mx::hle::HleTexturePayload& payload) {
+  if (!REXCVAR_GET(hle_dump_textures)) return;
+  static std::set<uint64_t> s_dumped;
+  if (!s_dumped.insert(key).second) return;
+  const std::string dir = "logs/texdump";
+  std::filesystem::create_directories(dir);
+  const std::string path = fmt::format(
+      "{}/tex_{:016x}_{}x{}_pitch{}_fmt{}.raw", dir, key, payload.width,
+      payload.height, payload.row_pitch, uint32_t(payload.format));
+  std::ofstream out(path, std::ios::binary);
+  if (!out) return;
+  out.write(reinterpret_cast<const char*>(payload.data.data()),
+            std::streamsize(payload.data.size()));
+  REXLOG_INFO("d3d9: dumped texture {} ({} bytes)", path, payload.data.size());
+}
+
+void NoteBlankDecode(uint64_t key) {
+  BlankState& s = g_hleEmptyTextures[key];
+  s.last_frame = mx::hle::D3D9FrameCount();
+  ++s.strikes;
+}
+// The blank payload itself, so the draws that sample a still-blank key within
+// one frame share a decode instead of repeating it.
+std::map<uint64_t, std::shared_ptr<const mx::hle::HleTexturePayload>>
+    g_hleBlankPayloads;
 
 const ResolvedPixelBinding* ResolvePixelProfile(uint32_t handle) {
   // This used to search every PM4-captured pixel shader for a byte match inside
@@ -3531,11 +3647,119 @@ void ReportSlotFailures() {
   for (const auto& [sampler, n] : g_slotFailFetchBySampler)
     by += fmt::format(" s{}={}", sampler, n);
   REXLOG_INFO("d3d9: slot fill outcomes {}: range {} describe {} copy {} "
-              "decode {} (these still fail the draw); BOUND anyway: all-zero "
-              "{}, unbound-sampler {}; unbound by sampler:{}",
+              "decode {} (these still fail the draw); unbound by sampler:{}",
               total, g_slotFailRange, g_slotFailDescribe, g_slotFailCopy,
-              g_slotFailDecode, g_slotBoundZero, g_slotBoundUnbound,
+              g_slotFailDecode, by.empty() ? " none" : by);
+}
+
+// A texture that DECODED but is entirely zero, and a sampler the guest never
+// bound, are both bound rather than refused -- deliberately, see the notes in
+// ResolvePixelSlotTexture. Their counters used to be printed only inside
+// ReportSlotFailures, which returns early when the hard-failure total is zero.
+// In mx_736 nothing failed, so neither number was ever printed once: draws
+// painting solid black were invisible in the log. They get their own line,
+// fired off their own total.
+uint64_t g_boundZeroReported = 0;
+
+// One entry per distinct all-zero texture, so the offenders can be named rather
+// than counted. The set is small -- nine keys covered 10,890 draws in mx_706 --
+// so it is printed in full. `recovered` is the question the log has to answer:
+// a key that later decodes non-blank was a texture sampled before the guest
+// finished streaming it, which is a caching defect; one that never recovers is
+// a genuinely blank guest texture and a different investigation.
+// Distinguishes the host upload of a blank decode from the host upload of the
+// same texture once it has real contents. Both would otherwise share the
+// fetch-word key that EnsureGameTexture caches on, and the recovered texture
+// would hit the black resource uploaded before it.
+constexpr uint64_t kBlankTextureKeyMarker = 0x8000000000000000ull;
+
+struct BlankTexture {
+  uint32_t sampler = 0;
+  uint32_t address = 0;
+  uint32_t width = 0, height = 0;
+  uint32_t guest_format = 0;
+  uint32_t swizzle = 0;
+  uint64_t first_frame = 0;
+  uint64_t draws = 0;
+  bool recovered = false;
+};
+std::map<uint64_t, BlankTexture> g_blankTextures;
+
+void NoteBlankTexture(uint64_t key, uint32_t sampler,
+                      const mx::hle::HleTextureSource& source) {
+  auto [it, inserted] = g_blankTextures.emplace(key, BlankTexture{});
+  BlankTexture& b = it->second;
+  ++b.draws;
+  if (!inserted) return;
+  b.sampler = sampler;
+  b.address = source.address;
+  b.width = source.width;
+  b.height = source.height;
+  b.guest_format = source.guest_format;
+  b.swizzle = source.swizzle;
+  b.first_frame = mx::hle::D3D9FrameCount();
+  REXLOG_INFO("d3d9: bound-zero texture {:#x}: sampler {} addr {:#x} {}x{} "
+              "guest format {} swizzle {:#o} first seen frame {}",
+              key, sampler, source.address, source.width, source.height,
+              source.guest_format, source.swizzle, b.first_frame);
+}
+
+// Called when a key that was previously all-zero decodes to real data. This is
+// the line that convicts or clears the cache: it can only ever print once the
+// blank decode stops being cached forever.
+void NoteBlankRecovered(uint64_t key) {
+  // Both judgements were made when the texture was blank and are now wrong, so
+  // they are withdrawn rather than left standing: the stand-in path refuses any
+  // key in the empty set as a poor representative of the draw, and the blank
+  // payload is what the within-frame retry would hand back.
+  g_hleEmptyTextures.erase(key);
+  g_hleBlankPayloads.erase(key);
+  auto it = g_blankTextures.find(key);
+  if (it == g_blankTextures.end() || it->second.recovered) return;
+  it->second.recovered = true;
+  REXLOG_INFO("d3d9: bound-zero texture {:#x} RECOVERED on frame {} (was blank "
+              "from frame {}, {} draws sampled black)",
+              key, mx::hle::D3D9FrameCount(), it->second.first_frame,
+              it->second.draws);
+}
+
+void ReportBoundZero() {
+  const uint64_t total = g_slotBoundZero + g_slotBoundUnbound;
+  if (!total || total == g_boundZeroReported ||
+      (total % 2500) != 0)
+    return;
+  g_boundZeroReported = total;
+  size_t outstanding = 0;
+  for (const auto& [key, b] : g_blankTextures)
+    if (!b.recovered) ++outstanding;
+  std::string by;
+  for (const auto& [sampler, n] : g_slotFailFetchBySampler)
+    by += fmt::format(" s{}={}", sampler, n);
+  REXLOG_INFO("d3d9: draws sampling BLACK {}: all-zero texture {}, "
+              "unbound sampler {}; {} distinct blank textures, {} still blank; "
+              "unbound by sampler:{}",
+              total, g_slotBoundZero, g_slotBoundUnbound,
+              g_blankTextures.size(), outstanding,
               by.empty() ? " none" : by);
+}
+
+// Every distinct (guest format, swizzle) pair that reaches a binding, printed
+// once. Two open questions read straight off it: whether any swizzle component
+// is 6 or 7 -- values D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING does not define,
+// so the channel would be undefined rather than wrong -- and whether the
+// k_8_8_8_8 -> R8G8B8A8 mapping is relying on a swizzle that actually performs
+// the BGRA rotation.
+void NoteSwizzleCensus(const mx::hle::HleTextureSource& source) {
+  static std::set<uint64_t> s_seen;
+  const uint64_t pair = (uint64_t(source.guest_format) << 32) | source.swizzle;
+  if (!s_seen.insert(pair).second) return;
+  const uint32_t c[4] = {(source.swizzle >> 0) & 7u, (source.swizzle >> 3) & 7u,
+                         (source.swizzle >> 6) & 7u, (source.swizzle >> 9) & 7u};
+  const bool undefined = c[0] > 5 || c[1] > 5 || c[2] > 5 || c[3] > 5;
+  REXLOG_INFO("d3d9: swizzle census: guest format {} swizzle {:#o} "
+              "components [{} {} {} {}]{}",
+              source.guest_format, source.swizzle, c[0], c[1], c[2], c[3],
+              undefined ? "  <-- UNDEFINED in D3D12 (>5)" : "");
 }
 
 bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
@@ -3588,6 +3812,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     }();
     dc.pixel_textures[slot] = s_unbound;
     ++g_slotBoundUnbound;
+    ReportBoundZero();
     return true;
   }
   HleTextureSource source;
@@ -3614,8 +3839,25 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   const uint64_t key = HleTextureKey(fetch);
   if (auto cached = g_hleCpuTextures.find(key);
       cached != g_hleCpuTextures.end()) {
-    dc.pixel_textures[slot] = cached->second;
-    return true;
+    // A glyph atlas the guest has repacked since this was decoded falls
+    // through to a fresh decode; everything else is served from the cache.
+    if (!GlyphCacheStale(*cached->second)) {
+      dc.pixel_textures[slot] = cached->second;
+      return true;
+    }
+    g_hleCpuTextures.erase(cached);
+  }
+  // A key found blank recently and not yet due another look: bind the decode
+  // the earlier draw made rather than repeating it.
+  if (!BlankRetryDue(key)) {
+    if (auto payload = g_hleBlankPayloads.find(key);
+        payload != g_hleBlankPayloads.end()) {
+      dc.pixel_textures[slot] = payload->second;
+      ++g_slotBoundZero;
+      NoteBlankTexture(key, guest_sampler, source);
+      ReportBoundZero();
+      return true;
+    }
   }
   std::vector<uint8_t> guest;
   if (!CopyTexturePhysical(source, base, guest)) {
@@ -3629,13 +3871,37 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     ReportSlotFailures();
     return false;
   }
+  NoteSwizzleCensus(source);
   // Still recorded, so the single-texture path above keeps skipping it as a
   // representative and the count stays visible -- but no longer a refusal here.
   if (!HleTextureHasNonzeroData(*payload)) {
-    g_hleEmptyTextures.emplace(key, true);
+    NoteBlankDecode(key);
     ++g_slotBoundZero;
+    NoteBlankTexture(key, guest_sampler, source);
+    ReportBoundZero();
+    // Bind the zero for THIS draw -- that trade is settled -- but do not cache
+    // it. The cache key is FNV-1a over the six fetch dwords alone, so it hashes
+    // where the texture lives and what shape it is, never what it contains;
+    // inserting a blank decode under that key froze the texture black for the
+    // rest of the run, because nothing in the tree ever erases or versions an
+    // entry. A texture sampled once while the guest was still streaming into it
+    // could therefore never appear. Leaving it out means the next draw re-reads
+    // guest memory and the texture shows up the frame its upload completes.
+    //
+    // The host cache in EnsureGameTexture keys on payload->key too, so the
+    // blank upload must not sit on the key the recovered texture will use. It
+    // is given a marked key of its own; the real decode arrives under the
+    // unmarked key and uploads as a new resource rather than hitting the black
+    // one.
+    payload->key = key ^ kBlankTextureKeyMarker;
+    g_hleBlankPayloads[key] = payload;
+    dc.pixel_textures[slot] = std::move(payload);
+    return true;
   }
+  NoteBlankRecovered(key);
+  DumpDecodedTexture(key, *payload);
   payload->key = key;
+  payload->content_version = g_glyphCacheGeneration;
   dc.pixel_textures[slot] = payload;
   g_hleCpuTextures.emplace(key, std::move(payload));
   return true;
@@ -3905,15 +4171,23 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
     return false;
   }
   const uint64_t key = HleTextureKey(fetch);
-  if (g_hleEmptyTextures.contains(key)) {
+  // Blank textures are still a poor representative for the one texture this
+  // path picks to stand in for the whole draw -- but only while they ARE blank.
+  // The refusal now expires on the same backoff the translated path retries on,
+  // so a texture the guest streams in later is reconsidered instead of being
+  // written off for the rest of the run.
+  if (!BlankRetryDue(key)) {
     ++s_empty;
     return false;
   }
   auto cached = g_hleCpuTextures.find(key);
   if (cached != g_hleCpuTextures.end()) {
-    dc.texture = cached->second;
-    ++s_ready;
-    return true;
+    if (!GlyphCacheStale(*cached->second)) {
+      dc.texture = cached->second;
+      ++s_ready;
+      return true;
+    }
+    g_hleCpuTextures.erase(cached);
   }
   std::vector<uint8_t> guest;
   if (!CopyTexturePhysical(source, base, guest)) {
@@ -3935,7 +4209,7 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
   }
   size_t nonzero_bytes = 0;
   if (!HleTextureHasNonzeroData(*payload, &nonzero_bytes)) {
-    g_hleEmptyTextures.emplace(key, true);
+    NoteBlankDecode(key);
     ++s_empty;
     if (s_empty <= 12) {
       REXLOG_INFO("d3d9: HLE texture fallback: sampler {} {}x{} format {} "
@@ -3945,7 +4219,10 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
     }
     return false;
   }
+  NoteBlankRecovered(key);
+  DumpDecodedTexture(key, *payload);
   payload->key = key;
+  payload->content_version = g_glyphCacheGeneration;
   dc.texture = payload;
   g_hleCpuTextures.emplace(key, std::move(payload));
   ++s_ready;
@@ -5595,6 +5872,10 @@ void ReportHostPageQueryStats() {
 // does — so the time is not recompiled PPC compute. That traversal reaches D3D9
 // through indirect calls, so either it is blocking inside these hooks or it is
 // not. Turning them off separates those two cases in one run.
+REXCVAR_DEFINE_BOOL(hle_dump_textures, false, "Debug",
+                    "Write each distinct decoded HLE texture to "
+                    "logs/texdump as raw host bytes, once per key.");
+
 REXCVAR_DEFINE_BOOL(d3d9_hooks_passthrough, false, "Debug",
                     "Diagnostic: make the D3D9 HLE hooks pass straight through "
                     "in native mode too. Breaks rendering; isolates whether "
@@ -5629,6 +5910,36 @@ REXCVAR_DEFINE_BOOL(d3d9_hooks_passthrough, false, "Debug",
 // Recorded here because a later round hooking SetVertexDeclaration will need
 // it to get from a declaration pointer back to the elements.
 //=============================================================================
+
+//=============================================================================
+// 0x8293C778 — Scaleform GFx: flush the raster glyph cache's dirty rects.
+//
+// The one guest call that means "the font atlas contents just changed". See
+// the long note by g_glyphCacheGeneration for how it was found and why the
+// texture cache cannot notice this on its own.
+//
+// The pending-rect count at +28 is read BEFORE the original runs, because the
+// original clears it on the way out. Zero pending means this call updates
+// nothing, so frames where no glyph moved cost one load and no invalidation.
+//=============================================================================
+REX_IMPORT(__imp__sub_8293C778, orig_GlyphCacheFlush, void());
+extern "C" REX_FUNC(sub_8293C778) {
+  const uint32_t cache = ctx.r3.u32;
+  uint32_t pending = 0;
+  if (cache && HostPageReadable(REX_RAW_ADDR(cache + 28)))
+    pending = REX_LOAD_U32(cache + 28);
+
+  orig_GlyphCacheFlush(ctx, base);
+
+  if (!pending) return;
+  ++g_glyphCacheGeneration;
+  ++g_glyphCacheFlushes;
+  if (g_glyphCacheFlushes <= 8 || (g_glyphCacheFlushes % 250) == 0) {
+    REXLOG_INFO("d3d9: glyph cache flushed {} times ({} rects this time); "
+                "atlas generation {}",
+                g_glyphCacheFlushes, pending, g_glyphCacheGeneration);
+  }
+}
 
 REX_IMPORT(__imp__sub_82550B80, orig_CreateVertexDeclaration, void());
 extern "C" REX_FUNC(sub_82550B80) {
