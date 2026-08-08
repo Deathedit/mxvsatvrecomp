@@ -1460,6 +1460,7 @@ void D3D12Renderer::RenderGameFrame() {
   m_commandList->SetDescriptorHeaps(2, heaps);
   // Composite draws take their plane descriptor blocks in order within a frame.
   m_yuvDrawsThisFrame = 0;
+  ++m_gameFrame;
   for (auto& [object, target] : m_gameRenderTargets)
     target.usedThisFrame = false;
 
@@ -1609,6 +1610,7 @@ void D3D12Renderer::RenderGameFrame() {
       snap->state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
       // Refreshed: whatever earlier drop marked this stale is now irrelevant.
       snap->stale = false;
+      snap->lastCopyFrame = m_gameFrame;
       // The target is bound again by whichever draw follows; forcing a rebind
       // keeps that from being skipped because boundTargetObject still matches.
       boundTargetObject = 0xFFFFFFFFu;
@@ -1744,6 +1746,14 @@ void D3D12Renderer::RenderGameFrame() {
           !snap->second.stale) {
         sampledPtr = &snap->second;
         ++m_snapshotHits;
+        if (snap->second.width * 2 >= m_width) {
+          const uint64_t age = m_gameFrame - snap->second.lastCopyFrame;
+          ++m_snapshotAge[age == 0   ? 0
+                          : age == 1 ? 1
+                          : age < 10 ? 2
+                          : age < 100 ? 3
+                                      : 4];
+        }
       } else if (d.sampledTextureObject &&
                  m_gameSnapshots.count(d.sampledTextureObject)) {
         ++m_snapshotStaleRefused;
@@ -1990,6 +2000,17 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_snapshotBlankSource),
                   static_cast<unsigned long long>(m_snapshotStaleRefused),
                   uint32_t(m_gameSnapshots.size()));
+    LogInfo(message);
+    // Age of a full-screen snapshot when a draw samples it. The 100+ bucket is
+    // the one that matters: those are whole leftover frames being composited.
+    std::snprintf(message, sizeof(message),
+                  "fullscreen snapshot age at sample: this-frame %llu, "
+                  "last %llu, 2-9 %llu, 10-99 %llu, 100+ %llu",
+                  static_cast<unsigned long long>(m_snapshotAge[0]),
+                  static_cast<unsigned long long>(m_snapshotAge[1]),
+                  static_cast<unsigned long long>(m_snapshotAge[2]),
+                  static_cast<unsigned long long>(m_snapshotAge[3]),
+                  static_cast<unsigned long long>(m_snapshotAge[4]));
     LogInfo(message);
     // Both of these have been non-zero for real reasons — a draw-list cap that
     // dropped resolves, and a descriptor leak that made every creation fail —

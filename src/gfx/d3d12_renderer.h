@@ -567,6 +567,14 @@ void ClearGameDraws();
   // dropped resolve. Each one is a full previous frame NOT painted over this
   // one. A large count means the drop upstream is the defect, not this refusal.
   uint64_t m_snapshotStaleRefused = 0;
+  // Monotonic game-frame counter, for snapshot age at sample time.
+  uint64_t m_gameFrame = 0;
+  // Age histogram of FULL-SCREEN snapshots (>= half the presented width) at the
+  // moment a draw samples one: refreshed this frame, last frame, 2-9, 10-99,
+  // 100+ frames ago. A large 100+ bucket means whole leftover frames are being
+  // composited over the current one. Small snapshots are excluded because
+  // static compositor content is legitimately old and would swamp the signal.
+  uint64_t m_snapshotAge[5] = {};
   uint64_t m_snapshotMissingSource = 0;
   // Resolves lost because the frame's draw list was already full, and snapshot
   // resources that failed to create. Both exist to tell a fix that stopped
@@ -594,6 +602,12 @@ void ClearGameDraws();
     // frames — so age is not evidence of staleness, but a dropped refresh is.
     // Binding one paints a whole previous frame over the current one.
     bool stale = false;
+    // Snapshots only: the frame counter value at the last successful copy into
+    // this snapshot. Age at sample time is the measurement that separates a
+    // static compositor image -- resolved once, sampled for many frames, and
+    // legitimately old -- from a leftover full-screen frame that nothing has
+    // refreshed and that a draw is about to paint over the current one.
+    uint64_t lastCopyFrame = 0;
   };
   std::unordered_map<uint32_t, GameRenderTarget> m_gameRenderTargets;
   // Resolve snapshots, keyed by DESTINATION TEXTURE object rather than by the
