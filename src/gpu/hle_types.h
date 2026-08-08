@@ -225,7 +225,9 @@ struct DrawCall {
   // A slot may instead name a resolved render target, for the post-process
   // chain, which samples resolve results rather than guest memory. The two are
   // parallel arrays because a slot has exactly one or the other.
-  static constexpr uint32_t kMaxPixelTextures = 8;
+  // One per sampler slot a translated pixel shader can declare. Tied to
+  // HlslShader::kMaxSamplerSlots and the renderer's kTranslatedSamplerSlots.
+  static constexpr uint32_t kMaxPixelTextures = 16;
   std::array<std::shared_ptr<const HleTexturePayload>, kMaxPixelTextures>
       pixel_textures;
   std::array<uint32_t, kMaxPixelTextures> pixel_sampled_objects = {};
