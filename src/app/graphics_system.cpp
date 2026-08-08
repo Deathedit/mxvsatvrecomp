@@ -90,6 +90,15 @@ REXCVAR_DEFINE_UINT32(hle_shader_verts, 8, "Debug",
                       "guest vertex shader on. Only has effect when "
                       "hle_shader_exec is non-zero");
 
+// The GPU vertex path is a replacement for the CPU interpreter, not an
+// addition to it, so the only honest way to judge it is the same scene with and
+// without. Both configurations have to be ONE binary or the comparison is
+// between two builds rather than between two paths.
+REXCVAR_DEFINE_BOOL(hle_gpu_vertex, true, "Debug",
+                    "Run the guest's own vertex shader on the GPU for draws "
+                    "whose vertex AND pixel shaders both translate. Off keeps "
+                    "every draw on the CPU interpreter");
+
 // HLE does not yet create a host target for every guest render target. Until
 // it does, mixing the 129x129 shadow pass and other off-screen viewports into
 // the 1280x720 scene produces the long white wedges seen in ST_Southwest.

@@ -62,6 +62,7 @@
 REXCVAR_DECLARE(bool, hle_capture);
 REXCVAR_DECLARE(uint32_t, hle_shader_exec);
 REXCVAR_DECLARE(uint32_t, hle_shader_verts);
+REXCVAR_DECLARE(bool, hle_gpu_vertex);
 
 namespace {
 
@@ -1959,7 +1960,8 @@ ShaderApplyResult ApplyShaderOutputs(
   //    every draw in this game, so this refuses nothing today; it is here so
   //    that if it ever does not, the draw falls back rather than moves.
   const TranslatedShader* vs_translated = TranslatedVertexShader(handle);
-  bool gpu_vertex = vs_translated && vs_translated->source &&
+  bool gpu_vertex = REXCVAR_GET(hle_gpu_vertex) &&
+                    vs_translated && vs_translated->source &&
                     vs_translated->sampler_count == 0 &&
                     VportScaleEnabled(device, base) &&
                     dc.pixel_shader_hlsl != nullptr;
