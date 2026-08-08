@@ -1479,6 +1479,8 @@ void D3D12Renderer::RenderGameFrame() {
   // this frame, present must fall back to m_gameRT rather than blit a target
   // that belongs to an earlier frame.
   m_presentSourceObject = 0;
+  std::unordered_set<uint32_t> fullSizeTargets;
+  uint32_t fullSizeDraws = 0;
   for (const auto& d : m_gameDraws) {
     // A resolve: snapshot the source target as it stands right now, so draws
     // recorded after this point sample these contents rather than whatever the
@@ -1660,8 +1662,17 @@ void D3D12Renderer::RenderGameFrame() {
       // finished scene, and what present should show. Tracked by last write
       // rather than by object identity because which surface ends up on screen
       // is a property of draw order, not of any particular target.
-      if (drawTarget && d.targetWidth == 1280 && d.targetHeight == 720)
+      if (drawTarget && d.targetWidth == 1280 && d.targetHeight == 720) {
         m_presentSourceObject = d.targetObject;
+        // Present shows the LAST guest-backbuffer-sized surface written this
+        // frame. That is only correct if there is exactly one. Seven 1280x720
+        // surfaces are live, and if the guest builds the scene across several
+        // and composites them, presenting one of them shows a single layer --
+        // which is what a white frame with content on one band looks like.
+        // Count the distinct ones per frame rather than assume either way.
+        fullSizeTargets.insert(d.targetObject);
+        ++fullSizeDraws;
+      }
     }
     // The three populations, kept apart on purpose. A draw that never wanted an
     // offscreen target and one that wanted it and was refused both end up on
@@ -2000,6 +2011,15 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_snapshotBlankSource),
                   static_cast<unsigned long long>(m_snapshotStaleRefused),
                   uint32_t(m_gameSnapshots.size()));
+    LogInfo(message);
+    // THIS frame, not cumulative: the question is whether the frame on screen
+    // was assembled on one surface or several. "presented 1 of 1" means present
+    // is showing the finished scene; "1 of 4" means it is showing one layer.
+    std::snprintf(message, sizeof(message),
+                  "present source: object 0x%08X, %u full-size surfaces drawn "
+                  "this frame, %u draws across them",
+                  m_presentSourceObject, uint32_t(fullSizeTargets.size()),
+                  fullSizeDraws);
     LogInfo(message);
     // Age of a full-screen snapshot when a draw samples it. The 100+ bucket is
     // the one that matters: those are whole leftover frames being composited.
