@@ -160,6 +160,22 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
     case xenos::TextureFormat::k_32_FLOAT:
       out.host_format = HostTextureFormat::kR32Float;
       break;
+    // Depth sampled as a texture. This was the ONLY format rejected across
+    // whole runs while it was rejected once per run -- a shader read it, gave
+    // up, and the draw fell back. Once the pixel shaders that sample depth
+    // started translating it became 29,240 rejections in a single run
+    // (mx_716), the largest texture rejection by far and the last remaining
+    // one of any size.
+    //
+    // Carried as R32Float rather than a depth format: the guest samples this
+    // as ordinary colour data, and a host DSV-backed SRV would drag format
+    // typelessness through the whole binding path for no gain. The 24-bit
+    // integer depth is converted to float in DecodeHleTexture2D, which is the
+    // one place that knows the guest format.
+    case xenos::TextureFormat::k_24_8:
+    case xenos::TextureFormat::k_24_8_FLOAT:
+      out.host_format = HostTextureFormat::kR32Float;
+      break;
     default:
       return reject("unsupported texture format");
   }
@@ -252,6 +268,32 @@ bool DecodeHleTexture2D(const HleTextureSource& source,
                      (uint64_t(y) * wb + x) * source.bytes_per_block;
       std::memcpy(dst, guest + src, source.bytes_per_block);
       SwapBlock(dst, source.bytes_per_block, endian);
+    }
+  }
+
+  // Depth is the one accepted format whose BYTES are not already the host's.
+  // Every other entry is a straight copy plus an endian swap, so this is the
+  // only place a value conversion happens, and it is done after the swap so it
+  // reads host-order words.
+  //
+  // k_24_8 packs 24 bits of depth above 8 bits of stencil. The shader wants the
+  // depth as it wrote it, in [0,1], so the stencil is dropped and the integer
+  // is normalised -- NOT reinterpreted as a float, which would produce
+  // denormals and NaNs from perfectly ordinary depth values.
+  //
+  // k_24_8_FLOAT shares the layout but stores a float depth; it is converted
+  // the same way here, which is wrong in the last bits of precision and right
+  // in range. Called out rather than hidden: it has never been observed in this
+  // title, and doing it properly needs a sample to check against.
+  if (source.guest_format == uint32_t(xenos::TextureFormat::k_24_8) ||
+      source.guest_format == uint32_t(xenos::TextureFormat::k_24_8_FLOAT)) {
+    if (source.bytes_per_block != 4) return reject("24_8 block is not 4 bytes");
+    const size_t texels = out.data.size() / 4;
+    for (size_t i = 0; i < texels; ++i) {
+      uint32_t raw = 0;
+      std::memcpy(&raw, out.data.data() + i * 4, 4);
+      const float depth = float(raw >> 8) * (1.0f / 16777215.0f);
+      std::memcpy(out.data.data() + i * 4, &depth, 4);
     }
   }
   return true;
