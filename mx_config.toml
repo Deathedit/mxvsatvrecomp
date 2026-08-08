@@ -92,10 +92,39 @@ memchr = 0x82BDEEB0
 0x82CA4530 = { size = 0x8 }
 0x828D13B8 = { size = 0x18 }
 0x82B09B28 = { size = 0x10 }
+# Vtable-thunk table at 0x82327BF8..0x82327D8F. Every entry is the same four
+# instructions — `lwz r12,0(r3); lwz r11,SLOT(r12); mtctr r11; bctr` — a
+# tail-call through one vtable slot, and IDA defines none of them as functions,
+# so the recompiler skips them and a call lands on "invalid or unregistered
+# function". Four were listed; the rest were found after 0x82327CF0 killed a
+# freeroam run at 1m24s (mx_700), reached via the Lua dispatcher with a null
+# cfunc. They are all reachable the same way, so the whole table is listed
+# rather than waiting for each one to crash in turn. The gaps (0x82327CA8,
+# 0x82327D00, 0x82327D78) are real functions IDA already knows.
+0x82327BF8 = { size = 0x10 }
+0x82327C08 = { size = 0x10 }
 0x82327C18 = { size = 0x10 }
+0x82327C28 = { size = 0x10 }
+0x82327C38 = { size = 0x10 }
 0x82327C48 = { size = 0x10 }
 0x82327C58 = { size = 0x10 }
+0x82327C68 = { size = 0x10 }
+0x82327C78 = { size = 0x10 }
+0x82327C88 = { size = 0x10 }
+0x82327C98 = { size = 0x10 }
+0x82327CB0 = { size = 0x10 }
+0x82327CC0 = { size = 0x10 }
+0x82327CD0 = { size = 0x10 }
+0x82327CE0 = { size = 0x10 }
+0x82327CF0 = { size = 0x10 }
+0x82327D08 = { size = 0x10 }
+0x82327D18 = { size = 0x10 }
+0x82327D28 = { size = 0x10 }
+0x82327D38 = { size = 0x10 }
+0x82327D48 = { size = 0x10 }
 0x82327D58 = { size = 0x10 }
+0x82327D68 = { size = 0x10 }
+0x82327D80 = { size = 0x10 }
 
 #IDA
 0x821D8360 = { size = 0x1CC }
