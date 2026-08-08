@@ -549,20 +549,32 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
       // A resolve result: sample the snapshot the guest resolved into, which is
       // the same resource the stand-in path samples for this object.
       auto it = m_gameSnapshots.find(object);
-      if (it == m_gameSnapshots.end() || !it->second.resource) return false;
+      if (it == m_gameSnapshots.end() || !it->second.resource) {
+        ++m_translatedNoSnapshot;
+        return false;
+      }
       slots[i].resource = it->second.resource.Get();
       slots[i].format = kBackBufferFormat;
       continue;
     }
     const auto& tex = d.pixelTextures[i];
-    if (!tex) return false;
+    if (!tex) {
+      ++m_translatedNoTexture;
+      return false;
+    }
     uint32_t unusedDescriptor = 0;
     // Uploads the texture and gives it its cached descriptor. That descriptor
     // is not the one bound here — it lives in a different heap — but the upload
     // and the resource it creates are exactly what this needs.
-    if (!EnsureGameTexture(tex, unusedDescriptor)) return false;
+    if (!EnsureGameTexture(tex, unusedDescriptor)) {
+      ++m_translatedUploadFailed;
+      return false;
+    }
     auto it = m_gameTextures.find(tex->key);
-    if (it == m_gameTextures.end() || !it->second.resource) return false;
+    if (it == m_gameTextures.end() || !it->second.resource) {
+      ++m_translatedUploadFailed;
+      return false;
+    }
     slots[i].resource = it->second.resource.Get();
     slots[i].format = it->second.resource->GetDesc().Format;
     slots[i].swizzle = tex->swizzle;
@@ -1995,6 +2007,19 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_standInDraws),
                   static_cast<unsigned long long>(m_translatedOk),
                   static_cast<unsigned long long>(m_translatedFailed));
+    LogInfo(message);
+    // Which of the four bind failures sent a translatable draw to the stand-in.
+    // The counts are what decide the next move: block-exhausted means the ring
+    // is undersized or not being reset, no-snapshot means the draw wants a
+    // resolve result we never captured, and the texture ones point upstream at
+    // the hooks rather than at anything here.
+    std::snprintf(message, sizeof(message),
+                  "translated bind failures: block-exhausted %llu, "
+                  "no-snapshot %llu, no-texture %llu, upload-failed %llu",
+                  static_cast<unsigned long long>(m_translatedBlockExhausted),
+                  static_cast<unsigned long long>(m_translatedNoSnapshot),
+                  static_cast<unsigned long long>(m_translatedNoTexture),
+                  static_cast<unsigned long long>(m_translatedUploadFailed));
     LogInfo(message);
     // Separate line rather than a longer format: the snapshot numbers answer a
     // different question (which resolve result a draw sampled) from the routing

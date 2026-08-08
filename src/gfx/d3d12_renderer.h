@@ -359,6 +359,13 @@ void ClearGameDraws();
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_translatedSrvHeap;
   uint32_t m_translatedBlockNext = 0;
   uint64_t m_translatedBlockExhausted = 0;
+  // Why a draw with a translated shader fell back to the stand-in anyway. All
+  // four used to be a silent `return false`, which made "translated 17243,
+  // stand-in 670699" impossible to act on: it could not distinguish a shader
+  // we cannot bind from a resource we cannot find.
+  uint64_t m_translatedNoSnapshot = 0;
+  uint64_t m_translatedNoTexture = 0;
+  uint64_t m_translatedUploadFailed = 0;
   // Points `out` at a block holding this draw's textures. False when a block
   // could not be allocated or a slot had no resource, in which case the draw
   // must fall back rather than sample an undefined descriptor.
