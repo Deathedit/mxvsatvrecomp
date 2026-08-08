@@ -21,16 +21,9 @@ enum class HostTextureFormat : uint8_t {
   kBc5,
   kR16Float,
   kRgba16Float,
-  // Added from measurement, not from the enum: these are the only guest
-  // formats the decoder was seen to turn down across four runs. kBgra4 is the
-  // front end's own format (3/3 runs, the sole rejection there); kR8 and kR16
-  // appear only under --force_load=NAT_Farm.
   kBgra4,
   kR8,
   kR16,
-  // Only became visible once kR8/kR16 stopped failing: those rejections were
-  // ending the binding scan before it reached this sampler. Measured 71/90/79
-  // across three farm runs.
   kR32Float,
 };
 
