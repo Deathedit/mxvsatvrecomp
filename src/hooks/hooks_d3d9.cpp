@@ -3416,12 +3416,44 @@ bool CopyTexturePhysical(const mx::hle::HleTextureSource& source, uint8_t* base,
 // Fills exactly one of the two per-slot outputs: a resolved render target if
 // the guest bound one there, otherwise a decoded CPU payload. Returns false
 // when neither could be produced, and the caller decides whether that is fatal.
+// Why a sampler slot could not be filled. A slot that fails sends the WHOLE
+// draw back to the tex*col stand-in, so these are the draws the guest's own
+// pixel shader was translated for and then not used on -- 26,844 of them in
+// mx_705, which is essentially every stand-in draw in that run. Six of the
+// seven exits below were previously silent, and the one that logged fired once.
+uint64_t g_slotFailRange = 0, g_slotFailFetch = 0, g_slotFailDescribe = 0;
+uint64_t g_slotFailCopy = 0, g_slotFailDecode = 0;
+uint64_t g_slotBoundZero = 0;   // all-zero, and bound anyway -- see below
+// Which guest sampler had no readable fetch constant. The open question this
+// answers is whether the shaders' samplers 8-15 index the bank the same way
+// 0-7 do: a failure spread evenly over low samplers means genuinely unbound
+// slots, whereas one concentrated at and above 8 means the indexing is wrong.
+std::map<uint32_t, uint64_t> g_slotFailFetchBySampler;
+
+void ReportSlotFailures() {
+  const uint64_t total = g_slotFailRange + g_slotFailFetch +
+                         g_slotFailDescribe + g_slotFailCopy + g_slotFailDecode;
+  if (!total || (total % 5000) != 0) return;
+  std::string by;
+  for (const auto& [sampler, n] : g_slotFailFetchBySampler)
+    by += fmt::format(" s{}={}", sampler, n);
+  REXLOG_INFO("d3d9: slot fill failures {}: range {} fetch-unreadable {} "
+              "describe {} copy {} decode {}; all-zero BOUND {}; "
+              "unreadable by sampler:{}",
+              total, g_slotFailRange, g_slotFailFetch, g_slotFailDescribe,
+              g_slotFailCopy, g_slotFailDecode, g_slotBoundZero,
+              by.empty() ? " none" : by);
+}
+
 bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
                              uint32_t guest_sampler, uint32_t device,
                              uint8_t* base) {
   using namespace mx::hle;
-  if (slot >= DrawCall::kMaxPixelTextures || guest_sampler >= kMaxSamplers)
+  if (slot >= DrawCall::kMaxPixelTextures || guest_sampler >= kMaxSamplers) {
+    ++g_slotFailRange;
+    ReportSlotFailures();
     return false;
+  }
 
   // A slot the guest points at a resolve result: the renderer samples the live
   // host target, exactly as the single-texture path already does.
@@ -3433,28 +3465,56 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   }
 
   uint32_t fetch[6] = {};
-  if (!ReadLiveTextureFetch(device, base, guest_sampler, fetch)) return false;
+  if (!ReadLiveTextureFetch(device, base, guest_sampler, fetch)) {
+    ++g_slotFailFetch;
+    ++g_slotFailFetchBySampler[guest_sampler];
+    ReportSlotFailures();
+    return false;
+  }
   HleTextureSource source;
   const char* why = nullptr;
   if (!DescribeHleTexture2D(fetch, source, &why)) {
     NoteRejectedTextureFormat("slot", guest_sampler, source, why, fetch);
+    ++g_slotFailDescribe;
+    ReportSlotFailures();
     return false;
   }
+  // NOTE the empty-texture set is deliberately NOT consulted here.
+  //
+  // It is consulted by the single-texture path, which CHOOSES one sampler to
+  // represent the draw -- there, skipping a blank candidate is right, because
+  // a blank one is a poor representative of a shader that reads several.
+  //
+  // This path does not choose. The translated shader NAMES this sampler, and
+  // the guest bound a texture to it that decodes, from readable memory, to
+  // zeros. Then zero is the value the guest's own shader samples, and black is
+  // the correct answer. Refusing it reverted the whole draw to the tex*col
+  // stand-in -- discarding every other slot's real shading to avoid a black
+  // sample that was never wrong. That cost 10,890 draws in mx_706, from just
+  // nine distinct all-zero textures, because the refusal is cached per key.
   const uint64_t key = HleTextureKey(fetch);
-  if (g_hleEmptyTextures.contains(key)) return false;
   if (auto cached = g_hleCpuTextures.find(key);
       cached != g_hleCpuTextures.end()) {
     dc.pixel_textures[slot] = cached->second;
     return true;
   }
   std::vector<uint8_t> guest;
-  if (!CopyTexturePhysical(source, base, guest)) return false;
-  auto payload = std::make_shared<HleTexturePayload>();
-  if (!DecodeHleTexture2D(source, guest.data(), guest.size(), *payload, &why))
+  if (!CopyTexturePhysical(source, base, guest)) {
+    ++g_slotFailCopy;
+    ReportSlotFailures();
     return false;
+  }
+  auto payload = std::make_shared<HleTexturePayload>();
+  if (!DecodeHleTexture2D(source, guest.data(), guest.size(), *payload, &why)) {
+    ++g_slotFailDecode;
+    ReportSlotFailures();
+    return false;
+  }
+  // Still recorded, so the single-texture path above keeps skipping it as a
+  // representative and the count stays visible -- but no longer a refusal here.
   if (!HleTextureHasNonzeroData(*payload)) {
     g_hleEmptyTextures.emplace(key, true);
-    return false;
+    ++g_slotBoundZero;
   }
   payload->key = key;
   dc.pixel_textures[slot] = payload;
