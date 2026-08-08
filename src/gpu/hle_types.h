@@ -246,6 +246,41 @@ struct DrawCall {
   // selected was ever read.
   std::vector<uint8_t> interpolators;
 
+  // The guest VERTEX shader, translated to HLSL, and the raw attribute stream
+  // the emitted `XeVsIn` consumes. Null/empty means this draw keeps the CPU
+  // interpreter, which is still the path for every draw whose vertex or pixel
+  // shader did not translate.
+  //
+  // Only populated when BOTH stages translate. A GPU vertex stage feeding the
+  // stand-in pixel shader would have to also reproduce everything the CPU path
+  // derives on the side — the param_gen UV reconstruction above all — so the
+  // migration is per draw and takes both stages together or neither.
+  uint32_t vertex_shader_handle = 0;
+  std::shared_ptr<const std::string> vertex_shader_hlsl;
+
+  // The registers the translated vertex shader reads, ascending. This is the
+  // same order `EmitShaderHlsl` walks `input_mask` to declare
+  // `float4 vN : TEXCOORDN`, so input element i carries register
+  // `vertex_input_regs[i]` at semantic index that register number.
+  //
+  // Keyed by REGISTER, not by attribute, and that distinction is measured: 816
+  // of 15,000 draws (5.4%) have two vfetch attributes writing one register with
+  // complementary destination swizzles — a mini-fetch completing a full one.
+  // One element per attribute would declare the same register twice and the
+  // second would clobber the first, which is the exact bug shader_alu.cpp
+  // documents at its own seeding loop.
+  static constexpr uint32_t kMaxVertexInputs = 32;
+  std::array<uint8_t, kMaxVertexInputs> vertex_input_regs = {};
+  uint32_t vertex_input_count = 0;
+
+  // One float4 per declared register per vertex, tightly packed in
+  // `vertex_input_regs` order: stride is vertex_input_count * 16.
+  std::vector<uint8_t> vertex_inputs;
+
+  // The guest's VERTEX ALU constant bank (constants 0-255 at device+0x780), in
+  // the same shape as `pixel_constants`: constant i is vertex_constants[i * 4].
+  std::vector<uint32_t> vertex_constants;
+
   // The guest's PIXEL ALU constant bank, as raw dwords, indexed the way the
   // shader indexes it: constant i is pixel_constants[i * 4].
   //

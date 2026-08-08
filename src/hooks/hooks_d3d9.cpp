@@ -43,6 +43,12 @@
 #include <d3dcompiler.h>
 #include <wrl/client.h>
 
+// For the vfetch destination swizzle, so the GPU vertex path merges attributes
+// into registers by exactly the rule shader_alu.cpp seeds its register file
+// with. Two decoders of the same field that disagree is the bug that decoder
+// exists to prevent.
+#include <rex/graphics/format/ucode.h>
+
 #include "gpu/d3d9_draw.h"
 #include "gpu/d3d9_layout.h"
 #include "gpu/d3d9_texture.h"
@@ -58,6 +64,8 @@ REXCVAR_DECLARE(uint32_t, hle_shader_exec);
 REXCVAR_DECLARE(uint32_t, hle_shader_verts);
 
 namespace {
+
+namespace uc = rex::graphics::ucode;
 
 using mx::hle::DeviceState;
 
@@ -837,6 +845,22 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
                         mx::hle::PixelTextureBinding& binding);
 void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
                         const uint32_t* code, uint32_t count);
+// The emitted source, kept per shader handle. Shared with every draw that binds
+// the shader, so a frame's ~158 draws across a few dozen shaders copy a pointer
+// rather than a few kilobytes of text each.
+//
+// Defined here rather than beside the emitter probe that fills it because
+// ApplyShaderOutputs — which is further up the file — now reads the vertex
+// stage's input_mask to build the GPU vertex layout.
+struct TranslatedShader {
+  std::shared_ptr<const std::string> source;  // null unless emitted AND compiled
+  uint32_t input_mask = 0;
+  uint32_t sampler_mask = 0;
+  uint32_t sampler_count = 0;
+  uint32_t slot_guest[mx::hle::HlslShader::kMaxSamplerSlots] = {};
+  uint32_t max_const_index = 0;
+};
+const TranslatedShader* TranslatedVertexShader(uint32_t handle);
 void ProbePixelProfileForDraw(uint32_t pixel_shader, uint32_t device,
                               uint8_t* base,
                               const mx::hle::DrawCall& dc);
@@ -1745,6 +1769,13 @@ uint64_t g_hleShaderBadStream = 0, g_hleShaderBadConstants = 0;
 uint64_t g_hleShaderBadVertex = 0;
 uint64_t g_hleShaderIdentityMvp = 0, g_hleShaderViewportMvp = 0;
 
+// How many draws qualify for the GPU vertex path. This is the migration's
+// bisector: it says what share of the frame can leave the interpreter before
+// anything is actually switched over, so a regression can be attributed to the
+// switch rather than to the qualifying rule.
+uint64_t g_gpuVertexDraws = 0, g_gpuVertexSkipped = 0;
+uint64_t g_gpuVertexUndeclared = 0;
+
 // Some shaders are already resident before the title reaches
 // PatchVertexShaderToMatchVertexDeclaration, so the exact post-call capture
 // above never observes them.  SH_pPhysical still names the live allocation
@@ -1775,14 +1806,16 @@ ShaderApplyResult ApplyShaderOutputs(
           "vertices; skipped no-code {} decode {} stream {} constants {} "
           "vertex {}; output transform identity {} viewport {} (VTE scale-on "
           "{} off {} unreadable {}, disagrees with old tie-break {}); live "
-          "shader resolved {} no-match {} ambiguous {} unreadable {}",
+          "shader resolved {} no-match {} ambiguous {} unreadable {}; GPU "
+          "vertex path {} draws qualify, {} skipped ({} undeclared reg)",
           g_hleShaderAttempts, g_hleShaderDraws, g_hleShaderVertices,
           g_hleShaderNoCode, g_hleShaderBadDecode, g_hleShaderBadStream,
           g_hleShaderBadConstants, g_hleShaderBadVertex,
           g_hleShaderIdentityMvp, g_hleShaderViewportMvp, g_vteSeen[2],
           g_vteSeen[1], g_vteSeen[0], g_hleShaderMvpDisagree,
           g_liveVertexResolved, g_liveVertexNoMatch, g_liveVertexAmbiguous,
-          g_liveVertexUnreadable);
+          g_liveVertexUnreadable, g_gpuVertexDraws, g_gpuVertexSkipped,
+          g_gpuVertexUndeclared);
     }
   } report{attempt};
   if (!handle || !device) {
@@ -1893,6 +1926,70 @@ ShaderApplyResult ApplyShaderOutputs(
   uint8_t vtx[kMaxStreams][256];
   std::vector<std::array<float, 4>> values(attrs.size());
 
+  // ---- The GPU vertex path ------------------------------------------------
+  //
+  // Qualifying is deliberately narrow, and every condition is a thing that
+  // would otherwise be guessed at:
+  //
+  //  - BOTH stages must have translated. A GPU vertex stage under the stand-in
+  //    pixel shader would still owe it the reconstructed param_gen UV and the
+  //    single selected interpolator, both of which are computed from
+  //    ExecuteVertexShader's result below. Taking the stages together means
+  //    none of that has to be reproduced — the rasterizer does it natively.
+  //  - Every attribute's destination must be a register the shader declares.
+  //    An attribute writing an undeclared register has nowhere to go, and
+  //    dropping it silently would feed the shader a zero it never saw on the
+  //    console. Measured over 15,000 draws this never happened (0 undeclared),
+  //    but the check costs nothing and turns a would-be silent wrong answer
+  //    into a fallback.
+  //
+  // The layout is one element per REGISTER, not per attribute: 5.4% of draws
+  // have two vfetches sharing a register with complementary destination
+  // swizzles, and one element each would clobber rather than merge.
+  const TranslatedShader* vs_translated = TranslatedVertexShader(handle);
+  bool gpu_vertex = vs_translated && vs_translated->source &&
+                    dc.pixel_shader_hlsl != nullptr;
+  if (gpu_vertex) {
+    for (const auto& a : attrs) {
+      if (a.dest_reg >= 32 ||
+          !(vs_translated->input_mask & (1u << a.dest_reg))) {
+        gpu_vertex = false;
+        ++g_gpuVertexUndeclared;
+        break;
+      }
+    }
+  }
+  uint32_t input_stride = 0;
+  // reg_slot[r] = which input element register r occupies, or 0xFF.
+  uint8_t reg_slot[32];
+  std::memset(reg_slot, 0xFF, sizeof(reg_slot));
+  if (gpu_vertex) {
+    dc.vertex_input_count = 0;
+    for (uint32_t r = 0; r < 32; ++r) {
+      if (!(vs_translated->input_mask & (1u << r))) continue;
+      if (dc.vertex_input_count >= mx::hle::DrawCall::kMaxVertexInputs) {
+        gpu_vertex = false;
+        break;
+      }
+      reg_slot[r] = uint8_t(dc.vertex_input_count);
+      dc.vertex_input_regs[dc.vertex_input_count++] = uint8_t(r);
+    }
+  }
+  if (gpu_vertex) {
+    input_stride = dc.vertex_input_count * 16;
+    // Zeroed, and that is the correct default rather than a convenience: the
+    // interpreter's register file starts at zero, so a destination swizzle of
+    // "keep" on a component no fetch writes must read zero, not stale bytes.
+    dc.vertex_inputs.assign(size_t(dc.vertex_count) * input_stride, 0);
+    dc.vertex_shader_handle = handle;
+    dc.vertex_shader_hlsl = vs_translated->source;
+    dc.vertex_constants = consts;
+    ++g_gpuVertexDraws;
+  } else {
+    dc.vertex_input_count = 0;
+    ++g_gpuVertexSkipped;
+  }
+
   // The interpolator stream for a translated pixel shader. Allocated only when
   // this draw has one: it is 128 bytes per vertex and a frame carries six
   // figures of vertices.
@@ -1974,6 +2071,34 @@ ShaderApplyResult ApplyShaderOutputs(
         return ShaderApplyResult::kFailed;
       }
       values[a] = {f[0], f[1], f[2], f[3]};
+    }
+
+    // Merge the attributes into their destination registers, by exactly the
+    // rule shader_alu.cpp:614 seeds its register file with — three bits per
+    // destination component, 0-3 selecting x/y/z/w of the fetched value, 4 and
+    // 5 the constants 0.0 and 1.0, 7 meaning keep. `kKeep` is the whole reason
+    // two fetches can share a register, so writing all four components would
+    // reintroduce the clobber that decoder documents.
+    if (gpu_vertex) {
+      float* regs = reinterpret_cast<float*>(dc.vertex_inputs.data() +
+                                             size_t(v) * input_stride);
+      for (size_t a = 0; a < attrs.size(); ++a) {
+        const uint32_t slot = reg_slot[attrs[a].dest_reg & 31];
+        if (slot == 0xFF) continue;  // cannot happen; qualifying proved it
+        float* d = regs + size_t(slot) * 4;
+        const uint32_t swiz = attrs[a].dest_swizzle;
+        for (uint32_t c = 0; c < 4; ++c) {
+          switch (uc::GetFetchDestinationComponentSwizzle(swiz, c)) {
+            case uc::FetchDestinationSwizzle::kX: d[c] = values[a][0]; break;
+            case uc::FetchDestinationSwizzle::kY: d[c] = values[a][1]; break;
+            case uc::FetchDestinationSwizzle::kZ: d[c] = values[a][2]; break;
+            case uc::FetchDestinationSwizzle::kW: d[c] = values[a][3]; break;
+            case uc::FetchDestinationSwizzle::k0: d[c] = 0.0f; break;
+            case uc::FetchDestinationSwizzle::k1: d[c] = 1.0f; break;
+            default: break;  // kKeep, and the one undefined encoding
+          }
+        }
+      }
     }
 
     const AluResult r = ExecuteVertexShader(
@@ -2386,22 +2511,17 @@ std::string HlslCoverageSummary(const HlslCoverage& c) {
   return s;
 }
 
-// The emitted source, kept per shader handle. Shared with every draw that binds
-// the shader, so a frame's ~158 draws across a few dozen shaders copy a pointer
-// rather than a few kilobytes of text each.
-struct TranslatedShader {
-  std::shared_ptr<const std::string> source;  // null unless emitted AND compiled
-  uint32_t input_mask = 0;
-  uint32_t sampler_mask = 0;
-  uint32_t sampler_count = 0;
-  uint32_t slot_guest[mx::hle::HlslShader::kMaxSamplerSlots] = {};
-  uint32_t max_const_index = 0;
-};
 std::map<uint32_t, TranslatedShader> g_translatedPs;
+std::map<uint32_t, TranslatedShader> g_translatedVs;
 
 const TranslatedShader* TranslatedPixelShader(uint32_t handle) {
   const auto it = g_translatedPs.find(handle);
   return it == g_translatedPs.end() ? nullptr : &it->second;
+}
+
+const TranslatedShader* TranslatedVertexShader(uint32_t handle) {
+  const auto it = g_translatedVs.find(handle);
+  return it == g_translatedVs.end() ? nullptr : &it->second;
 }
 
 void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
@@ -2451,16 +2571,16 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
     // Retained only for shaders that both emitted and compiled. A source the
     // compiler rejects must never reach the renderer, which would only discover
     // the same failure later and with less context.
-    if (stage == mx::hle::HlslStage::kPixel) {
-      TranslatedShader& t = g_translatedPs[handle];
-      t.source = std::make_shared<const std::string>(std::move(out.source));
-      t.input_mask = out.input_mask;
-      t.sampler_mask = out.sampler_mask;
-      t.sampler_count = out.sampler_count;
-      for (uint32_t i = 0; i < out.sampler_count; ++i)
-        t.slot_guest[i] = out.sampler_slot_guest[i];
-      t.max_const_index = out.max_const_index;
-    }
+    TranslatedShader& kept = (stage == mx::hle::HlslStage::kPixel
+                                  ? g_translatedPs
+                                  : g_translatedVs)[handle];
+    kept.source = std::make_shared<const std::string>(std::move(out.source));
+    kept.input_mask = out.input_mask;
+    kept.sampler_mask = out.sampler_mask;
+    kept.sampler_count = out.sampler_count;
+    for (uint32_t i = 0; i < out.sampler_count; ++i)
+      kept.slot_guest[i] = out.sampler_slot_guest[i];
+    kept.max_const_index = out.max_const_index;
   } else {
     ++cov.compile_failed;
   }
