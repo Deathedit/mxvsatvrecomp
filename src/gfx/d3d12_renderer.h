@@ -388,6 +388,10 @@ void ClearGameDraws();
   // Of the translated draws, how many also ran the guest's VERTEX shader. This
   // is the one that says whether the CPU interpreter is still the frame.
   uint64_t m_gpuVertexDraws = 0;
+  // Draws that brought a vertex stage and could not be given one, so had to be
+  // dropped: their vertices were never transformed by anything. Must stay at
+  // zero — anything else is geometry missing from the picture.
+  uint64_t m_gpuVertexDropped = 0;
 
   // A shader's textures have to sit in ONE contiguous descriptor range, and the
   // cached per-texture descriptors in m_gameSrvHeap are scattered — a texture

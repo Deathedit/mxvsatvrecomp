@@ -2047,10 +2047,11 @@ void D3D12Renderer::RenderGameFrame() {
     // draws in a corner do".
     std::snprintf(message, sizeof(message),
                   "guest shaders: %llu draws TRANSLATED (%llu of them running "
-                  "the guest VERTEX shader too), %llu stand-in; "
-                  "%llu pipelines built, %llu failed",
+                  "the guest VERTEX shader too, %llu dropped for want of one), "
+                  "%llu stand-in; %llu pipelines built, %llu failed",
                   static_cast<unsigned long long>(m_translatedDraws),
                   static_cast<unsigned long long>(m_gpuVertexDraws),
+                  static_cast<unsigned long long>(m_gpuVertexDropped),
                   static_cast<unsigned long long>(m_standInDraws),
                   static_cast<unsigned long long>(m_translatedOk),
                   static_cast<unsigned long long>(m_translatedFailed));
@@ -2254,17 +2255,35 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
     }
   }
 
+  // Does this draw bring the guest's own vertex stage? Decided BEFORE the
+  // translated gate below, because it changes what that gate requires: a draw
+  // running the guest vertex shader has no interpolator stream and must not
+  // have one. Demanding it anyway is what turned every qualifying draw into a
+  // stand-in draw holding vertices the interpreter no longer transformed —
+  // a flat red frame, and zero translated draws in a run where 36,064
+  // qualified.
+  const bool hasVertexStage =
+      vertexStage && vertexStage->handle && vertexStage->hlsl &&
+      vertexStage->inputs && vertexStage->inputBytes && vertexStage->regs &&
+      vertexStage->regCount && vertexStage->regCount <= 32 &&
+      vertexStage->constants && vertexStage->constDwords;
+
   // The translated path needs all of its inputs or none of them. A shader run
   // without its interpolators reads undefined registers, and one run without
   // its constants computes from zeros — both produce a confident wrong picture
   // rather than a visible failure, which is worse than keeping the stand-in.
   //
+  // "Its interpolators" means the CPU-built stream only when the CPU built the
+  // vertices. With the guest vertex shader running, the rasterizer produces
+  // them and there is nothing to require.
+  //
   // The sampler limit is the honest current boundary: a descriptor block per
   // draw is not built yet, so only a shader reading a single texture can be
   // bound correctly, using the descriptor this draw already has. Multi-sampler
   // shaders keep the stand-in until that lands.
-  if (d.pixelShaderHlsl && d.pixelShaderHandle && interpolators &&
-      interpBytes && pixelConstants && pixelConstDwords && pixelSamplerCount &&
+  if (d.pixelShaderHlsl && d.pixelShaderHandle &&
+      (hasVertexStage || (interpolators && interpBytes)) && pixelConstants &&
+      pixelConstDwords && pixelSamplerCount &&
       pixelSamplerCount <= kTranslatedSamplerSlots) {
     // The shader's cbuffer is xe_c[256] followed by xe_texsize[slots], so the
     // buffer must cover BOTH. Sizing it to the constant bank alone would leave
@@ -2273,33 +2292,40 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
     const uint32_t bankBytes = pixelConstDwords * 4;
     const uint32_t texSizeBytes = kTranslatedSamplerSlots * 16;
     const uint32_t constBytes = ((bankBytes + texSizeBytes) + 255u) & ~255u;
-    if (createBuffer(d.ivb, interpBytes) && createBuffer(d.pscb, constBytes)) {
-      void* p = nullptr;
-      D3D12_RANGE none = {0, 0};
-      if (SUCCEEDED(d.ivb->Map(0, &none, &p)) && p) {
-        std::memcpy(p, interpolators, interpBytes);
+    // Built only for the CPU-vertex shape. A zero-byte buffer is not a valid
+    // D3D12 resource, so this cannot simply fall out of interpBytes == 0.
+    bool haveInterp = hasVertexStage;
+    if (!hasVertexStage && createBuffer(d.ivb, interpBytes)) {
+      void* ip = nullptr;
+      D3D12_RANGE inone = {0, 0};
+      if (SUCCEEDED(d.ivb->Map(0, &inone, &ip)) && ip) {
+        std::memcpy(ip, interpolators, interpBytes);
         d.ivb->Unmap(0, nullptr);
         d.ivbv.BufferLocation = d.ivb->GetGPUVirtualAddress();
         d.ivbv.SizeInBytes = interpBytes;
         d.ivbv.StrideInBytes =
             kTranslatedInterpolators * 4 * uint32_t(sizeof(float));
-        p = nullptr;
-        if (SUCCEEDED(d.pscb->Map(0, &none, &p)) && p) {
-          std::memset(p, 0, constBytes);
-          std::memcpy(p, pixelConstants, bankBytes);
-          // xe_texsize, immediately after the bank. An unnormalized fetch
-          // multiplies its coordinate by this, so it must be the extent of the
-          // texture actually bound at that slot — with one sampler that is this
-          // draw's texture. Left zero when there is none, which makes such a
-          // fetch read texel 0 rather than something plausible.
-          if (d.texture) {
-            float ts[4] = {float(d.texture->width), float(d.texture->height),
-                           0.0f, 0.0f};
-            std::memcpy(static_cast<uint8_t*>(p) + bankBytes, ts, sizeof(ts));
-          }
-          d.pscb->Unmap(0, nullptr);
-          d.translated = true;
+        haveInterp = true;
+      }
+    }
+    if (haveInterp && createBuffer(d.pscb, constBytes)) {
+      void* p = nullptr;
+      D3D12_RANGE none = {0, 0};
+      if (SUCCEEDED(d.pscb->Map(0, &none, &p)) && p) {
+        std::memset(p, 0, constBytes);
+        std::memcpy(p, pixelConstants, bankBytes);
+        // xe_texsize, immediately after the bank. An unnormalized fetch
+        // multiplies its coordinate by this, so it must be the extent of the
+        // texture actually bound at that slot — with one sampler that is this
+        // draw's texture. Left zero when there is none, which makes such a
+        // fetch read texel 0 rather than something plausible.
+        if (d.texture) {
+          float ts[4] = {float(d.texture->width), float(d.texture->height),
+                         0.0f, 0.0f};
+          std::memcpy(static_cast<uint8_t*>(p) + bankBytes, ts, sizeof(ts));
         }
+        d.pscb->Unmap(0, nullptr);
+        d.translated = true;
       }
     }
     if (!d.translated) {
@@ -2319,10 +2345,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   // is what the rasterizer does natively, and the param_gen UV becomes
   // SV_Position in a pixel shader that reads it. So there is nothing to carry
   // across — only something to stop doing.
-  if (d.translated && vertexStage && vertexStage->handle && vertexStage->hlsl &&
-      vertexStage->inputs && vertexStage->inputBytes && vertexStage->regs &&
-      vertexStage->regCount && vertexStage->regCount <= 32 &&
-      vertexStage->constants && vertexStage->constDwords) {
+  if (d.translated && hasVertexStage) {
     // The emitted cbuffer is xe_c[256] followed by xe_texsize[slots] in BOTH
     // stages, so the buffer has to cover both here too. Sizing it to the
     // constant bank alone leaves the shader reading past the end of the
@@ -2362,6 +2385,15 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
       d.vsvb.Reset();
       d.vscb.Reset();
     }
+  }
+  // A draw that brought a vertex stage and could not get one has no path left.
+  // Its `vb` holds the raw declaration positions, NOT transformed ones — the
+  // interpreter did not run for it — so the stand-in would paint untransformed
+  // geometry over the scene. Dropping it loses one draw; falling back paints a
+  // wrong one, and a whole frame of them is a flat red screen.
+  if (hasVertexStage && !d.gpuVertex) {
+    ++m_gpuVertexDropped;
+    return;
   }
   d.blendEnable = blendEnable;
   d.srcBlend = srcBlend;
