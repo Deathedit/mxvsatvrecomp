@@ -70,14 +70,18 @@ enum class HlslStatus : uint8_t {
   kUnsupportedVectorOp,
   kUnsupportedScalarOp,
   kUnsupportedFetch,      // relative or non-2D texture fetch
-  // The three causes the one status above used to hide. They need different
-  // fixes -- a cube fetch needs a TextureCube binding and a direction
-  // reconstruction, a relative fetch needs an index we do not have -- so a
-  // combined count could not say which work would pay.
+  // The causes the one status above used to hide. They need different fixes --
+  // a relative fetch needs an index we do not have, a 3D fetch needs a resource
+  // type we do not create -- so a combined count could not say which work would
+  // pay. It said exactly that for cube, which turned out to be the largest
+  // bucket and is now translated.
   kFetchRelative,         // src or dest indexed by a register
-  kFetchCube,             // dimension kCube
-  kFetch1D,               // dimension k1D
+  kFetchCube,             // UNUSED: cube fetches translate, see EmitTextureFetch
+  kFetch1D,               // UNUSED: 1D fetches translate through a 2D binding
   kFetch3D,               // dimension k3DOrStacked
+  // Two fetches on one sampler slot at different dimensions. The slot gets one
+  // HLSL declaration and one descriptor, so neither choice can serve both.
+  kFetchDimensionConflict,
   kTooManySamplers,       // more distinct samplers than kMaxSamplerSlots
   kLoopRelative,          // aL-relative index; no honest value for aL
   kInstructionCap,
@@ -129,6 +133,17 @@ struct HlslShader {
   static constexpr uint32_t kMaxSamplerSlots = 16;
   uint32_t sampler_count = 0;
   uint32_t sampler_slot_guest[kMaxSamplerSlots] = {};
+
+  // Bit i set = compact slot i is declared Texture2DArray, not Texture2D,
+  // because its fetches are cube. The binder MUST create a TEXTURE2DARRAY SRV
+  // for those slots: an SRV whose dimension contradicts the declaration is
+  // undefined, not merely wrong-looking.
+  uint32_t sampler_array_mask = 0;
+
+  // A cube fetch appeared in a shader that never ran the `cube` ALU op, so the
+  // (S, T, face) operand form this translation assumes was produced by
+  // something we have not seen. Diagnostic only -- reported, not refused.
+  bool cube_fetch_without_cube_op = false;
 
   // Bit i set = register i is read before this shader ever writes it, i.e. it
   // arrives as an input. For a pixel shader these are the interpolators the

@@ -34,6 +34,7 @@
 #include <cstring>
 #include <filesystem>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -66,6 +67,7 @@ REXCVAR_DECLARE(uint32_t, hle_shader_exec);
 REXCVAR_DECLARE(uint32_t, hle_shader_verts);
 REXCVAR_DECLARE(bool, hle_gpu_vertex);
 REXCVAR_DECLARE(bool, hle_dump_textures);
+REXCVAR_DECLARE(bool, hle_dump_shaders);
 
 namespace {
 
@@ -880,6 +882,119 @@ std::map<uint64_t, uint64_t> g_viewportExtents;
 // not a guessed match between EDRAM tile base and system-memory address.
 std::map<uint32_t, uint32_t> g_resolvedTextureTargets;
 
+// The same relationship keyed by the destination's GUEST MEMORY ADDRESS, so a
+// draw that samples a DIFFERENT texture object naming the same memory still
+// finds the snapshot. Object identity above cannot see that case, and it is
+// what leaves a resolved surface decoding to zeros -- black -- because the CPU
+// path then reads memory the GPU wrote and the emulator never populated.
+//
+// This is NOT the guess the note above refuses. That warning is about matching
+// an EDRAM tile base (`color_info & 0xFFF`, a 10 MB tile index) against a
+// system-memory address -- two different address spaces. Both sides here are
+// the SAME field: `base_address << 12` out of a texture fetch constant, read
+// from the destination texture at resolve time and from the sampled texture at
+// draw time. Exact equality of one field, not a correspondence between two.
+//
+// The extent is carried so the match can be refused when it disagrees: guest
+// allocators recycle addresses, and a later texture at a freed address must not
+// inherit the earlier one's snapshot.
+struct ResolvedTargetByAddress {
+  uint32_t dest_object = 0;
+  uint32_t source_object = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+};
+// Keyed by PHYSICAL address -- see GpuPhysicalAddress.
+std::map<uint32_t, ResolvedTargetByAddress> g_resolvedTargetsByAddress;
+
+// The same physical page is visible through several virtual windows on this
+// console, and the guest uses different ones for the same surface. Measured in
+// mx_755: the resolve destinations are 0xBDD20000 and 0xBEDA0000 while the
+// draws that sample them describe 0x1DD20000 and 0x1EDA0000 -- identical once
+// the window is removed. Comparing the raw `base_address << 12` therefore
+// misses every one of them.
+//
+// The conversion is TRANSCRIBED FROM THE GUEST, not derived. D3DDevice_Resolve
+// (0x8255CE98) tail-calls sub_8255BD48, which computes the destination address
+// its command packet carries as:
+//
+//     v55 = base & 0xFFFFF000;
+//     v68 = ((v55 >> 20) + 512) & 0x1000;      // conditional +4 KB
+//     v70 = v55 & 0x1FFFFFFF;                  // low 512 MB
+//     v75 = <dest-point offset> + v68 + v70;
+//
+// The same idiom appears twice more in that function (the vertex-buffer address
+// at v148[2], and v172), so it is the runtime's standard virtual -> GPU
+// physical conversion rather than anything specific to one path.
+//
+// Masking alone was WRONG, and wrong in a way that looked right: for the
+// 0xA0000000-window addresses the adjustment term is zero, so plain masking
+// matched two of the three surfaces and left the third one page short --
+//
+//     0xBDD20000 -> 0xDDD & 0x1000 = 0      -> 0x1DD20000   (mask agrees)
+//     0xBEDA0000 -> 0xDED & 0x1000 = 0      -> 0x1EDA0000   (mask agrees)
+//     0xFA2E2000 -> 0x11A2 & 0x1000 = 0x1000 -> 0x1A2E3000  (mask is 0x1000 low)
+//
+// -- and 0x1A2E3000 is exactly the address the draw samples for the 2048x2048
+// menu-scene atlas. One formula accounts for all three.
+uint32_t GpuPhysicalAddress(uint32_t address) {
+  const uint32_t page_aligned = address & 0xFFFFF000u;
+  return (page_aligned & 0x1FFFFFFFu) +
+         (((page_aligned >> 20) + 512u) & 0x1000u);
+}
+
+// Resolves that named a destination but were never recorded, because the source
+// slot was never seen by SetRenderTarget or SnapshotRenderTarget rejected its
+// extent. This was silent, and a resolve lost here is indistinguishable
+// downstream from a texture the guest never filled.
+uint64_t g_resolveDroppedNoSource = 0;
+uint64_t g_resolveAddressMatches = 0;   // blanks rescued by the address match
+uint64_t g_resolveAddressExtentMiss = 0;  // same address, different extent
+
+// The destination texture object whose snapshot covers this described texture,
+// or 0. Matches on the guest memory address the two fetch constants agree on,
+// and refuses when the extents disagree -- an address the guest allocator has
+// recycled describes a different texture, and inheriting the old snapshot would
+// swap a black surface for a confidently wrong one.
+const ResolvedTargetByAddress* ResolvedTargetForAddress(
+    const mx::hle::HleTextureSource& described) {
+  if (!described.address) return nullptr;
+  const uint32_t physical = GpuPhysicalAddress(described.address);
+  const auto it = g_resolvedTargetsByAddress.find(physical);
+  if (it == g_resolvedTargetsByAddress.end()) {
+    // A resolve destination of the SAME extent that starts near this address,
+    // but not at it. Reported and deliberately NOT claimed: an atlas built by
+    // many small resolves into sub-rects (mx_755 has a 256x256 surface
+    // resolving into a 2048x2048 destination) would need an offset-aware
+    // sample this path cannot express, and guessing would trade a black
+    // texture for a confidently misplaced one.
+    static uint64_t s_near = 0;
+    for (const auto& [addr, e] : g_resolvedTargetsByAddress) {
+      if (e.width != described.width || e.height != described.height) continue;
+      const uint32_t delta = physical > addr ? physical - addr : addr - physical;
+      if (delta && delta <= 0x10000u && ++s_near <= 8) {
+        REXLOG_INFO("d3d9: resolve NEAR-MISS: sampled phys 0x{:08X} {}x{} vs "
+                    "resolve dest phys 0x{:08X} (delta 0x{:X}) -- not claimed",
+                    physical, described.width, described.height, addr, delta);
+      }
+    }
+    return nullptr;
+  }
+  if (it->second.width != described.width ||
+      it->second.height != described.height) {
+    ++g_resolveAddressExtentMiss;
+    static uint64_t s_logged = 0;
+    if (++s_logged <= 8) {
+      REXLOG_INFO("d3d9: resolve phys 0x{:08X} matched but extent differs: "
+                  "resolve {}x{} vs sampled {}x{} -- not claimed",
+                  physical, it->second.width, it->second.height,
+                  described.width, described.height);
+    }
+    return nullptr;
+  }
+  return &it->second;
+}
+
 // Stage C — run the guest's own vertex shader over this draw's vertices.
 // Defined further down, next to the microcode it needs; declared here because
 // the draw builder is the only place that has the vertices and the streams
@@ -910,6 +1025,7 @@ struct TranslatedShader {
   uint32_t input_mask = 0;
   uint32_t sampler_mask = 0;
   uint32_t sampler_count = 0;
+  uint32_t sampler_array_mask = 0;
   uint32_t slot_guest[mx::hle::HlslShader::kMaxSamplerSlots] = {};
   uint32_t max_const_index = 0;
 };
@@ -1288,6 +1404,28 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   dc.viewport_width = viewport_width;
   dc.viewport_height = viewport_height;
   const auto& rt = st.render_target[0];
+  // Which THREAD saw which render target. DeviceState() is `static
+  // thread_local` (d3d9_state.cpp:15), and both this and the Resolve hook read
+  // st.render_target[] out of it -- so a draw recorded on a worker thread and a
+  // resolve issued on the guest thread can disagree about what the target is.
+  // Every missing resolve source measured in mx_759 reported "ever a draw
+  // target: NO", which is exactly what that disagreement looks like from the
+  // renderer. This pairs the two so they can be compared directly.
+  {
+    static std::mutex s_mu;
+    static std::set<uint64_t> s_seen;
+    const uint64_t id = (uint64_t(GetCurrentThreadId()) << 32) | rt.object;
+    bool first = false;
+    {
+      std::lock_guard<std::mutex> lock(s_mu);
+      first = s_seen.insert(id).second && s_seen.size() <= 48;
+    }
+    if (first) {
+      REXLOG_INFO("d3d9: DRAW thread {} render target 0x{:08X} {}x{} valid={}",
+                  GetCurrentThreadId(), rt.object, rt.width, rt.height,
+                  rt.valid);
+    }
+  }
   if (rt.valid) {
     dc.render_target_object = rt.object;
     dc.render_target_surface_info = rt.surface_info;
@@ -2760,9 +2898,18 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
     kept.input_mask = out.input_mask;
     kept.sampler_mask = out.sampler_mask;
     kept.sampler_count = out.sampler_count;
+    kept.sampler_array_mask = out.sampler_array_mask;
     for (uint32_t i = 0; i < out.sampler_count; ++i)
       kept.slot_guest[i] = out.sampler_slot_guest[i];
     kept.max_const_index = out.max_const_index;
+    if (out.sampler_array_mask) {
+      REXLOG_INFO("d3d9: HLSL {} 0x{:08X} declares cube slots 0x{:X}{}",
+                  stage == mx::hle::HlslStage::kPixel ? "PS" : "VS",
+                  handle, out.sampler_array_mask,
+                  out.cube_fetch_without_cube_op
+                      ? " -- WITHOUT a cube ALU op, coordinate form unverified"
+                      : "");
+    }
   } else {
     ++cov.compile_failed;
   }
@@ -3002,6 +3149,24 @@ void NoteBlankDecode(uint64_t key) {
 std::map<uint64_t, std::shared_ptr<const mx::hle::HleTexturePayload>>
     g_hleBlankPayloads;
 
+// The captured microcode itself, once per handle. Counters say a shader was
+// refused; only the instruction stream says what it actually asks for. Written
+// as raw little-endian dwords exactly as CollectPixelShaderBlob captured them,
+// so tools/ucode_test can walk it with the same decoder the emitter uses.
+void DumpPixelShaderBlob(uint32_t handle, const uint32_t* code, uint32_t count) {
+  if (!REXCVAR_GET(hle_dump_shaders)) return;
+  static std::set<uint32_t> s_dumped;
+  if (!s_dumped.insert(handle).second) return;
+  const std::string dir = "logs/shaderdump";
+  std::filesystem::create_directories(dir);
+  const std::string path = fmt::format("{}/ps_{:08X}.bin", dir, handle);
+  std::ofstream out(path, std::ios::binary);
+  if (!out) return;
+  out.write(reinterpret_cast<const char*>(code),
+            std::streamsize(count) * 4);
+  REXLOG_INFO("d3d9: dumped pixel shader {} ({} dwords)", path, count);
+}
+
 const ResolvedPixelBinding* ResolvePixelProfile(uint32_t handle) {
   // This used to search every PM4-captured pixel shader for a byte match inside
   // the D3D9 allocation, to locate where the CF stream began. CollectPixelShaderBlob
@@ -3016,6 +3181,7 @@ const ResolvedPixelBinding* ResolvePixelProfile(uint32_t handle) {
   ResolvedPixelBinding resolved;
   const uint32_t* code = bi->second.data();
   uint32_t code_count = uint32_t(bi->second.size());
+  DumpPixelShaderBlob(handle, code, code_count);
   ReportHlslCoverage(mx::hle::HlslStage::kPixel, handle, code, code_count);
   resolved.decoded = mx::hle::DecodePixelTextureFetches(
       code, code_count, resolved.bindings, &resolved.fail);
@@ -3737,10 +3903,12 @@ void ReportBoundZero() {
     by += fmt::format(" s{}={}", sampler, n);
   REXLOG_INFO("d3d9: draws sampling BLACK {}: all-zero texture {}, "
               "unbound sampler {}; {} distinct blank textures, {} still blank; "
-              "unbound by sampler:{}",
+              "unbound by sampler:{}; resolve address matches {} (extent "
+              "mismatches {}), resolves dropped for no source {}",
               total, g_slotBoundZero, g_slotBoundUnbound,
               g_blankTextures.size(), outstanding,
-              by.empty() ? " none" : by);
+              by.empty() ? " none" : by, g_resolveAddressMatches,
+              g_resolveAddressExtentMiss, g_resolveDroppedNoSource);
 }
 
 // Every distinct (guest format, swizzle) pair that reaches a binding, printed
@@ -3823,6 +3991,22 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     ReportSlotFailures();
     return false;
   }
+
+  // The same memory a resolve wrote into, reached through a different texture
+  // object than the one the resolve named -- so the object test above missed
+  // it. Sample the snapshot rather than decoding guest memory the GPU wrote and
+  // the emulator never populated, which reads as zeros and paints black.
+  //
+  // Placed after the describe because the address and extent it matches on come
+  // out of it, and before the decode because the decode is precisely what has
+  // to be skipped.
+  if (const ResolvedTargetByAddress* resolved =
+          ResolvedTargetForAddress(source)) {
+    dc.pixel_sampled_objects[slot] = resolved->dest_object;
+    ++g_resolveAddressMatches;
+    return true;
+  }
+
   // NOTE the empty-texture set is deliberately NOT consulted here.
   //
   // It is consulted by the single-texture path, which CHOOSES one sampler to
@@ -3947,6 +4131,7 @@ void AttachTranslatedPixelShader(mx::hle::DrawCall& dc, uint32_t handle,
   if (const TranslatedShader* t = TranslatedPixelShader(handle)) {
     dc.pixel_shader_hlsl = t->source;
     dc.pixel_sampler_count = t->sampler_count;
+    dc.pixel_sampler_array_mask = t->sampler_array_mask;
     // The PIXEL constant bank, ALU constants 256-511 at device+0x1780. Captured
     // per draw because the guest rewrites it between draws, and captured only
     // for a shader that will use it. Its base is applied here so the shader can
@@ -4145,6 +4330,26 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
   dc.sampled_texture_height = source.height;
   dc.clamp_x = uint8_t(source.clamp_x);
   dc.clamp_y = uint8_t(source.clamp_y);
+
+  // The address route, for the same reason as in ResolvePixelSlotTexture: this
+  // memory is a resolve destination reached through a texture object the
+  // resolve never named, so the object test above missed it.
+  //
+  // Both routing fields are set here rather than left to PrepareHleDraw, which
+  // sets them only when its own object lookup hits. It runs after this and does
+  // not clear them on a miss, so these survive.
+  if (const ResolvedTargetByAddress* resolved =
+          ResolvedTargetForAddress(source)) {
+    ++s_mapped;
+    ++g_resolveAddressMatches;
+    dc.sampled_texture_object = resolved->dest_object;
+    dc.sampled_render_target_object = resolved->source_object;
+    // The renderer samples the snapshot; uploading the empty guest storage
+    // alongside it would just be the black texture again.
+    dc.texture.reset();
+    return true;
+  }
+
   // kR8 and kR16 join this list on the same reasoning as the others: they are
   // single-channel, so binding one as visible base colour would paint the
   // surface grey. They are decoded rather than rejected so the counters can
@@ -5876,6 +6081,10 @@ REXCVAR_DEFINE_BOOL(hle_dump_textures, false, "Debug",
                     "Write each distinct decoded HLE texture to "
                     "logs/texdump as raw host bytes, once per key.");
 
+REXCVAR_DEFINE_BOOL(hle_dump_shaders, false, "Debug",
+                    "Write each distinct captured pixel shader microcode blob "
+                    "to logs/shaderdump, once per handle.");
+
 REXCVAR_DEFINE_BOOL(d3d9_hooks_passthrough, false, "Debug",
                     "Diagnostic: make the D3D9 HLE hooks pass straight through "
                     "in native mode too. Breaks rendering; isolates whether "
@@ -6715,8 +6924,82 @@ extern "C" REX_FUNC(sub_8255CE98) {
   else if (source_slot == 4)
     source = &st.depth_stencil;
 
+  // A resolve that names a destination but cannot be recorded. Counted and
+  // logged because it used to be silent, and it is one of the two ways a
+  // resolved surface ends up sampled as black.
+  if (dest_texture && (!source || !source->valid)) {
+    ++g_resolveDroppedNoSource;
+    static std::map<uint32_t, uint64_t> s_dropped;
+    if (s_dropped[dest_texture]++ == 0) {
+      REXLOG_INFO("d3d9: resolve DROPPED (no valid source): slot {} dest "
+                  "0x{:08X}; source {} {}x{} -- this destination will decode "
+                  "from guest memory and read black",
+                  source_slot, dest_texture,
+                  source ? "invalid" : "absent",
+                  source ? source->width : 0, source ? source->height : 0);
+    }
+  }
+
+  // The other half of the thread pairing above.
+  {
+    static std::set<uint64_t> s_seen;
+    const uint64_t id =
+        (uint64_t(GetCurrentThreadId()) << 32) | (source ? source->object : 0);
+    if (s_seen.insert(id).second && s_seen.size() <= 32) {
+      REXLOG_INFO("d3d9: RESOLVE thread {} source slot {} object 0x{:08X} "
+                  "valid={}",
+                  GetCurrentThreadId(), source_slot,
+                  source ? source->object : 0, source && source->valid);
+    }
+  }
+
+  uint32_t dest_extent_width = 0, dest_extent_height = 0;
   if (dest_texture && source && source->valid) {
     g_resolvedTextureTargets[dest_texture] = source->object;
+
+    // The destination's own fetch constant, which is where its guest memory
+    // address lives. The six dwords sit at +0x1C..+0x30 -- the same offsets
+    // SetTexture copies from -- and DescribeHleTexture2D already turns them
+    // into an address and an extent, so nothing here decodes a bitfield by
+    // hand. Only dword 0 used to be read, and only to print.
+    if (HostPageReadable(REX_RAW_ADDR(dest_texture + 0x1C)) &&
+        HostPageReadable(REX_RAW_ADDR(dest_texture + 0x30))) {
+      uint32_t dest_fetch[6] = {};
+      for (uint32_t i = 0; i < 6; ++i)
+        dest_fetch[i] = REX_LOAD_U32(dest_texture + 0x1C + i * 4);
+      mx::hle::HleTextureSource dest_desc;
+      if (mx::hle::DescribeHleTexture2D(dest_fetch, dest_desc, nullptr) &&
+          dest_desc.address) {
+        const uint32_t physical = GpuPhysicalAddress(dest_desc.address);
+        auto& entry = g_resolvedTargetsByAddress[physical];
+        const bool first = entry.dest_object == 0;
+        entry.dest_object = dest_texture;
+        entry.source_object = source->object;
+        entry.width = dest_desc.width;
+        entry.height = dest_desc.height;
+        // Carried to the renderer so the snapshot is sized to the destination
+        // TEXTURE rather than to the region this one resolve covers.
+        dest_extent_width = dest_desc.width;
+        dest_extent_height = dest_desc.height;
+        if (first) {
+          // DestLevel and DestSliceOrFace, which this hook has never read. A
+          // resolve into a level or slice lands at base + that subresource's
+          // offset, so ignoring them is a candidate explanation for the atlas
+          // whose sampled base sits exactly one 4 KB page above the base
+          // recorded here.
+          REXLOG_INFO("d3d9: resolve dest addr 0x{:08X} (phys 0x{:08X}) {}x{} "
+                      "<- texture 0x{:08X} from surface 0x{:08X} ({}x{}); "
+                      "level={} slice={} destpoint={} ({},{}) srcrect={} "
+                      "({},{})..({},{})",
+                      dest_desc.address, physical, dest_desc.width,
+                      dest_desc.height, dest_texture, source->object,
+                      source->width, source->height, ctx.r8.u32, ctx.r9.u32,
+                      have_dest_point, dest_point[0], dest_point[1],
+                      have_src_rect, src_rect[0], src_rect[1], src_rect[2],
+                      src_rect[3]);
+        }
+      }
+    }
     // Queue the resolve itself, not just the relationship.
     //
     // Recording the mapping alone left the renderer binding the source target's
@@ -6734,6 +7017,8 @@ extern "C" REX_FUNC(sub_8255CE98) {
       PendingHleDraw pending{};
       pending.draw.resolve_dest_texture = dest_texture;
       pending.draw.resolve_source_object = source->object;
+      pending.draw.resolve_dest_width = dest_extent_width;
+      pending.draw.resolve_dest_height = dest_extent_height;
       // Without an explicit destination point, the source rectangle's origin is
       // the best available answer: a banded resolve names the band's place in
       // the full image there. Zero when neither is supplied, which is the whole

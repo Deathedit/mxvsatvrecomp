@@ -25,6 +25,12 @@ struct HleTextureSource {
   uint32_t swizzle = 0;
   uint32_t clamp_x = 0;
   uint32_t clamp_y = 0;
+  // 1 for a plain 2D or 1D texture; 6 for a cube; stack_depth+1 for a stacked
+  // 2D. Each slice is a whole 2D image of the width/height above, and
+  // slice_stride_bytes is the distance between their bases in guest memory
+  // (0 when array_size is 1). Both come from GetGuestTextureLayout.
+  uint32_t array_size = 1;
+  uint32_t slice_stride_bytes = 0;
   bool tiled = false;
   bool linear_filter = true;
   HostTextureFormat host_format = HostTextureFormat::kRgba8;

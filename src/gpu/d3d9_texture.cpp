@@ -107,10 +107,25 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
   // the row centre. Its extent lives in a different union member (size_1d has
   // 24 bits of width, size_2d only 13), so reading it the 2D way would truncate
   // any row wider than 8192.
+  //
+  // CUBE and STACKED textures are the same thing in memory as several 2D ones:
+  // six faces, or stack_depth+1 slices, each an ordinary 2D image, each starting
+  // 4 KB-aligned from the last (see the layout note in
+  // rex/graphics/pipeline/texture/util.h). So they are described here as a 2D
+  // texture plus a slice count and stride, decoded by running the 2D untile once
+  // per slice, and bound as a Texture2DArray. Only true 3D volumes, whose slices
+  // interleave INSIDE a tile, need a resource type we do not build.
   const bool one_d = fetch.dimension == xenos::DataDimension::k1D;
-  if (!one_d &&
-      (fetch.dimension != xenos::DataDimension::k2DOrStacked || fetch.stacked))
-    return reject("texture is not plain 2D");
+  const bool cube = fetch.dimension == xenos::DataDimension::kCube;
+  if (fetch.dimension == xenos::DataDimension::k3D)
+    return reject("texture is a 3D volume");
+  if (cube) {
+    // size_2d.stack_depth is documented as 5 for a cube but "not very
+    // meaningful"; a cube has six faces by definition, so do not read it.
+    out.array_size = 6;
+  } else if (!one_d && fetch.stacked) {
+    out.array_size = fetch.size_2d.stack_depth + 1;
+  }
   if (!fetch.base_address) return reject("texture has no base level");
 
   const auto format = rex::graphics::GetBaseFormat(fetch.format);
@@ -220,6 +235,22 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
     if (extent > UINT32_MAX) return reject("texture extent overflow");
     out.source_bytes = uint32_t(extent);
   }
+  // Multi-slice: the distance between slices, and the extent covering all of
+  // them, come from the SDK's own layout calculation rather than being derived
+  // here. The 4 KB alignment interacts with tile padding and the packed-mip
+  // rules in ways the single-image arithmetic above does not model, and this is
+  // the same computation the reference emulator validated against real titles.
+  if (out.array_size > 1) {
+    const tu::TextureGuestLayout layout = tu::GetGuestTextureLayout(
+        fetch.dimension, fetch.pitch, out.width, out.height, out.array_size,
+        out.tiled, format, /*has_packed_levels=*/false, /*has_base=*/true,
+        /*max_level=*/0);
+    if (!layout.base.array_slice_stride_bytes ||
+        !layout.base.level_data_extent_bytes)
+      return reject("array texture layout is empty");
+    out.slice_stride_bytes = layout.base.array_slice_stride_bytes;
+    out.source_bytes = layout.base.level_data_extent_bytes;
+  }
   if (!out.source_bytes || out.source_bytes > 256u * 1024u * 1024u)
     return reject("texture extent out of range");
   return true;
@@ -239,12 +270,20 @@ bool DecodeHleTexture2D(const HleTextureSource& source,
       (source.width + source.block_width - 1) / source.block_width;
   const uint32_t hb =
       (source.height + source.block_height - 1) / source.block_height;
-  const uint64_t tight = uint64_t(wb) * hb * source.bytes_per_block;
+  // One slice's worth, then multiplied up: the host wants the slices TIGHTLY
+  // packed one after another (that is what GetCopyableFootprints will be handed
+  // per subresource), which is not how the guest stores them -- guest slices are
+  // 4 KB-aligned and may be tiled, so the gap between them is
+  // source.slice_stride_bytes on the way in and nothing on the way out.
+  const uint64_t slice_tight = uint64_t(wb) * hb * source.bytes_per_block;
+  const uint32_t slices = std::max(source.array_size, 1u);
+  const uint64_t tight = slice_tight * slices;
   if (!tight || tight > UINT32_MAX) return reject("decoded extent overflow");
 
   out = {};
   out.width = source.width;
   out.height = source.height;
+  out.array_size = slices;
   out.row_pitch = wb * source.bytes_per_block;
   out.format = source.host_format;
   out.swizzle = source.swizzle;
@@ -255,19 +294,24 @@ bool DecodeHleTexture2D(const HleTextureSource& source,
 
   const auto endian = static_cast<xenos::Endian>(source.endian);
   const uint32_t bpb_log2 = std::bit_width(source.bytes_per_block) - 1;
-  for (uint32_t y = 0; y < hb; ++y) {
-    for (uint32_t x = 0; x < wb; ++x) {
-      const uint64_t src = source.tiled
-          ? uint64_t(tu::GetTiledOffset2D(x, y, source.pitch_blocks,
-                                         bpb_log2))
-          : (uint64_t(y) * source.pitch_blocks + x) *
-                source.bytes_per_block;
-      if (src + source.bytes_per_block > guest_bytes)
-        return reject("tiled block outside source");
-      uint8_t* dst = out.data.data() +
-                     (uint64_t(y) * wb + x) * source.bytes_per_block;
-      std::memcpy(dst, guest + src, source.bytes_per_block);
-      SwapBlock(dst, source.bytes_per_block, endian);
+  for (uint32_t slice = 0; slice < slices; ++slice) {
+    const uint64_t slice_base = uint64_t(slice) * source.slice_stride_bytes;
+    uint8_t* slice_out = out.data.data() + uint64_t(slice) * slice_tight;
+    for (uint32_t y = 0; y < hb; ++y) {
+      for (uint32_t x = 0; x < wb; ++x) {
+        const uint64_t src = slice_base +
+            (source.tiled
+                 ? uint64_t(tu::GetTiledOffset2D(x, y, source.pitch_blocks,
+                                                 bpb_log2))
+                 : (uint64_t(y) * source.pitch_blocks + x) *
+                       source.bytes_per_block);
+        if (src + source.bytes_per_block > guest_bytes)
+          return reject("tiled block outside source");
+        uint8_t* dst =
+            slice_out + (uint64_t(y) * wb + x) * source.bytes_per_block;
+        std::memcpy(dst, guest + src, source.bytes_per_block);
+        SwapBlock(dst, source.bytes_per_block, endian);
+      }
     }
   }
 

@@ -581,6 +581,18 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
       // the same resource the stand-in path samples for this object.
       auto it = m_gameSnapshots.find(object);
       if (it == m_gameSnapshots.end() || !it->second.resource) {
+        // TRIED AND REMOVED: binding a 1x1 far-plane (white) stand-in here
+        // instead of failing the draw. The intent was that a depth resolve can
+        // never produce a snapshot -- a depth surface is never a colour draw
+        // target -- so one permanently unsatisfiable slot was discarding whole
+        // draws under the all-or-nothing slot fill.
+        //
+        // It was measured and it does not work. 1143 of 1160 missing snapshots
+        // were depth-sourced (mx_766), so gating on depth barely narrowed it:
+        // this was a blanket substitution, not a targeted one, and blanket
+        // substitution is what put white over the Bink logo composite. The menu
+        // scene did not come back either. Removed rather than left in as a
+        // plausible-looking no-op.
         ++m_translatedNoSnapshot;
         return false;
       }
@@ -616,12 +628,32 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
   cpu.ptr += SIZE_T(block) * kTranslatedSamplerSlots * m_gameSrvDescriptorSize;
   for (uint32_t i = 0; i < kTranslatedSamplerSlots; ++i) {
     D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
-    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    srv.Texture2D.MipLevels = 1;
     // Slots past what the shader declares still need a valid descriptor: the
     // table's range covers all of them whether or not they are sampled. They
     // repeat slot 0 rather than being left undefined.
-    const Slot& s = slots[i < d.pixelSamplerCount ? i : 0];
+    const uint32_t from = i < d.pixelSamplerCount ? i : 0;
+    const Slot& s = slots[from];
+    // The dimension must be the one the SHADER declared, not the one the
+    // resource happens to have: a Texture2DArray declaration read through a
+    // TEXTURE2D descriptor is undefined, not merely wrong-looking.
+    //
+    // The two can disagree -- the shader is translated from the microcode while
+    // the texture is decoded from the fetch constant, and a cube-sampling shader
+    // can be handed a plain 2D texture. That case is safe without a stand-in
+    // resource: a one-slice array view over a DepthOrArraySize=1 resource is
+    // legal, and D3D clamps the slice index, so every face reads slice 0. Wrong
+    // colour, never a garbage descriptor. Counted so it is visible.
+    if ((d.pixelSamplerArrayMask >> from) & 1u) {
+      const UINT16 arraySize =
+          s.resource ? s.resource->GetDesc().DepthOrArraySize : 1;
+      if (arraySize < 2) ++m_translatedArraySlotNot2DArray;
+      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+      srv.Texture2DArray.MipLevels = 1;
+      srv.Texture2DArray.ArraySize = std::max<UINT>(arraySize, 1);
+    } else {
+      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      srv.Texture2D.MipLevels = 1;
+    }
     srv.Format = s.format;
     srv.Shader4ComponentMapping =
         s.useSwizzle
@@ -1094,12 +1126,18 @@ bool D3D12Renderer::UploadGameTexture(GameTexture& entry,
   if (!entry.resource || src.data.empty() || !src.row_pitch) return false;
   const D3D12_RESOURCE_DESC td = entry.resource->GetDesc();
 
-  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
-  UINT rows = 0;
-  UINT64 rowBytes = 0;
+  // One subresource per array slice. A cube arrives as six tightly packed 2D
+  // images in `src.data`; the host wants each at its own aligned footprint
+  // offset, so the footprints are laid out here in one pass and copied
+  // slice-by-slice below.
+  const uint32_t slices = std::max<uint32_t>(td.DepthOrArraySize, 1);
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[6] = {};
+  UINT rowCounts[6] = {};
+  UINT64 rowByteCounts[6] = {};
   UINT64 uploadBytes = 0;
-  m_device->GetCopyableFootprints(&td, 0, 1, 0, &footprint, &rows, &rowBytes,
-                                  &uploadBytes);
+  if (slices > std::size(footprints)) return false;
+  m_device->GetCopyableFootprints(&td, 0, slices, 0, footprints, rowCounts,
+                                  rowByteCounts, &uploadBytes);
 
   auto& upload = entry.upload[m_frameIndex % kFrameCount];
   if (!upload || upload->GetDesc().Width < uploadBytes) {
@@ -1134,13 +1172,22 @@ bool D3D12Renderer::UploadGameTexture(GameTexture& entry,
   uint8_t* mapped = nullptr;
   if (FAILED(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped))))
     return false;
-  const uint32_t copyRows =
-      std::min<uint32_t>(rows, uint32_t(src.data.size() / src.row_pitch));
-  const size_t copyBytes = std::min<size_t>(src.row_pitch, size_t(rowBytes));
-  for (uint32_t y = 0; y < copyRows; ++y) {
-    std::memcpy(
-        mapped + footprint.Offset + size_t(y) * footprint.Footprint.RowPitch,
-        src.data.data() + size_t(y) * src.row_pitch, copyBytes);
+  // Rows available per slice in the payload. The decoder packs slices back to
+  // back with no padding, so slice n starts at n * srcRows * row_pitch.
+  const uint32_t srcRowsTotal = uint32_t(src.data.size() / src.row_pitch);
+  const uint32_t srcRowsPerSlice = srcRowsTotal / slices;
+  for (uint32_t s = 0; s < slices; ++s) {
+    const uint32_t copyRows =
+        std::min<uint32_t>(rowCounts[s], srcRowsPerSlice);
+    const size_t copyBytes =
+        std::min<size_t>(src.row_pitch, size_t(rowByteCounts[s]));
+    const uint8_t* srcSlice =
+        src.data.data() + size_t(s) * srcRowsPerSlice * src.row_pitch;
+    for (uint32_t y = 0; y < copyRows; ++y) {
+      std::memcpy(mapped + footprints[s].Offset +
+                      size_t(y) * footprints[s].Footprint.RowPitch,
+                  srcSlice + size_t(y) * src.row_pitch, copyBytes);
+    }
   }
   upload->Unmap(0, nullptr);
 
@@ -1152,15 +1199,17 @@ bool D3D12Renderer::UploadGameTexture(GameTexture& entry,
   barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
   m_commandList->ResourceBarrier(1, &barrier);
 
-  D3D12_TEXTURE_COPY_LOCATION dst = {};
-  dst.pResource = entry.resource.Get();
-  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-  dst.SubresourceIndex = 0;
-  D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
-  srcLoc.pResource = upload.Get();
-  srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-  srcLoc.PlacedFootprint = footprint;
-  m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &srcLoc, nullptr);
+  for (uint32_t s = 0; s < slices; ++s) {
+    D3D12_TEXTURE_COPY_LOCATION dst = {};
+    dst.pResource = entry.resource.Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = s;
+    D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+    srcLoc.pResource = upload.Get();
+    srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    srcLoc.PlacedFootprint = footprints[s];
+    m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &srcLoc, nullptr);
+  }
 
   std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
   m_commandList->ResourceBarrier(1, &barrier);
@@ -1258,7 +1307,10 @@ bool D3D12Renderer::EnsureGameTexture(
   td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
   td.Width = texture->width;
   td.Height = texture->height;
-  td.DepthOrArraySize = 1;
+  // A cube is six array slices of a plain 2D resource -- not a D3D12 cube
+  // resource, because the shader samples it by face index rather than by
+  // direction. See the cube note in EmitTextureFetch.
+  td.DepthOrArraySize = UINT16(std::max<uint32_t>(texture->array_size, 1));
   td.MipLevels = 1;
   td.Format = format;
   td.SampleDesc.Count = 1;
@@ -1592,7 +1644,8 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameSnapshot(
 void D3D12Renderer::AddGameResolve(uint32_t destTexture, uint32_t sourceObject,
                                    int32_t destX, int32_t destY, int32_t srcX1,
                                    int32_t srcY1, int32_t srcX2,
-                                   int32_t srcY2) {
+                                   int32_t srcY2, uint32_t destWidth,
+                                   uint32_t destHeight) {
   if (!destTexture || !sourceObject) return;
   // Counted, not silent. Resolves are interleaved through the stream, so a
   // frame that overruns kMaxGameDraws loses the tail — and the tail is mostly
@@ -1611,6 +1664,8 @@ void D3D12Renderer::AddGameResolve(uint32_t destTexture, uint32_t sourceObject,
   d.resolveSrcY1 = srcY1;
   d.resolveSrcX2 = srcX2;
   d.resolveSrcY2 = srcY2;
+  d.resolveDestWidth = destWidth;
+  d.resolveDestHeight = destHeight;
   m_gameDraws.push_back(std::move(d));
 }
 
@@ -1643,6 +1698,30 @@ void D3D12Renderer::RenderGameFrame() {
       sampledTargets.insert(d.sampledTargetObject);
     if (d.resolveDest && d.resolveSource) resolveSources.insert(d.resolveSource);
   }
+  // Carry both sets forward across frames, and decide routing on the union.
+  //
+  // The routing decision below is made when a surface is DRAWN INTO, but the
+  // facts it needs -- will this be resolved, will a later draw sample it -- are
+  // only known when the resolve or the sample arrives, which is often a
+  // different frame. Built per frame, the sets answer for the wrong frame: a
+  // surface drawn in frame N and resolved in N+1 is not a resolve source in N,
+  // so N routes it to m_gameRT, which is cleared every frame, and N+1's resolve
+  // finds no offscreen entry and copies nothing. Its snapshot stays at the
+  // clear colour, and every draw sampling it paints black.
+  //
+  // That is the other side of the note below: "25 of 33 resolves had sources
+  // with no draws at all that frame". The contents were established earlier --
+  // and were thrown away earlier, for exactly this reason.
+  //
+  // History is the right basis because these are properties of a surface's
+  // ROLE, which is stable: a surface the guest resolves once is a resolve
+  // target it will resolve again. Cost is bounded and visible -- more surfaces
+  // qualify for an offscreen target, capped by the same budget, and the
+  // "refused: budget" figure on the routing line is what says if it bites.
+  for (uint32_t object : resolveSources) m_everResolveSource.insert(object);
+  for (uint32_t object : sampledTargets) m_everSampledTarget.insert(object);
+  for (const auto& d : m_gameDraws)
+    if (d.targetObject) m_everDrawTarget.insert(d.targetObject);
   // Reset per frame: if nothing is drawn offscreen at guest-backbuffer size
   // this frame, present must fall back to m_gameRT rather than blit a target
   // that belongs to an earlier frame.
@@ -1693,6 +1772,14 @@ void D3D12Renderer::RenderGameFrame() {
         // is what it had before. A steady non-zero count here means targets are
         // being refused offscreen surfaces upstream — read the routing line.
         ++m_snapshotMissingSource;
+        // Which sources, and how often. Counted rather than logged on first
+        // sighting: the first miss for any source happens in the opening frames
+        // before anything has drawn into it, so a once-per-source line reports
+        // startup state as if it were the steady state -- which is exactly the
+        // mistake that produced a confident and wrong "never a draw target".
+        // The tally is dumped with the periodic counters, with the status read
+        // at dump time.
+        ++m_missingSourceCounts[d.resolveSource];
         // The guest asked for this image to be refreshed and it was not. Any
         // snapshot already held for this destination is now a stale earlier
         // frame; mark it so the sampling path refuses it rather than blitting a
@@ -1730,10 +1817,22 @@ void D3D12Renderer::RenderGameFrame() {
       }
       const uint32_t dx = d.resolveDestX > 0 ? uint32_t(d.resolveDestX) : 0;
       const uint32_t dy = d.resolveDestY > 0 ? uint32_t(d.resolveDestY) : 0;
-      // The snapshot must cover this band's placement, not merely match the
-      // band's size — that conflation is what made the scene an 80-line strip.
-      GameRenderTarget* snap =
-          EnsureGameSnapshot(d.resolveDest, dx + copyW, dy + copyH);
+      // The snapshot must be the size of the DESTINATION TEXTURE, not of the
+      // region this resolve happens to cover.
+      //
+      // Covering was right for a banded resolve, which eventually fills the
+      // whole image, and wrong for an atlas, which never does: the menu scene's
+      // 2048x2048 atlas is built from repeated 256x256 sub-rect resolves, so
+      // the first one created a 256x256 snapshot. The shader samples a texture
+      // the guest declares as 2048x2048, so normalized UVs map [0,1] across our
+      // 256x256 resource — every fetch lands at 1/8 scale and anything packed
+      // outside the top-left corner cannot be reached at all.
+      //
+      // The covered region is still the floor, so a destination whose extent we
+      // could not decode behaves exactly as before rather than shrinking.
+      const uint32_t snapW = std::max(d.resolveDestWidth, dx + copyW);
+      const uint32_t snapH = std::max(d.resolveDestHeight, dy + copyH);
+      GameRenderTarget* snap = EnsureGameSnapshot(d.resolveDest, snapW, snapH);
       if (!snap) continue;
       D3D12_RESOURCE_BARRIER pre[2] = {};
       pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -2171,8 +2270,13 @@ void D3D12Renderer::RenderGameFrame() {
   // Cumulative, every 100th frame that drew anything. Distinct live targets is
   // reported alongside the cap because the two together say whether the budget
   // is comfortable or about to be exhausted — the count alone does not.
+  // Every 20 frames, not 100. Frames cost ~0.5s here, so a 100-frame interval
+  // is ~50 seconds and a driven session that reaches the menu and is watched
+  // for a few seconds produces exactly ONE print -- from frame 1, before
+  // anything has been drawn or resolved. Every measurement taken that way
+  // describes startup.
   static uint32_t s_rtFrame = 0;
-  if (!m_gameDraws.empty() && (++s_rtFrame % 100) == 1) {
+  if (!m_gameDraws.empty() && (++s_rtFrame % 20) == 1) {
     char message[300];
     std::snprintf(message, sizeof(message),
                   "game RT routing: offscreen %llu, main %llu, OVERPAINT %llu "
@@ -2208,12 +2312,15 @@ void D3D12Renderer::RenderGameFrame() {
     // the hooks rather than at anything here.
     std::snprintf(message, sizeof(message),
                   "translated bind failures: block-exhausted %llu, "
-                  "no-snapshot %llu, no-texture %llu, upload-failed %llu; "
+                  "no-snapshot %llu, no-texture %llu, "
+                  "upload-failed %llu, array-slot-flat %llu; "
                   "sampler blocks %zu of %u, exhausted %llu",
                   static_cast<unsigned long long>(m_translatedBlockExhausted),
                   static_cast<unsigned long long>(m_translatedNoSnapshot),
                   static_cast<unsigned long long>(m_translatedNoTexture),
                   static_cast<unsigned long long>(m_translatedUploadFailed),
+                  static_cast<unsigned long long>(
+                      m_translatedArraySlotNot2DArray),
                   m_samplerBlocks.size(), kSamplerBlockCount,
                   static_cast<unsigned long long>(m_samplerBlockExhausted));
     LogInfo(message);
@@ -2233,6 +2340,29 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_snapshotStaleRefused),
                   uint32_t(m_gameSnapshots.size()));
     LogInfo(message);
+    // The worst offenders behind source-not-offscreen, with their status read
+    // NOW rather than at first sighting. Sorted by how many resolves each one
+    // cost, because one source losing a thousand resolves and a thousand losing
+    // one are different defects.
+    if (!m_missingSourceCounts.empty()) {
+      std::vector<std::pair<uint32_t, uint64_t>> worst(
+          m_missingSourceCounts.begin(), m_missingSourceCounts.end());
+      std::sort(worst.begin(), worst.end(),
+                [](const auto& a, const auto& b) { return a.second > b.second; });
+      std::string line;
+      for (size_t i = 0; i < worst.size() && i < 6; ++i) {
+        char one[96];
+        std::snprintf(one, sizeof(one), " 0x%08X x%llu(drawn:%s)",
+                      worst[i].first,
+                      static_cast<unsigned long long>(worst[i].second),
+                      m_everDrawTarget.count(worst[i].first) ? "Y" : "N");
+        line += one;
+      }
+      std::snprintf(message, sizeof(message),
+                    "missing-source offenders (%zu distinct):%s",
+                    m_missingSourceCounts.size(), line.c_str());
+      LogInfo(message);
+    }
     // THIS frame, not cumulative: the question is whether the frame on screen
     // was assembled on one surface or several. "presented 1 of 1" means present
     // is showing the finished scene; "1 of 4" means it is showing one layer.
@@ -2333,7 +2463,8 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t pixelSamplerCount,
                                  const std::shared_ptr<const mx::hle::HleTexturePayload>* pixelTextures,
                                  const uint32_t* pixelSampledObjects,
-                                 const GpuVertexStage* vertexStage) {
+                                 const GpuVertexStage* vertexStage,
+                                 uint32_t pixelSamplerArrayMask) {
   // PERF(per-frame-allocs): this creates three ID3D12Resource's per call (VB +
   // IB + CB) on the UPLOAD heap, and is called once per submitted draw rather
   // than once per frame, so the allocation rate scales with the draw count —
@@ -2409,6 +2540,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.pixelShaderHandle = pixelShaderHandle;
   d.pixelShaderHlsl = std::move(pixelShaderHlsl);
   d.pixelSamplerCount = pixelSamplerCount;
+  d.pixelSamplerArrayMask = pixelSamplerArrayMask;
   if (pixelTextures && pixelSampledObjects) {
     for (uint32_t i = 0; i < kTranslatedSamplerSlots; ++i) {
       d.pixelTextures[i] = pixelTextures[i];

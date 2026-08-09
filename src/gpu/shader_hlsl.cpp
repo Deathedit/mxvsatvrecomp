@@ -21,6 +21,8 @@ const char* HlslStatusName(HlslStatus s) {
     case HlslStatus::kFetchCube: return "cube texture fetch";
     case HlslStatus::kFetch1D: return "1D texture fetch";
     case HlslStatus::kFetch3D: return "3D/stacked texture fetch";
+    case HlslStatus::kFetchDimensionConflict:
+      return "one sampler fetched at two dimensions";
     case HlslStatus::kTooManySamplers: return "too many distinct samplers";
     case HlslStatus::kLoopRelative: return "aL-relative (loop)";
     case HlslStatus::kInstructionCap: return "instruction cap";
@@ -152,9 +154,22 @@ class Emitter {
   // cannot be the register number.
   uint32_t sampler_count = 0;
   uint32_t slot_guest[HlslShader::kMaxSamplerSlots] = {};
+  // Slots whose fetches are cube, and so are declared Texture2DArray rather
+  // than Texture2D. One bit per COMPACT slot, mirrored into
+  // HlslShader::sampler_array_mask for the binder, which must create a matching
+  // SRV dimension or the descriptor contradicts the declaration.
+  uint32_t slot_array_mask = 0;
+  // Slots that have been fetched at all, so a second fetch at a different
+  // dimension can be told apart from the first fetch of a slot.
+  uint32_t slot_fetched_mask = 0;
   // kCube needs scratch that does not fold into an expression. Declared only
   // when used, so the common shader carries none.
   bool uses_cube = false;
+  // A cube FETCH in a shader with no cube ALU op. The (S, T, face) form this
+  // emitter assumes is produced by that op; without it, something else computed
+  // the fetch coordinate and the assumption is unverified. Reported rather than
+  // refused -- it is the hardware's own operand form either way.
+  bool cube_fetch_without_cube_op = false;
   std::string body;
 
   // Returns the compact slot for a guest sampler, allocating one on first use.
@@ -385,8 +400,9 @@ class Emitter {
         break;
       }
       default:
-        // kCube and the setp_*_push family. Neither has appeared in a shader
-        // captured here. Reported by opcode, not guessed.
+        // The setp_*_push family. Has not appeared in a shader captured here.
+        // Reported by opcode, not guessed. (kCube used to be listed here too;
+        // it is implemented above.)
         status = HlslStatus::kUnsupportedVectorOp;
         blocking_opcode = uint32_t(op);
         return "float4(0,0,0,0)";
@@ -605,12 +621,31 @@ class Emitter {
     }
     // 1D joins 2D: a single-row texture samples correctly through an ordinary
     // 2D binding, so it needs no new resource type -- only the v coordinate
-    // pinned to the row, below. Cube and 3D still need a real TextureCube /
-    // Texture3D and are refused by name.
+    // pinned to the row, below.
+    //
+    // CUBE joins them through a Texture2DArray, because the guest has already
+    // done the cube projection in software before it gets here. The hardware
+    // sequence is
+    //
+    //     cube       r0, source.zzxy, source.yxz   // (T, S, 2*majoraxis, face)
+    //     rcp        r0.z, r0_abs.z
+    //     mad        r0.xy, r0, r0.zzzw, 1.5f      // ST biased into [1,2)
+    //     tfetchCube r0, r0.yxw, tf0               // samples (S, T, face)
+    //
+    // so tfetchCube receives three scalars, never a direction vector -- which is
+    // the whole reason `cube` exists as an ALU opcode. Binding a real TextureCube
+    // would mean UNDOING that projection so the hardware could redo it; an array
+    // consumes the guest's output as it stands. Faces are six ordinary 2D images
+    // at 4 KB-aligned strides in guest memory, so the decode is the 2D one run
+    // six times. Xenos does not filter across face edges either, so the one thing
+    // this gives up costs nothing against the console.
+    //
+    // 3D/stacked still needs a real Texture3D or a stack-sized array and is
+    // refused by name.
     using Dim = rex::graphics::xenos::FetchOpDimension;
-    if (tf.dimension() != Dim::k2D && tf.dimension() != Dim::k1D) {
-      status = tf.dimension() == Dim::kCube ? HlslStatus::kFetchCube
-                                            : HlslStatus::kFetch3D;
+    const bool is_cube = tf.dimension() == Dim::kCube;
+    if (!is_cube && tf.dimension() != Dim::k2D && tf.dimension() != Dim::k1D) {
+      status = HlslStatus::kFetch3D;
       blocking_opcode = uint32_t(tf.opcode());
       return;
     }
@@ -625,6 +660,23 @@ class Emitter {
     const uint32_t slot = SamplerSlot(sampler);
     if (status != HlslStatus::kOk) return;
 
+    // One slot, one resource type. A second fetch on the same slot at the other
+    // dimension would contradict whichever declaration the preamble writes, so
+    // the shader is refused rather than emitted with a descriptor that cannot
+    // match both of its fetches.
+    const uint32_t slot_bit = 1u << slot;
+    if ((slot_fetched_mask & slot_bit) &&
+        bool(slot_array_mask & slot_bit) != is_cube) {
+      status = HlslStatus::kFetchDimensionConflict;
+      blocking_opcode = uint32_t(tf.opcode());
+      return;
+    }
+    slot_fetched_mask |= slot_bit;
+    if (is_cube) {
+      slot_array_mask |= slot_bit;
+      if (!uses_cube) cube_fetch_without_cube_op = true;
+    }
+
     // The fetch source swizzle is ABSOLUTE, two bits per component — unlike an
     // ALU swizzle, which is component-relative. Reading it the ALU way sends
     // every fetch to the wrong coordinate pair.
@@ -633,6 +685,26 @@ class Emitter {
     std::string uv;
     uv += kComponent[swiz & 3];
     if (!is_1d) uv += kComponent[(swiz >> 2) & 3];
+
+    if (is_cube) {
+      // The third source component is the face index the `cube` op produced,
+      // 0-5 in D3DCUBEMAP_FACES order — which is also the array slice order the
+      // guest stores the faces in, so it indexes the array directly.
+      //
+      // ST arrive biased into [1,2) by the `mad ..., 1.5` above: that bias is
+      // what the hardware fetch expects, not a shader idiom, so subtracting one
+      // is decoding the operand rather than guessing at a convention.
+      //
+      // xe_texinv is deliberately NOT applied. It normalises TEXEL coordinates,
+      // and these are already face-relative.
+      const std::string src = Temp(tf.src());
+      const std::string face = std::string(1, kComponent[(swiz >> 4) & 3]);
+      const std::string s3 = std::to_string(slot);
+      Line("xe_v = xe_tex" + s3 + ".Sample(xe_smp" + s3 + ", float3(" + src +
+           "." + uv + " - 1.0, " + src + "." + face + "));");
+      EmitFetchDestination(tf);
+      return;
+    }
 
     std::string coord = Temp(tf.src()) + "." + uv;
     if (tf.unnormalized_coordinates()) {
@@ -655,7 +727,12 @@ class Emitter {
     }
     const std::string s = std::to_string(slot);
     Line("xe_v = xe_tex" + s + ".Sample(xe_smp" + s + ", " + coord + ");");
+    EmitFetchDestination(tf);
+  }
 
+  // Write xe_v out through the fetch's destination swizzle. Shared by the 1D/2D
+  // and cube paths, which differ only in how they build the coordinate.
+  void EmitFetchDestination(const uc::TextureFetchInstruction& tf) {
     // The destination swizzle is three bits per component: 0-3 select x/y/z/w
     // of the fetched value, 4 is 0.0, 5 is 1.0, and 7 means keep — which is what
     // lets two fetches share a destination register, so ignoring it would
@@ -799,9 +876,16 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   src += "};\n";
   // Declared for EVERY slot up to sampler_count, contiguously from t0/s0, so
   // the registers match a descriptor table of exactly that width.
+  //
+  // A slot fetched as a cube is declared Texture2DArray: the guest projects the
+  // direction to (S, T, face) itself, so an array indexed by face is what its
+  // operands already describe. BindTranslatedTextures must give that slot a
+  // TEXTURE2DARRAY SRV to match — see HlslShader::sampler_array_mask.
   for (uint32_t s = 0; s < em.sampler_count; ++s) {
     const std::string n = std::to_string(s);
-    src += "Texture2D<float4> xe_tex" + n + " : register(t" + n + ");\n";
+    const bool array = (em.slot_array_mask >> s) & 1u;
+    src += array ? "Texture2DArray<float4> xe_tex" : "Texture2D<float4> xe_tex";
+    src += n + " : register(t" + n + ");\n";
     src += "SamplerState xe_smp" + n + " : register(s" + n + ");\n";
   }
 
@@ -902,6 +986,8 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   out.fetches = std::move(em.fetches);
   out.sampler_mask = em.sampler_mask;
   out.sampler_count = em.sampler_count;
+  out.sampler_array_mask = em.slot_array_mask;
+  out.cube_fetch_without_cube_op = em.cube_fetch_without_cube_op;
   for (uint32_t i = 0; i < em.sampler_count; ++i)
     out.sampler_slot_guest[i] = em.slot_guest[i];
   out.input_mask = em.input_mask;

@@ -21,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <vector>
 
@@ -108,7 +109,8 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  const std::shared_ptr<const mx::hle::HleTexturePayload>*
                      pixelTextures = nullptr,
                  const uint32_t* pixelSampledObjects = nullptr,
-                 const GpuVertexStage* vertexStage = nullptr);
+                 const GpuVertexStage* vertexStage = nullptr,
+                 uint32_t pixelSamplerArrayMask = 0);
 
 // Append a resolve to this frame's list, in order with the draws around it.
 //
@@ -125,7 +127,8 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
 // collected separately.
 void AddGameResolve(uint32_t destTexture, uint32_t sourceObject,
                     int32_t destX, int32_t destY, int32_t srcX1, int32_t srcY1,
-                    int32_t srcX2, int32_t srcY2);
+                    int32_t srcX2, int32_t srcY2,
+                    uint32_t destWidth = 0, uint32_t destHeight = 0);
 
 // Drop the previous frame's draws. Called when a real guest-frame handoff
 // arrives, including one whose draws are all filtered; an empty render-thread
@@ -466,6 +469,11 @@ void ClearGameDraws();
   uint64_t m_translatedNoSnapshot = 0;
   uint64_t m_translatedNoTexture = 0;
   uint64_t m_translatedUploadFailed = 0;
+  // A slot the shader declared Texture2DArray whose bound resource has only one
+  // slice, so every cube face reads slice 0. Not a failure -- the draw still
+  // runs -- but it means the shader and the fetch constant disagree about the
+  // texture's dimension, which would otherwise be invisible.
+  uint64_t m_translatedArraySlotNot2DArray = 0;
   // Points `out` at a block holding this draw's textures. False when a block
   // could not be allocated or a slot had no resource, in which case the draw
   // must fall back rather than sample an undefined descriptor.
@@ -529,6 +537,21 @@ void ClearGameDraws();
     // resource is showing stale bytes -- see HleTexturePayload::content_version.
     uint32_t uploadedVersion = 0;
   };
+  // Every surface object ever seen as a resolve source, and ever sampled by a
+  // later draw. Historical rather than per frame because the offscreen routing
+  // decision is taken when a surface is drawn into, which is usually an earlier
+  // frame than the resolve or sample that proves it needed the storage. See the
+  // note at the top of the draw loop.
+  std::unordered_set<uint32_t> m_everResolveSource;
+  std::unordered_set<uint32_t> m_everSampledTarget;
+  // Every object ever named as a draw's render target. A resolve source that
+  // never appears here was never drawn into through this path at all, so no
+  // routing decision could ever have given it an offscreen surface -- a
+  // different defect from one that was drawn and routed to m_gameRT.
+  std::unordered_set<uint32_t> m_everDrawTarget;
+  // resolve source object -> how many resolves it lost for want of an offscreen
+  // surface, over the whole run.
+  std::map<uint32_t, uint64_t> m_missingSourceCounts;
   std::unordered_map<uint64_t, GameTexture> m_gameTextures;
   bool UploadGameTexture(GameTexture& entry,
                          const mx::hle::HleTexturePayload& src);
@@ -612,6 +635,11 @@ void ClearGameDraws();
     int32_t resolveSrcY1 = 0;
     int32_t resolveSrcX2 = 0;
     int32_t resolveSrcY2 = 0;
+    // The destination texture's declared extent. The snapshot is sized to this
+    // rather than to the region this resolve covers -- see
+    // DrawCall::resolve_dest_width.
+    uint32_t resolveDestWidth = 0;
+    uint32_t resolveDestHeight = 0;
     // Bink's Y/Cr/Cb (+ optional alpha) plane set, bound together.
     std::array<std::shared_ptr<const mx::hle::HleTexturePayload>,
                kMaxDrawPlanes> planes;
@@ -632,6 +660,11 @@ void ClearGameDraws();
     D3D12_VERTEX_BUFFER_VIEW ivbv = {};
     Microsoft::WRL::ComPtr<ID3D12Resource> pscb;
     uint32_t pixelSamplerCount = 0;
+    // Bit i set = the shader declares slot i as Texture2DArray (a cube fetch),
+    // so its SRV must be TEXTURE2DARRAY. A descriptor whose dimension
+    // contradicts the shader's declaration is undefined behaviour, not just a
+    // wrong colour.
+    uint32_t pixelSamplerArrayMask = 0;
     // One texture per compact sampler slot, in the order the shader declares
     // them. Parallel arrays: a slot names either a CPU payload or a resolved
     // render target, never both.

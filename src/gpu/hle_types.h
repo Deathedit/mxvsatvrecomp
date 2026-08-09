@@ -34,6 +34,11 @@ struct HleTexturePayload {
   uint32_t width = 0;
   uint32_t height = 0;
   uint32_t row_pitch = 0;
+  // Slices in `data`, tightly packed one after another, each row_pitch *
+  // height_in_blocks bytes. 1 for an ordinary texture, 6 for a cube. Anything
+  // above 1 is uploaded as that many D3D12 subresources and bound as a
+  // Texture2DArray.
+  uint32_t array_size = 1;
   HostTextureFormat format = HostTextureFormat::kRgba8;
   uint32_t swizzle = 0;
   uint8_t clamp_x = 0;
@@ -183,6 +188,19 @@ struct DrawCall {
   int32_t resolve_src_y1 = 0;
   int32_t resolve_src_x2 = 0;
   int32_t resolve_src_y2 = 0;
+  // The DESTINATION TEXTURE's own declared extent, off its fetch constant --
+  // not the extent of the region this particular resolve covers.
+  //
+  // The host snapshot must be this size. It used to be sized to the covered
+  // region (dest point + copied rect), which is right for a banded resolve that
+  // eventually covers the whole image and wrong for an ATLAS: the menu scene's
+  // 2048x2048 atlas is filled by repeated 256x256 sub-rect resolves, so the
+  // first one created a 256x256 snapshot. The shader then samples a texture the
+  // guest declares as 2048x2048, and normalized UVs map [0,1] across our 256x256
+  // resource -- every fetch lands at 1/8 scale and anything packed outside the
+  // top-left corner is unreachable.
+  uint32_t resolve_dest_width = 0;
+  uint32_t resolve_dest_height = 0;
   // Extent of the D3D9 texture object selected by the pixel fetch. This is
   // needed even for resolved render-target samples, which deliberately have no
   // CPU texture payload, because an unnormalized tfetch still needs conversion
@@ -213,6 +231,10 @@ struct DrawCall {
   // How many distinct samplers the translated shader reads, and the guest
   // sampler each compact slot was assigned. See HlslShader::sampler_slot_guest.
   uint32_t pixel_sampler_count = 0;
+  // Bit i set = slot i is declared Texture2DArray by the emitted shader and so
+  // needs a TEXTURE2DARRAY SRV. See HlslShader::sampler_array_mask; the
+  // descriptor's dimension must agree with the declaration.
+  uint32_t pixel_sampler_array_mask = 0;
 
   // One texture per compact sampler slot, in the order the emitted shader
   // declares them: slot i is the texture the shader reads as xe_texi.
@@ -233,7 +255,6 @@ struct DrawCall {
   std::array<std::shared_ptr<const HleTexturePayload>, kMaxPixelTextures>
       pixel_textures;
   std::array<uint32_t, kMaxPixelTextures> pixel_sampled_objects = {};
-
   // The interpolators the translated pixel shader reads, one float4 per
   // linkage slot per vertex, in a buffer parallel to `vertices`.
   //

@@ -314,7 +314,8 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
             m_renderer->AddGameResolve(
                 d->resolve_dest_texture, d->resolve_source_object,
                 d->resolve_dest_x, d->resolve_dest_y, d->resolve_src_x1,
-                d->resolve_src_y1, d->resolve_src_x2, d->resolve_src_y2);
+                d->resolve_src_y1, d->resolve_src_x2, d->resolve_src_y2,
+                d->resolve_dest_width, d->resolve_dest_height);
             continue;
           }
           // The guest vertex stage, when the hooks built one for this draw.
@@ -382,7 +383,8 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   d->pixel_sampler_count,
                                   d->pixel_textures.data(),
                                   d->pixel_sampled_objects.data(),
-                                  vertexStage.handle ? &vertexStage : nullptr);
+                                  vertexStage.handle ? &vertexStage : nullptr,
+                                  d->pixel_sampler_array_mask);
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;
