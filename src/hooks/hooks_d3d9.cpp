@@ -66,9 +66,6 @@ REXCVAR_DECLARE(bool, hle_capture);
 REXCVAR_DECLARE(uint32_t, hle_shader_exec);
 REXCVAR_DECLARE(uint32_t, hle_shader_verts);
 REXCVAR_DECLARE(bool, hle_gpu_vertex);
-REXCVAR_DECLARE(bool, hle_dump_textures);
-REXCVAR_DECLARE(bool, hle_dump_shaders);
-
 namespace {
 
 namespace uc = rex::graphics::ucode;
@@ -903,9 +900,61 @@ struct ResolvedTargetByAddress {
   uint32_t source_object = 0;
   uint32_t width = 0;
   uint32_t height = 0;
+  // How far into the destination the resolves recorded here actually reach.
+  // A destination is only worth sampling as a snapshot if the GPU wrote most
+  // of it. Measured in mx_778: the 2048x2048 menu atlas at phys 0x1A2E3000
+  // receives exactly ONE resolve in a whole session, a 256x256 blit at (0,0)
+  // -- 1.5% of its area -- and the address match then claimed it permanently,
+  // handing every draw that samples it a surface that is 98.5% clear colour
+  // and, worse, suppressing the CPU decode that would have re-read guest
+  // memory. Reached extent, not summed area: repeated full-surface resolves
+  // must not add up past 100%, and a corner blit must not be mistaken for
+  // coverage because it happened often.
+  uint32_t reached_x = 0;
+  uint32_t reached_y = 0;
+  uint32_t resolves = 0;
 };
+// Destination texture OBJECT -> the physical address its entry is keyed by.
+// The object-identity match (g_resolvedTextureTargets) runs BEFORE the address
+// match and would otherwise escape the coverage rule below entirely -- which is
+// exactly what happened in mx_779: the guard was added to the address path,
+// the atlas was claimed by the object path, and the refusal counter read 0.
+std::map<uint32_t, uint32_t> g_resolveDestObjectPhys;
 // Keyed by PHYSICAL address -- see GpuPhysicalAddress.
 std::map<uint32_t, ResolvedTargetByAddress> g_resolvedTargetsByAddress;
+
+// The pixel shader each DEVICE last had bound, shared across threads.
+//
+// DeviceState() is `static thread_local`, so a draw submitted on a worker
+// thread sees ps_seen == false and no shader at all -- the same thread-split
+// this file already documents for render targets. Measured on a loaded menu:
+// 15,555 draws arrived with no pixel shader handle, including the 21753-index
+// rider mesh, and every one of them fell to the tex*col stand-in, which sampled
+// the material's PACKED normal/gloss atlas and painted it as if it were albedo.
+// That is the magenta-and-green rider.
+//
+// A pixel shader belongs to the device in D3D9, not to the thread that happened
+// to set it, so the device is the right key. device+0x3244 is consulted first
+// and this is only the fallback for when that field reads zero.
+std::mutex g_pixelShaderByDeviceMu;
+std::map<uint32_t, uint32_t> g_pixelShaderByDevice;
+uint32_t g_lastPixelShaderAnyDevice = 0;
+
+void NotePixelShaderForDevice(uint32_t device, uint32_t shader) {
+  if (!shader) return;
+  std::lock_guard<std::mutex> lock(g_pixelShaderByDeviceMu);
+  if (device) g_pixelShaderByDevice[device] = shader;
+  g_lastPixelShaderAnyDevice = shader;
+}
+
+uint32_t PixelShaderForDevice(uint32_t device) {
+  std::lock_guard<std::mutex> lock(g_pixelShaderByDeviceMu);
+  if (device) {
+    const auto it = g_pixelShaderByDevice.find(device);
+    if (it != g_pixelShaderByDevice.end()) return it->second;
+  }
+  return g_lastPixelShaderAnyDevice;
+}
 
 // The same physical page is visible through several virtual windows on this
 // console, and the guest uses different ones for the same surface. Measured in
@@ -950,6 +999,44 @@ uint32_t GpuPhysicalAddress(uint32_t address) {
 uint64_t g_resolveDroppedNoSource = 0;
 uint64_t g_resolveAddressMatches = 0;   // blanks rescued by the address match
 uint64_t g_resolveAddressExtentMiss = 0;  // same address, different extent
+uint64_t g_resolveAddressPartial = 0;  // matched, but barely written by the GPU
+
+// Whether a resolve destination is worth sampling as a snapshot at all.
+//
+// Extent agreeing, or the object being named by a resolve, is not the same as
+// the GPU having WRITTEN the surface. A destination the resolves reach only a
+// corner of is mostly clear colour, and claiming it is strictly worse than
+// letting the CPU decode run: it paints the same black AND suppresses the
+// re-read that would pick the texture up once the guest fills it.
+//
+// A quarter of the area is the threshold. A genuine render target is resolved
+// whole, or in full-width bands that reach the full extent between them, so
+// nothing legitimate sits near it -- while the 2048x2048 menu atlas that
+// motivated this reaches 256x256, one sixty-fourth.
+//
+// Unknown coverage allows the claim: a destination whose fetch constant could
+// not be read has no entry, and refusing on absent evidence would undo the
+// Phase 2 rescue for every surface this measurement missed.
+bool ResolvedDestinationIsMostlyWritten(uint32_t dest_object) {
+  const auto po = g_resolveDestObjectPhys.find(dest_object);
+  if (po == g_resolveDestObjectPhys.end()) return true;
+  const auto it = g_resolvedTargetsByAddress.find(po->second);
+  if (it == g_resolvedTargetsByAddress.end()) return true;
+  const uint64_t reached =
+      uint64_t(it->second.reached_x) * it->second.reached_y;
+  const uint64_t full = uint64_t(it->second.width) * it->second.height;
+  if (!full || reached * 4 >= full) return true;
+  ++g_resolveAddressPartial;
+  static std::set<uint32_t> s_logged;
+  if (s_logged.insert(dest_object).second && s_logged.size() <= 8) {
+    REXLOG_INFO("d3d9: resolve dest 0x{:08X} phys 0x{:08X} {}x{} reached only "
+                "{}x{} over {} resolves -- not claimed, CPU decode keeps it",
+                dest_object, po->second, it->second.width, it->second.height,
+                it->second.reached_x, it->second.reached_y,
+                it->second.resolves);
+  }
+  return false;
+}
 
 // The destination texture object whose snapshot covers this described texture,
 // or 0. Matches on the guest memory address the two fetch constants agree on,
@@ -990,6 +1077,9 @@ const ResolvedTargetByAddress* ResolvedTargetForAddress(
                   physical, it->second.width, it->second.height,
                   described.width, described.height);
     }
+    return nullptr;
+  }
+  if (!ResolvedDestinationIsMostlyWritten(it->second.dest_object)) {
     return nullptr;
   }
   return &it->second;
@@ -3118,27 +3208,6 @@ bool GlyphCacheStale(const mx::hle::HleTexturePayload& payload) {
          payload.content_version != g_glyphCacheGeneration;
 }
 
-// Writes each distinct decoded texture to disk once, as raw host bytes with the
-// geometry in the filename, so the decode can be LOOKED AT rather than reasoned
-// about. Off by default and never hit unless asked for: the question it answers
-// -- is a blurred glyph blurred in the atlas, or only on screen -- cannot be
-// answered from counters, and the two causes need opposite fixes.
-void DumpDecodedTexture(uint64_t key, const mx::hle::HleTexturePayload& payload) {
-  if (!REXCVAR_GET(hle_dump_textures)) return;
-  static std::set<uint64_t> s_dumped;
-  if (!s_dumped.insert(key).second) return;
-  const std::string dir = "logs/texdump";
-  std::filesystem::create_directories(dir);
-  const std::string path = fmt::format(
-      "{}/tex_{:016x}_{}x{}_pitch{}_fmt{}.raw", dir, key, payload.width,
-      payload.height, payload.row_pitch, uint32_t(payload.format));
-  std::ofstream out(path, std::ios::binary);
-  if (!out) return;
-  out.write(reinterpret_cast<const char*>(payload.data.data()),
-            std::streamsize(payload.data.size()));
-  REXLOG_INFO("d3d9: dumped texture {} ({} bytes)", path, payload.data.size());
-}
-
 void NoteBlankDecode(uint64_t key) {
   BlankState& s = g_hleEmptyTextures[key];
   s.last_frame = mx::hle::D3D9FrameCount();
@@ -3148,24 +3217,6 @@ void NoteBlankDecode(uint64_t key) {
 // one frame share a decode instead of repeating it.
 std::map<uint64_t, std::shared_ptr<const mx::hle::HleTexturePayload>>
     g_hleBlankPayloads;
-
-// The captured microcode itself, once per handle. Counters say a shader was
-// refused; only the instruction stream says what it actually asks for. Written
-// as raw little-endian dwords exactly as CollectPixelShaderBlob captured them,
-// so tools/ucode_test can walk it with the same decoder the emitter uses.
-void DumpPixelShaderBlob(uint32_t handle, const uint32_t* code, uint32_t count) {
-  if (!REXCVAR_GET(hle_dump_shaders)) return;
-  static std::set<uint32_t> s_dumped;
-  if (!s_dumped.insert(handle).second) return;
-  const std::string dir = "logs/shaderdump";
-  std::filesystem::create_directories(dir);
-  const std::string path = fmt::format("{}/ps_{:08X}.bin", dir, handle);
-  std::ofstream out(path, std::ios::binary);
-  if (!out) return;
-  out.write(reinterpret_cast<const char*>(code),
-            std::streamsize(count) * 4);
-  REXLOG_INFO("d3d9: dumped pixel shader {} ({} dwords)", path, count);
-}
 
 const ResolvedPixelBinding* ResolvePixelProfile(uint32_t handle) {
   // This used to search every PM4-captured pixel shader for a byte match inside
@@ -3181,7 +3232,8 @@ const ResolvedPixelBinding* ResolvePixelProfile(uint32_t handle) {
   ResolvedPixelBinding resolved;
   const uint32_t* code = bi->second.data();
   uint32_t code_count = uint32_t(bi->second.size());
-  DumpPixelShaderBlob(handle, code, code_count);
+  // Applied here rather than at startup: this is the first point every run
+  // reaches before any shader is emitted, and the emitter has no cvar access.
   ReportHlslCoverage(mx::hle::HlslStage::kPixel, handle, code, code_count);
   resolved.decoded = mx::hle::DecodePixelTextureFetches(
       code, code_count, resolved.bindings, &resolved.fail);
@@ -3942,11 +3994,28 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
 
   // A slot the guest points at a resolve result: the renderer samples the live
   // host target, exactly as the single-texture path already does.
+  // A destination the GPU wrote whole is a render target: its guest memory is
+  // meaningless and the snapshot is the only truthful answer, so take it before
+  // spending a decode. 25 of the 26 destinations in mx_780 are this case.
+  //
+  // A destination the GPU wrote only part of is the interesting one, and it is
+  // NOT a choice between a good answer and a bad one -- both sources are
+  // partial. The 2048x2048 menu atlas has three 256x256 tiles of real rendered
+  // content along its top edge and nothing else, while guest memory for it
+  // decodes to zeros. Refusing the snapshot outright, as the first version of
+  // this rule did, threw those three tiles away 2272 times and bound zeros
+  // instead. So: try memory first, and fall back to the snapshot when memory
+  // has nothing -- which also keeps the blank-retry path alive, so the day the
+  // guest fills that memory it wins on its own.
+  uint32_t partial_snapshot_object = 0;
   const auto& texture_state = DeviceState().texture[guest_sampler];
   if (texture_state.object &&
       g_resolvedTextureTargets.contains(texture_state.object)) {
-    dc.pixel_sampled_objects[slot] = texture_state.object;
-    return true;
+    if (ResolvedDestinationIsMostlyWritten(texture_state.object)) {
+      dc.pixel_sampled_objects[slot] = texture_state.object;
+      return true;
+    }
+    partial_snapshot_object = texture_state.object;
   }
 
   uint32_t fetch[6] = {};
@@ -4034,6 +4103,12 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // A key found blank recently and not yet due another look: bind the decode
   // the earlier draw made rather than repeating it.
   if (!BlankRetryDue(key)) {
+    if (partial_snapshot_object && g_hleBlankPayloads.contains(key)) {
+      // Known blank and not due a re-read: the snapshot's tiles are the best
+      // available answer until the retry says otherwise.
+      dc.pixel_sampled_objects[slot] = partial_snapshot_object;
+      return true;
+    }
     if (auto payload = g_hleBlankPayloads.find(key);
         payload != g_hleBlankPayloads.end()) {
       dc.pixel_textures[slot] = payload->second;
@@ -4060,6 +4135,13 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // representative and the count stays visible -- but no longer a refusal here.
   if (!HleTextureHasNonzeroData(*payload)) {
     NoteBlankDecode(key);
+    // Memory had nothing and a partly-written snapshot exists: its resolved
+    // tiles beat zeros everywhere, and the blank is still recorded above so the
+    // retry keeps looking.
+    if (partial_snapshot_object) {
+      dc.pixel_sampled_objects[slot] = partial_snapshot_object;
+      return true;
+    }
     ++g_slotBoundZero;
     NoteBlankTexture(key, guest_sampler, source);
     ReportBoundZero();
@@ -4083,12 +4165,108 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     return true;
   }
   NoteBlankRecovered(key);
-  DumpDecodedTexture(key, *payload);
   payload->key = key;
   payload->content_version = g_glyphCacheGeneration;
   dc.pixel_textures[slot] = payload;
   g_hleCpuTextures.emplace(key, std::move(payload));
   return true;
+}
+
+// Overlay a pixel shader's EMBEDDED constants onto the bank read from the
+// device shadow.
+//
+// The shadow at device+0x1780 is not the whole story, and reading it alone is
+// why every 3D material in this title rendered black. A shader object carries
+// its own constant-load table, and the draw-time flush publishes it straight to
+// the GPU by address, never through the shadow:
+//
+//   sub_82565928, the draw flush, does
+//       v8 = *(device + 12868);              // 0x3244, the PIXEL shader
+//       sub_825656A0(device, v8 + 10, v8[6]) // table at ps+0x28, data *(ps+0x18)
+//       v6 = *(device + 12872);              // 0x3248, the VERTEX shader
+//       sub_825656A0(device, v6 + 218, v6[8])// table at vs+0x368, data *(vs+0x20)
+//
+//   and sub_825656A0 walks, from `rel = *(u32*)(table + 0x14)`, a block at
+//   `table + rel` whose entry list starts at +0x14 and runs *(u32*)(+0x10)
+//   bytes:
+//       entry: u16 reg_index, u16 dword_count, u32 data_offset   (8 bytes)
+//       terminated by dword_count == 0
+//       source  = data_offset + data_base
+//       emitted as PM4 0xC0022F00 (LOAD_ALU_CONSTANT) with body
+//       [physical(source), 4 * reg_index, dword_count]
+//
+// The vertex half of this was already understood -- see
+// ProbeVertexShaderConstantPatch, which recorded that the data "never passes
+// through device + 0x780". What was missed is that the PIXEL shader has the
+// same mechanism at DIFFERENT offsets, so the pixel bank was left with only the
+// registers SetPixelShaderConstantF happens to write. Measured over 264 dumped
+// shaders: 242 read constants above c217, which the shadow never contains, and
+// the 22 that read only written registers are exactly the UI shaders that
+// always looked correct.
+//
+// reg_index is an ABSOLUTE ALU constant index, so the pixel half is 256..511
+// and maps to this bank at reg_index - 256. Entries below 256 belong to the
+// vertex file and are ignored here rather than folded in at a wrong index.
+void ApplyShaderLoadTable(uint32_t shader, uint32_t table_at, uint32_t data_at,
+                          uint8_t* base, std::vector<uint32_t>& bank) {
+  if (!shader || bank.size() < 256 * 4) return;
+  const uint32_t kPsLoadTableAt = table_at;
+  const uint32_t kPsDataBaseAt = data_at;
+  const uint32_t table = shader + kPsLoadTableAt;
+  if (!HostPageReadable(REX_RAW_ADDR(table + 0x14)) ||
+      !HostPageReadable(REX_RAW_ADDR(shader + kPsDataBaseAt)))
+    return;
+  const uint32_t rel = REX_LOAD_U32(table + 0x14);
+  if (!rel || rel >= 0x10000) return;
+  const uint32_t block = table + rel;
+  if (!HostPageReadable(REX_RAW_ADDR(block + 0x10))) return;
+  const uint32_t bytes = REX_LOAD_U32(block + 0x10);
+  if (!bytes || bytes >= 0x10000) return;
+  const uint32_t data_base = REX_LOAD_U32(shader + kPsDataBaseAt);
+  if (!data_base) return;
+
+  uint32_t at = block + 0x14;
+  const uint32_t end = at + bytes;
+  uint32_t applied = 0, entries = 0;
+  std::string first;
+  while (at + 8 <= end && HostPageReadable(REX_RAW_ADDR(at + 4))) {
+    const uint32_t hdr = REX_LOAD_U32(at);
+    const uint32_t reg = hdr >> 16;
+    const uint32_t dwords = hdr & 0xFFFF;
+    if (!dwords) break;
+    const uint32_t data_off = REX_LOAD_U32(at + 4);
+    at += 8;
+    ++entries;
+    const uint32_t src = data_base + data_off;
+    for (uint32_t j = 0; j < dwords; ++j) {
+      const uint32_t abs_reg = reg + j / 4;
+      if (abs_reg < 256 || abs_reg >= 512) continue;
+      const uint32_t dst = (abs_reg - 256) * 4 + (j % 4);
+      if (dst >= bank.size()) continue;
+      if (!HostPageReadable(REX_RAW_ADDR(src + j * 4))) continue;
+      bank[dst] = REX_LOAD_U32(src + j * 4);
+      ++applied;
+    }
+    if (entries <= 4)
+      first += fmt::format(" c{}..c{}", reg, reg + (dwords + 3) / 4 - 1);
+  }
+}
+
+// Both shaders publish into the SAME unified ALU constant file -- the draw
+// flush calls sub_825656A0 once for the pixel shader and once for the vertex
+// shader -- so an entry in EITHER table whose register lands in 256..511 is a
+// pixel constant. Taking only the pixel shader's table left c43 and c85 at
+// zero, which is most of a material's shading still missing.
+void ApplyPixelShaderLoadTable(uint32_t shader, uint32_t device, uint8_t* base,
+                               std::vector<uint32_t>& bank) {
+  ApplyShaderLoadTable(shader, 0x28, 0x18, base, bank);
+  // device+0x3248 is the vertex shader object; its table sits at +0x368 with
+  // its data base at +0x20.
+  constexpr uint32_t kDeviceVertexShaderAt = 0x3248;
+  if (device && HostPageReadable(REX_RAW_ADDR(device + kDeviceVertexShaderAt))) {
+    const uint32_t vs = REX_LOAD_U32(device + kDeviceVertexShaderAt);
+    if (vs) ApplyShaderLoadTable(vs, 0x368, 0x20, base, bank);
+  }
 }
 
 // Attach the guest's own translated pixel shader to a draw: its source, its
@@ -4144,6 +4322,8 @@ void AttachTranslatedPixelShader(mx::hle::DrawCall& dc, uint32_t handle,
       dc.pixel_constants.resize(kPixelConstRegs * 4);
       for (uint32_t i = 0; i < kPixelConstRegs * 4; ++i)
         dc.pixel_constants[i] = REX_LOAD_U32(device + kPixelConstBase + i * 4);
+      // The shadow is only half the bank. Overlay the shader's own literals.
+      ApplyPixelShaderLoadTable(handle, device, base, dc.pixel_constants);
 
       // One texture per slot the shader declares. A shader whose slots cannot
       // all be filled keeps the stand-in: running it with a missing texture
@@ -4165,8 +4345,21 @@ void AttachTranslatedPixelShader(mx::hle::DrawCall& dc, uint32_t handle,
         ++s_slotOk;
       }
       if (((s_slotOk + s_slotShort) % 5000) == 0) {
-        REXLOG_INFO("d3d9: translated texture slots: {} draws bound, {} short",
-                    s_slotOk, s_slotShort);
+        // The resolve-address counters ride here rather than in ReportBoundZero,
+        // which only fires every 2500 BLACK draws -- so the moment the black
+        // count collapses, the numbers saying whether the address match is
+        // doing the work disappear with it. They were invisible in exactly the
+        // runs where they mattered most.
+        size_t blank_outstanding = 0;
+        for (const auto& [key, b] : g_blankTextures)
+          if (!b.recovered) ++blank_outstanding;
+        REXLOG_INFO("d3d9: translated texture slots: {} draws bound, {} short; "
+                    "resolve address matches {} (extent mismatches {}, "
+                    "partial-coverage refusals {}), "
+                    "blank textures {} still blank of {}",
+                    s_slotOk, s_slotShort, g_resolveAddressMatches,
+                    g_resolveAddressExtentMiss, g_resolveAddressPartial,
+                    blank_outstanding, g_blankTextures.size());
       }
     } else {
       // Without its constants the shader would compute from zeros, which is a
@@ -4216,6 +4409,12 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
   if (!resolved && device &&
       HostPageReadable(REX_RAW_ADDR(device + 0x3244)))
     resolved = REX_LOAD_U32(device + 0x3244);
+  // Last resort: the device's own last-bound shader, recorded across threads.
+  // Both sources above are thread-local in effect -- the argument comes from a
+  // thread_local DeviceState, and device+0x3244 read zero for 15,555 draws on a
+  // loaded menu. Without this those draws take the tex*col stand-in and paint
+  // whatever their first texture happens to be, which for a character material
+  // is a packed normal/gloss map.
   if (resolved) {
     // Normally reached via ReadBoundPixelShader, which is below the contest and
     // therefore never ran for these draws -- so their microcode was never
@@ -4277,6 +4476,10 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
                   binding.sampler);
     return false;
   }
+  // No coverage rule here, deliberately. This path picks ONE texture to
+  // represent a draw the translated path could not take, so a partly-written
+  // snapshot is still the best thing it has -- there is no second source to
+  // prefer over it, which is the only reason the rule exists on the slot path.
   const auto& texture_state = DeviceState().texture[binding.sampler];
   if (texture_state.object &&
       g_resolvedTextureTargets.contains(texture_state.object)) {
@@ -4425,7 +4628,6 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
     return false;
   }
   NoteBlankRecovered(key);
-  DumpDecodedTexture(key, *payload);
   payload->key = key;
   payload->content_version = g_glyphCacheGeneration;
   dc.texture = payload;
@@ -6077,13 +6279,8 @@ void ReportHostPageQueryStats() {
 // does — so the time is not recompiled PPC compute. That traversal reaches D3D9
 // through indirect calls, so either it is blocking inside these hooks or it is
 // not. Turning them off separates those two cases in one run.
-REXCVAR_DEFINE_BOOL(hle_dump_textures, false, "Debug",
-                    "Write each distinct decoded HLE texture to "
-                    "logs/texdump as raw host bytes, once per key.");
 
-REXCVAR_DEFINE_BOOL(hle_dump_shaders, false, "Debug",
-                    "Write each distinct captured pixel shader microcode blob "
-                    "to logs/shaderdump, once per handle.");
+
 
 REXCVAR_DEFINE_BOOL(d3d9_hooks_passthrough, false, "Debug",
                     "Diagnostic: make the D3D9 HLE hooks pass straight through "
@@ -6808,6 +7005,9 @@ extern "C" REX_FUNC(sub_825506E8) {
   st.NoteDevice(ctx.r3.u32, mx::hle::kEpSetPixelShader);
   st.pixel_shader = ctx.r4.u32;
   st.ps_seen = true;
+  // Also record it against the DEVICE, so draws submitted on other threads can
+  // find it -- see NotePixelShaderForDevice.
+  NotePixelShaderForDevice(ctx.r3.u32, ctx.r4.u32);
   CollectPixelShaderBlob(ctx.r4.u32, base);
   orig_SetPixelShader(ctx, base);
 }
@@ -6977,6 +7177,26 @@ extern "C" REX_FUNC(sub_8255CE98) {
         entry.source_object = source->object;
         entry.width = dest_desc.width;
         entry.height = dest_desc.height;
+        // Where this resolve lands in the destination. No rect means the whole
+        // surface, which is the common case and must read as full coverage.
+        {
+          const uint32_t dx = have_dest_point ? dest_point[0]
+                              : have_src_rect ? src_rect[0]
+                                              : 0;
+          const uint32_t dy = have_dest_point ? dest_point[1]
+                              : have_src_rect ? src_rect[1]
+                                              : 0;
+          uint32_t w = have_src_rect && src_rect[2] > src_rect[0]
+                           ? uint32_t(src_rect[2] - src_rect[0])
+                           : source->width;
+          uint32_t h = have_src_rect && src_rect[3] > src_rect[1]
+                           ? uint32_t(src_rect[3] - src_rect[1])
+                           : source->height;
+          entry.reached_x = std::max(entry.reached_x, dx + w);
+          entry.reached_y = std::max(entry.reached_y, dy + h);
+          ++entry.resolves;
+          g_resolveDestObjectPhys[dest_texture] = physical;
+        }
         // Carried to the renderer so the snapshot is sized to the destination
         // TEXTURE rather than to the region this one resolve covers.
         dest_extent_width = dest_desc.width;

@@ -552,6 +552,13 @@ void ClearGameDraws();
   // resolve source object -> how many resolves it lost for want of an offscreen
   // surface, over the whole run.
   std::map<uint32_t, uint64_t> m_missingSourceCounts;
+  // Which condition of the translated gate a stand-in draw failed. Exactly one
+  // is charged per draw, in the order the gate tests them.
+  uint64_t m_standInNoHlsl = 0;
+  uint64_t m_standInNoHandle = 0;
+  uint64_t m_standInNoVertexInputs = 0;
+  uint64_t m_standInNoConstants = 0;
+  uint64_t m_standInTooManySamplers = 0;
   std::unordered_map<uint64_t, GameTexture> m_gameTextures;
   bool UploadGameTexture(GameTexture& entry,
                          const mx::hle::HleTexturePayload& src);

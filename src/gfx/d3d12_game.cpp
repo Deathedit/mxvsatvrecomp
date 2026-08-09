@@ -558,7 +558,13 @@ bool D3D12Renderer::CreateTranslatedRootSignature() {
 
 bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
                                            D3D12_GPU_DESCRIPTOR_HANDLE& out) {
-  if (!m_translatedSrvHeap || !d.pixelSamplerCount) return false;
+  // A shader that fetches NO texture is allowed through. It used to be refused
+  // here and at the translated gate, purely because the count was zero -- which
+  // is exactly backwards: a shader sampling nothing is the one case that needs
+  // no texture, and the tex*col stand-in it fell back to is the one thing that
+  // does. The descriptor range still has to be filled, with null descriptors;
+  // the shader declares no Texture2D at all, so nothing reads them.
+  if (!m_translatedSrvHeap) return false;
   if (m_translatedBlockNext >= m_translatedBlockLimit) {
     ++m_translatedBlockExhausted;
     return false;
@@ -633,6 +639,18 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
     // repeat slot 0 rather than being left undefined.
     const uint32_t from = i < d.pixelSamplerCount ? i : 0;
     const Slot& s = slots[from];
+    // No resource at all (a shader that samples nothing): a null descriptor is
+    // legal and reads as zero. It still needs a concrete format -- UNKNOWN is
+    // rejected -- so give it one nothing will look at.
+    if (!s.resource) {
+      srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+      srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      srv.Texture2D.MipLevels = 1;
+      srv.Shader4ComponentMapping = UINT(D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
+      m_device->CreateShaderResourceView(nullptr, &srv, cpu);
+      cpu.ptr += SIZE_T(m_gameSrvDescriptorSize);
+      continue;
+    }
     // The dimension must be the one the SHADER declared, not the one the
     // resource happens to have: a Texture2DArray declaration read through a
     // TEXTURE2D descriptor is undefined, not merely wrong-looking.
@@ -2363,6 +2381,16 @@ void D3D12Renderer::RenderGameFrame() {
                     m_missingSourceCounts.size(), line.c_str());
       LogInfo(message);
     }
+    std::snprintf(message, sizeof(message),
+                  "stand-in reasons: no-hlsl %llu, no-handle %llu, "
+                  "no-vertex-inputs %llu, no-constants %llu, "
+                  "too-many-samplers %llu",
+                  static_cast<unsigned long long>(m_standInNoHlsl),
+                  static_cast<unsigned long long>(m_standInNoHandle),
+                  static_cast<unsigned long long>(m_standInNoVertexInputs),
+                  static_cast<unsigned long long>(m_standInNoConstants),
+                  static_cast<unsigned long long>(m_standInTooManySamplers));
+    LogInfo(message);
     // THIS frame, not cumulative: the question is whether the frame on screen
     // was assembled on one surface or several. "presented 1 of 1" means present
     // is showing the finished scene; "1 of 4" means it is showing one layer.
@@ -2574,10 +2602,23 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   // draw is not built yet, so only a shader reading a single texture can be
   // bound correctly, using the descriptor this draw already has. Multi-sampler
   // shaders keep the stand-in until that lands.
+  // WHICH of the six conditions sent this draw to the stand-in. Without this the
+  // only available numbers are measured at two different points -- the hook
+  // counts ~475k D3D9 draw attempts, the renderer ~52k submitted draws -- so
+  // "2000 draws with an untranslated shader" and "27015 stand-in draws" describe
+  // different populations and cannot be subtracted from one another. Every
+  // attempt to reason about the difference between them has been wrong.
+  if (!d.pixelShaderHlsl) {
+  }
+  else if (!d.pixelShaderHandle) ++m_standInNoHandle;
+  else if (!hasVertexStage && !(interpolators && interpBytes))
+    ++m_standInNoVertexInputs;
+  else if (!pixelConstants || !pixelConstDwords) ++m_standInNoConstants;
+  else if (pixelSamplerCount > kTranslatedSamplerSlots) ++m_standInTooManySamplers;
+
   if (d.pixelShaderHlsl && d.pixelShaderHandle &&
       (hasVertexStage || (interpolators && interpBytes)) && pixelConstants &&
-      pixelConstDwords && pixelSamplerCount &&
-      pixelSamplerCount <= kTranslatedSamplerSlots) {
+      pixelConstDwords && pixelSamplerCount <= kTranslatedSamplerSlots) {
     // The shader's cbuffer is xe_c[256] followed by xe_texinv[slots], so the
     // buffer must cover BOTH. Sizing it to the constant bank alone would leave
     // the shader reading past the end of the resource for every unnormalized
@@ -2629,13 +2670,35 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
         // The per-slot payloads were already carried here; only this fill was
         // still single-texture. Slot 0 falls back to d.texture because the
         // single-texture path populates that and not the array.
+        //
+        // A slot bound to a RESOLVE SNAPSHOT has no CPU payload at all, and
+        // filling only from d.pixelTextures left those slots at zero -- the
+        // same defect as the slot-0-only fill above, surviving in the one case
+        // that never carries a payload. The extent then has to come from the
+        // snapshot resource, which is the texture actually bound there.
+        //
+        // This is what the menu rider looks like: its material samples the
+        // scene composite at s13, that slot is a snapshot, its texinv was zero,
+        // and an unnormalized fetch times zero reads texel (0,0) and paints it
+        // flat over 21753 indices of character mesh.
         for (uint32_t s = 0; s < kTranslatedSamplerSlots; ++s) {
+          uint32_t w = 0, h = 0;
           const auto& tex = s < d.pixelTextures.size() && d.pixelTextures[s]
                                 ? d.pixelTextures[s]
                                 : (s == 0 ? d.texture : nullptr);
-          if (!tex || !tex->width || !tex->height) continue;
-          const float ts[4] = {1.0f / float(tex->width),
-                               1.0f / float(tex->height), 0.0f, 0.0f};
+          if (tex && tex->width && tex->height) {
+            w = tex->width;
+            h = tex->height;
+          } else if (s < d.pixelSampledObjects.size() &&
+                     d.pixelSampledObjects[s]) {
+            const auto snap = m_gameSnapshots.find(d.pixelSampledObjects[s]);
+            if (snap != m_gameSnapshots.end()) {
+              w = snap->second.width;
+              h = snap->second.height;
+            }
+          }
+          if (!w || !h) continue;
+          const float ts[4] = {1.0f / float(w), 1.0f / float(h), 0.0f, 0.0f};
           std::memcpy(static_cast<uint8_t*>(p) + bankBytes + s * 16, ts,
                       sizeof(ts));
         }
