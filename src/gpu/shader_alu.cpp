@@ -272,6 +272,15 @@ class Interpreter {
     }
   }
 
+  // Direct3D 9 legacy multiply: a zero multiplicand yields +0 regardless of the
+  // other operand, so 0 * INF is +0 and not NaN. Every multiplying operation on
+  // this hardware behaves this way -- see the note above AluScalarOpcode in the
+  // SDK's ucode.h, and the matching XeMul in shader_hlsl.cpp. Titles rely on it
+  // for vector normalisation written as rcp-then-mul.
+  static float LegacyMul(float a, float b) {
+    return (a == 0.0f || b == 0.0f) ? 0.0f : a * b;
+  }
+
   Vec4 VectorOp(const uc::AluInstruction& alu) {
     Vec4 r;
     using Op = uc::AluVectorOpcode;
@@ -286,7 +295,7 @@ class Interpreter {
     // same discipline the export tracer needed, for the same reason.
     switch (op) {
       case Op::kAdd: for (int c = 0; c < 4; ++c) r[c] = a[c] + b[c]; break;
-      case Op::kMul: for (int c = 0; c < 4; ++c) r[c] = a[c] * b[c]; break;
+      case Op::kMul: for (int c = 0; c < 4; ++c) r[c] = LegacyMul(a[c], b[c]); break;
       case Op::kMax: for (int c = 0; c < 4; ++c) r[c] = a[c] >= b[c] ? a[c] : b[c]; break;
       case Op::kMin: for (int c = 0; c < 4; ++c) r[c] = a[c] < b[c] ? a[c] : b[c]; break;
       case Op::kSeq: for (int c = 0; c < 4; ++c) r[c] = a[c] == b[c] ? 1.0f : 0.0f; break;
@@ -304,7 +313,7 @@ class Interpreter {
         break;
       case Op::kMad: {
         const Vec4 c3 = Src(alu, 3);
-        for (int c = 0; c < 4; ++c) r[c] = a[c] * b[c] + c3[c];
+        for (int c = 0; c < 4; ++c) r[c] = LegacyMul(a[c], b[c]) + c3[c];
         break;
       }
       case Op::kCndEq: {
@@ -324,19 +333,19 @@ class Interpreter {
       }
       case Op::kDp4: {
         float d = 0;
-        for (int c = 0; c < 4; ++c) d += a[c] * b[c];
+        for (int c = 0; c < 4; ++c) d += LegacyMul(a[c], b[c]);
         for (int c = 0; c < 4; ++c) r[c] = d;
         break;
       }
       case Op::kDp3: {
         float d = 0;
-        for (int c = 0; c < 3; ++c) d += a[c] * b[c];
+        for (int c = 0; c < 3; ++c) d += LegacyMul(a[c], b[c]);
         for (int c = 0; c < 4; ++c) r[c] = d;
         break;
       }
       case Op::kDp2Add: {
         const Vec4 c3 = Src(alu, 3);
-        const float d = a[0] * b[0] + a[1] * b[1] + c3[0];
+        const float d = LegacyMul(a[0], b[0]) + LegacyMul(a[1], b[1]) + c3[0];
         for (int c = 0; c < 4; ++c) r[c] = d;
         break;
       }
@@ -347,7 +356,7 @@ class Interpreter {
         break;
       }
       case Op::kDst:
-        r[0] = 1.0f; r[1] = a[1] * b[1]; r[2] = a[2]; r[3] = b[3];
+        r[0] = 1.0f; r[1] = LegacyMul(a[1], b[1]); r[2] = a[2]; r[3] = b[3];
         break;
       default:
         // kCube, the setp_*_push family and the kill_* family. The kills are
@@ -388,7 +397,7 @@ class Interpreter {
         temps[alu.scalar_const_reg_op_src_temp_reg() & (kNumTemps - 1)][comp];
 
     switch (op) {
-      case Op::kMulsc0: case Op::kMulsc1: out = a * b; break;
+      case Op::kMulsc0: case Op::kMulsc1: out = LegacyMul(a, b); break;
       case Op::kAddsc0: case Op::kAddsc1: out = a + b; break;
       default:                            out = a - b; break;  // subsc0/1
     }
@@ -413,7 +422,7 @@ class Interpreter {
     float r = 0.0f;
     switch (op) {
       case Op::kAdds: r = a + b; break;
-      case Op::kMuls: r = a * b; break;
+      case Op::kMuls: r = LegacyMul(a, b); break;
       case Op::kSubs: r = a - b; break;
       case Op::kMaxs: r = a >= b ? a : b; break;
       case Op::kMins: r = a < b ? a : b; break;
@@ -422,7 +431,7 @@ class Interpreter {
       case Op::kSges: r = a >= b ? 1.0f : 0.0f; break;
       case Op::kSnes: r = a != b ? 1.0f : 0.0f; break;
       case Op::kAddsPrev: r = a + ps_; break;
-      case Op::kMulsPrev: r = a * ps_; break;
+      case Op::kMulsPrev: r = LegacyMul(a, ps_); break;
       case Op::kSubsPrev: r = a - ps_; break;
       case Op::kFrcs: r = a - std::floor(a); break;
       case Op::kTruncs: r = std::trunc(a); break;
@@ -432,13 +441,20 @@ class Interpreter {
         r = a == 0.0f ? -INFINITY : std::log2(std::fabs(a));
         if (op == Op::kLogc && std::isinf(r)) r = -3.402823466e+38f;
         break;
+      // The three forms differ only on an infinity, and treating the FF form
+      // as IEEE is what blacked out the menu on the HLSL side -- see the note
+      // beside kRcpf in shader_hlsl.cpp. Corrected here too so the interpreter
+      // and the emitter cannot disagree about a shader they both run.
+      //   RECIP_IEEE  +INF          RECIP_CLAMP  +/-FLT_MAX   RECIP_FF  +/-0.0
       case Op::kRcp: case Op::kRcpc: case Op::kRcpf:
         r = a == 0.0f ? INFINITY : 1.0f / a;
         if (op == Op::kRcpc && std::isinf(r)) r = r > 0 ? 3.402823466e+38f : -3.402823466e+38f;
+        if (op == Op::kRcpf && std::isinf(r)) r = r > 0 ? 0.0f : -0.0f;
         break;
       case Op::kRsq: case Op::kRsqc: case Op::kRsqf:
         r = a == 0.0f ? INFINITY : 1.0f / std::sqrt(std::fabs(a));
         if (op == Op::kRsqc && std::isinf(r)) r = 3.402823466e+38f;
+        if (op == Op::kRsqf && std::isinf(r)) r = r > 0 ? 0.0f : -0.0f;
         break;
       case Op::kSqrt: r = std::sqrt(a); break;
       case Op::kSin: r = std::sin(a); break;

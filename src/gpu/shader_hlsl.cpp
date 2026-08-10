@@ -292,7 +292,7 @@ class Emitter {
     std::string r;
     switch (op) {
       case Op::kAdd: r = "(" + a + " + " + b + ")"; break;
-      case Op::kMul: r = "(" + a + " * " + b + ")"; break;
+      case Op::kMul: r = "XeMul(" + a + ", " + b + ")"; break;
       case Op::kMax: r = "max(" + a + ", " + b + ")"; break;
       case Op::kMin: r = "min(" + a + ", " + b + ")"; break;
       case Op::kSeq: r = "float4(" + a + " == " + b + ")"; break;
@@ -308,7 +308,9 @@ class Emitter {
         Line("xe_a0 = (int)clamp(floor((" + a + ").w + 0.5), -256.0, 255.0);");
         r = "max(" + a + ", " + b + ")";
         break;
-      case Op::kMad: r = "mad(" + a + ", " + b + ", " + Src(alu, 3) + ")"; break;
+      case Op::kMad:
+        r = "(XeMul(" + a + ", " + b + ") + " + Src(alu, 3) + ")";
+        break;
       // lerp with a selector of exactly 0 or 1 is an exact select, and unlike a
       // vector ternary it is unambiguous about being component-wise.
       case Op::kCndEq:
@@ -320,10 +322,10 @@ class Emitter {
       case Op::kCndGt:
         r = "lerp(" + Src(alu, 3) + ", " + b + ", float4(" + a + " > 0.0))";
         break;
-      case Op::kDp4: r = "dot(" + a + ", " + b + ").xxxx"; break;
-      case Op::kDp3: r = "dot((" + a + ").xyz, (" + b + ").xyz).xxxx"; break;
+      case Op::kDp4: r = "XeDot4(" + a + ", " + b + ").xxxx"; break;
+      case Op::kDp3: r = "XeDot3((" + a + ").xyz, (" + b + ").xyz).xxxx"; break;
       case Op::kDp2Add:
-        r = "(dot((" + a + ").xy, (" + b + ").xy) + (" + Src(alu, 3) +
+        r = "(XeDot2((" + a + ").xy, (" + b + ").xy) + (" + Src(alu, 3) +
             ").x).xxxx";
         break;
       case Op::kMax4: {
@@ -332,8 +334,8 @@ class Emitter {
         break;
       }
       case Op::kDst:
-        r = "float4(1.0, (" + a + ").y * (" + b + ").y, (" + a + ").z, (" + b +
-            ").w)";
+        r = "float4(1.0, XeMul((" + a + ").y, (" + b + ").y), (" + a + ").z, (" +
+            b + ").w)";
         break;
       // Cube map coordinate generation. Transcribed from the hardware
       // definition in ucode.h (kCube), not approximated:
@@ -431,7 +433,7 @@ class Emitter {
         Temp(alu.scalar_const_reg_op_src_temp_reg()) + "." + kComponent[comp];
 
     switch (op) {
-      case Op::kMulsc0: case Op::kMulsc1: out = "(" + a + " * " + b + ")"; break;
+      case Op::kMulsc0: case Op::kMulsc1: out = "XeMul(" + a + ", " + b + ")"; break;
       case Op::kAddsc0: case Op::kAddsc1: out = "(" + a + " + " + b + ")"; break;
       default:                            out = "(" + a + " - " + b + ")"; break;
     }
@@ -452,7 +454,7 @@ class Emitter {
     std::string r;
     switch (op) {
       case Op::kAdds: r = "(" + a + " + " + b + ")"; break;
-      case Op::kMuls: r = "(" + a + " * " + b + ")"; break;
+      case Op::kMuls: r = "XeMul(" + a + ", " + b + ")"; break;
       case Op::kSubs: r = "(" + a + " - " + b + ")"; break;
       case Op::kMaxs: r = "max(" + a + ", " + b + ")"; break;
       case Op::kMins: r = "min(" + a + ", " + b + ")"; break;
@@ -461,7 +463,7 @@ class Emitter {
       case Op::kSges: r = "float(" + a + " >= " + b + ")"; break;
       case Op::kSnes: r = "float(" + a + " != " + b + ")"; break;
       case Op::kAddsPrev: r = "(" + a + " + xe_ps)"; break;
-      case Op::kMulsPrev: r = "(" + a + " * xe_ps)"; break;
+      case Op::kMulsPrev: r = "XeMul(" + a + ", xe_ps)"; break;
       case Op::kSubsPrev: r = "(" + a + " - xe_ps)"; break;
       case Op::kFrcs: r = "frac(" + a + ")"; break;
       case Op::kTruncs: r = "trunc(" + a + ")"; break;
@@ -470,11 +472,32 @@ class Emitter {
       // log(0) is -inf on the hardware; the clamped form saturates to -FLT_MAX.
       case Op::kLog: r = "log2(abs(" + a + "))"; break;
       case Op::kLogc: r = "max(log2(abs(" + a + ")), -3.402823466e+38)"; break;
-      case Op::kRcp: case Op::kRcpf: r = "rcp(" + a + ")"; break;
+      // The three reciprocal forms differ ONLY on what they do with an
+      // infinity, and that difference is the whole of this game's black main
+      // menu. From the SDK (ucode.h:1082-1114):
+      //
+      //   RECIP_IEEE  (kRcp)   1/0 = +INF
+      //   RECIP_CLAMP (kRcpc)  +INF -> +FLT_MAX, -INF -> -FLT_MAX
+      //   RECIP_FF    (kRcpf)  +INF ->  0.0,     -INF -> -0.0
+      //
+      // kRcpf was emitted as a plain rcp, so it produced +Inf where the console
+      // produces zero. Traced in a RenderDoc capture of the menu: the rider's
+      // material samples a texture, takes its Rec.709 luminance, and divides by
+      // it. The luminance is 0, RECIP_FF should hand back 0 and the term
+      // vanishes; instead we handed back +Inf, the next instruction computed
+      // 0 * Inf = NaN, and every pixel of the rider and bike came out NaN. NaN
+      // then poisoned the composite and blacked out the whole 3D layer.
+      //
+      // "Fast-forward" is the fixed-function-emulation form and it exists
+      // precisely so a shader can divide by a possibly-zero quantity without
+      // guarding it. A title relies on that.
+      case Op::kRcp: r = "rcp(" + a + ")"; break;
+      case Op::kRcpf: r = "XeFlushInf(rcp(" + a + "))"; break;
       case Op::kRcpc:
         r = "clamp(rcp(" + a + "), -3.402823466e+38, 3.402823466e+38)";
         break;
-      case Op::kRsq: case Op::kRsqf: r = "rsqrt(abs(" + a + "))"; break;
+      case Op::kRsq: r = "rsqrt(abs(" + a + "))"; break;
+      case Op::kRsqf: r = "XeFlushInf(rsqrt(abs(" + a + ")))"; break;
       case Op::kRsqc:
         r = "min(rsqrt(abs(" + a + ")), 3.402823466e+38)";
         break;
@@ -874,6 +897,72 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   src += "  float4 xe_texinv[" + std::to_string(HlslShader::kMaxSamplerSlots) +
          "];\n";
   src += "};\n";
+  // RECIP_FF / RECIPSQ_FF: an infinity becomes a signed zero. See the note at
+  // the kRcpf case -- these are the "fast-forward" forms a title uses when it
+  // wants to divide by a possibly-zero quantity and have the term vanish
+  // instead of poisoning the result. Emitted unconditionally: it is four lines,
+  // and gating it on whether the shader happens to use one is a way for the two
+  // to drift apart.
+  //
+  // `isinf` rather than a comparison against FLT_MAX: rcp of a denormal can
+  // overflow to infinity without the input being zero, and the hardware flushes
+  // that case too.
+  src +=
+      "float XeFlushInf(float v) {\n"
+      "  return isinf(v) ? (v < 0.0 ? -0.0 : 0.0) : v;\n"
+      "}\n";
+  // Direct3D 9 "legacy" multiply, which is what every multiplying operation on
+  // this hardware does -- mul, mad, the dot products, and their scalar forms.
+  // Quoting the SDK (ucode.h, above AluScalarOpcode):
+  //
+  //   Direct3D 9 rules (like in GCN v_*_legacy_f32 instructions) for
+  //   multiplication (+-0 or denormal * anything = +0) wherever it's present
+  //   (mul, mad, dp, etc.) [...] It's very important to respect this rule for
+  //   multiplication, as games often rely on it in vector normalization (rcp
+  //   and mul), Infinity * 0 resulting in NaN breaks a lot of things in games
+  //   - causes white screen [...], white specular on characters [...]. The
+  //   result is always positive zero in this case, no matter what the signs of
+  //   the other operands are.
+  //
+  // That is this game's menu exactly. The light-prepass materials sample the
+  // screen-space light buffer, take its Rec.709 luminance, `rcp` it, and scale
+  // colour*colour by the result -- the standard light-prepass specular
+  // reconstruction. Where the light buffer is black the hardware computes
+  // 0 * INF = +0 and the specular term simply vanishes; we computed NaN and
+  // every pixel of the rider and the bike came out NaN.
+  //
+  // Only exact zero is tested, not denormals: the hardware flushes denormal
+  // inputs to zero before the multiply, and so does every host GPU we target.
+  //
+  // mad stays unfused and is emitted as XeMul(a, b) + c rather than as a select
+  // on c -- per the same note, +0 + -0 is +0, so a zero multiplicand must still
+  // go through the add.
+  src +=
+      "float XeMul(float a, float b) {\n"
+      "  return (a == 0.0 || b == 0.0) ? 0.0 : a * b;\n"
+      "}\n"
+      "float2 XeMul(float2 a, float2 b) {\n"
+      "  return float2(XeMul(a.x, b.x), XeMul(a.y, b.y));\n"
+      "}\n"
+      "float3 XeMul(float3 a, float3 b) {\n"
+      "  return float3(XeMul(a.x, b.x), XeMul(a.y, b.y), XeMul(a.z, b.z));\n"
+      "}\n"
+      "float4 XeMul(float4 a, float4 b) {\n"
+      "  return float4(XeMul(a.x, b.x), XeMul(a.y, b.y), XeMul(a.z, b.z),\n"
+      "                XeMul(a.w, b.w));\n"
+      "}\n"
+      "float XeDot2(float2 a, float2 b) {\n"
+      "  float2 p = XeMul(a, b);\n"
+      "  return p.x + p.y;\n"
+      "}\n"
+      "float XeDot3(float3 a, float3 b) {\n"
+      "  float3 p = XeMul(a, b);\n"
+      "  return p.x + p.y + p.z;\n"
+      "}\n"
+      "float XeDot4(float4 a, float4 b) {\n"
+      "  float4 p = XeMul(a, b);\n"
+      "  return p.x + p.y + p.z + p.w;\n"
+      "}\n";
   // Declared for EVERY slot up to sampler_count, contiguously from t0/s0, so
   // the registers match a descriptor table of exactly that width.
   //
