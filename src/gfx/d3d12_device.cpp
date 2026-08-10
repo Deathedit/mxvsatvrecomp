@@ -57,15 +57,30 @@ bool D3D12Renderer::Initialize(HWND hwnd) {
     m_height = static_cast<uint32_t>(clientRect.bottom - clientRect.top);
   }
 
-#if defined(_DEBUG) && 1
+  // The debug layer used to be reachable only in a _DEBUG build, and a debug
+  // build of this emulator is too slow to reach the menu — so the one tool that
+  // names an invalid-work bug exactly was unavailable for the only scenes where
+  // such bugs appear. MX_D3D12_DEBUG=1 turns it on in a release build;
+  // MX_D3D12_DEBUG=2 adds GPU-based validation, which is far slower again but
+  // catches descriptor and resource-state errors the basic layer misses.
+  uint32_t debugLevel = 0;
+#if defined(_DEBUG)
+  debugLevel = 2;
+#endif
   {
+    char value[8] = {};
+    size_t len = 0;
+    if (getenv_s(&len, value, sizeof(value), "MX_D3D12_DEBUG") == 0 && len)
+      debugLevel = uint32_t(std::atoi(value));
+  }
+  if (debugLevel) {
     Microsoft::WRL::ComPtr<ID3D12Debug> debugController;
     if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)))) {
       debugController->EnableDebugLayer();
       LogInfo("D3D12 debug layer enabled.");
 
       Microsoft::WRL::ComPtr<ID3D12Debug1> debugController1;
-      if (SUCCEEDED(debugController.As(&debugController1))) {
+      if (debugLevel >= 2 && SUCCEEDED(debugController.As(&debugController1))) {
         debugController1->SetEnableGPUBasedValidation(TRUE);
         LogInfo("GPU-based validation enabled.");
       }
@@ -77,7 +92,6 @@ bool D3D12Renderer::Initialize(HWND hwnd) {
       LogInfo("DXGI debug interface acquired.");
     }
   }
-#endif
 
   if (!CreateFactory()) return false;
   if (!CreateDevice()) return false;
@@ -161,12 +175,27 @@ void D3D12Renderer::BeginFrame() {
   assert(m_commandAllocators[m_frameIndex] != nullptr);
   assert(m_commandList != nullptr);
 
-  if (FAILED(m_commandAllocators[m_frameIndex]->Reset())) {
-    LogError("BeginFrame: failed to reset command allocator");
+  HRESULT reset_hr = m_commandAllocators[m_frameIndex]->Reset();
+  if (FAILED(reset_hr)) {
+    char buf[160] = {};
+    std::snprintf(buf, sizeof(buf),
+                  "BeginFrame: failed to reset command allocator HR=0x%08lX",
+                  reset_hr);
+    LogError(buf);
     return;
   }
-  if (FAILED(m_commandList->Reset(m_commandAllocators[m_frameIndex].Get(), nullptr))) {
-    LogError("BeginFrame: failed to reset command list");
+  reset_hr = m_commandList->Reset(m_commandAllocators[m_frameIndex].Get(),
+                                  nullptr);
+  if (FAILED(reset_hr)) {
+    // Logged with its HRESULT because the bare message was unreadable: this
+    // fires every frame once EndFrame's Close has failed, and without the code
+    // there is no way to tell "the list is still open" from a device removal.
+    char buf[160] = {};
+    std::snprintf(buf, sizeof(buf),
+                  "BeginFrame: failed to reset command list HR=0x%08lX "
+                  "removed=0x%08lX",
+                  reset_hr, m_device->GetDeviceRemovedReason());
+    LogError(buf);
     return;
   }
 
@@ -258,12 +287,36 @@ void D3D12Renderer::EndFrame() {
 
   HRESULT hr = m_commandList->Close();
   if (FAILED(hr)) {
-    LogError("EndFrame: Close failed");
+    // This used to return here and nothing else, which killed the renderer for
+    // the rest of the run. A failed Close leaves the list OPEN, so every later
+    // BeginFrame failed to reset it; and because MoveToNextFrame never ran, the
+    // fence never advanced, so DrainRetired released nothing and the per-draw
+    // upload buffers accumulated without bound.
+    //
+    // Measured in mx_881: one Close failure at frame 43, then 521 consecutive
+    // dead frames at 4-5 SECONDS of wall clock each. That is what 0.40 fps in
+    // the menu actually is -- not the vertex path, which by then was not
+    // rendering at all.
+    char buf[192] = {};
+    std::snprintf(buf, sizeof(buf),
+                  "EndFrame: Close failed HR=0x%08lX removed=0x%08lX", hr,
+                  m_device->GetDeviceRemovedReason());
+    LogError(buf);
+    // Drained HERE rather than only after ExecuteCommandLists below: the
+    // validation message that REJECTED this Close is queued before it, so on
+    // the old ordering the one line naming the cause was never printed.
+    DrainD3D12Messages();
+    RecoverCommandList();
     return;
   }
 
   ID3D12CommandList* lists[] = {m_commandList.Get()};
   m_commandQueue->ExecuteCommandLists(1, lists);
+
+  // Before Present, so the messages for the work just recorded appear BEFORE
+  // the device-removal line rather than after it. Ordering is the whole value:
+  // the last validation error before the first hang is the one that caused it.
+  DrainD3D12Messages();
 
   hr = m_swapChain->Present(1, 0);
   if (FAILED(hr)) {
@@ -346,7 +399,49 @@ bool D3D12Renderer::CreateDevice() {
     LogInfo("Created D3D12 device at feature level 12.0");
   }
 
+  // Route the debug layer's messages into OUR log. Without this the layer is
+  // enabled and silent from the caller's point of view: its output goes to the
+  // debugger via OutputDebugString, and this process is normally run from a
+  // shell with no debugger attached. Breaking on corruption and error also
+  // stops AT the offending call rather than at the device hang it causes some
+  // frames later, which is the difference between a name and a guess.
+  Microsoft::WRL::ComPtr<ID3D12InfoQueue> infoQueue;
+  if (SUCCEEDED(m_device.As(&infoQueue))) {
+    infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, FALSE);
+    infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, FALSE);
+    m_infoQueue = infoQueue;
+    LogInfo("D3D12 info queue attached — validation messages will be logged.");
+  }
+
   return true;
+}
+
+// Drain whatever the debug layer has queued since the last call. Cheap when the
+// layer is off, because the queue is then never populated.
+void D3D12Renderer::DrainD3D12Messages() {
+  if (!m_infoQueue) return;
+  const UINT64 count = m_infoQueue->GetNumStoredMessages();
+  for (UINT64 i = 0; i < count; ++i) {
+    SIZE_T bytes = 0;
+    if (FAILED(m_infoQueue->GetMessage(i, nullptr, &bytes)) || !bytes) continue;
+    std::vector<uint8_t> storage(bytes);
+    auto* msg = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+    if (FAILED(m_infoQueue->GetMessage(i, msg, &bytes))) continue;
+    // Only the two severities that indicate we did something wrong. Warnings
+    // and info are voluminous and would bury them.
+    if (msg->Severity != D3D12_MESSAGE_SEVERITY_CORRUPTION &&
+        msg->Severity != D3D12_MESSAGE_SEVERITY_ERROR)
+      continue;
+    char line[1024];
+    std::snprintf(line, sizeof(line), "D3D12 %s [id %d]: %.*s",
+                  msg->Severity == D3D12_MESSAGE_SEVERITY_CORRUPTION
+                      ? "CORRUPTION"
+                      : "ERROR",
+                  int(msg->ID), int(msg->DescriptionByteLength),
+                  msg->pDescription);
+    LogError(line);
+  }
+  m_infoQueue->ClearStoredMessages();
 }
 
 bool D3D12Renderer::CreateCommandQueue() {
@@ -471,6 +566,39 @@ bool D3D12Renderer::CreateCommandList() {
 
   m_commandList->Close();
   return true;
+}
+
+// Discard the command list and build a new one, after a Close that failed.
+//
+// D3D12 offers no way to return an indeterminate list to a usable state — the
+// runtime's own guidance is to abandon it — so the only recovery is a fresh
+// one. The GPU is drained first because we do not know how much of the
+// abandoned frame, if any, is still referencing resources; after that wait
+// nothing is, which is also the one moment the retirement list can be emptied
+// outright.
+void D3D12Renderer::RecoverCommandList() {
+  WaitForGpu();
+  m_commandList.Reset();
+  for (auto& a : m_commandAllocators) {
+    if (a) a->Reset();
+  }
+  DrainRetired();
+  HRESULT hr = m_device->CreateCommandList(
+      0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+      m_commandAllocators[m_frameIndex].Get(), nullptr,
+      IID_PPV_ARGS(&m_commandList));
+  if (FAILED(hr)) {
+    char buf[160] = {};
+    std::snprintf(buf, sizeof(buf),
+                  "EndFrame: could not rebuild the command list HR=0x%08lX — "
+                  "the renderer is dead from here",
+                  hr);
+    LogError(buf);
+    return;
+  }
+  // Left closed, which is the state BeginFrame expects to reset from.
+  m_commandList->Close();
+  LogError("EndFrame: command list rebuilt after a failed Close");
 }
 
 bool D3D12Renderer::CreateFence() {

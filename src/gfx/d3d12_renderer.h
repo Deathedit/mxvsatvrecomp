@@ -211,12 +211,19 @@ void ClearGameDraws();
   bool CreateRenderTargetViews();
   bool CreateCommandAllocator();
   bool CreateCommandList();
+  // Abandon and rebuild the command list after a Close that failed. Without
+  // this one failure killed every later frame in the run.
+  void RecoverCommandList();
   bool CreateFence();
   void CreateViewportAndScissor();
 
 
   bool CreateGamePipeline();
   bool CreateGameRenderTargets();
+  // Empties the debug layer's message queue into the log. No-op unless
+  // MX_D3D12_DEBUG enabled the layer.
+  void DrainD3D12Messages();
+  Microsoft::WRL::ComPtr<ID3D12InfoQueue> m_infoQueue;
   // Uploads the Bink plane set into reusable host textures and writes their
   // SRVs into the four descriptors reserved at the head of the heap. Separate
   // from EnsureGameTexture because these planes are new content every video
