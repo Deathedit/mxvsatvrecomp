@@ -68,6 +68,7 @@ REXCVAR_DECLARE(uint32_t, hle_shader_verts);
 REXCVAR_DECLARE(bool, hle_gpu_vertex);
 REXCVAR_DECLARE(bool, hle_texture_signs);
 REXCVAR_DECLARE(bool, hle_gpu_vertex_fetch);
+REXCVAR_DECLARE(bool, hle_ps_device_fallback);
 namespace {
 
 namespace uc = rex::graphics::ucode;
@@ -958,6 +959,42 @@ uint32_t PixelShaderForDevice(uint32_t device) {
   }
   return g_lastPixelShaderAnyDevice;
 }
+
+// The same lookup, but ONLY for the device asked about.
+//
+// The any-device fallback above is a guess across devices, and this title drives
+// three of them from three worker threads -- so it can hand a draw a shader that
+// was never bound on its device. That is fine for a diagnostic and not fine for
+// something that decides which program a third of the frame runs. Kept separate
+// rather than changing the existing function, which other callers may want.
+uint32_t PixelShaderForDeviceStrict(uint32_t device) {
+  if (!device) return 0;
+  std::lock_guard<std::mutex> lock(g_pixelShaderByDeviceMu);
+  const auto it = g_pixelShaderByDevice.find(device);
+  return it != g_pixelShaderByDevice.end() ? it->second : 0;
+}
+// Every device SetPixelShader has ever been called on, with the shader it last
+// received. Rendered for the report below so the devices that SET a shader can
+// be read directly against the devices that DRAW without one.
+std::string PixelShaderDeviceSummary() {
+  std::lock_guard<std::mutex> lock(g_pixelShaderByDeviceMu);
+  std::string s;
+  for (const auto& [dev, sh] : g_pixelShaderByDevice)
+    s += fmt::format(" 0x{:08X}=0x{:08X}", dev, sh);
+  return s.empty() ? " (none)" : s;
+}
+
+// How often the per-device record is what rescues a draw. Read against
+// s_no_shader_no_setter: the gap between them is draws still unattributed.
+uint64_t g_psFromDeviceRecord = 0;
+// Luminance readings replaced by the floor because the GPU reported exactly
+// zero. Should be a handful at startup; a number that keeps climbing means the
+// reduction chain is producing nothing and the floor is masking that.
+uint64_t g_luminanceFloored = 0;
+// Draws whose pixel constant bank held a non-finite value, and how many
+// components in total. Reported so the experiment can be read even when the
+// picture does not change.
+uint64_t g_constDrawsSanitized = 0, g_constComponentsSanitized = 0;
 
 // The same physical page is visible through several virtual windows on this
 // console, and the guest uses different ones for the same surface. Measured in
@@ -4940,6 +4977,65 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
   // loaded menu. Without this those draws take the tex*col stand-in and paint
   // whatever their first texture happens to be, which for a character material
   // is a packed normal/gloss map.
+  //
+  // That fallback was WRITTEN AND NEVER CALLED. This comment described it and
+  // the code below stopped at device+0x3244, so PixelShaderForDevice sat dead
+  // in the file. Measured cost of the omission, mx_890 at the menu: 79,984 of
+  // 240,000 draws arrive with no setter handle at all; 133 of them per frame
+  // carry 144,097 vertices, and because no translated pixel shader means no GPU
+  // vertex path, they run the software interpreter and the CPU attribute decode
+  // -- 121ms of a 225ms frame, the single largest item in it.
+  // Gated, because it is both the largest speedup this session and a suspected
+  // regression, and those have to be separable.
+  //
+  // It took the menu 4.45 -> 9.88 fps by giving 80,000 draws a translated pixel
+  // shader, which is what lets them onto the GPU vertex path instead of the
+  // software interpreter. But "unbound by sampler s0/s1/s2" appears in no run
+  // before mx_891 and in every run after it, at ~69,000 draws a frame: the
+  // shader this attaches declares sampler slots those draws never bound, and
+  // each one gets a 1x1 black. Whether that is a wrong shader or a second
+  // missing binding is the open question, and one flag answers it.
+  // WHOSE device is it? Recorded BEFORE the fallback runs, so it describes the
+  // draw as it arrived rather than after being patched up.
+  //
+  // The 3D layer of the menu is 133 draws a frame with no pixel shader from
+  // either source, and both offsets have been confirmed against the guest:
+  // D3DDevice_SetPixelShader writes pDevice[1].m_Constants.Fetch[29] —
+  // device+0x3244 — which is exactly what was read above. So the field is not
+  // being misread; either the shader was never set on THIS device, or the draw
+  // is carrying the wrong device pointer.
+  //
+  // The guest runs three parallel record workers, each driving its own device
+  // (dword_830B2C60[0..2]), and this file has twice been caught by state being
+  // read from the wrong one of the three. If the draw devices below do not
+  // appear among the setter devices, that is the whole defect.
+  if (!resolved) {
+    static std::mutex s_mu;
+    static std::map<uint64_t, uint64_t> s_byDeviceThread;
+    static uint64_t s_total = 0;
+    bool report = false;
+    {
+      std::lock_guard<std::mutex> lk(s_mu);
+      ++s_byDeviceThread[(uint64_t(device) << 32) | GetCurrentThreadId()];
+      report = (++s_total % 20000) == 0;
+    }
+    if (report) {
+      std::string draws;
+      {
+        std::lock_guard<std::mutex> lk(s_mu);
+        for (const auto& [key, n] : s_byDeviceThread) {
+          draws += fmt::format(" dev=0x{:08X}/t{}={}", uint32_t(key >> 32),
+                               uint32_t(key & 0xFFFFFFFFu), n);
+        }
+      }
+      REXLOG_INFO("d3d9: NO-PS DEVICES over {} draws:{}", s_total, draws);
+      REXLOG_INFO("d3d9: SETTER DEVICES:{}", PixelShaderDeviceSummary());
+    }
+  }
+  if (REXCVAR_GET(hle_ps_device_fallback) && !resolved) {
+    resolved = PixelShaderForDeviceStrict(device);
+    if (resolved) ++g_psFromDeviceRecord;
+  }
   if (resolved) {
     // Normally reached via ReadBoundPixelShader, which is below the contest and
     // therefore never ran for these draws -- so their microcode was never
@@ -4974,10 +5070,11 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
       // bound. Left as it was, the next reader would diagnose 80,000 lost
       // draws that are not lost.
       REXLOG_INFO("d3d9: stand-in has no single texture to sample: {} of {} "
-                  "attempts ({} with no setter handle at all); this one "
-                  "setter=0x{:08X}, device+0x3244=0x{:08X}",
-                  s_no_shader, s_attempts, s_no_shader_no_setter, pixel_shader,
-                  direct);
+                  "attempts ({} with no setter handle at all, {} rescued by "
+                  "the per-device record); this one setter=0x{:08X}, "
+                  "device+0x3244=0x{:08X}",
+                  s_no_shader, s_attempts, s_no_shader_no_setter,
+                  g_psFromDeviceRecord, pixel_shader, direct);
     }
     return false;
   }

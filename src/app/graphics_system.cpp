@@ -113,6 +113,17 @@ REXCVAR_DEFINE_BOOL(hle_gpu_vertex_fetch, true, "Debug",
                     "guest vertex buffer itself, instead of the CPU unpacking "
                     "attributes per vertex. Requires hle_gpu_vertex");
 
+// When a draw arrives with no pixel shader from either the setter argument or
+// device+0x3244, fall back to the last shader bound on that DEVICE.
+//
+// Default on: it is worth 4.45 -> 9.88 fps at the menu, because a draw with no
+// translated pixel shader cannot take the GPU vertex path and runs the software
+// interpreter instead.
+REXCVAR_DEFINE_BOOL(hle_ps_device_fallback, true, "Debug",
+                    "Resolve a draw's pixel shader from the last one bound on "
+                    "its device when neither the setter nor device+0x3244 has "
+                    "one");
+
 // TEX_FORMAT_COMP / GPUSIGN. Off leaves every xe_texsign at 1.0, which is the
 // exact behaviour of every build before this one, so a suspected regression is
 // one run to bisect rather than a rebuild -- the same reason hle_gpu_vertex has
