@@ -66,9 +66,11 @@ REXCVAR_DECLARE(bool, hle_capture);
 REXCVAR_DECLARE(uint32_t, hle_shader_exec);
 REXCVAR_DECLARE(uint32_t, hle_shader_verts);
 REXCVAR_DECLARE(bool, hle_gpu_vertex);
+REXCVAR_DECLARE(bool, hle_texture_signs);
 namespace {
 
 namespace uc = rex::graphics::ucode;
+namespace xn = rex::graphics::xenos;
 
 using mx::hle::DeviceState;
 
@@ -3969,17 +3971,81 @@ void ReportBoundZero() {
 // so the channel would be undefined rather than wrong -- and whether the
 // k_8_8_8_8 -> R8G8B8A8 mapping is relying on a swizzle that actually performs
 // the BGRA rotation.
+// Also censused here: TEX_FORMAT_COMP / GPUSIGN, which the describe step reads
+// but nothing acts on. Three of its four values change what a fetch returns --
+// kSigned is two's complement (an SNORM host format), kUnsignedBiased is
+// 2*c-1, and kGamma is sRGB linearized on sample -- so any of them appearing
+// means we hand the shader the wrong numbers, quietly. This says whether the
+// game uses them at all before any of it is built.
 void NoteSwizzleCensus(const mx::hle::HleTextureSource& source) {
   static std::set<uint64_t> s_seen;
-  const uint64_t pair = (uint64_t(source.guest_format) << 32) | source.swizzle;
+  const uint64_t pair = (uint64_t(source.guest_format) << 32) |
+                        (uint64_t(source.signs) << 16) | source.swizzle;
   if (!s_seen.insert(pair).second) return;
   const uint32_t c[4] = {(source.swizzle >> 0) & 7u, (source.swizzle >> 3) & 7u,
                          (source.swizzle >> 6) & 7u, (source.swizzle >> 9) & 7u};
   const bool undefined = c[0] > 5 || c[1] > 5 || c[2] > 5 || c[3] > 5;
+  static constexpr const char* kSignName[4] = {"unsigned", "signed", "biased",
+                                               "gamma"};
+  const uint32_t s[4] = {(source.signs >> 0) & 3u, (source.signs >> 2) & 3u,
+                         (source.signs >> 4) & 3u, (source.signs >> 6) & 3u};
   REXLOG_INFO("d3d9: swizzle census: guest format {} swizzle {:#o} "
-              "components [{} {} {} {}]{}",
+              "components [{} {} {} {}]{} signs [{} {} {} {}]{}",
               source.guest_format, source.swizzle, c[0], c[1], c[2], c[3],
-              undefined ? "  <-- UNDEFINED in D3D12 (>5)" : "");
+              undefined ? "  <-- UNDEFINED in D3D12 (>5)" : "", kSignName[s[0]],
+              kSignName[s[1]], kSignName[s[2]], kSignName[s[3]],
+              source.signs ? "  <-- NOT PLAIN UNSIGNED, we ignore this" : "");
+}
+
+// How many slot binds actually carry a sign mode we do not honour, split by
+// guest format. The census above says which formats do it; this says whether it
+// is one decorative texture or the whole scene, which is the difference between
+// closing the question and building a signed decode path.
+//
+// Float formats are excluded deliberately. A TextureSign on k_*_FLOAT is a
+// no-op -- the data is already signed float, and the reference cache only needs
+// a separate host texture when a FIXED-POINT format has no signed host
+// equivalent (cache.h:488, IsSignedVersionSeparateForFormat). Counting them
+// would inflate the number with binds that need nothing done.
+bool IsFloatGuestFormat(uint32_t guest_format) {
+  switch (xn::TextureFormat(guest_format)) {
+    case xn::TextureFormat::k_16_FLOAT:
+    case xn::TextureFormat::k_16_16_FLOAT:
+    case xn::TextureFormat::k_16_16_16_16_FLOAT:
+    case xn::TextureFormat::k_32_FLOAT:
+    case xn::TextureFormat::k_32_32_FLOAT:
+    case xn::TextureFormat::k_32_32_32_32_FLOAT:
+      return true;
+    default:
+      return false;
+  }
+}
+
+void NoteSignedBind(const mx::hle::HleTextureSource& source) {
+  if (!source.signs || IsFloatGuestFormat(source.guest_format)) return;
+  static std::map<uint32_t, uint64_t> s_binds;
+  const uint64_t n = ++s_binds[(source.guest_format << 8) | source.signs];
+  if ((n % 5000) != 0) return;
+  std::string by;
+  for (const auto& [k, v] : s_binds)
+    by += fmt::format(" fmt{}/signs{:#04x}={}", k >> 8, k & 0xFF, v);
+  REXLOG_INFO("d3d9: binds of a non-float texture with an unhonoured sign mode:{}",
+              by);
+}
+
+// A sign mode that reaches a bind and is NOT applied. kSigned needs the
+// texture's bits reinterpreted into a signed host format (a decode change, task
+// #43); kGamma needs an sRGB curve. Neither is approximated here -- an
+// unimplemented mode that silently behaves as unsigned is at least visible in
+// this line.
+void NoteUnhandledSign(uint32_t guest_format, uint32_t mode) {
+  static std::map<uint32_t, uint64_t> s_seen;
+  const uint64_t n = ++s_seen[(guest_format << 4) | mode];
+  if (n != 1 && (n % 20000) != 0) return;
+  static constexpr const char* kName[4] = {"unsigned", "signed", "biased",
+                                           "gamma"};
+  REXLOG_INFO("d3d9: texture sign mode NOT applied: guest format {} mode {} x{}",
+              guest_format, kName[mode & 3], n);
 }
 
 bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
@@ -4059,6 +4125,31 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     ++g_slotFailDescribe;
     ReportSlotFailures();
     return false;
+  }
+  NoteSignedBind(source);
+  // Permuted into host component order here, at the bind, because this is
+  // per-binding state: the same guest memory is sampled with different sign
+  // modes by different draws. Applied by the shader after the fetch, which is
+  // where it has to happen -- see the note in EmitTextureFetch.
+  //
+  // Only kUnsignedBiased rides this. kSigned would need the texture's bits
+  // reinterpreted into a signed host format, and kGamma is a curve rather than
+  // a scale; both are counted by NoteUnhandledSign and left alone rather than
+  // approximated, since the census over a full menu run finds no kGamma at all
+  // and kSigned on one FMT_4_4_4_4 texture.
+  if (REXCVAR_GET(hle_texture_signs)) {
+    const uint8_t swizzled =
+        mx::hle::SwizzleTextureSigns(source.signs, source.swizzle);
+    uint8_t biased = 0;
+    for (uint32_t c = 0; c < 4; ++c) {
+      const uint32_t mode = (swizzled >> (c * 2)) & 3u;
+      if (mode == uint32_t(xn::TextureSign::kUnsignedBiased))
+        biased |= uint8_t(1u << c);
+      else if (mode != uint32_t(xn::TextureSign::kUnsigned) &&
+               !IsFloatGuestFormat(source.guest_format))
+        NoteUnhandledSign(source.guest_format, mode);
+    }
+    dc.pixel_sampler_signs[slot] = biased;
   }
 
   // The same memory a resolve wrote into, reached through a different texture

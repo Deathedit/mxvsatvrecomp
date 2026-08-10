@@ -42,6 +42,17 @@ void SwapBlock(uint8_t* p, uint32_t bytes, xenos::Endian endian) {
 // Spellings are the guest's own, including index 20's truncated "FMT_4_5" for
 // DXT4_5 and index 0's lowercase tail. Indices 61-63 are compiler-internal and
 // have no GPU meaning.
+uint8_t SwizzleTextureSigns(uint8_t signs, uint32_t swizzle) {
+  if (!signs) return 0;
+  uint8_t out = 0;
+  for (uint32_t c = 0; c < 4; ++c) {
+    const uint32_t src = (swizzle >> (c * 3)) & 7u;
+    if (src > 3) continue;  // forced 0 or 1: no guest component, so unsigned.
+    out |= uint8_t(((signs >> (src * 2)) & 3u) << (c * 2));
+  }
+  return out;
+}
+
 const char* GuestTextureFormatName(uint32_t guest_format) {
   static constexpr const char* kNames[64] = {
       "FMT_1_reverse", "FMT_1", "FMT_8", "FMT_1_5_5_5",
@@ -220,6 +231,10 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
   out.swizzle = fetch.swizzle;
   out.clamp_x = uint32_t(fetch.clamp_x);
   out.clamp_y = uint32_t(fetch.clamp_y);
+  out.signs = uint8_t((uint32_t(fetch.sign_x) & 3u) |
+                      ((uint32_t(fetch.sign_y) & 3u) << 2) |
+                      ((uint32_t(fetch.sign_z) & 3u) << 4) |
+                      ((uint32_t(fetch.sign_w) & 3u) << 6));
   out.tiled = fetch.tiled != 0;
   out.linear_filter = fetch.min_filter != xenos::TextureFilter::kPoint &&
                       fetch.mag_filter != xenos::TextureFilter::kPoint;

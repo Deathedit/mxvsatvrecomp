@@ -750,6 +750,26 @@ class Emitter {
     }
     const std::string s = std::to_string(slot);
     Line("xe_v = xe_tex" + s + ".Sample(xe_smp" + s + ", " + coord + ");");
+    // TEX_FORMAT_COMP / GPUSIGN, applied here because it is per-BINDING state,
+    // not per-texture: the same guest memory is bound with different sign modes
+    // by different draws, so baking it into the decode would poison a cache
+    // keyed on content. 2*c-1 is also unrepresentable in the UNORM8 the decode
+    // produces. The reference does the same thing for the same reasons -- see
+    // texture_swizzled_signs in dxbc_translator.h.
+    //
+    // xe_texsign carries a per-component SCALE, already permuted into host
+    // component order by SwizzleTextureSigns because the SRV applies the fetch
+    // swizzle before the shader ever sees a texel. The offset is not carried:
+    // for the two modes that reach here it is exactly 1-scale, since unsigned
+    // is (1, 0) and kUnsignedBiased is (2, -1).
+    //
+    // kSigned needs the texture's bits reinterpreted and so is a host-side
+    // decode, not this; kGamma is a curve and cannot ride a scale. Both are
+    // refused upstream rather than silently approximated by a mad.
+    if (pixel()) {
+      Line("xe_v = xe_v * xe_texsign[" + s + "] + (1.0 - xe_texsign[" + s +
+           "]);");
+    }
     EmitFetchDestination(tf);
   }
 
@@ -896,6 +916,15 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   // unnormalized-coordinate note in EmitTextureFetch.
   src += "  float4 xe_texinv[" + std::to_string(HlslShader::kMaxSamplerSlots) +
          "];\n";
+  // Per-component TextureSign scale, host component order, 1.0 where the fetch
+  // is plain unsigned. See the note at the fetch site. Pixel stage only, both
+  // because no vertex shader in this game samples anything and because the
+  // vertex cbuffer is addressed by the renderer at a fixed offset just past
+  // xe_texinv -- adding a member there would silently move it.
+  if (stage == HlslStage::kPixel) {
+    src += "  float4 xe_texsign[" +
+           std::to_string(HlslShader::kMaxSamplerSlots) + "];\n";
+  }
   src += "};\n";
   // RECIP_FF / RECIPSQ_FF: an infinity becomes a signed zero. See the note at
   // the kRcpf case -- these are the "fast-forward" forms a title uses when it

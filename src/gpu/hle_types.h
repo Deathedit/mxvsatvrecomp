@@ -255,6 +255,12 @@ struct DrawCall {
   std::array<std::shared_ptr<const HleTexturePayload>, kMaxPixelTextures>
       pixel_textures;
   std::array<uint32_t, kMaxPixelTextures> pixel_sampled_objects = {};
+  // Per compact slot: the fetch constant's four TextureSign values, already
+  // permuted into host component order (SwizzleTextureSigns), two bits per
+  // component. 0 means plain unsigned, which is the overwhelming majority.
+  // Per-BINDING state, not per-texture -- the same guest memory is bound with
+  // different sign modes by different draws.
+  std::array<uint8_t, kMaxPixelTextures> pixel_sampler_signs = {};
   // The interpolators the translated pixel shader reads, one float4 per
   // linkage slot per vertex, in a buffer parallel to `vertices`.
   //

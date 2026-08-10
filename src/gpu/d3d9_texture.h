@@ -25,6 +25,12 @@ struct HleTextureSource {
   uint32_t swizzle = 0;
   uint32_t clamp_x = 0;
   uint32_t clamp_y = 0;
+  // TEX_FORMAT_COMP / GPUSIGN, one xenos::TextureSign per component packed two
+  // bits each in XYZW order -- kUnsigned(0), kSigned(1), kUnsignedBiased(2,
+  // meaning 2*c-1), kGamma(3, sRGB linearized when sampled). Decoded so the
+  // census can say whether this game uses anything but kUnsigned; nothing acts
+  // on it yet.
+  uint8_t signs = 0;
   // 1 for a plain 2D or 1D texture; 6 for a cube; stack_depth+1 for a stacked
   // 2D. Each slice is a whole 2D image of the width/height above, and
   // slice_stride_bytes is the distance between their bases in guest memory
@@ -39,6 +45,20 @@ struct HleTextureSource {
 // Name of a guest texture format, transcribed from the game's own 64-entry
 // table. Never null; unknown indices return "FMT_?".
 const char* GuestTextureFormatName(uint32_t guest_format);
+
+// The fetch constant's four TextureSign values, permuted into HOST component
+// order so a shader can apply them to an already-swizzled sample.
+//
+// This has to be permuted because the swizzle is applied by the SRV's component
+// mapping, not in the shader: by the time the shader sees a texel, component c
+// holds guest component swizzle[c], so it needs guest component swizzle[c]'s
+// sign. A swizzle entry of 4 or 5 forces a literal 0 or 1, which carries no
+// guest component and is therefore unsigned. Mirrors the reference's
+// SwizzleSigns (pipeline/texture/util.h:309).
+//
+// Returns two bits per host component in XYZW order, same packing as
+// HleTextureSource::signs.
+uint8_t SwizzleTextureSigns(uint8_t signs, uint32_t swizzle);
 
 bool DescribeHleTexture2D(const uint32_t fetch_words[6],
                           HleTextureSource& out, const char** fail = nullptr);

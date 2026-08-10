@@ -110,7 +110,8 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                      pixelTextures = nullptr,
                  const uint32_t* pixelSampledObjects = nullptr,
                  const GpuVertexStage* vertexStage = nullptr,
-                 uint32_t pixelSamplerArrayMask = 0);
+                 uint32_t pixelSamplerArrayMask = 0,
+                 const uint8_t* pixelSamplerSigns = nullptr);
 
 // Append a resolve to this frame's list, in order with the draws around it.
 //
@@ -685,6 +686,10 @@ void ClearGameDraws();
     std::array<std::shared_ptr<const mx::hle::HleTexturePayload>,
                kTranslatedSamplerSlots> pixelTextures;
     std::array<uint32_t, kTranslatedSamplerSlots> pixelSampledObjects = {};
+    // Per slot, bit c set = host component c of this fetch is
+    // kUnsignedBiased and the shader must expand it as 2*c-1. Already
+    // permuted into host component order by the hooks side.
+    std::array<uint8_t, kTranslatedSamplerSlots> pixelSamplerSigns = {};
     bool translated = false;
 
     // The guest VERTEX shader on the GPU. `gpuVertex` is only set once every

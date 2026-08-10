@@ -99,6 +99,15 @@ REXCVAR_DEFINE_BOOL(hle_gpu_vertex, true, "Debug",
                     "whose vertex AND pixel shaders both translate. Off keeps "
                     "every draw on the CPU interpreter");
 
+// TEX_FORMAT_COMP / GPUSIGN. Off leaves every xe_texsign at 1.0, which is the
+// exact behaviour of every build before this one, so a suspected regression is
+// one run to bisect rather than a rebuild -- the same reason hle_gpu_vertex has
+// a switch. Worth having because this change and the D3D9-legacy-multiply
+// change landed back to back and both touch every translated pixel shader.
+REXCVAR_DEFINE_BOOL(hle_texture_signs, true, "Debug",
+                    "Apply the fetch constant's kUnsignedBiased texture sign "
+                    "(2*c-1) in the pixel shader");
+
 // HLE does not yet create a host target for every guest render target. Until
 // it does, mixing the 129x129 shadow pass and other off-screen viewports into
 // the 1280x720 scene produces the long white wedges seen in ST_Southwest.
@@ -384,7 +393,8 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   d->pixel_textures.data(),
                                   d->pixel_sampled_objects.data(),
                                   vertexStage.handle ? &vertexStage : nullptr,
-                                  d->pixel_sampler_array_mask);
+                                  d->pixel_sampler_array_mask,
+                                  d->pixel_sampler_signs.data());
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;

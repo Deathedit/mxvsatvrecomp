@@ -2492,7 +2492,8 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  const std::shared_ptr<const mx::hle::HleTexturePayload>* pixelTextures,
                                  const uint32_t* pixelSampledObjects,
                                  const GpuVertexStage* vertexStage,
-                                 uint32_t pixelSamplerArrayMask) {
+                                 uint32_t pixelSamplerArrayMask,
+                                 const uint8_t* pixelSamplerSigns) {
   // PERF(per-frame-allocs): this creates three ID3D12Resource's per call (VB +
   // IB + CB) on the UPLOAD heap, and is called once per submitted draw rather
   // than once per frame, so the allocation rate scales with the draw count —
@@ -2569,6 +2570,9 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.pixelShaderHlsl = std::move(pixelShaderHlsl);
   d.pixelSamplerCount = pixelSamplerCount;
   d.pixelSamplerArrayMask = pixelSamplerArrayMask;
+  if (pixelSamplerSigns)
+    std::memcpy(d.pixelSamplerSigns.data(), pixelSamplerSigns,
+                d.pixelSamplerSigns.size());
   if (pixelTextures && pixelSampledObjects) {
     for (uint32_t i = 0; i < kTranslatedSamplerSlots; ++i) {
       d.pixelTextures[i] = pixelTextures[i];
@@ -2619,13 +2623,16 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   if (d.pixelShaderHlsl && d.pixelShaderHandle &&
       (hasVertexStage || (interpolators && interpBytes)) && pixelConstants &&
       pixelConstDwords && pixelSamplerCount <= kTranslatedSamplerSlots) {
-    // The shader's cbuffer is xe_c[256] followed by xe_texinv[slots], so the
-    // buffer must cover BOTH. Sizing it to the constant bank alone would leave
-    // the shader reading past the end of the resource for every unnormalized
-    // fetch. Rounded up to 256 bytes, the constant-buffer granularity.
+    // The shader's cbuffer is xe_c[256], then xe_texinv[slots], then
+    // xe_texsign[slots], so the buffer must cover ALL THREE. Sizing it to the
+    // constant bank alone would leave the shader reading past the end of the
+    // resource for every unnormalized fetch. Rounded up to 256 bytes, the
+    // constant-buffer granularity.
     const uint32_t bankBytes = pixelConstDwords * 4;
-    const uint32_t texSizeBytes = kTranslatedSamplerSlots * 16;
-    const uint32_t constBytes = ((bankBytes + texSizeBytes) + 255u) & ~255u;
+    const uint32_t texInvBytes = kTranslatedSamplerSlots * 16;
+    const uint32_t texSignBytes = kTranslatedSamplerSlots * 16;
+    const uint32_t constBytes =
+        ((bankBytes + texInvBytes + texSignBytes) + 255u) & ~255u;
     // Built only for the CPU-vertex shape. A zero-byte buffer is not a valid
     // D3D12 resource, so this cannot simply fall out of interpBytes == 0.
     bool haveInterp = hasVertexStage;
@@ -2701,6 +2708,25 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
           const float ts[4] = {1.0f / float(w), 1.0f / float(h), 0.0f, 0.0f};
           std::memcpy(static_cast<uint8_t*>(p) + bankBytes + s * 16, ts,
                       sizeof(ts));
+        }
+        // xe_texsign, immediately after xe_texinv: the per-component scale for
+        // TEXTURE SIGNS, 2.0 where the guest fetch is kUnsignedBiased and the
+        // shader must expand [0,1] to [-1,1]. The shader pairs it with an
+        // offset of 1-scale, so 1.0 is the identity.
+        //
+        // Written for EVERY slot and every component, unconditionally. The
+        // buffer was memset to zero above, and a zero scale here does not mean
+        // "unsigned", it means the fetch becomes v*0 + 1 -- every texture
+        // sampling as solid white. There is no slot this may be skipped for.
+        for (uint32_t s = 0; s < kTranslatedSamplerSlots; ++s) {
+          const uint8_t biased = d.pixelSamplerSigns[s];
+          const float sc[4] = {(biased & 1) ? 2.0f : 1.0f,
+                               (biased & 2) ? 2.0f : 1.0f,
+                               (biased & 4) ? 2.0f : 1.0f,
+                               (biased & 8) ? 2.0f : 1.0f};
+          std::memcpy(
+              static_cast<uint8_t*>(p) + bankBytes + texInvBytes + s * 16, sc,
+              sizeof(sc));
         }
         d.pscb->Unmap(0, nullptr);
         d.translated = true;
