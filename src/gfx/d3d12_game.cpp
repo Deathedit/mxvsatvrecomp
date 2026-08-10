@@ -989,10 +989,28 @@ DXGI_FORMAT D3D12Renderer::HostColorFormat(uint32_t guestColorFormat) {
     case 12:  // k_2_10_10_10_FLOAT_AS_16_16_16_16
     case 7:   // k_16_16_16_16_FLOAT
       return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    // SIGNED FIXED POINT, -32...32 -- not UNORM. From the SDK, xenos.h:305 and
+    // :308 label both of these "Fixed point -32...32", and xenos.h:566 says a
+    // resolve out of them is NOT bitwise equivalent to the texture format:
+    // "k_16_16 and k_16_16_16_16 render target formats, which are signed and
+    // also have a different range, are not equivalent to the respective texture
+    // formats". IsColorResolveFormatBitwiseEquivalent returns false for both.
+    //
+    // We resolve with a plain CopyTextureRegion, which IS bitwise -- so calling
+    // these UNORM meant the guest wrote values across -32...32, we stored the
+    // bits as if they spanned 0...1, and the copy carried the pattern into a
+    // snapshot that a shader then sampled. Measured: the menu's tonemap read
+    // 32736.0 out of the scene colour and produced 40.09, which the 8-bit
+    // target clamped to saturated cyan on the bike.
+    //
+    // A half-float host target holds the whole -32...32 range, keeps the copy
+    // inside one typeless family, and needs no shader-side scale. It trades
+    // some mantissa -- 11 bits against the guest's 16 -- which is the right way
+    // round: a little banding beats a 32x error and a sign flip.
     case 4:   // k_16_16
-      return DXGI_FORMAT_R16G16_UNORM;
+      return DXGI_FORMAT_R16G16_FLOAT;
     case 5:   // k_16_16_16_16
-      return DXGI_FORMAT_R16G16B16A16_UNORM;
+      return DXGI_FORMAT_R16G16B16A16_FLOAT;
     case 6:   // k_16_16_FLOAT
       return DXGI_FORMAT_R16G16_FLOAT;
     case 15:  // k_32_FLOAT
