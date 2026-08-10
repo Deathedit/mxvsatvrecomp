@@ -899,6 +899,14 @@ void ClearGameDraws();
   // used to fall through to the untextured PSO and paint fabricated opaque
   // white over the frame; they are now skipped. See RenderGameFrame.
   uint64_t m_sampleMissSkipped = 0;
+  // DIAG (remove before commit): WHITE-SKIPPED draws grouped by target extent.
+  struct SkipTargetInfo {
+    uint64_t count = 0;
+    uint64_t translated = 0;
+    uint64_t wantedSlots = 0;
+    uint32_t object = 0;
+  };
+  std::map<uint64_t, SkipTargetInfo> m_skipByTarget;
   // Resolves whose source target has never been drawn into: the snapshot they
   // produce is blank by construction.
   uint64_t m_snapshotBlankSource = 0;

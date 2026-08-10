@@ -113,12 +113,35 @@ REXCVAR_DEFINE_BOOL(hle_gpu_vertex_fetch, true, "Debug",
                     "guest vertex buffer itself, instead of the CPU unpacking "
                     "attributes per vertex. Requires hle_gpu_vertex");
 
+// The per-draw and per-vertex diagnostics this investigation accumulated.
+//
+// Default OFF. They are not free — the Stage-3 transform probe alone reads 256
+// guest dwords and scores every vertex of every draw to log a ranking nothing
+// acts on — and a run is now expected to be a measurement of the emulator, not
+// of its instrumentation. Per-FRAME reporting is unaffected and stays on.
+REXCVAR_DEFINE_BOOL(hle_diag, false, "Debug",
+                    "Per-draw and per-vertex HLE diagnostics: the transform "
+                    "probe, the prim-type and vfetch censuses, and the vertex "
+                    "fetch addressing self-check. Off by default; they cost "
+                    "real frame time");
+
+// Replace Inf and NaN in the pixel constant bank with zero before the shader
+// reads them. See the note at the use site: this is an experiment to classify
+// whether those registers are uninitialised guest memory or real data, and it
+// is a cvar so a single build answers it both ways.
+REXCVAR_DEFINE_BOOL(hle_sanitize_constants, true, "Debug",
+                    "Zero any non-finite pixel shader constant before upload. "
+                    "The menu's 3D layer is black because a shader takes +Inf "
+                    "into a multiply and outputs NaN");
+
 // When a draw arrives with no pixel shader from either the setter argument or
 // device+0x3244, fall back to the last shader bound on that DEVICE.
 //
 // Default on: it is worth 4.45 -> 9.88 fps at the menu, because a draw with no
 // translated pixel shader cannot take the GPU vertex path and runs the software
-// interpreter instead.
+// interpreter instead. It is also the change that introduced ~69,000 draws a
+// frame with samplers s0/s1/s2 unbound, which no run before it shows. Keep both
+// facts measurable from one build.
 REXCVAR_DEFINE_BOOL(hle_ps_device_fallback, true, "Debug",
                     "Resolve a draw's pixel shader from the last one bound on "
                     "its device when neither the setter nor device+0x3244 has "
@@ -126,9 +149,10 @@ REXCVAR_DEFINE_BOOL(hle_ps_device_fallback, true, "Debug",
 
 // TEX_FORMAT_COMP / GPUSIGN. Off leaves every xe_texsign at 1.0, which is the
 // exact behaviour of every build before this one, so a suspected regression is
-// one run to bisect rather than a rebuild -- the same reason hle_gpu_vertex has
-// a switch. Worth having because this change and the D3D9-legacy-multiply
-// change landed back to back and both touch every translated pixel shader.
+// one run to bisect rather than a rebuild -- the same reason hle_gpu_vertex and
+// hle_gpu_vertex_fetch have switches. Worth having because this change and the
+// D3D9-legacy-multiply change landed back to back and both touch every
+// translated pixel shader.
 REXCVAR_DEFINE_BOOL(hle_texture_signs, true, "Debug",
                     "Apply the fetch constant's kUnsignedBiased texture sign "
                     "(2*c-1) in the pixel shader");

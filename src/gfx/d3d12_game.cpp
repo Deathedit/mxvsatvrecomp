@@ -2928,6 +2928,13 @@ void D3D12Renderer::RenderGameFrame() {
     // the guard was written for. See the note beside fabricatedWhite.
     if (!translatedPso && fabricatedWhite) {
       ++m_sampleMissSkipped;
+      // DIAG (remove before commit): what the skipped draws are aimed at.
+      auto& e =
+          m_skipByTarget[(uint64_t(d.targetWidth) << 32) | d.targetHeight];
+      ++e.count;
+      e.object = d.targetObject;
+      if (d.translated) ++e.translated;
+      if (d.pixelSamplerCount) ++e.wantedSlots;
       continue;
     }
     if (translatedPso) {
@@ -3139,6 +3146,41 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_aliasedSourceResolves),
                   static_cast<unsigned long long>(m_containedSourceResolves));
     LogInfo(message);
+    // DIAG (remove before commit): what the WHITE-SKIPPED draws were aimed at.
+    for (const auto& [extent, e] : m_skipByTarget) {
+      std::snprintf(message, sizeof(message),
+                    "  WHITE-SKIPPED target %ux%u obj 0x%08X: %llu draws, "
+                    "%llu translated, %llu wanted sampler slots",
+                    uint32_t(extent >> 32), uint32_t(extent), e.object,
+                    static_cast<unsigned long long>(e.count),
+                    static_cast<unsigned long long>(e.translated),
+                    static_cast<unsigned long long>(e.wantedSlots));
+      LogInfo(message);
+    }
+    // DIAG (remove before commit): the COLOUR pool with its EDRAM bases. The
+    // 640x360 resolve source (0x21B0F320, base 0x2D0, pitch 640, 4x MSAA in
+    // its surface word) has no host target of its own, while a 640x720 surface
+    // (0x2123C9BC) sits at the same base and pitch at 1x. Whether that 640x720
+    // is drawn into decides whether the 640x360 resolve should take a region of
+    // it or whether the pass that fills it is being lost somewhere else.
+    for (const auto& [object, t] : m_gameRenderTargets) {
+      std::snprintf(message, sizeof(message),
+                    "  COLOUR pool obj 0x%08X %ux%u base 0x%03X fmt %u "
+                    "drawn:%s",
+                    object, t.width, t.height, t.edramBase,
+                    uint32_t(t.format), t.everDrawn ? "Y" : "N");
+      LogInfo(message);
+    }
+    // DIAG (remove before commit): what the depth pool actually holds. The
+    // shadow resolve names a 768x1024 depth surface while the pass appears to
+    // render two EDRAM bands (768x640 at base 0x580, 768x384 at base 0x710),
+    // so the object the resolve asks for may be one no draw ever bound.
+    for (const auto& [object, t] : m_gameDepthTargets) {
+      std::snprintf(message, sizeof(message),
+                    "  DEPTH pool obj 0x%08X %ux%u drawn:%s", object, t.width,
+                    t.height, t.everDrawn ? "Y" : "N");
+      LogInfo(message);
+    }
     // The worst offenders behind source-not-offscreen, with their status read
     // NOW rather than at first sighting. Sorted by how many resolves each one
     // cost, because one source losing a thousand resolves and a thousand losing

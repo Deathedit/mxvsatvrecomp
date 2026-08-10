@@ -60,15 +60,18 @@
 #include "gpu/shader_hlsl.h"    // EmitShaderHlsl
 #include <cmath>
 #include "gpu/d3d9_state.h"
+#include "gpu/hle_types.h"      // g_luminanceReadbackBits/Seq
 
 // Defined in src/app/graphics_system.cpp with the rest of the Debug cvars.
 REXCVAR_DECLARE(bool, hle_capture);
 REXCVAR_DECLARE(uint32_t, hle_shader_exec);
 REXCVAR_DECLARE(uint32_t, hle_shader_verts);
 REXCVAR_DECLARE(bool, hle_gpu_vertex);
-REXCVAR_DECLARE(bool, hle_texture_signs);
 REXCVAR_DECLARE(bool, hle_gpu_vertex_fetch);
+REXCVAR_DECLARE(bool, hle_diag);
+REXCVAR_DECLARE(bool, hle_sanitize_constants);
 REXCVAR_DECLARE(bool, hle_ps_device_fallback);
+REXCVAR_DECLARE(bool, hle_texture_signs);
 namespace {
 
 namespace uc = rex::graphics::ucode;
@@ -401,6 +404,21 @@ thread_local HostRegionCacheEntry t_hprCache[kHostRegionCacheSize];
 thread_local size_t t_hprCacheCount = 0;
 thread_local size_t t_hprCacheNext = 0;
 thread_local uint64_t t_hprGeneration = 0;
+// DIAG (remove before commit): guest address of the 1x1 luminance resolve
+// destination, so the exposure probe can read what the guest CPU reads.
+std::atomic<uint32_t> g_luminanceDestPhys{0};
+// Last readback sequence written into guest memory, so an unchanged value is
+// not rewritten every resolve. Only the resolve hook touches it.
+uint32_t g_luminanceWroteSeq = 0;
+// Destination texture object -> its guest address, for every 1x1 resolve.
+// The renderer reports its readbacks by object, which is the only identity
+// both sides share; this turns that back into somewhere to write.
+std::map<uint32_t, uint32_t> g_luminanceDestAddrs;
+// Its guest FORMAT, packed fmt<<16 | bytes_per_block<<8 | endian. A readback
+// has to write what the guest expects to read, and our host surfaces are all
+// RGBA8 -- if the guest wants a float format here, the surface itself is wrong
+// and not just the missing copy.
+std::atomic<uint32_t> g_luminanceDestFormat{0};
 std::atomic<uint64_t> g_hprGeneration{1};
 std::atomic<uint64_t> g_hprCalls{0};
 std::atomic<uint64_t> g_hprQueries{0};
@@ -1217,10 +1235,17 @@ struct PendingHleDraw {
   mx::hle::PixelTextureBinding texture_binding;
   uint32_t vertex_shader = 0;
   uint32_t device = 0;
+  // Which guest thread queued this entry. Recorded at push time, because the
+  // whole question this answers is whether the frame's list order is the
+  // guest's submission order or just the order three workers won one mutex in.
+  uint32_t thread = 0;
   bool have_texture = false;
 };
 
 std::vector<PendingHleDraw> g_pendingHleDraws;
+// Defined next to FinalizePendingD3D9DrawsImpl, called from both push sites.
+void NoteQueueThread(uint32_t thread, bool is_resolve);
+void NoteResolvePosition(uint32_t dest, size_t index);
 uint64_t g_pendingQueued = 0, g_pendingApplied = 0, g_pendingDropped = 0;
 constexpr size_t kMaxPendingHleDraws = 2048;
 
@@ -1560,7 +1585,12 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   // Stage 3's measurement, on the built positions rather than on raw bytes: the
   // vertices are already decoded and in host order here, so the probe scores the
   // same numbers the renderer would receive.
-  {
+  //
+  // The single most expensive diagnostic in the tree: 256 guest dword loads plus
+  // a scoring pass over every vertex, per draw, to rank candidate matrices that
+  // nothing selects. Its verdict was read long ago; it stays behind hle_diag so
+  // it can be re-run rather than deleted.
+  if (g_diag) {
     static float consts[kHleProbeRegs * 4];
     if (ReadVsConstants(device, base, consts)) {
       ScoreHleTransform(dc, consts, have_vp ? vp : nullptr,
@@ -1742,6 +1772,8 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   pending.texture_binding = texture_binding;
   pending.vertex_shader = vertex_shader;
   pending.device = device;
+  pending.thread = GetCurrentThreadId();
+  NoteQueueThread(pending.thread, false);
   pending.have_texture = have_texture;
   if (!CaptureVertexConstants(device, base, vertex_shader,
                               pending.constants)) {
@@ -2412,6 +2444,29 @@ ShaderApplyResult ApplyShaderOutputs(
     return ShaderApplyResult::kFailed;
   }
 
+  // The index operand and exp_adjust, censused once per distinct combination.
+  //
+  // Emitting the fetch into HLSL means addressing the vertex buffer with
+  // SV_VertexID, which is only correct if every fetch really does index by the
+  // vertex ID. The CPU path has always assumed that without checking, and
+  // exp_adjust is decoded and applied nowhere at all -- a non-zero one is a
+  // silently dropped power-of-two scale. Both are cheap to see and expensive to
+  // get wrong, so they are measured before anything is built on them.
+  if (g_diag) {
+    static std::map<uint64_t, bool> s_seen;
+    for (const auto& a : attrs) {
+      const uint64_t sig = (uint64_t(a.src_reg) << 32) |
+                           (uint64_t(a.src_swizzle) << 16) |
+                           (uint64_t(a.is_index_rounded ? 1 : 0) << 8) |
+                           uint64_t(uint8_t(a.exp_adjust));
+      if (!s_seen.emplace(sig, true).second) continue;
+      REXLOG_INFO("d3d9: VFETCH index census: src r{}.{} rounded={} "
+                  "exp_adjust={} (fmt {} slot {})",
+                  a.src_reg, "xyzw"[a.src_swizzle & 3], a.is_index_rounded,
+                  a.exp_adjust, a.format, a.fetch_slot);
+    }
+  }
+
   std::vector<uint32_t> attr_stream(attrs.size());
   for (size_t a = 0; a < attrs.size(); ++a) {
     const uint32_t fs = attrs[a].fetch_slot;
@@ -2844,6 +2899,11 @@ ShaderApplyResult ApplyShaderOutputs(
       uv_generated = true;
     }
   }
+  // Not a PhaseTimer: the loop below has early returns on malformed geometry,
+  // and a scope guard there would have to survive them. Those paths abandon the
+  // draw anyway, so losing their timing is correct rather than merely tolerable.
+  const auto loop_t0 = std::chrono::steady_clock::now();
+  g_phaseVertexCount += dc.vertex_count;
   for (uint32_t v = 0; v < dc.vertex_count; ++v) {
     if (!referenced[v]) continue;
     const uint64_t src = uint64_t(dc.first_vertex) + v;
@@ -3064,6 +3124,16 @@ ShaderApplyResult ApplyShaderOutputs(
     }
     ++applied_vertices;
   }
+  {
+    const uint64_t loop_us =
+        uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - loop_t0)
+                     .count());
+    g_phaseVertexLoopUs += loop_us;
+    g_loopUs[loop_reason] += loop_us;
+    g_loopVerts[loop_reason] += applied_vertices;
+    ++g_loopDraws[loop_reason];
+  }
 
   dc.vertices = std::move(transformed);
   if (texture_binding) {
@@ -3257,9 +3327,69 @@ ShaderApplyResult ApplyShaderOutputs(
   return ShaderApplyResult::kApplied;
 }
 
+// Is this frame's list order the guest's submission order, or just the order
+// three workers happened to win one mutex in?
+//
+// Everything downstream -- the Resolve hook, the finalize below, the graphics
+// system's `submittable`, the renderer's inline resolve execution -- is careful
+// to preserve the order of this list. None of that helps if the order was
+// already wrong when entries arrived. A capture (render.rdc) showed the
+// 1280x720 light-buffer snapshot being sampled by all 44 draws of the HDR scene
+// pass and written only by copies AFTER that pass ended, so one of the two is
+// true and they need opposite fixes:
+//
+//   resolve and the scene draws on DIFFERENT threads
+//       -> we flatten independent streams by arrival, and ordering is the fix
+//   all on ONE thread
+//       -> we reproduce the guest's order faithfully, the guest really does
+//          resolve late, and the defect is that the snapshot does not survive
+//          from the frame that filled it
+//
+// Prints the distinct threads with their entry counts, and every resolve's
+// position in the list with its destination, so the two cases are told apart by
+// reading one line. Bounded to the first few frames: this is a question with an
+// answer, not a counter to watch.
+// Who queues draws and who queues resolves.
+//
+// A first attempt read g_pendingHleDraws expecting a frame's worth of entries.
+// It is not that: it is flushed constantly in batches of a handful, so it never
+// reached even 100 and the report never fired. The ordered per-frame list is
+// HleFrameDraws(); this counts by thread at PUSH time, which does not depend on
+// how the batching happens to fall.
+//
+// If draws and resolves come from different threads, our single global list
+// flattens independent guest streams by arrival and ordering is the fix. If
+// they share one thread, our order IS the guest's order, the guest really does
+// resolve after the pass that samples the result, and the defect is that the
+// snapshot does not survive the frame that filled it. Opposite fixes.
+void NoteQueueThread(uint32_t thread, bool is_resolve) {
+  static std::map<uint32_t, std::pair<uint64_t, uint64_t>> s_byThread;
+  auto& e = s_byThread[thread];
+  (is_resolve ? e.second : e.first)++;
+  static uint64_t s_total = 0;
+  if ((++s_total % 20000) != 0) return;
+  std::string by;
+  for (const auto& [tid, dr] : s_byThread)
+    by += fmt::format(" t{:X}={}draws/{}resolves", tid, dr.first, dr.second);
+  REXLOG_INFO("d3d9: QUEUE BY THREAD:{}", by);
+}
+
+// Where each resolve sits in the frame's ordered list, and how long that list
+// is by the end. A resolve at index 12 of 900 is early in the frame; one at 880
+// is late. This is the number that says whether the guest resolves before or
+// after the draws that sample the result.
+void NoteResolvePosition(uint32_t dest, size_t index) {
+  static uint32_t s_logged = 0;
+  if (s_logged >= 40) return;
+  ++s_logged;
+  REXLOG_INFO("d3d9: RESOLVE at frame-list index {} -> dest 0x{:08X}", index,
+              dest);
+}
+
 void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
   const size_t count = g_pendingHleDraws.size();
   uint64_t applied = 0, dropped = 0;
+  const auto finalize_t0 = std::chrono::steady_clock::now();
   for (PendingHleDraw& pending : g_pendingHleDraws) {
     // A resolve carries no geometry, so it has no shader to run and no topology
     // to finalize — both would refuse it and it would be counted as a dropped
@@ -3268,6 +3398,8 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
     // every draw after it must sample that rather than the surface's later
     // state.
     if (pending.draw.resolve_dest_texture) {
+      NoteResolvePosition(pending.draw.resolve_dest_texture,
+                          mx::hle::HleFrameDraws().size());
       mx::hle::HleFrameDraws().push_back(std::move(pending.draw));
       ++applied;
       continue;
@@ -3285,12 +3417,83 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
   g_pendingApplied += applied;
   g_pendingDropped += dropped;
   g_pendingHleDraws.clear();
+  const uint64_t finalize_us =
+      uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now() - finalize_t0)
+                   .count());
   if (count && (g_pendingQueued <= 32 || (g_pendingQueued % 1000) < count)) {
     REXLOG_INFO("d3d9: deferred HLE draws: frame {} applied {} dropped {}; "
                 "cumulative queued {} applied {} dropped {}",
                 count, applied, dropped, g_pendingQueued, g_pendingApplied,
                 g_pendingDropped);
   }
+  // One unsampled line per frame with the wall-clock gap to the previous one.
+  //
+  // Every existing frame signal is gated or sampled -- FRAME COST fires only on
+  // busy frames, VdSwap logs periodically -- and reading a frame rate off either
+  // gave a wrong answer three times in one session, twice in the flattering
+  // direction. A frame rate has to come from something that logs every frame and
+  // nothing else, so this is it. Cheap: one clock read and one line.
+  {
+    static auto s_prev = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    const uint64_t gap_us = uint64_t(
+        std::chrono::duration_cast<std::chrono::microseconds>(now - s_prev)
+            .count());
+    s_prev = now;
+    static uint64_t s_frame = 0;
+    REXLOG_INFO("d3d9: FRAMETIME {} {}us", ++s_frame, gap_us);
+  }
+
+  // Read once per frame. Every gated diagnostic below and in the draw path tests
+  // this rather than the cvar, so the lookup cannot itself become a per-draw
+  // cost -- which is the thing being measured.
+  g_diag = REXCVAR_GET(hle_diag);
+
+  // Every frame, not sampled: a slow frame is the one worth seeing, and a
+  // sampled report would miss exactly those.
+  //
+  // The texture bucket is NOT inside finalize: PrepareDrawTexture runs when the
+  // draw is recorded, not when the frame is flushed. So the two are reported
+  // side by side and not subtracted from one another.
+  // Gated on the vertex buckets too. Without them a run whose vertex work has
+  // been moved to the GPU logs only its texture-heavy loading frames, and the
+  // busy frames -- the ones the whole change is about -- never appear at all.
+  // That made an A/B look like a 30% win when the two runs had simply reached
+  // different scenes.
+  if (finalize_us >= 20000 || g_phaseTextureUs >= 20000 ||
+      mx::hle::g_transcodeUs >= 20000 || g_phaseVertexUs >= 20000 ||
+      g_phaseVertexCount >= 50000) {
+    REXLOG_INFO("d3d9: FRAME COST {} draws {} verts | vertex {}ms = per-vertex "
+                "loop {}ms (interpreter {}ms) + per-draw setup {}ms | "
+                "transcode {}ms over {} verts (skipped {} draws, {} paid late, "
+                "{} lost) | texture {}ms | finalize {}ms",
+                g_phaseDrawCount, g_phaseVertexCount, g_phaseVertexUs / 1000,
+                g_phaseVertexLoopUs / 1000, g_phaseInterpUs / 1000,
+                (g_phaseVertexUs > g_phaseVertexLoopUs
+                     ? (g_phaseVertexUs - g_phaseVertexLoopUs) / 1000
+                     : 0),
+                mx::hle::g_transcodeUs / 1000, mx::hle::g_transcodeVerts,
+                g_transcodeDeferred, g_transcodeLate, g_transcodeLost,
+                g_phaseTextureUs / 1000, finalize_us / 1000);
+    // Who owns the loop. Printed beside the total so the two can be checked
+    // against each other rather than trusted separately.
+    std::string split;
+    for (uint32_t r = 0; r < 3; ++r) {
+      split += fmt::format(" {}={}ms/{}v/{}d", kLoopReasonName[r],
+                           g_loopUs[r] / 1000, g_loopVerts[r], g_loopDraws[r]);
+    }
+    REXLOG_INFO("d3d9: LOOP BY REASON{}", split);
+    REXLOG_INFO("d3d9: CONSTANTS sanitized: {} draws, {} components",
+                g_constDrawsSanitized, g_constComponentsSanitized);
+  }
+  for (uint32_t r = 0; r < 3; ++r)
+    g_loopUs[r] = g_loopVerts[r] = g_loopDraws[r] = 0;
+  mx::hle::g_transcodeUs = mx::hle::g_transcodeVerts = 0;
+  g_transcodeDeferred = g_transcodeLate = g_transcodeLost = 0;
+  g_phaseVertexUs = g_phaseInterpUs = g_phaseTextureUs = 0;
+  g_phaseVertexLoopUs = g_phaseVertexCount = 0;
+  g_phaseDrawCount = 0;
 }
 
 //===========================================================================
@@ -4814,6 +5017,48 @@ void ApplyShaderLoadTable(uint32_t shader, uint32_t table_at, uint32_t data_at,
   }
 }
 
+// DIAG (remove before commit): print a shader's constant-load table verbatim,
+// so a register that reaches the shader as NaN can be checked against what the
+// table actually claims to write. Mirrors ApplyShaderLoadTable's walk exactly
+// rather than sharing it, so deleting this cannot disturb the working path.
+void DumpShaderLoadTable(uint32_t shader, uint32_t table_at, uint32_t data_at,
+                         uint8_t* base, const char* tag) {
+  if (!shader) return;
+  const uint32_t table = shader + table_at;
+  if (!HostPageReadable(REX_RAW_ADDR(table + 0x14)) ||
+      !HostPageReadable(REX_RAW_ADDR(shader + data_at))) {
+    REXLOG_INFO("d3d9:   {} table 0x{:08X}: unreadable", tag, shader);
+    return;
+  }
+  const uint32_t rel = REX_LOAD_U32(table + 0x14);
+  if (!rel || rel >= 0x10000) {
+    REXLOG_INFO("d3d9:   {} table 0x{:08X}: rel=0x{:X} rejected", tag, shader,
+                rel);
+    return;
+  }
+  const uint32_t block = table + rel;
+  if (!HostPageReadable(REX_RAW_ADDR(block + 0x10))) return;
+  const uint32_t bytes = REX_LOAD_U32(block + 0x10);
+  const uint32_t data_base = REX_LOAD_U32(shader + data_at);
+  std::string entries;
+  uint32_t at = block + 0x14;
+  const uint32_t end = at + bytes;
+  uint32_t n = 0;
+  while (at + 8 <= end && HostPageReadable(REX_RAW_ADDR(at + 4))) {
+    const uint32_t hdr = REX_LOAD_U32(at);
+    const uint32_t reg = hdr >> 16;
+    const uint32_t dwords = hdr & 0xFFFF;
+    if (!dwords) break;
+    const uint32_t data_off = REX_LOAD_U32(at + 4);
+    at += 8;
+    if (++n <= 24)
+      entries += fmt::format(" c{}+{}dw@0x{:X}", reg, dwords,
+                             data_base + data_off);
+  }
+  REXLOG_INFO("d3d9:   {} 0x{:08X} bytes={} data=0x{:08X} {} entries:{}", tag,
+              shader, bytes, data_base, n, entries);
+}
+
 // Both shaders publish into the SAME unified ALU constant file -- the draw
 // flush calls sub_825656A0 once for the pixel shader and once for the vertex
 // shader -- so an entry in EITHER table whose register lands in 256..511 is a
@@ -4887,6 +5132,190 @@ void AttachTranslatedPixelShader(mx::hle::DrawCall& dc, uint32_t handle,
       // The shadow is only half the bank. Overlay the shader's own literals.
       ApplyPixelShaderLoadTable(handle, device, base, dc.pixel_constants);
 
+      // Non-finite constants are replaced with zero before the shader sees
+      // them.
+      //
+      // EXPERIMENT, not a claimed fix -- it classifies. A capture traced the
+      // black menu to draw 10012 taking +Inf into r1.w at instruction 52 and
+      // outputting NaN at 53, and the bad registers have a distinctive shape:
+      // c100 is [+Inf,+Inf,+Inf,+Inf] and c138 is [QNaN x4], all four
+      // components identical, in registers the shader's own LOAD_ALU_CONSTANT
+      // table does not write. Nothing on the CPU computes them -- the whole
+      // exposure reduction (sub_82AFB588) is GPU-side -- so the likeliest
+      // reading is guest memory the title never initialised. The console does
+      // not care because it never uses those registers; we read every register
+      // the translated shader references, unconditionally.
+      //
+      // If the picture comes back, they were garbage and this is the fix. If it
+      // does not, they were meaningful and this is ruled out. Either way the
+      // counter says how many draws were touched, and the cvar makes it an A/B
+      // rather than a rebuild.
+      if (REXCVAR_GET(hle_sanitize_constants)) {
+        uint32_t fixed = 0;
+        for (uint32_t i = 0; i < kPixelConstRegs * 4; ++i) {
+          if ((dc.pixel_constants[i] & 0x7F800000u) != 0x7F800000u) continue;
+          dc.pixel_constants[i] = 0;
+          ++fixed;
+        }
+        if (fixed) {
+          ++g_constDrawsSanitized;
+          g_constComponentsSanitized += fixed;
+        }
+      }
+
+      // DIAG (remove before commit): a RenderDoc capture of the menu shows the
+      // deferred composite reading xe_c[100] as NaN, which poisons the whole
+      // pass and paints the backdrop white. c14.zw and c196.zw are NaN too,
+      // and both of those have their .xy written by a table entry -- so what
+      // is underneath is the SHADOW, not a decode error. Report every
+      // non-finite component that reaches a shader, say whether the shadow
+      // dword was already non-finite, and print the shader's own table so we
+      // can see whether the guest ever claims to write that register.
+      {
+        static std::mutex s_nonFiniteMu;
+        static std::set<uint32_t> s_nonFiniteSeen;
+        std::lock_guard<std::mutex> lk(s_nonFiniteMu);
+        // DIAG (remove before commit): re-arm periodically. Reporting once per
+        // shader for the whole run means every line is from the opening frames,
+        // so after a fix the log still shows the OLD value and says nothing
+        // about the current one. That is not evidence of no change, it is an
+        // absence of measurement -- and it misled this investigation twice.
+        static uint64_t s_nonFiniteDraws = 0;
+        if ((++s_nonFiniteDraws % 20000) == 0) {
+          s_nonFiniteSeen.clear();
+          const uint32_t c100 =
+              REX_LOAD_U32(device + kPixelConstBase + 100 * 16);
+          const uint32_t lumAddr =
+              g_luminanceDestPhys.load(std::memory_order_relaxed);
+          uint32_t lum = 0xDEADBEEFu;
+          if (lumAddr && HostPageReadable(REX_RAW_ADDR(lumAddr)))
+            lum = REX_LOAD_U32(lumAddr);
+          // The three floats sub_82AFB588 hands the final luminance pass as
+          // g_KeyValue / g_MinLuminance / g_MaxLuminance. The reduction chain
+          // itself is pure GPU -- every stage samples the previous stage's
+          // texture, there is no LockRect anywhere in it -- so the exposure is
+          // NOT computed from a memory read. These globals are the only thing
+          // the CPU contributes, and an uninitialised one hands the shader an
+          // Infinity that no amount of rendering work can undo.
+          auto readGlobal = [&](uint32_t addr) -> uint32_t {
+            return HostPageReadable(REX_RAW_ADDR(addr)) ? REX_LOAD_U32(addr)
+                                                        : 0xDEADBEEFu;
+          };
+          const uint32_t keyValue = readGlobal(0x830B13B4);
+          const uint32_t minLum = readGlobal(0x830B2C3C);
+          const uint32_t maxLum = readGlobal(0x830B2E74);
+          // The composite (sub_82AC3450) sets exactly three floats by name:
+          // g_KeyValue, g_BloomAttn and g_OneOverWhitePointSquared. Only one
+          // of the three is computed rather than stored, and sub_821D3CD0
+          // computes it as 1.0f / (w * w) from the white point at
+          // flt_830B2C40 -- so a white point of zero hands the tonemap a
+          // literal +Infinity. Reading all three names which register the
+          // shader's Infinity actually is, without guessing the mapping.
+          const uint32_t whitePoint = readGlobal(0x830B2C40);
+          const uint32_t oneOverW2 = readGlobal(0x830B2E7C);
+          const uint32_t bloomAttn = readGlobal(0x830B2E40);
+          auto bitsToFloat = [](uint32_t b) {
+            float f;
+            std::memcpy(&f, &b, sizeof(f));
+            return f;
+          };
+          REXLOG_INFO("d3d9: EXPOSURE globals: g_KeyValue=0x{:08X} ({}) "
+                      "g_MinLuminance=0x{:08X} ({}) g_MaxLuminance=0x{:08X} "
+                      "({})",
+                      keyValue, bitsToFloat(keyValue), minLum,
+                      bitsToFloat(minLum), maxLum, bitsToFloat(maxLum));
+          REXLOG_INFO("d3d9: EXPOSURE tonemap: whitePoint=0x{:08X} ({}) "
+                      "g_OneOverWhitePointSquared=0x{:08X} ({}) "
+                      "g_BloomAttn=0x{:08X} ({})",
+                      whitePoint, bitsToFloat(whitePoint), oneOverW2,
+                      bitsToFloat(oneOverW2), bloomAttn,
+                      bitsToFloat(bloomAttn));
+          // WHICH DEVICE. c100 reads finite in some samples and +Infinity in
+          // others, milliseconds apart, at the same register -- which is not a
+          // value being miscomputed but two different constant banks. If the
+          // guest has more than one device object, the composite can be
+          // reading one bank while another gets the good values, and no GPU
+          // fix would ever touch that. Same shape as the thread-local
+          // DeviceState defect that hid the bound pixel shader.
+          {
+            static std::mutex s_devMu;
+            static std::map<uint32_t, uint32_t> s_devices;  // device -> c100.x
+            std::string all;
+            {
+              std::lock_guard<std::mutex> dlk(s_devMu);
+              s_devices[device] = c100;
+              for (const auto& [dev, v] : s_devices)
+                all += fmt::format(" 0x{:08X}=0x{:08X}", dev, v);
+            }
+            REXLOG_INFO("d3d9: EXPOSURE devices ({} distinct):{}",
+                        s_devices.size(), all);
+          }
+          REXLOG_INFO("d3d9: EXPOSURE probe: device 0x{:08X} "
+                      "shadow c100.x=0x{:08X} ({}); "
+                      "guest luminance @0x{:08X} = 0x{:08X} fmt {} ({}) "
+                      "bpb {} endian {}",
+                      device,
+                      c100,
+                      (c100 & 0x7F800000u) == 0x7F800000u ? "NONFINITE"
+                                                          : "finite",
+                      lumAddr, lum,
+                      g_luminanceDestFormat.load(
+                          std::memory_order_relaxed) >> 16,
+                      GuestTextureFormatName(
+                          g_luminanceDestFormat.load(
+                              std::memory_order_relaxed) >> 16),
+                      (g_luminanceDestFormat.load(
+                           std::memory_order_relaxed) >> 8) & 0xFFu,
+                      g_luminanceDestFormat.load(
+                          std::memory_order_relaxed) & 0xFFu);
+        }
+        if (s_nonFiniteSeen.size() < 24 && !s_nonFiniteSeen.count(handle)) {
+          std::string worst;
+          uint32_t bad = 0;
+          for (uint32_t r = 0; r < kPixelConstRegs; ++r) {
+            // Only a register the shader actually READS can poison it. The
+            // first cut of this reported the whole bank and spent its budget
+            // on registers nobody indexes.
+            const std::string ref = fmt::format("xe_c[{}]", r);
+            if (!t->source || t->source->find(ref) == std::string::npos)
+              continue;
+            for (uint32_t c = 0; c < 4; ++c) {
+              const uint32_t i = r * 4 + c;
+              const uint32_t bits = dc.pixel_constants[i];
+              if ((bits & 0x7F800000u) != 0x7F800000u) continue;  // finite
+              ++bad;
+              if (bad <= 8) {
+                const uint32_t shadow =
+                    REX_LOAD_U32(device + kPixelConstBase + i * 4);
+                worst += fmt::format(" c{}.{}=0x{:08X}(shadow 0x{:08X})", r,
+                                     "xyzw"[c], bits, shadow);
+              }
+            }
+          }
+          if (bad) {
+            s_nonFiniteSeen.insert(handle);
+            // WHICH DEVICE. This title drives three, one per record worker, and
+            // each keeps its own constant shadow. The EXPOSURE probe reports
+            // c100 as FINITE on the single device it has ever seen, while these
+            // draws read +Inf out of "the shadow" -- the two can only both be
+            // true if the draws are on a different device from the one the
+            // exposure correction reaches. Without the device here that cannot
+            // be told apart from the correction simply not working.
+            REXLOG_INFO("d3d9: NONFINITE ps 0x{:08X} device 0x{:08X}: {} "
+                        "components;{}",
+                        handle, device,
+                        bad, worst);
+            DumpShaderLoadTable(handle, 0x28, 0x18, base, "ps");
+            constexpr uint32_t kDeviceVertexShaderAt = 0x3248;
+            if (HostPageReadable(
+                    REX_RAW_ADDR(device + kDeviceVertexShaderAt))) {
+              const uint32_t vs = REX_LOAD_U32(device + kDeviceVertexShaderAt);
+              if (vs) DumpShaderLoadTable(vs, 0x368, 0x20, base, "vs");
+            }
+          }
+        }
+      }
+
       // One texture per slot the shader declares. A shader whose slots cannot
       // all be filled keeps the stand-in: running it with a missing texture
       // would sample whatever descriptor happened to be at that index, which is
@@ -4939,6 +5368,7 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
                         uint32_t device, uint8_t* base,
                         mx::hle::PixelTextureBinding& binding) {
   using namespace mx::hle;
+  PhaseTimer phase_timer(g_phaseTextureUs);
   static uint64_t s_attempts = 0, s_ready = 0, s_no_shader = 0;
   static uint64_t s_no_binding = 0, s_bad_desc = 0, s_unreadable = 0;
   static uint64_t s_mapped = 0, s_empty = 0, s_semantic_reject = 0;
@@ -7698,6 +8128,36 @@ extern "C" REX_FUNC(sub_8254C3B0) {
   auto& st = DeviceState();
   st.NoteDevice(ctx.r3.u32, mx::hle::kEpSetDepthStencil);
   st.depth_stencil = SnapshotRenderTarget(ctx.r4.u32, base);
+  // DIAG (remove before commit): the depth surfaces the guest binds, and their
+  // OWN extents. Sizing a host depth surface to the colour target instead
+  // collapsed the frame, because one depth object is bound alongside colour
+  // targets of several extents (the 1280x720 surface and its 1280x640 and
+  // 1280x80 EDRAM bands). Whether the guest declares one 1280x720 depth for all
+  // of them, or a separate depth surface per band, decides whether the host
+  // pool can be keyed by object alone.
+  {
+    const auto& ds = st.depth_stencil;
+    static std::mutex s_mu;
+    static std::map<uint64_t, uint64_t> s_seen;
+    if (ds.valid) {
+      const uint64_t key = (uint64_t(ds.object) << 32) |
+                           (uint64_t(ds.width) << 16) | ds.height;
+      bool first = false;
+      {
+        std::lock_guard<std::mutex> lock(s_mu);
+        first = s_seen.emplace(key, 0).second && s_seen.size() <= 24;
+      }
+      if (first) {
+        REXLOG_INFO("d3d9: DEPTH surface object 0x{:08X} {}x{} "
+                    "surface=0x{:08X} depthinfo=0x{:08X} base=0x{:03X} "
+                    "pitch={} (colour target now 0x{:08X} {}x{})",
+                    ds.object, ds.width, ds.height, ds.surface_info,
+                    ds.color_info, ds.color_info & 0xFFFu,
+                    ds.surface_info & 0x3FFFu, st.render_target[0].object,
+                    st.render_target[0].width, st.render_target[0].height);
+      }
+    }
+  }
   orig_SetDepthStencil(ctx, base);
 }
 
@@ -7819,6 +8279,114 @@ extern "C" REX_FUNC(sub_8255CE98) {
           ++entry.resolves;
           g_resolveDestObjectPhys[dest_texture] = physical;
         }
+        // DIAG (remove before commit): remember where the 1x1 luminance result
+        // is supposed to land in GUEST memory. The exposure is computed by the
+        // guest CPU -- the constant SHADOW holds the Infinity, so the guest
+        // wrote it -- which means it read an average of zero from somewhere,
+        // and this is the only candidate. Our resolves copy into host snapshots
+        // and never write guest RAM, so if the guest reads this address it can
+        // only ever see whatever was there before.
+        if (dest_desc.width == 1 && dest_desc.height == 1) {
+          g_luminanceDestPhys.store(dest_desc.address,
+                                    std::memory_order_relaxed);
+          g_luminanceDestFormat.store((dest_desc.guest_format << 16) |
+                                          (dest_desc.bytes_per_block << 8) |
+                                          (dest_desc.endian & 0xFFu),
+                                      std::memory_order_relaxed);
+          // Write the GPU's answer where the guest is about to read it.
+          //
+          // sub_82AFB8A8 resolves the 1x1 and then loads its bytes straight
+          // out of guest memory (`lhz` at the texture base) rather than
+          // sampling them, so a host-only resolve leaves it reading whatever
+          // was there -- zero -- and its exposure comes out as a division by
+          // zero. This is the moment to write: the resolve the guest just
+          // issued is the one it is about to read. The value is the previous
+          // frame's, which is what the console's own latency gives it anyway,
+          // and the pass filters over time by construction.
+          //
+          // FMT_16_FLOAT with endian 1 is an 8-in-16 swap, so the host's
+          // little-endian half goes out byte-reversed.
+          //
+          // Written to EVERY 1x1 destination seen, not just the one this
+          // resolve names. sub_82AFB8A8 ping-pongs two of them (a1+12 and
+          // a1+16, alternating on a frame counter) and READS the one it is not
+          // resolving into, so writing only the current destination leaves the
+          // buffer the guest actually loads untouched -- which is what the
+          // first cut of this did. They are successive samples of one
+          // quantity, so giving both the latest value costs the adaptation
+          // one frame of history and nothing else.
+          if (dest_desc.bytes_per_block == 2)
+            g_luminanceDestAddrs[dest_texture] = dest_desc.address;
+          const uint32_t seq =
+              mx::hle::g_luminanceReadbackSeq.load(std::memory_order_acquire);
+          if (seq != g_luminanceWroteSeq) {
+            g_luminanceWroteSeq = seq;
+            uint32_t wrote = 0, offered = 0;
+            std::string all;
+            {
+              std::lock_guard<std::mutex> lk(
+                  mx::hle::g_luminanceReadbackMutex);
+              offered = mx::hle::g_luminanceReadbackCount;
+              // The newest reading, whichever destination it was resolved into.
+              // Every 1x1 destination is a successive sample of ONE quantity —
+              // the scene's average luminance — so the latest value is the right
+              // answer for all of them.
+              bool have_latest = false;
+              uint32_t latest_bits = 0;
+              for (uint32_t i = 0; i < offered; ++i) {
+                const auto& r = mx::hle::g_luminanceReadbacks[i];
+                if (!g_luminanceDestAddrs.count(r.destObject)) continue;
+                latest_bits = r.bits;
+                have_latest = true;
+              }
+              // EVERY known destination, which is what the note above this
+              // block has always claimed and what the code did NOT do: it
+              // matched each readback to its own destObject, so it wrote one of
+              // the three known destinations and left the other two at whatever
+              // they held. sub_82AFB8A8 ping-pongs and READS the buffer it is
+              // not resolving into, so the guest was loading a stale or zero
+              // luminance, computing exposure = g_KeyValue / 0 = +Inf, and
+              // parking 0x7F800000 in pixel constant c100. Every shader reading
+              // it then output NaN, which is what blacks out the whole 3D layer
+              // of the main menu while the UI survives.
+              if (have_latest) {
+                // NEVER hand the guest a zero. sub_82AFB8A8 DIVIDES by this --
+                // exposure is g_KeyValue / averageLuminance -- so a zero makes
+                // it +Inf, and the adaptation that consumes it is a feedback
+                // filter (adapted = lerp(adapted, target, k)). Once `adapted`
+                // is Inf it stays Inf for the rest of the run however good the
+                // later readings are, and every shader reading the exposure
+                // constant outputs NaN. Traced in capture--.rdc at draw 10012:
+                // 0x7F800000 enters r1.w at instruction 52 and is NaN by 53.
+                //
+                // Zero is our artefact, not the scene's: it is what the
+                // reduction chain reads before it has ever run. The floor is
+                // g_MinLuminance (0.075), which is the value the guest's own
+                // pass clamps to, so this cannot push exposure anywhere the
+                // guest would not have gone by itself.
+                constexpr uint32_t kMinLuminanceHalf = 0x2CCD;  // 0.075
+                if ((latest_bits & 0x7FFFu) == 0) {
+                  latest_bits = kMinLuminanceHalf;
+                  ++g_luminanceFloored;
+                }
+                const uint16_t be = uint16_t(((latest_bits & 0xFFu) << 8) |
+                                             ((latest_bits >> 8) & 0xFFu));
+                for (const auto& [obj, addr] : g_luminanceDestAddrs) {
+                  if (!HostPageReadable(REX_RAW_ADDR(addr))) continue;
+                  *reinterpret_cast<uint16_t*>(REX_RAW_ADDR(addr)) = be;
+                  ++wrote;
+                  all += fmt::format(" 0x{:08X}=0x{:04X}", addr, latest_bits);
+                }
+              }
+            }
+            static uint64_t s_wrote = 0;
+            if ((++s_wrote % 600) == 1)
+              REXLOG_INFO("d3d9: EXPOSURE writeback #{} seq {} wrote {} of {} "
+                          "offered ({} dests known, {} floored):{}",
+                          s_wrote, seq, wrote, offered,
+                          g_luminanceDestAddrs.size(), g_luminanceFloored, all);
+          }
+        }
         // Carried to the renderer so the snapshot is sized to the destination
         // TEXTURE rather than to the region this one resolve covers.
         dest_extent_width = dest_desc.width;
@@ -7880,6 +8448,8 @@ extern "C" REX_FUNC(sub_8255CE98) {
         pending.draw.resolve_src_y2 = src_rect[3];
       }
       pending.device = ctx.r3.u32;
+      pending.thread = GetCurrentThreadId();
+      NoteQueueThread(pending.thread, true);
       g_pendingHleDraws.push_back(std::move(pending));
       ++g_pendingQueued;
     } else {
