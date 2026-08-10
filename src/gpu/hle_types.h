@@ -4,7 +4,9 @@
 #include "gpu/shader_ucode.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -141,6 +143,16 @@ struct DrawCall {
   uint32_t render_target_color_info = 0;
   uint32_t render_target_width = 0;
   uint32_t render_target_height = 0;
+  // The bound DEPTH-STENCIL surface, carried for the same reason as the colour
+  // one: it is a guest surface with its own object identity, and Resolve names
+  // it by that identity (source slot 4). Offscreen colour targets used to be
+  // rendered with no depth attachment at all, so a depth resolve had nothing to
+  // copy -- measured as 224 misses on one surface in a single menu run.
+  uint32_t depth_target_object = 0;
+  uint32_t depth_target_width = 0;
+  uint32_t depth_target_height = 0;
+  // EDRAM tile base of that depth surface. See resolve_source_base below.
+  uint32_t depth_target_base = 0;
   // HLE path: if the sampled D3D9 texture was most recently populated by
   // D3DDevice_Resolve, this is the source render-target object. It is separate
   // from the CPU texture payload because a resolve is an ordered GPU operation,
@@ -168,6 +180,23 @@ struct DrawCall {
   // free.
   uint32_t resolve_dest_texture = 0;
   uint32_t resolve_source_object = 0;
+  // The source was the DEPTH-STENCIL surface (Resolve source slot 4), not a
+  // colour target. Carried because one guest object can be bound as both --
+  // 0x218C1FE0 is a 640x360 depth surface in one binding and a colour target
+  // in another -- so the object alone cannot say which pool to look in.
+  bool resolve_source_is_depth = false;
+  // The EDRAM tile base of the resolve source surface. A banded depth pass
+  // renders into two surfaces (768x640 at base 0x580, 768x384 at base 0x710)
+  // and then resolves the WHOLE 768x1024 through a third object that aliases
+  // band 0's base -- an object no draw ever binds. Matching the pool by object
+  // identity misses every one of those, so the base is what stitches the bands
+  // back together in the right order.
+  uint32_t resolve_source_base = 0;
+  // The source surface's OWN extent. Matching an aliased source on the
+  // DESTINATION texture's extent fails whenever that extent could not be
+  // decoded, and the source is the thing being identified anyway.
+  uint32_t resolve_source_width = 0;
+  uint32_t resolve_source_height = 0;
   // Where in the destination texture this resolve lands, and which part of the
   // source it takes — D3DDevice_Resolve's pDestPoint (r7) and pSourceRect (r5).
   //
@@ -500,5 +529,39 @@ uint32_t ExpandRectangleList(DrawCall& dc);
 // incoming indices, so it is correct for auto-draws and real index buffers
 // alike. Returns the number of quads expanded, 0 if the draw could not be.
 uint32_t ExpandQuadList(DrawCall& dc);
+
+// The 1x1 auto-exposure result, read back from the GPU and handed to the
+// guest.
+//
+// The guest's adaptation pass (sub_82AFB8A8) does not sample this value, it
+// LOADS it: `lwz r4, 0x20(r5); clrrwi r3, r4, 12; lhz r11, 0(r3)` reads the
+// destination texture's own bytes out of guest memory as a 16-bit half. On
+// the console a resolve writes those bytes; our resolves only ever fill host
+// textures, so the guest read zero, computed its exposure as a division by
+// that zero, and wrote +Infinity into pixel constant 100 -- which turned the
+// composite's output to NaN and the frame white.
+//
+// The renderer publishes here and the D3D9 layer consumes, because only the
+// renderer can read the GPU and only the hooks can address guest memory.
+// `seq` is bumped last and read first; a consumer that sees an unchanged seq
+// has nothing new to write.
+// Keyed by DESTINATION TEXTURE OBJECT, not broadcast.
+//
+// The first cut published a single value and the D3D9 layer wrote it to every
+// 1x1 destination it had seen. That was wrong in a way worth spelling out: the
+// adaptation is `new = old + (cur - old) * k`, reading one buffer and writing
+// the other, so giving both buffers the same number makes `cur == old` and
+// pins the filter at a fixed point for the rest of the run. Each destination
+// has to carry its own measurement.
+struct LuminanceReadback {
+  uint32_t destObject = 0;  // resolve destination texture object
+  uint32_t bits = 0;        // host R16 half, little-endian
+};
+inline constexpr uint32_t kMaxLuminanceReadbacks = 4;
+// Guarded by g_luminanceReadbackMutex; `seq` changes whenever the set does.
+extern std::mutex g_luminanceReadbackMutex;
+extern LuminanceReadback g_luminanceReadbacks[kMaxLuminanceReadbacks];
+extern uint32_t g_luminanceReadbackCount;
+extern std::atomic<uint32_t> g_luminanceReadbackSeq;
 
 }  // namespace mx::hle

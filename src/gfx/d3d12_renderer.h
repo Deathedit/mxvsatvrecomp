@@ -111,7 +111,10 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  const uint32_t* pixelSampledObjects = nullptr,
                  const GpuVertexStage* vertexStage = nullptr,
                  uint32_t pixelSamplerArrayMask = 0,
-                 const uint8_t* pixelSamplerSigns = nullptr);
+                 const uint8_t* pixelSamplerSigns = nullptr,
+                 uint32_t depthObject = 0, uint32_t depthWidth = 0,
+                 uint32_t depthHeight = 0, uint32_t depthBase = 0,
+                 uint32_t targetBase = 0, uint32_t targetColorFormat = 0);
 
 // Append a resolve to this frame's list, in order with the draws around it.
 //
@@ -129,7 +132,9 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
 void AddGameResolve(uint32_t destTexture, uint32_t sourceObject,
                     int32_t destX, int32_t destY, int32_t srcX1, int32_t srcY1,
                     int32_t srcX2, int32_t srcY2,
-                    uint32_t destWidth = 0, uint32_t destHeight = 0);
+                    uint32_t destWidth = 0, uint32_t destHeight = 0,
+                    bool sourceIsDepth = false, uint32_t sourceBase = 0,
+                    uint32_t sourceWidth = 0, uint32_t sourceHeight = 0);
 
 // Drop the previous frame's draws. Called when a real guest-frame handoff
 // arrives, including one whose draws are all filtered; an empty render-thread
@@ -239,8 +244,39 @@ void ClearGameDraws();
   bool EnsureGameTexture(const std::shared_ptr<const mx::hle::HleTexturePayload>& texture,
                          uint32_t& descriptorIndex);
   struct GameRenderTarget;
-  GameRenderTarget* EnsureGameRenderTarget(uint32_t object, uint32_t width,
-                                           uint32_t height);
+  GameRenderTarget* EnsureGameRenderTarget(
+      uint32_t object, uint32_t width, uint32_t height,
+      uint32_t edramBase = 0,
+      DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM);
+
+  // What distinguishes one pooled offscreen surface from another. Everything
+  // else about creating one — the heap properties, the resource desc, claiming
+  // an SRV descriptor only AFTER the resource exists, and building the view —
+  // is identical for colour targets, resolve snapshots and depth surfaces, and
+  // had grown two verbatim copies before this was extracted.
+  struct PooledSurfaceSpec {
+    DXGI_FORMAT resourceFormat = kBackBufferFormat;
+    // Separate from the resource format so a depth surface can be created
+    // typeless and read as R32_FLOAT: a DSV-capable resource cannot also carry
+    // a depth-typed SRV, which is why depth was unsamplable and every depth
+    // resolve missed its source.
+    DXGI_FORMAT srvFormat = kBackBufferFormat;
+    D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE;
+    D3D12_RESOURCE_STATES initialState =
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    const D3D12_CLEAR_VALUE* clear = nullptr;
+  };
+  // Fills entry.resource and entry.srvIndex, or returns false having claimed
+  // nothing. Pass reuseSrvIndex to keep an existing descriptor slot when a
+  // surface is replaced or grown in place.
+  bool CreatePooledSurface(GameRenderTarget& entry, uint32_t width,
+                           uint32_t height, const PooledSurfaceSpec& spec,
+                           uint32_t reuseSrvIndex);
+  // Hand a resource to the retirement list rather than releasing it inline. A
+  // command list does not keep its resources alive, so the GPU may still be
+  // reading one this frame; releasing inline made every later create of that
+  // size fail — 1834 failures in one run.
+  void RetireResource(Microsoft::WRL::ComPtr<ID3D12Resource>&& res);
 
   void WaitForGpu();
   void MoveToNextFrame();
@@ -281,6 +317,21 @@ void ClearGameDraws();
   // Indexed by depth-enable bit 0, depth-write bit 1, no-colour bit 2,
   // textured bit 3, YUV composite bit 4. Opaque draws only.
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, 32> m_gamePSOs;
+  // The same 32 opaque variants for a NON-RGBA8 render target, built on demand.
+  // Keyed (format << 8) | variant. The guest's HDR chain -- the 320x180 and
+  // 160x90 luminance targets are k_2_10_10_10_FLOAT and the 64x64 down to 1x1
+  // reduction is k_16_16_FLOAT -- cannot be drawn by a pipeline that declares
+  // RGBA8, and drawing it into an RGBA8 surface clamped the log-average to
+  // [0,1] before anything could read it.
+  std::unordered_map<uint32_t, Microsoft::WRL::ComPtr<ID3D12PipelineState>>
+      m_gamePSOsByFormat;
+  ID3D12PipelineState* OpaquePSO(
+      uint32_t variant, DXGI_FORMAT rtvFormat,
+      D3D12_PRIMITIVE_TOPOLOGY_TYPE topoType =
+          D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+  // The host format an offscreen target takes for a given guest
+  // ColorRenderTargetFormat (RB_COLOR_INFO bits [16:19]).
+  static DXGI_FORMAT HostColorFormat(uint32_t guestColorFormat);
 
   // Blended draws, built on demand and keyed by the state they need.
   //
@@ -294,15 +345,26 @@ void ClearGameDraws();
     uint32_t src = 0;         // D3DBLEND
     uint32_t dest = 0;        // D3DBLEND
     uint32_t op = 0;          // D3DBLENDOP
+    // The render target's format. A PSO declares the format it writes, and
+    // binding it to an RTV of a different one is invalid: once offscreen
+    // targets stopped all being RGBA8, one cached pipeline per blend mode was
+    // no longer enough.
+    DXGI_FORMAT rtvFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    // The topology GROUP the pipeline declares. A draw whose topology is in a
+    // different group is refused by the runtime and renders nothing, so this
+    // belongs in the key for the same reason rtvFormat does.
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE topoType =
+        D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     bool operator==(const BlendKey& o) const noexcept {
       return pso_index == o.pso_index && src == o.src && dest == o.dest &&
-             op == o.op;
+             op == o.op && rtvFormat == o.rtvFormat && topoType == o.topoType;
     }
   };
   struct BlendKeyHash {
     size_t operator()(const BlendKey& k) const noexcept {
       return (size_t(k.pso_index) << 24) ^ (size_t(k.src) << 16) ^
-             (size_t(k.dest) << 8) ^ size_t(k.op);
+             (size_t(k.dest) << 8) ^ size_t(k.op) ^
+             (size_t(k.rtvFormat) << 32) ^ (size_t(k.topoType) << 44);
     }
   };
   // Bounded so an unrecognised state cannot grow this without limit; past the
@@ -384,17 +446,30 @@ void ClearGameDraws();
     // different vertex shader is a different PSO with a different input layout.
     uint32_t vsHandle = 0;
     uint32_t src = 0, dest = 0, op = 0;
-    uint8_t flags = 0;  // 1 depth, 2 depth write, 4 no colour, 8 blend
+    // 1 depth, 2 depth write, 4 no colour, 8 blend,
+    // 16 the vertex stage is the FETCH variant of vsHandle -- a different
+    // compilation of the same guest shader, with an empty input layout and a
+    // raw-buffer SRV instead of input elements. Without this bit the two
+    // variants would share a PSO and whichever compiled first would be used for
+    // both, which is a mismatched input layout rather than a visible error.
+    uint8_t flags = 0;
+    // See BlendKey::rtvFormat.
+    DXGI_FORMAT rtvFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    // See BlendKey::topoType.
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE topoType =
+        D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     bool operator==(const TranslatedKey& o) const noexcept {
       return handle == o.handle && vsHandle == o.vsHandle && src == o.src &&
-             dest == o.dest && op == o.op && flags == o.flags;
+             dest == o.dest && op == o.op && flags == o.flags &&
+             rtvFormat == o.rtvFormat && topoType == o.topoType;
     }
   };
   struct TranslatedKeyHash {
     size_t operator()(const TranslatedKey& k) const noexcept {
       return (size_t(k.handle) << 20) ^ (size_t(k.vsHandle) << 28) ^
              (size_t(k.src) << 12) ^ (size_t(k.dest) << 6) ^
-             (size_t(k.op) << 3) ^ size_t(k.flags);
+             (size_t(k.op) << 3) ^ size_t(k.flags) ^
+             (size_t(k.rtvFormat) << 40) ^ (size_t(k.topoType) << 50);
     }
   };
   std::unordered_map<TranslatedKey, TranslatedPipeline, TranslatedKeyHash>
@@ -626,6 +701,22 @@ void ClearGameDraws();
     uint32_t targetObject = 0;
     uint32_t targetWidth = 0;
     uint32_t targetHeight = 0;
+    // EDRAM tile base of the colour target. The guest gives one EDRAM
+    // allocation several surface OBJECTS -- 0x2653FDA0 is drawn into and
+    // 0x2653FF20 is resolved out of, both 129x129 at base 0x2D0 -- so object
+    // identity alone cannot connect a resolve to the surface that holds its
+    // contents.
+    uint32_t targetBase = 0;
+    // Guest ColorRenderTargetFormat for that target, RB_COLOR_INFO[16:19].
+    uint32_t targetColorFormat = 0;
+    // The guest's depth surface for this draw, by object identity. Offscreen
+    // colour targets used to get no depth attachment at all.
+    uint32_t depthObject = 0;
+    uint32_t depthWidth = 0;
+    uint32_t depthHeight = 0;
+    // EDRAM tile base of that depth surface, so a banded pass can be stitched
+    // back together when the guest resolves the whole of it. See resolveSourceBase.
+    uint32_t depthBase = 0;
     // The vertex declaration carried no COLOR element, so the {1,1,1,1} in the
     // vertex buffer is a seed rather than data — a modulation identity for the
     // textured shader. If such a draw is not textured, that value is emitted
@@ -642,6 +733,19 @@ void ClearGameDraws();
     // draw order. It carries no geometry.
     uint32_t resolveDest = 0;
     uint32_t resolveSource = 0;
+    // Source slot 4: the depth surface, which lives in its own pool. One
+    // guest object can be bound as depth in one place and colour in another,
+    // so the object alone cannot say which pool to search.
+    bool resolveSourceIsDepth = false;
+    // EDRAM tile base of the resolve source. The shadow pass renders two depth
+    // bands (768x640 at base 0x580, 768x384 at base 0x710) and then resolves
+    // the whole 768x1024 through a THIRD object that aliases band 0's base and
+    // that no draw ever binds -- so an object-identity lookup misses it and the
+    // shadow map never reaches the shader that samples it. Base ordering is
+    // what puts the bands back in the right vertical order.
+    uint32_t resolveSourceBase = 0;
+    uint32_t resolveSourceWidth = 0;
+    uint32_t resolveSourceHeight = 0;
     // Placement of this band within the destination, and the sub-rectangle of
     // the source it takes. `resolveSrcX2 == 0` means the whole source.
     int32_t resolveDestX = 0;
@@ -788,8 +892,52 @@ void ClearGameDraws();
   // resources that failed to create. Both exist to tell a fix that stopped
   // working apart from one that never ran, and both have been non-zero for real
   // reasons.
+  // Depth resolves satisfied by stitching EDRAM bands rather than by an
+  // object-identity hit. Non-zero means the shadow pass is reaching its shader.
+  uint64_t m_depthBandResolves = 0;
+  // Colour resolves matched to their source by EDRAM base rather than by
+  // object identity, because the guest named the storage twice.
+  uint64_t m_aliasedSourceResolves = 0;
+  // PROVISIONAL: resolves satisfied from a LARGER host surface at the same
+  // EDRAM base, by taking the top rows. The multisample-alias case.
+  uint64_t m_containedSourceResolves = 0;
   uint64_t m_resolvesDroppedFull = 0;
   uint64_t m_snapshotCreateFailed = 0;
+  // A snapshot recreated because the resolve source's format changed under it.
+  // Each one loses the bands already resolved for one frame; a large number
+  // means two sources of different formats are alternating into one texture,
+  // which would thrash and wants a per-format snapshot instead.
+  uint64_t m_snapshotFormatChanged = 0;
+  // The 1x1 auto-exposure result on its way back to the guest. The guest reads
+  // the resolve destination's bytes out of its own memory rather than sampling
+  // them (mx::hle::g_luminanceReadbackBits explains why that matters), so the
+  // value has to make the round trip through host memory.
+  //
+  // One buffer per frame in flight, drained at the top of the frame that
+  // reuses the slot: MoveToNextFrame has already waited out the frame
+  // kFrameCount ago, so that slot's copy is complete and mapping it cannot
+  // stall. The cost is a couple of frames of latency on a value the guest
+  // filters over time anyway.
+  // Generous enough that GetCopyableFootprints for any single small texel can
+  // never need more, and a round multiple of the 512-byte placement alignment.
+  static constexpr uint32_t kLuminanceReadbackBytes = 4096;
+  // One buffer per frame in flight, carved into slots 512 bytes apart so each
+  // 1x1 resolve in the frame gets its own. 512 is
+  // D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, the minimum spacing a placed
+  // footprint may use.
+  static constexpr uint32_t kLuminanceSlotStride = 512;
+  std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kFrameCount>
+      m_luminanceReadback;
+  std::array<uint32_t, kFrameCount> m_luminancePending = {};
+  // Mirrors mx::hle::kMaxLuminanceReadbacks; this header deliberately does not
+  // include hle_types.h, and d3d12_game.cpp static_asserts the two agree.
+  static constexpr uint32_t kMaxLuminanceSlots = 4;
+  std::array<std::array<uint32_t, kMaxLuminanceSlots>, kFrameCount>
+      m_luminanceDestObject = {};
+  uint64_t m_luminanceReadbacks = 0;
+  uint32_t m_luminanceLastBits = 0;
+  void DrainLuminanceReadback();
+  void QueueLuminanceReadback(GameRenderTarget* snap, uint32_t destObject);
   struct GameRenderTarget {
     Microsoft::WRL::ComPtr<ID3D12Resource> resource;
     uint32_t width = 0;
@@ -816,6 +964,11 @@ void ClearGameDraws();
     // legitimately old -- from a leftover full-screen frame that nothing has
     // refreshed and that a draw is about to paint over the current one.
     uint64_t lastCopyFrame = 0;
+    // Depth targets only: the EDRAM tile base this surface was rendered at.
+    uint32_t edramBase = 0;
+    // The format this surface was created with, so a PSO can be built to match
+    // it and a snapshot can be created in the same format.
+    DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM;
   };
   std::unordered_map<uint32_t, GameRenderTarget> m_gameRenderTargets;
   // Resolve snapshots, keyed by DESTINATION TEXTURE object rather than by the
@@ -828,5 +981,24 @@ void ClearGameDraws();
   // union of them. An existing snapshot that is already at least this large is
   // returned untouched; a smaller one grows, preserving what it holds.
   GameRenderTarget* EnsureGameSnapshot(uint32_t destTexture, uint32_t width,
-                                       uint32_t height);
+                                       uint32_t height,
+                                       DXGI_FORMAT format = kBackBufferFormat);
+  // Per-object depth surfaces, keyed like the colour targets. Created
+  // R32_TYPELESS so the same resource can carry a D32_FLOAT DSV for rendering
+  // and an R32_FLOAT SRV for the depth resolve; a D32_FLOAT resource can do
+  // only the first, which is why depth was unresolvable.
+  std::unordered_map<uint32_t, GameRenderTarget> m_gameDepthTargets;
+  GameRenderTarget* EnsureGameDepthTarget(uint32_t object, uint32_t width,
+                                          uint32_t height, uint32_t edramBase);
+  // Descriptor 0 stays the main-target depth created by CreateGameRenderTargets;
+  // the rest are stable slots for guest depth-surface identities.
+  static constexpr uint32_t kMaxGameDepthTargets = 16;
+  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_gameDepthDsvHeap;
+  uint32_t m_gameDsvDescriptorSize = 0;
+  // Depth resolves served from a per-object depth surface. Separate from the
+  // colour counters so the two cannot be confused when reading whether this
+  // path is working at all.
+  uint64_t m_depthResolves = 0;
+  // Stand-in draws refused a depth snapshot as their one colour texture.
+  uint64_t m_standInDepthSnapshotRefused = 0;
 };

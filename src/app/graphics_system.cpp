@@ -324,7 +324,9 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                 d->resolve_dest_texture, d->resolve_source_object,
                 d->resolve_dest_x, d->resolve_dest_y, d->resolve_src_x1,
                 d->resolve_src_y1, d->resolve_src_x2, d->resolve_src_y2,
-                d->resolve_dest_width, d->resolve_dest_height);
+                d->resolve_dest_width, d->resolve_dest_height,
+                d->resolve_source_is_depth, d->resolve_source_base,
+                d->resolve_source_width, d->resolve_source_height);
             continue;
           }
           // The guest vertex stage, when the hooks built one for this draw.
@@ -394,7 +396,12 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   d->pixel_sampled_objects.data(),
                                   vertexStage.handle ? &vertexStage : nullptr,
                                   d->pixel_sampler_array_mask,
-                                  d->pixel_sampler_signs.data());
+                                  d->pixel_sampler_signs.data(),
+                                  d->depth_target_object,
+                                  d->depth_target_width,
+                                  d->depth_target_height,
+                                  d->depth_target_base, d->surface_base,
+                                  (d->render_target_color_info >> 16) & 0xFu);
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;

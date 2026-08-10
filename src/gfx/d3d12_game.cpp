@@ -325,6 +325,30 @@ bool D3D12Renderer::CreateGamePipeline() {
 
   if (!CreatePresentQuad()) return false;
 
+  // Up front, not on first use. Creating a committed resource part-way through
+  // recording a command list is legal, but doing it under a capture layer is
+  // the kind of thing that only works most of the time -- and it did not work
+  // under RenderDoc, which failed the Close of the list that created one.
+  // There is nothing to gain by deferring three 4 KB buffers.
+  for (auto& rb : m_luminanceReadback) {
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd = {};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = kLuminanceReadbackBytes;
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.Format = DXGI_FORMAT_UNKNOWN;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    // Non-fatal: without it the guest keeps reading a stale exposure, which is
+    // a wrong picture rather than no picture.
+    m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd,
+                                      D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                      IID_PPV_ARGS(&rb));
+  }
+
   m_hasGamePipeline = true;
   // Non-fatal: a failure here costs the translated path, not the stand-in one,
   // so the game still renders exactly as it did.
@@ -603,7 +627,12 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
         return false;
       }
       slots[i].resource = it->second.resource.Get();
-      slots[i].format = kBackBufferFormat;
+      // From the resource, not assumed. Every snapshot was RGBA8 until depth
+      // resolves started producing R32_FLOAT ones, and an RGBA8 view over an
+      // R32_FLOAT resource is not merely wrong -- CreateShaderResourceView
+      // rejects it as a cross-family format and D3D12 removes the device
+      // (DXGI_ERROR_INVALID_CALL). That was the hang.
+      slots[i].format = it->second.resource->GetDesc().Format;
       continue;
     }
     const auto& tex = d.pixelTextures[i];
@@ -817,9 +846,9 @@ ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
   pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
   pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
   pso.SampleMask = UINT_MAX;
-  pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  pso.PrimitiveTopologyType = key.topoType;
   pso.NumRenderTargets = 1;
-  pso.RTVFormats[0] = kBackBufferFormat;
+  pso.RTVFormats[0] = key.rtvFormat;
   pso.DSVFormat = kGameDepthFormat;
   pso.SampleDesc.Count = 1;
   pso.InputLayout.pInputElementDescs = layout.data();
@@ -878,6 +907,119 @@ ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
   return result;
 }
 
+// Xenos ColorRenderTargetFormat -> the host format that can hold it.
+//
+// Read from RB_COLOR_INFO bits [16:19] at draw time. Every offscreen target
+// used to be created RGBA8 regardless, which is correct for the scene (format
+// 0) and destroys anything HDR: the menu's luminance chain is format 3 at
+// 320x180/160x90 and format 6 from 64x64 down to 1x1, so the log-average
+// luminance was being clamped to [0,1] and quantised to 8 bits.
+//
+// 2_10_10_10_FLOAT has no host equivalent and takes RGBA16F, which is what
+// Xenia does: wider than the guest, so nothing is lost.
+DXGI_FORMAT D3D12Renderer::HostColorFormat(uint32_t guestColorFormat) {
+  switch (guestColorFormat) {
+    case 0:   // k_8_8_8_8
+    case 1:   // k_8_8_8_8_GAMMA
+      return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case 2:   // k_2_10_10_10
+    case 10:  // k_2_10_10_10_AS_10_10_10_10
+      return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case 3:   // k_2_10_10_10_FLOAT
+    case 12:  // k_2_10_10_10_FLOAT_AS_16_16_16_16
+    case 7:   // k_16_16_16_16_FLOAT
+      return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case 4:   // k_16_16
+      return DXGI_FORMAT_R16G16_UNORM;
+    case 5:   // k_16_16_16_16
+      return DXGI_FORMAT_R16G16B16A16_UNORM;
+    case 6:   // k_16_16_FLOAT
+      return DXGI_FORMAT_R16G16_FLOAT;
+    case 15:  // k_32_FLOAT
+      return DXGI_FORMAT_R32_FLOAT;
+    case 16:  // k_32_32_FLOAT
+      return DXGI_FORMAT_R32G32_FLOAT;
+    default:
+      return DXGI_FORMAT_R8G8B8A8_UNORM;
+  }
+}
+
+// Which topology GROUP a PSO must declare for this topology to be legal against
+// it. Not a nicety: a LINESTRIP draw submitted to a PSO built for TRIANGLE is
+// refused outright by the runtime —
+//
+//   D3D12 ERROR [id 611]: DrawIndexedInstanced: The primitive topology does not
+//   belong to the appropriate group specified by the current pipeline state.
+//
+// — and the draw renders nothing. Every PSO here was hardcoded to TRIANGLE, so
+// all 944 D3DPT_LINESTRIP draws per 170,000 were silently discarded.
+D3D12_PRIMITIVE_TOPOLOGY_TYPE TopologyTypeOf(D3D12_PRIMITIVE_TOPOLOGY topo) {
+  switch (topo) {
+    case D3D_PRIMITIVE_TOPOLOGY_POINTLIST:
+      return D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+    case D3D_PRIMITIVE_TOPOLOGY_LINELIST:
+    case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP:
+    case D3D_PRIMITIVE_TOPOLOGY_LINELIST_ADJ:
+    case D3D_PRIMITIVE_TOPOLOGY_LINESTRIP_ADJ:
+      return D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+    default:
+      return D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+  }
+}
+
+// The opaque stand-in variant for a target that is not RGBA8, or for a topology
+// group other than triangles. The 32 built at startup cover the back-buffer
+// format and triangles only; these are the same descriptions with RTVFormats[0]
+// and PrimitiveTopologyType changed, built once each on demand.
+ID3D12PipelineState* D3D12Renderer::OpaquePSO(
+    uint32_t variant, DXGI_FORMAT rtvFormat,
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE topoType) {
+  if (topoType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE &&
+      (rtvFormat == kBackBufferFormat || rtvFormat == DXGI_FORMAT_UNKNOWN))
+    return m_gamePSOs[variant].Get();
+  const uint32_t key = (uint32_t(rtvFormat) << 8) | (variant & 0xFFu) |
+                       (uint32_t(topoType) << 28);
+  if (auto it = m_gamePSOsByFormat.find(key); it != m_gamePSOsByFormat.end())
+    return it->second.Get();
+  if (!m_gameVsBlob || m_gamePsBlobs[0] == nullptr)
+    return m_gamePSOs[variant].Get();
+
+  D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = m_gamePsoTemplate;
+  pso.RTVFormats[0] = rtvFormat;
+  pso.PrimitiveTopologyType = topoType;
+  const bool depth_enable = (variant & 1u) != 0;
+  const bool depth_write = depth_enable && (variant & 2u) != 0;
+  const bool color_write = (variant & 4u) == 0;
+  const bool textured = (variant & 8u) != 0;
+  const bool yuv = (variant & 16u) != 0;
+  ID3DBlob* ps = yuv ? m_gamePsBlobs[2].Get()
+                     : (textured ? m_gamePsBlobs[1].Get()
+                                 : m_gamePsBlobs[0].Get());
+  pso.PS.pShaderBytecode = ps->GetBufferPointer();
+  pso.PS.BytecodeLength = ps->GetBufferSize();
+  pso.DepthStencilState = {};
+  pso.DepthStencilState.DepthEnable = depth_enable;
+  pso.DepthStencilState.DepthWriteMask =
+      depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+  pso.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+  pso.BlendState.RenderTarget[0] = {};
+  pso.BlendState.RenderTarget[0].RenderTargetWriteMask =
+      color_write ? D3D12_COLOR_WRITE_ENABLE_ALL : 0;
+
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> created;
+  if (FAILED(m_device->CreateGraphicsPipelineState(&pso,
+                                                   IID_PPV_ARGS(&created)))) {
+    // Fall back to the RGBA8 variant rather than dropping the draw. It will be
+    // refused by the debug layer against a mismatched RTV, which is visible,
+    // whereas a silently missing draw is not.
+    LogError("OpaquePSO: variant creation failed for a non-RGBA8 target or a "
+             "non-triangle topology");
+    return m_gamePSOs[variant].Get();
+  }
+  auto [it, ok] = m_gamePSOsByFormat.emplace(key, std::move(created));
+  return it->second.Get();
+}
+
 ID3D12PipelineState* D3D12Renderer::BlendedPSO(const BlendKey& key) {
   if (auto it = m_blendPSOs.find(key); it != m_blendPSOs.end())
     return it->second.Get();
@@ -907,6 +1049,8 @@ ID3D12PipelineState* D3D12Renderer::BlendedPSO(const BlendKey& key) {
   }
 
   D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = m_gamePsoTemplate;
+  pso.RTVFormats[0] = key.rtvFormat;
+  pso.PrimitiveTopologyType = key.topoType;
   const bool depth_enable = (key.pso_index & 1u) != 0;
   const bool depth_write = depth_enable && (key.pso_index & 2u) != 0;
   const bool color_write = (key.pso_index & 4u) == 0;
@@ -1370,8 +1514,62 @@ bool D3D12Renderer::EnsureGameTexture(
   return true;
 }
 
+void D3D12Renderer::RetireResource(
+    Microsoft::WRL::ComPtr<ID3D12Resource>&& res) {
+  if (!res) return;
+  RetiredFrame& r = (!m_retired.empty() && m_retired.back().fence == m_fenceValue)
+                        ? m_retired.back()
+                        : m_retired.emplace_back(RetiredFrame{m_fenceValue, {}});
+  r.res.push_back(std::move(res));
+}
+
+bool D3D12Renderer::CreatePooledSurface(GameRenderTarget& entry, uint32_t width,
+                                        uint32_t height,
+                                        const PooledSurfaceSpec& spec,
+                                        uint32_t reuseSrvIndex) {
+  D3D12_HEAP_PROPERTIES hp = {};
+  hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC rd = {};
+  rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  rd.Width = width;
+  rd.Height = height;
+  rd.DepthOrArraySize = 1;
+  rd.MipLevels = 1;
+  rd.Format = spec.resourceFormat;
+  rd.SampleDesc.Count = 1;
+  rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+  rd.Flags = spec.flags;
+  if (FAILED(m_device->CreateCommittedResource(
+          &hp, D3D12_HEAP_FLAG_NONE, &rd, spec.initialState, spec.clear,
+          IID_PPV_ARGS(&entry.resource))))
+    return false;
+  // Recorded HERE, from what the resource was actually created with, rather
+  // than by each caller. EnsureGameRenderTarget set it and EnsureGameSnapshot
+  // did not, so every snapshot claimed to be R8G8B8A8_UNORM — the struct
+  // default — whatever it really was. Anything reasoning about a snapshot's
+  // format was reading a lie, which is half of why an HDR resolve reached
+  // CopyTextureRegion with a mismatched destination.
+  entry.format = spec.resourceFormat;
+  // Claimed only once the resource exists. Claiming before the call leaks a
+  // descriptor on every failure, and the caller retries the same object every
+  // frame — that drained the heap to 1024/1024 in about twenty seconds.
+  entry.srvIndex =
+      reuseSrvIndex != UINT32_MAX ? reuseSrvIndex : m_nextGameSrvDescriptor++;
+
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+  srv.Format = spec.srvFormat;
+  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv.Texture2D.MipLevels = 1;
+  auto cpu = m_gameSrvHeap->GetCPUDescriptorHandleForHeapStart();
+  cpu.ptr += SIZE_T(entry.srvIndex) * m_gameSrvDescriptorSize;
+  m_device->CreateShaderResourceView(entry.resource.Get(), &srv, cpu);
+  return true;
+}
+
 D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameRenderTarget(
-    uint32_t object, uint32_t width, uint32_t height) {
+    uint32_t object, uint32_t width, uint32_t height, uint32_t edramBase,
+    DXGI_FORMAT format) {
   if (!object || !width || !height || width > 8192 || height > 8192 ||
       !m_gameRtvHeap || !m_gameSrvHeap)
     return nullptr;
@@ -1379,7 +1577,11 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameRenderTarget(
   uint32_t reuseSrvIndex = UINT32_MAX;
   if (auto it = m_gameRenderTargets.find(object);
       it != m_gameRenderTargets.end()) {
-    if (it->second.width != width || it->second.height != height) {
+    // A format change is handled exactly like a size change -- the resource has
+    // to be recreated either way, and refusing would make the object
+    // unroutable for the rest of the run.
+    if (it->second.width != width || it->second.height != height ||
+        it->second.format != format) {
       // A guest heap address reused at a different size. This used to refuse,
       // which made the object unroutable for the REST OF THE RUN — every later
       // draw onto it fell back to the main target and overpainted the scene,
@@ -1393,13 +1595,7 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameRenderTarget(
       ++m_rtRejectResized;
       reuseRtvIndex = it->second.rtvIndex;
       reuseSrvIndex = it->second.srvIndex;
-      if (it->second.resource) {
-        RetiredFrame& r =
-            (!m_retired.empty() && m_retired.back().fence == m_fenceValue)
-                ? m_retired.back()
-                : m_retired.emplace_back(RetiredFrame{m_fenceValue, {}});
-        r.res.push_back(std::move(it->second.resource));
-      }
+      RetireResource(std::move(it->second.resource));
       m_gameRenderTargets.erase(it);
     } else {
       return &it->second;
@@ -1420,38 +1616,25 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameRenderTarget(
   GameRenderTarget entry;
   entry.width = width;
   entry.height = height;
+  entry.edramBase = edramBase;
+  entry.format = format;
   entry.rtvIndex = reuseRtvIndex != UINT32_MAX
                        ? reuseRtvIndex
                        : uint32_t(m_gameRenderTargets.size()) + 1;
 
-  D3D12_HEAP_PROPERTIES hp = {};
-  hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-  D3D12_RESOURCE_DESC rd = {};
-  rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  rd.Width = width;
-  rd.Height = height;
-  rd.DepthOrArraySize = 1;
-  rd.MipLevels = 1;
-  rd.Format = kBackBufferFormat;
-  rd.SampleDesc.Count = 1;
-  rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-  rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
   D3D12_CLEAR_VALUE cv = {};
-  cv.Format = kBackBufferFormat;
+  cv.Format = format;
   cv.Color[0] = 0.0f;
   cv.Color[1] = 0.0f;
   cv.Color[2] = 0.0f;
   cv.Color[3] = 0.0f;
-  if (FAILED(m_device->CreateCommittedResource(
-          &hp, D3D12_HEAP_FLAG_NONE, &rd,
-          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv,
-          IID_PPV_ARGS(&entry.resource))))
+  PooledSurfaceSpec spec;
+  spec.resourceFormat = format;
+  spec.srvFormat = format;
+  spec.flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  spec.clear = &cv;
+  if (!CreatePooledSurface(entry, width, height, spec, reuseSrvIndex))
     return nullptr;
-  // Claimed only once the resource exists. Claiming before the call leaks a
-  // descriptor on every failure, and the caller retries the same object every
-  // frame — see the snapshot path for the run where that drained the heap.
-  entry.srvIndex = reuseSrvIndex != UINT32_MAX ? reuseSrvIndex
-                                               : m_nextGameSrvDescriptor++;
 
   auto rtv = m_gameRtvHeap->GetCPUDescriptorHandleForHeapStart();
   rtv.ptr += SIZE_T(entry.rtvIndex) * m_gameRtvDescriptorSize;
@@ -1483,15 +1666,6 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameRenderTarget(
     m_commandList->ResourceBarrier(1, &back);
   }
 
-  D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
-  srv.Format = kBackBufferFormat;
-  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-  srv.Texture2D.MipLevels = 1;
-  auto cpu = m_gameSrvHeap->GetCPUDescriptorHandleForHeapStart();
-  cpu.ptr += SIZE_T(entry.srvIndex) * m_gameSrvDescriptorSize;
-  m_device->CreateShaderResourceView(entry.resource.Get(), &srv, cpu);
-
   auto [it, inserted] = m_gameRenderTargets.emplace(object, std::move(entry));
   if (!inserted) return nullptr;
   char message[192];
@@ -1502,13 +1676,226 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameRenderTarget(
   return &it->second;
 }
 
+// A depth surface for one guest depth-stencil object.
+//
+// Offscreen colour targets were rendered with OMSetRenderTargets(..., nullptr)
+// and tDepthEnable forced false, so the whole deferred scene ran with no depth
+// buffer. That is not only wrong for depth testing: the guest RESOLVES its
+// depth surface to a texture to reconstruct world position in the lighting
+// pass, and with nothing to copy every one of those resolves missed. Measured
+// on the menu: source 0x2123C208 missed 224 times in one sample window, and it
+// is the depth surface (Resolve source slot 4).
+//
+// R32_TYPELESS so one resource serves both views. D3D12 will not give a
+// D32_FLOAT resource a colour SRV, and a resolve has to be sampled.
+D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameDepthTarget(
+    uint32_t object, uint32_t width, uint32_t height, uint32_t edramBase) {
+  if (!object || !width || !height || width > 8192 || height > 8192 ||
+      !m_gameDepthDsvHeap || !m_gameSrvHeap)
+    return nullptr;
+  uint32_t reuseDsvIndex = UINT32_MAX;
+  uint32_t reuseSrvIndex = UINT32_MAX;
+  if (auto it = m_gameDepthTargets.find(object);
+      it != m_gameDepthTargets.end()) {
+    if (it->second.width == width && it->second.height == height) {
+      it->second.edramBase = edramBase;
+      return &it->second;
+    }
+    // Same policy as the colour targets: replace in place rather than refuse,
+    // so a guest address reused at another size does not become unroutable.
+    ++m_rtRejectResized;
+    reuseDsvIndex = it->second.rtvIndex;
+    reuseSrvIndex = it->second.srvIndex;
+    RetireResource(std::move(it->second.resource));
+    m_gameDepthTargets.erase(it);
+  }
+  if (reuseSrvIndex == UINT32_MAX &&
+      (m_gameDepthTargets.size() >= kMaxGameDepthTargets ||
+       m_nextGameSrvDescriptor >= kMaxGameTextures)) {
+    ++m_rtRejectBudget;
+    return nullptr;
+  }
+
+  GameRenderTarget entry;
+  entry.width = width;
+  entry.height = height;
+  entry.edramBase = edramBase;
+  // rtvIndex doubles as the DSV index here — same bookkeeping, different heap.
+  entry.rtvIndex = reuseDsvIndex != UINT32_MAX
+                       ? reuseDsvIndex
+                       : uint32_t(m_gameDepthTargets.size()) + 1;
+
+  D3D12_CLEAR_VALUE cv = {};
+  cv.Format = kGameDepthFormat;
+  cv.DepthStencil.Depth = 1.0f;
+  cv.DepthStencil.Stencil = 0;
+  PooledSurfaceSpec spec;
+  spec.resourceFormat = DXGI_FORMAT_R32_TYPELESS;
+  spec.srvFormat = DXGI_FORMAT_R32_FLOAT;
+  spec.flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+  spec.initialState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+  spec.clear = &cv;
+  if (!CreatePooledSurface(entry, width, height, spec, reuseSrvIndex))
+    return nullptr;
+  entry.state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+
+  D3D12_DEPTH_STENCIL_VIEW_DESC dsv = {};
+  dsv.Format = kGameDepthFormat;
+  dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+  auto handle = m_gameDepthDsvHeap->GetCPUDescriptorHandleForHeapStart();
+  handle.ptr += SIZE_T(entry.rtvIndex) * m_gameDsvDescriptorSize;
+  m_device->CreateDepthStencilView(entry.resource.Get(), &dsv, handle);
+
+  auto [it, inserted] = m_gameDepthTargets.emplace(object, std::move(entry));
+  if (!inserted) return nullptr;
+  char message[192];
+  std::snprintf(message, sizeof(message),
+                "game depth target: object 0x%08X %ux%u cache %zu", object,
+                width, height, m_gameDepthTargets.size());
+  LogInfo(message);
+  return &it->second;
+}
+
 // A snapshot is an offscreen surface like any other — same struct, same
 // creation, same budget — so this defers to EnsureGameRenderTarget's storage
 // rather than duplicating it. The only difference is the key: destination
 // texture object, not source target object. That is what stops six resolves out
 // of one shared scratch surface from aliasing each other.
+// -- see EnsureGameSnapshot below, past the two exposure-readback helpers.
+
+// Hand the frame-old 1x1 exposure result to the guest.
+//
+// Called at the top of a frame, so the slot about to be reused has already
+// been waited out by MoveToNextFrame and the map is guaranteed non-blocking.
+// Only the R channel is published: the reduction targets are R16G16_FLOAT and
+// the guest's destination is a single FMT_16_FLOAT texel, so the second
+// channel has nowhere to go.
+void D3D12Renderer::DrainLuminanceReadback() {
+  const uint32_t count = m_luminancePending[m_frameIndex];
+  if (!count) return;
+  m_luminancePending[m_frameIndex] = 0;
+  ID3D12Resource* rb = m_luminanceReadback[m_frameIndex].Get();
+  if (!rb) return;
+  void* mapped = nullptr;
+  D3D12_RANGE readRange = {0, 4};
+  if (FAILED(rb->Map(0, &readRange, &mapped)) || !mapped) return;
+  uint32_t texel = 0;
+  {
+    std::lock_guard<std::mutex> lk(mx::hle::g_luminanceReadbackMutex);
+    mx::hle::g_luminanceReadbackCount = count;
+    for (uint32_t i = 0; i < count; ++i) {
+      uint32_t bits = 0;
+      std::memcpy(&bits,
+                  static_cast<const uint8_t*>(mapped) +
+                      size_t(i) * kLuminanceSlotStride,
+                  sizeof(bits));
+      mx::hle::g_luminanceReadbacks[i].destObject =
+          m_luminanceDestObject[m_frameIndex][i];
+      mx::hle::g_luminanceReadbacks[i].bits = bits & 0xFFFFu;
+      if (i == 0) texel = bits;
+    }
+  }
+  D3D12_RANGE noWrite = {0, 0};
+  rb->Unmap(0, &noWrite);
+  const uint32_t half = texel & 0xFFFFu;
+  // DIAG (remove before commit): whether the GPU's own answer is non-zero.
+  // If this only ever reports 0x0000 the write-back is faithful and the
+  // reduction chain is the thing producing nothing -- a different defect from
+  // the value not reaching the guest.
+  if (half != m_luminanceLastBits && m_luminanceReadbacks < 40) {
+    char msg[160];
+    std::snprintf(msg, sizeof(msg),
+                  "EXPOSURE readback #%llu texel 0x%08X -> half 0x%04X",
+                  static_cast<unsigned long long>(m_luminanceReadbacks), texel,
+                  half);
+    LogInfo(msg);
+  }
+  m_luminanceLastBits = half;
+  ++m_luminanceReadbacks;
+  // Bumped last so a consumer that reads the sequence first can never pair a
+  // new sequence with a half-written set.
+  mx::hle::g_luminanceReadbackSeq.fetch_add(1, std::memory_order_release);
+}
+
+// Copy a freshly written 1x1 snapshot into this frame's readback buffer.
+//
+// The snapshot is in PIXEL_SHADER_RESOURCE when this runs -- the resolve path
+// just put it there -- and is returned to it, because the composite samples it
+// later in the same frame.
+void D3D12Renderer::QueueLuminanceReadback(GameRenderTarget* snap,
+                                           uint32_t destObject) {
+  if (!snap || !snap->resource || !destObject) return;
+  // ONE copy per frame, which is the shape that was measured working. A
+  // four-slot version -- four placed footprints into one buffer at 512-byte
+  // offsets -- failed Close every time, and rather than keep guessing at why,
+  // this rotates across destinations instead: each frame samples the next 1x1
+  // resolve in turn, so over a handful of frames every buffer of the guest's
+  // ping-pong gets its own measurement. The adaptation filters over time
+  // anyway, so a value that refreshes every few frames is in keeping with it.
+  if (m_luminancePending[m_frameIndex]) return;
+  const D3D12_RESOURCE_DESC sd = snap->resource->GetDesc();
+  // A typeless resource cannot be the source of a buffer copy -- the footprint
+  // has no way to say what the bytes mean. Depth snapshots are R32_TYPELESS,
+  // and a 1x1 depth resolve would otherwise land here and record a copy the
+  // runtime rejects at Close, which kills the command list for the rest of the
+  // run. The reduction chain is R16G16_FLOAT (confirmed in intro-all-white.rdc)
+  // so nothing legitimate is turned away by demanding a typed format.
+  if (sd.Format == DXGI_FORMAT_R32_TYPELESS ||
+      sd.Format == DXGI_FORMAT_R24G8_TYPELESS ||
+      sd.Format == DXGI_FORMAT_UNKNOWN)
+    return;
+  // The caller checked the RESOLVE was 1x1; this checks the RESOURCE is, since
+  // EnsureGameSnapshot grows and never shrinks. Copying a whole subresource
+  // means the two have to agree.
+  if (sd.Width != 1 || sd.Height != 1 || sd.DepthOrArraySize != 1 ||
+      sd.MipLevels != 1 || sd.SampleDesc.Count != 1)
+    return;
+  // Ask the device for the footprint rather than deriving one. The first cut
+  // hand-computed a 256-byte row and sized the buffer to match; the row pitch
+  // was right but D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT is 512, so the
+  // destination was too small for a placed footprint. The debug layer never
+  // flagged it -- the runtime deferred the complaint to Close(), which then
+  // failed every frame and took the command list with it.
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout = {};
+  UINT numRows = 0;
+  UINT64 rowSize = 0, totalBytes = 0;
+  m_device->GetCopyableFootprints(&sd, 0, 1, 0, &layout, &numRows, &rowSize,
+                                  &totalBytes);
+  if (!totalBytes || totalBytes > kLuminanceSlotStride) return;
+  auto& rb = m_luminanceReadback[m_frameIndex];
+  if (!rb) return;  // Created at init; absent only if that failed.
+  D3D12_RESOURCE_BARRIER pre = {};
+  pre.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  pre.Transition.pResource = snap->resource.Get();
+  pre.Transition.StateBefore = snap->state;
+  pre.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  pre.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  m_commandList->ResourceBarrier(1, &pre);
+  D3D12_TEXTURE_COPY_LOCATION src = {};
+  src.pResource = snap->resource.Get();
+  src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  src.SubresourceIndex = 0;
+  D3D12_TEXTURE_COPY_LOCATION dst = {};
+  dst.pResource = rb.Get();
+  dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  dst.PlacedFootprint = layout;
+  // No source box: the footprint above already describes the whole subresource,
+  // and the guard below only lets a genuinely 1x1 resource through, so a box
+  // could only ever restate what the footprint says. Capture layers replay
+  // boxed copies less reliably than whole-subresource ones, and there is
+  // nothing to express here that needs one.
+  m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  D3D12_RESOURCE_BARRIER post = pre;
+  post.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  post.Transition.StateAfter = snap->state;
+  m_commandList->ResourceBarrier(1, &post);
+  m_luminanceDestObject[m_frameIndex][0] = destObject;
+  m_luminancePending[m_frameIndex] = 1;
+}
+
 D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameSnapshot(
-    uint32_t destTexture, uint32_t width, uint32_t height) {
+    uint32_t destTexture, uint32_t width, uint32_t height,
+    DXGI_FORMAT format) {
   if (!destTexture || !width || !height) return nullptr;
   // GROW to cover, never resize to match. A snapshot is assembled from one or
   // more resolve bands: the scene arrives as 1280x640 then 1280x80 at y=640,
@@ -1526,7 +1913,22 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameSnapshot(
   D3D12_RESOURCE_STATES growFromState = D3D12_RESOURCE_STATE_COMMON;
   uint32_t growWidth = 0, growHeight = 0;
   if (auto it = m_gameSnapshots.find(destTexture); it != m_gameSnapshots.end()) {
-    if (it->second.width >= width && it->second.height >= height)
+    // FORMAT, not only extent. One guest destination texture can be resolved
+    // into from sources of different formats over a run, and this cache
+    // returned the first snapshot ever made for it — so a later resolve out of
+    // an R16G16B16A16 HDR target copied into an R8G8B8A8 snapshot, which
+    // CopyTextureRegion rejects outright:
+    //
+    //   D3D12 ERROR [id 874]: CopyTextureRegion: The source and destination
+    //   resource formats are incompatible. The source format is
+    //   R16G16B16A16_TYPELESS and the destination format is R8G8B8A8_TYPELESS.
+    //
+    // An invalid call makes the whole command list fail to Close, and until
+    // EndFrame learned to rebuild the list that killed the renderer for the
+    // rest of the run — 4-5 SECONDS per frame, which is the 0.40 fps menu.
+    // Recovery alone does not fix it: the same copy is re-issued every frame.
+    const bool format_ok = it->second.format == format;
+    if (format_ok && it->second.width >= width && it->second.height >= height)
       return &it->second;
     ++m_rtRejectResized;
     reuseSrvIndex = it->second.srvIndex;
@@ -1535,20 +1937,16 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameSnapshot(
     growHeight = it->second.height;
     width = std::max(width, growWidth);
     height = std::max(height, growHeight);
-    growFrom = it->second.resource;
-    growFromState = it->second.state;
-    // Retire the old resource rather than releasing it here. It was referenced
-    // by the command list submitted for the previous frame and the GPU may
-    // still be reading it; a command list does not keep its resources alive.
-    // Dropping it inline made every subsequent CreateCommittedResource for that
-    // size fail — 1834 failures in one run.
-    if (it->second.resource) {
-      RetiredFrame& r =
-          (!m_retired.empty() && m_retired.back().fence == m_fenceValue)
-              ? m_retired.back()
-              : m_retired.emplace_back(RetiredFrame{m_fenceValue, {}});
-      r.res.push_back(std::move(it->second.resource));
+    if (format_ok) {
+      growFrom = it->second.resource;
+      growFromState = it->second.state;
+    } else {
+      // Nothing to carry forward across a format change — the copy that would
+      // do it is the very one that is illegal. The bands already resolved are
+      // lost for one frame and re-resolved into the new format after it.
+      ++m_snapshotFormatChanged;
     }
+    RetireResource(std::move(it->second.resource));
     m_gameSnapshots.erase(it);
   }
   if (reuseSrvIndex == UINT32_MAX &&
@@ -1567,27 +1965,19 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameSnapshot(
   // need, and nothing renders into it.
   entry.rtvIndex = 0;
 
-  D3D12_HEAP_PROPERTIES hp = {};
-  hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-  D3D12_RESOURCE_DESC rd = {};
-  rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  rd.Width = width;
-  rd.Height = height;
-  rd.DepthOrArraySize = 1;
-  rd.MipLevels = 1;
-  rd.Format = kBackBufferFormat;
-  rd.SampleDesc.Count = 1;
-  rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-  rd.Flags = D3D12_RESOURCE_FLAG_NONE;
-  if (FAILED(m_device->CreateCommittedResource(
-          &hp, D3D12_HEAP_FLAG_NONE, &rd,
-          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, nullptr,
-          IID_PPV_ARGS(&entry.resource)))) {
-    // Loudly, and without having spent a descriptor. Claiming the index before
-    // this call leaked one on every failure — silently, because this path used
-    // to return with no log — and the caller retries the same texture next
-    // frame, so it drained the heap to 1024/1024 in about twenty seconds and
-    // every snapshot after that was refused for budget.
+  // A depth resolve lands in an R32_FLOAT snapshot: CopyTextureRegion accepts
+  // it from the R32_TYPELESS depth resource because they share a typeless
+  // family, and the shader reads the depth in .x.
+  PooledSurfaceSpec snapSpec;
+  snapSpec.resourceFormat = format;
+  snapSpec.srvFormat = format;
+  if (!CreatePooledSurface(entry, width, height, snapSpec, reuseSrvIndex)) {
+    // Loudly, and without having spent a descriptor — CreatePooledSurface
+    // claims the index only after the resource exists. Claiming it before
+    // leaked one on every failure, silently, because this path used to return
+    // with no log; the caller retries the same texture next frame, so it
+    // drained the heap to 1024/1024 in about twenty seconds and every snapshot
+    // after that was refused for budget.
     ++m_snapshotCreateFailed;
     static bool s_logged = false;
     if (!s_logged) {
@@ -1600,9 +1990,6 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameSnapshot(
     }
     return nullptr;
   }
-  entry.srvIndex = reuseSrvIndex != UINT32_MAX ? reuseSrvIndex
-                                               : m_nextGameSrvDescriptor++;
-
   // Carry the old contents forward. Growing must not discard the bands already
   // resolved into this texture — the band that triggered the growth covers only
   // its own slice, so without this the rest of the image would be undefined
@@ -1640,15 +2027,6 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameSnapshot(
     m_commandList->ResourceBarrier(1, &post);
   }
 
-  D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
-  srv.Format = kBackBufferFormat;
-  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-  srv.Texture2D.MipLevels = 1;
-  auto cpu = m_gameSrvHeap->GetCPUDescriptorHandleForHeapStart();
-  cpu.ptr += SIZE_T(entry.srvIndex) * m_gameSrvDescriptorSize;
-  m_device->CreateShaderResourceView(entry.resource.Get(), &srv, cpu);
-
   auto [it, inserted] = m_gameSnapshots.emplace(destTexture, std::move(entry));
   if (!inserted) return nullptr;
   char message[192];
@@ -1663,7 +2041,9 @@ void D3D12Renderer::AddGameResolve(uint32_t destTexture, uint32_t sourceObject,
                                    int32_t destX, int32_t destY, int32_t srcX1,
                                    int32_t srcY1, int32_t srcX2,
                                    int32_t srcY2, uint32_t destWidth,
-                                   uint32_t destHeight) {
+                                   uint32_t destHeight, bool sourceIsDepth,
+                                   uint32_t sourceBase, uint32_t sourceWidth,
+                                   uint32_t sourceHeight) {
   if (!destTexture || !sourceObject) return;
   // Counted, not silent. Resolves are interleaved through the stream, so a
   // frame that overruns kMaxGameDraws loses the tail — and the tail is mostly
@@ -1676,6 +2056,10 @@ void D3D12Renderer::AddGameResolve(uint32_t destTexture, uint32_t sourceObject,
   GameDraw d;
   d.resolveDest = destTexture;
   d.resolveSource = sourceObject;
+  d.resolveSourceIsDepth = sourceIsDepth;
+  d.resolveSourceBase = sourceBase;
+  d.resolveSourceWidth = sourceWidth;
+  d.resolveSourceHeight = sourceHeight;
   d.resolveDestX = destX;
   d.resolveDestY = destY;
   d.resolveSrcX1 = srcX1;
@@ -1697,6 +2081,9 @@ void D3D12Renderer::RenderGameFrame() {
   // Composite draws take their plane descriptor blocks in order within a frame.
   m_yuvDrawsThisFrame = 0;
   ++m_gameFrame;
+  // Before anything is recorded into this slot: the copy issued the last time
+  // round is complete, and the guest is waiting on its exposure.
+  DrainLuminanceReadback();
   // This frame in flight takes its own slice of the descriptor blocks, so the
   // window resets every host frame rather than only when the guest hands off a
   // new draw list. See kTranslatedBlocksPerFrame.
@@ -1704,8 +2091,15 @@ void D3D12Renderer::RenderGameFrame() {
   m_translatedBlockLimit = m_translatedBlockNext + kTranslatedBlocksPerFrame;
   for (auto& [object, target] : m_gameRenderTargets)
     target.usedThisFrame = false;
+  for (auto& [object, target] : m_gameDepthTargets)
+    target.usedThisFrame = false;
 
+  // Which 1x1 resolve of this frame we are looking at, for the rotation in
+  // QueueLuminanceReadback.
+  uint32_t oneByOneSeen = 0;
   uint32_t boundTargetObject = 0;  // zero is the final m_gameRT.
+  // Zero means "no DSV bound", which is a distinct state from any depth object.
+  uint32_t boundDepthObject = 0;
   static const float kOffscreenClear[4] = {0, 0, 0, 0};
   std::unordered_set<uint32_t> sampledTargets;
   sampledTargets.reserve(m_gameDraws.size());
@@ -1767,13 +2161,179 @@ void D3D12Renderer::RenderGameFrame() {
       GameRenderTarget* srcEntry = nullptr;
       uint32_t srcWidth = 0, srcHeight = 0;
       D3D12_RESOURCE_STATES srcState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+      // The snapshot takes the source's format: a depth resolve has to land in
+      // R32_FLOAT, not RGBA8, for CopyTextureRegion to accept it.
+      DXGI_FORMAT snapFormat = kBackBufferFormat;
       if (auto it = m_gameRenderTargets.find(d.resolveSource);
-          it != m_gameRenderTargets.end()) {
+          !d.resolveSourceIsDepth && it != m_gameRenderTargets.end()) {
         srcEntry = &it->second;
         srcRes = srcEntry->resource.Get();
         srcWidth = srcEntry->width;
         srcHeight = srcEntry->height;
         srcState = srcEntry->state;
+        // CopyTextureRegion requires the two formats to agree, so the snapshot
+        // takes the source's -- which stopped being RGBA8 once the HDR targets
+        // got their real formats.
+        snapFormat = srcEntry->format;
+      } else if (auto dit = m_gameDepthTargets.find(d.resolveSource);
+                 dit != m_gameDepthTargets.end()) {
+        // A DEPTH resolve. The guest reads its depth buffer back as a texture
+        // to reconstruct world position in the deferred lighting pass, and
+        // Resolve names the depth surface by object exactly as it names a
+        // colour one (source slot 4). Looking only in the colour map is what
+        // made every one of these miss.
+        srcEntry = &dit->second;
+        srcRes = srcEntry->resource.Get();
+        srcWidth = srcEntry->width;
+        srcHeight = srcEntry->height;
+        srcState = srcEntry->state;
+        snapFormat = DXGI_FORMAT_R32_FLOAT;
+        ++m_depthResolves;
+      }
+      // ALIASED COLOUR SOURCE. The guest gives one EDRAM allocation several
+      // surface objects: 0x2653FDA0 is what its draws name as their target and
+      // 0x2653FF20 is what the resolve names as its source, both 129x129 at
+      // base 0x2D0 through surface descriptor 0x028000A0. Object identity
+      // cannot connect them, so the resolve found nothing, the snapshot never
+      // appeared, and every draw sampling it was discarded -- including the
+      // draws into that same target, which is a permanent deadlock: the
+      // snapshot only exists once the draw has run, and the draw only runs once
+      // the snapshot exists.
+      //
+      // Match on the EDRAM base and the extent instead, which is what actually
+      // identifies the storage. Both must agree, and the base must be non-zero,
+      // so a target at an unknown base cannot capture an unrelated resolve.
+      // Matched on the SOURCE's own extent, not the destination texture's: a
+      // 640x360 source whose destination extent could not be decoded reads as
+      // 0x0 and matched nothing, which left 0x22414860 losing 20 resolves a
+      // window after the 129x129 pair was already fixed.
+      //
+      // Two passes, exact before containment. Exact is the 129x129 and 640x360
+      // pairs -- one allocation named twice at one size. Containment is the
+      // MULTISAMPLE case: 0x21DFCA60 is 640x360 with 4x MSAA in its surface
+      // word (0x0A020280) and 0x2123C9BC is 640x720 at 1x (0x0A000280), both at
+      // base 0x2D0 pitch 640, and only the 640x720 is ever drawn into -- which
+      // the colour-pool dump confirmed. We render everything at 1x, so the
+      // samples the guest would resolve down are not there to resolve; taking
+      // the top 640x360 rows of the surface that IS drawn is the closest thing
+      // we hold. PROVISIONAL: this is the one step here not established from
+      // evidence, so it is counted separately and judged on the picture. If the
+      // luminance it produces looks wrong, the row mapping is what to revisit.
+      if (!srcRes && !d.resolveSourceIsDepth && d.resolveSourceBase &&
+          d.resolveSourceWidth && d.resolveSourceHeight) {
+        GameRenderTarget* exact = nullptr;
+        GameRenderTarget* contains = nullptr;
+        for (auto& [obj, t] : m_gameRenderTargets) {
+          if (!t.resource || t.edramBase != d.resolveSourceBase ||
+              t.width != d.resolveSourceWidth)
+            continue;
+          if (t.height == d.resolveSourceHeight) {
+            exact = &t;
+            break;
+          }
+          if (t.height > d.resolveSourceHeight && t.everDrawn &&
+              (!contains || t.height < contains->height))
+            contains = &t;
+        }
+        if (GameRenderTarget* hit = exact ? exact : contains) {
+          srcEntry = hit;
+          srcRes = hit->resource.Get();
+          srcWidth = d.resolveSourceWidth;
+          srcHeight = d.resolveSourceHeight;
+          srcState = hit->state;
+          snapFormat = hit->format;
+          if (exact)
+            ++m_aliasedSourceResolves;
+          else
+            ++m_containedSourceResolves;
+        }
+      }
+      // A BANDED depth resolve, which no object-identity lookup can satisfy.
+      // The shadow pass renders 768x1024 as two EDRAM bands -- 768x640 at base
+      // 0x580 and 768x384 at base 0x710 -- and then resolves the whole image
+      // through a THIRD surface object that aliases band 0's base and that no
+      // draw ever binds. Measured: both bands are in the depth pool and drawn,
+      // and the object the resolve names (0x214C5130) is in neither.
+      //
+      // Stitch them by EDRAM base, which is the only thing that says which band
+      // is on top. The bands must start at the resolve's own base and their
+      // heights must add up to the destination exactly; anything else is not a
+      // banding of this surface and is left to fail as before rather than
+      // assembled on a guess.
+      if (!srcRes && d.resolveSourceIsDepth && d.resolveDestWidth &&
+          d.resolveDestHeight) {
+        std::vector<GameRenderTarget*> bands;
+        for (auto& [obj, t] : m_gameDepthTargets) {
+          if (t.resource && t.width == d.resolveDestWidth &&
+              t.edramBase >= d.resolveSourceBase)
+            bands.push_back(&t);
+        }
+        std::sort(bands.begin(), bands.end(),
+                  [](const GameRenderTarget* a, const GameRenderTarget* b) {
+                    return a->edramBase < b->edramBase;
+                  });
+        uint32_t total = 0;
+        for (const GameRenderTarget* b : bands) total += b->height;
+        if (bands.size() >= 2 && total == d.resolveDestHeight &&
+            bands.front()->edramBase == d.resolveSourceBase) {
+          GameRenderTarget* snap =
+              EnsureGameSnapshot(d.resolveDest, d.resolveDestWidth,
+                                 d.resolveDestHeight, DXGI_FORMAT_R32_FLOAT);
+          if (snap) {
+            D3D12_RESOURCE_BARRIER toDest = {};
+            toDest.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            toDest.Transition.pResource = snap->resource.Get();
+            toDest.Transition.StateBefore = snap->state;
+            toDest.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            toDest.Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            m_commandList->ResourceBarrier(1, &toDest);
+            uint32_t dstY = 0;
+            for (GameRenderTarget* b : bands) {
+              D3D12_RESOURCE_BARRIER toSrc = {};
+              toSrc.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+              toSrc.Transition.pResource = b->resource.Get();
+              toSrc.Transition.StateBefore = b->state;
+              toSrc.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+              toSrc.Transition.Subresource =
+                  D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+              m_commandList->ResourceBarrier(1, &toSrc);
+              D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+              dstLoc.pResource = snap->resource.Get();
+              dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+              dstLoc.SubresourceIndex = 0;
+              D3D12_TEXTURE_COPY_LOCATION srcLoc = dstLoc;
+              srcLoc.pResource = b->resource.Get();
+              D3D12_BOX box = {};
+              box.right = b->width;
+              box.bottom = b->height;
+              box.back = 1;
+              m_commandList->CopyTextureRegion(&dstLoc, 0, dstY, 0, &srcLoc,
+                                               &box);
+              dstY += b->height;
+              // Straight back to DEPTH_WRITE: the next frame's shadow pass
+              // renders into these again, and that is the state it expects.
+              D3D12_RESOURCE_BARRIER back = toSrc;
+              back.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+              back.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+              m_commandList->ResourceBarrier(1, &back);
+              b->state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            }
+            D3D12_RESOURCE_BARRIER toSrv = toDest;
+            toSrv.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            toSrv.Transition.StateAfter =
+                D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            m_commandList->ResourceBarrier(1, &toSrv);
+            snap->state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            snap->everDrawn = true;
+            snap->stale = false;
+            snap->lastCopyFrame = m_gameFrame;
+            ++m_snapshotCopies;
+            ++m_depthResolves;
+            ++m_depthBandResolves;
+            continue;
+          }
+        }
       }
       if (!srcRes) {
         // The source has no offscreen surface — it was refused one (budget or a
@@ -1850,7 +2410,8 @@ void D3D12Renderer::RenderGameFrame() {
       // could not decode behaves exactly as before rather than shrinking.
       const uint32_t snapW = std::max(d.resolveDestWidth, dx + copyW);
       const uint32_t snapH = std::max(d.resolveDestHeight, dy + copyH);
-      GameRenderTarget* snap = EnsureGameSnapshot(d.resolveDest, snapW, snapH);
+      GameRenderTarget* snap =
+          EnsureGameSnapshot(d.resolveDest, snapW, snapH, snapFormat);
       if (!snap) continue;
       D3D12_RESOURCE_BARRIER pre[2] = {};
       pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -1909,6 +2470,13 @@ void D3D12Renderer::RenderGameFrame() {
       // keeps that from being skipped because boundTargetObject still matches.
       boundTargetObject = 0xFFFFFFFFu;
       ++m_snapshotCopies;
+      // The guest LOADS the 1x1 exposure result out of guest memory instead of
+      // sampling it, so this one destination has to travel back to the CPU.
+      // See DrainLuminanceReadback and mx::hle::g_luminanceReadbackBits.
+      if (snapW == 1 && snapH == 1 &&
+          (oneByOneSeen++ % kMaxLuminanceSlots) ==
+              (m_gameFrame % kMaxLuminanceSlots))
+        QueueLuminanceReadback(snap, d.resolveDest);
       continue;
     }
     // Keep only the unsampled final 1280x720 surface on m_gameRT so
@@ -1917,6 +2485,8 @@ void D3D12Renderer::RenderGameFrame() {
     // classifying solely by dimensions made that target alias m_gameRT and
     // left the final draw with nothing it could legally sample.
     GameRenderTarget* drawTarget = nullptr;
+    // Declared out here because the depth-state decision below needs it.
+    GameRenderTarget* depthTarget = nullptr;
     const bool feedsLaterDraw =
         d.targetObject && sampledTargets.contains(d.targetObject);
     // A resolve source needs storage that outlives the frame. Measured: of 33
@@ -1943,18 +2513,42 @@ void D3D12Renderer::RenderGameFrame() {
     // off and the stall still present.
     const bool isResolveSource =
         d.targetObject && resolveSources.contains(d.targetObject);
+    // A DEPTH-ONLY pass has no colour target at all -- the shadow map is
+    // 768x1024 with "colour target now 0x00000000" -- so d.targetObject is 0
+    // and every one of its draws fell through to the main render target. Two
+    // consequences, both measured: the shadow geometry overpainted the
+    // backbuffer, and the depth surface (0x213DCC30) was never created, so the
+    // guest's depth resolve out of it found no source. That missing snapshot
+    // then discarded every draw sampling the shadow map at s15 -- 396 of them,
+    // which is the whole 320x180 luminance pass, which is why the exposure
+    // divides by zero.
+    //
+    // Route it like any other offscreen pass, keyed by the DEPTH object, with a
+    // scratch colour target at the same extent. The scratch target is not
+    // wasted: every PSO declares NumRenderTargets = 1, so binding no RTV at all
+    // would be invalid work against a pipeline that expects one.
+    const bool depthOnlyPass =
+        !d.targetObject && d.depthObject && d.depthWidth && d.depthHeight;
+    const uint32_t targetObject = depthOnlyPass ? d.depthObject : d.targetObject;
+    const uint32_t targetWidth = depthOnlyPass ? d.depthWidth : d.targetWidth;
+    const uint32_t targetHeight = depthOnlyPass ? d.depthHeight : d.targetHeight;
     const bool wantsOffscreen =
-        d.targetObject && d.targetWidth && d.targetHeight &&
-        (feedsLaterDraw || isResolveSource ||
-         d.targetWidth != 1280 || d.targetHeight != 720);
+        targetObject && targetWidth && targetHeight &&
+        (depthOnlyPass || feedsLaterDraw || isResolveSource ||
+         targetWidth != 1280 || targetHeight != 720);
     if (wantsOffscreen) {
-      drawTarget = EnsureGameRenderTarget(d.targetObject, d.targetWidth,
-                                          d.targetHeight);
+      // A depth-only pass has no colour format of its own; its scratch target
+      // is never sampled, so RGBA8 is as good as anything.
+      drawTarget = EnsureGameRenderTarget(
+          targetObject, targetWidth, targetHeight, d.targetBase,
+          depthOnlyPass ? kBackBufferFormat
+                        : HostColorFormat(d.targetColorFormat));
       // The last guest-backbuffer-sized target drawn into this frame is the
       // finished scene, and what present should show. Tracked by last write
       // rather than by object identity because which surface ends up on screen
       // is a property of draw order, not of any particular target.
-      if (drawTarget && d.targetWidth == 1280 && d.targetHeight == 720) {
+      if (drawTarget && !depthOnlyPass && d.targetWidth == 1280 &&
+          d.targetHeight == 720) {
         m_presentSourceObject = d.targetObject;
         // Present shows the LAST guest-backbuffer-sized surface written this
         // frame. That is only correct if there is exactly one. Seven 1280x720
@@ -1987,10 +2581,73 @@ void D3D12Renderer::RenderGameFrame() {
         m_commandList->ResourceBarrier(1, &barrier);
         drawTarget->state = D3D12_RESOURCE_STATE_RENDER_TARGET;
       }
-      if (boundTargetObject != d.targetObject) {
+      // Depth for this offscreen target, at the target's own extent. The guest
+      // pairs one depth surface with a colour target of the same size, and
+      // sizing to the colour target is what keeps the DSV and RTV agreeing when
+      // the guest's own depth extent is unreadable.
+      // Sized from the DEPTH surface's own declared extent, never from the
+      // colour target's.
+      //
+      // Sizing it from the colour target collapsed the frame -- 2664 offscreen
+      // draws fell to 133, resolve copies rose from 1750 to 30166 with hits
+      // falling to 19 -- because the same depth object then demanded two
+      // different sizes and was retired and recreated on every alternation. It
+      // demands two sizes because DeviceState is thread_local: a draw carries
+      // whatever depth surface ITS thread last saw, which is not always the one
+      // paired with the colour target it is drawing into.
+      //
+      // The guest itself pairs one depth surface per colour target at matching
+      // extents, including a separate depth object for each EDRAM band
+      // (1280x640 and 1280x80 have their own, distinct from the 1280x720). So
+      // each depth object has exactly one size and this never resizes.
+      //
+      // Binding only on an exact extent match keeps that guarantee honest: a
+      // stale pairing skips depth for that draw rather than binding a DSV whose
+      // size disagrees with the RTV.
+      // TEMPORARILY ENABLED for a RenderDoc capture of the collapsed frame.
+      //
+      // Sized from the depth surface's OWN extent, which removed the resize
+      // churn entirely (resized 13 -> 0) and let 3423 depth resolves run from 4
+      // surfaces, with 0x2123C208 leaving the missing-source offenders. The
+      // frame still collapses to ~125 offscreen draws and ~20 translated,
+      // identically to the first attempt -- so neither the churn nor depth
+      // testing is the cause, and routing (which precedes all depth state) is
+      // what falls. The capture is to find what stops being submitted.
+      depthTarget = (d.depthObject && d.depthWidth == drawTarget->width &&
+                     d.depthHeight == drawTarget->height)
+                        ? EnsureGameDepthTarget(d.depthObject, d.depthWidth,
+                                                d.depthHeight, d.depthBase)
+                        : nullptr;
+      if (depthTarget && depthTarget->state !=
+                             D3D12_RESOURCE_STATE_DEPTH_WRITE) {
+        D3D12_RESOURCE_BARRIER toDepth = {};
+        toDepth.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        toDepth.Transition.pResource = depthTarget->resource.Get();
+        toDepth.Transition.StateBefore = depthTarget->state;
+        toDepth.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        toDepth.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        m_commandList->ResourceBarrier(1, &toDepth);
+        depthTarget->state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+      }
+      // The DEPTH binding is part of what makes this pair current, not just the
+      // colour target. Gating the rebind on the colour object alone let two
+      // consecutive draws onto the same colour target keep the first one's
+      // depth binding -- including the case where the first bound no DSV at all
+      // and the second runs a depth-enabled PSO against it, which is invalid
+      // work and hangs the device (DXGI_ERROR_DEVICE_HUNG at ~frame 75).
+      const uint32_t wantDepthObject = depthTarget ? d.depthObject : 0;
+      if (boundTargetObject != targetObject ||
+          boundDepthObject != wantDepthObject) {
         auto rtv = m_gameRtvHeap->GetCPUDescriptorHandleForHeapStart();
         rtv.ptr += SIZE_T(drawTarget->rtvIndex) * m_gameRtvDescriptorSize;
-        m_commandList->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv = {};
+        if (depthTarget) {
+          dsv = m_gameDepthDsvHeap->GetCPUDescriptorHandleForHeapStart();
+          dsv.ptr += SIZE_T(depthTarget->rtvIndex) * m_gameDsvDescriptorSize;
+        }
+        m_commandList->OMSetRenderTargets(1, &rtv, FALSE,
+                                          depthTarget ? &dsv : nullptr);
+        boundDepthObject = wantDepthObject;
         D3D12_VIEWPORT viewport = {};
         viewport.Width = float(drawTarget->width);
         viewport.Height = float(drawTarget->height);
@@ -2000,7 +2657,7 @@ void D3D12Renderer::RenderGameFrame() {
                               LONG(drawTarget->height)};
         m_commandList->RSSetViewports(1, &viewport);
         m_commandList->RSSetScissorRects(1, &scissor);
-        boundTargetObject = d.targetObject;
+        boundTargetObject = targetObject;
       }
       if (!drawTarget->usedThisFrame) {
         auto rtv = m_gameRtvHeap->GetCPUDescriptorHandleForHeapStart();
@@ -2008,6 +2665,18 @@ void D3D12Renderer::RenderGameFrame() {
         m_commandList->ClearRenderTargetView(rtv, kOffscreenClear, 0, nullptr);
         drawTarget->usedThisFrame = true;
         drawTarget->everDrawn = true;
+      }
+      // Depth is cleared on its own schedule: one depth surface serves several
+      // colour targets in a pass, so clearing it with each of them would wipe
+      // what the previous target established.
+      if (depthTarget && !depthTarget->usedThisFrame) {
+        D3D12_CPU_DESCRIPTOR_HANDLE dsv =
+            m_gameDepthDsvHeap->GetCPUDescriptorHandleForHeapStart();
+        dsv.ptr += SIZE_T(depthTarget->rtvIndex) * m_gameDsvDescriptorSize;
+        m_commandList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f,
+                                             0, 0, nullptr);
+        depthTarget->usedThisFrame = true;
+        depthTarget->everDrawn = true;
       }
     } else if (boundTargetObject != 0) {
       auto rtv = m_gameRtvHeap->GetCPUDescriptorHandleForHeapStart();
@@ -2017,6 +2686,9 @@ void D3D12Renderer::RenderGameFrame() {
       m_commandList->RSSetViewports(1, &m_viewport);
       m_commandList->RSSetScissorRects(1, &m_scissorRect);
       boundTargetObject = 0;
+      // The main target binds m_gameDepth, which is not one of the per-object
+      // depth surfaces, so the offscreen path must treat this as "not mine".
+      boundDepthObject = 0;
     }
 
     uint32_t textureDescriptor = 0;
@@ -2047,9 +2719,25 @@ void D3D12Renderer::RenderGameFrame() {
       // the fabricated-colour gate below drop the draw, which shows what is
       // underneath: incomplete, but not a previous frame painted over the
       // current one.
+      // A DEPTH snapshot is not a colour source. The tex*col stand-in has one
+      // texture and multiplies it by the vertex colour, so binding an
+      // R32_FLOAT depth image gives (depth, 0, 0, 1) * white -- a flat red
+      // sheet over the frame, which is exactly what appeared over the menu the
+      // first time depth resolves started succeeding. Whatever the guest's real
+      // shader does with depth, the stand-in cannot express it; falling through
+      // leaves the draw to the fabricated-colour gate, which shows what is
+      // underneath instead of painting depth over it.
+      const bool depthSnapshot =
+          [&] {
+            auto s = m_gameSnapshots.find(d.sampledTextureObject);
+            return s != m_gameSnapshots.end() && s->second.resource &&
+                   s->second.resource->GetDesc().Format ==
+                       DXGI_FORMAT_R32_FLOAT;
+          }();
+      if (depthSnapshot) ++m_standInDepthSnapshotRefused;
       if (auto snap = m_gameSnapshots.find(d.sampledTextureObject);
-          d.sampledTextureObject && snap != m_gameSnapshots.end() &&
-          !snap->second.stale) {
+          d.sampledTextureObject && !depthSnapshot &&
+          snap != m_gameSnapshots.end() && !snap->second.stale) {
         sampledPtr = &snap->second;
         ++m_snapshotHits;
         if (snap->second.width * 2 >= m_width) {
@@ -2060,8 +2748,13 @@ void D3D12Renderer::RenderGameFrame() {
                           : age < 100 ? 3
                                       : 4];
         }
-      } else if (d.sampledTextureObject &&
+      } else if (d.sampledTextureObject && !depthSnapshot &&
                  m_gameSnapshots.count(d.sampledTextureObject)) {
+        // Not counted for a depth snapshot: that refusal has its own counter
+        // and is deliberate, whereas STALE-REFUSED means a resolve was dropped
+        // and the image is a known-wrong earlier frame. Letting the depth
+        // refusals fall through here made both read 233 and made a healthy
+        // number look like 233 lost refreshes.
         ++m_snapshotStaleRefused;
       } else if (d.sampledTargetObject != d.targetObject) {
         if (auto it = m_gameRenderTargets.find(d.sampledTargetObject);
@@ -2139,20 +2832,48 @@ void D3D12Renderer::RenderGameFrame() {
     // Skipping shows what is underneath: incomplete, but honest. A steady count
     // is a real upstream defect (a dropped resolve, a rejected texture format),
     // and this only stops that defect from being painted over everything.
-    if (d.colorSource ==
-            uint8_t(mx::hle::DrawCall::ColorSource::kNone) && !textured) {
-      ++m_sampleMissSkipped;
-      continue;
-    }
+    // Decided here, applied below once it is known whether the guest's own
+    // shader will run. `textured` describes only d.texture, the ONE texture the
+    // stand-in samples; a translated draw carries its textures in
+    // pixelTextures and binds them itself, so this says nothing about it.
+    //
+    // Applying the skip here cost the menu its whole post-processing chain.
+    // Measured on mx_806: every skipped draw was translated -- 76 aimed at the
+    // 320x180 luminance target, 74 at each of two bloom targets, 247 at the
+    // scene. That left the luminance target cleared and never drawn into, so
+    // the guest measured an average scene luminance of zero, computed its
+    // auto-exposure as key/0 = +Infinity, and the composite turned the frame
+    // to NaN. The white menu backdrop was this gate.
+    //
+    // A depth-only pass is exempt. Its draws have no colour source and no
+    // texture BY DESIGN -- that is what a shadow-map pass is -- and their
+    // colour output goes to a scratch target nothing samples. Skipping them
+    // would leave the depth surface empty, which is the whole thing this pass
+    // exists to fill.
+    const bool fabricatedWhite =
+        !depthOnlyPass &&
+        d.colorSource == uint8_t(mx::hle::DrawCall::ColorSource::kNone) &&
+        !textured;
 
     // Depth state is decided the same way for both paths, so it is computed
     // before the split rather than duplicated inside it.
-    const bool tDepthEnable = !drawTarget && d.depthEnable;
+    // Offscreen draws used to force depth off because they had no attachment.
+    // They can have one now, so the guest's own depth state is honoured on both
+    // paths; a draw whose depth surface could not be created still falls back
+    // to no depth rather than binding a DSV that does not exist.
+    const bool tDepthEnable =
+        (drawTarget ? depthTarget != nullptr : true) && d.depthEnable;
     const bool tDepthWrite = tDepthEnable && d.depthWrite;
 
     // Run the guest's own pixel shader, when this draw has everything it needs:
     // a translated shader, its interpolators, and its constant bank. Anything
     // missing keeps the tex*col stand-in rather than rendering a guess.
+    // The group every pipeline for this draw must declare. Computed once, above
+    // the split, so the translated and stand-in paths cannot disagree about it —
+    // they already did about nothing else, and a disagreement here is invisible
+    // except as a draw that does not appear.
+    const D3D12_PRIMITIVE_TOPOLOGY_TYPE topoType = TopologyTypeOf(d.topology);
+
     ID3D12PipelineState* translatedPso = nullptr;
     if (d.translated) {
       TranslatedKey key;
@@ -2161,6 +2882,8 @@ void D3D12Renderer::RenderGameFrame() {
       key.src = d.srcBlend;
       key.dest = d.destBlend;
       key.op = d.blendOp;
+      key.rtvFormat = drawTarget ? drawTarget->format : kBackBufferFormat;
+      key.topoType = topoType;
       key.flags = uint8_t((tDepthEnable ? 1u : 0u) |
                           (tDepthWrite ? 2u : 0u) |
                           (d.colorWrite ? 0u : 4u) |
@@ -2173,6 +2896,13 @@ void D3D12Renderer::RenderGameFrame() {
     D3D12_GPU_DESCRIPTOR_HANDLE translatedSrvTable = {};
     if (translatedPso && !BindTranslatedTextures(d, translatedSrvTable))
       translatedPso = nullptr;
+    // Now that the translated path has had its chance, a draw still heading for
+    // the untextured stand-in with an invented colour is the fabricated white
+    // the guard was written for. See the note beside fabricatedWhite.
+    if (!translatedPso && fabricatedWhite) {
+      ++m_sampleMissSkipped;
+      continue;
+    }
     if (translatedPso) {
       m_commandList->SetGraphicsRootSignature(m_translatedRootSig.Get());
       // The block heap is a different heap from the stand-in path's, so it has
@@ -2244,11 +2974,15 @@ void D3D12Renderer::RenderGameFrame() {
     // A blended draw takes a pipeline built for its exact blend state; anything
     // that cannot be translated falls back to the opaque one it used before.
     ID3D12PipelineState* pipeline = nullptr;
+    // The pipeline must declare the format of the target it writes. Offscreen
+    // targets are no longer all RGBA8.
+    const DXGI_FORMAT rtvFormat =
+        drawTarget ? drawTarget->format : kBackBufferFormat;
     if (d.blendEnable) {
       pipeline = BlendedPSO(BlendKey{pso_index, d.srcBlend, d.destBlend,
-                                     d.blendOp});
+                                     d.blendOp, rtvFormat, topoType});
     }
-    if (!pipeline) pipeline = m_gamePSOs[pso_index].Get();
+    if (!pipeline) pipeline = OpaquePSO(pso_index, rtvFormat, topoType);
     m_commandList->SetPipelineState(pipeline);
     // Each translated draw brings its own transform; a draw whose cb failed to
     // allocate falls back to the identity matrix rather than being dropped.
@@ -2348,7 +3082,10 @@ void D3D12Renderer::RenderGameFrame() {
     std::snprintf(message, sizeof(message),
                   "resolve snapshots: copies %llu, hits %llu, FALLBACKS %llu, "
                   "source-not-offscreen %llu, WHITE-SKIPPED %llu, "
-                  "BLANK-SOURCE %llu, STALE-REFUSED %llu; live snapshots %u",
+                  "BLANK-SOURCE %llu, STALE-REFUSED %llu; live snapshots %u, "
+                  "DEPTH resolves %llu (%llu band-stitched) from %zu depth "
+                  "surfaces, stand-in depth refused %llu, "
+                  "aliased-source matches %llu (+%llu contained)",
                   static_cast<unsigned long long>(m_snapshotCopies),
                   static_cast<unsigned long long>(m_snapshotHits),
                   static_cast<unsigned long long>(m_snapshotFallbacks),
@@ -2356,7 +3093,14 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_sampleMissSkipped),
                   static_cast<unsigned long long>(m_snapshotBlankSource),
                   static_cast<unsigned long long>(m_snapshotStaleRefused),
-                  uint32_t(m_gameSnapshots.size()));
+                  uint32_t(m_gameSnapshots.size()),
+                  static_cast<unsigned long long>(m_depthResolves),
+                  static_cast<unsigned long long>(m_depthBandResolves),
+                  m_gameDepthTargets.size(),
+                  static_cast<unsigned long long>(
+                      m_standInDepthSnapshotRefused),
+                  static_cast<unsigned long long>(m_aliasedSourceResolves),
+                  static_cast<unsigned long long>(m_containedSourceResolves));
     LogInfo(message);
     // The worst offenders behind source-not-offscreen, with their status read
     // NOW rather than at first sighting. Sorted by how many resolves each one
@@ -2493,7 +3237,11 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  const uint32_t* pixelSampledObjects,
                                  const GpuVertexStage* vertexStage,
                                  uint32_t pixelSamplerArrayMask,
-                                 const uint8_t* pixelSamplerSigns) {
+                                 const uint8_t* pixelSamplerSigns,
+                                 uint32_t depthObject, uint32_t depthWidth,
+                                 uint32_t depthHeight, uint32_t depthBase,
+                                 uint32_t targetBase,
+                                 uint32_t targetColorFormat) {
   // PERF(per-frame-allocs): this creates three ID3D12Resource's per call (VB +
   // IB + CB) on the UPLOAD heap, and is called once per submitted draw rather
   // than once per frame, so the allocation rate scales with the draw count —
@@ -2573,6 +3321,12 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   if (pixelSamplerSigns)
     std::memcpy(d.pixelSamplerSigns.data(), pixelSamplerSigns,
                 d.pixelSamplerSigns.size());
+  d.depthObject = depthObject;
+  d.depthWidth = depthWidth;
+  d.depthHeight = depthHeight;
+  d.depthBase = depthBase;
+  d.targetBase = targetBase;
+  d.targetColorFormat = targetColorFormat;
   if (pixelTextures && pixelSampledObjects) {
     for (uint32_t i = 0; i < kTranslatedSamplerSlots; ++i) {
       d.pixelTextures[i] = pixelTextures[i];
@@ -2891,6 +3645,20 @@ bool D3D12Renderer::CreateGameRenderTargets() {
     }
     m_device->CreateDepthStencilView(m_gameDepth.Get(), nullptr,
         m_gameDsvHeap->GetCPUDescriptorHandleForHeapStart());
+  }
+
+  // Depth for OFFSCREEN targets, one surface per guest depth object. The main
+  // target keeps m_gameDepth above; only offscreen draws, which previously had
+  // no depth attachment at all, are served from this heap.
+  {
+    D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+    hd.NumDescriptors = kMaxGameDepthTargets + 1;
+    if (FAILED(m_device->CreateDescriptorHeap(
+            &hd, IID_PPV_ARGS(&m_gameDepthDsvHeap))))
+      return false;
+    m_gameDsvDescriptorSize = m_device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
   }
 
   LogInfo("CreateGameRT: done");

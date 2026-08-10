@@ -1529,6 +1529,14 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     dc.surface_base = rt.color_info & 0xFFFu;
     dc.surface_pitch = rt.surface_info & 0x3FFFu;
   }
+  // The depth surface bound alongside it. Recorded even when the colour target
+  // is not, because the two are independent bindings on the guest.
+  if (st.depth_stencil.valid) {
+    dc.depth_target_object = st.depth_stencil.object;
+    dc.depth_target_width = st.depth_stencil.width;
+    dc.depth_target_height = st.depth_stencil.height;
+    dc.depth_target_base = st.depth_stencil.color_info & 0xFFFu;
+  }
   ProbePixelProfileForDraw(st.ps_seen ? st.pixel_shader : 0, device, base, dc);
   // The Bink composite needs its whole plane set, so it takes its own path
   // rather than competing in the single-winner binding contest.
@@ -7328,6 +7336,10 @@ extern "C" REX_FUNC(sub_8255CE98) {
       PendingHleDraw pending{};
       pending.draw.resolve_dest_texture = dest_texture;
       pending.draw.resolve_source_object = source->object;
+      pending.draw.resolve_source_is_depth = (source_slot == 4);
+      pending.draw.resolve_source_base = source->color_info & 0xFFFu;
+      pending.draw.resolve_source_width = source->width;
+      pending.draw.resolve_source_height = source->height;
       pending.draw.resolve_dest_width = dest_extent_width;
       pending.draw.resolve_dest_height = dest_extent_height;
       // Without an explicit destination point, the source rectangle's origin is

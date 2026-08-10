@@ -108,6 +108,13 @@ void ExpandRectStream(std::vector<uint8_t>& stream, uint32_t stride,
 
 }  // namespace
 
+// See the note beside the declaration: the renderer writes these, the D3D9
+// layer reads them, and neither can do the other's half of the job.
+std::mutex g_luminanceReadbackMutex;
+LuminanceReadback g_luminanceReadbacks[kMaxLuminanceReadbacks];
+uint32_t g_luminanceReadbackCount = 0;
+std::atomic<uint32_t> g_luminanceReadbackSeq{0};
+
 uint32_t ExpandRectangleList(DrawCall& dc) {
   const uint32_t stride = dc.vertex_stride;
   if (stride < 12 || dc.vertices.size() < size_t(dc.vertex_count) * stride)
