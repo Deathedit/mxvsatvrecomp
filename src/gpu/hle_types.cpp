@@ -1,5 +1,7 @@
 #include "gpu/hle_types.h"
 
+#include "gpu/shader_hlsl.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -57,6 +59,55 @@ HostTopology MapTopology(uint32_t prim_type) {
   }
 }
 
+namespace {
+
+// Expand a PER-VERTEX byte array the same way ExpandRectangleList expands the
+// vertex buffer: three supplied vertices per rect, plus a synthesized fourth
+// at v1 + v2 - v0.
+//
+// This exists because the vertex buffer was not the only per-vertex stream.
+// The GPU vertex stage's input registers (dc.vertex_inputs) and the CPU path's
+// interpolator stream (dc.interpolators) are both built BEFORE topology
+// finalisation, sized to the incoming vertex_count of 3 -- so after expansion
+// the index buffer referenced a fourth vertex whose registers did not exist.
+// The vertex stage read zeros, the position came out (0,0,0,0), and the second
+// triangle of every rectangle collapsed to a point at the screen centre.
+//
+// Measured in capture-ask.rdc at the 320x180 luminance pass: post-transform
+// v3 = (0,0) where it should be (1,-1), and the target was covered by a single
+// triangle with its bottom-right corner missing. Every full-screen post pass in
+// this game is a RECTLIST, so each reduction stage lost half its area and the
+// chain drove the average luminance toward zero.
+//
+// Every register here is affine across the rectangle -- position, colour, UV
+// and any other interpolant alike -- so the same v1 + v2 - v0 rule that gives
+// the fourth corner gives the fourth vertex's registers.
+void ExpandRectStream(std::vector<uint8_t>& stream, uint32_t stride,
+                      uint32_t rects) {
+  if (stream.empty() || !stride) return;
+  if (stream.size() < size_t(rects) * 3 * stride) return;
+  std::vector<uint8_t> out;
+  out.resize(size_t(rects) * 4 * stride);
+  const uint32_t floats = stride / 4;
+  for (uint32_t r = 0; r < rects; ++r) {
+    const uint8_t* src = stream.data() + size_t(r) * 3 * stride;
+    uint8_t* dst = out.data() + size_t(r) * 4 * stride;
+    std::memcpy(dst, src, size_t(3) * stride);
+    uint8_t* v3 = dst + size_t(3) * stride;
+    for (uint32_t c = 0; c < floats; ++c) {
+      float p0, p1, p2;
+      std::memcpy(&p0, src + c * 4, 4);
+      std::memcpy(&p1, src + stride + c * 4, 4);
+      std::memcpy(&p2, src + size_t(2) * stride + c * 4, 4);
+      const float p3 = p1 + p2 - p0;
+      std::memcpy(v3 + c * 4, &p3, 4);
+    }
+  }
+  stream = std::move(out);
+}
+
+}  // namespace
+
 uint32_t ExpandRectangleList(DrawCall& dc) {
   const uint32_t stride = dc.vertex_stride;
   if (stride < 12 || dc.vertices.size() < size_t(dc.vertex_count) * stride)
@@ -111,6 +162,12 @@ uint32_t ExpandRectangleList(DrawCall& dc) {
     const uint32_t order[6] = {0, 1, 2, 2, 1, 3};
     for (uint32_t i = 0; i < 6; ++i) idx.push_back(base + order[i]);
   }
+
+  // The other per-vertex streams have to grow with it. See ExpandRectStream.
+  ExpandRectStream(dc.vertex_inputs, dc.vertex_input_count * 16u, rects);
+  ExpandRectStream(dc.interpolators,
+                   kHlslInterpolatorLinkage * 4u * uint32_t(sizeof(float)),
+                   rects);
 
   dc.vertices = std::move(verts);
   dc.vertex_count = rects * 4;
