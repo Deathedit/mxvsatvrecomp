@@ -1,6 +1,7 @@
 #include "gpu/d3d9_draw.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -63,7 +64,46 @@ bool CopyVertex(const HleStream& s, uint32_t index, uint8_t* dst,
   return true;
 }
 
+// POSITION 0 is required; COLOR 0 and TEXCOORD 0 are optional and are dropped
+// rather than fatal when their stream is unusable. Shared by BuildHleDraw and
+// the deferred transcode so the two cannot resolve a declaration differently.
+bool ResolveTranscodeElements(const HleDrawInputs& in,
+                              const HleInputElement*& pos,
+                              const HleInputElement*& col,
+                              const HleInputElement*& tex, HleSkip& skip) {
+  skip = HleSkip::kNone;
+  pos = col = tex = nullptr;
+  if (!in.layout || in.layout->elements.empty()) {
+    skip = HleSkip::kNoLayout;
+    return false;
+  }
+  pos = FindUsage(*in.layout, kUsagePosition, 0);
+  if (!pos) {
+    skip = HleSkip::kNoPosition;
+    return false;
+  }
+  col = FindUsage(*in.layout, kUsageColor, 0);
+  tex = FindUsage(*in.layout, kUsageTexcoord, 0);
+
+  auto stream_ok = [&](const HleInputElement* e) -> HleSkip {
+    if (!e) return HleSkip::kNone;
+    if (e->stream >= kMaxStreams) return HleSkip::kStreamUnbound;
+    const HleStream& s = in.streams[e->stream];
+    if (!s.bound || !s.host) return HleSkip::kStreamUnbound;
+    if (s.stride == 0) return HleSkip::kZeroStride;
+    return HleSkip::kNone;
+  };
+  if ((skip = stream_ok(pos)) != HleSkip::kNone) return false;
+  if (stream_ok(col) != HleSkip::kNone) col = nullptr;
+  if (stream_ok(tex) != HleSkip::kNone) tex = nullptr;
+  skip = HleSkip::kNone;
+  return true;
+}
+
 }  // namespace
+
+uint64_t g_transcodeUs = 0;
+uint64_t g_transcodeVerts = 0;
 
 bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
   out = DrawCall{};
@@ -97,39 +137,14 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
   // fallback — this is the single biggest difference from the PM4 path, where
   // PickPositionAttribute has to trace the microcode to the position export and
   // guesses when that fails.
-  const HleInputElement* pos = FindUsage(*in.layout, kUsagePosition, 0);
-  if (!pos) {
-    skip = HleSkip::kNoPosition;
-    return false;
-  }
-  // Colour is optional: a declaration without one seeds the modulation identity
-  // (see the seed below — it is a factor, not a colour), and it is recorded so
-  // a screenshot can be read against the count.
-  const HleInputElement* col = FindUsage(*in.layout, kUsageColor, 0);
-  // Likewise the first texcoord set. Optional for the same reason, and it
-  // defaults to (0,0) — but only untextured draws should ever see that default.
-  // This used to be hardcoded to (0,0) for every vertex of every draw, so every
-  // textured draw sampled one corner texel and came out a flat colour.
-  const HleInputElement* tex = FindUsage(*in.layout, kUsageTexcoord, 0);
-
-  auto stream_ok = [&](const HleInputElement* e) -> HleSkip {
-    if (!e) return HleSkip::kNone;
-    if (e->stream >= kMaxStreams) return HleSkip::kStreamUnbound;
-    const HleStream& s = in.streams[e->stream];
-    if (!s.bound || !s.host) return HleSkip::kStreamUnbound;
-    if (s.stride == 0) return HleSkip::kZeroStride;
-    return HleSkip::kNone;
-  };
-  if ((skip = stream_ok(pos)) != HleSkip::kNone) return false;
-  if ((skip = stream_ok(col)) != HleSkip::kNone) {
-    // A missing colour stream is not worth losing the geometry over.
-    col = nullptr;
-    skip = HleSkip::kNone;
-  }
-  if ((skip = stream_ok(tex)) != HleSkip::kNone) {
-    tex = nullptr;
-    skip = HleSkip::kNone;
-  }
+  //
+  // Colour and the first texcoord set are optional: a declaration without a
+  // colour seeds the modulation identity (see the seed in the transcode — it is
+  // a factor, not a colour), and a missing texcoord defaults to (0,0). Both are
+  // dropped rather than fatal when their stream is unusable, because neither is
+  // worth losing the geometry over.
+  const HleInputElement *pos = nullptr, *col = nullptr, *tex = nullptr;
+  if (!ResolveTranscodeElements(in, pos, col, tex, skip)) return false;
 
   // --- the index buffer, and the vertex range it implies -------------------
   std::vector<uint8_t> indices;
@@ -203,6 +218,70 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
 
   const uint32_t nverts = hi - lo + 1;
   out.first_vertex = lo;
+  out.vertex_count = nverts;
+
+  if (in.defer_transcode) {
+    // The caller predicts this draw fetches on the GPU. Leave the host vertices
+    // unbuilt — but reproduce, in O(1), every condition under which the loop
+    // below would have REFUSED the draw, so a deferred draw is dropped in
+    // exactly the cases an eager one is. Otherwise turning the prediction on
+    // would silently start rendering geometry that used to be discarded.
+    //
+    // All three are constant or monotone across the range: the stride bound and
+    // the position format do not vary per vertex, and the buffer overrun is
+    // worst at the highest index.
+    const HleStream& s = in.streams[pos->stream];
+    if (s.stride > 256) {
+      skip = HleSkip::kZeroStride;
+      return false;
+    }
+    uint8_t probe[256];
+    float pp[4] = {0, 0, 0, 1};
+    if (!CopyVertex(s, lo, probe, sizeof(probe)) ||
+        !CopyVertex(s, hi, probe, sizeof(probe))) {
+      skip = HleSkip::kVertexOutOfRange;
+      return false;
+    }
+    if (!ReadHleElement(probe, s.stride, *pos, s.endian, pp)) {
+      skip = HleSkip::kUnreadableFormat;
+      return false;
+    }
+    out.vertex_stride = 0;
+  } else if (!TranscodeHleVertices(in, out, skip)) {
+    return false;
+  }
+
+  if (in.mvp) {
+    std::memcpy(out.mvp, in.mvp, sizeof(out.mvp));
+  } else {
+    static const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0,
+                                        0, 0, 1, 0, 0, 0, 0, 1};
+    std::memcpy(out.mvp, kIdentity, sizeof(out.mvp));
+  }
+
+  out.indices = std::move(indices);
+  out.prim_type = in.prim_type;
+  out.topology = topo;
+
+  // The same two expansions the PM4 path uses, shared rather than reimplemented
+  // — a second copy could drift from the one the renderer already agrees with.
+  out.valid = true;
+  out.color_source = col ? DrawCall::ColorSource::kPacked
+                         : DrawCall::ColorSource::kNone;
+  return true;
+}
+
+bool TranscodeHleVertices(const HleDrawInputs& in, DrawCall& out,
+                          HleSkip& skip) {
+  const HleInputElement *pos = nullptr, *col = nullptr, *tex = nullptr;
+  if (!ResolveTranscodeElements(in, pos, col, tex, skip)) return false;
+
+  const uint32_t lo = out.first_vertex;
+  const uint32_t nverts = out.vertex_count;
+  if (nverts == 0) {
+    skip = HleSkip::kEmpty;
+    return false;
+  }
 
   // --- the vertices --------------------------------------------------------
   //
@@ -211,6 +290,11 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
   // vfetch and need not index every stream alike — so this refuses the draw and
   // counts it rather than clamping into whatever follows the buffer.
   out.vertices.resize(size_t(nverts) * kHostVertexStride);
+
+  // The second per-vertex CPU pass, measured. ApplyShaderOutputs' loop was the
+  // one the FRAME COST buckets caught; this one is upstream of it and was part
+  // of the unaccounted remainder. Read by the caller and reset each frame.
+  const auto transcode_t0 = std::chrono::steady_clock::now();
 
   uint8_t vtx[256];   // one guest vertex, larger than any observed stride
   for (uint32_t i = 0; i < nverts; ++i) {
@@ -284,24 +368,13 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
     std::memcpy(dst + 16, c, 16);      // float4 COLOR
     std::memcpy(dst + 32, t, 8);       // float2 TEXCOORD0
   }
+  g_transcodeUs +=
+      uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                   std::chrono::steady_clock::now() - transcode_t0)
+                   .count());
+  g_transcodeVerts += nverts;
 
-  if (in.mvp) {
-    std::memcpy(out.mvp, in.mvp, sizeof(out.mvp));
-  } else {
-    static const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0,
-                                        0, 0, 1, 0, 0, 0, 0, 1};
-    std::memcpy(out.mvp, kIdentity, sizeof(out.mvp));
-  }
-
-  out.vertex_count = nverts;
   out.vertex_stride = kHostVertexStride;
-  out.indices = std::move(indices);
-  out.prim_type = in.prim_type;
-  out.topology = topo;
-
-  // The same two expansions the PM4 path uses, shared rather than reimplemented
-  // — a second copy could drift from the one the renderer already agrees with.
-  out.valid = true;
   out.color_source = col ? DrawCall::ColorSource::kPacked
                          : DrawCall::ColorSource::kNone;
   return true;

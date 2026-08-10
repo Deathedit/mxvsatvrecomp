@@ -57,7 +57,26 @@ struct HleDrawInputs {
   // transform, this file only applies it — so changing where the matrix comes
   // from never means touching the vertex path.
   const float* mvp = nullptr;
+
+  // The caller expects this draw to fetch its vertices on the GPU, where the
+  // 36-byte host vertex below is never read. Set it and BuildHleDraw leaves
+  // `vertices` empty and `vertex_stride` zero, skipping the per-vertex pass
+  // entirely — 26-31 ms of a menu frame, measured over 289,379 vertices.
+  //
+  // It is a PREDICTION, not a decision: the fetch path is only finally settled
+  // once the shader's attributes have been cross-checked against the streams,
+  // which happens after the draw is built. A draw that turns out not to fetch
+  // fills the gap by calling TranscodeHleVertices below, so a wrong prediction
+  // costs nothing beyond doing the work later.
+  bool defer_transcode = false;
 };
+
+// Cost of BuildHleDraw's per-vertex transcode into the 36-byte host vertex.
+// A GPU-fetch draw never reads that output, so this is the size of the second
+// prize once the vertex fetch moves into the shader. Accumulated here, read and
+// reset by the frame report in the D3D9 layer.
+extern uint64_t g_transcodeUs;
+extern uint64_t g_transcodeVerts;
 
 // Why a draw produced nothing. Every one is counted and named — a bare
 // "skipped" total cannot distinguish a decode gap from a stream this path does
@@ -92,6 +111,17 @@ constexpr uint32_t kMaxHleVertices = 1u << 20;
 // Fills `out` and returns true, or returns false with `skip` set. `out` is
 // cleared on entry either way.
 bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip);
+
+// Fill in the 36-byte host vertices for a draw built with `defer_transcode`.
+// Reads `out.first_vertex` and `out.vertex_count`, which BuildHleDraw has
+// already set, and resolves the declaration's POSITION/COLOR/TEXCOORD0 by
+// exactly the rule BuildHleDraw uses — one implementation, so the deferred and
+// eager forms cannot decode a vertex differently.
+//
+// `in` must be the same inputs the draw was built from, with its stream
+// pointers still live.
+bool TranscodeHleVertices(const HleDrawInputs& in, DrawCall& out,
+                          HleSkip& skip);
 
 // Finish primitive types that are expansions rather than native host
 // topologies. Kept separate from BuildHleDraw because the HLE hook executes the

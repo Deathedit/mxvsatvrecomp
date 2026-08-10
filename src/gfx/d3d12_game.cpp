@@ -503,15 +503,29 @@ bool D3D12Renderer::CreateTranslatedRootSignature() {
 
   // Samplers live in their own heap type, so they cannot share a table with the
   // SRVs and need a fourth parameter.
-  D3D12_ROOT_PARAMETER params[4] = {rootParams[0], rootParams[1], rootParams[2],
-                                    {}};
+  D3D12_ROOT_PARAMETER params[5] = {rootParams[0], rootParams[1], rootParams[2],
+                                    {}, {}};
   params[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
   params[3].DescriptorTable.NumDescriptorRanges = 1;
   params[3].DescriptorTable.pDescriptorRanges = &ranges[1];
   params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
+  // t16, vertex: the guest's raw vertex buffer, for a vertex shader that
+  // fetches and decodes its own attributes instead of reading input elements
+  // the CPU unpacked.
+  //
+  // A ROOT SRV, not a table: it needs no descriptor heap slot, takes an upload
+  // heap's GPU virtual address directly, and so leaves BindTranslatedTextures
+  // and its block ring completely untouched. t16 because the pixel table
+  // occupies t0..t15 — a register space would have been cleaner but needs
+  // shader model 5.1 and this compiles vs_5_0.
+  params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+  params[4].Descriptor.ShaderRegister = 16;
+  params[4].Descriptor.RegisterSpace = 0;
+  params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+
   D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
-  rootDesc.NumParameters = 4;
+  rootDesc.NumParameters = 5;
   rootDesc.pParameters = params;
   rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
@@ -813,7 +827,12 @@ ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
   ID3DBlob* vsBlob = m_translatedVsBlob.Get();
   std::vector<D3D12_INPUT_ELEMENT_DESC> layout;
   if (key.vsHandle) {
-    auto& cachedVs = m_translatedVsBlobs[key.vsHandle];
+    // The two variants of one guest vertex shader are separate compilations
+    // with incompatible input signatures, so they get separate caches. Sharing
+    // one keyed by handle would hand a draw the other's bytecode.
+    const bool fetch = (key.flags & 16) != 0;
+    auto& cachedVs = fetch ? m_translatedVsFetchBlobs[key.vsHandle]
+                           : m_translatedVsBlobs[key.vsHandle];
     if (!cachedVs && draw.vertexShaderHlsl)
       cachedVs = CompileShader(draw.vertexShaderHlsl->c_str(), "vs_5_0", "main");
     if (!cachedVs) {
@@ -823,10 +842,17 @@ ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
       return nullptr;
     }
     vsBlob = cachedVs.Get();
-    for (uint32_t i = 0; i < draw.vertexInputCount; ++i) {
-      layout.push_back({"TEXCOORD", draw.vertexInputRegs[i],
-                        DXGI_FORMAT_R32G32B32A32_FLOAT, 0, i * 16,
-                        D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0});
+    // A fetch stage declares no input elements at all: its only input is
+    // SV_VertexID, and it reads everything else out of the raw buffer. The loop
+    // below is a no-op for it anyway (vertexInputCount is 0), but leaving that
+    // implicit would make an empty layout look like a bug rather than the
+    // design.
+    if (!fetch) {
+      for (uint32_t i = 0; i < draw.vertexInputCount; ++i) {
+        layout.push_back({"TEXCOORD", draw.vertexInputRegs[i],
+                          DXGI_FORMAT_R32G32B32A32_FLOAT, 0, i * 16,
+                          D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0});
+      }
     }
   } else {
     layout.push_back({"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0,
@@ -2887,7 +2913,8 @@ void D3D12Renderer::RenderGameFrame() {
       key.flags = uint8_t((tDepthEnable ? 1u : 0u) |
                           (tDepthWrite ? 2u : 0u) |
                           (d.colorWrite ? 0u : 4u) |
-                          (d.blendEnable ? 8u : 0u));
+                          (d.blendEnable ? 8u : 0u) |
+                          (d.gpuVertexFetch ? 16u : 0u));
       translatedPso = TranslatedPSO(key, *d.pixelShaderHlsl, d);
     }
     // Every texture the shader reads must be bindable, or the draw falls back:
@@ -2933,7 +2960,15 @@ void D3D12Renderer::RenderGameFrame() {
       if (BindTranslatedSamplers(d, samp))
         m_commandList->SetGraphicsRootDescriptorTable(3, samp);
       m_commandList->IASetPrimitiveTopology(d.topology);
-      if (d.gpuVertex) {
+      if (d.gpuVertexFetch) {
+        // No vertex buffers at all. The stage's only input is SV_VertexID and
+        // it reads the guest's raw bytes through t16, so binding a stream here
+        // would contradict the empty input layout the PSO was built with.
+        m_commandList->SetGraphicsRootShaderResourceView(
+            4, d.rawvb->GetGPUVirtualAddress());
+        ++m_gpuVertexDraws;
+        ++m_gpuVertexFetchDraws;
+      } else if (d.gpuVertex) {
         // One stream: the guest's raw attributes. No stand-in vertex and no
         // interpolator stream, because neither exists for this draw — the
         // vertex shader produces the position and the rasterizer interpolates
@@ -3048,10 +3083,12 @@ void D3D12Renderer::RenderGameFrame() {
     // draws in a corner do".
     std::snprintf(message, sizeof(message),
                   "guest shaders: %llu draws TRANSLATED (%llu of them running "
-                  "the guest VERTEX shader too, %llu dropped for want of one), "
+                  "the guest VERTEX shader too, %llu of those fetching their "
+                  "own vertices, %llu dropped for want of one), "
                   "%llu stand-in; %llu pipelines built, %llu failed",
                   static_cast<unsigned long long>(m_translatedDraws),
                   static_cast<unsigned long long>(m_gpuVertexDraws),
+                  static_cast<unsigned long long>(m_gpuVertexFetchDraws),
                   static_cast<unsigned long long>(m_gpuVertexDropped),
                   static_cast<unsigned long long>(m_standInDraws),
                   static_cast<unsigned long long>(m_translatedOk),
@@ -3190,11 +3227,22 @@ void D3D12Renderer::ClearGameDraws() {
   RetiredFrame& r = (!m_retired.empty() && m_retired.back().fence == m_fenceValue)
                         ? m_retired.back()
                         : m_retired.emplace_back(RetiredFrame{m_fenceValue, {}});
-  r.res.reserve(r.res.size() + m_gameDraws.size() * 3);
+  //
+  // Every per-draw buffer, not just the first three. vsvb, vscb, ivb and pscb
+  // were being destroyed here while the GPU could still be reading them --
+  // pre-existing, and not a defect I hit, but rawvb joins exactly that set and
+  // retiring one while dropping its neighbours would be incoherent. Retiring
+  // more only ever delays a release.
+  r.res.reserve(r.res.size() + m_gameDraws.size() * 7);
   for (auto& d : m_gameDraws) {
     if (d.vb) r.res.push_back(std::move(d.vb));
     if (d.ib) r.res.push_back(std::move(d.ib));
     if (d.cb) r.res.push_back(std::move(d.cb));
+    if (d.ivb) r.res.push_back(std::move(d.ivb));
+    if (d.pscb) r.res.push_back(std::move(d.pscb));
+    if (d.vsvb) r.res.push_back(std::move(d.vsvb));
+    if (d.vscb) r.res.push_back(std::move(d.vscb));
+    if (d.rawvb) r.res.push_back(std::move(d.rawvb));
   }
   m_gameDraws.clear();
   // The descriptor block window is NOT reset here. This runs on guest handoff,
@@ -3255,7 +3303,15 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   // resources they reference; that was a D3D11 guarantee. Lifetime is the
   // application's job, and it is now done by ClearGameDraws handing these to
   // the fenced retirement list rather than releasing them outright.
-  if (!vertices || !indices || vtxBytes == 0 || idxBytes == 0) return;
+  // A fetch draw brings no host vertex buffer at all: its geometry arrives in
+  // vertexStage->rawBytes and the shader reads it through the root SRV, so a
+  // null `vertices` is correct here rather than a malformed draw. Tested before
+  // the gate because the gate would otherwise drop every one of them.
+  const bool fetchGeometry = vertexStage && vertexStage->rawBytes &&
+                             vertexStage->rawByteCount &&
+                             vertexStage->rawFetch && vertexStage->rawFetchCount;
+  if (!indices || idxBytes == 0) return;
+  if (!fetchGeometry && (!vertices || vtxBytes == 0)) return;
   if (m_gameDraws.size() >= kMaxGameDraws) {
     static bool s_logged = false;
     if (!s_logged) {
@@ -3284,14 +3340,20 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   // the frame's list untouched rather than half-populated.
   GameDraw d;
 
-  if (!createBuffer(d.vb, vtxBytes)) return;
-  void* vtxMap = nullptr;
-  if (FAILED(d.vb->Map(0, nullptr, &vtxMap))) return;
-  memcpy(vtxMap, vertices, vtxBytes);
-  d.vb->Unmap(0, nullptr);
-  d.vbv.BufferLocation = d.vb->GetGPUVirtualAddress();
-  d.vbv.StrideInBytes = vtxStride;
-  d.vbv.SizeInBytes = vtxBytes;
+  // Skipped entirely for a fetch draw — a zero-byte buffer is not a valid D3D12
+  // resource, and nothing binds `vbv` on that path. The guard at the end of this
+  // function is what keeps such a draw from ever reaching the stand-in, which
+  // WOULD read it.
+  if (vertices && vtxBytes) {
+    if (!createBuffer(d.vb, vtxBytes)) return;
+    void* vtxMap = nullptr;
+    if (FAILED(d.vb->Map(0, nullptr, &vtxMap))) return;
+    memcpy(vtxMap, vertices, vtxBytes);
+    d.vb->Unmap(0, nullptr);
+    d.vbv.BufferLocation = d.vb->GetGPUVirtualAddress();
+    d.vbv.StrideInBytes = vtxStride;
+    d.vbv.SizeInBytes = vtxBytes;
+  }
 
   if (!createBuffer(d.ib, idxBytes)) return;
   void* idxMap = nullptr;
@@ -3341,11 +3403,25 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   // stand-in draw holding vertices the interpreter no longer transformed —
   // a flat red frame, and zero translated draws in a run where 36,064
   // qualified.
+  //
+  // Two valid shapes, and a fetch stage has NONE of the input-element fields by
+  // design -- its only input is SV_VertexID. Requiring them unconditionally
+  // dropped every fetch draw on the floor here: `hasVertexStage` was false, and
+  // the guard further down that refuses a draw which brought a vertex stage and
+  // could not get one then discarded it rather than falling back. Measured as a
+  // frame going from 339 draws to 28.
+  const bool hasVertexCommon = vertexStage && vertexStage->handle &&
+                               vertexStage->hlsl && vertexStage->constants &&
+                               vertexStage->constDwords;
+  const bool hasFetchStage =
+      hasVertexCommon && vertexStage->rawBytes && vertexStage->rawByteCount &&
+      vertexStage->rawFetch && vertexStage->rawFetchCount &&
+      vertexStage->rawFetchCount <= mx::hle::HlslShader::kMaxVertexFetches;
   const bool hasVertexStage =
-      vertexStage && vertexStage->handle && vertexStage->hlsl &&
-      vertexStage->inputs && vertexStage->inputBytes && vertexStage->regs &&
-      vertexStage->regCount && vertexStage->regCount <= 32 &&
-      vertexStage->constants && vertexStage->constDwords;
+      hasFetchStage ||
+      (hasVertexCommon && vertexStage->inputs && vertexStage->inputBytes &&
+       vertexStage->regs && vertexStage->regCount &&
+       vertexStage->regCount <= 32);
 
   // The translated path needs all of its inputs or none of them. A shader run
   // without its interpolators reads undefined registers, and one run without
@@ -3509,11 +3585,52 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
     // constant bank alone leaves the shader reading past the end of the
     // resource — the same trap the pixel path documents above, and it does not
     // stop applying because this stage never samples.
+    //
+    // The fetch variant appends uint4 xe_vf[kMaxVertexFetches] after
+    // xe_texinv, so its cbuffer is longer. Sized for it unconditionally: the
+    // tail is zeroed either way and 512 spare bytes per draw is not worth a
+    // second size.
     const uint32_t vsConstBytes =
-        ((vertexStage->constDwords * 4 + kTranslatedSamplerSlots * 16) + 255u) &
-        ~255u;
-    if (createBuffer(d.vsvb, vertexStage->inputBytes) &&
-        createBuffer(d.vscb, vsConstBytes)) {
+        ((vertexStage->constDwords * 4 + kTranslatedSamplerSlots * 16 +
+          mx::hle::HlslShader::kMaxVertexFetches * 16) + 255u) & ~255u;
+    if (vertexStage->rawBytes) {
+      // The fetch path: one raw buffer, no vertex buffer view, and xe_vf[]
+      // written into the cbuffer tail immediately after xe_texinv.
+      if (createBuffer(d.rawvb, vertexStage->rawByteCount) &&
+          createBuffer(d.vscb, vsConstBytes)) {
+        void* p = nullptr;
+        D3D12_RANGE none = {0, 0};
+        if (SUCCEEDED(d.rawvb->Map(0, &none, &p)) && p) {
+          std::memcpy(p, vertexStage->rawBytes, vertexStage->rawByteCount);
+          d.rawvb->Unmap(0, nullptr);
+          p = nullptr;
+          if (SUCCEEDED(d.vscb->Map(0, &none, &p)) && p) {
+            std::memset(p, 0, vsConstBytes);
+            std::memcpy(p, vertexStage->constants,
+                        vertexStage->constDwords * 4);
+            // xe_vf sits directly after xe_c[256] and xe_texinv[16], which is
+            // where the emitter declares it. This offset and that declaration
+            // are one fact in two places -- if either moves the other must.
+            const uint32_t vfOffset =
+                vertexStage->constDwords * 4 + kTranslatedSamplerSlots * 16;
+            std::memcpy(static_cast<uint8_t*>(p) + vfOffset,
+                        vertexStage->rawFetch,
+                        vertexStage->rawFetchCount * 16);
+            d.vscb->Unmap(0, nullptr);
+            d.vertexShaderHandle = vertexStage->handle;
+            d.vertexShaderHlsl = vertexStage->hlsl;
+            d.vertexInputCount = 0;
+            d.gpuVertex = true;
+            d.gpuVertexFetch = true;
+          }
+        }
+      }
+      if (!d.gpuVertexFetch) {
+        d.rawvb.Reset();
+        d.vscb.Reset();
+      }
+    } else if (createBuffer(d.vsvb, vertexStage->inputBytes) &&
+               createBuffer(d.vscb, vsConstBytes)) {
       void* p = nullptr;
       D3D12_RANGE none = {0, 0};
       if (SUCCEEDED(d.vsvb->Map(0, &none, &p)) && p) {
@@ -3541,6 +3658,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
     }
     if (!d.gpuVertex) {
       d.vsvb.Reset();
+      d.rawvb.Reset();
       d.vscb.Reset();
     }
   }

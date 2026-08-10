@@ -82,6 +82,19 @@ struct GpuVertexStage {
   // bank from the pixel one; each stage indexes its own from 0.
   const uint32_t* constants = nullptr;
   uint32_t constDwords = 0;
+
+  // --- the fetch variant ----------------------------------------------------
+  //
+  // When `rawBytes` is set the shader fetches for itself: `hlsl` is the fetch
+  // form, `inputs`/`regs` are unused, and the pipeline takes an EMPTY input
+  // layout plus a root SRV over the raw buffer. The two forms are not
+  // interchangeable, so this pointer is what selects between them.
+  const uint8_t* rawBytes = nullptr;
+  uint32_t rawByteCount = 0;
+  // {base, stride, endian, pad} per emitted fetch, uploaded as the shader's
+  // xe_vf[]. 4 dwords each, matching DrawCall::RawFetch.
+  const uint32_t* rawFetch = nullptr;
+  uint32_t rawFetchCount = 0;
 };
 
 void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
@@ -486,6 +499,11 @@ void ClearGameDraws();
   // Compiled bytecode per VERTEX shader handle, alongside the pixel one below.
   std::unordered_map<uint32_t, Microsoft::WRL::ComPtr<ID3DBlob>>
       m_translatedVsBlobs;
+  // The fetch variant of the same handles, in its own map. One map keyed by
+  // handle alone would hand a draw the other variant's bytecode, whose input
+  // signature does not match the layout the PSO declares.
+  std::unordered_map<uint32_t, Microsoft::WRL::ComPtr<ID3DBlob>>
+      m_translatedVsFetchBlobs;
   // Compiled bytecode per shader handle, so one shader used with several blend
   // states is compiled once rather than once per state.
   std::unordered_map<uint32_t, Microsoft::WRL::ComPtr<ID3DBlob>>
@@ -502,6 +520,8 @@ void ClearGameDraws();
   // Of the translated draws, how many also ran the guest's VERTEX shader. This
   // is the one that says whether the CPU interpreter is still the frame.
   uint64_t m_gpuVertexDraws = 0;
+  // Of those, the ones whose vertex stage also fetched its own attributes.
+  uint64_t m_gpuVertexFetchDraws = 0;
   // Draws that brought a vertex stage and could not be given one, so had to be
   // dropped: their vertices were never transformed by anything. Must stay at
   // zero — anything else is geometry missing from the picture.
@@ -816,6 +836,13 @@ void ClearGameDraws();
     std::array<uint8_t, 32> vertexInputRegs = {};
     uint32_t vertexInputCount = 0;
     bool gpuVertex = false;
+
+    // The FETCH variant: the vertex stage reads the guest's raw vertex buffer
+    // through a root SRV and decodes attributes itself. `vsvb` and the input
+    // layout are then both unused -- there are no input elements at all, only
+    // SV_VertexID -- and `rawvb` is bound as root parameter 4.
+    Microsoft::WRL::ComPtr<ID3D12Resource> rawvb;
+    bool gpuVertexFetch = false;
   };
   // Bounded because each entry costs three CreateCommittedResource calls — see
   // the PERF(per-frame-allocs) note in d3d12_game.cpp.

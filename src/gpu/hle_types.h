@@ -333,7 +333,39 @@ struct DrawCall {
 
   // One float4 per declared register per vertex, tightly packed in
   // `vertex_input_regs` order: stride is vertex_input_count * 16.
+  //
+  // Empty when the draw is on the GPU FETCH path below, which is the point of
+  // that path: filling this is the per-vertex CPU pass that cost 145ms of a
+  // 159ms frame.
   std::vector<uint8_t> vertex_inputs;
+
+  // --- the GPU vertex fetch path -------------------------------------------
+  //
+  // The guest's own vertex streams, raw and still big-endian, concatenated into
+  // one buffer for the translated vertex shader to decode for itself. A shader
+  // may read up to kMaxStreams of them, so they are merged rather than bound
+  // separately: one buffer means one root SRV and no descriptor at all.
+  //
+  // A copy rather than a pointer, deliberately. The guest may overwrite its
+  // vertex buffer before the render thread submits this draw — the same hazard
+  // `content_version` documents for textures above.
+  std::vector<uint8_t> raw_vertex_bytes;
+
+  // Per emitted vfetch, in the shader's program order, matching
+  // HlslShader::vertex_fetch_slot. Uploaded verbatim as the shader's xe_vf[].
+  //
+  // `base` already includes first_vertex * stride and the stream's own byte
+  // offset, so the shader indexes with SV_VertexID and needs no bias. `endian`
+  // is the stream's, applied per attribute as the CPU path applies it.
+  struct RawFetch {
+    uint32_t base = 0;
+    uint32_t stride = 0;
+    uint32_t endian = 0;
+    uint32_t pad = 0;
+  };
+  static constexpr uint32_t kMaxRawFetches = 32;
+  std::array<RawFetch, kMaxRawFetches> raw_fetch = {};
+  uint32_t raw_fetch_count = 0;
 
   // The guest's VERTEX ALU constant bank (constants 0-255 at device+0x780), in
   // the same shape as `pixel_constants`: constant i is vertex_constants[i * 4].

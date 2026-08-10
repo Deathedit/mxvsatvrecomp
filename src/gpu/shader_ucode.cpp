@@ -566,6 +566,9 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
         a.is_signed = vf.is_signed();
         a.is_normalized = vf.is_normalized();
         a.exp_adjust = vf.exp_adjust();
+        a.src_reg = vf.src();
+        a.src_swizzle = vf.src_swizzle();
+        a.is_index_rounded = vf.is_index_rounded();
 
         // A fetch defines its destination outright, discarding whatever the
         // register held. Attributes past the 32nd cannot be represented in the

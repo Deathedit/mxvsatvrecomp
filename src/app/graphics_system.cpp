@@ -99,6 +99,20 @@ REXCVAR_DEFINE_BOOL(hle_gpu_vertex, true, "Debug",
                     "whose vertex AND pixel shaders both translate. Off keeps "
                     "every draw on the CPU interpreter");
 
+// The vertex FETCH, as opposed to the vertex shader. With hle_gpu_vertex alone
+// the shader runs on the GPU but the CPU still unpacks every attribute of every
+// vertex into input registers -- measured at 145ms of a 159ms frame over
+// 289,000 vertices. This makes the shader read the guest's raw vertex buffer
+// and decode it itself.
+//
+// Default on, because it is strictly an accelerated form of the same path: a
+// draw it refuses falls back to hle_gpu_vertex rather than failing. Off is the
+// A/B, and the two must produce the same picture.
+REXCVAR_DEFINE_BOOL(hle_gpu_vertex_fetch, true, "Debug",
+                    "Let the translated vertex shader fetch and decode the "
+                    "guest vertex buffer itself, instead of the CPU unpacking "
+                    "attributes per vertex. Requires hle_gpu_vertex");
+
 // TEX_FORMAT_COMP / GPUSIGN. Off leaves every xe_texsign at 1.0, which is the
 // exact behaviour of every build before this one, so a suspected regression is
 // one run to bisect rather than a rebuild -- the same reason hle_gpu_vertex has
@@ -265,9 +279,19 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
           submittable.push_back(&d);
           continue;
         }
+        // A draw whose vertex shader fetches for itself carries NO host
+        // vertices and no stride — the 36-byte transcode that used to produce
+        // them is the CPU pass that path exists to remove. Its geometry is in
+        // raw_vertex_bytes, so the two gates below have to let it through or
+        // the saving turns into a blank frame.
+        const bool fetch_draw =
+            d.vertex_shader_hlsl && !d.raw_vertex_bytes.empty() &&
+            d.raw_fetch_count && !d.vertex_constants.empty();
         // vertices are only populated when the translator resolved a vertex
         // fetch constant; index-only draws have nothing to bind.
-        if (!d.valid || d.vertices.empty() || d.index_count == 0) continue;
+        if (!d.valid || (!fetch_draw && d.vertices.empty()) ||
+            d.index_count == 0)
+          continue;
         if (d.topology == mx::hle::HostTopology::kUndefined) {
           ++skipped;
           continue;
@@ -281,7 +305,7 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
           ++s_skippedUntransformable;
           continue;
         }
-        if (d.vertex_stride != kSupportedStride) {
+        if (!fetch_draw && d.vertex_stride != kSupportedStride) {
           ++skipped;
           ++s_skippedStrides[d.vertex_stride];
           continue;
@@ -333,8 +357,23 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
           // Pass-through only: every decision about whether a draw qualifies
           // was made where the microcode and the attributes are.
           D3D12Renderer::GpuVertexStage vertexStage;
-          if (d->vertex_shader_hlsl && !d->vertex_inputs.empty() &&
-              d->vertex_input_count && !d->vertex_constants.empty()) {
+          if (d->vertex_shader_hlsl && !d->raw_vertex_bytes.empty() &&
+              d->raw_fetch_count && !d->vertex_constants.empty()) {
+            // The fetch form. No inputs and no regs by construction — the
+            // shader reads the raw buffer itself.
+            vertexStage.handle = d->vertex_shader_handle;
+            vertexStage.hlsl = d->vertex_shader_hlsl;
+            vertexStage.constants = d->vertex_constants.data();
+            vertexStage.constDwords =
+                static_cast<uint32_t>(d->vertex_constants.size());
+            vertexStage.rawBytes = d->raw_vertex_bytes.data();
+            vertexStage.rawByteCount =
+                static_cast<uint32_t>(d->raw_vertex_bytes.size());
+            vertexStage.rawFetch =
+                reinterpret_cast<const uint32_t*>(d->raw_fetch.data());
+            vertexStage.rawFetchCount = d->raw_fetch_count;
+          } else if (d->vertex_shader_hlsl && !d->vertex_inputs.empty() &&
+                     d->vertex_input_count && !d->vertex_constants.empty()) {
             vertexStage.handle = d->vertex_shader_handle;
             vertexStage.hlsl = d->vertex_shader_hlsl;
             vertexStage.inputs = d->vertex_inputs.data();

@@ -67,6 +67,7 @@ REXCVAR_DECLARE(uint32_t, hle_shader_exec);
 REXCVAR_DECLARE(uint32_t, hle_shader_verts);
 REXCVAR_DECLARE(bool, hle_gpu_vertex);
 REXCVAR_DECLARE(bool, hle_texture_signs);
+REXCVAR_DECLARE(bool, hle_gpu_vertex_fetch);
 namespace {
 
 namespace uc = rex::graphics::ucode;
@@ -1099,12 +1100,36 @@ ShaderApplyResult ApplyShaderOutputs(
     mx::hle::DrawCall& dc, uint32_t handle,
     const mx::hle::HleStream* streams, uint32_t device, uint8_t* base,
     const mx::hle::PixelTextureBinding* texture_binding,
-    const uint32_t* constant_snapshot = nullptr);
+    const uint32_t* constant_snapshot = nullptr,
+    const mx::hle::HleDrawInputs* deferred_in = nullptr);
 bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
                         uint32_t device, uint8_t* base,
                         mx::hle::PixelTextureBinding& binding);
 void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
                         const uint32_t* code, uint32_t count);
+// Draws whose 36-byte host vertex was never built because the fetch path was
+// predicted, and the two ways that prediction can end. `late` is a wrong guess
+// paid for at its ordinary price; `lost` should stay at zero, and means a
+// deferred draw reached a caller that could not supply the inputs to fill it.
+uint64_t g_transcodeDeferred = 0, g_transcodeLate = 0, g_transcodeLost = 0;
+
+// Are the PER-DRAW diagnostics on?
+//
+// This session's investigation left a lot of measurement in the hot path, and
+// some of it is not cheap: the Stage-3 transform probe alone reads 256 guest
+// dwords and scores every vertex, FOR EVERY DRAW, purely to log a ranking
+// nothing acts on. Per-FRAME reporting (FRAME COST, the periodic summaries) is
+// negligible and stays on unconditionally — only work proportional to draws or
+// vertices is gated here.
+//
+// Default OFF, so a plain run is the fast one and `--hle_diag=1` is what you
+// pass to get the counters back. That also makes the cost of the instrumentation
+// itself an A/B rather than a rebuild.
+// Read once per frame rather than per draw: the cvar lookup is itself the sort
+// of per-draw cost this exists to remove. Declared beside the other cvars at
+// the top of the file — a REXCVAR_DECLARE inside this anonymous namespace looks
+// for namespace-local storage and does not link.
+bool g_diag = false;
 // The emitted source, kept per shader handle. Shared with every draw that binds
 // the shader, so a frame's ~158 draws across a few dozen shaders copy a pointer
 // rather than a few kilobytes of text each.
@@ -1120,7 +1145,23 @@ struct TranslatedShader {
   uint32_t sampler_array_mask = 0;
   uint32_t slot_guest[mx::hle::HlslShader::kMaxSamplerSlots] = {};
   uint32_t max_const_index = 0;
+
+  // The same vertex shader emitted a second way: performing its own vfetches
+  // out of the raw guest vertex buffer, indexed by SV_VertexID. Null when that
+  // variant refused or did not compile, in which case the draw stays on the CPU
+  // vertex path and `source` above is what runs.
+  //
+  // Both are kept because they are not interchangeable — the fetch variant has
+  // an empty input layout and needs xe_vf[], the other needs an input layout
+  // built from input_mask.
+  std::shared_ptr<const std::string> fetch_source;
+  uint32_t vertex_fetch_count = 0;
+  uint32_t vertex_fetch_slot[mx::hle::HlslShader::kMaxVertexFetches] = {};
 };
+// Vertex fetch translation coverage, keyed by refusal reason.
+std::map<std::string, uint64_t> g_vfetchRefused;
+uint64_t g_vfetchCompiled = 0;
+
 const TranslatedShader* TranslatedVertexShader(uint32_t handle);
 void ProbePixelProfileForDraw(uint32_t pixel_shader, uint32_t device,
                               uint8_t* base,
@@ -1436,6 +1477,28 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   }
   if (have_vp) in.mvp = vp;
 
+  // Will this draw fetch its own vertices on the GPU? Asked HERE, before the
+  // draw is built, because the answer decides whether to spend a per-vertex
+  // pass transcoding a 36-byte host vertex the fetch path never reads — 26-31ms
+  // of a menu frame over 289,379 vertices.
+  //
+  // Only the conditions knowable this early are tested. The pixel shader has
+  // not been resolved yet and the per-attribute stream checks need the built
+  // vertex range, so the draws those refuse are deferred and then transcoded
+  // late, at exactly the cost of having done it now. The two big refusals ARE
+  // covered: RECTLIST, which is 85% of draws, and a vertex shader with no fetch
+  // variant.
+  {
+    const uint32_t vs = st.vs_seen ? st.vertex_shader : 0;
+    const TranslatedShader* vst = vs ? TranslatedVertexShader(vs) : nullptr;
+    in.defer_transcode =
+        vst && vst->source && vst->fetch_source && vst->sampler_count == 0 &&
+        prim_type != uint32_t(mx::hle::PrimitiveType::kRectangleList) &&
+        REXCVAR_GET(hle_gpu_vertex) && REXCVAR_GET(hle_gpu_vertex_fetch) &&
+        VportScaleEnabled(device, base);
+    if (in.defer_transcode) ++g_transcodeDeferred;
+  }
+
   DrawCall dc;
   HleSkip skip = HleSkip::kNone;
   if (!BuildHleDraw(in, dc, skip)) {
@@ -1478,9 +1541,15 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
             << consts[r * 4 + 1] << " " << consts[r * 4 + 2] << " "
             << consts[r * 4 + 3] << "\n";
         }
-        f << "    first host position = " << *(const float*)dc.vertices.data()
-          << " " << *((const float*)dc.vertices.data() + 1) << " "
-          << *((const float*)dc.vertices.data() + 2) << "\n";
+        // Empty for a draw whose transcode was deferred to the fetch path;
+        // data() is then null and dereferencing it reads address 0.
+        if (dc.vertices.size() >= 12) {
+          const auto* hp = reinterpret_cast<const float*>(dc.vertices.data());
+          f << "    first host position = " << hp[0] << " " << hp[1] << " "
+            << hp[2] << "\n";
+        } else {
+          f << "    first host position = (not transcoded — GPU fetch)\n";
+        }
         f.flush();
       }
     }
@@ -1618,7 +1687,8 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   const uint32_t vertex_shader = st.vs_seen ? st.vertex_shader : 0;
   const ShaderApplyResult applied = ApplyShaderOutputs(
       dc, vertex_shader, streams, device, base,
-      have_texture ? &texture_binding : nullptr);
+      have_texture ? &texture_binding : nullptr, nullptr,
+      in.defer_transcode ? &in : nullptr);
   if (applied == ShaderApplyResult::kApplied) {
     FinishHleDraw(dc);
     return;
@@ -2157,6 +2227,57 @@ uint64_t g_hleShaderIdentityMvp = 0, g_hleShaderViewportMvp = 0;
 // switch rather than to the qualifying rule.
 uint64_t g_gpuVertexDraws = 0, g_gpuVertexSkipped = 0;
 uint64_t g_gpuVertexUndeclared = 0;
+// Why a draw was refused the GPU vertex path. "skipped" has only ever been one
+// number, so a refusal for a reason we could lift is indistinguishable from one
+// we could not. The skinned-mesh question needs exactly this split: a vertex
+// shader that samples a texture is refused by `sampler_count == 0` and then
+// falls to an interpreter that has no texture fetch at all, so its result is a
+// silent zero rather than a fallback.
+uint64_t g_gpuVertexNoCvar = 0, g_gpuVertexNoVs = 0, g_gpuVertexVsSamplers = 0;
+uint64_t g_gpuVertexNoVte = 0, g_gpuVertexNoPs = 0, g_gpuVertexTooManyInputs = 0;
+// The GPU vertex FETCH path: draws taking it, and why a draw that qualified for
+// the GPU vertex stage still could not.
+uint64_t g_gpuFetchDraws = 0, g_gpuFetchRectList = 0;
+uint64_t g_gpuFetchOrdinalMismatch = 0, g_gpuFetchOutOfRange = 0;
+uint64_t g_gpuFetchUnaligned = 0;
+
+// Where the frame goes. The guest's RenderPipeline call is measured whole in
+// hooks_gameloop.cpp, which says the frame is slow but not which of our stages
+// is spending it. These accumulate per frame and reset each frame, so the
+// numbers are a frame's cost rather than a run's.
+//
+// Deliberately coarse -- three buckets and a total. A finer breakdown is worth
+// having only once one bucket is known to dominate.
+uint64_t g_phaseVertexUs = 0;   // ApplyShaderOutputs, all of it
+uint64_t g_phaseInterpUs = 0;   // the software vertex shader inside it
+uint64_t g_phaseTextureUs = 0;  // describe + copy + decode, per draw
+uint64_t g_phaseDrawCount = 0;
+uint64_t g_phaseVertexLoopUs = 0;  // the per-vertex loop alone
+
+// WHY a draw is still paying for the per-vertex loop, and what that costs.
+//
+// The aggregate said 144,163 vertices cost 119ms while the 145,216 the fetch
+// path took away cost only 24ms -- the vertices left on the CPU are five times
+// more expensive EACH than the ones removed. That means the remaining work is
+// concentrated in a subset, and widening fetch coverage is only worth doing for
+// whichever subset it is. Three counters, incremented once per draw, rather
+// than another inference from two aggregate numbers.
+enum LoopReason : uint8_t { kLoopRectList = 0, kLoopNoPs = 1, kLoopOther = 2 };
+uint64_t g_loopUs[3] = {}, g_loopVerts[3] = {}, g_loopDraws[3] = {};
+const char* const kLoopReasonName[3] = {"rectlist", "no-PS", "other"};
+uint64_t g_phaseVertexCount = 0;
+
+struct PhaseTimer {
+  uint64_t& sink;
+  std::chrono::steady_clock::time_point t0;
+  explicit PhaseTimer(uint64_t& s)
+      : sink(s), t0(std::chrono::steady_clock::now()) {}
+  ~PhaseTimer() {
+    sink += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - t0)
+                         .count());
+  }
+};
 
 // Some shaders are already resident before the title reaches
 // PatchVertexShaderToMatchVertexDeclaration, so the exact post-call capture
@@ -2176,8 +2297,11 @@ ShaderApplyResult ApplyShaderOutputs(
     mx::hle::DrawCall& dc, uint32_t handle,
     const mx::hle::HleStream* streams, uint32_t device, uint8_t* base,
     const mx::hle::PixelTextureBinding* texture_binding,
-    const uint32_t* constant_snapshot) {
+    const uint32_t* constant_snapshot,
+    const mx::hle::HleDrawInputs* deferred_in) {
   using namespace mx::hle;
+  PhaseTimer phase_timer(g_phaseVertexUs);
+  ++g_phaseDrawCount;
   const uint64_t attempt = ++g_hleShaderAttempts;
   struct ReportApply {
     uint64_t attempt;
@@ -2189,7 +2313,10 @@ ShaderApplyResult ApplyShaderOutputs(
           "vertex {}; output transform identity {} viewport {} (VTE scale-on "
           "{} off {} unreadable {}, disagrees with old tie-break {}); live "
           "shader resolved {} no-match {} ambiguous {} unreadable {}; GPU "
-          "vertex path {} draws qualify, {} skipped ({} undeclared reg)",
+          "vertex path {} draws qualify, {} skipped ({} undeclared reg, "
+          "{} cvar-off, {} no-VS, {} VS-samplers, {} no-VTE, {} no-PS, "
+          "{} too-many-inputs); GPU FETCH {} draws (refused: rectlist {}, "
+          "ordinal-mismatch {}, out-of-range {}, unaligned {})",
           g_hleShaderAttempts, g_hleShaderDraws, g_hleShaderVertices,
           g_hleShaderNoCode, g_hleShaderBadDecode, g_hleShaderBadStream,
           g_hleShaderBadConstants, g_hleShaderBadVertex,
@@ -2197,7 +2324,10 @@ ShaderApplyResult ApplyShaderOutputs(
           g_vteSeen[1], g_vteSeen[0], g_hleShaderMvpDisagree,
           g_liveVertexResolved, g_liveVertexNoMatch, g_liveVertexAmbiguous,
           g_liveVertexUnreadable, g_gpuVertexDraws, g_gpuVertexSkipped,
-          g_gpuVertexUndeclared);
+          g_gpuVertexUndeclared, g_gpuVertexNoCvar, g_gpuVertexNoVs,
+          g_gpuVertexVsSamplers, g_gpuVertexNoVte, g_gpuVertexNoPs,
+          g_gpuVertexTooManyInputs, g_gpuFetchDraws, g_gpuFetchRectList,
+          g_gpuFetchOrdinalMismatch, g_gpuFetchOutOfRange, g_gpuFetchUnaligned);
     }
   } report{attempt};
   if (!handle || !device) {
@@ -2342,11 +2472,32 @@ ShaderApplyResult ApplyShaderOutputs(
   //    every draw in this game, so this refuses nothing today; it is here so
   //    that if it ever does not, the draw falls back rather than moves.
   const TranslatedShader* vs_translated = TranslatedVertexShader(handle);
-  bool gpu_vertex = REXCVAR_GET(hle_gpu_vertex) &&
-                    vs_translated && vs_translated->source &&
-                    vs_translated->sampler_count == 0 &&
-                    VportScaleEnabled(device, base) &&
-                    dc.pixel_shader_hlsl != nullptr;
+  // Evaluated as separate tests rather than one `&&` chain so each refusal is
+  // attributed. The chain short-circuits, so a draw refused for two reasons is
+  // counted against the first — read the counters as "the reason that fired",
+  // not as a partition of independent causes.
+  bool gpu_vertex = true;
+  if (!REXCVAR_GET(hle_gpu_vertex)) {
+    gpu_vertex = false;
+    ++g_gpuVertexNoCvar;
+  } else if (!vs_translated || !vs_translated->source) {
+    gpu_vertex = false;
+    ++g_gpuVertexNoVs;
+  } else if (vs_translated->sampler_count != 0) {
+    gpu_vertex = false;
+    ++g_gpuVertexVsSamplers;
+  } else if (!VportScaleEnabled(device, base)) {
+    gpu_vertex = false;
+    ++g_gpuVertexNoVte;
+  } else if (dc.pixel_shader_hlsl == nullptr) {
+    gpu_vertex = false;
+    ++g_gpuVertexNoPs;
+  }
+  // Which bucket this draw's loop time lands in, if it reaches the loop at all.
+  // Set at the point of refusal so it names the reason that actually fired
+  // rather than the first one that could have.
+  uint8_t loop_reason = kLoopOther;
+  if (!gpu_vertex && dc.pixel_shader_hlsl == nullptr) loop_reason = kLoopNoPs;
   if (gpu_vertex) {
     for (const auto& a : attrs) {
       if (a.dest_reg >= 32 ||
@@ -2357,6 +2508,154 @@ ShaderApplyResult ApplyShaderOutputs(
       }
     }
   }
+  // Can this draw let the SHADER do the vertex fetch, out of the raw guest
+  // buffer, instead of the CPU unpacking every attribute of every vertex?
+  //
+  // Strictly an accelerated form of gpu_vertex: everything that refuses that
+  // refuses this, and anything this refuses falls back to it rather than
+  // failing. So a defect here costs frame time, not pixels.
+  bool gpu_fetch = gpu_vertex && REXCVAR_GET(hle_gpu_vertex_fetch) &&
+                   vs_translated && vs_translated->fetch_source;
+  if (gpu_fetch && dc.prim_type == uint32_t(mx::hle::PrimitiveType::kRectangleList)) {
+    // ExpandRectangleList synthesizes a fourth vertex as v1 + v2 - v0 from the
+    // host vertices AND from vertex_inputs. The fetch path produces neither,
+    // and raw guest bytes cannot be combined affinely without first decoding
+    // them -- which is the work being removed. Every full-screen post pass is a
+    // RECTLIST, but they are 3-6 vertices each, so this costs nothing.
+    gpu_fetch = false;
+    ++g_gpuFetchRectList;
+    loop_reason = kLoopRectList;
+  }
+  if (g_diag) {
+    // Independent check on the refusal above: 88% of qualifying draws coming
+    // back RECTLIST is not a plausible frame, so the primitive type is counted
+    // directly rather than inferred from the refusal.
+    static std::map<uint32_t, uint64_t> s_prims;
+    static uint64_t s_primTotal = 0;
+    ++s_prims[dc.prim_type];
+    if ((++s_primTotal % 5000) == 0) {
+      std::string h;
+      for (const auto& [p, n] : s_prims) h += fmt::format(" {}={}", p, n);
+      REXLOG_INFO("d3d9: prim_type histogram over {} draws:{}", s_primTotal, h);
+    }
+  }
+  if (gpu_fetch && attrs.size() != vs_translated->vertex_fetch_count) {
+    // The emitter and DecodeVertexShaderFetches walk the same instruction
+    // stream, so these must agree. If they ever do not, the xe_vf[] entries
+    // would be paired with the wrong fetches and geometry would be misaddressed
+    // with no symptom at the point of the mistake.
+    gpu_fetch = false;
+    ++g_gpuFetchOrdinalMismatch;
+  }
+  if (gpu_fetch) {
+    // Merge the used streams into one buffer, in first-use order, and describe
+    // each fetch's window into it.
+    uint32_t region_of_stream[kMaxStreams];
+    std::memset(region_of_stream, 0xFF, sizeof(region_of_stream));
+    dc.raw_vertex_bytes.clear();
+    dc.raw_fetch_count = 0;
+    for (size_t a = 0; a < attrs.size() && gpu_fetch; ++a) {
+      if (attrs[a].fetch_slot != vs_translated->vertex_fetch_slot[a]) {
+        gpu_fetch = false;
+        ++g_gpuFetchOrdinalMismatch;
+        break;
+      }
+      const uint32_t si = attr_stream[a];
+      const mx::hle::HleStream& s = streams[si];
+      if (region_of_stream[si] == 0xFFFFFFFFu) {
+        const uint64_t start = uint64_t(s.offset_bytes) +
+                               uint64_t(dc.first_vertex) * s.stride;
+        const uint64_t bytes = uint64_t(dc.vertex_count) * s.stride;
+        if (start + bytes > s.size_bytes) {
+          // The same bound BuildHleDraw enforces per vertex, applied once to
+          // the whole window. A stream the shader indexes past is a refusal,
+          // not a clamp into whatever follows the buffer.
+          gpu_fetch = false;
+          ++g_gpuFetchOutOfRange;
+          break;
+        }
+        // ByteAddressBuffer.Load needs 4-byte alignment, and every address the
+        // shader forms is base + vid * stride + a dword-derived offset. Guest
+        // strides and offsets are dword counts so this should always hold --
+        // refused rather than assumed, because misalignment reads silently
+        // wrong data rather than faulting.
+        if ((dc.raw_vertex_bytes.size() % 4) != 0 || (s.stride % 4) != 0 ||
+            (start % 4) != 0) {
+          gpu_fetch = false;
+          ++g_gpuFetchUnaligned;
+          break;
+        }
+        region_of_stream[si] = uint32_t(dc.raw_vertex_bytes.size());
+        dc.raw_vertex_bytes.insert(dc.raw_vertex_bytes.end(),
+                                   s.host + start, s.host + start + bytes);
+      }
+      auto& rf = dc.raw_fetch[dc.raw_fetch_count++];
+      rf.base = region_of_stream[si];
+      rf.stride = s.stride;
+      rf.endian = s.endian;
+    }
+    if (!gpu_fetch) {
+      dc.raw_vertex_bytes.clear();
+      dc.raw_fetch_count = 0;
+    }
+
+    // Self-check on the ADDRESSING, bounded to the first draws of a run.
+    //
+    // The picture is the only real verdict and it needs an attended run, but
+    // the half of this most likely to be silently wrong -- the base offset,
+    // whether first_vertex is folded in correctly, the stride, and which bytes
+    // were copied -- can be checked without a GPU at all. Decode the same
+    // attribute twice: once from the guest stream the way the CPU path always
+    // has, and once from the merged buffer at the address the shader will form.
+    // They must be bit-identical.
+    //
+    // This does NOT check the HLSL format decode or the endian shuffle emitted
+    // into the shader; both sides here use the CPU decoder. It checks that the
+    // shader is pointed at the right bytes.
+    static uint64_t s_checked = 0, s_mismatch = 0;
+    if (g_diag && gpu_fetch && s_checked < 400) {
+      ++s_checked;
+      const uint32_t probe[2] = {0, dc.vertex_count ? dc.vertex_count - 1 : 0};
+      for (uint32_t pi = 0; pi < 2; ++pi) {
+        const uint32_t v = probe[pi];
+        for (size_t a = 0; a < attrs.size(); ++a) {
+          const mx::hle::HleStream& s = streams[attr_stream[a]];
+          const auto& rf = dc.raw_fetch[a];
+          uint8_t direct[256] = {};
+          const uint64_t off =
+              uint64_t(s.offset_bytes) +
+              (uint64_t(dc.first_vertex) + v) * s.stride;
+          if (off + s.stride > s.size_bytes || s.stride > sizeof(direct))
+            continue;
+          std::memcpy(direct, s.host + off, s.stride);
+          const uint64_t raw_off = uint64_t(rf.base) + uint64_t(v) * rf.stride;
+          if (raw_off + rf.stride > dc.raw_vertex_bytes.size()) continue;
+          float fa[4] = {}, fb[4] = {};
+          const bool oka = mx::hle::ReadVertexAttribute(direct, s.stride,
+                                                        attrs[a], s.endian, fa);
+          const bool okb = mx::hle::ReadVertexAttribute(
+              dc.raw_vertex_bytes.data() + raw_off, rf.stride, attrs[a],
+              rf.endian, fb);
+          if (oka != okb || (oka && std::memcmp(fa, fb, sizeof(fa)) != 0)) {
+            if (++s_mismatch <= 8) {
+              REXLOG_INFO(
+                  "d3d9: VFETCH ADDRESSING MISMATCH vs 0x{:08X} attr {} fmt {} "
+                  "vertex {}: stream ({:.6g},{:.6g},{:.6g},{:.6g}) vs raw "
+                  "({:.6g},{:.6g},{:.6g},{:.6g}); base {} stride {} endian {}",
+                  handle, a, attrs[a].format, v, fa[0], fa[1], fa[2], fa[3],
+                  fb[0], fb[1], fb[2], fb[3], rf.base, rf.stride, rf.endian);
+            }
+          }
+        }
+      }
+      if (s_checked == 400) {
+        REXLOG_INFO("d3d9: VFETCH addressing self-check: {} draws, {} "
+                    "mismatches",
+                    s_checked, s_mismatch);
+      }
+    }
+  }
+
   uint32_t input_stride = 0;
   // reg_slot[r] = which input element register r occupies, or 0xFF.
   uint8_t reg_slot[32];
@@ -2367,13 +2666,27 @@ ShaderApplyResult ApplyShaderOutputs(
       if (!(vs_translated->input_mask & (1u << r))) continue;
       if (dc.vertex_input_count >= mx::hle::DrawCall::kMaxVertexInputs) {
         gpu_vertex = false;
+        ++g_gpuVertexTooManyInputs;
         break;
       }
       reg_slot[r] = uint8_t(dc.vertex_input_count);
       dc.vertex_input_regs[dc.vertex_input_count++] = uint8_t(r);
     }
   }
-  if (gpu_vertex) {
+  // gpu_fetch can only have been set while gpu_vertex held, but the input-count
+  // loop above can still clear gpu_vertex afterwards -- so re-check rather than
+  // leave a draw claiming a fetch path its vertex stage was just refused.
+  if (!gpu_vertex) gpu_fetch = false;
+  if (gpu_fetch) {
+    // No vertex_inputs and no per-vertex loop: the shader reads the raw bytes
+    // itself. This is the whole point of the path.
+    dc.vertex_input_count = 0;
+    dc.vertex_shader_handle = handle;
+    dc.vertex_shader_hlsl = vs_translated->fetch_source;
+    dc.vertex_constants = consts;
+    ++g_gpuVertexDraws;
+    ++g_gpuFetchDraws;
+  } else if (gpu_vertex) {
     input_stride = dc.vertex_input_count * 16;
     // Zeroed, and that is the correct default rather than a convenience: the
     // interpreter's register file starts at zero, so a destination swizzle of
@@ -2404,6 +2717,50 @@ ShaderApplyResult ApplyShaderOutputs(
   const bool want_interpolators = dc.pixel_shader_hlsl != nullptr && !gpu_vertex;
   if (want_interpolators)
     dc.interpolators.assign(size_t(dc.vertex_count) * kInterpStride, 0);
+
+  // A fetch draw is finished. Everything below this point exists to produce
+  // per-vertex data the GPU is now producing for itself: the attribute decode,
+  // the input registers, the transformed positions, the interpolator stream and
+  // the UV reconstruction. Returning here is what removes the 145ms.
+  //
+  // The mvp must be identity, which VportScaleEnabled already guaranteed as a
+  // condition of gpu_vertex -- the translated vertex stage applies no mvp at
+  // all, on either path.
+  if (gpu_fetch) {
+    static constexpr float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0,
+                                            0, 0, 1, 0, 0, 0, 0, 1};
+    std::memcpy(dc.mvp, kIdentity, sizeof(dc.mvp));
+    ++g_hleShaderIdentityMvp;
+    ++g_hleShaderDraws;
+    g_hleShaderVertices += dc.vertex_count;
+    return ShaderApplyResult::kApplied;
+  }
+
+  // The fetch prediction was made before this draw was built, so its 36-byte
+  // host vertices were never transcoded — and everything from here down reads
+  // them. Filling the gap now costs exactly what building them eagerly would
+  // have; the saving is entirely on the draws that DID fetch and returned above.
+  if (dc.vertex_stride == 0 && dc.vertex_count) {
+    if (!deferred_in) {
+      // Should be unreachable: deferral requires a translated vertex shader, and
+      // the only caller without inputs to hand is the kNoCode replay, which by
+      // definition has none.
+      ++g_transcodeLost;
+      return ShaderApplyResult::kFailed;
+    }
+    HleSkip tskip = HleSkip::kNone;
+    if (!mx::hle::TranscodeHleVertices(*deferred_in, dc, tskip)) {
+      ++HleSkipCounts()[uint32_t(tskip)];
+      return ShaderApplyResult::kFailed;
+    }
+    // `transformed` was copied from dc.vertices at the top of this function,
+    // which for a deferred draw was EMPTY. The per-vertex loop below writes the
+    // shader's clip-space export into it by offset, so leaving it empty is a
+    // memcpy to nullptr — an access violation writing address 0, which is
+    // exactly what mx_882 and mx_883 crashed on.
+    transformed = dc.vertices;
+    ++g_transcodeLate;
+  }
 
   uint64_t applied_vertices = 0;
   uint64_t identity_in_clip = 0, viewport_in_clip = 0;
@@ -2521,9 +2878,13 @@ ShaderApplyResult ApplyShaderOutputs(
       continue;
     }
 
-    const AluResult r = ExecuteVertexShader(
-        patch.code.data() + patch.code_off,
-        uint32_t(patch.code.size() - patch.code_off), attrs, values, alu_in);
+    AluResult r;
+    {
+      PhaseTimer interp_timer(g_phaseInterpUs);
+      r = ExecuteVertexShader(
+          patch.code.data() + patch.code_off,
+          uint32_t(patch.code.size() - patch.code_off), attrs, values, alu_in);
+    }
     if (!have_probe) {
       have_probe = true;
       probe = r;
@@ -3002,6 +3363,59 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
     for (uint32_t i = 0; i < out.sampler_count; ++i)
       kept.slot_guest[i] = out.sampler_slot_guest[i];
     kept.max_const_index = out.max_const_index;
+
+    // The vertex fetch variant of the same blob. Emitted and compiled here,
+    // beside the one that already works, so a shader whose fetch form is
+    // refused or rejected shows up as a counter rather than as a draw that
+    // silently stayed slow. Failure is not an error: it means this shader keeps
+    // the CPU vertex path, which still renders correctly.
+    if (stage == mx::hle::HlslStage::kVertex) {
+      mx::hle::HlslShader fetched;
+      mx::hle::EmitShaderHlsl(code, count, stage,
+                              mx::hle::kHlslInterpolatorLinkage, fetched,
+                              /*emit_vertex_fetch=*/true);
+      if (fetched.status != mx::hle::HlslStatus::kOk) {
+        ++g_vfetchRefused[mx::hle::HlslStatusName(fetched.status)];
+      } else {
+        Microsoft::WRL::ComPtr<ID3DBlob> fblob, ferrors;
+        const HRESULT fhr = D3DCompile(
+            fetched.source.data(), fetched.source.size(), nullptr, nullptr,
+            nullptr, "main", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL0, 0,
+            &fblob, &ferrors);
+        if (SUCCEEDED(fhr) && fblob) {
+          kept.fetch_source =
+              std::make_shared<const std::string>(std::move(fetched.source));
+          kept.vertex_fetch_count = fetched.vertex_fetch_count;
+          for (uint32_t i = 0; i < fetched.vertex_fetch_count; ++i)
+            kept.vertex_fetch_slot[i] = fetched.vertex_fetch_slot[i];
+          ++g_vfetchCompiled;
+        } else {
+          ++g_vfetchRefused["FXC rejected"];
+          static uint32_t s_vf_logged = 0;
+          if (s_vf_logged++ < 6 && ferrors) {
+            std::string msg(
+                static_cast<const char*>(ferrors->GetBufferPointer()),
+                ferrors->GetBufferSize());
+            if (msg.size() > 400) msg.resize(400);
+            REXLOG_INFO("d3d9: VFETCH VS 0x{:08X} FXC REJECTED: {}", handle,
+                        msg);
+          }
+        }
+      }
+    }
+
+    // One line per distinct VERTEX shader. There are 32 of them in a run, so
+    // this is bounded and unconditional. A vertex shader that samples is the
+    // shape a bone-matrix palette takes when the engine binds it as
+    // g_BoneMatrixVectors rather than as a constant array, and it is currently
+    // refused the GPU vertex path -- see the g_gpuVertexVsSamplers counter.
+    if (stage == mx::hle::HlslStage::kVertex) {
+      REXLOG_INFO(
+          "d3d9: VS census 0x{:08X}: samplers {} (mask 0x{:X}) inputs 0x{:08X} "
+          "max const c{}",
+          handle, out.sampler_count, out.sampler_mask, out.input_mask,
+          out.max_const_index);
+    }
     if (out.sampler_array_mask) {
       REXLOG_INFO("d3d9: HLSL {} 0x{:08X} declares cube slots 0x{:X}{}",
                   stage == mx::hle::HlslStage::kPixel ? "PS" : "VS",
@@ -3040,6 +3454,18 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
   if ((seen.size() % 16) == 0 || seen.size() <= 6) {
     REXLOG_INFO("d3d9: HLSL {} coverage over {} shaders: {}", tag, seen.size(),
                 HlslCoverageSummary(cov));
+  }
+  // Every new vertex shader, not on the coverage report's schedule: that one
+  // fires at 6 and then at multiples of 16, so a run ending at 11 shaders never
+  // shows its final tally -- which is exactly what happened the first time.
+  if (stage == mx::hle::HlslStage::kVertex) {
+    std::string refused;
+    for (const auto& [why, n] : g_vfetchRefused)
+      refused += fmt::format(" {}={}", why, n);
+    REXLOG_INFO(
+        "d3d9: VFETCH coverage: {} of {} vertex shaders fetch on the GPU;{}",
+        g_vfetchCompiled, seen.size(),
+        refused.empty() ? " none refused" : refused);
   }
 }
 

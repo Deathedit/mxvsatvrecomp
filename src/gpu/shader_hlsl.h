@@ -86,6 +86,13 @@ enum class HlslStatus : uint8_t {
   kLoopRelative,          // aL-relative index; no honest value for aL
   kInstructionCap,
   kNoOutput,              // executed, but never wrote position (VS) or colour (PS)
+  // Vertex fetch, and only reachable when the caller asked for the fetch to be
+  // emitted. Each one means the draw stays on the CPU vertex path, which still
+  // works — so these are a cost, not a defect, and are counted apart so it is
+  // visible which decode is worth adding.
+  kVertexFetchFormat,     // a vertex format the emitter does not decode
+  kVertexFetchExpAdjust,  // non-zero exp_adjust, a scale nothing applies
+  kVertexFetchIndex,      // index operand this cannot express as SV_VertexID
 };
 
 const char* HlslStatusName(HlslStatus s);
@@ -171,6 +178,22 @@ struct HlslShader {
   // caller's job at upload time, so this index is never above 255.
   uint32_t max_const_index = 0;
   bool reads_constants = false;
+
+  // --- vertex fetch, only when the caller asked for it ----------------------
+  //
+  // The number of vfetches emitted into the body, and for each one the guest
+  // fetch slot it reads. The host fills xe_vf[i] for i < vertex_fetch_count
+  // with {byte offset of that stream in the merged raw buffer, stride, endian}.
+  //
+  // Ordinals follow program order, which is the order
+  // DecodeVertexShaderFetches pushes its attributes in — both walk the same
+  // stream the same way, so the two lists pair positionally. `fetch_slot` is
+  // still carried explicitly rather than inferred from that pairing, because a
+  // silent divergence between the two walks would misaddress geometry with no
+  // symptom at the point of the mistake.
+  static constexpr uint32_t kMaxVertexFetches = 32;
+  uint32_t vertex_fetch_count = 0;
+  uint32_t vertex_fetch_slot[kMaxVertexFetches] = {};
 };
 
 // Emit HLSL for one shader blob.
@@ -179,10 +202,18 @@ struct HlslShader {
 // emitted with the same value or the signatures will not match. Clamped to
 // kMaxHlslInterpolators.
 //
+// `emit_vertex_fetch` (vertex stage only) makes the shader perform its own
+// vfetches out of a raw guest vertex buffer bound as `xe_vb`, indexed by
+// SV_VertexID, instead of reading input elements the CPU unpacked for it. The
+// two forms are NOT interchangeable: the fetch form leaves input_mask empty and
+// needs an empty input layout plus xe_vf[], the other needs an input layout
+// built from input_mask. Emit both and keep both — the CPU path still needs the
+// second whenever the first refuses.
+//
 // Does not throw and does not loop unbounded. On failure `out.source` is empty
 // and `out.status` says why.
 bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
                     HlslStage stage, uint32_t interpolator_count,
-                    HlslShader& out);
+                    HlslShader& out, bool emit_vertex_fetch = false);
 
 }  // namespace mx::hle

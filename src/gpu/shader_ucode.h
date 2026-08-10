@@ -39,6 +39,15 @@ struct VertexAttribute {
   int      exp_adjust    = 0;
   bool     from_mini     = false;  // inherited slot/stride from a preceding full
 
+  // The index operand. Decoded but unused by the CPU path, which has always
+  // assumed the fetch index is the vertex ID. That assumption becomes
+  // load-bearing the moment the fetch is emitted into HLSL against
+  // SV_VertexID, so the fields are surfaced to be censused and checked rather
+  // than assumed a second time.
+  uint32_t src_reg         = 0;
+  uint32_t src_swizzle     = 0;  // 2 bits, which component holds the index
+  bool     is_index_rounded = false;
+
   // True when this attribute's destination register reaches the position export
   // (register 62) through the shader's ALU instructions. This is the shader
   // saying which of its inputs is the position, rather than us guessing from

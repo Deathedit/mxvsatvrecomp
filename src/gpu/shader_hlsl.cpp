@@ -21,6 +21,12 @@ const char* HlslStatusName(HlslStatus s) {
     case HlslStatus::kFetchCube: return "cube texture fetch";
     case HlslStatus::kFetch1D: return "1D texture fetch";
     case HlslStatus::kFetch3D: return "3D/stacked texture fetch";
+    case HlslStatus::kVertexFetchFormat:
+      return "vertex fetch format";
+    case HlslStatus::kVertexFetchExpAdjust:
+      return "vertex fetch exp_adjust";
+    case HlslStatus::kVertexFetchIndex:
+      return "vertex fetch index operand";
     case HlslStatus::kFetchDimensionConflict:
       return "one sampler fetched at two dimensions";
     case HlslStatus::kTooManySamplers: return "too many distinct samplers";
@@ -134,8 +140,10 @@ std::string MaskSwizzle(uint32_t mask) {
 
 class Emitter {
  public:
-  Emitter(HlslStage stage, uint32_t interpolator_count)
-      : stage_(stage), interpolators_(interpolator_count) {}
+  Emitter(HlslStage stage, uint32_t interpolator_count, bool vertex_fetch)
+      : stage_(stage),
+        interpolators_(interpolator_count),
+        vertex_fetch_(vertex_fetch) {}
 
   HlslStatus status = HlslStatus::kOk;
   uint32_t blocking_opcode = 0;
@@ -170,6 +178,11 @@ class Emitter {
   // the fetch coordinate and the assumption is unverified. Reported rather than
   // refused -- it is the hardware's own operand form either way.
   bool cube_fetch_without_cube_op = false;
+  // Vertex fetches emitted into the body, in program order. The ordinal is the
+  // index into xe_vf[] the host must fill, and it matches the order
+  // DecodeVertexShaderFetches pushes attributes in -- both walk the same stream
+  // the same way, so the host can pair them positionally.
+  uint32_t vertex_fetch_count = 0;
   std::string body;
 
   // Returns the compact slot for a guest sampler, allocating one on first use.
@@ -773,15 +786,226 @@ class Emitter {
     EmitFetchDestination(tf);
   }
 
-  // Write xe_v out through the fetch's destination swizzle. Shared by the 1D/2D
-  // and cube paths, which differ only in how they build the coordinate.
+  // A VERTEX fetch, decoded on the GPU out of the raw guest vertex buffer.
+  //
+  // The CPU used to do this: per vertex, per attribute, a stream memcpy, this
+  // format decode and this destination swizzle, at 0.48us a vertex over 289,000
+  // vertices a frame. Everything the decode needs -- format, offset, dest and
+  // dest swizzle -- comes from the INSTRUCTION, so the generated HLSL stays a
+  // pure function of the shader handle. Only the buffer base, the stride and
+  // the endian mode are runtime state, and those ride in xe_vf[].
+  //
+  // The index is SV_VertexID. Censused over a full run: every vfetch in this
+  // game reads r0.x with is_index_rounded false, so the vertex ID is what r0.x
+  // holds. A shader that indexed by anything else would need the ALU value and
+  // is refused below.
+  void EmitVertexFetch(const uc::VertexFetchInstruction& vf,
+                       uint32_t fetch_ordinal) {
+    if (vf.exp_adjust() != 0) {
+      // Decoded by the ucode reader and applied by nothing, on either path. A
+      // power-of-two scale dropped silently is wrong geometry that looks
+      // plausible, so refuse instead. Censused as always 0 in this game.
+      status = HlslStatus::kVertexFetchExpAdjust;
+      blocking_opcode = uint32_t(vf.opcode());
+      return;
+    }
+    if (vf.is_index_rounded()) {
+      status = HlslStatus::kVertexFetchIndex;
+      blocking_opcode = uint32_t(vf.opcode());
+      return;
+    }
+
+    const uint32_t fmt = uint32_t(vf.data_format());
+    // num_format_all == 0 means normalized -- the sense is inverted, which is
+    // why this reads is_normalized() rather than the raw bit. The pairing below
+    // matches d3d9_layout.cpp's ReadHleElement, NOT shader_ucode.cpp's
+    // ReadVertexAttribute: that PM4 wrapper deliberately ignores both bits, and
+    // matching it here would decode signed data as unsigned.
+    const bool sign = vf.is_signed();
+    const bool norm = vf.is_normalized();
+
+    // Sizes from VertexFormatSizeBytes (shader_ucode.cpp:114-136), in dwords.
+    uint32_t dwords = 0;
+    switch (fmt) {
+      case 6: case 7: case 25: case 31: case 36: dwords = 1; break;  // 4 bytes
+      case 26: case 32: case 37: dwords = 2; break;          // 8 bytes
+      case 57: dwords = 3; break;                            // 12 bytes
+      case 38: dwords = 4; break;                            // 16 bytes
+      default:
+        // 16/17 (k_10_11_11, k_11_11_10) and the integer 32-bit family never
+        // appear in this title's census; refusing keeps the draw on the CPU
+        // path rather than guessing at a decode nothing has exercised.
+        status = HlslStatus::kVertexFetchFormat;
+        blocking_opcode = uint32_t(vf.opcode());
+        return;
+    }
+
+    // Every fetch gets its own block. A shader with several vfetches would
+    // otherwise redeclare xe_vr and the byte address at function scope, and the
+    // scratch names below are deliberately fixed rather than uniquified.
+    Line("{");
+    const std::string n = std::to_string(fetch_ordinal);
+    const std::string base = "xe_vf[" + n + "]";
+    // offset() is in dwords, like stride().
+    Line("uint xe_vfa = " + base + ".x + xe_vid * " + base + ".y + " +
+         std::to_string(uint32_t(vf.offset()) * 4) + "u;");
+
+    const char* load = dwords == 1 ? "Load" : dwords == 2 ? "Load2"
+                     : dwords == 3 ? "Load3" : "Load4";
+    const std::string uty = dwords == 1 ? "uint" : "uint" + std::to_string(dwords);
+    Line(uty + " xe_vr = xe_vb." + load + "(xe_vfa);");
+
+    // Endian, exactly as ApplyFetchEndianFor does it on the CPU: reverse fixed
+    // width units across the attribute, 4-byte units for mode 2 and 2-byte for
+    // mode 1, WITHOUT consulting the format. A 4-byte reversal of a dword
+    // holding two 16-bit components both swaps each component and exchanges the
+    // pair, and that is the hardware's real behaviour -- the guest compiler
+    // compensates for it in the destination swizzle, so narrowing the unit by
+    // format would be wrong. Mode 2 is 7335 of 8772 fetches here and mode 1
+    // never occurs, but both are emitted rather than assumed away.
+    Line("if (" + base + ".z == 2u) xe_vr = XeSwap8in32(xe_vr);");
+    Line("else if (" + base + ".z == 1u) xe_vr = XeSwap8in16(xe_vr);");
+
+    // Unwritten components default to (0,0,0,1), matching ReadVertexAttributeAs.
+    Line("xe_v = float4(0.0, 0.0, 0.0, 1.0);");
+    EmitVertexFormatDecode(fmt, dwords, sign, norm);
+    EmitFetchDestination(vf.dest(), vf.dest_swizzle());
+    Line("}");
+    ++vertex_fetch_count;
+  }
+
+  // Turn the raw dwords in xe_vr into xe_v, per Xenos vertex format. Mirrors
+  // ReadVertexAttributeAs (shader_ucode.cpp:214-330) case for case.
+  void EmitVertexFormatDecode(uint32_t fmt, uint32_t dwords, bool sign,
+                              bool norm) {
+    const std::string r = "xe_vr";
+    auto dw = [&](uint32_t i) {
+      return dwords == 1 ? r : r + "." + std::string(1, kComponent[i]);
+    };
+    switch (fmt) {
+      // --- float formats: no num_format involvement --------------------------
+      case 36:  // k_32_FLOAT (not in the census, but free alongside 37/57/38)
+        Line("xe_v.x = asfloat(" + dw(0) + ");");
+        break;
+      case 37:  // k_32_32_FLOAT
+        Line("xe_v.xy = asfloat(" + r + ".xy);");
+        break;
+      case 57:  // k_32_32_32_FLOAT
+        Line("xe_v.xyz = asfloat(" + r + ".xyz);");
+        break;
+      case 38:  // k_32_32_32_32_FLOAT
+        Line("xe_v = asfloat(" + r + ");");
+        break;
+      case 31:  // k_16_16_FLOAT -- two halves packed in one dword
+        Line("xe_v.x = f16tof32(" + dw(0) + " & 0xFFFFu);");
+        Line("xe_v.y = f16tof32(" + dw(0) + " >> 16);");
+        break;
+      case 32:  // k_16_16_16_16_FLOAT
+        Line("xe_v.x = f16tof32(" + r + ".x & 0xFFFFu);");
+        Line("xe_v.y = f16tof32(" + r + ".x >> 16);");
+        Line("xe_v.z = f16tof32(" + r + ".y & 0xFFFFu);");
+        Line("xe_v.w = f16tof32(" + r + ".y >> 16);");
+        break;
+
+      // --- integer formats: num_format decides the scaling -------------------
+      case 25:    // k_16_16 (absent from the census; free alongside 26)
+        EmitInt16Pair("xe_v.xy", dw(0), sign, norm, 0);
+        break;
+      case 26:    // k_16_16_16_16
+        EmitInt16Pair("xe_v.xy", r + ".x", sign, norm, 0);
+        EmitInt16Pair("xe_v.zw", r + ".y", sign, norm, 1);
+        break;
+      case 6: {  // k_8_8_8_8 -- component 0 is the LOW byte
+        for (uint32_t i = 0; i < 4; ++i) {
+          const std::string b =
+              "((" + dw(0) + " >> " + std::to_string(i * 8) + ") & 0xFFu)";
+          const std::string comp = "xe_v." + std::string(1, kComponent[i]);
+          if (sign) {
+            // Sign-extend the byte, then normalise by 127 as Norm(S8) does.
+            Line("int xe_s8_" + std::to_string(i) + " = int(" + b +
+                 " ^ 0x80u) - 128;");
+            const std::string s = "xe_s8_" + std::to_string(i);
+            Line(comp + " = " +
+                 (norm ? "max(float(" + s + ") / 127.0, -1.0)" : "float(" + s + ")") +
+                 ";");
+          } else {
+            Line(comp + " = " +
+                 (norm ? "float(" + b + ") / 255.0" : "float(" + b + ")") + ";");
+          }
+        }
+        break;
+      }
+      case 7: {  // k_2_10_10_10 -- three 10-bit then a 2-bit at bits 30-31
+        for (uint32_t i = 0; i < 3; ++i) {
+          const std::string f =
+              "((" + dw(0) + " >> " + std::to_string(i * 10) + ") & 0x3FFu)";
+          const std::string comp = "xe_v." + std::string(1, kComponent[i]);
+          if (sign) {
+            Line("int xe_s10_" + std::to_string(i) + " = int(" + f +
+                 " ^ 0x200u) - 512;");
+            const std::string s = "xe_s10_" + std::to_string(i);
+            Line(comp + " = " +
+                 (norm ? "max(float(" + s + ") / 511.0, -1.0)" : "float(" + s + ")") +
+                 ";");
+          } else {
+            Line(comp + " = " +
+                 (norm ? "float(" + f + ") / 1023.0" : "float(" + f + ")") + ";");
+          }
+        }
+        {
+          const std::string f = "((" + dw(0) + " >> 30) & 0x3u)";
+          if (sign) {
+            Line("int xe_s2 = int(" + f + " ^ 0x2u) - 2;");
+            Line("xe_v.w = " +
+                 std::string(norm ? "max(float(xe_s2) / 1.0, -1.0)"
+                                  : "float(xe_s2)") + ";");
+          } else {
+            Line("xe_v.w = " +
+                 std::string(norm ? "float(" + f + ") / 3.0" : "float(" + f + ")") +
+                 ";");
+          }
+        }
+        break;
+      }
+      default:
+        // Unreachable: EmitVertexFetch refuses anything not listed above.
+        status = HlslStatus::kVertexFetchFormat;
+        break;
+    }
+  }
+
+  // Two 16-bit components out of one dword, low half first.
+  void EmitInt16Pair(const std::string& dst, const std::string& src, bool sign,
+                     bool norm, uint32_t half) {
+    const std::string a = "xe_h" + std::to_string(half);
+    if (sign) {
+      Line("int2 " + a + " = int2(int((" + src + " & 0xFFFFu) ^ 0x8000u) - 32768,"
+           " int((" + src + " >> 16) ^ 0x8000u) - 32768);");
+      Line(dst + " = " +
+           (norm ? "max(float2(" + a + ") / 32767.0, -1.0)" : "float2(" + a + ")") +
+           ";");
+    } else {
+      Line("uint2 " + a + " = uint2(" + src + " & 0xFFFFu, " + src + " >> 16);");
+      Line(dst + " = " +
+           (norm ? "float2(" + a + ") / 65535.0" : "float2(" + a + ")") + ";");
+    }
+  }
+
   void EmitFetchDestination(const uc::TextureFetchInstruction& tf) {
+    EmitFetchDestination(tf.dest(), tf.dest_swizzle());
+  }
+
+  // Write xe_v out through the fetch's destination swizzle. Shared by the 1D/2D
+  // and cube texture paths and by the vertex fetch, which differ only in how
+  // they produce xe_v. Takes the two fields rather than an instruction because
+  // TextureFetchInstruction and VertexFetchInstruction are unrelated types that
+  // happen to spell these identically.
+  void EmitFetchDestination(uint32_t dest, uint32_t dswiz) {
     // The destination swizzle is three bits per component: 0-3 select x/y/z/w
     // of the fetched value, 4 is 0.0, 5 is 1.0, and 7 means keep — which is what
     // lets two fetches share a destination register, so ignoring it would
     // clobber.
-    const uint32_t dswiz = tf.dest_swizzle();
-    const std::string dst = Temp(tf.dest());
+    const std::string dst = Temp(dest);
     for (uint32_t c = 0; c < 4; ++c) {
       switch (uc::GetFetchDestinationComponentSwizzle(dswiz, c)) {
         case uc::FetchDestinationSwizzle::kX:
@@ -803,19 +1027,24 @@ class Emitter {
           break;  // kKeep, and the one undefined encoding
       }
     }
-    MarkWritten(tf.dest());
+    MarkWritten(dest);
   }
 
  private:
   HlslStage stage_;
   uint32_t interpolators_;
+  bool vertex_fetch_ = false;
 };
 
 }  // namespace
 
 bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
                     HlslStage stage, uint32_t interpolator_count,
-                    HlslShader& out) {
+                    HlslShader& out, bool emit_vertex_fetch) {
+  // Only the vertex stage has vertex fetches. Asking for them on a pixel shader
+  // is a caller mistake, and silently honouring it would emit a buffer
+  // declaration nothing binds.
+  if (stage == HlslStage::kPixel) emit_vertex_fetch = false;
   out = {};
   if (interpolator_count > kMaxHlslInterpolators)
     interpolator_count = kMaxHlslInterpolators;
@@ -843,8 +1072,14 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
     return false;
   }
 
-  Emitter em(stage, interpolator_count);
+  Emitter em(stage, interpolator_count, emit_vertex_fetch);
   uint32_t executed = 0;
+  // Vertex fetch bookkeeping, unused unless emit_vertex_fetch. `fetch_slot_of`
+  // tells the host which guest stream each xe_vf[] entry addresses.
+  uint32_t vfetch_ordinal = 0;
+  uint32_t last_full_slot = 0;
+  bool have_full = false;
+  uint32_t fetch_slot_of[HlslShader::kMaxVertexFetches] = {};
 
   for (uint32_t i = 0; i + 2 < max_cf_dword; i += 3) {
     uc::ControlFlowInstruction cf[2];
@@ -873,11 +1108,37 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
         // Bit 0 of each 2-bit sequence slot says "this is a fetch", exactly as
         // DecodePixelTextureFetches reads it.
         if ((seq >> (n * 2)) & 0x1) {
-          if ((dwords[at] & 0x1F) != uint32_t(uc::FetchOpcode::kTextureFetch))
-            continue;  // a vertex fetch; the layout path owns those
-          uc::TextureFetchInstruction tf{};
-          std::memcpy(&tf, dwords + at, sizeof(tf));
-          em.EmitTextureFetch(tf);
+          if ((dwords[at] & 0x1F) != uint32_t(uc::FetchOpcode::kTextureFetch)) {
+            // A vertex fetch. Without emit_vertex_fetch the host input assembler
+            // performs it and skipping is what leaves the destination register
+            // unwritten, which is precisely how input_mask is produced. With it,
+            // the shader reads the raw guest buffer itself.
+            if (!emit_vertex_fetch) continue;
+            if (vfetch_ordinal >= HlslShader::kMaxVertexFetches) {
+              out.status = HlslStatus::kVertexFetchFormat;
+              return false;
+            }
+            uc::VertexFetchInstruction vf{};
+            std::memcpy(&vf, dwords + at, sizeof(vf));
+            // Mini fetches inherit the fetch constant from the preceding full
+            // one, exactly as DecodeVertexShaderFetches does. Their own field
+            // reads garbage, so consuming it unconditionally would address the
+            // wrong stream.
+            if (!vf.is_mini_fetch()) {
+              last_full_slot = vf.fetch_constant_index();
+              have_full = true;
+            } else if (!have_full) {
+              out.status = HlslStatus::kVertexFetchIndex;
+              return false;
+            }
+            em.EmitVertexFetch(vf, vfetch_ordinal);
+            fetch_slot_of[vfetch_ordinal] = last_full_slot;
+            ++vfetch_ordinal;
+          } else {
+            uc::TextureFetchInstruction tf{};
+            std::memcpy(&tf, dwords + at, sizeof(tf));
+            em.EmitTextureFetch(tf);
+          }
         } else {
           uc::AluInstruction alu{};
           std::memcpy(&alu, dwords + at, sizeof(alu));
@@ -919,11 +1180,22 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   // Per-component TextureSign scale, host component order, 1.0 where the fetch
   // is plain unsigned. See the note at the fetch site. Pixel stage only, both
   // because no vertex shader in this game samples anything and because the
-  // vertex cbuffer is addressed by the renderer at a fixed offset just past
-  // xe_texinv -- adding a member there would silently move it.
+  // vertex cbuffer's xe_vf is addressed by the renderer at a fixed offset just
+  // past xe_texinv -- adding a member there would silently move it.
   if (stage == HlslStage::kPixel) {
     src += "  float4 xe_texsign[" +
            std::to_string(HlslShader::kMaxSamplerSlots) + "];\n";
+  }
+  // One entry per emitted vertex fetch: .x the byte offset of this attribute's
+  // stream within the merged raw buffer (with first_vertex already folded in),
+  // .y the stream stride, .z the endian mode. Everything else the decode needs
+  // came from the instruction and is already baked into the code below.
+  //
+  // Always declared for the vertex stage, even at zero fetches, so the constant
+  // buffer this shader is handed has one layout rather than two.
+  if (stage != HlslStage::kPixel) {
+    src += "  uint4 xe_vf[" + std::to_string(HlslShader::kMaxVertexFetches) +
+           "];\n";
   }
   src += "};\n";
   // RECIP_FF / RECIPSQ_FF: an infinity becomes a signed zero. See the note at
@@ -992,6 +1264,46 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
       "  float4 p = XeMul(a, b);\n"
       "  return p.x + p.y + p.z + p.w;\n"
       "}\n";
+  if (em.vertex_fetch_count) {
+    // t16, not (t0, space1): register spaces need shader model 5.1 and this
+    // compiles vs_5_0. The pixel stage's descriptor table covers t0..t15 --
+    // kMaxSamplerSlots of them -- so t16 is the first free register and cannot
+    // collide with it whatever the visibility.
+    static_assert(HlslShader::kMaxSamplerSlots == 16,
+                  "xe_vb sits at t16 because the texture table ends at t15");
+    src += "ByteAddressBuffer xe_vb : register(t16);\n";
+    // The endian shuffles, matching ApplyFetchEndianFor: whole-attribute
+    // reversal in fixed units, applied per dword because the CPU loop reverses
+    // each 4-byte unit independently.
+    src +=
+        "uint XeSwap8in32(uint v) {\n"
+        "  return ((v & 0x000000FFu) << 24) | ((v & 0x0000FF00u) << 8) |\n"
+        "         ((v & 0x00FF0000u) >> 8)  | ((v & 0xFF000000u) >> 24);\n"
+        "}\n"
+        "uint XeSwap8in16(uint v) {\n"
+        "  return ((v & 0x00FF00FFu) << 8) | ((v & 0xFF00FF00u) >> 8);\n"
+        "}\n"
+        "uint2 XeSwap8in32(uint2 v) {\n"
+        "  return uint2(XeSwap8in32(v.x), XeSwap8in32(v.y));\n"
+        "}\n"
+        "uint2 XeSwap8in16(uint2 v) {\n"
+        "  return uint2(XeSwap8in16(v.x), XeSwap8in16(v.y));\n"
+        "}\n"
+        "uint3 XeSwap8in32(uint3 v) {\n"
+        "  return uint3(XeSwap8in32(v.x), XeSwap8in32(v.y), XeSwap8in32(v.z));\n"
+        "}\n"
+        "uint3 XeSwap8in16(uint3 v) {\n"
+        "  return uint3(XeSwap8in16(v.x), XeSwap8in16(v.y), XeSwap8in16(v.z));\n"
+        "}\n"
+        "uint4 XeSwap8in32(uint4 v) {\n"
+        "  return uint4(XeSwap8in32(v.x), XeSwap8in32(v.y), XeSwap8in32(v.z),\n"
+        "               XeSwap8in32(v.w));\n"
+        "}\n"
+        "uint4 XeSwap8in16(uint4 v) {\n"
+        "  return uint4(XeSwap8in16(v.x), XeSwap8in16(v.y), XeSwap8in16(v.z),\n"
+        "               XeSwap8in16(v.w));\n"
+        "}\n";
+  }
   // Declared for EVERY slot up to sampler_count, contiguously from t0/s0, so
   // the registers match a descriptor table of exactly that width.
   //
@@ -1027,20 +1339,30 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
     src += "};\n";
     src += "XePsOut main(XeInterpolants xe_in) {\n";
   } else {
-    // A vertex shader's inputs are its vfetch destinations. The fetches
-    // themselves are not emitted here — the host input assembler performs them,
-    // driven by the layout DecodeVertexShaderFetches already recovers — so each
-    // register the body reads before writing becomes one input element. The
-    // caller must build its input layout from input_mask, in this same order,
-    // or the semantics will not match.
-    src += "struct XeVsIn {\n";
-    for (uint32_t i = 0; i < kNumTemps && i < 32; ++i) {
-      if (!(em.input_mask & (1u << i))) continue;
-      const std::string n = std::to_string(i);
-      src += "  float4 v" + n + " : TEXCOORD" + n + ";\n";
+    // Two shapes, and which one this is depends on emit_vertex_fetch.
+    //
+    // Without it, a vertex shader's inputs are its vfetch destinations: the
+    // fetches are skipped here, the host input assembler performs them driven by
+    // the layout DecodeVertexShaderFetches recovers, and each register the body
+    // reads before writing becomes one input element. The caller must build its
+    // input layout from input_mask, in this same order.
+    //
+    // With it, the shader fetches for itself out of xe_vb and the only input is
+    // the vertex ID. input_mask is then normally empty — a register still in it
+    // is one the body reads that no vfetch writes, which reads zero on hardware
+    // too, so it needs no element either.
+    if (emit_vertex_fetch) {
+      src += "XeInterpolants main(uint xe_vid : SV_VertexID) {\n";
+    } else {
+      src += "struct XeVsIn {\n";
+      for (uint32_t i = 0; i < kNumTemps && i < 32; ++i) {
+        if (!(em.input_mask & (1u << i))) continue;
+        const std::string n = std::to_string(i);
+        src += "  float4 v" + n + " : TEXCOORD" + n + ";\n";
+      }
+      src += "};\n";
+      src += "XeInterpolants main(XeVsIn xe_in) {\n";
     }
-    src += "};\n";
-    src += "XeInterpolants main(XeVsIn xe_in) {\n";
   }
 
   src += "  float4 r[" + std::to_string(kNumTemps) + "];\n";
@@ -1068,10 +1390,12 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
     }
     if (em.writes_depth) src += "  float xe_depth = 0.0;\n";
   } else {
-    for (uint32_t i = 0; i < kNumTemps && i < 32; ++i) {
-      if (!(em.input_mask & (1u << i))) continue;
-      src += "  r[" + std::to_string(i) + "] = xe_in.v" + std::to_string(i) +
-             ";\n";
+    if (!emit_vertex_fetch) {
+      for (uint32_t i = 0; i < kNumTemps && i < 32; ++i) {
+        if (!(em.input_mask & (1u << i))) continue;
+        src += "  r[" + std::to_string(i) + "] = xe_in.v" + std::to_string(i) +
+               ";\n";
+      }
     }
     src += "  float4 xe_pos = float4(0, 0, 0, 1);\n";
     for (uint32_t i = 0; i < link; ++i)
@@ -1114,6 +1438,9 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   out.writes_depth = em.writes_depth;
   out.max_const_index = em.max_const_index;
   out.reads_constants = em.reads_constants;
+  out.vertex_fetch_count = em.vertex_fetch_count;
+  for (uint32_t i = 0; i < em.vertex_fetch_count; ++i)
+    out.vertex_fetch_slot[i] = fetch_slot_of[i];
   return true;
 }
 
