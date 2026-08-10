@@ -200,6 +200,45 @@ int main() {
           "2-byte blocks are endian-swapped");
   }
 
+  // PACKED MIP TAIL. A texture 16 texels or smaller stores its base level at an
+  // offset inside the tail, not at the origin. The offsets come from the SDK's
+  // GetPackedMipOffset -- for an 8x8 DXT1 it reports x=4 blocks -- and this
+  // checks the decode actually reads from there. Before the fix every such
+  // texture returned the bytes at x=0, which belong to a different image.
+  {
+    HleTextureSource packed{};
+    packed.width = 8;
+    packed.height = 8;
+    packed.block_width = packed.block_height = 4;  // DXT1: 2x2 blocks
+    packed.bytes_per_block = 8;
+    packed.pitch_blocks = 8;
+    packed.packed_offset_x_blocks = 4;
+    packed.host_format = HostTextureFormat::kBc1;
+    packed.source_bytes = 6 * 8;  // (2 + 4) blocks across one row
+    // One byte per block, so the value at a block says where it was read from.
+    std::vector<uint8_t> tail(8 * 2 * 8, 0);
+    for (uint32_t by = 0; by < 2; ++by)
+      for (uint32_t bx = 0; bx < 8; ++bx)
+        tail[(by * 8 + bx) * 8] = uint8_t(0x10 * by + bx);
+    HleTexturePayload outp;
+    Check(DecodeHleTexture2D(packed, tail.data(), tail.size(), outp, &why),
+          "packed mip tail decode");
+    // Block (0,0) of the image must be block (4,0) of the tail, not (0,0).
+    Check(outp.data.size() == 2 * 2 * 8, "packed decode extent is the image");
+    Check(outp.data[0] == 0x04 && outp.data[8] == 0x05,
+          "packed base reads from the tail offset, not the origin");
+    Check(outp.data[16] == 0x14 && outp.data[24] == 0x15,
+          "packed base second block row");
+
+    // The identity case: no offset must read from the origin exactly as before.
+    HleTextureSource unpacked = packed;
+    unpacked.packed_offset_x_blocks = 0;
+    Check(DecodeHleTexture2D(unpacked, tail.data(), tail.size(), outp, &why),
+          "unpacked decode");
+    Check(outp.data[0] == 0x00 && outp.data[8] == 0x01,
+          "a zero offset is the identity");
+  }
+
   Check(!DecodeHleTexture2D(linear, rgba, sizeof(rgba) - 1, decoded, &why),
         "truncated source rejected");
   uint32_t fetchA[6] = {1,2,3,4,5,6};

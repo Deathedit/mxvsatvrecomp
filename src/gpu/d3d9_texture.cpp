@@ -239,14 +239,34 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
   out.linear_filter = fetch.min_filter != xenos::TextureFilter::kPoint &&
                       fetch.mag_filter != xenos::TextureFilter::kPoint;
 
+  // The base level of a small texture is inside the packed mip tail, not at the
+  // origin. GetPackedMipOffset reports false for anything whose base is stored
+  // plainly, so this is self-gating: only textures with a dimension of 16 or
+  // less come back packed, and everything larger keeps a zero offset.
+  //
+  // Gated on the fetch constant's flag as well, because the tail only exists if
+  // the guest asked for one -- see xenos.h:1265, packed_mips at bit +11.
+  if (fetch.packed_mips) {
+    uint32_t px = 0, py = 0, pz = 0;
+    if (tu::GetPackedMipOffset(out.width, out.height, 1, format, /*mip=*/0, px,
+                               py, pz)) {
+      out.packed_offset_x_blocks = px;
+      out.packed_offset_y_blocks = py;
+    }
+  }
+  // The extent has to cover the offset too, or the bounds check in the decode
+  // rejects every block of a packed texture as "outside source".
+  const uint32_t reach_x_blocks = width_blocks + out.packed_offset_x_blocks;
+  const uint32_t reach_y_blocks = height_blocks + out.packed_offset_y_blocks;
+
   if (out.tiled) {
     const uint32_t bpb_log2 = std::bit_width(out.bytes_per_block) - 1;
     out.source_bytes = tu::GetTiledAddressUpperBound2D(
-        width_blocks, height_blocks, out.pitch_blocks, bpb_log2);
+        reach_x_blocks, reach_y_blocks, out.pitch_blocks, bpb_log2);
   } else {
     const uint64_t row = uint64_t(out.pitch_blocks) * out.bytes_per_block;
-    const uint64_t extent = row * (height_blocks - 1) +
-                            uint64_t(width_blocks) * out.bytes_per_block;
+    const uint64_t extent = row * (reach_y_blocks - 1) +
+                            uint64_t(reach_x_blocks) * out.bytes_per_block;
     if (extent > UINT32_MAX) return reject("texture extent overflow");
     out.source_bytes = uint32_t(extent);
   }
@@ -314,11 +334,16 @@ bool DecodeHleTexture2D(const HleTextureSource& source,
     uint8_t* slice_out = out.data.data() + uint64_t(slice) * slice_tight;
     for (uint32_t y = 0; y < hb; ++y) {
       for (uint32_t x = 0; x < wb; ++x) {
+        // Read coordinates, which are the write coordinates displaced into the
+        // packed mip tail. Both zero for any texture bigger than 16 texels, so
+        // this is the identity for the overwhelming majority of textures.
+        const uint32_t sx = x + source.packed_offset_x_blocks;
+        const uint32_t sy = y + source.packed_offset_y_blocks;
         const uint64_t src = slice_base +
             (source.tiled
-                 ? uint64_t(tu::GetTiledOffset2D(x, y, source.pitch_blocks,
+                 ? uint64_t(tu::GetTiledOffset2D(sx, sy, source.pitch_blocks,
                                                  bpb_log2))
-                 : (uint64_t(y) * source.pitch_blocks + x) *
+                 : (uint64_t(sy) * source.pitch_blocks + sx) *
                        source.bytes_per_block);
         if (src + source.bytes_per_block > guest_bytes)
           return reject("tiled block outside source");

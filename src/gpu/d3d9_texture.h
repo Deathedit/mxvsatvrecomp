@@ -37,6 +37,21 @@ struct HleTextureSource {
   // (0 when array_size is 1). Both come from GetGuestTextureLayout.
   uint32_t array_size = 1;
   uint32_t slice_stride_bytes = 0;
+  // PACKED MIP TAIL. A texture whose width OR height is 16 or smaller does not
+  // store its BASE level plainly at base_address: the level lives inside a mip
+  // tail, offset by these block counts. From the SDK,
+  // rex/graphics/pipeline/texture/util.h:77 -- "the mip tail can be used both
+  // for the base level and mips (1...) if the entire texture has width or
+  // height of 16 or smaller", and the game's own tiling routine checks only the
+  // packed flag, never the level.
+  //
+  // The offsets are not decorative. Measured against the SDK for an 8x8 DXT1
+  // the base sits at x=4 blocks, and for an 8x8 k_8_8_8_8 at x=16 -- so reading
+  // from the origin returns a whole texture's worth of unrelated bytes. Zero
+  // for anything larger than 16, and zero when the fetch constant does not set
+  // packed_mips.
+  uint32_t packed_offset_x_blocks = 0;
+  uint32_t packed_offset_y_blocks = 0;
   bool tiled = false;
   bool linear_filter = true;
   HostTextureFormat host_format = HostTextureFormat::kRgba8;
