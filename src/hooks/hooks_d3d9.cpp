@@ -4707,6 +4707,27 @@ void NoteSignedBind(const mx::hle::HleTextureSource& source) {
               by);
 }
 
+// Blast radius of the packed mip tail. A texture whose base is packed used to
+// be read from the origin of the tail rather than from its own offset within
+// it, so every one of these was returning another texture's bytes. Counted by
+// extent and format so the population is visible rather than inferred from the
+// one 8x8 DXT1 lookup that made it findable -- that one multiplies the menu's
+// deferred lighting, which is why the whole scene came out black.
+void NotePackedBase(const mx::hle::HleTextureSource& source) {
+  if (!source.packed_offset_x_blocks && !source.packed_offset_y_blocks) return;
+  static std::map<uint64_t, uint64_t> s_seen;
+  const uint64_t k = (uint64_t(source.guest_format) << 32) |
+                     (uint64_t(source.width) << 16) | source.height;
+  const uint64_t n = ++s_seen[k];
+  if (n != 1 && (n % 20000) != 0) return;
+  std::string by;
+  for (const auto& [key, v] : s_seen)
+    by += fmt::format(" {}x{}/fmt{}={}", (key >> 16) & 0xFFFF, key & 0xFFFF,
+                      uint32_t(key >> 32), v);
+  REXLOG_INFO("d3d9: textures read from a PACKED MIP TAIL, {} distinct:{}",
+              s_seen.size(), by);
+}
+
 // A sign mode that reaches a bind and is NOT applied. kSigned needs the
 // texture's bits reinterpreted into a signed host format (a decode change, task
 // #43); kGamma needs an sRGB curve. Neither is approximated here -- an
@@ -4801,6 +4822,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     return false;
   }
   NoteSignedBind(source);
+  NotePackedBase(source);
   // Permuted into host component order here, at the bind, because this is
   // per-binding state: the same guest memory is sampled with different sign
   // modes by different draws. Applied by the shader after the fetch, which is

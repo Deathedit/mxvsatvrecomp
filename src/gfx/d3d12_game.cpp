@@ -673,6 +673,40 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
     slots[i].useSwizzle = true;
   }
 
+  // SLOT CENSUS. The menu's deferred lighting shader declares three textures
+  // and its third sample returns (0,0,0,1) -- the exact pattern of a
+  // single-channel read of zero, or of a null descriptor. Which one it is
+  // cannot be told from a capture: RenderDoc reports the slot by NAME, so
+  // mapping slot to resource there means brute-forcing every resource in the
+  // frame. It is one line from this side, where both halves are in hand.
+  //
+  // Once per pixel shader handle, bounded, so it costs nothing after the first
+  // sighting of each. What it answers: whether pixelSamplerCount agrees with
+  // what the shader declares, and for every slot, whether it came from a
+  // resolve snapshot or a CPU texture, and at what format and extent.
+  if (d.pixelShaderHandle) {
+    static std::unordered_set<uint32_t> s_censused;
+    if (s_censused.size() < 64 && s_censused.insert(d.pixelShaderHandle).second) {
+      std::string slotDesc;
+      for (uint32_t i = 0; i < d.pixelSamplerCount && i < kTranslatedSamplerSlots;
+           ++i) {
+        if (!slots[i].resource) {
+          slotDesc += fmt::format(" [{}]=NONE", i);
+          continue;
+        }
+        const D3D12_RESOURCE_DESC rd = slots[i].resource->GetDesc();
+        slotDesc += fmt::format(" [{}]={} {}x{} fmt{}{}", i,
+                                slots[i].useSwizzle ? "tex" : "snap",
+                                uint32_t(rd.Width), rd.Height,
+                                uint32_t(slots[i].format),
+                                slots[i].useSwizzle ? "" : " (no swizzle)");
+      }
+      REXLOG_INFO("d3d12: PS 0x{:08X} slot census: count {}, array mask 0x{:X};{}",
+                  d.pixelShaderHandle, d.pixelSamplerCount,
+                  d.pixelSamplerArrayMask, slotDesc);
+    }
+  }
+
   auto cpu = m_translatedSrvHeap->GetCPUDescriptorHandleForHeapStart();
   cpu.ptr += SIZE_T(block) * kTranslatedSamplerSlots * m_gameSrvDescriptorSize;
   for (uint32_t i = 0; i < kTranslatedSamplerSlots; ++i) {
