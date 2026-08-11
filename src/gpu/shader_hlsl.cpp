@@ -150,6 +150,7 @@ class Emitter {
   uint32_t input_mask = 0;
   uint32_t written_mask = 0;   // temps this shader has written so far
   uint32_t export_mask = 0;
+  uint32_t dropped_export_mask = 0;
   uint32_t color_mask = 0;
   bool writes_position = false;
   bool writes_depth = false;
@@ -601,6 +602,13 @@ class Emitter {
         // An export we do not link: a point size, a misc output, or an
         // interpolator past the agreed linkage width. Dropped, not faked — but
         // the ALU side effects above have already been emitted.
+        //
+        // Recorded rather than discarded silently. A draw was investigated at
+        // length whose pixel shader read three interpolators the vertex stage
+        // never supplied, and from outside the emitter there was no way to tell
+        // whether the walk had seen those exports and rejected them here or had
+        // never reached them at all.
+        if (dest < 32) dropped_export_mask |= 1u << dest;
         return;
       }
       const uint32_t zero_mask = alu.GetConstant0WriteMask();
@@ -1232,15 +1240,40 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   // 0 * INF = +0 and the specular term simply vanishes; we computed NaN and
   // every pixel of the rider and the bike came out NaN.
   //
-  // Only exact zero is tested, not denormals: the hardware flushes denormal
-  // inputs to zero before the multiply, and so does every host GPU we target.
+  // DENORMALS COUNT AS ZERO, and this is not a refinement -- it is the rule as
+  // the SDK states it: "+-0 OR DENORMAL * anything = +0". An earlier version of
+  // this comment argued that testing exact zero was enough because the hardware
+  // flushes denormal inputs before the multiply. That conflated two different
+  // things: the input flush is about how an operand is READ, while this rule is
+  // about what the PRODUCT is. A denormal times a large value, or times an
+  // infinity, is a finite +0 on this hardware and an INF or a NaN under IEEE.
+  //
+  // This is a CORRECTNESS fix and nothing more. It is deliberately not credited
+  // with any visible defect: it was written while chasing the rider's black
+  // lower body, where a trace showed NaN appearing at instruction 3 out of an
+  // all-zero register -- but that same NaN appears in the runs where the rider
+  // renders correctly, so it is not what distinguishes them, and the build
+  // carrying this change left the lower body exactly as black as before.
+  //
+  // The comparison is against FLT_MIN, the smallest NORMAL float: anything
+  // below it in magnitude is a denormal or a zero, which is exactly the set
+  // this rule collapses. abs() rather than two comparisons so a negative
+  // denormal is caught, and the returned zero is positive in every case, per
+  // "The result is always positive zero [...] no matter what the signs of the
+  // other operands are".
+  //
+  // NaN is deliberately NOT caught here: abs(NaN) < FLT_MIN is false, so a NaN
+  // operand still propagates through the multiply, which is what the hardware
+  // does. Only zeros and denormals are collapsed.
   //
   // mad stays unfused and is emitted as XeMul(a, b) + c rather than as a select
   // on c -- per the same note, +0 + -0 is +0, so a zero multiplicand must still
   // go through the add.
   src +=
       "float XeMul(float a, float b) {\n"
-      "  return (a == 0.0 || b == 0.0) ? 0.0 : a * b;\n"
+      "  return (abs(a) < 1.175494351e-38 || abs(b) < 1.175494351e-38)\n"
+      "             ? 0.0\n"
+      "             : a * b;\n"
       "}\n"
       "float2 XeMul(float2 a, float2 b) {\n"
       "  return float2(XeMul(a.x, b.x), XeMul(a.y, b.y));\n"
@@ -1434,6 +1467,7 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
     out.sampler_slot_guest[i] = em.slot_guest[i];
   out.input_mask = em.input_mask;
   out.export_mask = stage == HlslStage::kPixel ? em.color_mask : em.export_mask;
+  out.dropped_export_mask = em.dropped_export_mask;
   out.writes_position = em.writes_position;
   out.writes_depth = em.writes_depth;
   out.max_const_index = em.max_const_index;

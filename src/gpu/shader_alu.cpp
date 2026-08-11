@@ -272,13 +272,22 @@ class Interpreter {
     }
   }
 
-  // Direct3D 9 legacy multiply: a zero multiplicand yields +0 regardless of the
-  // other operand, so 0 * INF is +0 and not NaN. Every multiplying operation on
-  // this hardware behaves this way -- see the note above AluScalarOpcode in the
-  // SDK's ucode.h, and the matching XeMul in shader_hlsl.cpp. Titles rely on it
-  // for vector normalisation written as rcp-then-mul.
+  // Direct3D 9 legacy multiply: a zero OR DENORMAL multiplicand yields +0
+  // regardless of the other operand, so 0 * INF is +0 and not NaN. Every
+  // multiplying operation on this hardware behaves this way -- see the note
+  // above AluScalarOpcode in the SDK's ucode.h ("+-0 or denormal * anything =
+  // +0"), and the matching XeMul in shader_hlsl.cpp, which carries the longer
+  // explanation of why denormals belong here. Titles rely on this for vector
+  // normalisation written as rcp-then-mul.
+  //
+  // Keep the two in step. They have the same contract and a divergence between
+  // the interpreter and the emitter is invisible until a draw silently changes
+  // colour depending on which path served it.
   static float LegacyMul(float a, float b) {
-    return (a == 0.0f || b == 0.0f) ? 0.0f : a * b;
+    constexpr float kSmallestNormal = 1.175494351e-38f;
+    return (std::fabs(a) < kSmallestNormal || std::fabs(b) < kSmallestNormal)
+               ? 0.0f
+               : a * b;
   }
 
   Vec4 VectorOp(const uc::AluInstruction& alu) {

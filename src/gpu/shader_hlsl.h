@@ -169,6 +169,14 @@ struct HlslShader {
   bool writes_position = false;  // VS: exported to register 62
   bool writes_depth = false;     // PS: exported to register 61
 
+  // Bit i set = the shader exported to destination i and the emitter DISCARDED
+  // it: a point size, a misc output, or an interpolator past the agreed linkage
+  // width. Reported rather than dropped in silence, because "the walk saw no
+  // exports" and "the walk saw exports and threw them away" are different
+  // defects with different fixes, and until this existed they were
+  // indistinguishable from outside. Destinations >= 32 are not represented.
+  uint32_t dropped_export_mask = 0;
+
   // The highest constant index the shader reads within its OWN stage bank, or
   // 0 if it reads none. Each stage indexes its bank from 0: the vertex bank is
   // ALU constants 0-255 at device+0x780, the pixel bank is 256-511 at
