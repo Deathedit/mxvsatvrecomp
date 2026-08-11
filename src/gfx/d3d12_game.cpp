@@ -637,6 +637,26 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
         // substitution is what put white over the Bink logo composite. The menu
         // scene did not come back either. Removed rather than left in as a
         // plausible-looking no-op.
+        // CLASSIFY, do not substitute. What the missing image would have held
+        // is recorded by the resolve (m_resolveDestIsDepth) and is worth
+        // counting, because it corrected a wrong reading: "no-snapshot 378"
+        // sitting near "stand-in depth refused 384" in mx_958 looked like the
+        // missing snapshots being overwhelmingly depth-sourced, and they are
+        // not. mx_960 split 613 into depth 165 and never-resolved 448, so the
+        // question is why those resolves never arrive, not what to bind in
+        // their place.
+        //
+        // Binding a substitute was tried here and reverted with the
+        // fabricatedWhite change it depended on -- see that gate. Leave the
+        // draw failing, which is what keeps it out of the stand-in and off the
+        // screen as white.
+        if (const auto kind = m_resolveDestIsDepth.find(object);
+            kind == m_resolveDestIsDepth.end())
+          ++m_noSnapshotUnknown;
+        else if (kind->second)
+          ++m_noSnapshotDepth;
+        else
+          ++m_noSnapshotColour;
         ++m_translatedNoSnapshot;
         return false;
       }
@@ -2230,6 +2250,19 @@ void D3D12Renderer::RenderGameFrame() {
     // recorded after this point sample these contents rather than whatever the
     // shared surface holds by the end of the frame. Draws nothing.
     if (d.resolveDest) {
+      // What KIND of image this destination holds, recorded before any of the
+      // branching below can refuse the resolve.
+      //
+      // A slot naming a destination we have no snapshot for used to fail the
+      // whole draw, and could not do better because nothing said whether the
+      // missing image was depth or colour -- so the only substitute available
+      // was a blanket one, and a blanket substitute is what put white over the
+      // Bink logo (see BindTranslatedTextures). The guest tells us on every
+      // resolve; it just was not being kept. Recorded for EVERY resolve that
+      // arrives, including ones that go on to be dropped for a missing source,
+      // because those are precisely the destinations that end up with no
+      // snapshot.
+      m_resolveDestIsDepth[d.resolveDest] = d.resolveSourceIsDepth;
       // Where the source actually rendered. Resolve sources are routed
       // offscreen (isResolveSource, below), so this normally finds a surface of
       // the source's own — which is the point: offscreen targets are only
@@ -2978,6 +3011,16 @@ void D3D12Renderer::RenderGameFrame() {
     // Now that the translated path has had its chance, a draw still heading for
     // the untextured stand-in with an invented colour is the fabricated white
     // the guard was written for. See the note beside fabricatedWhite.
+    //
+    // TRIED AND REVERTED (mx_960): exempting draws that HAD a translation and
+    // lost it in BindTranslatedTextures, on the argument that they are not
+    // "an invented colour" but a draw we chose to discard. They are exactly an
+    // invented colour. A draw whose texture binding failed has no colour source
+    // and no texture, so the stand-in paints it white -- and letting the 354
+    // such draws on the scene target through turned the whole menu backdrop
+    // white and buried the rider and bike under it. WHITE-SKIPPED fell 451 -> 76
+    // and the picture got worse; the counter was measuring the draws starting to
+    // render, not starting to render correctly.
     if (!translatedPso && fabricatedWhite) {
       ++m_sampleMissSkipped;
       // DIAG (remove before commit): what the skipped draws are aimed at.
@@ -3160,11 +3203,15 @@ void D3D12Renderer::RenderGameFrame() {
     // the hooks rather than at anything here.
     std::snprintf(message, sizeof(message),
                   "translated bind failures: block-exhausted %llu, "
-                  "no-snapshot %llu, no-texture %llu, "
+                  "no-snapshot %llu (depth %llu, colour %llu, "
+                  "never-resolved %llu), no-texture %llu, "
                   "upload-failed %llu, array-slot-flat %llu; "
                   "sampler blocks %zu of %u, exhausted %llu",
                   static_cast<unsigned long long>(m_translatedBlockExhausted),
                   static_cast<unsigned long long>(m_translatedNoSnapshot),
+                  static_cast<unsigned long long>(m_noSnapshotDepth),
+                  static_cast<unsigned long long>(m_noSnapshotColour),
+                  static_cast<unsigned long long>(m_noSnapshotUnknown),
                   static_cast<unsigned long long>(m_translatedNoTexture),
                   static_cast<unsigned long long>(m_translatedUploadFailed),
                   static_cast<unsigned long long>(

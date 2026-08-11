@@ -1036,4 +1036,17 @@ void ClearGameDraws();
   uint64_t m_depthResolves = 0;
   // Stand-in draws refused a depth snapshot as their one colour texture.
   uint64_t m_standInDepthSnapshotRefused = 0;
+
+  // Whether each resolve DESTINATION carries depth or colour, recorded from
+  // d.resolveSourceIsDepth as the resolve arrives. Read only when a translated
+  // draw names a destination we hold no snapshot for, to say WHICH KIND of
+  // image went missing -- see BindTranslatedTextures.
+  std::unordered_map<uint32_t, bool> m_resolveDestIsDepth;
+  // What a missing snapshot WOULD have held, split three ways. Diagnostic only:
+  // every one of these still fails the draw. The split is what showed the
+  // missing snapshots are mostly destinations no resolve ever named (448 of 613
+  // in mx_960), not depth-sourced ones as the mx_958 counters had suggested.
+  uint64_t m_noSnapshotDepth = 0;
+  uint64_t m_noSnapshotColour = 0;
+  uint64_t m_noSnapshotUnknown = 0;
 };
