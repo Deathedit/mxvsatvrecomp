@@ -2213,6 +2213,22 @@ void D3D12Renderer::AddGameClear(uint32_t targetObject, uint32_t targetWidth,
   m_gameDraws.push_back(std::move(d));
 }
 
+void D3D12Renderer::AddGameSurface(uint32_t object, uint32_t width,
+                                   uint32_t height, uint32_t edramBase,
+                                   uint32_t colorFormat, bool isDepth) {
+  if (!object || !width || !height) return;
+  if (m_gameDraws.size() >= kMaxGameDraws) return;
+  GameDraw d;
+  d.surfaceBind = true;
+  d.surfaceBindIsDepth = isDepth;
+  d.targetObject = object;
+  d.targetWidth = width;
+  d.targetHeight = height;
+  d.targetBase = edramBase;
+  d.targetColorFormat = colorFormat;
+  m_gameDraws.push_back(std::move(d));
+}
+
 void D3D12Renderer::RenderGameFrame() {
   if (!m_hasGamePipeline) return;
   m_commandList->SetGraphicsRootSignature(m_gameRootSig.Get());
@@ -2291,6 +2307,90 @@ void D3D12Renderer::RenderGameFrame() {
   // that was finished earlier, and those want opposite choices.
   std::vector<std::pair<uint32_t, uint32_t>> fullSizeOrder;
   for (const auto& d : m_gameDraws) {
+    // A SURFACE BIND: the guest named this surface as an attachment. Create
+    // host storage for it now, whether or not any draw we route ever targets
+    // it, and clear it to its documented creation value so a surface that is
+    // bound and resolved without a single draw reads as empty rather than as
+    // whatever the recycled pool handed us.
+    //
+    // This is what makes a depth-only pass cost nothing. Storage used to be
+    // created by the first DRAW naming a surface, so the menu's shadow atlas --
+    // bound depth-only with no colour target, resolved 287 times in one run --
+    // was never instantiated at all, its resolve found no source, and every
+    // draw sampling the result was discarded whole (mx_1000: no-snapshot 447,
+    // all depth). Xenia has no equivalent failure because it creates render
+    // targets from register state with depth as an equal peer of colour, not as
+    // a passenger on it (render_target_cache.cc:888, keys at
+    // render_target_cache.h:268).
+    //
+    // What this did NOT fix is the missing arena backdrop it was written for. A
+    // capture afterwards shows the surfaces created, the bands stitched and the
+    // snapshot carrying real depth (0.148..1.0), the backdrop draw running --
+    // and the arena still absent, with the draw count unchanged at 344 either
+    // side of the change. Judge this on the counters it moves, not on that.
+    //
+    // Draws nothing.
+    if (d.surfaceBind) {
+      GameRenderTarget* bound =
+          d.surfaceBindIsDepth
+              ? EnsureGameDepthTarget(d.targetObject, d.targetWidth,
+                                      d.targetHeight, d.targetBase)
+              : EnsureGameRenderTarget(d.targetObject, d.targetWidth,
+                                       d.targetHeight, d.targetBase,
+                                       HostColorFormat(d.targetColorFormat));
+      // Refused for budget or extent. m_rtRejectBudget already counts it; the
+      // draw path will try again and fail the same way, which is what it did
+      // before this record existed.
+      if (!bound || !bound->needsInitialClear) continue;
+      bound->needsInitialClear = false;
+      if (d.surfaceBindIsDepth) {
+        ++m_bindCreatedDepth;
+        // Created in DEPTH_WRITE, which is the state a clear wants.
+        if (bound->state != D3D12_RESOURCE_STATE_DEPTH_WRITE) {
+          D3D12_RESOURCE_BARRIER toDepth = {};
+          toDepth.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+          toDepth.Transition.pResource = bound->resource.Get();
+          toDepth.Transition.StateBefore = bound->state;
+          toDepth.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+          toDepth.Transition.Subresource =
+              D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+          m_commandList->ResourceBarrier(1, &toDepth);
+          bound->state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        }
+        auto dsv = m_gameDepthDsvHeap->GetCPUDescriptorHandleForHeapStart();
+        dsv.ptr += SIZE_T(bound->rtvIndex) * m_gameDsvDescriptorSize;
+        // 1.0 is the far plane: "nothing occludes". That is the correct reading
+        // of a shadow map no caster was rendered into, and it is the value
+        // EnsureGameDepthTarget already declares as the resource's clear value.
+        m_commandList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f,
+                                             0, 0, nullptr);
+      } else {
+        ++m_bindCreatedColour;
+        // Colour targets are created in PIXEL_SHADER_RESOURCE.
+        if (bound->state != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+          D3D12_RESOURCE_BARRIER toRt = {};
+          toRt.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+          toRt.Transition.pResource = bound->resource.Get();
+          toRt.Transition.StateBefore = bound->state;
+          toRt.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+          toRt.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+          m_commandList->ResourceBarrier(1, &toRt);
+          bound->state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        }
+        auto rtv = m_gameRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += SIZE_T(bound->rtvIndex) * m_gameRtvDescriptorSize;
+        // TRANSPARENT BLACK, never white. A blanket white stand-in for missing
+        // resolve results was tried before and put white over the Bink logo
+        // composite; that is the regression this must not reintroduce.
+        const float kEmpty[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        m_commandList->ClearRenderTargetView(rtv, kEmpty, 0, nullptr);
+      }
+      // everDrawn stays FALSE on purpose. A resolve out of a surface nothing
+      // drew into is exactly what m_snapshotBlankSource counts, and it should
+      // keep counting it -- the surface now exists, which is a different claim
+      // from the surface having contents.
+      continue;
+    }
     // A resolve: snapshot the source target as it stands right now, so draws
     // recorded after this point sample these contents rather than whatever the
     // shared surface holds by the end of the frame. Draws nothing.
@@ -2320,6 +2420,42 @@ void D3D12Renderer::RenderGameFrame() {
       // The snapshot takes the source's format: a depth resolve has to land in
       // R32_FLOAT, not RGBA8, for CopyTextureRegion to accept it.
       DXGI_FORMAT snapFormat = kBackBufferFormat;
+      // Gather the EDRAM bands of a depth resolve BEFORE looking for a target
+      // of the source's own, because the two are now in competition. Since
+      // surfaces are created when the guest binds them, the whole surface a
+      // banded pass resolves out of is in the depth pool too -- so the direct
+      // lookup below would succeed and quietly copy a surface nothing rendered
+      // into, discarding the bands that hold the actual image. Bands win, but
+      // only when something has been drawn into them.
+      //
+      // Excluding the resolve's OWN object from the band set is load-bearing
+      // for the same reason: the 768x1024 atlas matches the band filter on
+      // width and base as well as its own 768x640 band does, and including it
+      // makes the heights sum to 2048 against a 1024 destination, which fails
+      // the exact-cover test and loses the stitch entirely.
+      std::vector<GameRenderTarget*> depthBands;
+      bool depthBandsDrawn = false;
+      if (d.resolveSourceIsDepth && d.resolveDestWidth && d.resolveDestHeight) {
+        for (auto& [obj, t] : m_gameDepthTargets) {
+          if (obj == d.resolveSource) continue;
+          if (t.resource && t.width == d.resolveDestWidth &&
+              t.edramBase >= d.resolveSourceBase)
+            depthBands.push_back(&t);
+        }
+        std::sort(depthBands.begin(), depthBands.end(),
+                  [](const GameRenderTarget* a, const GameRenderTarget* b) {
+                    return a->edramBase < b->edramBase;
+                  });
+        uint32_t total = 0;
+        for (const GameRenderTarget* b : depthBands) total += b->height;
+        // Anything that is not an exact cover of the destination, starting at
+        // the resolve's own base, is not a banding of this surface.
+        if (depthBands.size() < 2 || total != d.resolveDestHeight ||
+            depthBands.front()->edramBase != d.resolveSourceBase)
+          depthBands.clear();
+        for (const GameRenderTarget* b : depthBands)
+          if (b->everDrawn) depthBandsDrawn = true;
+      }
       if (auto it = m_gameRenderTargets.find(d.resolveSource);
           !d.resolveSourceIsDepth && it != m_gameRenderTargets.end()) {
         srcEntry = &it->second;
@@ -2332,7 +2468,7 @@ void D3D12Renderer::RenderGameFrame() {
         // got their real formats.
         snapFormat = srcEntry->format;
       } else if (auto dit = m_gameDepthTargets.find(d.resolveSource);
-                 dit != m_gameDepthTargets.end()) {
+                 dit != m_gameDepthTargets.end() && !depthBandsDrawn) {
         // A DEPTH resolve. The guest reads its depth buffer back as a texture
         // to reconstruct world position in the deferred lighting pass, and
         // Resolve names the depth surface by object exactly as it names a
@@ -2416,26 +2552,14 @@ void D3D12Renderer::RenderGameFrame() {
       // heights must add up to the destination exactly; anything else is not a
       // banding of this surface and is left to fail as before rather than
       // assembled on a guess.
-      if (!srcRes && d.resolveSourceIsDepth && d.resolveDestWidth &&
-          d.resolveDestHeight) {
-        std::vector<GameRenderTarget*> bands;
-        for (auto& [obj, t] : m_gameDepthTargets) {
-          if (t.resource && t.width == d.resolveDestWidth &&
-              t.edramBase >= d.resolveSourceBase)
-            bands.push_back(&t);
-        }
-        std::sort(bands.begin(), bands.end(),
-                  [](const GameRenderTarget* a, const GameRenderTarget* b) {
-                    return a->edramBase < b->edramBase;
-                  });
-        uint32_t total = 0;
-        for (const GameRenderTarget* b : bands) total += b->height;
-        if (bands.size() >= 2 && total == d.resolveDestHeight &&
-            bands.front()->edramBase == d.resolveSourceBase) {
-          GameRenderTarget* snap =
-              EnsureGameSnapshot(d.resolveDest, d.resolveDestWidth,
-                                 d.resolveDestHeight, DXGI_FORMAT_R32_FLOAT);
-          if (snap) {
+      // The gather and its exact-cover test now live above, beside the source
+      // lookup they compete with; `depthBands` is empty unless it passed.
+      if (!srcRes && !depthBands.empty()) {
+        const std::vector<GameRenderTarget*>& bands = depthBands;
+        GameRenderTarget* snap =
+            EnsureGameSnapshot(d.resolveDest, d.resolveDestWidth,
+                               d.resolveDestHeight, DXGI_FORMAT_R32_FLOAT);
+        if (snap) {
             D3D12_RESOURCE_BARRIER toDest = {};
             toDest.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             toDest.Transition.pResource = snap->resource.Get();
@@ -2488,7 +2612,49 @@ void D3D12Renderer::RenderGameFrame() {
             ++m_depthResolves;
             ++m_depthBandResolves;
             continue;
+        }
+      }
+      // Nothing to copy out of, and the guest still asked for this image. Make
+      // the source exist, from the resolve's OWN extent, and copy the empty
+      // surface rather than refusing -- which is what Xenia does, creating
+      // render targets from the resolve's EDRAM info without consulting whether
+      // a draw was ever seen (render_target_cache.cc:1393).
+      //
+      // Only for a DEPTH source with an extent to build from. A colour source
+      // is deliberately left to the refusal below: it has an aliased-source
+      // matcher above that is measured and works, and an invented empty colour
+      // target would compete with it.
+      if (!srcRes && d.resolveSourceIsDepth && d.resolveSourceWidth &&
+          d.resolveSourceHeight) {
+        if (GameRenderTarget* made = EnsureGameDepthTarget(
+                d.resolveSource, d.resolveSourceWidth, d.resolveSourceHeight,
+                d.resolveSourceBase)) {
+          if (made->needsInitialClear) {
+            made->needsInitialClear = false;
+            if (made->state != D3D12_RESOURCE_STATE_DEPTH_WRITE) {
+              D3D12_RESOURCE_BARRIER toDepth = {};
+              toDepth.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+              toDepth.Transition.pResource = made->resource.Get();
+              toDepth.Transition.StateBefore = made->state;
+              toDepth.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+              toDepth.Transition.Subresource =
+                  D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+              m_commandList->ResourceBarrier(1, &toDepth);
+              made->state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            }
+            auto dsv = m_gameDepthDsvHeap->GetCPUDescriptorHandleForHeapStart();
+            dsv.ptr += SIZE_T(made->rtvIndex) * m_gameDsvDescriptorSize;
+            m_commandList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH,
+                                                 1.0f, 0, 0, nullptr);
           }
+          srcEntry = made;
+          srcRes = made->resource.Get();
+          srcWidth = made->width;
+          srcHeight = made->height;
+          srcState = made->state;
+          snapFormat = DXGI_FORMAT_R32_FLOAT;
+          ++m_depthResolves;
+          ++m_resolveCreatedSources;
         }
       }
       if (!srcRes) {
@@ -3312,6 +3478,8 @@ void D3D12Renderer::RenderGameFrame() {
                   "no-snapshot %llu (depth %llu, colour %llu, "
                   "never-resolved %llu), no-texture %llu, "
                   "upload-failed %llu, array-slot-flat %llu; "
+                  "surfaces created on bind %llu depth + %llu colour, "
+                  "on resolve %llu; "
                   "sampler blocks %zu of %u, exhausted %llu",
                   static_cast<unsigned long long>(m_translatedBlockExhausted),
                   static_cast<unsigned long long>(m_translatedNoSnapshot),
@@ -3322,6 +3490,9 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_translatedUploadFailed),
                   static_cast<unsigned long long>(
                       m_translatedArraySlotNot2DArray),
+                  static_cast<unsigned long long>(m_bindCreatedDepth),
+                  static_cast<unsigned long long>(m_bindCreatedColour),
+                  static_cast<unsigned long long>(m_resolveCreatedSources),
                   m_samplerBlocks.size(), kSamplerBlockCount,
                   static_cast<unsigned long long>(m_samplerBlockExhausted));
     LogInfo(message);

@@ -8527,6 +8527,48 @@ mx::hle::RenderTargetBinding SnapshotRenderTarget(uint32_t object,
   return out;
 }
 
+// Tell the renderer a surface EXISTS, whether or not a draw ever names it.
+//
+// Host storage used to be created on the first draw that targeted a surface,
+// which loses any pass that binds and resolves without a draw we route. The
+// menu's shadow atlas is exactly that: bound depth-only with no colour target,
+// resolved every frame, and never instantiated -- so the backdrop shader's
+// slot 15 found no snapshot, its draw was discarded whole, and the arena
+// rendered black.
+//
+// Deduped per frame on object and extent. A bind fires far more often than a
+// surface changes -- the guest re-binds the same depth surface around every
+// pass -- and the renderer only needs to be told once per frame that it exists.
+// Keyed on the extent too so a surface rebound at a new size still reaches the
+// factory, which replaces in place rather than refusing.
+void NoteSurfaceBind(const mx::hle::RenderTargetBinding& rt, bool is_depth) {
+  if (!rt.valid || !rt.object || !rt.width || !rt.height) return;
+  const uint64_t key = (uint64_t(rt.object) << 32) |
+                       (uint64_t(rt.width) << 17) | (rt.height << 1) |
+                       (is_depth ? 1u : 0u);
+  {
+    static std::mutex s_mu;
+    static uint64_t s_frame = UINT64_MAX;
+    static std::set<uint64_t> s_seen;
+    const uint64_t frame = mx::hle::D3D9FrameCount();
+    std::lock_guard<std::mutex> lock(s_mu);
+    if (frame != s_frame) {
+      s_frame = frame;
+      s_seen.clear();
+    }
+    if (!s_seen.insert(key).second) return;
+  }
+  mx::hle::DrawCall bind{};
+  bind.surface_bind = true;
+  bind.surface_bind_is_depth = is_depth;
+  bind.surface_bind_object = rt.object;
+  bind.surface_bind_width = rt.width;
+  bind.surface_bind_height = rt.height;
+  bind.surface_bind_base = rt.color_info & 0xFFFu;
+  bind.surface_bind_color_format = (rt.color_info >> 16) & 0xFu;
+  mx::hle::HleFrameDraws().push_back(std::move(bind));
+}
+
 REX_IMPORT(__imp__sub_8254C060, orig_SetRenderTarget, void());
 extern "C" REX_FUNC(sub_8254C060) {
   MX_D3D9_PLUGIN_PASSTHROUGH(orig_SetRenderTarget);
@@ -8539,6 +8581,12 @@ extern "C" REX_FUNC(sub_8254C060) {
     st.render_target_seen_mask |= 1u << slot;
 
     const auto& rt = st.render_target[slot];
+    // Slot 0 only. The renderer models one colour attachment (DrawCall's
+    // render_target_object comes from render_target[0]), so instantiating
+    // slots 1-3 would spend budget on surfaces nothing routes -- and worse,
+    // would let a resolve out of an MRT slot copy a freshly cleared target
+    // instead of failing, trading a missing image for a confidently blank one.
+    if (slot == 0) NoteSurfaceBind(rt, /*is_depth=*/false);
     static std::map<uint64_t, uint64_t> s_targets;
     if (rt.valid) {
       const uint64_t key = (uint64_t(rt.object) << 32) |
@@ -8564,6 +8612,10 @@ extern "C" REX_FUNC(sub_8254C3B0) {
   auto& st = DeviceState();
   st.NoteDevice(ctx.r3.u32, mx::hle::kEpSetDepthStencil);
   st.depth_stencil = SnapshotRenderTarget(ctx.r4.u32, base);
+  // The depth half of the same story, and the one that motivated it: every
+  // depth target we have ever created arrived paired with a colour target, so
+  // a depth-only pass instantiated nothing at all.
+  NoteSurfaceBind(st.depth_stencil, /*is_depth=*/true);
   // DIAG (remove before commit): the depth surfaces the guest binds, and their
   // OWN extents. Sizing a host depth surface to the colour target instead
   // collapsed the frame, because one depth object is bound alongside colour

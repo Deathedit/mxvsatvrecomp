@@ -153,6 +153,45 @@ struct DrawCall {
   // distinct avoids quantizing HDR clear values.
   bool clear_color_is_float = false;
   std::array<float, 4> clear_color_float = {};
+  // A SURFACE BIND event rather than a draw, a clear or a resolve. The guest
+  // named this surface as a render target or depth-stencil attachment; nothing
+  // has necessarily been drawn into it yet.
+  //
+  // It exists because host storage used to be created on the first DRAW that
+  // named a surface, which silently loses every pass that binds and resolves
+  // without a draw we route. The measured case is the menu's shadow atlas --
+  // 768x1024 at EDRAM base 0x580 pitch 800, with two bands at 768x640 (base
+  // 0x580) and 768x384 (base 0x710) -- bound depth-only with no colour target
+  // and resolved every frame, but instantiated by nothing. In mx_1000 that left
+  // no-snapshot 447 (all depth) and source-not-offscreen 448, and the atlas as
+  // the sole missing-source offender at 287 dropped resolves.
+  //
+  // Addresses are deliberately not quoted here: guest surface objects are
+  // pointers and differ every run. Extent, EDRAM base and pitch are what
+  // identify these surfaces across runs.
+  //
+  // NOT credited with a visible fix. It was written while chasing the menu's
+  // missing arena backdrop, and it does retire that whole failure class -- but
+  // a capture taken afterwards showed the backdrop draw running and the
+  // backdrop still absent (white, not the arena), with the draw count unchanged
+  // at 344 either side. Whatever leaves the arena unpainted is a different
+  // defect, and this record is correctness, not its cure.
+  //
+  // Xenia keys render targets on EDRAM identity and creates them from register
+  // state (render_target_cache.cc:888) and from a resolve's own info
+  // (:1393), which is why a depth-only pass costs it nothing; this record is
+  // the same idea expressed through the object identity our path carries.
+  //
+  // Rides the ordered queue for the same reason a resolve does: a bind that
+  // arrives after a resolve must not create the surface the resolve wanted.
+  bool surface_bind = false;
+  bool surface_bind_is_depth = false;
+  uint32_t surface_bind_object = 0;
+  uint32_t surface_bind_width = 0;
+  uint32_t surface_bind_height = 0;
+  uint32_t surface_bind_base = 0;
+  // Colour format nibble, as render_target_color_info >> 16. Unused for depth.
+  uint32_t surface_bind_color_format = 0;
   // The bound DEPTH-STENCIL surface, carried for the same reason as the colour
   // one: it is a guest surface with its own object identity, and Resolve names
   // it by that identity (source slot 4). Offscreen colour targets used to be

@@ -156,6 +156,12 @@ void AddGameClear(uint32_t targetObject, uint32_t targetWidth,
                   uint32_t targetColorFormat, uint32_t color,
                   const float* floatColor = nullptr);
 
+// Append a SURFACE BIND in order with draws, clears and resolves: the guest
+// named this surface as an attachment, so host storage for it must exist even
+// if no draw we route ever targets it. See DrawCall::surface_bind.
+void AddGameSurface(uint32_t object, uint32_t width, uint32_t height,
+                    uint32_t edramBase, uint32_t colorFormat, bool isDepth);
+
 // Drop the previous frame's draws. Called when a real guest-frame handoff
 // arrives, including one whose draws are all filtered; an empty render-thread
 // tick still re-presents the previous frame.
@@ -747,6 +753,13 @@ void ClearGameDraws();
     uint32_t clearColor = 0;  // D3DCOLOR A8R8G8B8.
     bool clearColorIsFloat = false;
     std::array<float, 4> clearColorFloat = {};
+    // Ordered SURFACE BIND. Carries no geometry and draws nothing: it exists so
+    // host storage is created when the guest NAMES a surface rather than when a
+    // draw first targets one. Reuses targetObject/Width/Height/Base and
+    // targetColorFormat above, since a bind describes the same thing a draw's
+    // target does. See DrawCall::surface_bind for why this record exists.
+    bool surfaceBind = false;
+    bool surfaceBindIsDepth = false;
     // The guest's depth surface for this draw, by object identity. Offscreen
     // colour targets used to get no depth attachment at all.
     uint32_t depthObject = 0;
@@ -1006,6 +1019,15 @@ void ClearGameDraws();
     // creation clear — the snapshot is then blank, and a compositor quad paints
     // that blank over the frame.
     bool everDrawn = false;
+    // Set on create and on resize, cleared once the surface has actually been
+    // cleared on the GPU. Pooled surfaces are RECYCLED, so a fresh entry's
+    // contents are whatever the previous tenant left behind -- which is why the
+    // everDrawn comment above ("holds only its creation clear") was aspirational
+    // rather than true: nothing performed that clear. A surface the guest binds
+    // and resolves without ever drawing into must read as its documented
+    // creation value -- the far plane for depth, transparent black for colour --
+    // and not as a stale image from an unrelated pass.
+    bool needsInitialClear = true;
     // Snapshots only. Set when the guest asked to resolve into this texture and
     // we could not perform the copy, so the contents are a KNOWN-WRONG earlier
     // frame rather than merely an old one. Snapshots legitimately persist across
@@ -1047,7 +1069,12 @@ void ClearGameDraws();
                                           uint32_t height, uint32_t edramBase);
   // Descriptor 0 stays the main-target depth created by CreateGameRenderTargets;
   // the rest are stable slots for guest depth-surface identities.
-  static constexpr uint32_t kMaxGameDepthTargets = 16;
+  // 16 was sized against the four depth surfaces a DRAW ever named. Surfaces
+  // are now created when the guest BINDS them, and the menu run binds twelve
+  // distinct ones -- close enough to the old cap that a busier scene would
+  // start losing them to m_rtRejectBudget, which fails silently and looks
+  // exactly like the missing-surface bug this change exists to fix.
+  static constexpr uint32_t kMaxGameDepthTargets = 32;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_gameDepthDsvHeap;
   uint32_t m_gameDsvDescriptorSize = 0;
   // Depth resolves served from a per-object depth surface. Separate from the
@@ -1069,4 +1096,13 @@ void ClearGameDraws();
   uint64_t m_noSnapshotDepth = 0;
   uint64_t m_noSnapshotColour = 0;
   uint64_t m_noSnapshotUnknown = 0;
+  // Surfaces instantiated because the guest BOUND them, not because a draw
+  // targeted them. The loss the no-snapshot counters above measure has to move
+  // into these rather than merely disappear from the accounting -- a counter
+  // going quiet has already been mistaken for a fix once this cycle.
+  uint64_t m_bindCreatedDepth = 0;
+  uint64_t m_bindCreatedColour = 0;
+  // Surfaces instantiated at RESOLVE time because the guest resolved out of one
+  // it never bound as an attachment we saw.
+  uint64_t m_resolveCreatedSources = 0;
 };

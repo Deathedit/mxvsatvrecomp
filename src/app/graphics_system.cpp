@@ -317,13 +317,16 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       // frame that never arrived.
       std::vector<const mx::hle::DrawCall*> submittable;
       for (const auto& d : draws) {
-        // A resolve is not a draw. It has no geometry, so every gate below
-        // would reject it — the first one silently, without even counting it —
-        // and a dropped resolve leaves a stale snapshot, which looks like a
-        // partial fix rather than a failure. It keeps its slot in
-        // `submittable` because the snapshot must be taken at this point in the
-        // draw order, not at the end of the frame.
-        if (d.resolve_dest_texture || d.clear_color_target) {
+        // A resolve, a clear and a surface bind are not draws. None has
+        // geometry, so every gate below would reject them — the first one
+        // silently, without even counting it — and a dropped resolve leaves a
+        // stale snapshot, which looks like a partial fix rather than a failure.
+        // They keep their slots in `submittable` because each is only
+        // meaningful in sequence: the snapshot must be taken at this point in
+        // the draw order rather than at the end of the frame, and a bind that
+        // arrives after a resolve must not create the surface the resolve
+        // wanted.
+        if (d.resolve_dest_texture || d.clear_color_target || d.surface_bind) {
           submittable.push_back(&d);
           continue;
         }
@@ -399,6 +402,13 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                 d->resolve_dest_width, d->resolve_dest_height,
                 d->resolve_source_is_depth, d->resolve_source_base,
                 d->resolve_source_width, d->resolve_source_height);
+            continue;
+          }
+          if (d->surface_bind) {
+            m_renderer->AddGameSurface(
+                d->surface_bind_object, d->surface_bind_width,
+                d->surface_bind_height, d->surface_bind_base,
+                d->surface_bind_color_format, d->surface_bind_is_depth);
             continue;
           }
           if (d->clear_color_target) {
