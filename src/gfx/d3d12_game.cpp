@@ -650,13 +650,34 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
         // fabricatedWhite change it depended on -- see that gate. Leave the
         // draw failing, which is what keeps it out of the stand-in and off the
         // screen as white.
-        if (const auto kind = m_resolveDestIsDepth.find(object);
-            kind == m_resolveDestIsDepth.end())
+        const auto kind = m_resolveDestIsDepth.find(object);
+        const char* kindName = "never-resolved";
+        if (kind == m_resolveDestIsDepth.end())
           ++m_noSnapshotUnknown;
-        else if (kind->second)
+        else if (kind->second) {
+          kindName = "depth";
           ++m_noSnapshotDepth;
-        else
+        } else {
+          kindName = "colour";
           ++m_noSnapshotColour;
+        }
+        // One line per distinct failing link. The cumulative counters say that
+        // two full-screen draws are lost every menu frame, but without the
+        // shader, slot and destination object they cannot say which resolve is
+        // absent. Keep this bounded by the naturally small tuple population;
+        // repeated frames do not produce repeated log lines.
+        static std::unordered_set<std::string> s_missingLinks;
+        const std::string link =
+            fmt::format("{:08X}/{}/{:08X}/{}", d.pixelShaderHandle, i,
+                        object, kindName);
+        if (s_missingLinks.size() < 64 && s_missingLinks.insert(link).second) {
+          REXLOG_INFO(
+              "d3d12: translated snapshot MISSING: PS 0x{:08X}, target "
+              "0x{:08X} {}x{}, compact slot {} of {}, destination texture "
+              "0x{:08X}, class {}",
+              d.pixelShaderHandle, d.targetObject, d.targetWidth,
+              d.targetHeight, i, d.pixelSamplerCount, object, kindName);
+        }
         ++m_translatedNoSnapshot;
         return false;
       }
@@ -2135,7 +2156,8 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameSnapshot(
   return &it->second;
 }
 
-void D3D12Renderer::AddGameResolve(uint32_t destTexture, uint32_t sourceObject,
+void D3D12Renderer::AddGameResolve(uint32_t destTexture,
+                                   uint32_t sourceObject,
                                    int32_t destX, int32_t destY, int32_t srcX1,
                                    int32_t srcY1, int32_t srcX2,
                                    int32_t srcY2, uint32_t destWidth,
@@ -2166,6 +2188,28 @@ void D3D12Renderer::AddGameResolve(uint32_t destTexture, uint32_t sourceObject,
   d.resolveSrcY2 = srcY2;
   d.resolveDestWidth = destWidth;
   d.resolveDestHeight = destHeight;
+  m_gameDraws.push_back(std::move(d));
+}
+
+void D3D12Renderer::AddGameClear(uint32_t targetObject, uint32_t targetWidth,
+                                 uint32_t targetHeight, uint32_t targetBase,
+                                 uint32_t targetColorFormat, uint32_t color,
+                                 const float* floatColor) {
+  if (!targetObject || !targetWidth || !targetHeight) return;
+  if (m_gameDraws.size() >= kMaxGameDraws) return;
+  GameDraw d;
+  d.colorClear = true;
+  d.clearColor = color;
+  d.targetObject = targetObject;
+  d.targetWidth = targetWidth;
+  d.targetHeight = targetHeight;
+  d.targetBase = targetBase;
+  d.targetColorFormat = targetColorFormat;
+  if (floatColor) {
+    d.clearColorIsFloat = true;
+    std::memcpy(d.clearColorFloat.data(), floatColor,
+                sizeof(d.clearColorFloat));
+  }
   m_gameDraws.push_back(std::move(d));
 }
 
@@ -2232,9 +2276,10 @@ void D3D12Renderer::RenderGameFrame() {
   for (uint32_t object : sampledTargets) m_everSampledTarget.insert(object);
   for (const auto& d : m_gameDraws)
     if (d.targetObject) m_everDrawTarget.insert(d.targetObject);
-  // Reset per frame: if nothing is drawn offscreen at guest-backbuffer size
-  // this frame, present must fall back to m_gameRT rather than blit a target
-  // that belongs to an earlier frame.
+  // Reset per frame. The final whole-backbuffer colour resolve is the exact
+  // image handed to VdSwap, while the last target drawn into is only a fallback
+  // for lists that contain no such resolve.
+  m_presentResolveTexture = 0;
   m_presentSourceObject = 0;
   std::unordered_set<uint32_t> fullSizeTargets;
   uint32_t fullSizeDraws = 0;
@@ -2577,6 +2622,16 @@ void D3D12Renderer::RenderGameFrame() {
       // Refreshed: whatever earlier drop marked this stale is now irrelevant.
       snap->stale = false;
       snap->lastCopyFrame = m_gameFrame;
+      // A D3D9 frame resolves its completed backbuffer immediately before
+      // VdSwap. Because resolves keep their guest order in m_gameDraws, the
+      // last successful whole 1280x720 colour resolve is the frame to present.
+      // Presenting d.resolveSource instead is incorrect: that object is shared
+      // scratch storage and later post-processing draws may overwrite it after
+      // the resolve has preserved the intended image.
+      if (!d.resolveSourceIsDepth && snapW == 1280 && snapH == 720 && dx == 0 &&
+          dy == 0 && copyW == 1280 && copyH == 720) {
+        m_presentResolveTexture = d.resolveDest;
+      }
       // The target is bound again by whichever draw follows; forcing a rebind
       // keeps that from being skipped because boundTargetObject still matches.
       boundTargetObject = 0xFFFFFFFFu;
@@ -2590,6 +2645,57 @@ void D3D12Renderer::RenderGameFrame() {
         QueueLuminanceReadback(snap, d.resolveDest);
       continue;
     }
+    // A full-surface D3D9 colour clear. This is an ordered command, not setup:
+    // the guest may resolve the cleared target immediately with no draw in
+    // between (the front-end default-texture atlas does exactly that).
+    if (d.colorClear) {
+      const bool wantsOffscreen =
+          d.targetObject && d.targetWidth && d.targetHeight &&
+          (resolveSources.contains(d.targetObject) ||
+           sampledTargets.contains(d.targetObject) ||
+           d.targetWidth != 1280 || d.targetHeight != 720);
+      GameRenderTarget* clearTarget = nullptr;
+      D3D12_CPU_DESCRIPTOR_HANDLE rtv = {};
+      if (wantsOffscreen) {
+        clearTarget = EnsureGameRenderTarget(
+            d.targetObject, d.targetWidth, d.targetHeight, d.targetBase,
+            HostColorFormat(d.targetColorFormat));
+        if (!clearTarget) continue;
+        if (clearTarget->state != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+          D3D12_RESOURCE_BARRIER barrier = {};
+          barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+          barrier.Transition.pResource = clearTarget->resource.Get();
+          barrier.Transition.StateBefore = clearTarget->state;
+          barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+          barrier.Transition.Subresource =
+              D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+          m_commandList->ResourceBarrier(1, &barrier);
+          clearTarget->state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        }
+        rtv = m_gameRtvHeap->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += SIZE_T(clearTarget->rtvIndex) * m_gameRtvDescriptorSize;
+      } else {
+        rtv = m_gameRtvHeap->GetCPUDescriptorHandleForHeapStart();
+      }
+      const float packedRgba[4] = {
+          float((d.clearColor >> 16) & 0xFFu) / 255.0f,
+          float((d.clearColor >> 8) & 0xFFu) / 255.0f,
+          float(d.clearColor & 0xFFu) / 255.0f,
+          float((d.clearColor >> 24) & 0xFFu) / 255.0f};
+      const float* rgba =
+          d.clearColorIsFloat ? d.clearColorFloat.data() : packedRgba;
+      m_commandList->ClearRenderTargetView(rtv, rgba, 0, nullptr);
+      if (clearTarget) {
+        clearTarget->usedThisFrame = true;
+        clearTarget->everDrawn = true;
+      }
+      // Clear does not bind through the normal draw path. Force the following
+      // draw to restore its RTV/DSV and viewport.
+      boundTargetObject = 0xFFFFFFFFu;
+      boundDepthObject = 0xFFFFFFFFu;
+      continue;
+    }
+
     // Keep only the unsampled final 1280x720 surface on m_gameRT so
     // PresentGameFrame remains an exact-size copy. A full-size scene target
     // that a later compositor samples is still offscreen and needs its own SRV;
@@ -3317,10 +3423,10 @@ void D3D12Renderer::RenderGameFrame() {
     // was assembled on one surface or several. "presented 1 of 1" means present
     // is showing the finished scene; "1 of 4" means it is showing one layer.
     std::snprintf(message, sizeof(message),
-                  "present source: object 0x%08X, %u full-size surfaces drawn "
-                  "this frame, %u draws across them",
-                  m_presentSourceObject, uint32_t(fullSizeTargets.size()),
-                  fullSizeDraws);
+                  "present source: resolve 0x%08X, fallback object 0x%08X, %u "
+                  "full-size surfaces drawn this frame, %u draws across them",
+                  m_presentResolveTexture, m_presentSourceObject,
+                  uint32_t(fullSizeTargets.size()), fullSizeDraws);
     LogInfo(message);
     {
       std::string order;
@@ -3427,6 +3533,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  const GpuVertexStage* vertexStage,
                                  uint32_t pixelSamplerArrayMask,
                                  const uint8_t* pixelSamplerSigns,
+                                 uint32_t pixelParamGen,
                                  uint32_t depthObject, uint32_t depthWidth,
                                  uint32_t depthHeight, uint32_t depthBase,
                                  uint32_t targetBase,
@@ -3490,6 +3597,39 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
     void* vtxMap = nullptr;
     if (FAILED(d.vb->Map(0, nullptr, &vtxMap))) return;
     memcpy(vtxMap, vertices, vtxBytes);
+    // The fixed Bink YUV shader replaces the guest pixel shader, but it must
+    // preserve the guest shader's final modulation:
+    //
+    //   export = decoded_yuva * c0
+    //
+    // kGameYuvPS performs that multiply through its COLOR input. Bink uses an
+    // UP/FVF quad with no guest COLOR element, so the transcode supplies white
+    // there; leaving it white would make the video ignore c0 entirely.
+    //
+    // The host layout is position float4 @0, color float4 @16, uv float2 @32.
+    // Multiplying the seeded color by c0 is algebraically identical to the
+    // guest shader and avoids adding a second constant-buffer binding solely
+    // for this optimized path.
+    if (planes && planeCount >= 3 && pixelConstants &&
+        pixelConstDwords >= 4 && vtxStride >= 32) {
+      float modulation[4];
+      std::memcpy(modulation, pixelConstants, sizeof(modulation));
+      auto* bytes = static_cast<uint8_t*>(vtxMap);
+      const uint32_t vertexCount = vtxBytes / vtxStride;
+      for (uint32_t i = 0; i < vertexCount; ++i) {
+        float color[4];
+        std::memcpy(color, bytes + i * vtxStride + 16, sizeof(color));
+        for (uint32_t c = 0; c < 4; ++c) color[c] *= modulation[c];
+        std::memcpy(bytes + i * vtxStride + 16, color, sizeof(color));
+      }
+      static uint32_t s_yuvModulationLogs = 0;
+      if (s_yuvModulationLogs++ < 8) {
+        const std::string message = fmt::format(
+            "Bink YUV c0 modulation: ({:.4f}, {:.4f}, {:.4f}, {:.4f})",
+            modulation[0], modulation[1], modulation[2], modulation[3]);
+        LogInfo(message.c_str());
+      }
+    }
     d.vb->Unmap(0, nullptr);
     d.vbv.BufferLocation = d.vb->GetGPUVirtualAddress();
     d.vbv.StrideInBytes = vtxStride;
@@ -3521,6 +3661,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.pixelShaderHlsl = std::move(pixelShaderHlsl);
   d.pixelSamplerCount = pixelSamplerCount;
   d.pixelSamplerArrayMask = pixelSamplerArrayMask;
+  d.pixelParamGen = pixelParamGen;
   if (pixelSamplerSigns)
     std::memcpy(d.pixelSamplerSigns.data(), pixelSamplerSigns,
                 d.pixelSamplerSigns.size());
@@ -3594,16 +3735,19 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   if (d.pixelShaderHlsl && d.pixelShaderHandle &&
       (hasVertexStage || (interpolators && interpBytes)) && pixelConstants &&
       pixelConstDwords && pixelSamplerCount <= kTranslatedSamplerSlots) {
-    // The shader's cbuffer is xe_c[256], then xe_texinv[slots], then
-    // xe_texsign[slots], so the buffer must cover ALL THREE. Sizing it to the
+    // The shader's cbuffer is xe_c[256], then xe_texinv[slots],
+    // xe_texsign[slots], and xe_param_gen, so the buffer must cover all four.
+    // Sizing it to the
     // constant bank alone would leave the shader reading past the end of the
     // resource for every unnormalized fetch. Rounded up to 256 bytes, the
     // constant-buffer granularity.
     const uint32_t bankBytes = pixelConstDwords * 4;
     const uint32_t texInvBytes = kTranslatedSamplerSlots * 16;
     const uint32_t texSignBytes = kTranslatedSamplerSlots * 16;
+    const uint32_t paramGenBytes = 16;
     const uint32_t constBytes =
-        ((bankBytes + texInvBytes + texSignBytes) + 255u) & ~255u;
+        ((bankBytes + texInvBytes + texSignBytes + paramGenBytes) + 255u) &
+        ~255u;
     // Built only for the CPU-vertex shape. A zero-byte buffer is not a valid
     // D3D12 resource, so this cannot simply fall out of interpBytes == 0.
     bool haveInterp = hasVertexStage;
@@ -3699,6 +3843,20 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
               static_cast<uint8_t*>(p) + bankBytes + texInvBytes + s * 16, sc,
               sizeof(sc));
         }
+        // xe_param_gen follows xe_texsign. x is the biased destination
+        // register; y identifies the primitive so the shader can reproduce the
+        // Xenos point and line sign flags.
+        uint32_t primitive = 0;
+        if (d.topology == D3D_PRIMITIVE_TOPOLOGY_POINTLIST) {
+          primitive = 1;
+        } else if (d.topology == D3D_PRIMITIVE_TOPOLOGY_LINELIST ||
+                   d.topology == D3D_PRIMITIVE_TOPOLOGY_LINESTRIP) {
+          primitive = 2;
+        }
+        const uint32_t pg[4] = {d.pixelParamGen, primitive, 0, 0};
+        std::memcpy(static_cast<uint8_t*>(p) + bankBytes + texInvBytes +
+                        texSignBytes,
+                    pg, sizeof(pg));
         d.pscb->Unmap(0, nullptr);
         d.translated = true;
       }
@@ -3931,10 +4089,23 @@ void D3D12Renderer::PresentGameFrame() {
   // it has to be scaled to the backbuffer rather than copied. m_viewport already
   // carries the pillarbox, so drawing through it puts the image in the same
   // place the copy path did.
-  if (m_presentSourceObject && m_hasGamePipeline && m_presentVB) {
-    auto it = m_gameRenderTargets.find(m_presentSourceObject);
-    if (it != m_gameRenderTargets.end() && it->second.resource) {
-      GameRenderTarget& src = it->second;
+  if (m_hasGamePipeline && m_presentVB) {
+    GameRenderTarget* presentSource = nullptr;
+    if (m_presentResolveTexture) {
+      auto it = m_gameSnapshots.find(m_presentResolveTexture);
+      if (it != m_gameSnapshots.end() && it->second.resource &&
+          !it->second.stale) {
+        presentSource = &it->second;
+      }
+    }
+    if (!presentSource && m_presentSourceObject) {
+      auto it = m_gameRenderTargets.find(m_presentSourceObject);
+      if (it != m_gameRenderTargets.end() && it->second.resource) {
+        presentSource = &it->second;
+      }
+    }
+    if (presentSource) {
+      GameRenderTarget& src = *presentSource;
       if (src.state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
         D3D12_RESOURCE_BARRIER toSrv = {};
         toSrv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;

@@ -113,6 +113,19 @@ REXCVAR_DEFINE_BOOL(hle_gpu_vertex_fetch, true, "Debug",
                     "guest vertex buffer itself, instead of the CPU unpacking "
                     "attributes per vertex. Requires hle_gpu_vertex");
 
+// Texture fetch constants embedded in a shader object's state-patch list. The
+// guest copies these to the device shadow when binding the shader, but a draw on
+// another record device may not have that copy even though the shader owns the
+// complete descriptor.
+//
+// Default on: without it those samplers bind a 1x1 black stand-in, which is
+// what left the menu's HUD panels and arena backdrop black. Off is the A/B --
+// the picture must differ, and if it does not, the diagnosis was wrong.
+REXCVAR_DEFINE_BOOL(hle_shader_fetch_constants, true, "Debug",
+                    "Honour texture fetch constants embedded in a shader's "
+                    "state-patch list, not just those currently present in "
+                    "the device shadow at device+0x480");
+
 // The per-draw and per-vertex diagnostics this investigation accumulated.
 //
 // Default OFF. They are not free — the Stage-3 transform probe alone reads 256
@@ -310,7 +323,7 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
         // partial fix rather than a failure. It keeps its slot in
         // `submittable` because the snapshot must be taken at this point in the
         // draw order, not at the end of the frame.
-        if (d.resolve_dest_texture) {
+        if (d.resolve_dest_texture || d.clear_color_target) {
           submittable.push_back(&d);
           continue;
         }
@@ -386,6 +399,16 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                 d->resolve_dest_width, d->resolve_dest_height,
                 d->resolve_source_is_depth, d->resolve_source_base,
                 d->resolve_source_width, d->resolve_source_height);
+            continue;
+          }
+          if (d->clear_color_target) {
+            m_renderer->AddGameClear(
+                d->render_target_object, d->render_target_width,
+                d->render_target_height, d->surface_base,
+                (d->render_target_color_info >> 16) & 0xFu,
+                d->clear_color,
+                d->clear_color_is_float ? d->clear_color_float.data()
+                                        : nullptr);
             continue;
           }
           // The guest vertex stage, when the hooks built one for this draw.
@@ -471,6 +494,7 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   vertexStage.handle ? &vertexStage : nullptr,
                                   d->pixel_sampler_array_mask,
                                   d->pixel_sampler_signs.data(),
+                                  d->pixel_param_gen,
                                   d->depth_target_object,
                                   d->depth_target_width,
                                   d->depth_target_height,

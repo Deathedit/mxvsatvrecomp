@@ -431,20 +431,28 @@ class Emitter {
   // The mulsc/addsc/subsc family, opcodes 42..47. These do not use the normal
   // operand encoding: src3 names a constant register directly and the temp
   // register is scattered, with one bit in the opcode field itself — which is
-  // why each operation has a _0 and a _1 form. Both operands are scalars,
-  // selected by the low two bits of src3_swiz. The constant's negate bit
-  // applies; the temp's does not, there being no field for it.
+  // why each operation has a _0 and a _1 form. The constant is selected with
+  // the W-relative src3 swizzle and the temporary with the X-relative src3
+  // swizzle (the Xenos AB = WX scalar convention). abs_constants and src3
+  // negate apply to both operands.
   bool ConstRegScalarOp(const uc::AluInstruction& alu, std::string& out) {
     using Op = uc::AluScalarOpcode;
     const Op op = alu.scalar_opcode();
     if (op < Op::kMulsc0 || op > Op::kSubsc1) return false;
 
-    const uint32_t comp = alu.src_swizzle(3) & 3;
-    std::string a = Const(alu.src_reg(3) & 0xFF) + "." + kComponent[comp];
+    const uint32_t swizzle = alu.src_swizzle(3);
+    const uint32_t const_comp =
+        uc::AluInstruction::GetSwizzledComponentIndex(swizzle, 3);
+    const uint32_t temp_comp =
+        uc::AluInstruction::GetSwizzledComponentIndex(swizzle, 0);
+    std::string a =
+        Const(alu.src_reg(3) & 0xFF) + "." + kComponent[const_comp];
     if (alu.abs_constants()) a = "abs(" + a + ")";
     if (alu.src_negate(3)) a = "-(" + a + ")";
-    const std::string b =
-        Temp(alu.scalar_const_reg_op_src_temp_reg()) + "." + kComponent[comp];
+    std::string b = Temp(alu.scalar_const_reg_op_src_temp_reg()) + "." +
+                    kComponent[temp_comp];
+    if (alu.abs_constants()) b = "abs(" + b + ")";
+    if (alu.src_negate(3)) b = "-(" + b + ")";
 
     switch (op) {
       case Op::kMulsc0: case Op::kMulsc1: out = "XeMul(" + a + ", " + b + ")"; break;
@@ -464,7 +472,11 @@ class Emitter {
     }
 
     const std::string s = "(" + Src(alu, 3) + ")";
-    const std::string a = s + ".x", b = s + ".y", w = s + ".w";
+    // Xenos scalar operands use AB = WX, not XY. Src() has already applied
+    // the component-relative swizzle, so the W-relative left operand is .w
+    // and the X-relative right operand is .x. One-component scalar opcodes
+    // consume only a; the two-component forms consume both a and b.
+    const std::string a = s + ".w", b = s + ".x";
     std::string r;
     switch (op) {
       case Op::kAdds: r = "(" + a + " + " + b + ")"; break;
@@ -472,10 +484,10 @@ class Emitter {
       case Op::kSubs: r = "(" + a + " - " + b + ")"; break;
       case Op::kMaxs: r = "max(" + a + ", " + b + ")"; break;
       case Op::kMins: r = "min(" + a + ", " + b + ")"; break;
-      case Op::kSeqs: r = "float(" + a + " == " + b + ")"; break;
-      case Op::kSgts: r = "float(" + a + " > " + b + ")"; break;
-      case Op::kSges: r = "float(" + a + " >= " + b + ")"; break;
-      case Op::kSnes: r = "float(" + a + " != " + b + ")"; break;
+      case Op::kSeqs: r = "float(" + a + " == 0.0)"; break;
+      case Op::kSgts: r = "float(" + a + " > 0.0)"; break;
+      case Op::kSges: r = "float(" + a + " >= 0.0)"; break;
+      case Op::kSnes: r = "float(" + a + " != 0.0)"; break;
       case Op::kAddsPrev: r = "(" + a + " + xe_ps)"; break;
       case Op::kMulsPrev: r = "XeMul(" + a + ", xe_ps)"; break;
       case Op::kSubsPrev: r = "(" + a + " - xe_ps)"; break;
@@ -519,14 +531,14 @@ class Emitter {
       case Op::kSin: r = "sin(" + a + ")"; break;
       case Op::kCos: r = "cos(" + a + ")"; break;
       case Op::kMaxAs:
-        // As kMaxA, but the address source is src0.x rather than src0.w.
+        // The address source and left maximum operand are both scalar a.
         Line("xe_a0 = (int)clamp(floor(" + a + " + 0.5), -256.0, 255.0);");
-        r = "max(" + a + ", " + w + ")";
+        r = "max(" + a + ", " + b + ")";
         break;
       case Op::kMaxAsf:
         // The floor variant: truncates toward negative infinity, same clamp.
         Line("xe_a0 = (int)clamp(floor(" + a + "), -256.0, 255.0);");
-        r = "max(" + a + ", " + w + ")";
+        r = "max(" + a + ", " + b + ")";
         break;
       case Op::kRetainPrev: r = "xe_ps"; break;
       case Op::kKillsEq: case Op::kKillsGt: case Op::kKillsGe:
@@ -1193,6 +1205,10 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   if (stage == HlslStage::kPixel) {
     src += "  float4 xe_texsign[" +
            std::to_string(HlslShader::kMaxSamplerSlots) + "];\n";
+    // .x is zero when disabled, otherwise one plus the destination register;
+    // .y classifies the primitive (0 triangle, 1 point, 2 line). This remains
+    // draw state because host shaders are cached by guest shader handle.
+    src += "  uint4 xe_param_gen;\n";
   }
   // One entry per emitted vertex fetch: .x the byte offset of this attribute's
   // stream within the merged raw buffer (with first_vertex already folded in),
@@ -1370,7 +1386,8 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
     }
     if (em.writes_depth) src += "  float d : SV_Depth;\n";
     src += "};\n";
-    src += "XePsOut main(XeInterpolants xe_in) {\n";
+    src +=
+        "XePsOut main(XeInterpolants xe_in, bool xe_front : SV_IsFrontFace) {\n";
   } else {
     // Two shapes, and which one this is depends on emit_vertex_fetch.
     //
@@ -1417,6 +1434,22 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
       src += "  r[" + std::to_string(i) + "] = xe_in.i" + std::to_string(i) +
              ";\n";
     }
+    // PsParamGen.xy is the magnitude of the host pixel position rounded down.
+    // Floor before abs so sample-rate positions and derivative helper quads
+    // retain the Xenos integer-pixel behavior. The X face flag applies only to
+    // polygon primitives; points are always front-facing and lines have their
+    // own flag in Z.
+    // Point-sprite z/w coordinates need point expansion that this renderer
+    // does not yet provide, while non-point geometry uses neutral zero there.
+    src +=
+        "  if (xe_param_gen.x != 0) {\n"
+        "    uint xe_pg_reg = xe_param_gen.x - 1;\n"
+        "    uint4 xe_pg = asuint(float4(abs(floor(xe_in.pos.xy)), 0.0, 0.0));\n"
+        "    if (xe_param_gen.y == 0 && !xe_front) xe_pg.x |= 0x80000000u;\n"
+        "    if (xe_param_gen.y == 1) xe_pg.y |= 0x80000000u;\n"
+        "    if (xe_param_gen.y == 2) xe_pg.z |= 0x80000000u;\n"
+        "    r[xe_pg_reg] = asfloat(xe_pg);\n"
+        "  }\n";
     for (uint32_t t = 0; t < kMaxColorTargets; ++t) {
       if (!(em.color_mask & (1u << t))) continue;
       src += "  float4 xe_color" + std::to_string(t) + " = float4(0,0,0,0);\n";

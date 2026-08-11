@@ -143,6 +143,16 @@ struct DrawCall {
   uint32_t render_target_color_info = 0;
   uint32_t render_target_width = 0;
   uint32_t render_target_height = 0;
+  // A full-surface D3DDevice_Clear event rather than a geometry draw. Clears
+  // share the ordered draw/resolve stream because a scratch target may be
+  // cleared and resolved without any draw between the two.
+  bool clear_color_target = false;
+  uint32_t clear_color = 0;  // D3DCOLOR A8R8G8B8.
+  // Resolve flag 0x100 clears the source after copying and takes a float4
+  // colour, unlike D3DDevice_Clear's packed D3DCOLOR. Keeping the two forms
+  // distinct avoids quantizing HDR clear values.
+  bool clear_color_is_float = false;
+  std::array<float, 4> clear_color_float = {};
   // The bound DEPTH-STENCIL surface, carried for the same reason as the colour
   // one: it is a guest surface with its own object identity, and Resolve names
   // it by that identity (source slot 4). Offscreen colour targets used to be
@@ -257,6 +267,10 @@ struct DrawCall {
   // a later frame can still be compiled.
   uint32_t pixel_shader_handle = 0;
   std::shared_ptr<const std::string> pixel_shader_hlsl;
+  // Zero when SQ_PROGRAM_CNTL.param_gen is disabled; otherwise one plus
+  // SQ_CONTEXT_MISC.param_gen_pos. The bias leaves zero as the disabled value
+  // while still allowing the hardware destination r0.
+  uint32_t pixel_param_gen = 0;
   // How many distinct samplers the translated shader reads, and the guest
   // sampler each compact slot was assigned. See HlslShader::sampler_slot_guest.
   uint32_t pixel_sampler_count = 0;
@@ -443,18 +457,18 @@ struct DrawCall {
   uint32_t colour_mask = 0;    // RB_COLOR_MASK    0x2104, bits 0-3 = RGBA of RT0
   uint32_t depth_control = 0;  // RB_DEPTHCONTROL  0x2200
 
-  // Alpha blending, as the guest's own D3DRS_* values. Raw for the same reason
-  // as the two above: the translation to host enums belongs in the renderer,
-  // and keeping the guest's numbers here means a wrong mapping shows up as a
-  // wrong number rather than as a plausible blend nobody asked for.
+  // Alpha blending from RB_BLENDCONTROL0. Raw for the same reason as the two
+  // above: the translation to host enums belongs in the renderer, and keeping
+  // the guest's Xenos numbers here means a wrong mapping shows up as a wrong
+  // number rather than as a plausible blend nobody asked for.
   //
   // Everything was drawn opaque before this, so anything the guest expected to
   // blend covered what was underneath it — the front end's fullscreen overlays
   // painted flat over the whole scene.
-  uint32_t blend_enable = 0;   // D3DRS_ALPHABLENDENABLE
-  uint32_t src_blend = 0;      // D3DRS_SRCBLEND,  a D3DBLEND
-  uint32_t dest_blend = 0;     // D3DRS_DESTBLEND, a D3DBLEND
-  uint32_t blend_op = 0;       // D3DRS_BLENDOP,   a D3DBLENDOP
+  uint32_t blend_enable = 0;   // equation differs from ONE/ZERO/ADD
+  uint32_t src_blend = 0;      // Xenos color source factor
+  uint32_t dest_blend = 0;     // Xenos color destination factor
+  uint32_t blend_op = 0;       // Xenos color combine function
   uint32_t blend_control = 0;  // RB_BLENDCONTROL0 0x2201
   // RB_COLORCONTROL 0x2202: bits 0-2 the alpha comparison, bit 3 its enable.
   // With the reference value below, this is the alpha test — the one piece of

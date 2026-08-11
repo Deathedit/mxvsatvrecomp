@@ -125,6 +125,7 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  const GpuVertexStage* vertexStage = nullptr,
                  uint32_t pixelSamplerArrayMask = 0,
                  const uint8_t* pixelSamplerSigns = nullptr,
+                 uint32_t pixelParamGen = 0,
                  uint32_t depthObject = 0, uint32_t depthWidth = 0,
                  uint32_t depthHeight = 0, uint32_t depthBase = 0,
                  uint32_t targetBase = 0, uint32_t targetColorFormat = 0);
@@ -148,6 +149,12 @@ void AddGameResolve(uint32_t destTexture, uint32_t sourceObject,
                     uint32_t destWidth = 0, uint32_t destHeight = 0,
                     bool sourceIsDepth = false, uint32_t sourceBase = 0,
                     uint32_t sourceWidth = 0, uint32_t sourceHeight = 0);
+
+// Append a full-surface colour clear in order with draws and resolves.
+void AddGameClear(uint32_t targetObject, uint32_t targetWidth,
+                  uint32_t targetHeight, uint32_t targetBase,
+                  uint32_t targetColorFormat, uint32_t color,
+                  const float* floatColor = nullptr);
 
 // Drop the previous frame's draws. Called when a real guest-frame handoff
 // arrives, including one whose draws are all filtered; an empty render-thread
@@ -618,8 +625,14 @@ void ClearGameDraws();
   // with no seam down the diagonal.
   Microsoft::WRL::ComPtr<ID3D12Resource> m_presentVB;
   D3D12_VERTEX_BUFFER_VIEW m_presentVbv = {};
-  // Which offscreen target holds the finished frame, or 0 for m_gameRT. Set
-  // during RenderGameFrame, consumed by PresentGameFrame.
+  // The final full-backbuffer colour resolve before VdSwap is the guest's
+  // completed frame. Prefer that immutable snapshot for presentation; the
+  // draw-target object remains a fallback for frames that contain no usable
+  // full-size resolve.
+  uint32_t m_presentResolveTexture = 0;
+  // Which offscreen target was written last, or 0 for m_gameRT. This is only
+  // the fallback now -- a render target may be shared scratch storage whose
+  // contents change again after the guest resolved the frame from it.
   uint32_t m_presentSourceObject = 0;
   bool CreatePresentQuad();
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_gameSrvHeap;
@@ -729,6 +742,11 @@ void ClearGameDraws();
     uint32_t targetBase = 0;
     // Guest ColorRenderTargetFormat for that target, RB_COLOR_INFO[16:19].
     uint32_t targetColorFormat = 0;
+    // Ordered full-surface D3DDevice_Clear. Carries no geometry.
+    bool colorClear = false;
+    uint32_t clearColor = 0;  // D3DCOLOR A8R8G8B8.
+    bool clearColorIsFloat = false;
+    std::array<float, 4> clearColorFloat = {};
     // The guest's depth surface for this draw, by object identity. Offscreen
     // colour targets used to get no depth attachment at all.
     uint32_t depthObject = 0;
@@ -814,6 +832,8 @@ void ClearGameDraws();
     // kUnsignedBiased and the shader must expand it as 2*c-1. Already
     // permuted into host component order by the hooks side.
     std::array<uint8_t, kTranslatedSamplerSlots> pixelSamplerSigns = {};
+    // Zero when disabled, otherwise one plus SQ_CONTEXT_MISC.param_gen_pos.
+    uint32_t pixelParamGen = 0;
     bool translated = false;
 
     // The guest VERTEX shader on the GPU. `gpuVertex` is only set once every

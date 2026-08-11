@@ -388,22 +388,32 @@ class Interpreter {
   // operation has a _0 and a _1 form. The SDK reassembles it for us in
   // scalar_const_reg_op_src_temp_reg().
   //
-  // Both operands are scalars, selected by the low two bits of src3_swiz. The
-  // constant's negate bit still applies; the temp's does not, there being no
-  // field for it.
+  // The constant is selected with the W-relative src3 swizzle and the temporary
+  // with the X-relative src3 swizzle (the Xenos AB = WX scalar convention).
+  // abs_constants and src3 negate apply to both operands.
   bool ConstRegScalarOp(const uc::AluInstruction& alu, float& out) {
     using Op = uc::AluScalarOpcode;
     const Op op = alu.scalar_opcode();
     if (op < Op::kMulsc0 || op > Op::kSubsc1) return false;
 
-    const uint32_t comp = alu.src_swizzle(3) & 3;
+    const uint32_t swizzle = alu.src_swizzle(3);
+    const uint32_t const_comp =
+        uc::AluInstruction::GetSwizzledComponentIndex(swizzle, 3);
+    const uint32_t temp_comp =
+        uc::AluInstruction::GetSwizzledComponentIndex(swizzle, 0);
     Vec4 cv = Const(alu.src_reg(3) & 0xFF);
-    float a = cv[comp];
-    if (alu.abs_constants()) a = std::fabs(a);
-    if (alu.src_negate(3)) a = -a;
-
-    const float b =
-        temps[alu.scalar_const_reg_op_src_temp_reg() & (kNumTemps - 1)][comp];
+    float a = cv[const_comp];
+    float b =
+        temps[alu.scalar_const_reg_op_src_temp_reg() & (kNumTemps - 1)]
+             [temp_comp];
+    if (alu.abs_constants()) {
+      a = std::fabs(a);
+      b = std::fabs(b);
+    }
+    if (alu.src_negate(3)) {
+      a = -a;
+      b = -b;
+    }
 
     switch (op) {
       case Op::kMulsc0: case Op::kMulsc1: out = LegacyMul(a, b); break;
@@ -425,9 +435,11 @@ class Interpreter {
     }
 
     const Vec4 s = Src(alu, 3);
-    // Two-operand scalar ops take x and y of the swizzled operand; one-operand
-    // ops take x, and a few also read w.
-    const float a = s[0], b = s[1], w = s[3];
+    // Xenos scalar operands use AB = WX, not XY. Src() has already applied
+    // the component-relative swizzle, so the W-relative left operand is [3]
+    // and the X-relative right operand is [0]. One-component scalar opcodes
+    // consume only a; the two-component forms consume both a and b.
+    const float a = s[3], b = s[0];
     float r = 0.0f;
     switch (op) {
       case Op::kAdds: r = a + b; break;
@@ -435,10 +447,10 @@ class Interpreter {
       case Op::kSubs: r = a - b; break;
       case Op::kMaxs: r = a >= b ? a : b; break;
       case Op::kMins: r = a < b ? a : b; break;
-      case Op::kSeqs: r = a == b ? 1.0f : 0.0f; break;
-      case Op::kSgts: r = a > b ? 1.0f : 0.0f; break;
-      case Op::kSges: r = a >= b ? 1.0f : 0.0f; break;
-      case Op::kSnes: r = a != b ? 1.0f : 0.0f; break;
+      case Op::kSeqs: r = a == 0.0f ? 1.0f : 0.0f; break;
+      case Op::kSgts: r = a > 0.0f ? 1.0f : 0.0f; break;
+      case Op::kSges: r = a >= 0.0f ? 1.0f : 0.0f; break;
+      case Op::kSnes: r = a != 0.0f ? 1.0f : 0.0f; break;
       case Op::kAddsPrev: r = a + ps_; break;
       case Op::kMulsPrev: r = LegacyMul(a, ps_); break;
       case Op::kSubsPrev: r = a - ps_; break;
@@ -469,15 +481,15 @@ class Interpreter {
       case Op::kSin: r = std::sin(a); break;
       case Op::kCos: r = std::cos(a); break;
       case Op::kMaxAs:
-        // As kMaxA, but the address source is src0.x rather than src0.w.
+        // The address source and left maximum operand are both scalar a.
         a0_ = SetAddressRegister(a);
-        r = a >= w ? a : w;
+        r = a >= b ? a : b;
         break;
       case Op::kMaxAsf:
         // The "floor" variant: truncates toward negative infinity instead of
         // rounding to nearest. Same clamp.
         a0_ = ClampAddress(std::floor(a));
-        r = a >= w ? a : w;
+        r = a >= b ? a : b;
         break;
       case Op::kRetainPrev: r = ps_; break;
       default:

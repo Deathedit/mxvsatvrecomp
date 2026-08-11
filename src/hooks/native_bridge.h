@@ -6,6 +6,7 @@
 
 #include <Windows.h>
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <memory>
 
@@ -30,7 +31,7 @@ class NativeGraphics {
   static NativeGraphics& Get();
 
   void Shutdown();
-  void Attach(D3D12Renderer* r) { m_renderer = r; }
+  void Attach(D3D12Renderer* r);
 
   void BeginFrame();
   void EndFrame();
@@ -51,7 +52,9 @@ class NativeGraphics {
   uint8_t* m_guest_base = nullptr;
 
   std::mutex m_drawMutex;
+  std::condition_variable m_drawConsumed;
   std::vector<mx::hle::DrawCall> m_drawCalls;
+  bool m_acceptDrawCalls = true;
 };
 
 }  // namespace mx::native

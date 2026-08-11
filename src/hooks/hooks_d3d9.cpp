@@ -72,6 +72,7 @@ REXCVAR_DECLARE(bool, hle_diag);
 REXCVAR_DECLARE(bool, hle_sanitize_constants);
 REXCVAR_DECLARE(bool, hle_ps_device_fallback);
 REXCVAR_DECLARE(bool, hle_texture_signs);
+REXCVAR_DECLARE(bool, hle_shader_fetch_constants);
 namespace {
 
 namespace uc = rex::graphics::ucode;
@@ -758,6 +759,9 @@ bool ReadDeviceViewport(uint32_t device, uint8_t* base, float out[6]) {
 // state, which is exactly why it has to be read per draw rather than once.
 //---------------------------------------------------------------------------
 constexpr uint32_t kDeviceSqProgramCntl = 10528;
+// SQ_CONTEXT_MISC (0x2181) immediately follows SQ_PROGRAM_CNTL (0x2180) in
+// the device register shadow, matching their consecutive PM4 writes.
+constexpr uint32_t kDeviceSqContextMisc = kDeviceSqProgramCntl + 4;
 
 // The 0x2200 register block's shadow, from the same flush pattern:
 // sub_82564768(device, 0, 8704, device + 10548), 8704 = 0x2200 =
@@ -829,6 +833,21 @@ bool ReadSqProgramCntl(uint32_t device, uint8_t* base, SqProgramCntl* out) {
   out->vs_export_count = (v >> 20) & 0xF;
   out->vs_export_mode = (v >> 24) & 0x7;
   out->ps_export_mode = (v >> 27) & 0x1F;
+  return true;
+}
+
+struct SqContextMisc {
+  uint32_t raw = 0;
+  uint32_t param_gen_pos = 0;
+};
+
+bool ReadSqContextMisc(uint32_t device, uint8_t* base, SqContextMisc* out) {
+  if (!device) return false;
+  if (!HostPageReadable(REX_RAW_ADDR(device + kDeviceSqContextMisc)))
+    return false;
+  const uint32_t v = REX_LOAD_U32(device + kDeviceSqContextMisc);
+  out->raw = v;
+  out->param_gen_pos = (v >> 8) & 0xFFu;
   return true;
 }
 
@@ -963,18 +982,34 @@ std::map<uint32_t, uint32_t> g_pixelShaderByDevice;
 uint32_t g_lastPixelShaderAnyDevice = 0;
 
 void NotePixelShaderForDevice(uint32_t device, uint32_t shader) {
-  if (!shader) return;
   std::lock_guard<std::mutex> lock(g_pixelShaderByDeviceMu);
+  // A null shader is a real D3D9 state transition, not a missing observation.
+  // Dropping it leaves the previous shader cached forever, so draws made after
+  // SetPixelShader(nullptr) inherit a stale program and try to sample its slots.
   if (device) g_pixelShaderByDevice[device] = shader;
   g_lastPixelShaderAnyDevice = shader;
 }
 
-uint32_t PixelShaderForDevice(uint32_t device) {
+// `from_fallback`, when given, reports whether the answer came from THIS
+// device's record or from the global last-shader-seen-anywhere fallback below.
+//
+// The distinction is load-bearing and used to be invisible. A draw whose device
+// has no record still gets a plausible handle back, so a mis-attributed pixel
+// shader looks exactly like a correct one from the outside. The light-prepass
+// draws are the case that exposed it: their device receives SetVertexShader and
+// never SetPixelShader, so the pixel half of SQ_PROGRAM_CNTL is empty on those
+// draws while the vertex half is set, and the handle returned here is the
+// fallback rather than theirs.
+uint32_t PixelShaderForDevice(uint32_t device, bool* from_fallback) {
   std::lock_guard<std::mutex> lock(g_pixelShaderByDeviceMu);
   if (device) {
     const auto it = g_pixelShaderByDevice.find(device);
-    if (it != g_pixelShaderByDevice.end()) return it->second;
+    if (it != g_pixelShaderByDevice.end()) {
+      if (from_fallback) *from_fallback = false;
+      return it->second;
+    }
   }
+  if (from_fallback) *from_fallback = true;
   return g_lastPixelShaderAnyDevice;
 }
 
@@ -1431,6 +1466,65 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   using namespace mx::hle;
   const auto& st = DeviceState();
 
+  // DIAG (remove before commit): census SQ_PROGRAM_CNTL per VS/PS pair, read
+  // AT DRAW TIME.
+  //
+  // Third site for this log, and the previous two were both wrong in a way that
+  // produced confident, WRONG numbers rather than obviously missing ones:
+  //   - AttachTranslatedPixelShader: the vertex handle is not set yet, so every
+  //     line read "vs 0x00000000" and could not be attributed to a pair.
+  //   - ApplyShaderOutputs (vertex attach): both handles are known, but the
+  //     register is still being programmed. For ps 0x216AE020 that site read
+  //     raw 0x00010002 while the pixel-attach site read raw 0x10210503 for the
+  //     same shader -- vs_export_count 0 versus 2. The value CHANGES between
+  //     them, so neither belongs to the draw.
+  // BuildAndQueueDraw is where the draw is actually issued, so the register has
+  // settled. If this reading disagrees with the other two, THIS is the one to
+  // trust.
+  //
+  // vs_export_count is the interpolator count MINUS ONE (SDK registers.h:144).
+  {
+    SqProgramCntl pc{};
+    if (ReadSqProgramCntl(device, base, &pc)) {
+      SqContextMisc cm{};
+      const bool have_cm = ReadSqContextMisc(device, base, &cm);
+      const uint32_t vs_h = st.vs_seen ? st.vertex_shader : 0;
+      // Three different answers to "which pixel shader is this draw running",
+      // logged side by side because they disagree and the disagreement is the
+      // finding:
+      //   ps_tl     - DeviceState().pixel_shader. thread_local, and these draws
+      //               come off worker threads, so it is empty for them.
+      //   ps_strict - THIS device's record only. What the real draw path uses
+      //               (see the hle_ps_device_fallback branch below), so this is
+      //               the one that decides what actually renders.
+      //   ps_any    - strict, else the last shader seen on ANY device. A guess
+      //               across devices; fine for a diagnostic, wrong for binding.
+      // If ps_strict is 0 while ps_any is not, this device never received
+      // SetPixelShader and any handle we show for it is borrowed.
+      const uint32_t ps_tl = st.ps_seen ? st.pixel_shader : 0;
+      const uint32_t ps_strict = PixelShaderForDeviceStrict(device);
+      bool ps_was_fallback = false;
+      const uint32_t ps_h = PixelShaderForDevice(device, &ps_was_fallback);
+      static std::set<uint64_t> s_seen;
+      const uint64_t key = (uint64_t(vs_h) << 32) | ps_h;
+      if (s_seen.size() < 128 && s_seen.insert(key).second) {
+        REXLOG_INFO(
+            "d3d9: SQ_PROGRAM_CNTL ATDRAW dev 0x{:08X} vs 0x{:08X} ps 0x{:08X} "
+            "(strict 0x{:08X} tl 0x{:08X} fallback {}): raw "
+            "0x{:08X} param_gen {} param_gen_pos {} context_misc 0x{:08X} "
+            "gen_index_pix {} vs_export_count {} (= {} "
+            "interpolators) vs_export_mode {} ps_export_mode {} vs_num_reg {} "
+            "ps_num_reg {}",
+            device, vs_h, ps_h, ps_strict, ps_tl, ps_was_fallback ? 1 : 0,
+            pc.raw, pc.param_gen ? 1 : 0,
+            have_cm ? cm.param_gen_pos : 0xFFFFFFFFu,
+            have_cm ? cm.raw : 0xFFFFFFFFu, pc.gen_index_pix ? 1 : 0,
+            pc.vs_export_count, pc.vs_export_count + 1, pc.vs_export_mode,
+            pc.ps_export_mode, pc.vs_num_reg, pc.ps_num_reg);
+      }
+    }
+  }
+
   // Before any early return. This probe previously sat after BuildHleDraw, so
   // a draw that failed to translate never reached it — the probe was gated on
   // the very thing it exists to diagnose, which is the third time that shape
@@ -1582,6 +1676,20 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   }
   ++HleBuiltCount();
 
+  // PsParamGen is draw state, not a vertex-shader export. Xenos writes the
+  // generated pixel parameters to the register selected by SQ_CONTEXT_MISC,
+  // independently of SQ_PROGRAM_CNTL.vs_export_count. Preserve that exact
+  // destination for the translated pixel stage. The SDK limits it to the
+  // sixteen interpolator registers; malformed state is left disabled.
+  {
+    SqProgramCntl pc{};
+    SqContextMisc cm{};
+    if (ReadSqProgramCntl(device, base, &pc) && pc.param_gen &&
+        ReadSqContextMisc(device, base, &cm) && cm.param_gen_pos < 16) {
+      dc.pixel_param_gen = cm.param_gen_pos + 1;
+    }
+  }
+
   // Stage 3's measurement, on the built positions rather than on raw bytes: the
   // vertices are already decoded and in host order here, so the probe scores the
   // same numbers the renderer would receive.
@@ -1677,7 +1785,25 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   // The Bink composite needs its whole plane set, so it takes its own path
   // rather than competing in the single-winner binding contest.
   const uint32_t bound_ps = st.ps_seen ? st.pixel_shader : 0;
-  if (IsBinkCompositeDraw(bound_ps, base)) PrepareBinkPlanes(dc, device, base);
+  if (IsBinkCompositeDraw(bound_ps, base) &&
+      PrepareBinkPlanes(dc, device, base)) {
+    // Bink intentionally skips PrepareDrawTexture because its composite needs
+    // three or four planes rather than the stand-in path's single winning
+    // texture. Capture only the c0 modulation consumed by the dedicated YUV
+    // shader. Attaching the whole translated shader here changes pipeline
+    // selection: the 640x216 FE_Smoke quad then runs through the general pixel
+    // path against its 1280x720 target and becomes a full white rectangle.
+    // Keeping pixel_shader_hlsl unset preserves the purpose-built YUV path.
+    constexpr uint32_t kPixelConstBase = 0x1780;
+    if (device &&
+        HostPageReadable(REX_RAW_ADDR(device + kPixelConstBase)) &&
+        HostPageReadable(REX_RAW_ADDR(device + kPixelConstBase + 12))) {
+      dc.pixel_constants.resize(4);
+      for (uint32_t i = 0; i < 4; ++i)
+        dc.pixel_constants[i] =
+            REX_LOAD_U32(device + kPixelConstBase + i * 4);
+    }
+  }
   const bool have_texture =
       !dc.yuv_composite &&
       PrepareDrawTexture(dc, bound_ps, device, base, texture_binding);
@@ -1704,7 +1830,18 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   // so use D3D9's normal writable-depth mode whenever ZEnable is on. Most
   // importantly, ColorWriteEnable=0 identifies the depth-only passes that the
   // host previously painted opaque white.
-  if (st.render_state.Seen(kRsColorWriteEnable)) {
+  // Read the effective Xenos mask from the device, not merely the setter call
+  // observed on this worker. D3DDevice_SetRenderState_ColorWriteEnable stores
+  // RB_COLOR_MASK at device+0x28DC after applying the device's active-target
+  // gate (confirmed from the XDK-matched function at 0x8254A078). The setter
+  // shadow is thread-local, while a device's render state is not, so relying on
+  // the shadow lets a draw submitted by another worker inherit the default
+  // host write mask and turns depth-only passes into black overpaint.
+  constexpr uint32_t kRbColorMask = 0x28DC;  // RB_COLOR_MASK 0x2104
+  if (device && HostPageReadable(REX_RAW_ADDR(device + kRbColorMask))) {
+    dc.colour_mask = REX_LOAD_U32(device + kRbColorMask) & 0xFu;
+    dc.om_seen |= 1u << 0;
+  } else if (st.render_state.Seen(kRsColorWriteEnable)) {
     dc.colour_mask = st.render_state.value[kRsColorWriteEnable] & 0xFu;
     dc.om_seen |= 1u << 0;
   }
@@ -1712,19 +1849,58 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     if (st.render_state.value[kRsZEnable]) dc.depth_control = (1u << 1) | (1u << 2);
     dc.om_seen |= 1u << 1;
   }
-  // Blending. Only meaningful when the guest actually enabled it, so the
-  // factors are read but not defaulted: a draw with no ALPHABLENDENABLE seen
-  // stays opaque, which is what it was before this existed.
-  if (st.render_state.Seen(kRsAlphaBlendEnable)) {
-    dc.blend_enable = st.render_state.value[kRsAlphaBlendEnable];
+  // Read the effective Xenos equation, not the D3D9-side requested state at
+  // device+0x2EF8/0x2EFC. D3DDevice_DrawVertices flushes the 0x2200 register
+  // block from device+0x2934, putting RB_BLENDCONTROL0 (0x2201) at +0x2938.
+  // This is also how xenia-edge decides host blending: Xenos has no separate
+  // RB blend-enable bit, so any equation other than ONE/ZERO/ADD is enabled.
+  //
+  // Using the D3D9-side bit made the menu's SRC_ALPHA/INV_SRC_ALPHA draw
+  // opaque. Its pixel shader deliberately exports transparent black, which
+  // should preserve the destination but instead erased the whole backdrop.
+  // The thread-local setter shadow remains only as a guarded fallback.
+  constexpr uint32_t kRbBlendControl0 = 0x2938;  // RB_BLENDCONTROL0 0x2201
+  if (device && HostPageReadable(REX_RAW_ADDR(device + kRbBlendControl0))) {
+    const uint32_t packed = REX_LOAD_U32(device + kRbBlendControl0);
+    dc.src_blend = packed & 0x1Fu;
+    dc.blend_op = (packed >> 5) & 0x7u;
+    dc.dest_blend = (packed >> 8) & 0x1Fu;
+    const uint32_t alpha_src = (packed >> 16) & 0x1Fu;
+    const uint32_t alpha_op = (packed >> 21) & 0x7u;
+    const uint32_t alpha_dest = (packed >> 24) & 0x1Fu;
+    dc.blend_enable =
+        dc.src_blend != 1 || dc.dest_blend != 0 || dc.blend_op != 0 ||
+        alpha_src != 1 || alpha_dest != 0 || alpha_op != 0;
+    dc.blend_control = packed;
     dc.om_seen |= 1u << 2;
+
+    // This is the exact draw that RenderDoc event 6809 identifies as the first
+    // black overpaint in test-2.rdc. Keep the first few occurrences visible so
+    // the next run proves that the effective Xenos equation reaches the host.
+    static uint32_t s_zero_ps_state_logs = 0;
+    if (dc.index_count == 35 && s_zero_ps_state_logs++ < 8) {
+      REXLOG_INFO("d3d9: 35-index OM state device 0x{:08X}: "
+                  "RB_BLENDCONTROL0 0x{:08X} => enable {} color "
+                  "src {} dest {} op {}, alpha src {} dest {} op {}; "
+                  "color mask 0x{:X}",
+                  device, packed, dc.blend_enable, dc.src_blend,
+                  dc.dest_blend, dc.blend_op, alpha_src, alpha_dest, alpha_op,
+                  dc.colour_mask);
+    }
+  } else {
+    // Only meaningful when the guest actually enabled it, so the factors are
+    // read but not defaulted: an entirely unobserved state stays opaque.
+    if (st.render_state.Seen(kRsAlphaBlendEnable)) {
+      dc.blend_enable = st.render_state.value[kRsAlphaBlendEnable];
+      dc.om_seen |= 1u << 2;
+    }
+    if (st.render_state.Seen(kRsSrcBlend))
+      dc.src_blend = st.render_state.value[kRsSrcBlend];
+    if (st.render_state.Seen(kRsDestBlend))
+      dc.dest_blend = st.render_state.value[kRsDestBlend];
+    if (st.render_state.Seen(kRsBlendOp))
+      dc.blend_op = st.render_state.value[kRsBlendOp];
   }
-  if (st.render_state.Seen(kRsSrcBlend))
-    dc.src_blend = st.render_state.value[kRsSrcBlend];
-  if (st.render_state.Seen(kRsDestBlend))
-    dc.dest_blend = st.render_state.value[kRsDestBlend];
-  if (st.render_state.Seen(kRsBlendOp))
-    dc.blend_op = st.render_state.value[kRsBlendOp];
 
   // The alpha test, from the device's Xenos register shadow. See the note on
   // DrawCall::colour_control for where these two offsets come from.
@@ -2872,33 +3048,18 @@ ShaderApplyResult ApplyShaderOutputs(
   // generate it?
   //
   // SQ_PROGRAM_CNTL bit 18 (`param_gen`) makes the hardware synthesise an
-  // interpolator holding the screen-space position. It is APPENDED after the
-  // vertex shader's own exports — at register `vs_export_count` — so no export
-  // feeds it and reading exports[] at that index is off the end of what the
-  // shader wrote. The register was already read and logged here; nothing acted
-  // on it, so the UV path indexed straight through and got zeros.
+  // interpolator holding the screen-space position. SQ_CONTEXT_MISC selects
+  // its destination register; vs_export_count only describes how many
+  // interpolators the vertex shader exports and cannot select this input.
   //
-  // Measured on the draws that were broken: param_gen=true, vs_export_count=2,
-  // and the fetch names exactly r2. Every vertex read (0,0), so the fullscreen
-  // quad sampled a single texel, every post-process stage output a flat colour,
-  // and the chain converged on a uniform grey.
-  //
-  // The two rejected alternatives are recorded because both looked right:
-  //   - indexing straight through (exports[2]) reads past the shader's exports
-  //     and yields exactly zero;
-  //   - shifting down by one (exports[1]) finds real data, but measuring its
-  //     raw range gives x -1..1, y -1..1, z 16..16, w 16..16 — clip-space
-  //     position and two constants. There is no texture coordinate in the
-  //     exports at all, which is what says the coordinate must be generated.
+  // PM4 captures show the distinction directly: SQ_PROGRAM_CNTL may report
+  // vs_export_count=2 while the following SQ_CONTEXT_MISC selects r3. Reading
+  // exports[3] returns zero because no vertex export is supposed to feed it.
   uint32_t uv_export_reg = texture_binding ? texture_binding->src_reg : 0;
   bool uv_generated = false;
-  if (texture_binding) {
-    SqProgramCntl pc{};
-    if (ReadSqProgramCntl(device, base, &pc) && pc.param_gen &&
-        texture_binding->src_reg == pc.vs_export_count) {
-      uv_generated = true;
-    }
-  }
+  if (texture_binding && dc.pixel_param_gen &&
+      texture_binding->src_reg == dc.pixel_param_gen - 1)
+    uv_generated = true;
   // Not a PhaseTimer: the loop below has early returns on malformed geometry,
   // and a scope guard there would have to survive them. Those paths abandon the
   // draw anyway, so losing their timing is correct rather than merely tolerable.
@@ -3573,6 +3734,62 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
         out.source.data(), out.source.size(), nullptr, nullptr, nullptr,
         "main", target, D3DCOMPILE_OPTIMIZATION_LEVEL0, 0, &blob, &errors);
     compiled = SUCCEEDED(hr) && blob;
+    // DIAG (remove before commit): dump the generated HLSL beside the DXBC the
+    // compiler produced from it, for every pixel shader that compiles.
+    //
+    // The reason both halves are needed: a RenderDoc pixel trace numbers its
+    // steps by DXBC INSTRUCTION, not by line of our HLSL, so "instruction 147"
+    // cannot be located in the source alone. The disassembly is the only thing
+    // that maps one to the other. renderdoc-mcp's get_shader refuses these
+    // shaders outright ("; Invalid Shader Specified") while still serving
+    // reflection, so the capture cannot supply it either.
+    //
+    // Unconditional rather than cvar-gated: two cvar-gated diagnostics
+    // (hle_skip_untextured, hle_dump_shaders) were added this session and
+    // NEITHER ever armed in this environment. Bounded to 96 files instead, which
+    // is above the ~72 pipelines a menu run builds, so the cap is a safety net
+    // rather than a filter.
+    //
+    // Compiled at OPTIMIZATION_LEVEL0 above, so the DXBC follows the emitted
+    // source closely and the mapping stays readable.
+    if (compiled) {
+      static uint32_t s_dumped = 0;
+      if (s_dumped < 160) {
+        ++s_dumped;
+        std::error_code ec;
+        std::filesystem::create_directories("logs/hlsldump", ec);
+        char path[128];
+        // Vertex shaders included: a light-prepass draw was found exporting a
+        // correct SV_Position and then ZERO for every interpolator, which is a
+        // defect on the VERTEX side, and the pixel-only dump could not show it.
+        std::snprintf(path, sizeof(path), "logs/hlsldump/%s_%08X.txt",
+                      stage == mx::hle::HlslStage::kPixel ? "ps" : "vs",
+                      handle);
+        std::ofstream f(path, std::ios::trunc | std::ios::binary);
+        if (f) {
+          f << "; guest "
+            << (stage == mx::hle::HlslStage::kPixel ? "pixel" : "vertex")
+            << " shader 0x" << std::hex << handle << std::dec
+            << "\n; sampler_count " << out.sampler_count << " max_const_index "
+            << out.max_const_index << " input_mask 0x" << std::hex
+            << out.input_mask << " export_mask 0x" << out.export_mask
+            << " dropped_export_mask 0x" << out.dropped_export_mask << std::dec
+            << " writes_position " << (out.writes_position ? 1 : 0)
+            << "\n\n=== EMITTED HLSL ===\n"
+            << out.source << "\n=== DXBC DISASSEMBLY ===\n";
+          Microsoft::WRL::ComPtr<ID3DBlob> disasm;
+          if (SUCCEEDED(D3DDisassemble(blob->GetBufferPointer(),
+                                       blob->GetBufferSize(), 0, nullptr,
+                                       &disasm)) &&
+              disasm) {
+            f.write(static_cast<const char*>(disasm->GetBufferPointer()),
+                    std::streamsize(disasm->GetBufferSize()));
+          } else {
+            f << "; D3DDisassemble failed\n";
+          }
+        }
+      }
+    }
     if (!compiled && errors) {
       compile_error.assign(
           static_cast<const char*>(errors->GetBufferPointer()),
@@ -3623,6 +3840,45 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
             nullptr, "main", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL0, 0,
             &fblob, &ferrors);
         if (SUCCEEDED(fhr) && fblob) {
+          // DIAG (remove before commit): dump the FETCH variant separately.
+          // This is the form that actually runs for a gpuVertexFetch draw, and
+          // it is NOT the blob dumped at the main compile site above -- a
+          // light-prepass draw was found exporting a correct SV_Position and
+          // then zero for every interpolator, and only this variant can show
+          // why. Written before the source is moved out of `fetched`.
+          {
+            static uint32_t s_vf_dumped = 0;
+            if (s_vf_dumped < 96) {
+              ++s_vf_dumped;
+              std::error_code vec;
+              std::filesystem::create_directories("logs/hlsldump", vec);
+              char vpath[128];
+              std::snprintf(vpath, sizeof(vpath),
+                            "logs/hlsldump/vsfetch_%08X.txt", handle);
+              std::ofstream vf(vpath, std::ios::trunc | std::ios::binary);
+              if (vf) {
+                vf << "; guest vertex shader 0x" << std::hex << handle
+                   << std::dec << " FETCH VARIANT\n; input_mask 0x" << std::hex
+                   << fetched.input_mask << " export_mask 0x"
+                   << fetched.export_mask << " dropped_export_mask 0x"
+                   << fetched.dropped_export_mask << std::dec
+                   << " writes_position " << (fetched.writes_position ? 1 : 0)
+                   << " vertex_fetch_count " << fetched.vertex_fetch_count
+                   << "\n\n=== EMITTED HLSL ===\n"
+                   << fetched.source << "\n=== DXBC DISASSEMBLY ===\n";
+                Microsoft::WRL::ComPtr<ID3DBlob> fdis;
+                if (SUCCEEDED(D3DDisassemble(fblob->GetBufferPointer(),
+                                             fblob->GetBufferSize(), 0, nullptr,
+                                             &fdis)) &&
+                    fdis) {
+                  vf.write(static_cast<const char*>(fdis->GetBufferPointer()),
+                           std::streamsize(fdis->GetBufferSize()));
+                } else {
+                  vf << "; D3DDisassemble failed\n";
+                }
+              }
+            }
+          }
           kept.fetch_source =
               std::make_shared<const std::string>(std::move(fetched.source));
           kept.vertex_fetch_count = fetched.vertex_fetch_count;
@@ -4040,8 +4296,62 @@ bool ResolvePixelBinding(uint32_t handle,
   return false;
 }
 
+// Texture fetch constants embedded in a shader object's state-patch list.
+//
+// SetPixelShader and SetVertexShader both walk the same three-part block. The
+// first list emits LOAD_ALU_CONSTANT packets. The SECOND list is different:
+// each entry is `(u16 byte_offset, u16 dword_count, inline payload)` and the
+// guest copies that payload to `device + 0x480 + byte_offset`. The first 0xC0
+// bytes of that device block are the 32 six-dword texture fetch constants.
+//
+// This distinction is verified directly in the recompiled guest functions
+// sub_825506E8 and sub_825508A8. An earlier implementation searched the first
+// list for ALU register indexes reaching 0x4800; no shader published such an
+// entry, so the runtime correctly reported zero captured descriptors.
+//
+// Cached per pixel-shader handle rather than re-walked per draw. The pixel and
+// vertex shader patch lists are merged because either may carry state for the
+// shared device constants block used by the draw.
+struct ShaderFetchConstants {
+  static constexpr uint32_t kDwords = 6;
+  uint32_t words[mx::hle::kMaxSamplers * kDwords] = {};
+  // Which of the six dwords of each sampler have arrived. A descriptor can be
+  // split across entries, and the two halves are only usable together.
+  uint8_t partial[mx::hle::kMaxSamplers] = {};
+  // Bit s set = ALL SIX dwords of sampler s arrived. A partial publish is not
+  // usable -- DescribeHleTexture2D reads all six and would describe a texture
+  // out of half a descriptor and half zeros, which is worse than reporting the
+  // slot unbound.
+  uint32_t complete_mask = 0;
+};
+std::mutex g_shaderFetchMu;
+std::map<uint32_t, ShaderFetchConstants> g_shaderFetch;
+// Slot fills served from a shader-embedded descriptor rather than the device
+// shadow. Reported beside the unbound-sampler counts, because these two are the
+// same population before and after the fix and only mean something together.
+std::atomic<uint64_t> g_shaderFetchServed{0};
+std::atomic<uint64_t> g_shaderFetchPublished{0};
+
+// Copy sampler `sampler`'s published fetch constant, if this shader published a
+// complete one. Returns false otherwise, leaving `out` untouched.
+bool ShaderPublishedFetch(uint32_t shader, uint32_t sampler, uint32_t out[6]) {
+  if (!shader || sampler >= mx::hle::kMaxSamplers) return false;
+  std::lock_guard<std::mutex> lock(g_shaderFetchMu);
+  const auto it = g_shaderFetch.find(shader);
+  if (it == g_shaderFetch.end()) return false;
+  if (!(it->second.complete_mask & (1u << sampler))) return false;
+  std::memcpy(out, &it->second.words[sampler * ShaderFetchConstants::kDwords],
+              sizeof(uint32_t) * 6);
+  return true;
+}
+
+// `ps_handle`, when given, is the pixel shader whose load table may carry this
+// sampler's descriptor. Pass the PER-DEVICE handle (PixelShaderForDeviceStrict),
+// never the thread-local one: DeviceState() is thread_local and a worker-thread
+// draw would name the wrong shader, which here would mean binding another
+// draw's texture rather than merely missing one.
 bool ReadLiveTextureFetch(uint32_t device, uint8_t* base, uint32_t sampler,
-                          uint32_t out[6]) {
+                          uint32_t out[6], uint32_t ps_handle = 0) {
   if (!out || sampler >= mx::hle::kMaxSamplers) return false;
   std::memset(out, 0, sizeof(uint32_t) * 6);
   const uint32_t fetch_at = device + 0x480 + sampler * 24;
@@ -4049,7 +4359,20 @@ bool ReadLiveTextureFetch(uint32_t device, uint8_t* base, uint32_t sampler,
       HostPageReadable(REX_RAW_ADDR(fetch_at + 20))) {
     for (uint32_t i = 0; i < 6; ++i)
       out[i] = REX_LOAD_U32(fetch_at + i * 4);
+    // FetchConstantType::kTexture == 2 (SDK rex/graphics/xenos.h:1093-1098).
     if ((out[0] & 3u) == 2u) return true;
+  }
+  // Second, and only when the device shadow has nothing: the descriptor the
+  // shader published for itself. A live SetTexture must still win, so this sits
+  // below the shadow rather than above it.
+  if (ps_handle && REXCVAR_GET(hle_shader_fetch_constants)) {
+    uint32_t published[6] = {};
+    if (ShaderPublishedFetch(ps_handle, sampler, published) &&
+        (published[0] & 3u) == 2u) {
+      std::memcpy(out, published, sizeof(uint32_t) * 6);
+      ++g_shaderFetchServed;
+      return true;
+    }
   }
   const auto& tb = DeviceState().texture[sampler];
   if (!tb.bound || !tb.valid) return false;
@@ -4632,11 +4955,14 @@ void ReportBoundZero() {
   REXLOG_INFO("d3d9: draws sampling BLACK {}: all-zero texture {}, "
               "unbound sampler {}; {} distinct blank textures, {} still blank; "
               "unbound by sampler:{}; resolve address matches {} (extent "
-              "mismatches {}), resolves dropped for no source {}",
+              "mismatches {}), resolves dropped for no source {}; "
+              "shader-published fetch: {} shaders, {} slots served",
               total, g_slotBoundZero, g_slotBoundUnbound,
               g_blankTextures.size(), outstanding,
               by.empty() ? " none" : by, g_resolveAddressMatches,
-              g_resolveAddressExtentMiss, g_resolveDroppedNoSource);
+              g_resolveAddressExtentMiss, g_resolveDroppedNoSource,
+              g_shaderFetchPublished.load(std::memory_order_relaxed),
+              g_shaderFetchServed.load(std::memory_order_relaxed));
 }
 
 // Every distinct (guest format, swizzle) pair that reaches a binding, printed
@@ -4780,7 +5106,11 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   }
 
   uint32_t fetch[6] = {};
-  if (!ReadLiveTextureFetch(device, base, guest_sampler, fetch)) {
+  // dc.pixel_shader_handle is the handle AttachTranslatedPixelShader resolved
+  // for this DEVICE, not the thread-local one -- see the resolution above it --
+  // which is the handle whose load table may carry this sampler's descriptor.
+  if (!ReadLiveTextureFetch(device, base, guest_sampler, fetch,
+                            dc.pixel_shader_handle)) {
     ++g_slotFailFetch;
     ++g_slotFailFetchBySampler[guest_sampler];
     ReportSlotFailures();
@@ -4991,9 +5321,10 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
 // the 22 that read only written registers are exactly the UI shaders that
 // always looked correct.
 //
-// reg_index is an ABSOLUTE ALU constant index, so the pixel half is 256..511
-// and maps to this bank at reg_index - 256. Entries below 256 belong to the
-// vertex file and are ignored here rather than folded in at a wrong index.
+// `reg` is an ALU float4 constant index. The emitted packet uses `4 * reg` as
+// its dword offset from register 0x4000, so pixel constants 256..511 map to this
+// bank at reg-256. Texture fetch constants do NOT live in this list; they are
+// in the second, inline state-patch list walked by ApplyShaderFetchPatchTable.
 void ApplyShaderLoadTable(uint32_t shader, uint32_t table_at, uint32_t data_at,
                           uint8_t* base, std::vector<uint32_t>& bank) {
   if (!shader || bank.size() < 256 * 4) return;
@@ -5036,6 +5367,64 @@ void ApplyShaderLoadTable(uint32_t shader, uint32_t table_at, uint32_t data_at,
     }
     if (entries <= 4)
       first += fmt::format(" c{}..c{}", reg, reg + (dwords + 3) / 4 - 1);
+  }
+}
+
+// Read the second list in the shader patch block -- the one SetPixelShader and
+// SetVertexShader memcpy directly into `device + 0x480`.
+void ApplyShaderFetchPatchTable(uint32_t shader, uint32_t table_at,
+                                uint8_t* base, ShaderFetchConstants& fetch) {
+  if (!shader) return;
+  const uint32_t table = shader + table_at;
+  if (!HostPageReadable(REX_RAW_ADDR(table + 0x14))) return;
+  const uint32_t rel = REX_LOAD_U32(table + 0x14);
+  if (!rel || rel >= 0x10000) return;
+  const uint32_t block = table + rel;
+  if (!HostPageReadable(REX_RAW_ADDR(block + 0x10))) return;
+  const uint32_t bytes = REX_LOAD_U32(block + 0x10);
+  if (!bytes || bytes >= 0x10000) return;
+
+  uint32_t at = block + 0x14;
+  const uint32_t end = at + bytes;
+
+  // First list: `(u16 reg, u16 dwords, u32 data_offset)`, terminated by a
+  // zero dword count. This is the LOAD_ALU_CONSTANT list handled above.
+  while (at + 4 <= end && HostPageReadable(REX_RAW_ADDR(at + 2))) {
+    const uint32_t dwords = REX_LOAD_U16(at + 2);
+    at += 4;
+    if (!dwords) break;
+    if (at + 4 > end) return;
+    at += 4;
+  }
+
+  // Second list: inline device-shadow copies. Offset zero is fetch constant 0;
+  // six dwords later begins fetch constant 1. Only retain the first 16 slots,
+  // which is the HLE binding width; the guest block itself contains all 32.
+  constexpr uint32_t kFetchBytes = mx::hle::kMaxSamplers *
+                                   ShaderFetchConstants::kDwords * 4;
+  while (at + 4 <= end && HostPageReadable(REX_RAW_ADDR(at + 2))) {
+    const uint32_t byte_offset = REX_LOAD_U16(at);
+    const uint32_t dwords = REX_LOAD_U16(at + 2);
+    at += 4;
+    if (!dwords) break;
+    const uint64_t payload_bytes = uint64_t(dwords) * 4;
+    if (payload_bytes > uint64_t(end - at)) return;
+    for (uint32_t j = 0; j < dwords; ++j) {
+      const uint64_t dst_byte = uint64_t(byte_offset) + uint64_t(j) * 4;
+      if (dst_byte >= kFetchBytes) continue;
+      const uint32_t src = at + j * 4;
+      if (!HostPageReadable(REX_RAW_ADDR(src))) continue;
+      const uint32_t fetch_dword = uint32_t(dst_byte / 4);
+      const uint32_t sampler =
+          fetch_dword / ShaderFetchConstants::kDwords;
+      const uint32_t component =
+          fetch_dword % ShaderFetchConstants::kDwords;
+      fetch.words[fetch_dword] = REX_LOAD_U32(src);
+      fetch.partial[sampler] |= uint8_t(1u << component);
+      if (fetch.partial[sampler] == 0x3F)
+        fetch.complete_mask |= 1u << sampler;
+    }
+    at += uint32_t(payload_bytes);
   }
 }
 
@@ -5086,16 +5475,41 @@ void DumpShaderLoadTable(uint32_t shader, uint32_t table_at, uint32_t data_at,
 // shader -- so an entry in EITHER table whose register lands in 256..511 is a
 // pixel constant. Taking only the pixel shader's table left c43 and c85 at
 // zero, which is most of a material's shading still missing.
-void ApplyPixelShaderLoadTable(uint32_t shader, uint32_t device, uint8_t* base,
-                               std::vector<uint32_t>& bank) {
+// The fetch patches are gathered from BOTH shader objects because both binding
+// calls write the same device constants block. They are keyed by the PIXEL
+// shader handle because that is the identity the draw's texture resolver owns.
+void ApplyPixelShaderLoadTable(
+    uint32_t shader, uint32_t device, uint8_t* base,
+    std::vector<uint32_t>& bank) {
+  ShaderFetchConstants fetch;
   ApplyShaderLoadTable(shader, 0x28, 0x18, base, bank);
+  ApplyShaderFetchPatchTable(shader, 0x28, base, fetch);
   // device+0x3248 is the vertex shader object; its table sits at +0x368 with
   // its data base at +0x20.
   constexpr uint32_t kDeviceVertexShaderAt = 0x3248;
   if (device && HostPageReadable(REX_RAW_ADDR(device + kDeviceVertexShaderAt))) {
     const uint32_t vs = REX_LOAD_U32(device + kDeviceVertexShaderAt);
-    if (vs) ApplyShaderLoadTable(vs, 0x368, 0x20, base, bank);
+    if (vs) {
+      ApplyShaderLoadTable(vs, 0x368, 0x20, base, bank);
+      ApplyShaderFetchPatchTable(vs, 0x368, base, fetch);
+    }
   }
+  if (!shader || !fetch.complete_mask) return;
+  bool first = false;
+  {
+    std::lock_guard<std::mutex> lock(g_shaderFetchMu);
+    first = g_shaderFetch.insert_or_assign(shader, fetch).second;
+  }
+  if (!first) return;
+  // Once per shader that publishes any complete descriptor. This is what
+  // confirms which shader objects actually embed complete descriptors, so it
+  // names the samplers rather than merely counting them.
+  ++g_shaderFetchPublished;
+  std::string list;
+  for (uint32_t s = 0; s < mx::hle::kMaxSamplers; ++s)
+    if (fetch.complete_mask & (1u << s)) list += fmt::format(" s{}", s);
+  REXLOG_INFO("d3d9: ps 0x{:08X} publishes its own texture fetch constants:{}",
+              shader, list);
 }
 
 // Attach the guest's own translated pixel shader to a draw: its source, its
@@ -8192,12 +8606,52 @@ extern "C" REX_FUNC(sub_8254C3B0) {
 // system-memory bridge. Record the ordered relationship for host-side
 // render-to-texture routing.
 //-----------------------------------------------------------------------------
+// 0x8255B258 - D3DDevice_Clear.
+//
+// Only the measured full-surface colour form is modelled here. The front-end
+// default-texture atlas binds a 256x256 scratch target, clears it, and resolves
+// it three times without issuing a draw. Without this ordered event the host
+// has no source resource for those resolves, so the final compositor shader is
+// rejected even though the atlas tiles are intentionally blank defaults.
+// Partial rectangle and depth/stencil clears still pass through to the guest.
+REX_IMPORT(__imp__sub_8255B258, orig_Clear, void());
+extern "C" REX_FUNC(sub_8255B258) {
+  MX_D3D9_PLUGIN_PASSTHROUGH(orig_Clear);
+  const uint32_t rect_count = ctx.r4.u32;
+  const uint32_t rects = ctx.r5.u32;
+  const uint32_t flags = ctx.r6.u32;
+  const uint32_t color = ctx.r7.u32;
+  const auto& target = DeviceState().render_target[0];
+  // D3DCLEAR_TARGET is bit 0. Count zero and a null rectangle pointer are the
+  // whole-target form used by the measured atlas initializer.
+  if ((flags & 1u) && rect_count == 0 && rects == 0 && target.valid) {
+    mx::hle::DrawCall clear{};
+    clear.clear_color_target = true;
+    clear.clear_color = color;
+    clear.render_target_object = target.object;
+    clear.render_target_surface_info = target.surface_info;
+    clear.render_target_color_info = target.color_info;
+    clear.render_target_width = target.width;
+    clear.render_target_height = target.height;
+    clear.surface_base = target.color_info & 0xFFFu;
+    mx::hle::HleFrameDraws().push_back(std::move(clear));
+    static std::set<uint32_t> s_logged;
+    if (s_logged.insert(target.object).second && s_logged.size() <= 32) {
+      REXLOG_INFO("d3d9: CLEAR target 0x{:08X} {}x{} color=0x{:08X} "
+                  "flags=0x{:X}",
+                  target.object, target.width, target.height, color, flags);
+    }
+  }
+  orig_Clear(ctx, base);
+}
+
 REX_IMPORT(__imp__sub_8255CE98, orig_Resolve, void());
 extern "C" REX_FUNC(sub_8255CE98) {
   MX_D3D9_PLUGIN_PASSTHROUGH(orig_Resolve);
   auto& st = DeviceState();
   st.NoteDevice(ctx.r3.u32, mx::hle::kEpResolve);
-  const uint32_t source_slot = ctx.r4.u32 & 7u;
+  const uint32_t resolve_flags = ctx.r4.u32;
+  const uint32_t source_slot = resolve_flags & 7u;
   const uint32_t dest_texture = ctx.r6.u32;
   // Decompiled signature (default.xex.probe.i64):
   //   D3DDevice_Resolve(pDevice, Flags, pSourceRect, pDestTexture, pDestPoint,
@@ -8442,40 +8896,82 @@ extern "C" REX_FUNC(sub_8255CE98) {
     // recently. Queuing it here, in the same ordered list as draws, is what
     // lets the renderer take a snapshot at the right moment.
     //
-    // Subject to the same cap and drop accounting as a draw: a full queue that
-    // silently swallowed resolves would leave stale snapshots, which looks like
-    // a partial fix rather than a failure.
-    if (g_pendingHleDraws.size() < kMaxPendingHleDraws) {
-      PendingHleDraw pending{};
-      pending.draw.resolve_dest_texture = dest_texture;
-      pending.draw.resolve_source_object = source->object;
-      pending.draw.resolve_source_is_depth = (source_slot == 4);
-      pending.draw.resolve_source_base = source->color_info & 0xFFFu;
-      pending.draw.resolve_source_width = source->width;
-      pending.draw.resolve_source_height = source->height;
-      pending.draw.resolve_dest_width = dest_extent_width;
-      pending.draw.resolve_dest_height = dest_extent_height;
-      // Without an explicit destination point, the source rectangle's origin is
-      // the best available answer: a banded resolve names the band's place in
-      // the full image there. Zero when neither is supplied, which is the whole
-      // -surface case and correct for it.
-      pending.draw.resolve_dest_x =
-          have_dest_point ? dest_point[0] : (have_src_rect ? src_rect[0] : 0);
-      pending.draw.resolve_dest_y =
-          have_dest_point ? dest_point[1] : (have_src_rect ? src_rect[1] : 0);
-      if (have_src_rect) {
-        pending.draw.resolve_src_x1 = src_rect[0];
-        pending.draw.resolve_src_y1 = src_rect[1];
-        pending.draw.resolve_src_x2 = src_rect[2];
-        pending.draw.resolve_src_y2 = src_rect[3];
+    // A resolve has nothing that needs deferred shader finalisation. Putting it
+    // in g_pendingHleDraws delayed it until VdSwap, while ordinary draws whose
+    // shaders were already available went straight into HleFrameDraws. That
+    // reversed the guest command stream: a resolve issued before a sampling
+    // draw appeared after that draw in the host list, so the translated shader
+    // was discarded for a snapshot that was created a few commands later.
+    //
+    // Every D3D9 hook holds HleGlobalMutex, so inserting directly here is both
+    // ordered and synchronized with FinishHleDraw. The rare kNoCode draw is the
+    // only entry that still belongs in g_pendingHleDraws.
+    mx::hle::DrawCall resolve{};
+    resolve.resolve_dest_texture = dest_texture;
+    resolve.resolve_source_object = source->object;
+    resolve.resolve_source_is_depth = (source_slot == 4);
+    resolve.resolve_source_base = source->color_info & 0xFFFu;
+    resolve.resolve_source_width = source->width;
+    resolve.resolve_source_height = source->height;
+    resolve.resolve_dest_width = dest_extent_width;
+    resolve.resolve_dest_height = dest_extent_height;
+    // Without an explicit destination point, the source rectangle's origin is
+    // the best available answer: a banded resolve names the band's place in
+    // the full image there. Zero when neither is supplied, which is the whole
+    // -surface case and correct for it.
+    resolve.resolve_dest_x =
+        have_dest_point ? dest_point[0] : (have_src_rect ? src_rect[0] : 0);
+    resolve.resolve_dest_y =
+        have_dest_point ? dest_point[1] : (have_src_rect ? src_rect[1] : 0);
+    if (have_src_rect) {
+      resolve.resolve_src_x1 = src_rect[0];
+      resolve.resolve_src_y1 = src_rect[1];
+      resolve.resolve_src_x2 = src_rect[2];
+      resolve.resolve_src_y2 = src_rect[3];
+    }
+    NoteQueueThread(GetCurrentThreadId(), true);
+    NoteResolvePosition(dest_texture, mx::hle::HleFrameDraws().size());
+    mx::hle::HleFrameDraws().push_back(std::move(resolve));
+    // D3DRESOLVE_CLEARRENDERTARGET (0x100) is not metadata on the copy: the
+    // guest implementation tests this bit after issuing the resolve and calls
+    // sub_8255BA10 to clear the source EDRAM surface. Bink relies on exactly
+    // this sequence: render FE_Smoke into the shared 1280x720 scratch surface,
+    // resolve its 1280x430 texture, then clear the scratch before the following
+    // swap resolve. Dropping the clear makes the smoke texture become the next
+    // presented frame.
+    if ((resolve_flags & 0x100u) && source_slot < 4) {
+      mx::hle::DrawCall clear{};
+      clear.clear_color_target = true;
+      clear.clear_color_is_float = true;
+      clear.render_target_object = source->object;
+      clear.render_target_surface_info = source->surface_info;
+      clear.render_target_color_info = source->color_info;
+      clear.render_target_width = source->width;
+      clear.render_target_height = source->height;
+      clear.surface_base = source->color_info & 0xFFFu;
+
+      // pClearColor is argument 8 (r10). A null pointer selects the runtime's
+      // default float4 at 0x82012FC0, as transcribed from sub_8255BD48.
+      uint32_t clear_ptr = ctx.r10.u32;
+      if (!clear_ptr) clear_ptr = 0x82012FC0u;
+      if (HostPageReadable(REX_RAW_ADDR(clear_ptr)) &&
+          HostPageReadable(REX_RAW_ADDR(clear_ptr + 12))) {
+        for (uint32_t i = 0; i < 4; ++i) {
+          const uint32_t bits = REX_LOAD_U32(clear_ptr + i * 4);
+          std::memcpy(&clear.clear_color_float[i], &bits, sizeof(bits));
+        }
       }
-      pending.device = ctx.r3.u32;
-      pending.thread = GetCurrentThreadId();
-      NoteQueueThread(pending.thread, true);
-      g_pendingHleDraws.push_back(std::move(pending));
-      ++g_pendingQueued;
-    } else {
-      ++g_pendingDropped;
+      mx::hle::HleFrameDraws().push_back(std::move(clear));
+
+      static uint32_t s_resolveClearLogs = 0;
+      if (s_resolveClearLogs++ < 12) {
+        const auto& c = mx::hle::HleFrameDraws().back().clear_color_float;
+        REXLOG_INFO(
+            "d3d9: resolve 0x{:08X} clears source 0x{:08X} after copy to "
+            "({:.3f},{:.3f},{:.3f},{:.3f}) flags=0x{:X}",
+            dest_texture, source->object, c[0], c[1], c[2], c[3],
+            resolve_flags);
+      }
     }
     static std::map<uint64_t, uint64_t> s_resolves;
     const uint64_t key = (uint64_t(source->object) << 32) | dest_texture;

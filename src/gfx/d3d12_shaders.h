@@ -93,6 +93,9 @@ float4 main(float4 pos : SV_POSITION, float4 col : COLOR,
   // no alpha plane, which is cheaper than a second PSO variant or an extra
   // root parameter carrying a flag.
   float a = g_alpha.Sample(g_smp, uv).r;
+  // AddGameDraw folds the guest Bink shader's c0 modulation into this COLOR
+  // seed. The UP/FVF quad itself has no diffuse element, so without that fold
+  // `col` would always be white and the guest modulation would be ignored.
   return float4(rgb, a) * col;
 }
 )";
