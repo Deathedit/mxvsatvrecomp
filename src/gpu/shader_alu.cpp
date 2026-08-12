@@ -515,10 +515,24 @@ class Interpreter {
 
     // Evaluate both halves. They read the register file before either writes,
     // which is the co-issue semantics.
+    // maxa/maxas/maxasf are issued for their address-register side effect and
+    // routinely leave the write mask empty, so a mask test skips the a0 load
+    // along with the instruction. See the same fix in shader_hlsl.cpp: this is
+    // what pinned a0 at 0 and rendered skinned meshes rigid at the palette
+    // base. The SDK's kAluOpChangedStateAddressRegister flag names exactly this
+    // set, but its opcode-info tables are extern-declared and never defined in
+    // anything the runtime links, so the opcodes are named directly here and in
+    // shader_hlsl.cpp. The two lists must stay identical.
+    const bool vector_sets_a0 =
+        alu.vector_opcode() == uc::AluVectorOpcode::kMaxA;
+    const bool scalar_sets_a0 =
+        alu.scalar_opcode() == uc::AluScalarOpcode::kMaxAs ||
+        alu.scalar_opcode() == uc::AluScalarOpcode::kMaxAsf;
+
     Vec4 vres;
     bool in_counting = true;
     float sres = ps_;
-    const bool has_vector = vmask != 0 || alu.is_export();
+    const bool has_vector = vmask != 0 || alu.is_export() || vector_sets_a0;
     if (has_vector) {
       // VectorOp still runs when vmask is 0 and this is an export — kMaxA's
       // address-register side effect depends on it. But nothing consumes vres
@@ -530,7 +544,15 @@ class Interpreter {
       vres = VectorOp(alu);
       counting_ = in_counting;
     }
-    if (smask != 0) sres = ScalarOp(alu);
+    // Same shape as the vector half above: run it for the side effect, but do
+    // not count operands nothing consumes. sres is only read under
+    // `smask & bit`, so the discarded max result cannot reach a register.
+    if (smask != 0 || scalar_sets_a0) {
+      in_counting = counting_;
+      counting_ = smask != 0;
+      sres = ScalarOp(alu);
+      counting_ = in_counting;
+    }
     if (status != AluStatus::kOk) return;
 
     if (alu.is_export()) {

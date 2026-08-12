@@ -594,15 +594,44 @@ class Emitter {
     const uint32_t vmask = alu.GetVectorOpResultWriteMask();
     const uint32_t smask = alu.GetScalarOpResultWriteMask();
     const bool is_export = alu.is_export();
+
+    // maxa/maxas/maxasf exist to load the address register, and a shader that
+    // wants only that side effect leaves the write mask empty. A mask test is
+    // therefore the wrong gate for them: it skipped the instruction outright
+    // and with it the a0 assignment, leaving xe_a0 at its initial 0 for the
+    // whole invocation.
+    //
+    // That is what un-posed the rider. Four-influence skinning is
+    //   mova a0, index.z ; r = weight.z * c[85+a0]
+    //   mova a0, index.y ; r += weight.y * c[85+a0]   ... and so on
+    // so with a0 pinned at 0 all four influences read the SAME matrix and the
+    // mesh renders rigid at the palette base. The torso sits near that base
+    // and looked right; the arms and hands, which are what the other bones are
+    // for, stayed in bind pose with the arms straight out.
+    //
+    // The SDK tags exactly these with kAluOpChangedStateAddressRegister, but
+    // its kAluScalarOpcodeInfos/kAluVectorOpcodeInfos tables are declared
+    // extern in the header and defined in a translation unit the runtime does
+    // not ship, so naming the opcodes is the only way to ask the question and
+    // still link. Keep this list in step with that flag: an a0-setting opcode
+    // missing here is silently dropped, which is precisely the bug above.
+    const bool vector_sets_a0 =
+        alu.vector_opcode() == uc::AluVectorOpcode::kMaxA;
+    const bool scalar_sets_a0 =
+        alu.scalar_opcode() == uc::AluScalarOpcode::kMaxAs ||
+        alu.scalar_opcode() == uc::AluScalarOpcode::kMaxAsf;
+
     // VectorOp still runs when vmask is 0 and this is an export, because
     // kMaxA's address-register side effect depends on it; nothing consumes the
     // value in that case.
-    const bool has_vector = vmask != 0 || is_export;
+    const bool has_vector = vmask != 0 || is_export || vector_sets_a0;
 
     std::string vexpr, sexpr;
     if (has_vector) vexpr = VectorOp(alu, vmask != 0);
     if (status != HlslStatus::kOk) return;
-    if (smask != 0) sexpr = ScalarOp(alu);
+    // sexpr is consumed only under `smask != 0` below, so running the scalar
+    // half purely for a0 costs an unused string and nothing else.
+    if (smask != 0 || scalar_sets_a0) sexpr = ScalarOp(alu);
     if (status != HlslStatus::kOk) return;
 
     // Both halves read the register file before either writes — the co-issue
