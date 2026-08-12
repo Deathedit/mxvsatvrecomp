@@ -3695,6 +3695,28 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
             << " dropped_export_mask 0x" << out.dropped_export_mask << std::dec
             << " writes_position " << (out.writes_position ? 1 : 0);
           if (!compiled) f << "\n; FXC REJECTED: " << compile_error;
+          // The guest's own bits, so a translation can be checked against its
+          // INPUT instead of against itself.
+          //
+          // The DXBC section below is this file's HLSL compiled, so the two
+          // agree by construction -- comparing them only ever proves FXC
+          // works. Chasing why the rider's red channel cancels reached exactly
+          // that wall: the emitted swizzle `r[2].zwww` and a two-component
+          // write mask are either a faithful decode or the bug, and nothing in
+          // the file could say which. These dwords can.
+          if (code && count) {
+            f << "\n\n=== GUEST MICROCODE (" << count << " dwords) ===\n";
+            char line[160];
+            for (uint32_t i = 0; i < count; i += 8) {
+              int n = std::snprintf(line, sizeof(line), "; %04X:", i);
+              if (n > 0) f.write(line, n);
+              for (uint32_t j = i; j < i + 8 && j < count; ++j) {
+                n = std::snprintf(line, sizeof(line), " %08X", code[j]);
+                if (n > 0) f.write(line, n);
+              }
+              f << "\n";
+            }
+          }
           f << "\n\n=== EMITTED HLSL ===\n" << out.source;
           // Only a shader that compiled has DXBC to disassemble. The section
           // header is inside the guard too, so a failure file does not end with
