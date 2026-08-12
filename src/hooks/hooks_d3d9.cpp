@@ -68,7 +68,6 @@ REXCVAR_DECLARE(bool, hle_capture);
 REXCVAR_DECLARE(uint32_t, hle_shader_exec);
 REXCVAR_DECLARE(uint32_t, hle_shader_verts);
 REXCVAR_DECLARE(bool, hle_diag);
-REXCVAR_DECLARE(bool, hle_sanitize_constants);
 
 // A NAMED namespace, not an anonymous one, so that the guest entry points can
 // move to their own translation unit and still reach the state they operate on.
@@ -1006,7 +1005,6 @@ uint64_t g_luminanceFloored = 0;
 // Draws whose pixel constant bank held a non-finite value, and how many
 // components in total. Reported so the experiment can be read even when the
 // picture does not change.
-uint64_t g_constDrawsSanitized = 0, g_constComponentsSanitized = 0;
 
 // The same physical page is visible through several virtual windows on this
 // console, and the guest uses different ones for the same surface. Measured in
@@ -3588,8 +3586,6 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
                            g_loopUs[r] / 1000, g_loopVerts[r], g_loopDraws[r]);
     }
     REXLOG_INFO("d3d9: LOOP BY REASON{}", split);
-    REXLOG_INFO("d3d9: CONSTANTS sanitized: {} draws, {} components",
-                g_constDrawsSanitized, g_constComponentsSanitized);
   }
   for (uint32_t r = 0; r < 3; ++r)
     g_loopUs[r] = g_loopVerts[r] = g_loopDraws[r] = 0;
@@ -5507,37 +5503,6 @@ void AttachTranslatedPixelShader(mx::hle::DrawCall& dc, uint32_t handle,
         dc.pixel_constants[i] = REX_LOAD_U32(device + kPixelConstBase + i * 4);
       // The shadow is only half the bank. Overlay the shader's own literals.
       ApplyPixelShaderLoadTable(handle, device, base, dc.pixel_constants);
-
-      // Non-finite constants are replaced with zero before the shader sees
-      // them.
-      //
-      // EXPERIMENT, not a claimed fix -- it classifies. A capture traced the
-      // black menu to draw 10012 taking +Inf into r1.w at instruction 52 and
-      // outputting NaN at 53, and the bad registers have a distinctive shape:
-      // c100 is [+Inf,+Inf,+Inf,+Inf] and c138 is [QNaN x4], all four
-      // components identical, in registers the shader's own LOAD_ALU_CONSTANT
-      // table does not write. Nothing on the CPU computes them -- the whole
-      // exposure reduction (sub_82AFB588) is GPU-side -- so the likeliest
-      // reading is guest memory the title never initialised. The console does
-      // not care because it never uses those registers; we read every register
-      // the translated shader references, unconditionally.
-      //
-      // If the picture comes back, they were garbage and this is the fix. If it
-      // does not, they were meaningful and this is ruled out. Either way the
-      // counter says how many draws were touched, and the cvar makes it an A/B
-      // rather than a rebuild.
-      if (REXCVAR_GET(hle_sanitize_constants)) {
-        uint32_t fixed = 0;
-        for (uint32_t i = 0; i < kPixelConstRegs * 4; ++i) {
-          if ((dc.pixel_constants[i] & 0x7F800000u) != 0x7F800000u) continue;
-          dc.pixel_constants[i] = 0;
-          ++fixed;
-        }
-        if (fixed) {
-          ++g_constDrawsSanitized;
-          g_constComponentsSanitized += fixed;
-        }
-      }
 
       // One texture per slot the shader declares. A shader whose slots cannot
       // all be filled keeps the stand-in: running it with a missing texture

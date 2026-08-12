@@ -101,15 +101,6 @@ REXCVAR_DEFINE_BOOL(hle_diag, false, "Debug",
                     "fetch addressing self-check. Off by default; they cost "
                     "real frame time");
 
-// Replace Inf and NaN in the pixel constant bank with zero before the shader
-// reads them. See the note at the use site: this is an experiment to classify
-// whether those registers are uninitialised guest memory or real data, and it
-// is a cvar so a single build answers it both ways.
-REXCVAR_DEFINE_BOOL(hle_sanitize_constants, true, "Debug",
-                    "Zero any non-finite pixel shader constant before upload. "
-                    "The menu's 3D layer is black because a shader takes +Inf "
-                    "into a multiply and outputs NaN");
-
 namespace rex {
 namespace system {
 

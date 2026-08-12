@@ -159,7 +159,6 @@ so they describe what a plain run already does, not what you can turn on.
 
 | cvar | default | |
 |---|---|---|
-| `hle_sanitize_constants` | **on** | Zero any non-finite pixel shader constant before upload |
 | `d3d9_page_cache_persist` | **on** | Keep the page-readability cache across frames instead of clearing every swap |
 | `hle_diag` | off | Per-draw and per-vertex diagnostics: transform probe, prim-type and vfetch censuses, fetch addressing self-check. They cost real frame time |
 | `hle_capture` | off | Score every draw against the state shadow and report what fraction is fully described. Capture only — submits nothing |
@@ -170,7 +169,7 @@ so they describe what a plain run already does, not what you can turn on.
 | `force_load` | — | Load a scene directly. A diagnostic lever, not a fix — see "Why there is no menu" |
 | `registry_override` | — | Force a registry key, e.g. `ReadyToLaunch=1`. Same caveat |
 
-**Six were retired on 2026-08-12**, by the same test that retired four on
+**Seven were retired on 2026-08-12**, by the same test that retired four on
 2026-08-07: none had ever been flipped, so the other branch was dead weight that
 still had to be reasoned about wherever it was read, and the shipped default was
 a configuration nobody had tested.
@@ -188,14 +187,32 @@ The first five all had one read site and an "off" that only meant *be wrong*, so
 freezing them changes no behaviour. `hle_main_viewport_only` defaulted off, so
 deleting its branch changes none either.
 
-**`hle_sanitize_constants` was NOT retired, deliberately.** Its help text is
-stale — it says the menu's 3D layer is black because a shader takes +Inf into a
-multiply, which was the hypothesis and was wrong; the cause was the D3D9 legacy
-multiply, where `0 * INF` is `+0` on Xenos and NaN on host. But it defaults
-**on** and is actively firing (`CONSTANTS sanitized: 3287 draws, 114270
-components` in mx_1040), so removing it would be *choosing a behaviour*, not
-deleting a dead branch. Run once with `--hle_sanitize_constants=false` and
-compare before deciding.
+**`hle_sanitize_constants` was retired last, and froze OFF rather than on.** It
+zeroed every Inf and NaN in the pixel constant bank before upload — 1,159,248
+components across 32,191 draws in a single run, about 36 of the bank's 1,024
+components on every draw.
+
+Its own comment called it *"EXPERIMENT, not a claimed fix"* and set the exit
+condition: *"If the picture comes back, they were garbage and this is the fix.
+If it does not, they were meaningful and this is ruled out."* That experiment was
+never cleanly concluded — the picture did come back, but from the legacy
+multiply fix (`28d4853`) landing separately, which confounded the result, and the
+flag stayed on by inertia.
+
+Measured 2026-08-12 with `--hle_sanitize_constants=false` (mx_1043): **no visible
+difference**, with over a million components per run no longer zeroed. So nothing
+indexes those registers, exactly as the comment predicted — the guest leaves that
+part of its bank uninitialised and its shaders never read it.
+
+It froze **off**, not on, because not zeroing is what the console does. Where a
+shader *did* index such a register, hardware would read `+Inf` and we were
+substituting `0` — making us the ones diverging. Keeping it would have been
+picture quality bought with correctness, the same trade `hide_colorless_draws`
+was retired for.
+
+*Caveat on scope: this was tested in the front end. If a loaded level ever shows
+non-finite constants reaching a shader that reads them, the symptom would be NaN
+output, and the instrument for it is the `NONFINITE` probe in `1078e5f`.*
 
 Seven more (`alu_execute`, `skip_untransformable_draws`, `tint_by_color_source`,
 `transcode_confirmed_formats_only`, `transcode_trust_export`,
