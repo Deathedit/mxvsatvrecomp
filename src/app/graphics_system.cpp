@@ -543,15 +543,17 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       static bool s_rendered = false;
       static uint64_t s_ticksSkippedRender = 0;
       if (draws.empty() && s_rendered) {
-        ++s_ticksSkippedRender;
+        // Counted and reported here rather than after the branch: the counter
+        // only changes on this path, so testing it on every tick re-logs the
+        // same line for as long as it rests on a multiple of 500.
+        if ((++s_ticksSkippedRender % 500) == 1)
+          REXLOG_INFO("RenderThread: skipped {} identical re-renders",
+                      s_ticksSkippedRender);
       } else {
         m_renderer->BeginFrame();
         m_renderer->EndFrame();
         s_rendered = true;
       }
-      if ((s_ticksSkippedRender % 500) == 1)
-        REXLOG_INFO("RenderThread: skipped {} identical re-renders",
-                    s_ticksSkippedRender);
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(16));
   }
