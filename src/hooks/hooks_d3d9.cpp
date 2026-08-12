@@ -405,9 +405,6 @@ thread_local HostRegionCacheEntry t_hprCache[kHostRegionCacheSize];
 thread_local size_t t_hprCacheCount = 0;
 thread_local size_t t_hprCacheNext = 0;
 thread_local uint64_t t_hprGeneration = 0;
-// DIAG (remove before commit): guest address of the 1x1 luminance resolve
-// destination, so the exposure probe can read what the guest CPU reads.
-std::atomic<uint32_t> g_luminanceDestPhys{0};
 // Last readback sequence written into guest memory, so an unchanged value is
 // not rewritten every resolve. Only the resolve hook touches it.
 uint32_t g_luminanceWroteSeq = 0;
@@ -415,11 +412,6 @@ uint32_t g_luminanceWroteSeq = 0;
 // The renderer reports its readbacks by object, which is the only identity
 // both sides share; this turns that back into somewhere to write.
 std::map<uint32_t, uint32_t> g_luminanceDestAddrs;
-// Its guest FORMAT, packed fmt<<16 | bytes_per_block<<8 | endian. A readback
-// has to write what the guest expects to read, and our host surfaces are all
-// RGBA8 -- if the guest wants a float format here, the surface itself is wrong
-// and not just the missing copy.
-std::atomic<uint32_t> g_luminanceDestFormat{0};
 std::atomic<uint64_t> g_hprGeneration{1};
 std::atomic<uint64_t> g_hprCalls{0};
 std::atomic<uint64_t> g_hprQueries{0};
@@ -5452,48 +5444,6 @@ void ApplyShaderFetchPatchTable(uint32_t shader, uint32_t table_at,
   }
 }
 
-// DIAG (remove before commit): print a shader's constant-load table verbatim,
-// so a register that reaches the shader as NaN can be checked against what the
-// table actually claims to write. Mirrors ApplyShaderLoadTable's walk exactly
-// rather than sharing it, so deleting this cannot disturb the working path.
-void DumpShaderLoadTable(uint32_t shader, uint32_t table_at, uint32_t data_at,
-                         uint8_t* base, const char* tag) {
-  if (!shader) return;
-  const uint32_t table = shader + table_at;
-  if (!HostPageReadable(REX_RAW_ADDR(table + 0x14)) ||
-      !HostPageReadable(REX_RAW_ADDR(shader + data_at))) {
-    REXLOG_INFO("d3d9:   {} table 0x{:08X}: unreadable", tag, shader);
-    return;
-  }
-  const uint32_t rel = REX_LOAD_U32(table + 0x14);
-  if (!rel || rel >= 0x10000) {
-    REXLOG_INFO("d3d9:   {} table 0x{:08X}: rel=0x{:X} rejected", tag, shader,
-                rel);
-    return;
-  }
-  const uint32_t block = table + rel;
-  if (!HostPageReadable(REX_RAW_ADDR(block + 0x10))) return;
-  const uint32_t bytes = REX_LOAD_U32(block + 0x10);
-  const uint32_t data_base = REX_LOAD_U32(shader + data_at);
-  std::string entries;
-  uint32_t at = block + 0x14;
-  const uint32_t end = at + bytes;
-  uint32_t n = 0;
-  while (at + 8 <= end && HostPageReadable(REX_RAW_ADDR(at + 4))) {
-    const uint32_t hdr = REX_LOAD_U32(at);
-    const uint32_t reg = hdr >> 16;
-    const uint32_t dwords = hdr & 0xFFFF;
-    if (!dwords) break;
-    const uint32_t data_off = REX_LOAD_U32(at + 4);
-    at += 8;
-    if (++n <= 24)
-      entries += fmt::format(" c{}+{}dw@0x{:X}", reg, dwords,
-                             data_base + data_off);
-  }
-  REXLOG_INFO("d3d9:   {} 0x{:08X} bytes={} data=0x{:08X} {} entries:{}", tag,
-              shader, bytes, data_base, n, entries);
-}
-
 // Both shaders publish into the SAME unified ALU constant file -- the draw
 // flush calls sub_825656A0 once for the pixel shader and once for the vertex
 // shader -- so an entry in EITHER table whose register lands in 256..511 is a
@@ -5620,159 +5570,6 @@ void AttachTranslatedPixelShader(mx::hle::DrawCall& dc, uint32_t handle,
         if (fixed) {
           ++g_constDrawsSanitized;
           g_constComponentsSanitized += fixed;
-        }
-      }
-
-      // DIAG (remove before commit): a RenderDoc capture of the menu shows the
-      // deferred composite reading xe_c[100] as NaN, which poisons the whole
-      // pass and paints the backdrop white. c14.zw and c196.zw are NaN too,
-      // and both of those have their .xy written by a table entry -- so what
-      // is underneath is the SHADOW, not a decode error. Report every
-      // non-finite component that reaches a shader, say whether the shadow
-      // dword was already non-finite, and print the shader's own table so we
-      // can see whether the guest ever claims to write that register.
-      {
-        static std::mutex s_nonFiniteMu;
-        static std::set<uint32_t> s_nonFiniteSeen;
-        std::lock_guard<std::mutex> lk(s_nonFiniteMu);
-        // DIAG (remove before commit): re-arm periodically. Reporting once per
-        // shader for the whole run means every line is from the opening frames,
-        // so after a fix the log still shows the OLD value and says nothing
-        // about the current one. That is not evidence of no change, it is an
-        // absence of measurement -- and it misled this investigation twice.
-        static uint64_t s_nonFiniteDraws = 0;
-        if ((++s_nonFiniteDraws % 20000) == 0) {
-          s_nonFiniteSeen.clear();
-          const uint32_t c100 =
-              REX_LOAD_U32(device + kPixelConstBase + 100 * 16);
-          const uint32_t lumAddr =
-              g_luminanceDestPhys.load(std::memory_order_relaxed);
-          uint32_t lum = 0xDEADBEEFu;
-          if (lumAddr && HostPageReadable(REX_RAW_ADDR(lumAddr)))
-            lum = REX_LOAD_U32(lumAddr);
-          // The three floats sub_82AFB588 hands the final luminance pass as
-          // g_KeyValue / g_MinLuminance / g_MaxLuminance. The reduction chain
-          // itself is pure GPU -- every stage samples the previous stage's
-          // texture, there is no LockRect anywhere in it -- so the exposure is
-          // NOT computed from a memory read. These globals are the only thing
-          // the CPU contributes, and an uninitialised one hands the shader an
-          // Infinity that no amount of rendering work can undo.
-          auto readGlobal = [&](uint32_t addr) -> uint32_t {
-            return HostPageReadable(REX_RAW_ADDR(addr)) ? REX_LOAD_U32(addr)
-                                                        : 0xDEADBEEFu;
-          };
-          const uint32_t keyValue = readGlobal(0x830B13B4);
-          const uint32_t minLum = readGlobal(0x830B2C3C);
-          const uint32_t maxLum = readGlobal(0x830B2E74);
-          // The composite (sub_82AC3450) sets exactly three floats by name:
-          // g_KeyValue, g_BloomAttn and g_OneOverWhitePointSquared. Only one
-          // of the three is computed rather than stored, and sub_821D3CD0
-          // computes it as 1.0f / (w * w) from the white point at
-          // flt_830B2C40 -- so a white point of zero hands the tonemap a
-          // literal +Infinity. Reading all three names which register the
-          // shader's Infinity actually is, without guessing the mapping.
-          const uint32_t whitePoint = readGlobal(0x830B2C40);
-          const uint32_t oneOverW2 = readGlobal(0x830B2E7C);
-          const uint32_t bloomAttn = readGlobal(0x830B2E40);
-          auto bitsToFloat = [](uint32_t b) {
-            float f;
-            std::memcpy(&f, &b, sizeof(f));
-            return f;
-          };
-          REXLOG_INFO("d3d9: EXPOSURE globals: g_KeyValue=0x{:08X} ({}) "
-                      "g_MinLuminance=0x{:08X} ({}) g_MaxLuminance=0x{:08X} "
-                      "({})",
-                      keyValue, bitsToFloat(keyValue), minLum,
-                      bitsToFloat(minLum), maxLum, bitsToFloat(maxLum));
-          REXLOG_INFO("d3d9: EXPOSURE tonemap: whitePoint=0x{:08X} ({}) "
-                      "g_OneOverWhitePointSquared=0x{:08X} ({}) "
-                      "g_BloomAttn=0x{:08X} ({})",
-                      whitePoint, bitsToFloat(whitePoint), oneOverW2,
-                      bitsToFloat(oneOverW2), bloomAttn,
-                      bitsToFloat(bloomAttn));
-          // WHICH DEVICE. c100 reads finite in some samples and +Infinity in
-          // others, milliseconds apart, at the same register -- which is not a
-          // value being miscomputed but two different constant banks. If the
-          // guest has more than one device object, the composite can be
-          // reading one bank while another gets the good values, and no GPU
-          // fix would ever touch that. Same shape as the thread-local
-          // DeviceState defect that hid the bound pixel shader.
-          {
-            static std::mutex s_devMu;
-            static std::map<uint32_t, uint32_t> s_devices;  // device -> c100.x
-            std::string all;
-            {
-              std::lock_guard<std::mutex> dlk(s_devMu);
-              s_devices[device] = c100;
-              for (const auto& [dev, v] : s_devices)
-                all += fmt::format(" 0x{:08X}=0x{:08X}", dev, v);
-            }
-            REXLOG_INFO("d3d9: EXPOSURE devices ({} distinct):{}",
-                        s_devices.size(), all);
-          }
-          REXLOG_INFO("d3d9: EXPOSURE probe: device 0x{:08X} "
-                      "shadow c100.x=0x{:08X} ({}); "
-                      "guest luminance @0x{:08X} = 0x{:08X} fmt {} ({}) "
-                      "bpb {} endian {}",
-                      device,
-                      c100,
-                      (c100 & 0x7F800000u) == 0x7F800000u ? "NONFINITE"
-                                                          : "finite",
-                      lumAddr, lum,
-                      g_luminanceDestFormat.load(
-                          std::memory_order_relaxed) >> 16,
-                      GuestTextureFormatName(
-                          g_luminanceDestFormat.load(
-                              std::memory_order_relaxed) >> 16),
-                      (g_luminanceDestFormat.load(
-                           std::memory_order_relaxed) >> 8) & 0xFFu,
-                      g_luminanceDestFormat.load(
-                          std::memory_order_relaxed) & 0xFFu);
-        }
-        if (s_nonFiniteSeen.size() < 24 && !s_nonFiniteSeen.count(handle)) {
-          std::string worst;
-          uint32_t bad = 0;
-          for (uint32_t r = 0; r < kPixelConstRegs; ++r) {
-            // Only a register the shader actually READS can poison it. The
-            // first cut of this reported the whole bank and spent its budget
-            // on registers nobody indexes.
-            const std::string ref = fmt::format("xe_c[{}]", r);
-            if (!t->source || t->source->find(ref) == std::string::npos)
-              continue;
-            for (uint32_t c = 0; c < 4; ++c) {
-              const uint32_t i = r * 4 + c;
-              const uint32_t bits = dc.pixel_constants[i];
-              if ((bits & 0x7F800000u) != 0x7F800000u) continue;  // finite
-              ++bad;
-              if (bad <= 8) {
-                const uint32_t shadow =
-                    REX_LOAD_U32(device + kPixelConstBase + i * 4);
-                worst += fmt::format(" c{}.{}=0x{:08X}(shadow 0x{:08X})", r,
-                                     "xyzw"[c], bits, shadow);
-              }
-            }
-          }
-          if (bad) {
-            s_nonFiniteSeen.insert(handle);
-            // WHICH DEVICE. This title drives three, one per record worker, and
-            // each keeps its own constant shadow. The EXPOSURE probe reports
-            // c100 as FINITE on the single device it has ever seen, while these
-            // draws read +Inf out of "the shadow" -- the two can only both be
-            // true if the draws are on a different device from the one the
-            // exposure correction reaches. Without the device here that cannot
-            // be told apart from the correction simply not working.
-            REXLOG_INFO("d3d9: NONFINITE ps 0x{:08X} device 0x{:08X}: {} "
-                        "components;{}",
-                        handle, device,
-                        bad, worst);
-            DumpShaderLoadTable(handle, 0x28, 0x18, base, "ps");
-            constexpr uint32_t kDeviceVertexShaderAt = 0x3248;
-            if (HostPageReadable(
-                    REX_RAW_ADDR(device + kDeviceVertexShaderAt))) {
-              const uint32_t vs = REX_LOAD_U32(device + kDeviceVertexShaderAt);
-              if (vs) DumpShaderLoadTable(vs, 0x368, 0x20, base, "vs");
-            }
-          }
         }
       }
 
@@ -8831,20 +8628,7 @@ extern "C" REX_FUNC(sub_8255CE98) {
           ++entry.resolves;
           g_resolveDestObjectPhys[dest_texture] = physical;
         }
-        // DIAG (remove before commit): remember where the 1x1 luminance result
-        // is supposed to land in GUEST memory. The exposure is computed by the
-        // guest CPU -- the constant SHADOW holds the Infinity, so the guest
-        // wrote it -- which means it read an average of zero from somewhere,
-        // and this is the only candidate. Our resolves copy into host snapshots
-        // and never write guest RAM, so if the guest reads this address it can
-        // only ever see whatever was there before.
         if (dest_desc.width == 1 && dest_desc.height == 1) {
-          g_luminanceDestPhys.store(dest_desc.address,
-                                    std::memory_order_relaxed);
-          g_luminanceDestFormat.store((dest_desc.guest_format << 16) |
-                                          (dest_desc.bytes_per_block << 8) |
-                                          (dest_desc.endian & 0xFFu),
-                                      std::memory_order_relaxed);
           // Write the GPU's answer where the guest is about to read it.
           //
           // sub_82AFB8A8 resolves the 1x1 and then loads its bytes straight

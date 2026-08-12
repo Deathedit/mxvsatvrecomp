@@ -2996,7 +2996,6 @@ void D3D12Renderer::RenderGameFrame() {
       // Binding only on an exact extent match keeps that guarantee honest: a
       // stale pairing skips depth for that draw rather than binding a DSV whose
       // size disagrees with the RTV.
-      // TEMPORARILY ENABLED for a RenderDoc capture of the collapsed frame.
       //
       // Sized from the depth surface's OWN extent, which removed the resize
       // churn entirely (resized 13 -> 0) and let 3423 depth resolves run from 4
@@ -3004,7 +3003,7 @@ void D3D12Renderer::RenderGameFrame() {
       // frame still collapses to ~125 offscreen draws and ~20 translated,
       // identically to the first attempt -- so neither the churn nor depth
       // testing is the cause, and routing (which precedes all depth state) is
-      // what falls. The capture is to find what stops being submitted.
+      // what falls.
       depthTarget = (d.depthObject && d.depthWidth == drawTarget->width &&
                      d.depthHeight == drawTarget->height)
                         ? EnsureGameDepthTarget(d.depthObject, d.depthWidth,
