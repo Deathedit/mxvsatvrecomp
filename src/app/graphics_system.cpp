@@ -507,8 +507,51 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       // call then declared StateBefore = RENDER_TARGET for a resource that was
       // not in it, an invalid transition, on top of drawing and copying the
       // whole frame twice.
-      m_renderer->BeginFrame();
-      m_renderer->EndFrame();
+      //
+      // Nothing new from the guest means the frame this would draw is the one
+      // already on screen, byte for byte: m_gameDraws is unchanged, so is every
+      // texture it samples, and RenderGameFrame is deterministic in them. Skip
+      // it whole.
+      //
+      // MEASURED, mx_1034: 713 ticks with new draws against 813 without, and an
+      // empty tick still spent 25-37ms re-recording ~340 draws, ~50 snapshot
+      // copies and ~50 clears to arrive at the same image. Once the upload ring
+      // took the allocator out of the tick, that re-recording was the largest
+      // phase left in it -- and over half of it was thrown away.
+      //
+      // NOT PRESENTING is what re-presents. The swapchain is flip-discard, so
+      // the last presented back buffer stays on screen until another Present
+      // replaces it; the note above about a tick with no new draws having to
+      // "re-present the last frame we did get, not a cleared screen" still holds,
+      // it is just satisfied by doing nothing rather than by drawing it again.
+      //
+      // Skipping the pair rather than only RenderGameFrame is deliberate.
+      // BeginFrame clears the targets, and every resource state either side of
+      // these two is directional -- m_gameRT ends in PIXEL_SHADER_RESOURCE for
+      // the next BeginFrame's barrier, the back buffer ends in PRESENT for the
+      // next transition. Running half the pair would leave those disagreeing;
+      // running neither leaves them exactly where the last full tick put them,
+      // which is the state BeginFrame already expects to find.
+      //
+      // GetDrawCalls above is NOT skipped, so a guest blocked in SetDrawCalls is
+      // still released every tick. This shortens that wait rather than extending
+      // it: the release no longer sits behind a frame nobody needed.
+      //
+      // The exception is a tick with nothing to replay. That is startup, before
+      // the first guest frame arrives -- it has to run, or the window is never
+      // cleared and shows whatever was behind it.
+      static bool s_rendered = false;
+      static uint64_t s_ticksSkippedRender = 0;
+      if (draws.empty() && s_rendered) {
+        ++s_ticksSkippedRender;
+      } else {
+        m_renderer->BeginFrame();
+        m_renderer->EndFrame();
+        s_rendered = true;
+      }
+      if ((s_ticksSkippedRender % 500) == 1)
+        REXLOG_INFO("RenderThread: skipped {} identical re-renders",
+                    s_ticksSkippedRender);
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(16));
   }
