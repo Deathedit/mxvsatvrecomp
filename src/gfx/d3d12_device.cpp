@@ -47,6 +47,108 @@ struct PhaseTimer {
                          .count());
   }
 };
+
+// The subset of D3D12_AUTO_BREADCRUMB_OP this renderer can actually emit.
+// Anything else prints as its number rather than a wrong name.
+const char* BreadcrumbOpName(D3D12_AUTO_BREADCRUMB_OP op) {
+  switch (op) {
+    case D3D12_AUTO_BREADCRUMB_OP_SETMARKER: return "SetMarker";
+    case D3D12_AUTO_BREADCRUMB_OP_BEGINEVENT: return "BeginEvent";
+    case D3D12_AUTO_BREADCRUMB_OP_ENDEVENT: return "EndEvent";
+    case D3D12_AUTO_BREADCRUMB_OP_DRAWINSTANCED: return "DrawInstanced";
+    case D3D12_AUTO_BREADCRUMB_OP_DRAWINDEXEDINSTANCED:
+      return "DrawIndexedInstanced";
+    case D3D12_AUTO_BREADCRUMB_OP_EXECUTEINDIRECT: return "ExecuteIndirect";
+    case D3D12_AUTO_BREADCRUMB_OP_DISPATCH: return "Dispatch";
+    case D3D12_AUTO_BREADCRUMB_OP_COPYBUFFERREGION: return "CopyBufferRegion";
+    case D3D12_AUTO_BREADCRUMB_OP_COPYTEXTUREREGION: return "CopyTextureRegion";
+    case D3D12_AUTO_BREADCRUMB_OP_COPYRESOURCE: return "CopyResource";
+    case D3D12_AUTO_BREADCRUMB_OP_RESOLVESUBRESOURCE: return "ResolveSubresource";
+    case D3D12_AUTO_BREADCRUMB_OP_CLEARRENDERTARGETVIEW:
+      return "ClearRenderTargetView";
+    case D3D12_AUTO_BREADCRUMB_OP_CLEARDEPTHSTENCILVIEW:
+      return "ClearDepthStencilView";
+    case D3D12_AUTO_BREADCRUMB_OP_RESOURCEBARRIER: return "ResourceBarrier";
+    case D3D12_AUTO_BREADCRUMB_OP_PRESENT: return "Present";
+    default: return nullptr;
+  }
+}
+
+// Everything DRED knows, written out at the moment of removal.
+//
+// The breadcrumb count is what the GPU *finished*; the op at that index is the
+// one it was executing when it died, which is the single most useful fact
+// available. Only nodes that did not finish are printed -- a completed list
+// says nothing about the fault, and a level's worth of them would bury the one
+// that matters.
+void ReportDred(ID3D12Device* device) {
+  if (!device) return;
+  Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedData> dred;
+  if (FAILED(device->QueryInterface(IID_PPV_ARGS(&dred)))) {
+    LogError("DRED: not available (was it enabled before device creation?)");
+    return;
+  }
+
+  char buf[256] = {};
+  D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT crumbs = {};
+  if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&crumbs))) {
+    uint32_t nodes = 0;
+    for (const D3D12_AUTO_BREADCRUMB_NODE* n = crumbs.pHeadAutoBreadcrumbNode;
+         n; n = n->pNext) {
+      const uint32_t done = n->pLastBreadcrumbValue ? *n->pLastBreadcrumbValue : 0;
+      if (done == n->BreadcrumbCount) continue;  // this list completed
+      ++nodes;
+      std::snprintf(buf, sizeof(buf),
+                    "DRED: list '%ls' queue '%ls' completed %u of %u ops",
+                    n->pCommandListDebugNameW ? n->pCommandListDebugNameW : L"?",
+                    n->pCommandQueueDebugNameW ? n->pCommandQueueDebugNameW : L"?",
+                    done, n->BreadcrumbCount);
+      LogError(buf);
+      // The failing op, plus a little history either side of it.
+      const uint32_t first = done > 4 ? done - 4 : 0;
+      const uint32_t last =
+          done + 4 < n->BreadcrumbCount ? done + 4 : n->BreadcrumbCount;
+      for (uint32_t i = first; i < last; ++i) {
+        const D3D12_AUTO_BREADCRUMB_OP op = n->pCommandHistory[i];
+        const char* name = BreadcrumbOpName(op);
+        if (name)
+          std::snprintf(buf, sizeof(buf), "DRED:   [%u]%s %s", i,
+                        i == done ? " <-- FAULTED HERE" : "", name);
+        else
+          std::snprintf(buf, sizeof(buf), "DRED:   [%u]%s op %u", i,
+                        i == done ? " <-- FAULTED HERE" : "", uint32_t(op));
+        LogError(buf);
+      }
+    }
+    if (!nodes) LogError("DRED: every command list completed; no faulting op");
+  }
+
+  D3D12_DRED_PAGE_FAULT_OUTPUT fault = {};
+  if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&fault)) &&
+      fault.PageFaultVA) {
+    std::snprintf(buf, sizeof(buf), "DRED: page fault at VA 0x%llX",
+                  static_cast<unsigned long long>(fault.PageFaultVA));
+    LogError(buf);
+    // Existing allocations are live objects the fault landed in; recent freed
+    // ones are use-after-free candidates, which is the likelier shape here
+    // given the ring allocator and per-draw upload buffers.
+    for (const D3D12_DRED_ALLOCATION_NODE* a = fault.pHeadExistingAllocationNode;
+         a; a = a->pNext) {
+      std::snprintf(buf, sizeof(buf), "DRED:   live allocation '%ls' type %u",
+                    a->ObjectNameW ? a->ObjectNameW : L"?",
+                    uint32_t(a->AllocationType));
+      LogError(buf);
+    }
+    for (const D3D12_DRED_ALLOCATION_NODE* a =
+             fault.pHeadRecentFreedAllocationNode;
+         a; a = a->pNext) {
+      std::snprintf(buf, sizeof(buf), "DRED:   RECENTLY FREED '%ls' type %u",
+                    a->ObjectNameW ? a->ObjectNameW : L"?",
+                    uint32_t(a->AllocationType));
+      LogError(buf);
+    }
+  }
+}
 }  // namespace
 
 HRESULT D3D12Renderer::CreateTimedCommittedResource(
@@ -123,6 +225,41 @@ bool D3D12Renderer::Initialize(HWND hwnd) {
     DXGIGetDebugInterface1(0, IID_PPV_ARGS(&dxgiInfoQueue));
     if (dxgiInfoQueue) {
       LogInfo("DXGI debug interface acquired.");
+    }
+  }
+
+  // DRED — Device Removed Extended Data.
+  //
+  // GetDeviceRemovedReason only ever answers DEVICE_HUNG, which names a symptom
+  // and nothing else. Three theories were argued from that one word and two of
+  // them were wrong: a long frame crossing the TDR threshold (disproved -- runs
+  // survived 3.7s frames and hung on a 0.77s one) and a driver left unstable by
+  // an earlier reset (disproved -- Windows logged no display reset at all).
+  //
+  // DRED records the breadcrumb trail of commands the GPU actually completed,
+  // so the first UNFINISHED op is the one that faulted, plus the faulting
+  // address and which allocation owned it. That is the difference between
+  // reading the fault and guessing at it.
+  //
+  // MUST be set before device creation: afterwards the settings object still
+  // hands back S_OK and changes nothing.
+  //
+  // On by default. Auto-breadcrumbs cost a small write per command-list op,
+  // and the bug being chased appears only after minutes of play -- an
+  // instrument that has to be armed in advance is one that will not be armed
+  // when it matters. MX_D3D12_DRED=0 turns it off for timing runs.
+  {
+    bool dred = true;
+    char value[8] = {};
+    size_t len = 0;
+    if (getenv_s(&len, value, sizeof(value), "MX_D3D12_DRED") == 0 && len)
+      dred = std::atoi(value) != 0;
+    Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dredSettings;
+    if (dred &&
+        SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dredSettings)))) {
+      dredSettings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+      dredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+      LogInfo("DRED enabled (auto-breadcrumbs + page fault).");
     }
   }
 
@@ -374,6 +511,15 @@ void D3D12Renderer::EndFrame() {
     char rbuf[128] = {};
     snprintf(rbuf, sizeof(rbuf), "EndFrame: DeviceRemovedReason HR=0x%08lX", reason);
     LogError(rbuf);
+    // Once. A removed device fails Present every frame afterwards, and the
+    // breadcrumb trail never changes -- dumping it per frame would bury the
+    // one copy that matters under thousands of identical ones, which is
+    // exactly how the dead-renderer logs already read.
+    static bool s_dredReported = false;
+    if (!s_dredReported) {
+      s_dredReported = true;
+      ReportDred(m_device.Get());
+    }
   }
 
   submit.reset();
