@@ -1,4 +1,4 @@
-# tools/ — MX vs ATV Alive BXML & asset bundle decoders
+# tools/ — MX vs ATV Alive BXML, asset bundle & shader decoders
 
 Scripts supporting the native Windows port of MX vs. ATV Alive via
 ReXGlue SDK 0.9.0 static recompilation. All formats are now fully
@@ -76,6 +76,42 @@ python bxml_strings.py assets/                                    # batch summar
 Categorizes strings into `ENTITY/SHADER/MATERIAL/ANIM/TEXTURE/META/OTHER`.
 Useful for understanding what asset references each `.xenon.database`
 contains without full XML reconstruction.
+
+### `xenos_shader_disasm.py` — Xenos microcode disassembler
+
+```
+python tools/xenos_shader_disasm.py logs/hlsldump/ps_2146CCA0.txt   # disassemble
+python tools/xenos_shader_disasm.py --verify logs/hlsldump/*.txt    # check vs C++
+python tools/xenos_shader_disasm.py --selftest                      # unit checks
+python tools/xenos_shader_disasm.py --scan-file <binary>            # scan raw file
+```
+
+Decodes Xbox 360 GPU shader microcode to readable assembly. Every bit layout
+and opcode table is transcribed from Xenia's `src/xenia/gpu/ucode.h` and
+`ucode.cc` — control flow is 48-bit packed two per three dwords, ALU and fetch
+instructions are 3 dwords each.
+
+Primary input is the renderer's own dump: `hooks_d3d9.cpp` writes a
+`=== GUEST MICROCODE (n dwords) ===` block into each `logs/hlsldump/*.txt`
+beside the emitted HLSL. This tool reads that section directly, which is what
+makes a translation checkable against its *input* rather than against itself.
+
+**Verified**: `--verify` cross-checks three independent facts per shader —
+position export, export register mask, distinct sampler count — against the
+header the C++ translator wrote. Agrees on all 160 dumps carrying microcode
+(92 ps + 68 vs; the 96 `vsfetch_*` variants carry HLSL only). `--selftest`
+covers swizzle relativity, CF pack/unpack round-trip, and rejection of
+all-zero, 0xFFFFFFFF-fill, and real PowerPC code.
+
+Also runs inside IDA (File > Script file...) to scan **non-executable**
+segments for embedded microcode. It skips `.text`/`BINK` outright; scanning PPC
+code is what made an earlier attempt report 586,594 phantom "shader blocks".
+Annotation is off by default (`ANNOTATE`), and `STRIP = True` removes only the
+comments it wrote.
+
+Note on coverage: the 2481 packaged `shader` assets are in encrypted
+`.xenon.package` heaps (see the decryption section below) and are not
+recoverable by scanning. Runtime dumps remain the reliable source.
 
 ## Internals / debug tools
 
