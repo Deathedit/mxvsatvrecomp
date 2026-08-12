@@ -178,8 +178,11 @@ void D3D12Renderer::Shutdown() {
 
   m_gameDraws.clear();
   // WaitForGpu above has already drained the queue, so nothing here is still in
-  // flight and the retirement list can be dropped outright.
+  // flight and the retirement list can be dropped outright. The upload ring goes
+  // with it — the pages are still mapped, which is fine to release from.
   m_retired.clear();
+  m_uploadPages.clear();
+  m_uploadPage = UINT32_MAX;
 
   m_gameRT.Reset();
   m_gameDepth.Reset();
@@ -405,6 +408,7 @@ void D3D12Renderer::ReportTickPhases() {
         message, sizeof(message),
         "render tick #%u %llums = add-draws %llums (%u calls) + record %llums + "
         "submit %llums + FENCE-WAIT %llums + retire %llums, unmeasured %lldms; "
+        "upload ring %zu pages, %llu KB this frame; "
         "CreateCommittedResource %llu calls %llums (mean %.1fus/call)",
         s_tick, static_cast<unsigned long long>(tickUs / 1000),
         static_cast<unsigned long long>(m_phaseAddDrawsUs / 1000),
@@ -414,6 +418,8 @@ void D3D12Renderer::ReportTickPhases() {
         static_cast<unsigned long long>(m_phaseFenceWaitUs / 1000),
         static_cast<unsigned long long>(m_phaseRetireUs / 1000),
         static_cast<long long>(int64_t(tickUs) - int64_t(measured)) / 1000,
+        m_uploadPages.size(),
+        static_cast<unsigned long long>(m_uploadBytesThisFrame / 1024),
         static_cast<unsigned long long>(m_committedCalls),
         static_cast<unsigned long long>(m_committedUs / 1000),
         m_committedCalls ? double(m_committedUs) / double(m_committedCalls)
@@ -807,6 +813,14 @@ void D3D12Renderer::MoveToNextFrame() {
     LogError("MoveToNextFrame: Signal failed");
     return;
   }
+
+  // The submission just signalled reads every ring page the draw list touches,
+  // so none of them may be reset until this value passes. Restamped every tick
+  // rather than once at allocation: an empty tick re-records the same draws, and
+  // a page stamped only when it was written would come free while a later
+  // submission was still reading it.
+  for (auto& p : m_uploadPages)
+    if (p.live) p.fence = currentFenceValue;
 
   m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
 

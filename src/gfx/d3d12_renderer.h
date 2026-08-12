@@ -695,6 +695,13 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   uint64_t m_standInNoVertexInputs = 0;
   uint64_t m_standInNoConstants = 0;
   uint64_t m_standInTooManySamplers = 0;
+  // And the three ways a draw that PASSED that gate still reaches the stand-in.
+  // Without these the gate counters describe 16% of the population and the rest
+  // is silent -- measured 2026-08-12: 54985 stand-in, 8833 charged to the gate,
+  // 346 to a bind failure, 45806 to nothing at all.
+  uint64_t m_standInBufferFailed = 0;   // gate passed, ivb/pscb never mapped
+  uint64_t m_translatedPsoCapped = 0;   // PSO cache at kMaxTranslatedPSOs
+  uint64_t m_translatedNoRootSig = 0;   // root signature or VS blob absent
   std::unordered_map<uint64_t, GameTexture> m_gameTextures;
   bool UploadGameTexture(GameTexture& entry,
                          const mx::hle::HleTexturePayload& src);
@@ -731,13 +738,66 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   std::array<YuvPlane, kMaxDrawPlanes> m_yuvPlanes;
   bool m_hasGamePipeline = false;
 
+  // A range inside one page of the per-draw upload ring. Replaces the
+  // ComPtr<ID3D12Resource> each of these used to be.
+  //
+  // MEASURED, mx_1033, steady-state main menu: a 1815ms render tick spent
+  // 1031ms creating per-draw buffers and 743ms destroying them -- 97.7% of the
+  // tick -- for 1476 CreateCommittedResource calls at ~683us each, 4.3 per draw.
+  // The GPU waited 0ms. The frame cost was never the rendering; it was the
+  // allocator, and the guest sat in SetDrawCalls behind all of it.
+  //
+  // A committed resource is its own kernel-mode video-memory allocation, so a
+  // few hundred microseconds each is simply what it costs. The fix is not to
+  // make the call cheaper but to stop making it: suballocate from a handful of
+  // large pages that live for the whole session.
+  struct UploadAlloc {
+    D3D12_GPU_VIRTUAL_ADDRESS gpu = 0;
+    uint8_t* cpu = nullptr;  // inside a persistently mapped page
+    uint32_t size = 0;
+    explicit operator bool() const noexcept { return cpu != nullptr; }
+  };
+
+  // One page of that ring. Created once and recycled forever after.
+  struct UploadPage {
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    uint8_t* cpu = nullptr;
+    D3D12_GPU_VIRTUAL_ADDRESS gpu = 0;
+    uint32_t size = 0;
+    uint32_t used = 0;
+    // The submission that last read this page. It cannot be reset until the
+    // fence passes this.
+    uint64_t fence = 0;
+    // Referenced by the CURRENT m_gameDraws. Not the same question as the fence:
+    // an empty render tick re-records the same draw list, so its pages stay live
+    // across however many fences pass, until the guest hands over a new frame
+    // and ClearGameDraws releases them.
+    bool live = false;
+  };
+
+  // 8MB rather than one page per frame: the menu frame measured ~10MB of
+  // per-draw data, so a page is a fraction of a frame and the ring settles near
+  // the true working set instead of rounding up to it. Growth is logged.
+  static constexpr uint32_t kUploadPageBytes = 8u * 1024u * 1024u;
+  // The strictest of the three requirements -- root CBVs need 256, root SRVs
+  // need their element size, vertex and index buffers less again -- applied to
+  // all of them so no call site has to know which it is.
+  static constexpr uint32_t kUploadAlign = 256;
+  std::vector<UploadPage> m_uploadPages;
+  uint32_t m_uploadPage = UINT32_MAX;  // the page being filled
+  uint64_t m_uploadBytesThisFrame = 0;
+
+  // Suballocate `bytes` from the ring. The returned range is already mapped:
+  // there is no Map/Unmap pair, which is the other per-draw cost this removes.
+  bool AllocUpload(UploadAlloc& out, uint32_t bytes);
+
   // One translated draw. The CB is per-draw rather than one shared buffer so it
   // is not rewritten while the GPU may still be reading the previous frame's
-  // value.
+  // value — now a distinct range of the ring rather than a distinct resource.
   struct GameDraw {
-    Microsoft::WRL::ComPtr<ID3D12Resource> vb;
-    Microsoft::WRL::ComPtr<ID3D12Resource> ib;
-    Microsoft::WRL::ComPtr<ID3D12Resource> cb;
+    UploadAlloc vb;
+    UploadAlloc ib;
+    UploadAlloc cb;
     D3D12_VERTEX_BUFFER_VIEW vbv = {};
     D3D12_INDEX_BUFFER_VIEW ibv = {};
     uint32_t indexCount = 0;
@@ -840,9 +900,9 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // them the shader would read undefined inputs and compute from zeros, which
     // is a confident wrong answer rather than a visible failure. `translated`
     // is only set once every piece is present.
-    Microsoft::WRL::ComPtr<ID3D12Resource> ivb;
+    UploadAlloc ivb;
     D3D12_VERTEX_BUFFER_VIEW ivbv = {};
-    Microsoft::WRL::ComPtr<ID3D12Resource> pscb;
+    UploadAlloc pscb;
     uint32_t pixelSamplerCount = 0;
     // Bit i set = the shader declares slot i as Texture2DArray (a cube fetch),
     // so its SRV must be TEXTURE2DARRAY. A descriptor whose dimension
@@ -874,9 +934,9 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // interpolates what the vertex stage exports, which is the entire point.
     uint32_t vertexShaderHandle = 0;
     std::shared_ptr<const std::string> vertexShaderHlsl;
-    Microsoft::WRL::ComPtr<ID3D12Resource> vsvb;
+    UploadAlloc vsvb;
     D3D12_VERTEX_BUFFER_VIEW vsvbv = {};
-    Microsoft::WRL::ComPtr<ID3D12Resource> vscb;
+    UploadAlloc vscb;
     // The registers the translated vertex shader reads, ascending — the input
     // layout the PSO must be built with. Carried per draw and not derived from
     // the handle because the PSO cache is what turns it back into a layout.
@@ -888,7 +948,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // through a root SRV and decodes attributes itself. `vsvb` and the input
     // layout are then both unused -- there are no input elements at all, only
     // SV_VertexID -- and `rawvb` is bound as root parameter 4.
-    Microsoft::WRL::ComPtr<ID3D12Resource> rawvb;
+    UploadAlloc rawvb;
     bool gpuVertexFetch = false;
   };
   // Bounded because each entry costs three CreateCommittedResource calls — see
@@ -970,6 +1030,20 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_gameDsvHeap;
   uint32_t m_gameRtvDescriptorSize = 0;
   static constexpr uint32_t kMaxGameRenderTargets = 64;
+  // Snapshots get their OWN cap, and it is not this one. 64 bounds the RTV heap
+  // (`kMaxGameRenderTargets + 1` descriptors, see the heap desc), and a snapshot
+  // has no RTV -- EnsureGameSnapshot sets rtvIndex = 0 and says so. Charging
+  // snapshots against the RTV budget anyway is what broke the 129x129
+  // post-process chain: measured 2026-08-12, 50 targets + 33 snapshots = 83
+  // against 64, so every NEW resolve destination past that point was refused,
+  // its resolve dropped on the `if (!snap) continue`, and the six draws that
+  // sampled those destinations fell to the tex*col stand-in.
+  //
+  // 128 rather than uncapped: the observed steady state is 33, so this is ~4x
+  // headroom, and a runaway allocator is worth catching. The real bound is the
+  // SRV budget (kMaxGameTextures), which is checked on the same line and sat at
+  // 359 of 1024 in that run.
+  static constexpr uint32_t kMaxGameSnapshots = 128;
   // Offscreen render-target routing counters. Reported by RenderGameDraws.
   // m_rtDrawsOverpaint is the one that matters: a draw that asked for its own
   // target, was refused, and therefore painted onto the main scene instead.
@@ -978,6 +1052,10 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   uint64_t m_rtDrawsOverpaint = 0;
   uint64_t m_rtRejectBudget = 0;
   uint64_t m_rtRejectResized = 0;
+  // Snapshot creations refused for budget. Its own counter because a snapshot
+  // refusal and an offscreen-target refusal have different causes and different
+  // fixes, and reporting both as "routing refused: budget" hid the former.
+  uint64_t m_snapshotRejectBudget = 0;
   // Resolve snapshots. m_snapshotFallbacks is the one that matters: a draw that
   // wanted a snapshot, found none, and fell back to sampling the source
   // target's live surface — which is the old aliasing behaviour, so a large

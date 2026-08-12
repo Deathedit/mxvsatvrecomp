@@ -864,10 +864,16 @@ ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
                                                   const GameDraw& draw) {
   if (auto it = m_translatedPSOs.find(key); it != m_translatedPSOs.end())
     return it->second.failed ? nullptr : it->second.pso.Get();
-  if (!m_translatedRootSig || !m_translatedVsBlob) return nullptr;
+  if (!m_translatedRootSig || !m_translatedVsBlob) {
+    ++m_translatedNoRootSig;
+    return nullptr;
+  }
   // Past the cap a draw falls back to the stand-in rather than being dropped,
   // and nothing is cached, so the cap bounds memory without hiding shaders.
-  if (m_translatedPSOs.size() >= kMaxTranslatedPSOs) return nullptr;
+  if (m_translatedPSOs.size() >= kMaxTranslatedPSOs) {
+    ++m_translatedPsoCapped;
+    return nullptr;
+  }
 
   TranslatedPipeline entry;
   entry.failed = true;
@@ -2068,11 +2074,14 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameSnapshot(
     RetireResource(std::move(it->second.resource));
     m_gameSnapshots.erase(it);
   }
+  // Counted apart from m_rtRejectBudget. Sharing that counter put snapshot
+  // refusals in the "game RT routing" line, where they read as an offscreen
+  // target being refused -- 1894 of them sat there being read as something else
+  // while the post-process chain went unresolved.
   if (reuseSrvIndex == UINT32_MAX &&
-      (m_gameSnapshots.size() + m_gameRenderTargets.size() >=
-           kMaxGameRenderTargets ||
+      (m_gameSnapshots.size() >= kMaxGameSnapshots ||
        m_nextGameSrvDescriptor >= kMaxGameTextures)) {
-    ++m_rtRejectBudget;
+    ++m_snapshotRejectBudget;
     return nullptr;
   }
 
@@ -3317,14 +3326,13 @@ void D3D12Renderer::RenderGameFrame() {
       // shader is running, and the per-draw transform when the passthrough
       // stage is — that one does not read b0 at all, but the root signature
       // requires a bound CBV either way.
-      ID3D12Resource* tcb = d.gpuVertex   ? d.vscb.Get()
-                            : d.cb        ? d.cb.Get()
-                                          : m_gameCB.Get();
-      m_commandList->SetGraphicsRootConstantBufferView(
-          0, tcb->GetGPUVirtualAddress());
+      const D3D12_GPU_VIRTUAL_ADDRESS tcb =
+          d.gpuVertex ? d.vscb.gpu
+          : d.cb      ? d.cb.gpu
+                      : m_gameCB->GetGPUVirtualAddress();
+      m_commandList->SetGraphicsRootConstantBufferView(0, tcb);
       // b1 pixel: the guest's own pixel constant bank.
-      m_commandList->SetGraphicsRootConstantBufferView(
-          1, d.pscb->GetGPUVirtualAddress());
+      m_commandList->SetGraphicsRootConstantBufferView(1, d.pscb.gpu);
       m_commandList->SetGraphicsRootDescriptorTable(2, translatedSrvTable);
       // One sampler per slot. This used to offset a four-descriptor heap by a
       // single per-draw variant index while the root signature's sampler range
@@ -3338,8 +3346,7 @@ void D3D12Renderer::RenderGameFrame() {
         // No vertex buffers at all. The stage's only input is SV_VertexID and
         // it reads the guest's raw bytes through t16, so binding a stream here
         // would contradict the empty input layout the PSO was built with.
-        m_commandList->SetGraphicsRootShaderResourceView(
-            4, d.rawvb->GetGPUVirtualAddress());
+        m_commandList->SetGraphicsRootShaderResourceView(4, d.rawvb.gpu);
         ++m_gpuVertexDraws;
         ++m_gpuVertexFetchDraws;
       } else if (d.gpuVertex) {
@@ -3395,9 +3402,9 @@ void D3D12Renderer::RenderGameFrame() {
     m_commandList->SetPipelineState(pipeline);
     // Each translated draw brings its own transform; a draw whose cb failed to
     // allocate falls back to the identity matrix rather than being dropped.
-    ID3D12Resource* cb = d.cb ? d.cb.Get() : m_gameCB.Get();
-    m_commandList->SetGraphicsRootConstantBufferView(0,
-                                                     cb->GetGPUVirtualAddress());
+    const D3D12_GPU_VIRTUAL_ADDRESS cb =
+        d.cb ? d.cb.gpu : m_gameCB->GetGPUVirtualAddress();
+    m_commandList->SetGraphicsRootConstantBufferView(0, cb);
     if (textured) {
       // The table declares kMaxPlanes descriptors, so its base must leave that
       // many inside the heap. A single-texture draw reads only the first.
@@ -3438,7 +3445,10 @@ void D3D12Renderer::RenderGameFrame() {
   // describes startup.
   static uint32_t s_rtFrame = 0;
   if (!m_gameDraws.empty() && (++s_rtFrame % 20) == 1) {
-    char message[300];
+    // 512, not 300: the stand-in line below carries eight counters now, and a
+    // snprintf that truncates would drop the three newest — silently losing the
+    // numbers this line exists to show.
+    char message[512];
     std::snprintf(message, sizeof(message),
                   "game RT routing: offscreen %llu, main %llu, OVERPAINT %llu "
                   "(refused: budget %llu, resized %llu); live targets %u/%u, "
@@ -3502,7 +3512,8 @@ void D3D12Renderer::RenderGameFrame() {
     std::snprintf(message, sizeof(message),
                   "resolve snapshots: copies %llu, hits %llu, FALLBACKS %llu, "
                   "source-not-offscreen %llu, WHITE-SKIPPED %llu, "
-                  "BLANK-SOURCE %llu, STALE-REFUSED %llu; live snapshots %u, "
+                  "BLANK-SOURCE %llu, STALE-REFUSED %llu; live snapshots %u/%u "
+                  "(REFUSED-BUDGET %llu), "
                   "DEPTH resolves %llu (%llu band-stitched) from %zu depth "
                   "surfaces, stand-in depth refused %llu, "
                   "aliased-source matches %llu (+%llu contained)",
@@ -3513,7 +3524,8 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_sampleMissSkipped),
                   static_cast<unsigned long long>(m_snapshotBlankSource),
                   static_cast<unsigned long long>(m_snapshotStaleRefused),
-                  uint32_t(m_gameSnapshots.size()),
+                  uint32_t(m_gameSnapshots.size()), kMaxGameSnapshots,
+                  static_cast<unsigned long long>(m_snapshotRejectBudget),
                   static_cast<unsigned long long>(m_depthResolves),
                   static_cast<unsigned long long>(m_depthBandResolves),
                   m_gameDepthTargets.size(),
@@ -3583,12 +3595,16 @@ void D3D12Renderer::RenderGameFrame() {
     std::snprintf(message, sizeof(message),
                   "stand-in reasons: no-hlsl %llu, no-handle %llu, "
                   "no-vertex-inputs %llu, no-constants %llu, "
-                  "too-many-samplers %llu",
+                  "too-many-samplers %llu; AFTER the gate: buffer-failed %llu, "
+                  "pso-capped %llu, no-root-sig %llu",
                   static_cast<unsigned long long>(m_standInNoHlsl),
                   static_cast<unsigned long long>(m_standInNoHandle),
                   static_cast<unsigned long long>(m_standInNoVertexInputs),
                   static_cast<unsigned long long>(m_standInNoConstants),
-                  static_cast<unsigned long long>(m_standInTooManySamplers));
+                  static_cast<unsigned long long>(m_standInTooManySamplers),
+                  static_cast<unsigned long long>(m_standInBufferFailed),
+                  static_cast<unsigned long long>(m_translatedPsoCapped),
+                  static_cast<unsigned long long>(m_translatedNoRootSig));
     LogInfo(message);
     // THIS frame, not cumulative: the question is whether the frame on screen
     // was assembled on one surface or several. "presented 1 of 1" means present
@@ -3634,34 +3650,109 @@ void D3D12Renderer::RenderGameFrame() {
   }
 }
 
-void D3D12Renderer::ClearGameDraws() {
-  if (m_gameDraws.empty()) return;
+// Suballocate one per-draw range from the upload ring.
+//
+// Three ways this can be satisfied, cheapest first: bump the page already being
+// filled, reset a page the GPU has finished with, or grow the ring. Only the
+// third calls into the driver, and in steady state it never happens — the ring
+// reaches the frame's working set within the first few frames and stays there.
+bool D3D12Renderer::AllocUpload(UploadAlloc& out, uint32_t bytes) {
+  out = {};
+  if (!bytes || !m_device) return false;
+  const uint32_t need = (bytes + kUploadAlign - 1) & ~(kUploadAlign - 1);
+  m_uploadBytesThisFrame += need;
 
-  // Hand the buffers to the retirement list rather than releasing them here.
-  // These draws were recorded into the command list submitted at the end of the
-  // previous frame, which signalled m_fenceValue; the GPU may still be reading
-  // them. See RetiredFrame in the header for why the command list itself is no
-  // protection.
-  RetiredFrame& r = (!m_retired.empty() && m_retired.back().fence == m_fenceValue)
-                        ? m_retired.back()
-                        : m_retired.emplace_back(RetiredFrame{m_fenceValue, {}});
-  //
-  // Every per-draw buffer, not just the first three. vsvb, vscb, ivb and pscb
-  // were being destroyed here while the GPU could still be reading them --
-  // pre-existing, and not a defect I hit, but rawvb joins exactly that set and
-  // retiring one while dropping its neighbours would be incoherent. Retiring
-  // more only ever delays a release.
-  r.res.reserve(r.res.size() + m_gameDraws.size() * 7);
-  for (auto& d : m_gameDraws) {
-    if (d.vb) r.res.push_back(std::move(d.vb));
-    if (d.ib) r.res.push_back(std::move(d.ib));
-    if (d.cb) r.res.push_back(std::move(d.cb));
-    if (d.ivb) r.res.push_back(std::move(d.ivb));
-    if (d.pscb) r.res.push_back(std::move(d.pscb));
-    if (d.vsvb) r.res.push_back(std::move(d.vsvb));
-    if (d.vscb) r.res.push_back(std::move(d.vscb));
-    if (d.rawvb) r.res.push_back(std::move(d.rawvb));
+  auto take = [&](uint32_t index) {
+    UploadPage& p = m_uploadPages[index];
+    out.cpu = p.cpu + p.used;
+    out.gpu = p.gpu + p.used;
+    out.size = need;
+    p.used += need;
+    p.live = true;
+    m_uploadPage = index;
+    return true;
+  };
+
+  if (m_uploadPage < m_uploadPages.size()) {
+    const UploadPage& p = m_uploadPages[m_uploadPage];
+    if (p.cpu && p.used + need <= p.size) return take(m_uploadPage);
   }
+
+  // A page is reusable only when BOTH are true: the GPU has passed the fence it
+  // was last submitted under, and the current draw list no longer references it.
+  // The second is not implied by the first — a replayed tick re-reads pages the
+  // GPU finished with long ago.
+  const uint64_t completed = m_fence ? m_fence->GetCompletedValue() : 0;
+  for (uint32_t i = 0; i < uint32_t(m_uploadPages.size()); ++i) {
+    UploadPage& p = m_uploadPages[i];
+    if (!p.cpu || p.live || p.size < need || p.fence > completed) continue;
+    p.used = 0;
+    return take(i);
+  }
+
+  // Grow. An allocation larger than the page size gets a page of its own rather
+  // than being refused; it recycles like any other.
+  UploadPage page;
+  page.size = std::max(kUploadPageBytes, need);
+  D3D12_HEAP_PROPERTIES hp = {};
+  hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+  D3D12_RESOURCE_DESC rd = {};
+  rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  rd.Width = page.size;
+  rd.Height = 1;
+  rd.DepthOrArraySize = 1;
+  rd.MipLevels = 1;
+  rd.Format = DXGI_FORMAT_UNKNOWN;
+  rd.SampleDesc.Count = 1;
+  rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  if (FAILED(CreateTimedCommittedResource(
+          &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
+          nullptr, IID_PPV_ARGS(&page.resource))))
+    return false;
+  // Mapped once and never unmapped. An UPLOAD resource may stay mapped for its
+  // whole life, and the Map/Unmap pair around every per-draw buffer was itself
+  // part of what this removes.
+  D3D12_RANGE noRead = {0, 0};
+  void* mapped = nullptr;
+  if (FAILED(page.resource->Map(0, &noRead, &mapped)) || !mapped) return false;
+  page.cpu = static_cast<uint8_t*>(mapped);
+  page.gpu = page.resource->GetGPUVirtualAddress();
+  m_uploadPages.push_back(std::move(page));
+  {
+    char message[192];
+    std::snprintf(message, sizeof(message),
+                  "upload ring: grew to %zu pages, %llu MB total",
+                  m_uploadPages.size(),
+                  static_cast<unsigned long long>(
+                      uint64_t(m_uploadPages.size()) * kUploadPageBytes /
+                      (1024 * 1024)));
+    LogInfo(message);
+  }
+  return take(uint32_t(m_uploadPages.size()) - 1);
+}
+
+void D3D12Renderer::ClearGameDraws() {
+  // Release the ring pages this draw list was holding.
+  //
+  // This is the whole of what used to be here. Every per-draw buffer was handed
+  // to the fenced retirement list to be destroyed a frame or two later, and the
+  // destruction cost as much as the creation: 743ms of an 1815ms menu tick in
+  // mx_1033, against 1031ms to create them. Neither exists now — a range of a
+  // page is not a resource, and a page is reset rather than freed.
+  //
+  // The fence protection has not gone away, it has moved: a page carries the
+  // submission it was last read under (UploadPage::fence) and cannot be reset
+  // until that passes. `live` is the separate condition, and this is what
+  // clears it — see the note on the field for why an empty tick makes the two
+  // different questions.
+  //
+  // Done before the empty check on purpose. AddGameDraw can allocate and then
+  // fail out before appending, so pages can be live with no draw referencing
+  // them; leaving those marked would retire them from the ring permanently.
+  for (auto& p : m_uploadPages) p.live = false;
+  m_uploadBytesThisFrame = 0;
+
+  if (m_gameDraws.empty()) return;
   m_gameDraws.clear();
   // The descriptor block window is NOT reset here. This runs on guest handoff,
   // not per host frame, and blocks are consumed per host frame — which is what
@@ -3709,19 +3800,26 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t depthHeight, uint32_t depthBase,
                                  uint32_t targetBase,
                                  uint32_t targetColorFormat) {
-  // PERF(per-frame-allocs): this creates three ID3D12Resource's per call (VB +
-  // IB + CB) on the UPLOAD heap, and is called once per submitted draw rather
-  // than once per frame, so the allocation rate scales with the draw count —
-  // which is why kMaxGameDraws caps it. The proper fix is a ring of upload
-  // buffers recycled after MoveToNextFrame's fence sync. Same TODO applies to
-  // the former UploadVideoFrame staging buffer.
+  // PERF(per-frame-allocs): DONE. This used to create an ID3D12Resource on the
+  // UPLOAD heap for each of the buffers below — up to nine per call, once per
+  // submitted draw — and the note here called for "a ring of upload buffers
+  // recycled after MoveToNextFrame's fence sync". That ring is AllocUpload; the
+  // buffers are now ranges of it and the only committed resources left in this
+  // path are the ring's own pages, created a handful of times per session.
+  //
+  // What it cost, measured in mx_1033 before the change: a steady-state main
+  // menu tick of 1815ms spent 1031ms creating those resources and 743ms
+  // destroying them — 97.7% of the tick — against 17ms to record the frame and
+  // 0ms waiting for the GPU. 1476 calls at ~683us each, 4.3 per draw. The guest
+  // was blocked in SetDrawCalls behind all of it, which is what its 1.75s frames
+  // and 0.55 fps actually were.
   //
   // This comment used to claim "D3D12's internal command-list tracking keeps
   // the underlying memory alive until the GPU finishes the last command using
   // it". That is false — D3D12 command lists do not reference-count the
-  // resources they reference; that was a D3D11 guarantee. Lifetime is the
-  // application's job, and it is now done by ClearGameDraws handing these to
-  // the fenced retirement list rather than releasing them outright.
+  // resources they reference; that was a D3D11 guarantee. Lifetime is still the
+  // application's job and is now the ring's: a page carries the submission it
+  // was last read under and cannot be reset until that fence passes.
   // A fetch draw brings no host vertex buffer at all: its geometry arrives in
   // vertexStage->rawBytes and the shader reads it through the root SRV, so a
   // null `vertices` is correct here rather than a malformed draw. Tested before
@@ -3740,22 +3838,12 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
     return;
   }
 
-  auto createBuffer = [&](Microsoft::WRL::ComPtr<ID3D12Resource>& buf,
-                          uint32_t size) -> bool {
-    buf.Reset();
-    D3D12_HEAP_PROPERTIES hp = {};
-    hp.Type = D3D12_HEAP_TYPE_UPLOAD;
-    D3D12_RESOURCE_DESC rd = {};
-    rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    rd.Width = size; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
-    rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1;
-    rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    // Counted and timed. This is the call the PERF note above is about, and it
-    // runs up to nine times per draw for several hundred draws a frame; whether
-    // it is getting slower per call as the session goes on is the open question.
-    return SUCCEEDED(CreateTimedCommittedResource(
-        &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
-        nullptr, IID_PPV_ARGS(&buf)));
+  // Was a CreateCommittedResource per buffer; now a bump allocation out of the
+  // ring. Kept as a lambda of the same shape so the call sites below read the
+  // same way, and because the ring hands back memory that is already mapped,
+  // each of them also loses its Map/Unmap pair.
+  auto createBuffer = [&](UploadAlloc& buf, uint32_t size) -> bool {
+    return AllocUpload(buf, size);
   };
 
   // Built locally and only appended once complete, so a partial failure leaves
@@ -3768,8 +3856,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   // WOULD read it.
   if (vertices && vtxBytes) {
     if (!createBuffer(d.vb, vtxBytes)) return;
-    void* vtxMap = nullptr;
-    if (FAILED(d.vb->Map(0, nullptr, &vtxMap))) return;
+    void* vtxMap = d.vb.cpu;
     memcpy(vtxMap, vertices, vtxBytes);
     // The fixed Bink YUV shader replaces the guest pixel shader, but it must
     // preserve the guest shader's final modulation:
@@ -3804,18 +3891,14 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
         LogInfo(message.c_str());
       }
     }
-    d.vb->Unmap(0, nullptr);
-    d.vbv.BufferLocation = d.vb->GetGPUVirtualAddress();
+    d.vbv.BufferLocation = d.vb.gpu;
     d.vbv.StrideInBytes = vtxStride;
     d.vbv.SizeInBytes = vtxBytes;
   }
 
   if (!createBuffer(d.ib, idxBytes)) return;
-  void* idxMap = nullptr;
-  if (FAILED(d.ib->Map(0, nullptr, &idxMap))) return;
-  memcpy(idxMap, indices, idxBytes);
-  d.ib->Unmap(0, nullptr);
-  d.ibv.BufferLocation = d.ib->GetGPUVirtualAddress();
+  memcpy(d.ib.cpu, indices, idxBytes);
+  d.ibv.BufferLocation = d.ib.gpu;
   d.ibv.Format = idx16 ? DXGI_FORMAT_R16_UINT : DXGI_FORMAT_R32_UINT;
   d.ibv.SizeInBytes = idxBytes;
   d.indexCount = idxCount;
@@ -3898,8 +3981,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   // "2000 draws with an untranslated shader" and "27015 stand-in draws" describe
   // different populations and cannot be subtracted from one another. Every
   // attempt to reason about the difference between them has been wrong.
-  if (!d.pixelShaderHlsl) {
-  }
+  if (!d.pixelShaderHlsl) ++m_standInNoHlsl;
   else if (!d.pixelShaderHandle) ++m_standInNoHandle;
   else if (!hasVertexStage && !(interpolators && interpBytes))
     ++m_standInNoVertexInputs;
@@ -3926,22 +4008,16 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
     // D3D12 resource, so this cannot simply fall out of interpBytes == 0.
     bool haveInterp = hasVertexStage;
     if (!hasVertexStage && createBuffer(d.ivb, interpBytes)) {
-      void* ip = nullptr;
-      D3D12_RANGE inone = {0, 0};
-      if (SUCCEEDED(d.ivb->Map(0, &inone, &ip)) && ip) {
-        std::memcpy(ip, interpolators, interpBytes);
-        d.ivb->Unmap(0, nullptr);
-        d.ivbv.BufferLocation = d.ivb->GetGPUVirtualAddress();
-        d.ivbv.SizeInBytes = interpBytes;
-        d.ivbv.StrideInBytes =
-            kTranslatedInterpolators * 4 * uint32_t(sizeof(float));
-        haveInterp = true;
-      }
+      std::memcpy(d.ivb.cpu, interpolators, interpBytes);
+      d.ivbv.BufferLocation = d.ivb.gpu;
+      d.ivbv.SizeInBytes = interpBytes;
+      d.ivbv.StrideInBytes =
+          kTranslatedInterpolators * 4 * uint32_t(sizeof(float));
+      haveInterp = true;
     }
     if (haveInterp && createBuffer(d.pscb, constBytes)) {
-      void* p = nullptr;
-      D3D12_RANGE none = {0, 0};
-      if (SUCCEEDED(d.pscb->Map(0, &none, &p)) && p) {
+      {
+        uint8_t* p = d.pscb.cpu;
         std::memset(p, 0, constBytes);
         std::memcpy(p, pixelConstants, bankBytes);
         // xe_texinv, immediately after the bank. An unnormalized fetch
@@ -4031,13 +4107,17 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
         std::memcpy(static_cast<uint8_t*>(p) + bankBytes + texInvBytes +
                         texSignBytes,
                     pg, sizeof(pg));
-        d.pscb->Unmap(0, nullptr);
         d.translated = true;
       }
     }
     if (!d.translated) {
-      d.ivb.Reset();
-      d.pscb.Reset();
+      // Reached only with the gate already passed, so this is the upload ring
+      // refusing a range -- not a property of the draw. Charged because it is
+      // otherwise indistinguishable from a draw that never qualified, and the
+      // two want completely different fixes.
+      ++m_standInBufferFailed;
+      d.ivb = {};
+      d.pscb = {};
     }
   }
 
@@ -4071,68 +4151,53 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
       // written into the cbuffer tail immediately after xe_texinv.
       if (createBuffer(d.rawvb, vertexStage->rawByteCount) &&
           createBuffer(d.vscb, vsConstBytes)) {
-        void* p = nullptr;
-        D3D12_RANGE none = {0, 0};
-        if (SUCCEEDED(d.rawvb->Map(0, &none, &p)) && p) {
-          std::memcpy(p, vertexStage->rawBytes, vertexStage->rawByteCount);
-          d.rawvb->Unmap(0, nullptr);
-          p = nullptr;
-          if (SUCCEEDED(d.vscb->Map(0, &none, &p)) && p) {
-            std::memset(p, 0, vsConstBytes);
-            std::memcpy(p, vertexStage->constants,
-                        vertexStage->constDwords * 4);
-            // xe_vf sits directly after xe_c[256] and xe_texinv[16], which is
-            // where the emitter declares it. This offset and that declaration
-            // are one fact in two places -- if either moves the other must.
-            const uint32_t vfOffset =
-                vertexStage->constDwords * 4 + kTranslatedSamplerSlots * 16;
-            std::memcpy(static_cast<uint8_t*>(p) + vfOffset,
-                        vertexStage->rawFetch,
-                        vertexStage->rawFetchCount * 16);
-            d.vscb->Unmap(0, nullptr);
-            d.vertexShaderHandle = vertexStage->handle;
-            d.vertexShaderHlsl = vertexStage->hlsl;
-            d.vertexInputCount = 0;
-            d.gpuVertex = true;
-            d.gpuVertexFetch = true;
-          }
-        }
+        // Both ranges are already mapped, so the pair of Map calls this used to
+        // guard on is gone and with it the only way these writes could fail.
+        std::memcpy(d.rawvb.cpu, vertexStage->rawBytes,
+                    vertexStage->rawByteCount);
+        uint8_t* p = d.vscb.cpu;
+        std::memset(p, 0, vsConstBytes);
+        std::memcpy(p, vertexStage->constants, vertexStage->constDwords * 4);
+        // xe_vf sits directly after xe_c[256] and xe_texinv[16], which is
+        // where the emitter declares it. This offset and that declaration
+        // are one fact in two places -- if either moves the other must.
+        const uint32_t vfOffset =
+            vertexStage->constDwords * 4 + kTranslatedSamplerSlots * 16;
+        std::memcpy(p + vfOffset, vertexStage->rawFetch,
+                    vertexStage->rawFetchCount * 16);
+        d.vertexShaderHandle = vertexStage->handle;
+        d.vertexShaderHlsl = vertexStage->hlsl;
+        d.vertexInputCount = 0;
+        d.gpuVertex = true;
+        d.gpuVertexFetch = true;
       }
       if (!d.gpuVertexFetch) {
-        d.rawvb.Reset();
-        d.vscb.Reset();
+        d.rawvb = {};
+        d.vscb = {};
       }
     } else if (createBuffer(d.vsvb, vertexStage->inputBytes) &&
                createBuffer(d.vscb, vsConstBytes)) {
-      void* p = nullptr;
-      D3D12_RANGE none = {0, 0};
-      if (SUCCEEDED(d.vsvb->Map(0, &none, &p)) && p) {
-        std::memcpy(p, vertexStage->inputs, vertexStage->inputBytes);
-        d.vsvb->Unmap(0, nullptr);
-        d.vsvbv.BufferLocation = d.vsvb->GetGPUVirtualAddress();
-        d.vsvbv.SizeInBytes = vertexStage->inputBytes;
-        d.vsvbv.StrideInBytes = vertexStage->regCount * 16;
-        p = nullptr;
-        if (SUCCEEDED(d.vscb->Map(0, &none, &p)) && p) {
-          // Zeroed first: the shader's cbuffer is xe_c[256] plus xe_texinv,
-          // and the vertex bank is 256 constants, so the tail past the bank
-          // must read zero rather than whatever the upload heap held.
-          std::memset(p, 0, vsConstBytes);
-          std::memcpy(p, vertexStage->constants, vertexStage->constDwords * 4);
-          d.vscb->Unmap(0, nullptr);
-          d.vertexShaderHandle = vertexStage->handle;
-          d.vertexShaderHlsl = vertexStage->hlsl;
-          d.vertexInputCount = vertexStage->regCount;
-          for (uint32_t i = 0; i < vertexStage->regCount; ++i)
-            d.vertexInputRegs[i] = vertexStage->regs[i];
-          d.gpuVertex = true;
-        }
-      }
+      std::memcpy(d.vsvb.cpu, vertexStage->inputs, vertexStage->inputBytes);
+      d.vsvbv.BufferLocation = d.vsvb.gpu;
+      d.vsvbv.SizeInBytes = vertexStage->inputBytes;
+      d.vsvbv.StrideInBytes = vertexStage->regCount * 16;
+      // Zeroed first: the shader's cbuffer is xe_c[256] plus xe_texinv, and the
+      // vertex bank is 256 constants, so the tail past the bank must read zero
+      // rather than whatever the ring page held from an earlier frame.
+      std::memset(d.vscb.cpu, 0, vsConstBytes);
+      std::memcpy(d.vscb.cpu, vertexStage->constants,
+                  vertexStage->constDwords * 4);
+      d.vertexShaderHandle = vertexStage->handle;
+      d.vertexShaderHlsl = vertexStage->hlsl;
+      d.vertexInputCount = vertexStage->regCount;
+      for (uint32_t i = 0; i < vertexStage->regCount; ++i)
+        d.vertexInputRegs[i] = vertexStage->regs[i];
+      d.gpuVertex = true;
     }
     if (!d.gpuVertex) {
-      d.vsvb.Reset();
-      d.rawvb.Reset();
-      d.vscb.Reset();
+      d.vsvb = {};
+      d.rawvb = {};
+      d.vscb = {};
     }
   }
   // A draw that brought a vertex stage and could not get one has no path left.
@@ -4161,13 +4226,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   // broken one look identical on screen. A null mvp, or a CB that fails to
   // allocate, falls back to that identity rather than dropping the draw.
   if (mvp && createBuffer(d.cb, 256)) {
-    void* cbMap = nullptr;
-    if (SUCCEEDED(d.cb->Map(0, nullptr, &cbMap))) {
-      memcpy(cbMap, mvp, 16 * sizeof(float));
-      d.cb->Unmap(0, nullptr);
-    } else {
-      d.cb.Reset();
-    }
+    memcpy(d.cb.cpu, mvp, 16 * sizeof(float));
   }
 
   m_gameDraws.push_back(std::move(d));
