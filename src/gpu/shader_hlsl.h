@@ -206,6 +206,14 @@ struct HlslShader {
   uint32_t max_const_index = 0;
   bool reads_constants = false;
 
+  // Count of setp_* instructions translated for their VALUE only. Their p0
+  // result is discarded because predicated issue (the `pred` instruction prefix
+  // and cond_exec_pred) is not implemented, so a shader reporting a non-zero
+  // count may execute instructions the console would have skipped. Emitting
+  // them beats refusing the shader — a refusal costs the whole draw — but the
+  // gap is real and this is how it stays visible.
+  uint32_t unhonoured_predicate_ops = 0;
+
   // --- vertex fetch, only when the caller asked for it ----------------------
   //
   // The number of vfetches emitted into the body, and for each one the guest

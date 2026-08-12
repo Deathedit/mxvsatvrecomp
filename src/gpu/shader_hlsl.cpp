@@ -156,6 +156,10 @@ class Emitter {
   bool writes_depth = false;
   uint32_t max_const_index = 0;
   bool reads_constants = false;
+  // setp_* instructions emitted with their value semantics but whose p0 result
+  // nothing acts on, because predicated issue is not implemented. Non-zero means
+  // this shader may take a branch or an instruction it should have skipped.
+  uint32_t unhonoured_predicate_ops = 0;
   std::vector<PixelTextureBinding> fetches;
   uint32_t sampler_mask = 0;
   // Guest sampler -> compact register slot, assigned in order of first fetch.
@@ -507,6 +511,17 @@ class Emitter {
       case Op::kSnes: r = "float(" + a + " != 0.0)"; break;
       case Op::kAddsPrev: r = "(" + a + " + xe_ps)"; break;
       case Op::kMulsPrev: r = "XeMul(" + a + ", xe_ps)"; break;
+      // The LIT-emulation form (ucode.h:kMulsPrev2): guards the specular term so
+      // a non-positive or non-finite exponent collapses to -FLT_MAX rather than
+      // producing a NaN. Not seen in this title's shaders, but it is the last
+      // scalar opcode without a handler, and the default: arm below refuses the
+      // whole shader — a cost the mask no longer hides now that the scalar half
+      // always runs.
+      case Op::kMulsPrev2:
+        r = "((xe_ps == -3.402823466e+38 || !isfinite(xe_ps) || !isfinite(" +
+            b + ") || " + b + " <= 0.0) ? -3.402823466e+38 : XeMul(" + a +
+            ", xe_ps))";
+        break;
       case Op::kSubsPrev: r = "(" + a + " - xe_ps)"; break;
       case Op::kFrcs: r = "frac(" + a + ")"; break;
       case Op::kTruncs: r = "trunc(" + a + ")"; break;
@@ -558,6 +573,46 @@ class Emitter {
         r = "max(" + a + ", " + b + ")";
         break;
       case Op::kRetainPrev: r = "xe_ps"; break;
+      // The predicate-set family. p0 itself is NOT honoured yet — nothing reads
+      // xe_p0, because predicated instruction issue (the `pred` prefix and
+      // cond_exec_pred) is unimplemented. What matters here is that these still
+      // produce a VALUE, and that value lands in ps for a following *_prev to
+      // read. Refusing the shader over the unimplemented half would throw away
+      // the implemented one and drop the draw to the stand-in; this title has
+      // two such shaders. Counted so the gap stays visible instead of inferred.
+      //
+      // Note the polarity, from the SDK (ucode.h:1140-1226): the predicate being
+      // TRUE writes 0.0 to the destination, not 1.0.
+      case Op::kSetpEq: case Op::kSetpNe: case Op::kSetpGt: case Op::kSetpGe: {
+        const char* cmp = op == Op::kSetpEq   ? "=="
+                          : op == Op::kSetpNe ? "!="
+                          : op == Op::kSetpGt ? ">"
+                                              : ">=";
+        Line("xe_p0 = (" + a + " " + std::string(cmp) + " 0.0);");
+        r = "float(!(" + a + " " + std::string(cmp) + " 0.0))";
+        ++unhonoured_predicate_ops;
+        break;
+      }
+      case Op::kSetpInv:
+        Line("xe_p0 = (" + a + " == 1.0);");
+        r = "(" + a + " == 1.0 ? 0.0 : (" + a + " == 0.0 ? 1.0 : " + a + "))";
+        ++unhonoured_predicate_ops;
+        break;
+      case Op::kSetpPop:
+        Line("xe_p0 = ((" + a + " - 1.0) <= 0.0);");
+        r = "max(" + a + " - 1.0, 0.0)";
+        ++unhonoured_predicate_ops;
+        break;
+      case Op::kSetpClr:
+        Line("xe_p0 = false;");
+        r = "3.402823466e+38";
+        ++unhonoured_predicate_ops;
+        break;
+      case Op::kSetpRstr:
+        Line("xe_p0 = (" + a + " == 0.0);");
+        r = a;
+        ++unhonoured_predicate_ops;
+        break;
       case Op::kKillsEq: case Op::kKillsGt: case Op::kKillsGe:
       case Op::kKillsNe: case Op::kKillsOne: {
         if (!pixel()) {
@@ -577,7 +632,6 @@ class Emitter {
         break;
       }
       default:
-        // The setp family — predicate machinery, none of it seen here.
         status = HlslStatus::kUnsupportedScalarOp;
         blocking_opcode = uint32_t(op);
         return "0.0";
@@ -629,9 +683,11 @@ class Emitter {
     std::string vexpr, sexpr;
     if (has_vector) vexpr = VectorOp(alu, vmask != 0);
     if (status != HlslStatus::kOk) return;
-    // sexpr is consumed only under `smask != 0` below, so running the scalar
-    // half purely for a0 costs an unused string and nothing else.
-    if (smask != 0 || scalar_sets_a0) sexpr = ScalarOp(alu);
+    // The scalar half ALWAYS runs. a0 was the first side effect found to survive
+    // an empty write mask, but it is not the only one and gating on the mask was
+    // never the right shape: `ps` is written by every scalar issue, and `p0` and
+    // the kill discard likewise. See the xe_ps note below.
+    sexpr = ScalarOp(alu);
     if (status != HlslStatus::kOk) return;
 
     // Both halves read the register file before either writes — the co-issue
@@ -639,7 +695,31 @@ class Emitter {
     // the vector result straight into r[] would let the scalar half read the
     // new value.
     if (vmask != 0) Line("xe_v = " + vexpr + ";");
-    if (smask != 0) Line("xe_s = " + sexpr + "; xe_ps = xe_s;");
+    // xe_ps is the Xenos PS register, and the hardware writes it on EVERY scalar
+    // issue. The write mask governs only whether the result is ALSO committed to
+    // the destination register, so gating the ps update on it silently deletes
+    // the one thing a mask-less scalar op exists to produce.
+    //
+    // Shaders lean on that. Xenia's dump of this title (85 of our microcode
+    // blobs pair to it by exact SHA-1) has 47 such instructions across 20
+    // shaders, every one immediately consumed by an adds_prev/muls_prev:
+    //
+    //     15   dp3_sat r1._y__, r3.wyzz, c158.zxyy
+    //      +   maxs r0._, -r5.yy          <- empty mask, issued only for ps
+    //     16   dp3 r5._y__, r2.wyzz, r3.wyzz
+    //      +   muls_prev r5.__z_, c255.y  <- reads that ps
+    //
+    // We emitted no line at all for 15, so 16 multiplied by instruction 14's
+    // leftover ps. Three vertex shaders in that set feed the stale value
+    // straight into an interpolator (`adds_prev o1.__z_, -r2.w`).
+    //
+    // This is the same error as the maxa/maxas/maxasf one above, one register
+    // over — that gated a0 on the write mask and un-posed the rider. A write
+    // mask is not a statement about side effects.
+    //
+    // kRetainPrev exists precisely to NOT disturb ps, and stays correct here
+    // because it yields xe_ps: the assignment is a self-assignment.
+    Line("xe_s = " + sexpr + "; xe_ps = xe_s;");
 
     if (is_export) {
       const uint32_t dest = alu.vector_dest();
@@ -1489,6 +1569,8 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
          "; ++xe_i) r[xe_i] = float4(0, 0, 0, 0);\n";
   src += "  float4 xe_v = float4(0, 0, 0, 0);\n";
   src += "  float xe_s = 0.0, xe_ps = 0.0;\n";
+  // Written by setp_*, read by nothing yet — see unhonoured_predicate_ops.
+  src += "  bool xe_p0 = false;\n";
   src += "  int xe_a0 = 0;\n";
   if (em.uses_cube) {
     src += "  float3 xe_cube = float3(0, 0, 0), xe_cube_a = float3(0, 0, 0);\n";
@@ -1574,6 +1656,7 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   out.writes_depth = em.writes_depth;
   out.max_const_index = em.max_const_index;
   out.reads_constants = em.reads_constants;
+  out.unhonoured_predicate_ops = em.unhonoured_predicate_ops;
   out.vertex_fetch_count = em.vertex_fetch_count;
   for (uint32_t i = 0; i < em.vertex_fetch_count; ++i)
     out.vertex_fetch_slot[i] = fetch_slot_of[i];

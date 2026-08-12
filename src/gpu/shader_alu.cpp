@@ -453,6 +453,13 @@ class Interpreter {
       case Op::kSnes: r = a != 0.0f ? 1.0f : 0.0f; break;
       case Op::kAddsPrev: r = a + ps_; break;
       case Op::kMulsPrev: r = LegacyMul(a, ps_); break;
+      // The LIT-emulation form; see the matching case in shader_hlsl.cpp.
+      case Op::kMulsPrev2:
+        r = (ps_ == -3.402823466e+38f || !std::isfinite(ps_) ||
+             !std::isfinite(b) || b <= 0.0f)
+                ? -3.402823466e+38f
+                : LegacyMul(a, ps_);
+        break;
       case Op::kSubsPrev: r = a - ps_; break;
       case Op::kFrcs: r = a - std::floor(a); break;
       case Op::kTruncs: r = std::trunc(a); break;
@@ -492,10 +499,28 @@ class Interpreter {
         r = a >= b ? a : b;
         break;
       case Op::kRetainPrev: r = ps_; break;
+      // Predicate-set family, value semantics only — p0_ is recorded but no
+      // instruction is skipped on it, exactly as in shader_hlsl.cpp. Kept in
+      // step with the emitter so the two cannot disagree about a shader they
+      // both run. Polarity per ucode.h:1140-1226: predicate TRUE writes 0.0.
+      case Op::kSetpEq: p0_ = a == 0.0f; r = p0_ ? 0.0f : 1.0f; break;
+      case Op::kSetpNe: p0_ = a != 0.0f; r = p0_ ? 0.0f : 1.0f; break;
+      case Op::kSetpGt: p0_ = a > 0.0f;  r = p0_ ? 0.0f : 1.0f; break;
+      case Op::kSetpGe: p0_ = a >= 0.0f; r = p0_ ? 0.0f : 1.0f; break;
+      case Op::kSetpInv:
+        p0_ = a == 1.0f;
+        r = p0_ ? 0.0f : (a == 0.0f ? 1.0f : a);
+        break;
+      case Op::kSetpPop:
+        p0_ = (a - 1.0f) <= 0.0f;
+        r = p0_ ? 0.0f : a - 1.0f;
+        break;
+      case Op::kSetpClr: p0_ = false; r = 3.402823466e+38f; break;
+      case Op::kSetpRstr: p0_ = a == 0.0f; r = p0_ ? 0.0f : a; break;
       default:
-        // The setp and kill families — predicate machinery and pixel-shader
-        // operations. The mulsc/addsc/subsc family used to land here too; it is
-        // now handled above, ahead of this switch.
+        // The kill family — pixel-shader operations with no vertex meaning, and
+        // this interpreter runs vertex shaders. The mulsc/addsc/subsc family
+        // used to land here too; it is now handled above, ahead of this switch.
         status = AluStatus::kUnsupportedScalarOp;
         blocking_opcode = uint32_t(op);
         return ps_;
@@ -544,15 +569,20 @@ class Interpreter {
       vres = VectorOp(alu);
       counting_ = in_counting;
     }
-    // Same shape as the vector half above: run it for the side effect, but do
-    // not count operands nothing consumes. sres is only read under
-    // `smask & bit`, so the discarded max result cannot reach a register.
-    if (smask != 0 || scalar_sets_a0) {
-      in_counting = counting_;
-      counting_ = smask != 0;
-      sres = ScalarOp(alu);
-      counting_ = in_counting;
-    }
+    // The scalar half ALWAYS runs. ScalarOp updates ps_ on its way out, and the
+    // hardware writes ps on every scalar issue — the write mask says only
+    // whether the result is ALSO committed to a register. Gating this on the
+    // mask meant a `maxs` issued purely for its ps side effect never ran, and
+    // the following `muls_prev` multiplied by a stale ps. Same class of error as
+    // the a0 one above; see the long note in shader_hlsl.cpp for the measurement
+    // against Xenia's dump of this title.
+    //
+    // Operands still are not counted when nothing consumes the value: sres is
+    // read only under `smask & bit`.
+    in_counting = counting_;
+    counting_ = smask != 0;
+    sres = ScalarOp(alu);
+    counting_ = in_counting;
     if (status != AluStatus::kOk) return;
 
     if (alu.is_export()) {
@@ -602,6 +632,7 @@ class Interpreter {
  private:
   const AluInputs& in_;
   float ps_ = 0.0f;  // previous scalar result, for the *_prev opcodes
+  bool p0_ = false;  // predicate register: written by setp_*, read by nothing
 };
 
 }  // namespace
