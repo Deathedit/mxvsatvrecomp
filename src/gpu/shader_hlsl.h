@@ -143,20 +143,22 @@ struct HlslShader {
 
   // Base HLSL register for this stage's textures and samplers.
   //
-  // The two stages CANNOT share t0/s0. They are translated and cached
-  // independently, keyed by guest shader handle, so a vertex shader's compact
-  // slot 0 and a pixel shader's compact slot 0 are different guest samplers
-  // that happen to have the same index -- one descriptor table serving both
-  // would hand the vertex stage the pixel stage's textures.
+  // BOTH stages use t0/s0, and that is correct rather than a collision.
+  // D3D12's ShaderVisibility scopes a register to a stage: a VERTEX-visible
+  // descriptor table at s0 and a PIXEL-visible one at s0 are different bind
+  // points, so each stage gets its own descriptors from its own root
+  // parameter. The two shaders are translated and cached independently, so
+  // their compact slot 0 IS a different guest sampler -- the root signature is
+  // what keeps them apart, not the register number.
   //
-  // So the vertex stage is moved out of the way: t17..t32 and s16..s31, and the
-  // pixel stage keeps t0..t15 / s0..s15 so nothing about the common path
-  // changes. t16 is skipped because it is the raw vertex buffer's root SRV
-  // (see the note on params[4] in the translated root signature).
+  // The first attempt at this moved the vertex stage to t17/s16 to "avoid" a
+  // collision that does not exist. It is also impossible: vs_5_0 has exactly
+  // 16 sampler slots, so s16 is not a register at all and FXC rejects the
+  // shader outright with X4509. Measured -- FAILED_vs_243B8AA0.
   static constexpr uint32_t kPixelTextureBaseRegister = 0;
   static constexpr uint32_t kPixelSamplerBaseRegister = 0;
-  static constexpr uint32_t kVertexTextureBaseRegister = 17;
-  static constexpr uint32_t kVertexSamplerBaseRegister = 16;
+  static constexpr uint32_t kVertexTextureBaseRegister = 0;
+  static constexpr uint32_t kVertexSamplerBaseRegister = 0;
 
   // Bit i set = compact slot i is declared Texture2DArray, not Texture2D,
   // because its fetches are cube. The binder MUST create a TEXTURE2DARRAY SRV

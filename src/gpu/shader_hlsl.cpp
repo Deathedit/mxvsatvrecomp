@@ -1386,8 +1386,8 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   }
   // Declared for EVERY slot up to sampler_count, contiguously from this stage's
   // base register, so the registers match a descriptor table of exactly that
-  // width. The two stages use different bases and so different tables — see
-  // HlslShader::kVertexTextureBaseRegister for why they cannot share one.
+  // width. Both stages base at t0/s0 and are kept apart by the root signature's
+  // ShaderVisibility — see HlslShader::kVertexTextureBaseRegister.
   //
   // A slot fetched as a cube is declared Texture2DArray: the guest projects the
   // direction to (S, T, face) itself, so an array indexed by face is what its

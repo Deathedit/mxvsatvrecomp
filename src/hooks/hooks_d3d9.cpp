@@ -65,8 +65,6 @@
 
 // Defined in src/app/graphics_system.cpp with the rest of the Debug cvars.
 REXCVAR_DECLARE(bool, hle_capture);
-REXCVAR_DECLARE(uint32_t, hle_shader_exec);
-REXCVAR_DECLARE(uint32_t, hle_shader_verts);
 REXCVAR_DECLARE(bool, hle_diag);
 
 // A NAMED namespace, not an anonymous one, so that the guest entry points can
@@ -1135,13 +1133,6 @@ const ResolvedTargetByAddress* ResolvedTargetForAddress(
   return &it->second;
 }
 
-// Stage C — run the guest's own vertex shader over this draw's vertices.
-// Defined further down, next to the microcode it needs; declared here because
-// the draw builder is the only place that has the vertices and the streams
-// together.
-void ProbeShaderExecution(const mx::hle::DrawCall& dc, uint32_t handle,
-                          const mx::hle::HleStream* streams, uint32_t device,
-                          uint8_t* base);
 ShaderApplyResult ApplyShaderOutputs(
     mx::hle::DrawCall& dc, uint32_t handle,
     const mx::hle::HleStream* streams, uint32_t device, uint8_t* base,
@@ -1664,8 +1655,6 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     }
   }
 
-  ProbeShaderExecution(dc, st.vs_seen ? st.vertex_shader : 0, streams, device,
-                       base);
 
   // The declaration supplies inputs, not the position the GPU rasterizes.
   // Execute the bound guest shader and replace POSITION with its homogeneous
@@ -2160,12 +2149,6 @@ uint32_t ClassifyClip(const float p[4]) {
   return kClipWild;
 }
 
-uint64_t g_aluRuns = 0, g_aluInClip = 0, g_aluDegenerate = 0;
-uint64_t g_aluNoShader = 0, g_aluNoAttrs = 0, g_aluStrideMismatch = 0;
-// fetch_slot did not invert to a stream in [0, kMaxStreams). Its own counter:
-// "the stream mapping does not hold here" and "the bound stride disagrees" are
-// different failures and folding them together would hide either one.
-uint64_t g_aluBadStream = 0;
 
 //---------------------------------------------------------------------------
 // Stage G — execute the shader that was actually bound.
@@ -2305,44 +2288,8 @@ const PatchedCode* CodeFromShaderObject(uint32_t shader, uint8_t* base) {
 }
 
 
-uint64_t g_srcPatchHook = 0;    // draws whose code came from the patch hook
-uint64_t g_srcNone = 0;
-uint64_t g_patchDecodeOk = 0;     // decoded, and the count matched the table
-uint64_t g_patchDecodeCount = 0;  // decoded, count disagreed with the table
-uint64_t g_patchDecodeFail = 0;   // refused outright
-std::map<std::string, uint64_t> g_patchDecodeFailWhy;
-uint64_t g_aluConstReads = 0, g_aluConstZero = 0;
-std::map<int, uint64_t> g_aluStatus;
-std::map<uint32_t, uint64_t> g_aluBlocking;
 
-// Stage D — cost. Draws entered, not draws offered: the difference between the
-// two is every named skip below, and a rate quoted against the wrong
-// denominator is how "35% of draws" turns into a claim about the whole title.
-uint64_t g_aluDrawsEntered = 0;
-uint64_t g_aluNanos = 0;
 
-// Stage F — which space the exported position is in.
-//
-// Everything before this assumed clip space, and never tested it. The PM4 path
-// established on the *same shaders* that the ring's exports read like window
-// coordinates, which is the entire reason the renderer applies the viewport
-// inverse. If that holds here too then the clip-volume test has been the wrong
-// yardstick and the numbers it produced measure the wrong thing.
-uint64_t g_spaceCount[4] = {};        // indexed by ExportSpace
-// The same histogram as the raw one, but after the viewport inverse. If these
-// positions are window coordinates, this is where they collapse into <=1.
-uint64_t g_clipExecVp[kClipBucketCount] = {};
-uint64_t g_vpApplied = 0;             // executions the inverse could be applied to
-
-// Stage D2 — the two histograms, and the control's own degenerate count.
-uint64_t g_clipExec[kClipBucketCount] = {};
-uint64_t g_clipCtl[kClipBucketCount] = {};
-uint64_t g_ctlVerts = 0, g_ctlDegenerate = 0, g_aluNoViewportDraws = 0;
-// The guard the Stage 3 probe needed (d3d9_draw.cpp, kSpreadEpsilon): a
-// transform that collapses distinct inputs to a point lands them all in one
-// bucket and looks like agreement. Tracked per draw for the control, because a
-// degenerate control is not a reference — it is a second way of saying nothing.
-uint64_t g_ctlCollapsedDraws = 0;
 constexpr float kCtlSpreadEpsilon = 1e-4f;
 
 // Stage I — the same numbers, attributed to the shader that produced them.
@@ -2383,11 +2330,6 @@ struct ShaderScore {
   // it. Costs one short string per distinct shader.
   std::string first_exec;
 };
-std::map<uint32_t, ShaderScore> g_shaderScore;   // key: shader handle
-// If D3D9 recycles a handle for a different shader, the table silently merges
-// two populations and reads as a finding. Counted, and reported: a nonzero
-// value invalidates every row rather than quietly biasing it.
-uint64_t g_shaderIdentityChanged = 0;
 
 // HLE rendering must consume the shader's position export, not the raw
 // declaration POSITION that BuildHleDraw initially packs. These counters are
@@ -2458,16 +2400,6 @@ struct PhaseTimer {
   }
 };
 
-// Some shaders are already resident before the title reaches
-// PatchVertexShaderToMatchVertexDeclaration, so the exact post-call capture
-// above never observes them.  SH_pPhysical still names the live allocation
-// D3D9 binds for the draw.  Accept that second exact source only when one and
-// only one CF start decodes and every resulting vfetch agrees with a currently
-// bound stream, including its patched stride.  An unpatched template has blank
-// fetch fields and fails this test; an arbitrary offset that happens to decode
-// is rejected by the uniqueness requirement.
-std::map<uint32_t, PatchedCode> g_liveVertexCode;
-std::map<uint32_t, size_t> g_liveVertexFailedAtShaderCount;
 uint64_t g_liveVertexResolved = 0, g_liveVertexAmbiguous = 0;
 uint64_t g_liveVertexUnreadable = 0, g_liveVertexNoMatch = 0;
 
@@ -3620,6 +3552,30 @@ HlslCoverage g_hlslVs, g_hlslPs;
 // not; the value is unused.
 std::map<uint32_t, bool> g_hlslReportedVs, g_hlslReportedPs;
 
+// logs/hlsldump, emptied once per process before the first file of the run.
+//
+// These dumps are named by guest shader HANDLE, and a handle is an address that
+// varies per run -- so a stale file neither collides with nor is overwritten by
+// the current run's. The directory simply accumulated every run's output with
+// nothing to say whose was whose, and that cost real confusion on 2026-08-12: a
+// FAILED_ dump written by an earlier binary was read as evidence about the
+// current one, and only its mtime settled it.
+//
+// Cleared lazily at the first dump rather than at startup, so a run that
+// translates nothing leaves the previous run's files alone to be read. Both
+// dump sites call this; the magic static makes the clear happen exactly once
+// however many threads reach it.
+void EnsureHlslDumpDir() {
+  static const bool s_cleared = [] {
+    std::error_code ec;
+    std::filesystem::remove_all("logs/hlsldump", ec);
+    return true;
+  }();
+  (void)s_cleared;
+  std::error_code ec;
+  std::filesystem::create_directories("logs/hlsldump", ec);
+}
+
 std::string HlslCoverageSummary(const HlslCoverage& c) {
   std::string s = fmt::format("{} translated+compiled", c.ok);
   if (c.compile_failed) s += fmt::format(", FXC-REJECTED={}", c.compile_failed);
@@ -3715,7 +3671,7 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
       if (budget < cap) {
         ++budget;
         std::error_code ec;
-        std::filesystem::create_directories("logs/hlsldump", ec);
+        EnsureHlslDumpDir();
         char path[128];
         // Vertex shaders included: a light-prepass draw was found exporting a
         // correct SV_Position and then ZERO for every interpolator, which is a
@@ -3813,8 +3769,7 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
             static uint32_t s_vf_dumped = 0;
             if (s_vf_dumped < 96) {
               ++s_vf_dumped;
-              std::error_code vec;
-              std::filesystem::create_directories("logs/hlsldump", vec);
+              EnsureHlslDumpDir();
               char vpath[128];
               std::snprintf(vpath, sizeof(vpath),
                             "logs/hlsldump/vsfetch_%08X.txt", handle);
@@ -5929,684 +5884,6 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
   return true;
 }
 
-void ProbeShaderExecution(const mx::hle::DrawCall& dc, uint32_t handle,
-                          const mx::hle::HleStream* streams, uint32_t device,
-                          uint8_t* base) {
-  using namespace mx::hle;
-  if (!REXCVAR_GET(hle_capture) || !handle || !device) return;
-  // Stage D: the sampling rate is the measurement, so it is a cvar and not a
-  // constant. 0 is off, N runs one draw in N, 1 runs every draw — and only the
-  // last of those says what using the interpreter would actually cost.
-  const uint32_t every = REXCVAR_GET(hle_shader_exec);
-  if (every == 0) return;
-  static uint64_t s_draws = 0;
-  if ((++s_draws % every) != 0) return;
-
-  // Timed from here, so the cost includes the lookups and the 1,024-word
-  // constant copy below and not merely the interpreter. Charging the frame only
-  // for ExecuteVertexShader would understate it by exactly the part that is
-  // easiest to forget.
-  const auto t0 = std::chrono::steady_clock::now();
-  struct ChargeTime {
-    std::chrono::steady_clock::time_point t;
-    ~ChargeTime() {
-      g_aluNanos += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                 std::chrono::steady_clock::now() - t)
-                                 .count());
-    }
-  } charge{t0};
-  ++g_aluDrawsEntered;
-
-  // Stage G: the exact code first, the heuristic only as a fallback, and each
-  // counted separately so "coverage improved" is a measurement rather than a
-  // hope. Both paths are kept because the patch hook fires on the lazy-state
-  // path — a shader bound but never re-patched has no entry, and swapping one
-  // heuristic for one assumption would not be progress.
-  const std::vector<uint32_t>* codep = nullptr;
-  uint32_t off = 0;
-  static std::vector<VertexAttribute> decoded;
-  const std::vector<VertexAttribute>* attrsp = nullptr;
-
-  auto pi = g_patchedCode.find(handle);
-  if (pi != g_patchedCode.end() && pi->second.resolved) {
-    decoded.clear();
-    const char* why = nullptr;
-    const uint32_t s = pi->second.code_off;
-    if (DecodeVertexShaderFetches(pi->second.code.data() + s,
-                                  uint32_t(pi->second.code.size() - s), decoded,
-                                  &why)) {
-      // The binding table said how many vfetches this shader has. If the decode
-      // disagrees, the captured window did not start where it was assumed to —
-      // a wrong start would otherwise decode into plausible nonsense.
-      if (decoded.size() == pi->second.expect_fetches) {
-        ++g_patchDecodeOk;
-        codep = &pi->second.code;
-        off = s;
-        attrsp = &decoded;
-      } else {
-        ++g_patchDecodeCount;
-      }
-    } else {
-      ++g_patchDecodeFail;
-      ++g_patchDecodeFailWhy[why ? why : "?"];
-    }
-  }
-
-  // The PM4 content-match fallback that used to sit here is REMOVED
-  // 2026-08-06, along with the cross-check that compared our decode of D3D9's
-  // patched output against PM4's decode of the ring's copy. Both had one
-  // source and it is gone.
-  //
-  // Neither is missed, and that is measured rather than assumed: stageG
-  // reported `patch hook (exact) 32212 (100%), content match >=90% 0 (0%),
-  // none 0 (0%)`. The heuristic was never once the source, so the branch it
-  // fed was dead code carrying a >=90%-similarity guess that could have picked
-  // the wrong shader if it ever had fired.
-  if (!codep) {
-    ++g_srcNone;
-    ++g_aluNoShader;
-    return;
-  }
-  ++g_srcPatchHook;
-
-  const std::vector<VertexAttribute>& attrs = *attrsp;
-  const std::vector<uint32_t>& code = *codep;
-  if (attrs.empty()) { ++g_aluNoAttrs; return; }
-
-  // Which stream each attribute fetches from.
-  //
-  // No longer a guess. PatchVertexShaderToMatchVertexDeclaration writes
-  // `95 - element.stream` into the vfetch's constant field (subfic r20, r5,
-  // 0x5F at 0x82564E30), so inverting it gives the D3D9 stream number. The
-  // prediction probe agreed with what D3D9 actually wrote on 52 of 53 slots.
-  //
-  // This also explains why every observed fetch_slot was 95: it is stream 0.
-  // The value is ambiguous — the no-match path writes 95 too — but an unmatched
-  // vfetch is left with a canned format (0x60000) and swizzle (0x9250), and the
-  // measurement found 0 unmatched slots in this title.
-  static std::vector<uint32_t> astream;
-  astream.assign(attrs.size(), 0);
-  for (size_t a = 0; a < attrs.size(); ++a) {
-    const uint32_t fs = attrs[a].fetch_slot;
-    if (fs > 95 || (95u - fs) >= kMaxStreams) { ++g_aluBadStream; return; }
-    astream[a] = 95u - fs;
-    const HleStream& sa = streams[astream[a]];
-    if (!sa.bound || !sa.host || sa.stride == 0 ||
-        sa.stride != attrs[a].stride_bytes) {
-      ++g_aluStrideMismatch;
-      return;
-    }
-  }
-
-  // Stage I: this draw's row. Keyed by the shader handle, which is only a valid
-  // identity if D3D9 does not reuse it — so the identity is checked, not
-  // assumed, against two things that cannot both survive a substitution.
-  ShaderScore& ss = g_shaderScore[handle];
-  const uint32_t first_dword = off < code.size() ? code[off] : 0;
-  if (ss.draws == 0) {
-    ss.attrs = uint32_t(attrs.size());
-    ss.first_dword = first_dword;
-  } else if (ss.attrs != attrs.size() || ss.first_dword != first_dword) {
-    ++g_shaderIdentityChanged;
-  }
-  ++ss.draws;
-
-  // The constant file, straight from the device. Const(i) reads
-  // alu_consts[i*4], and D3D9 register N lives at +0x780 + N*16, so the two are
-  // the same indexing and no rebase is needed — the API applied the base.
-  static std::vector<uint32_t> consts;
-  consts.assign(kD3d9ConstRegs * 4, 0);
-  if (!HostPageReadable(REX_RAW_ADDR(device + 0x780)) ||
-      !HostPageReadable(REX_RAW_ADDR(device + 0x780 + kD3d9ConstRegs * 16 - 4)))
-    return;
-  for (uint32_t i = 0; i < kD3d9ConstRegs * 4; ++i) {
-    const uint32_t bits = REX_LOAD_U32(device + 0x780 + i * 4);
-    consts[i] = bits;
-  }
-  AluInputs in;
-  in.alu_consts = consts.data();
-  in.alu_const_dwords = uint32_t(consts.size());
-
-  const uint32_t want = REXCVAR_GET(hle_shader_verts);
-  const uint32_t n = dc.vertex_count < want ? dc.vertex_count : want;
-
-  // The control's transform: the viewport inverse, which is what this draw is
-  // actually rendered with today and what scored 0% under Stage 3's threshold.
-  // Built once per draw; a draw with no viewport yet gets no control rather
-  // than an identity standing in for one.
-  float ctl[16];
-  const bool have_ctl = BuildViewportMvp(device, base, ctl);
-  if (!have_ctl) ++g_aluNoViewportDraws;
-  float ctl_lo[2] = {1e30f, 1e30f}, ctl_hi[2] = {-1e30f, -1e30f};
-  uint32_t ctl_scored = 0;
-
-  uint8_t vtx[kMaxStreams][256];
-  std::vector<std::array<float, 4>> values(attrs.size());
-  for (uint32_t v = 0; v < n; ++v) {
-    // The stream index this built vertex came from. dc.vertices packs the
-    // referenced range starting at first_vertex, so using v alone would run the
-    // shader on one vertex and the control on a different one, and the two
-    // histograms would not be comparable — which is the whole point of having
-    // a control.
-    const uint64_t src = uint64_t(dc.first_vertex) + v;
-
-    // One decoded vertex per stream this shader actually reads, fetched once
-    // and shared by every attribute that comes from it.
-    bool have[kMaxStreams] = {};
-    bool ranged = true;
-    for (size_t a = 0; a < attrs.size() && ranged; ++a) {
-      const uint32_t si = astream[a];
-      if (have[si]) continue;
-      const HleStream& sa = streams[si];
-      const uint64_t byte_off = src * sa.stride + sa.offset_bytes;
-      if (byte_off + sa.stride > sa.size_bytes ||
-          sa.stride > sizeof(vtx[0])) {
-        ranged = false;
-        break;
-      }
-      // Copied in guest byte order. The swap is applied per attribute below,
-      // where the format — and so the correct swap width — is known.
-      std::memcpy(vtx[si], sa.host + byte_off, sa.stride);
-      have[si] = true;
-    }
-    if (!ranged) break;
-
-    for (size_t a = 0; a < attrs.size(); ++a) {
-      float o[4] = {0, 0, 0, 1};
-      ReadVertexAttribute(vtx[astream[a]], streams[astream[a]].stride, attrs[a],
-                          streams[astream[a]].endian, o);
-      values[a] = {o[0], o[1], o[2], o[3]};
-    }
-
-    const AluResult r = ExecuteVertexShader(code.data() + off,
-                                            uint32_t(code.size() - off), attrs,
-                                            values, in);
-    ++g_aluRuns;
-    ++g_aluStatus[int(r.status)];
-    if (r.blocking_opcode) ++g_aluBlocking[r.blocking_opcode];
-    g_aluConstReads += r.const_reads;
-    g_aluConstZero += r.const_zero_reads;
-
-    const float* p = r.position;
-    const bool finite = std::isfinite(p[0]) && std::isfinite(p[1]) &&
-                        std::isfinite(p[2]) && std::isfinite(p[3]);
-    // The same guard the transform probe needed: an export of (0,0,0,w=0) sits
-    // inside any volume and means nothing.
-    ++ss.execs;
-    // The shader's own position input, before the shader touches it. attrs[0]
-    // is the attribute at offset 0, which every world shader here declares as
-    // its position.
-    if (!attrs.empty()) {
-      ++ss.in_seen;
-      for (uint32_t c = 0; c < 4; ++c) {
-        const float f = values[0][c];
-        if (f < ss.in_lo[c]) ss.in_lo[c] = f;
-        if (f > ss.in_hi[c]) ss.in_hi[c] = f;
-      }
-    }
-    if (p[0] == 0.0f && p[1] == 0.0f && p[2] == 0.0f) {
-      ++g_aluDegenerate;
-      ++ss.degenerate;
-    } else {
-      // Kept exactly as Stage C measured it — full volume, z included — so the
-      // 35% stays reproducible beside the histogram rather than being quietly
-      // redefined into a different number with the same name.
-      if (finite && p[3] > 0.0f && p[0] >= -p[3] && p[0] <= p[3] &&
-          p[1] >= -p[3] && p[1] <= p[3] && p[2] >= 0.0f && p[2] <= p[3]) {
-        ++g_aluInClip;
-        ++ss.in_clip;
-      }
-      ++g_clipExec[ClassifyClip(p)];
-      ++ss.clip[ClassifyClip(p)];
-    }
-
-    // Stage F. Scored on every execution including the degenerate ones —
-    // ClassifyExportSpace takes those out itself, and it has to, because the
-    // origin is inside both regions.
-    {
-      float dv[6];
-      if (ReadDeviceViewport(device, base, dv)) {
-        const float xs = dv[2] * 0.5f;
-        const float xo = dv[0] + xs;
-        const float ys = -dv[3] * 0.5f;
-        const float yo = dv[1] + dv[3] * 0.5f;
-        const ExportSpace sp =
-            ClassifyExportSpace(p[0], p[1], p[3], xs, xo, ys, yo);
-        ++g_spaceCount[uint32_t(sp)];
-        ++ss.space[uint32_t(sp)];
-        ss.vp_extent = (uint64_t(uint32_t(dv[2])) << 32) | uint32_t(dv[3]);
-
-        // The same buckets after the viewport inverse. Done on the divided
-        // position and rewrapped with w=1, so the bucket function sees exactly
-        // what the renderer would put on screen.
-        if (p[3] != 0.0f && std::isfinite(p[3])) {
-          const float dx = p[0] / p[3], dy = p[1] / p[3];
-          const float q[4] = {(dx - xo) / xs, (dy - yo) / ys, 0.0f, 1.0f};
-          ++g_clipExecVp[ClassifyClip(q)];
-          ++g_vpApplied;
-        }
-      }
-    }
-
-    // Stage I: this shader's first execution, in full — the raw bytes in, the
-    // decoded attributes, and the position out. Recorded for every shader
-    // because which one is worst is not known until the report, by which time
-    // the vertex is gone. This is the seed for verifying a draw by hand against
-    // the disassembly, and it costs one string per distinct shader.
-    if (ss.first_exec.empty() && g_shaderScore.size() <= 64) {
-      char buf[256];
-      std::snprintf(buf, sizeof(buf),
-                    "shader 0x%08X, %u attrs, vertex %llu of draw:\n",
-                    handle, uint32_t(attrs.size()),
-                    (unsigned long long)src);
-      ss.first_exec = buf;
-      for (size_t a = 0; a < attrs.size(); ++a) {
-        const HleStream& sa = streams[astream[a]];
-        std::snprintf(buf, sizeof(buf),
-                      "  attr%-2zu r%-2u%s stream %u  fetch %u  fmt 0x%02X  "
-                      "off %u  stride %u  ->  %g %g %g %g\n  raw",
-                      a, attrs[a].dest_reg,
-                      attrs[a].feeds_position ? " (position)" : "          ",
-                      astream[a], attrs[a].fetch_slot, attrs[a].format,
-                      attrs[a].offset_bytes, attrs[a].stride_bytes,
-                      values[a][0], values[a][1], values[a][2], values[a][3]);
-        ss.first_exec += buf;
-        // The bytes the value was read from, byte-swapped exactly as the fetch
-        // saw them, so the decode can be checked by hand and not just believed.
-        const uint32_t o = attrs[a].offset_bytes;
-        for (uint32_t k = 0; k < 16 && o + k < sa.stride; ++k) {
-          std::snprintf(buf, sizeof(buf), " %02X", vtx[astream[a]][o + k]);
-          ss.first_exec += buf;
-        }
-        ss.first_exec += "\n";
-      }
-      std::snprintf(buf, sizeof(buf), "  position = %g %g %g w=%g\n", p[0],
-                    p[1], p[2], p[3]);
-      ss.first_exec += buf;
-    }
-
-    // The first few exports in full. A bucket count cannot show that every
-    // position reads (640, 0, 1, 1) — which is how the ring's space was
-    // identified in the first place.
-    {
-      static uint32_t s_dumped = 0;
-      if (s_dumped < 8) {
-        ++s_dumped;
-        auto& f = DeclFile();
-        f << "HLE EXPORT " << s_dumped << ": pos = " << p[0] << " " << p[1]
-          << " " << p[2] << " w=" << p[3];
-        float dv[6];
-        if (ReadDeviceViewport(device, base, dv))
-          f << "   device viewport " << dv[0] << "," << dv[1] << " " << dv[2]
-            << "x" << dv[3];
-        const auto& sv = DeviceState().viewport;
-        if (sv.seen)
-          f << "   arg shadow " << sv.width << "x" << sv.height;
-        f << "\n";
-        f.flush();
-      }
-    }
-
-    // The control, on the same vertex: the host position BuildHleDraw decoded
-    // for it, through the viewport inverse.
-    if (have_ctl &&
-        (size_t(v) + 1) * kHostVertexStride <= dc.vertices.size()) {
-      const float* hp =
-          reinterpret_cast<const float*>(dc.vertices.data() +
-                                         size_t(v) * kHostVertexStride);
-      if (hp[0] == 0.0f && hp[1] == 0.0f && hp[2] == 0.0f) {
-        ++g_ctlDegenerate;
-      } else {
-        float o[4];
-        for (uint32_t r4 = 0; r4 < 4; ++r4) {
-          o[r4] = ctl[r4 * 4 + 0] * hp[0] + ctl[r4 * 4 + 1] * hp[1] +
-                  ctl[r4 * 4 + 2] * hp[2] + ctl[r4 * 4 + 3];
-        }
-        ++g_ctlVerts;
-        ++g_clipCtl[ClassifyClip(o)];
-        if (o[3] != 0.0f) {
-          const float nx = o[0] / o[3], ny = o[1] / o[3];
-          if (nx < ctl_lo[0]) ctl_lo[0] = nx;
-          if (nx > ctl_hi[0]) ctl_hi[0] = nx;
-          if (ny < ctl_lo[1]) ctl_lo[1] = ny;
-          if (ny > ctl_hi[1]) ctl_hi[1] = ny;
-          ++ctl_scored;
-        }
-      }
-    }
-  }
-
-  // Did the control collapse this draw's distinct vertices onto one point? A
-  // transform that does lands every vertex in one bucket and reads as a strong
-  // signal while meaning nothing — the failure the Stage 3 probe hit and had to
-  // guard against (kSpreadEpsilon, d3d9_draw.cpp). Counted, not discarded: how
-  // often the reference degenerates is itself part of how much it is worth.
-  if (ctl_scored > 1 && (ctl_hi[0] - ctl_lo[0]) < kCtlSpreadEpsilon &&
-      (ctl_hi[1] - ctl_lo[1]) < kCtlSpreadEpsilon) {
-    ++g_ctlCollapsedDraws;
-  }
-}
-
-// Stage D — the cost, stated against a frame rather than as a bare total.
-// Reported even when nothing ran, because "the interpreter was off and the
-// frame took N ms" is the baseline every other row is compared to.
-//
-// **Windowed, not cumulative.** A first run reported the run-wide mean and it
-// climbed monotonically — 219 ms/frame at frame 146, 808 ms at frame 186 —
-// because this title genuinely degrades as it runs. A run-wide mean therefore
-// measures mostly how long the run had been going, and comparing two configs on
-// it compares their durations. The delta since the previous report is the
-// number that can be compared; the cumulative figures stay beside it so the
-// drift remains visible rather than hidden by the fix.
-void ReportShaderExecutionCost() {
-  static uint64_t s_frames = 0, s_frameNs = 0, s_aluNs = 0, s_draws = 0,
-                  s_runs = 0;
-  const uint64_t frames = mx::hle::D3D9FrameCount();
-  const uint64_t frame_ns = mx::hle::D3D9FrameNanos();
-
-  const uint64_t d_frames = frames - s_frames;
-  const uint64_t d_frame_ns = frame_ns - s_frameNs;
-  const uint64_t d_alu_ns = g_aluNanos - s_aluNs;
-  const uint64_t d_draws = g_aluDrawsEntered - s_draws;
-  const uint64_t d_runs = g_aluRuns - s_runs;
-  s_frames = frames; s_frameNs = frame_ns; s_aluNs = g_aluNanos;
-  s_draws = g_aluDrawsEntered; s_runs = g_aluRuns;
-
-  const double win_frame_ms =
-      d_frames ? double(d_frame_ns) / double(d_frames) / 1e6 : 0.0;
-  const double win_alu_ms =
-      d_frames ? double(d_alu_ns) / double(d_frames) / 1e6 : 0.0;
-  REXLOG_INFO(
-      "d3d9: stageD  cost — exec={} verts={} | window: {} frames, {:.1f} "
-      "ms/frame, interpreter {:.3f} ms/frame ({:.2f}% of a frame), {} draws "
-      "entered, {} vertices | run total: {} frames, {:.1f}s, interpreter "
-      "{:.1f} ms, {} vertices",
-      REXCVAR_GET(hle_shader_exec), REXCVAR_GET(hle_shader_verts), d_frames,
-      win_frame_ms, win_alu_ms,
-      win_frame_ms > 0.0 ? (win_alu_ms / win_frame_ms) * 100.0 : 0.0, d_draws,
-      d_runs, frames, double(frame_ns) / 1e9, double(g_aluNanos) / 1e6,
-      g_aluRuns);
-}
-
-// Stage D2 — the two distributions, side by side, as counts.
-void ReportClipHistogram() {
-  if (!g_aluRuns) return;
-  for (uint32_t b = 0; b < kClipBucketCount; ++b) {
-    REXLOG_INFO("d3d9: stageD2 clip {:>9} : executed {:>7}   viewport-inverse {:>7}",
-                kClipBucketName[b], g_clipExec[b], g_clipCtl[b]);
-  }
-  REXLOG_INFO(
-      "d3d9: stageD2 control — {} vertices transformed, {} skipped as "
-      "degenerate input, {} draws had no viewport yet, {} draws collapsed to a "
-      "point (a collapsed control is not a reference)",
-      g_ctlVerts, g_ctlDegenerate, g_aluNoViewportDraws, g_ctlCollapsedDraws);
-  REXLOG_INFO(
-      "d3d9: stageD2 buckets are max(|x/w|,|y/w|); the '<=1' row is NOT the "
-      "same test as stageC's in-clip count, which also bounds z");
-
-  // Stage F. The question every number above assumed an answer to.
-  const uint64_t sp_total = g_spaceCount[0] + g_spaceCount[1] + g_spaceCount[2] +
-                            g_spaceCount[3];
-  if (sp_total) {
-    REXLOG_INFO(
-        "d3d9: stageF  export space — clip-like {} ({}%), window-like {} ({}%), "
-        "neither {}, degenerate {} — of {} scored (clip wins ties, degenerate "
-        "removed first)",
-        g_spaceCount[uint32_t(mx::hle::ExportSpace::kClipLike)],
-        (g_spaceCount[uint32_t(mx::hle::ExportSpace::kClipLike)] * 100) /
-            sp_total,
-        g_spaceCount[uint32_t(mx::hle::ExportSpace::kWindowLike)],
-        (g_spaceCount[uint32_t(mx::hle::ExportSpace::kWindowLike)] * 100) /
-            sp_total,
-        g_spaceCount[uint32_t(mx::hle::ExportSpace::kNeither)],
-        g_spaceCount[uint32_t(mx::hle::ExportSpace::kDegenerate)], sp_total);
-    for (uint32_t b = 0; b < kClipBucketCount; ++b) {
-      REXLOG_INFO(
-          "d3d9: stageF  clip {:>9} : raw {:>7}   after viewport inverse {:>7}",
-          kClipBucketName[b], g_clipExec[b], g_clipExecVp[b]);
-    }
-    REXLOG_INFO(
-        "d3d9: stageF  viewport inverse applied to {} of {} executions; if "
-        "these positions are window coordinates this is where they collapse "
-        "into <=1",
-        g_vpApplied, sp_total);
-  }
-  if (!g_viewportExtents.empty()) {
-    std::string ve;
-    for (const auto& [k, n] : g_viewportExtents) {
-      char buf[48];
-      std::snprintf(buf, sizeof(buf), "%ux%u:%llu ", uint32_t(k >> 32),
-                    uint32_t(k), (unsigned long long)n);
-      ve += buf;
-    }
-    REXLOG_INFO(
-        "d3d9: stageF  SetViewport *argument* extents seen — {}(the argument "
-        "shadow keeps only the last; the transform now reads the device's "
-        "clamped copy at +0x3218 instead)",
-        ve);
-  }
-  if (g_vpFromDevice || g_vpFromShadow) {
-    REXLOG_INFO(
-        "d3d9: stageF  viewport source — device +0x3218 {}, argument shadow "
-        "fallback {}; device disagreed with the shadow's extent on {} of them "
-        "(that difference is the clamp, and the bug)",
-        g_vpFromDevice, g_vpFromShadow, g_vpDisagreed);
-  }
-}
-
-// Stage I — the same population, broken down by the shader that produced it.
-void ReportPerShader() {
-  if (g_shaderScore.empty()) return;
-
-  // The per-shader counts must sum to the globals they were taken beside. If
-  // they do not, the attribution is wrong and every row below is a plausible
-  // table describing nothing — so this is reported, not assumed.
-  uint64_t sum_execs = 0, sum_inclip = 0, sum_space = 0;
-  for (const auto& [h, s] : g_shaderScore) {
-    (void)h;
-    sum_execs += s.execs;
-    sum_inclip += s.in_clip;
-    for (uint32_t i = 0; i < 4; ++i) sum_space += s.space[i];
-  }
-  const uint64_t g_space_total = g_spaceCount[0] + g_spaceCount[1] +
-                                 g_spaceCount[2] + g_spaceCount[3];
-  REXLOG_INFO(
-      "d3d9: stageI  attribution check — per-shader sums vs globals: execs "
-      "{}/{} {}, in-clip {}/{} {}, space-scored {}/{} {}",
-      sum_execs, g_aluRuns, sum_execs == g_aluRuns ? "ok" : "MISMATCH",
-      sum_inclip, g_aluInClip, sum_inclip == g_aluInClip ? "ok" : "MISMATCH",
-      sum_space, g_space_total,
-      sum_space == g_space_total ? "ok" : "MISMATCH");
-  REXLOG_INFO(
-      "d3d9: stageI  handle identity — {} shaders scored, {} times a handle's "
-      "fetch count or first dword changed under it ({})",
-      g_shaderScore.size(), g_shaderIdentityChanged,
-      g_shaderIdentityChanged
-          ? "NONZERO: handles are reused, the rows below merge populations"
-          : "handles are stable, the rows below are one shader each");
-
-  // Most-executed first: a shader that is 100% broken over six executions is
-  // not a finding, and the row has to make that visible.
-  std::vector<const std::pair<const uint32_t, ShaderScore>*> rows;
-  for (const auto& e : g_shaderScore) rows.push_back(&e);
-  std::sort(rows.begin(), rows.end(), [](auto* a, auto* b) {
-    return a->second.execs > b->second.execs;
-  });
-
-  auto pct = [](uint64_t n, uint64_t d) { return d ? (n * 100) / d : 0; };
-  uint32_t clean = 0, broken = 0;
-  uint64_t clean_execs = 0, broken_execs = 0;
-  const ShaderScore* worst = nullptr;
-  uint32_t worst_handle = 0;
-  for (const auto* r : rows) {
-    const ShaderScore& s = r->second;
-    const uint64_t sp = s.space[0] + s.space[1] + s.space[2] + s.space[3];
-    if (!sp) continue;
-    const uint64_t cl = s.space[uint32_t(mx::hle::ExportSpace::kClipLike)];
-    const uint64_t ne = s.space[uint32_t(mx::hle::ExportSpace::kNeither)];
-    if (pct(cl, sp) >= 90) { ++clean; clean_execs += s.execs; }
-    if (pct(ne, sp) >= 90) { ++broken; broken_execs += s.execs; }
-    // Worst = most executions landing in no modelled space. Weighted by count
-    // so the seed for hand-verification is a shader that actually matters.
-    if (!worst || ne > worst->space[uint32_t(mx::hle::ExportSpace::kNeither)]) {
-      worst = &s;
-      worst_handle = r->first;
-    }
-  }
-
-  uint32_t shown = 0;
-  for (const auto* r : rows) {
-    if (shown++ >= 12) break;
-    const ShaderScore& s = r->second;
-    const uint64_t sp = s.space[0] + s.space[1] + s.space[2] + s.space[3];
-    const uint64_t scored = s.execs - s.degenerate;
-    REXLOG_INFO(
-        "d3d9: stageI  shader 0x{:08X}: {:>6} execs over {:>5} draws, {} "
-        "attrs, rt {}x{} — clip-like {}%  window-like {}%  neither {}%  "
-        "degenerate {}%   in-clip {}%",
-        r->first, s.execs, s.draws, s.attrs, uint32_t(s.vp_extent >> 32),
-        uint32_t(s.vp_extent),
-        pct(s.space[uint32_t(mx::hle::ExportSpace::kClipLike)], sp),
-        pct(s.space[uint32_t(mx::hle::ExportSpace::kWindowLike)], sp),
-        pct(s.space[uint32_t(mx::hle::ExportSpace::kNeither)], sp),
-        pct(s.space[uint32_t(mx::hle::ExportSpace::kDegenerate)], sp),
-        pct(s.in_clip, scored));
-  }
-  if (rows.size() > shown) {
-    REXLOG_INFO("d3d9: stageI  ... and {} more shaders not shown",
-                rows.size() - shown);
-  }
-
-  REXLOG_INFO(
-      "d3d9: stageI  {} shaders: {} are >=90% clip-like ({} execs, {}% of "
-      "all), {} are >=90% neither ({} execs, {}% of all) — a failure held by a "
-      "few shaders is a bug with an address; one spread evenly is a wrong "
-      "model",
-      g_shaderScore.size(), clean, clean_execs, pct(clean_execs, g_aluRuns),
-      broken, broken_execs, pct(broken_execs, g_aluRuns));
-
-  // The seeds for verifying draws by hand, written where the declarations
-  // already go.
-  //
-  // Ranking by raw `neither` count picked the 129x129 shadow pass, which is the
-  // least diagnostic shader in the table: a cascade covers a slice of the world
-  // and the whole scene is drawn against it, so geometry outside its frustum is
-  // what that pass is *supposed* to produce. The shaders worth reading by hand
-  // are the ones drawing world geometry at the back-buffer's own extent and
-  // exporting nothing inside the volume. So dump the busiest few outright, and
-  // let whoever reads them pick.
-  (void)worst;
-  (void)worst_handle;
-  auto& f = DeclFile();
-  uint32_t dumped = 0;
-  for (const auto* r : rows) {
-    const ShaderScore& s = r->second;
-    if (s.first_exec.empty()) continue;
-    if (dumped++ >= 6) break;
-    const uint64_t sp = s.space[0] + s.space[1] + s.space[2] + s.space[3];
-    const uint64_t scored = s.execs - s.degenerate;
-    f << "\nSTAGE I shader 0x" << std::hex << r->first << std::dec << " — "
-      << s.execs << " execs, rt " << uint32_t(s.vp_extent >> 32) << "x"
-      << uint32_t(s.vp_extent) << ", clip-like "
-      << pct(s.space[uint32_t(mx::hle::ExportSpace::kClipLike)], sp)
-      << "%, window-like "
-      << pct(s.space[uint32_t(mx::hle::ExportSpace::kWindowLike)], sp)
-      << "%, neither "
-      << pct(s.space[uint32_t(mx::hle::ExportSpace::kNeither)], sp)
-      << "%, in-clip " << pct(s.in_clip, scored) << "%\n"
-      << s.first_exec;
-    if (s.in_seen) {
-      f << "  position input range over " << s.in_seen << " executions:\n";
-      for (uint32_t c = 0; c < 4; ++c) {
-        f << "    ." << "xyzw"[c] << "  [" << s.in_lo[c] << " .. "
-          << s.in_hi[c] << "]"
-          << (s.in_lo[c] == s.in_hi[c] ? "   CONSTANT" : "") << "\n";
-      }
-    }
-  }
-  f.flush();
-}
-
-void ReportShaderExecution() {
-  ReportShaderExecutionCost();
-  if (!g_aluRuns) {
-    REXLOG_INFO(
-        "d3d9: stageC  shader execution — nothing ran (no located shader {}, "
-        "no attrs {}, stride mismatch {})",
-        g_aluNoShader, g_aluNoAttrs, g_aluStrideMismatch);
-    return;
-  }
-  const uint64_t scored = g_aluRuns - g_aluDegenerate;
-  std::string st;
-  for (const auto& [k, n] : g_aluStatus) {
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "%d:%llu ", k, (unsigned long long)n);
-    st += buf;
-  }
-  std::string bl;
-  for (const auto& [k, n] : g_aluBlocking) {
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "0x%X:%llu ", k, (unsigned long long)n);
-    bl += buf;
-  }
-  REXLOG_INFO(
-      "d3d9: stageC  shader execution — {} vertices run, {} exported a "
-      "degenerate position, {} of the remaining {} landed in the clip volume "
-      "({}%); status {}; blocking opcodes {}",
-      g_aluRuns, g_aluDegenerate, g_aluInClip, scored,
-      scored ? (g_aluInClip * 100) / scored : 0, st, bl.empty() ? "none" : bl);
-  REXLOG_INFO(
-      "d3d9: stageC  constant reads {} of which {} read zero — a shader "
-      "computing from an empty file is the failure that still looks like "
-      "success",
-      g_aluConstReads, g_aluConstZero);
-  REXLOG_INFO(
-      "d3d9: stageC  skipped: no located shader {}, no attrs {}, bound stride "
-      "disagrees with the shader's {}, fetch_slot did not invert to a stream "
-      "{} — of {} draws entered",
-      g_aluNoShader, g_aluNoAttrs, g_aluStrideMismatch, g_aluBadStream,
-      g_aluDrawsEntered);
-  ReportClipHistogram();
-
-  // Stage G — where the executed code came from. Now a two-way split: the
-  // patch hook, or nothing. The PM4 content-match column is gone with its
-  // source, having reported 0 (0%) against the patch hook's 100% over 32212
-  // draws before it was removed.
-  const uint64_t src_total = g_srcPatchHook + g_srcNone;
-  if (src_total) {
-    REXLOG_INFO(
-        "d3d9: stageG  shader source — patch hook (exact) {} ({}%), none {} "
-        "({}%) of {} draws",
-        g_srcPatchHook, (g_srcPatchHook * 100) / src_total, g_srcNone,
-        (g_srcNone * 100) / src_total, src_total);
-    std::string why;
-    for (const auto& [w, n] : g_patchDecodeFailWhy) {
-      char buf[96];
-      std::snprintf(buf, sizeof(buf), "%s:%llu ", w.c_str(),
-                    (unsigned long long)n);
-      why += buf;
-    }
-    REXLOG_INFO(
-        "d3d9: stageG  patched decode — {} matched the binding table's fetch "
-        "count, {} decoded a different count (wrong window start), {} refused "
-        "[{}]",
-        g_patchDecodeOk, g_patchDecodeCount, g_patchDecodeFail,
-        why.empty() ? "none" : why);
-    std::string offs;
-    for (const auto& [o, n] : g_patchCodeOffsets) {
-      char buf[48];
-      std::snprintf(buf, sizeof(buf), "%+d:%llu ", o, (unsigned long long)n);
-      offs += buf;
-    }
-    REXLOG_INFO(
-        "d3d9: stageG  CF section found at dword offsets from dest — {}(one "
-        "value across every shader means a fixed layout; assuming -16 was "
-        "wrong and the decode said so)",
-        offs.empty() ? "none resolved " : offs);
-  }
-  ReportPerShader();
-}
-
 
 //---------------------------------------------------------------------------
 // The declaration-to-vfetch pairing rule, read out of
@@ -7288,7 +6565,6 @@ void ReportCoverage(uint8_t* base) {
     mx::hle::ReportHleTransform();
   }
 
-  ReportShaderExecution();
   ReportPatchRule();
 
   //-------------------------------------------------------------------------

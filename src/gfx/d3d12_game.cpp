@@ -481,11 +481,19 @@ bool D3D12Renderer::CreateTranslatedRootSignature() {
   samplerRange.BaseShaderRegister = 0;
   samplerRange.OffsetInDescriptorsFromTableStart = 0;
 
-  // The VERTEX stage's own ranges, at t17+/s16+. Separate tables rather than
-  // making the pixel ones ALL-visible: the two stages are translated and cached
-  // independently, so their compact slot 0 is a different guest sampler, and
-  // one shared table would hand the vertex stage the pixel stage's textures.
-  // t16 is skipped -- it is the raw vertex buffer's root SRV below.
+  // The VERTEX stage's own ranges, at the SAME t0/s0 as the pixel stage.
+  //
+  // Not a collision: ShaderVisibility scopes a register to a stage, so a
+  // VERTEX-visible table at s0 and a PIXEL-visible one at s0 are different bind
+  // points and each stage reads its own descriptors. Separate root parameters
+  // rather than making the pixel tables ALL-visible, because the two shaders
+  // are cached independently and their compact slot 0 IS a different guest
+  // sampler -- one shared table would hand the vertex stage the pixel stage's
+  // textures.
+  //
+  // These cannot be moved to higher registers to "keep them apart": vs_5_0 has
+  // exactly 16 sampler slots, so anything at s16+ is not a register and FXC
+  // rejects the shader with X4509.
   D3D12_DESCRIPTOR_RANGE vsSrvRange = srvRange;
   vsSrvRange.BaseShaderRegister = mx::hle::HlslShader::kVertexTextureBaseRegister;
   D3D12_DESCRIPTOR_RANGE vsSamplerRange = samplerRange;
@@ -535,7 +543,7 @@ bool D3D12Renderer::CreateTranslatedRootSignature() {
   params[4].Descriptor.RegisterSpace = 0;
   params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 
-  // t17.., s16..: the vertex stage's textures. Always present in the signature
+  // t0.., s0.., VERTEX-visible: the vertex stage's own textures. Always present
   // even though most draws have no sampling vertex shader — a root signature is
   // per-pipeline and these cost two unused root parameters on the draws that do
   // not use them, against recompiling a second signature for the ones that do.

@@ -65,30 +65,6 @@ REXCVAR_DEFINE_BOOL(hle_capture, false, "Debug",
                     "resolved draws to d3d9_dump_decls.txt. Capture only — it "
                     "submits nothing and renders nothing");
 
-// Samples the guest's own vertex shader microcode, from the D3D9 side, on the
-// vertices of the draws hle_capture describes. hle_render independently runs
-// every referenced vertex and renders it. hle_shader_exec only controls the
-// sampled measurement against the clip volume and its report.
-//
-// A divisor rather than a bool because the interpreter's cost is the open
-// question and a fixed sampling rate cannot answer it: at 64 the measurement is
-// a sliver of one draw, at 1 it is what using the thing actually costs. 0 is
-// off, and off is the default — this changes nothing that is submitted.
-REXCVAR_DEFINE_UINT32(hle_shader_exec, 0, "Debug",
-                      "Execute the bound guest vertex shader for one D3D9 draw "
-                      "in N (0 = off, 1 = every draw) and report where the "
-                      "exported positions land. Requires hle_capture. Capture "
-                      "only — it renders nothing");
-
-// A cvar rather than the constant it replaces for the same reason as the one
-// above: the cost scales with it, so the run matrix has to vary it without a
-// rebuild, or the four configurations are four different binaries and the
-// timings are not comparable.
-REXCVAR_DEFINE_UINT32(hle_shader_verts, 8, "Debug",
-                      "How many vertices of each executed draw to run the "
-                      "guest vertex shader on. Only has effect when "
-                      "hle_shader_exec is non-zero");
-
 // The per-draw and per-vertex diagnostics this investigation accumulated.
 //
 // Default OFF. They are not free — the Stage-3 transform probe alone reads 256
