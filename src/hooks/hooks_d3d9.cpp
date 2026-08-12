@@ -3752,17 +3752,41 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
     //
     // Compiled at OPTIMIZATION_LEVEL0 above, so the DXBC follows the emitted
     // source closely and the mapping stays readable.
-    if (compiled) {
+    // Read BEFORE the dump below, which prints it. It used to be extracted
+    // after, which was harmless only because the dump could not see a failure.
+    if (!compiled && errors) {
+      compile_error.assign(
+          static_cast<const char*>(errors->GetBufferPointer()),
+          errors->GetBufferSize());
+      if (compile_error.size() > 400) compile_error.resize(400);
+    }
+    // Dumped whether or not FXC accepted it. This was `if (compiled)`, which
+    // made the ONE shader worth reading the one shader never written out: X4532
+    // on VS 0x26EFD9A0 (mx_1030) had to be diagnosed from the emitter's source
+    // instead of from the source the emitter produced.
+    //
+    // Failures carry their own budget rather than sharing s_dumped. They are
+    // rare and they are the point; letting 160 successes arrive first would
+    // starve exactly the file anyone came looking for.
+    {
       static uint32_t s_dumped = 0;
-      if (s_dumped < 160) {
-        ++s_dumped;
+      static uint32_t s_dumpedFailed = 0;
+      uint32_t& budget = compiled ? s_dumped : s_dumpedFailed;
+      const uint32_t cap = compiled ? 160u : 32u;
+      if (budget < cap) {
+        ++budget;
         std::error_code ec;
         std::filesystem::create_directories("logs/hlsldump", ec);
         char path[128];
         // Vertex shaders included: a light-prepass draw was found exporting a
         // correct SV_Position and then ZERO for every interpolator, which is a
         // defect on the VERTEX side, and the pixel-only dump could not show it.
-        std::snprintf(path, sizeof(path), "logs/hlsldump/%s_%08X.txt",
+        //
+        // A rejection gets its own prefix so it sorts apart from the ~4900
+        // files that compiled, and so `ls FAILED_*` names a run's failures
+        // without grepping every file in the directory.
+        std::snprintf(path, sizeof(path), "logs/hlsldump/%s%s_%08X.txt",
+                      compiled ? "" : "FAILED_",
                       stage == mx::hle::HlslStage::kPixel ? "ps" : "vs",
                       handle);
         std::ofstream f(path, std::ios::trunc | std::ios::binary);
@@ -3774,27 +3798,27 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
             << out.max_const_index << " input_mask 0x" << std::hex
             << out.input_mask << " export_mask 0x" << out.export_mask
             << " dropped_export_mask 0x" << out.dropped_export_mask << std::dec
-            << " writes_position " << (out.writes_position ? 1 : 0)
-            << "\n\n=== EMITTED HLSL ===\n"
-            << out.source << "\n=== DXBC DISASSEMBLY ===\n";
-          Microsoft::WRL::ComPtr<ID3DBlob> disasm;
-          if (SUCCEEDED(D3DDisassemble(blob->GetBufferPointer(),
-                                       blob->GetBufferSize(), 0, nullptr,
-                                       &disasm)) &&
-              disasm) {
-            f.write(static_cast<const char*>(disasm->GetBufferPointer()),
-                    std::streamsize(disasm->GetBufferSize()));
-          } else {
-            f << "; D3DDisassemble failed\n";
+            << " writes_position " << (out.writes_position ? 1 : 0);
+          if (!compiled) f << "\n; FXC REJECTED: " << compile_error;
+          f << "\n\n=== EMITTED HLSL ===\n" << out.source;
+          // Only a shader that compiled has DXBC to disassemble. The section
+          // header is inside the guard too, so a failure file does not end with
+          // an empty heading that reads like the disassembler broke.
+          if (compiled && blob) {
+            f << "\n=== DXBC DISASSEMBLY ===\n";
+            Microsoft::WRL::ComPtr<ID3DBlob> disasm;
+            if (SUCCEEDED(D3DDisassemble(blob->GetBufferPointer(),
+                                         blob->GetBufferSize(), 0, nullptr,
+                                         &disasm)) &&
+                disasm) {
+              f.write(static_cast<const char*>(disasm->GetBufferPointer()),
+                      std::streamsize(disasm->GetBufferSize()));
+            } else {
+              f << "; D3DDisassemble failed\n";
+            }
           }
         }
       }
-    }
-    if (!compiled && errors) {
-      compile_error.assign(
-          static_cast<const char*>(errors->GetBufferPointer()),
-          errors->GetBufferSize());
-      if (compile_error.size() > 400) compile_error.resize(400);
     }
   }
 
