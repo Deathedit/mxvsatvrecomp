@@ -1689,6 +1689,37 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     dc.render_target_object = rt.object;
     dc.render_target_surface_info = rt.surface_info;
     dc.render_target_color_info = rt.color_info;
+    // RB_COLOR_INFO carries an EXPONENT BIAS we have never read.
+    //
+    // Layout, from Xenia's registers.h (the SDK's xenos.h is out of date and is
+    // not the reference here): color_base:12, _pad:4, color_format:4 at +16,
+    // and int32_t color_exp_bias:6 at +20 -- SIGNED. We take bits [16:19] for
+    // the format and discard the bias, so a target the guest asked to be scaled
+    // by 2^bias is rendered at 2^0.
+    //
+    // Xenia applies it as a multiplier on the pixel shader's colour output
+    // (d3d12_command_processor.cc, `sc.color_exp_bias[i]`, built as
+    // 0x3F800000 + (bias << 23) -- literally 2^bias as a float).
+    //
+    // Suspected in the rider's gear rendering green: its shader reads the scene
+    // snapshot and computes rcp(luminance), which saturates and kills the red
+    // channel unless that luminance exceeds 3.42. Measured 0.296, and the scene
+    // target is guest colour format 5. A bias of +5 would multiply by exactly
+    // 32, taking 0.296 to 9.48 -- and the alpha in that texel, 0.03125, to
+    // exactly 1.0. Suggestive, not yet proven: log the field before acting.
+    {
+      const int32_t bias = int32_t(rt.color_info << 6) >> 26;  // sign-extend :6
+      static std::mutex s_biasMutex;
+      static std::set<std::pair<uint32_t, uint32_t>> s_biasSeen;
+      std::lock_guard<std::mutex> lock(s_biasMutex);
+      if (s_biasSeen.emplace(rt.object, rt.color_info).second) {
+        REXLOG_INFO(
+            "d3d9: RB_COLOR_INFO object 0x{:08X} {}x{} raw 0x{:08X} format {} "
+            "exp_bias {} (x{})",
+            rt.object, rt.width, rt.height, rt.color_info,
+            (rt.color_info >> 16) & 0xFu, bias, std::exp2(float(bias)));
+      }
+    }
     dc.render_target_width = rt.width;
     dc.render_target_height = rt.height;
     // Reuse the established PM4-facing fields so diagnostics can compare the
@@ -4000,6 +4031,137 @@ void CollectPixelShaderBlob(uint32_t handle, uint8_t* base) {
   }
 }
 
+// PROBE, not a fix: is the vertex object's SECOND blob a pixel program?
+//
+// 120,000 menu draws bind a NULL pixel shader (see the NO-PS DEVICES tally in
+// PrepareDrawTexture) and so keep the tex*col stand-in. The guest's own PM4
+// flush sub_82565928 has an explicit path for them: with no pixel object, and
+// when `vs[218] & 0x20`, it emits a second blob selected by `vs[226]` instead
+// of the usual `vs[224]`. The open question is what that blob IS.
+//
+// The packet encoding argues it is a VERTEX program, not the missing pixel one.
+// Both blobs are loaded with PM4_IM_LOAD (opcode 0x27), whose first data dword
+// carries the shader type in its low two bits -- kVertex 0, kPixel 1, per
+// Xenia's ExecutePacketType3_IM_LOAD. The real pixel path forces that bit:
+//
+//     (v22 & 0x1FFFFFFE) | 1        <- pixel object, type = kPixel
+//      v69 & 0x1FFFFFFF             <- vs[224] AND vs[226] alike, type = kVertex
+//
+// If that reading is right, these draws emit no pixel IM_LOAD at all and simply
+// inherit whichever pixel program was loaded last -- a completely different fix
+// from reading a blob, so it is worth one run to know rather than guessing.
+//
+// Decided by structure, not by inference. Both blobs are emitted as each stage
+// and the results compared: a vertex program exports position (register 62) and
+// a pixel program exports colour (0-3). vs[224] is known-vertex and is probed
+// alongside purely as a control -- if the control does not come out vertex, the
+// offsets are wrong and nothing else here should be believed.
+//
+// Layout read out of the decompile, never guessed: the blob header sits at
+// `vs + vs[table] + 872`, and within it dword 0 is the microcode offset (added
+// to `vs[8]`), dword 1 the size in BYTES, dwords 2 and 3 the SQ_PROGRAM_CNTL
+// and SQ_CONTEXT_MISC the flush later writes as a type-0 packet to 0x2180.
+// `base` is not unused: REX_LOAD_U32 and REX_RAW_ADDR expand to reference it by
+// name, exactly as in CollectPixelShaderBlob above.
+void ProbeVertexObjectSecondBlob(uint32_t device, uint8_t* base) {
+  (void)base;
+  static std::mutex s_mu;
+  static std::set<uint32_t> s_seenVs;
+  static uint64_t s_withSecond = 0, s_withoutSecond = 0;
+  if (!device || !HostPageReadable(REX_RAW_ADDR(device + 0x3248))) return;
+  const uint32_t vs = REX_LOAD_U32(device + 0x3248);
+  // Deduplicated by VERTEX OBJECT, not by call count. The first cut capped at
+  // two reports and both landed on the same object, which says nothing about
+  // whether the rest of the population looks like it -- the one question the
+  // probe exists to answer. The tally below covers every draw; the expensive
+  // decode runs only for the first few distinct objects.
+  bool decode = false;
+  {
+    std::lock_guard<std::mutex> lk(s_mu);
+    const bool fresh = s_seenVs.insert(vs).second;
+    decode = fresh && s_seenVs.size() <= 8;
+  }
+  // vs[218] is the flag word, and 872 == 218 * 4 is the same place: the blob
+  // headers are addressed from it, so one readability check covers both.
+  if (!vs || !HostPageReadable(REX_RAW_ADDR(vs + 872)) ||
+      !HostPageReadable(REX_RAW_ADDR(vs + 32)))
+    return;
+  const uint32_t flags = REX_LOAD_U32(vs + 872);
+  const uint32_t ucode_base = REX_LOAD_U32(vs + 32);
+
+  auto probe_one = [&](const char* what, uint32_t table_dword) {
+    const uint32_t table_at = vs + table_dword * 4;
+    if (!HostPageReadable(REX_RAW_ADDR(table_at))) return;
+    const uint32_t hdr = vs + REX_LOAD_U32(table_at) + 872;
+    if (!HostPageReadable(REX_RAW_ADDR(hdr)) ||
+        !HostPageReadable(REX_RAW_ADDR(hdr + 12)))
+      return;
+    const uint32_t ucode_off = REX_LOAD_U32(hdr);
+    const uint32_t size_bytes = REX_LOAD_U32(hdr + 4);
+    const uint32_t prog_cntl = REX_LOAD_U32(hdr + 8);
+    const uint32_t ctx_misc = REX_LOAD_U32(hdr + 12);
+    if (!size_bytes || (size_bytes & 3) || size_bytes > kMaxBlobDwords * 4) {
+      REXLOG_INFO("d3d9: PROBE {} vs 0x{:08X}: bad size {} -- offsets wrong?",
+                  what, vs, size_bytes);
+      return;
+    }
+    const uint32_t addr = ucode_off + ucode_base;
+    if (!addr || !HostPageReadable(REX_RAW_ADDR(addr))) return;
+    std::vector<uint32_t> code(size_bytes / 4);
+    for (uint32_t i = 0; i < code.size(); ++i) {
+      const uint32_t at = addr + i * 4;
+      if ((at & (kHostPageSize - 1)) == 0 &&
+          !HostPageReadable(REX_RAW_ADDR(at))) {
+        code.resize(i);
+        break;
+      }
+      code[i] = REX_LOAD_U32(at);
+    }
+    if (code.empty()) return;
+
+    mx::hle::HlslShader as_vs{}, as_ps{};
+    EmitShaderHlsl(code.data(), uint32_t(code.size()),
+                   mx::hle::HlslStage::kVertex,
+                   mx::hle::kHlslInterpolatorLinkage, as_vs);
+    EmitShaderHlsl(code.data(), uint32_t(code.size()),
+                   mx::hle::HlslStage::kPixel,
+                   mx::hle::kHlslInterpolatorLinkage, as_ps);
+    REXLOG_INFO(
+        "d3d9: PROBE {} vs 0x{:08X} ucode 0x{:08X} {} dwords "
+        "prog_cntl 0x{:08X} ctx_misc 0x{:08X}; head {:08X} {:08X} {:08X} "
+        "{:08X}; AS-VERTEX {} writes_position {} export 0x{:X}; AS-PIXEL {} "
+        "colour 0x{:X} writes_depth {}",
+        what, vs, addr, code.size(), prog_cntl, ctx_misc, code[0],
+        code.size() > 1 ? code[1] : 0, code.size() > 2 ? code[2] : 0,
+        code.size() > 3 ? code[3] : 0,
+        mx::hle::HlslStatusName(as_vs.status), as_vs.writes_position ? 1 : 0,
+        as_vs.export_mask, mx::hle::HlslStatusName(as_ps.status),
+        as_ps.export_mask, as_ps.writes_depth ? 1 : 0);
+  };
+
+  // The population question, over EVERY null-PS draw rather than the sampled
+  // few: if the second blob is absent throughout, the guest emits no pixel
+  // IM_LOAD for any of them and they inherit whatever was loaded last.
+  {
+    std::lock_guard<std::mutex> lk(s_mu);
+    if (flags & 0x20)
+      ++s_withSecond;
+    else
+      ++s_withoutSecond;
+    if (((s_withSecond + s_withoutSecond) % 20000) == 0) {
+      REXLOG_INFO("d3d9: PROBE population: {} draws with a second blob, {} "
+                  "without, over {} distinct vertex objects",
+                  s_withSecond, s_withoutSecond, s_seenVs.size());
+    }
+  }
+  if (!decode) return;
+
+  REXLOG_INFO("d3d9: PROBE vertex object 0x{:08X} flags 0x{:08X}, second blob {}",
+              vs, flags, (flags & 0x20) ? "PRESENT" : "ABSENT");
+  probe_one("blob[224] (control, known vertex)", 224);
+  if (flags & 0x20) probe_one("blob[226] (the question)", 226);
+}
+
 struct ResolvedPixelBinding {
   std::vector<mx::hle::PixelTextureBinding> bindings;
   const char* fail = nullptr;
@@ -5067,6 +5229,31 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   if (texture_state.object &&
       g_resolvedTextureTargets.contains(texture_state.object)) {
     if (ResolvedDestinationIsMostlyWritten(texture_state.object)) {
+      // Logged HERE as well as at the decode below, because this path RETURNS.
+      // The first cut of the SLOT MAP diagnostic sat only after this point and
+      // so reported resolved=0 on every line it printed -- blind to precisely
+      // the slots that bind a snapshot, which are the ones worth seeing. A slot
+      // simply went missing from the table instead, which reads like it was
+      // never bound. See the note at the other call for why this matters.
+      static std::mutex s_mu;
+      static std::set<uint64_t> s_seen;
+      const uint64_t key = (uint64_t(dc.pixel_shader_handle) << 8) | slot;
+      bool fresh = false;
+      {
+        std::lock_guard<std::mutex> lk(s_mu);
+        // Bounded by the dedupe -- one line per distinct (shader, slot), which
+        // is tens of shaders times a handful of slots. A tighter cap filled up
+        // on early menu shaders and cut off before the material under
+        // investigation ever bound.
+        fresh = s_seen.size() < 1024 && s_seen.insert(key).second;
+      }
+      if (fresh) {
+        REXLOG_INFO(
+            "d3d9: SLOT MAP ps 0x{:08X} slot {} (guest sampler {}): object "
+            "0x{:08X} -> SNAPSHOT of a resolve destination (no guest-memory "
+            "decode)",
+            dc.pixel_shader_handle, slot, guest_sampler, texture_state.object);
+      }
       out_objects[slot] = texture_state.object;
       return true;
     }
@@ -5121,6 +5308,59 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   }
   NoteSignedBind(source);
   NotePackedBase(source);
+  // WHICH guest surface does each sampler slot actually ask for?
+  //
+  // Traced from the rider's gear rendering green. Its material computes
+  // saturate(tex5.y + rcp(luminance(tex4))) and the saturate pins at 1, which
+  // zeroes the red channel. Red survives only if that luminance exceeds ~1.03.
+  //
+  // tex4 resolves to the pre-pass band snapshot, whose content is written by
+  // the full-screen ambient lighting draw. That pass sums six directional
+  // lights whose colours are c149/151/153/155/157/159 -- measured, sane, and
+  // identical across captures -- and their red channels total 0.619. That is a
+  // hard ceiling with every dot product at 1.0 simultaneously, which opposing
+  // directions make impossible; the measured value is 0.109.
+  //
+  // So with that surface as tex4 the red channel can NEVER survive, on any
+  // hardware, with correct constants. The arithmetic does not merely say the
+  // input is dark -- it says it is the WRONG SURFACE. The gained main-pass
+  // scene holds 32.6 at the same pixel, and feeding that in yields
+  // saturate(0.033 + 0.029) = 0.062, a red multiplier of 0.938: yellow gear.
+  //
+  // Binding is by guest OBJECT (DeviceState().texture[sampler].object looked up
+  // in g_resolvedTextureTargets), so we follow whatever the guest bound. This
+  // says what that is: the object, whether a resolve ever named it, and the
+  // fetch constant's own address and extent -- enough to tell "the guest asked
+  // for the pre-pass" from "the guest asked for the scene and we handed it the
+  // pre-pass".
+  //
+  // Deduplicated per (shader, slot) and capped: one line per distinct binding,
+  // not per draw.
+  {
+    static std::mutex s_mu;
+    static std::set<uint64_t> s_seen;
+    static uint32_t s_lines = 0;
+    const uint64_t key = (uint64_t(dc.pixel_shader_handle) << 8) | slot;
+    bool fresh = false;
+    {
+      std::lock_guard<std::mutex> lk(s_mu);
+      fresh = s_lines < 1024 && s_seen.insert(key).second;
+      if (fresh) ++s_lines;
+    }
+    if (fresh) {
+      REXLOG_INFO(
+          "d3d9: SLOT MAP ps 0x{:08X} slot {} (guest sampler {}): object "
+          "0x{:08X} resolved={} mostly_written={} | fetch addr 0x{:08X} "
+          "{}x{} fmt {} bytes {}",
+          dc.pixel_shader_handle, slot, guest_sampler, texture_state.object,
+          texture_state.object &&
+                  g_resolvedTextureTargets.contains(texture_state.object)
+              ? 1
+              : 0,
+          partial_snapshot_object ? 0 : 1, source.address, source.width,
+          source.height, source.guest_format, source.source_bytes);
+    }
+  }
   // Permuted into host component order here, at the bind, because this is
   // per-binding state: the same guest memory is sampled with different sign
   // modes by different draws. Applied by the shader after the fetch, which is
@@ -5660,6 +5900,89 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
   // read from the wrong one of the three. If the draw devices below do not
   // appear among the setter devices, that is the whole defect.
   if (!resolved) {
+    // What ARE these draws running? Self-limiting; see ProbeVertexObjectSecondBlob.
+    ProbeVertexObjectSecondBlob(device, base);
+    // Does a null-pixel-shader draw bind a COLOUR target?
+    //
+    // The probe above establishes what these draws are: one 48-dword program
+    // that writes position and exports no interpolators at all, i.e. a
+    // depth-only pass, which is why a null pixel shader is legal for them. The
+    // renderer already has a route for that, but it opens only when NO colour
+    // target is bound:
+    //
+    //     depthOnlyPass = !d.targetObject && d.depthObject && ...
+    //
+    // If these draws carry a colour target too, they miss it, and each one is
+    // given a scratch colour target plus the tex*col stand-in -- painting
+    // colour the guest never wrote, into the scene buffer the rider's material
+    // later samples for its luminance. That would make the stand-in actively
+    // harmful here rather than merely a missing feature.
+    //
+    // Split by which targets are present, and record the colour extents seen,
+    // because "binds the 1280x640 scene band" and "binds some small offscreen
+    // target" want different answers.
+    {
+      static std::mutex s_mu;
+      static uint64_t s_colour_and_depth = 0, s_depth_only = 0;
+      static uint64_t s_colour_only = 0, s_neither = 0;
+      static std::set<uint64_t> s_extents;
+      // Whether they actually PAINT is a separate question from whether they
+      // bind a target, and it is decided by the colour mask, which the renderer
+      // already honours:
+      //
+      //     colorWrite = (om_seen & 1) == 0 || (colour_mask & 0xF) != 0
+      //
+      // A depth pass that binds the colour target but masks colour off is
+      // harmless -- its PSO gets RenderTargetWriteMask 0 and the stand-in
+      // writes nothing. The damaging case is narrower: colour bound and the
+      // mask permitting writes, so the stand-in paints.
+      //
+      // Read RB_COLOR_MASK from the device HERE rather than through dc.
+      // dc.colour_mask and dc.om_seen are filled further down this same
+      // function, ~34 lines AFTER the PrepareDrawTexture call this runs
+      // inside, so consulting them reports every draw in the game as
+      // "mask never observed" -- which is exactly what the first cut did, and
+      // 41844 of 41844 was the tell. Same address and same gate as the
+      // assignment below, so the two cannot drift.
+      constexpr uint32_t kRbColorMaskAt = 0x28DC;
+      static uint64_t s_wouldPaint = 0, s_maskedOff = 0, s_maskUnreadable = 0;
+      uint32_t mask = 0;
+      bool mask_readable = false;
+      if (device && HostPageReadable(REX_RAW_ADDR(device + kRbColorMaskAt))) {
+        mask = REX_LOAD_U32(device + kRbColorMaskAt) & 0xFu;
+        mask_readable = true;
+      }
+      std::lock_guard<std::mutex> lk(s_mu);
+      const bool has_colour = dc.render_target_object != 0;
+      const bool has_depth = dc.depth_target_object != 0;
+      if (has_colour) {
+        if (!mask_readable) ++s_maskUnreadable;
+        else if (mask != 0) ++s_wouldPaint;
+        else ++s_maskedOff;
+      }
+      if (has_colour && has_depth) ++s_colour_and_depth;
+      else if (has_depth) ++s_depth_only;
+      else if (has_colour) ++s_colour_only;
+      else ++s_neither;
+      if (has_colour && s_extents.size() < 32) {
+        s_extents.insert((uint64_t(dc.render_target_width) << 32) |
+                         dc.render_target_height);
+      }
+      const uint64_t total = s_colour_and_depth + s_depth_only +
+                             s_colour_only + s_neither;
+      if ((total % 5000) == 0) {
+        std::string extents;
+        for (uint64_t e : s_extents)
+          extents += fmt::format(" {}x{}", uint32_t(e >> 32), uint32_t(e));
+        REXLOG_INFO("d3d9: NULL-PS TARGETS over {} draws: colour+depth {}, "
+                    "depth only {}, colour only {}, neither {}; of those with "
+                    "colour: WOULD PAINT {}, masked off {}, mask unreadable "
+                    "{}; colour extents:{}",
+                    total, s_colour_and_depth, s_depth_only, s_colour_only,
+                    s_neither, s_wouldPaint, s_maskedOff, s_maskUnreadable,
+                    extents.empty() ? " none" : extents);
+      }
+    }
     static std::mutex s_mu;
     static std::map<uint64_t, uint64_t> s_byDeviceThread;
     static uint64_t s_total = 0;

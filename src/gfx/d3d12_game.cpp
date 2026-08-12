@@ -27,6 +27,8 @@
 #include <cstring>
 #include <string>
 #include <algorithm>
+#include <set>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -1149,6 +1151,41 @@ DXGI_FORMAT D3D12Renderer::HostColorFormat(uint32_t guestColorFormat) {
     default:
       return DXGI_FORMAT_R8G8B8A8_UNORM;
   }
+}
+
+// The guest colour-format nibble, reported once per (object, extent, format).
+//
+// HostColorFormat is many-to-one and the collision matters: guest 5
+// (k_16_16_16_16, signed fixed point -32...32) and guest 7
+// (k_16_16_16_16_FLOAT, a genuine half float) both become
+// R16G16B16A16_FLOAT, so nothing downstream -- not the resource desc, not a
+// RenderDoc capture -- can say which one the guest asked for. That question is
+// load-bearing: if the scene target is 5, values in it carry the -32...32
+// range and a shader reading 0.296 is reading a guest 9.48.
+//
+// It came up chasing the rider's gear rendering green: its shader computes
+// rcp(luminance(scene snapshot)) and saturates, and the saturate pins at 1 --
+// killing the red channel -- unless that luminance exceeds 3.42. Measured 0.296.
+// Whether that is an 11x error or the correct value depends entirely on this
+// nibble, and there was no way to ask.
+//
+// Deduplicated because it is called per draw. The set is small: one entry per
+// distinct target, which is tens across a run, not thousands.
+void LogGuestColorFormat(uint32_t object, uint32_t width, uint32_t height,
+                         uint32_t guestColorFormat) {
+  if (!object) return;
+  static std::set<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>> s_seen;
+  if (!s_seen.emplace(object, width, height, guestColorFormat).second) return;
+  REXLOG_INFO(
+      "d3d12: target object 0x{:08X} {}x{} guest colour format {}{}", object,
+      width, height, guestColorFormat,
+      guestColorFormat == 5    ? " (k_16_16_16_16, SIGNED FIXED -32..32)"
+      : guestColorFormat == 7  ? " (k_16_16_16_16_FLOAT)"
+      : guestColorFormat == 3  ? " (k_2_10_10_10_FLOAT)"
+      : guestColorFormat == 4  ? " (k_16_16, SIGNED FIXED -32..32)"
+      : guestColorFormat == 6  ? " (k_16_16_FLOAT)"
+      : guestColorFormat == 0  ? " (k_8_8_8_8)"
+                               : "");
 }
 
 // Which topology GROUP a PSO must declare for this topology to be legal against
@@ -2437,6 +2474,9 @@ void D3D12Renderer::RenderGameFrame() {
     //
     // Draws nothing.
     if (d.surfaceBind) {
+      if (!d.surfaceBindIsDepth)
+        LogGuestColorFormat(d.targetObject, d.targetWidth, d.targetHeight,
+                            d.targetColorFormat);
       GameRenderTarget* bound =
           d.surfaceBindIsDepth
               ? EnsureGameDepthTarget(d.targetObject, d.targetWidth,
@@ -2929,6 +2969,8 @@ void D3D12Renderer::RenderGameFrame() {
       GameRenderTarget* clearTarget = nullptr;
       D3D12_CPU_DESCRIPTOR_HANDLE rtv = {};
       if (wantsOffscreen) {
+        LogGuestColorFormat(d.targetObject, d.targetWidth, d.targetHeight,
+                            d.targetColorFormat);
         clearTarget = EnsureGameRenderTarget(
             d.targetObject, d.targetWidth, d.targetHeight, d.targetBase,
             HostColorFormat(d.targetColorFormat));
@@ -3028,6 +3070,9 @@ void D3D12Renderer::RenderGameFrame() {
     if (wantsOffscreen) {
       // A depth-only pass has no colour format of its own; its scratch target
       // is never sampled, so RGBA8 is as good as anything.
+      if (!depthOnlyPass)
+        LogGuestColorFormat(targetObject, targetWidth, targetHeight,
+                            d.targetColorFormat);
       drawTarget = EnsureGameRenderTarget(
           targetObject, targetWidth, targetHeight, d.targetBase,
           depthOnlyPass ? kBackBufferFormat

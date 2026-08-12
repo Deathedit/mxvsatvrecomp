@@ -1346,13 +1346,43 @@ extern "C" REX_FUNC(sub_8255CE98) {
       uint32_t fetch0 = 0;
       if (HostPageReadable(REX_RAW_ADDR(dest_texture + 0x1C)))
         fetch0 = REX_LOAD_U32(dest_texture + 0x1C);
+      // FLAGS, in full. Xenia applies an EXPONENT BIAS on resolve --
+      // RB_COPY_DEST_INFO.copy_dest_exp_bias, a signed 6-bit field at bit +16
+      // (registers.h:878) read straight into `exp_bias` in GetResolveInfo. Our
+      // resolve is a bitwise CopyTextureRegion and `copy_dest_exp_bias` appears
+      // nowhere in this tree, so if the guest ever asks for a scale we drop it
+      // and every surface sampled from that resolve reads 2^bias too dark.
+      //
+      // That is the missing factor the rider's arithmetic demands. Its material
+      // computes saturate(tex5.y + rcp(luminance(tex4))) and the saturate pins
+      // at 1, zeroing red, unless that luminance exceeds 1.03. tex4 is the
+      // resolve of the ambient pre-pass, which measures 0.109 and cannot exceed
+      // 0.619 -- the sum of its six light colours. A bias of +4 (x16) gives
+      // 1.74 and +5 (x32) gives 3.5; either clears the bar.
+      //
+      // The bit position is READ OUT OF THE GUEST, not guessed. Resolve's body
+      // sub_8255BD48 (0x8255CE98 is a thunk to it) builds RB_COPY_DEST_INFO and
+      // stores it at device+10788:
+      //
+      //   v81 = (((((8 * ((v77 << 8) & 0x100 | (v38 >> 26))) | v79 & 7) << 6)
+      //           | v73 & 0x3F) << 7) | ((unsigned __int8)v67 >> 6);
+      //   *(_DWORD *)(a1 + 10788) = v81;
+      //
+      // with v38 the Flags argument. Unpacking: bits 7-12 destination format,
+      // 13-15 endian, and bits 16-21 = `v38 >> 26`. Xenia's registers.h puts
+      // `int32_t copy_dest_exp_bias : 6` at +16, so the field is the TOP SIX
+      // BITS OF Flags, signed. An arithmetic shift of the signed word extracts
+      // it directly.
+      const int32_t copy_dest_exp_bias = int32_t(resolve_flags) >> 26;
       REXLOG_INFO(
           "d3d9: resolve slot {} target 0x{:08X} {}x{} -> texture "
-          "0x{:08X} fetch0=0x{:08X} rect={} ({},{})..({},{}) point={} ({},{})",
+          "0x{:08X} FLAGS=0x{:08X} EXP_BIAS={} (x{}) fetch0=0x{:08X} rect={} "
+          "({},{})..({},{}) point={} ({},{})",
           source_slot, source->object, source->width, source->height,
-          dest_texture, fetch0, have_src_rect, src_rect[0], src_rect[1],
-          src_rect[2], src_rect[3], have_dest_point, dest_point[0],
-          dest_point[1]);
+          dest_texture, resolve_flags, copy_dest_exp_bias,
+          std::exp2(float(copy_dest_exp_bias)), fetch0, have_src_rect,
+          src_rect[0], src_rect[1], src_rect[2], src_rect[3], have_dest_point,
+          dest_point[0], dest_point[1]);
     }
   }
   // sub_82AFCA38 calls Resolve four times and is where the native frame time
