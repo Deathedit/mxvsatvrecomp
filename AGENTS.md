@@ -459,21 +459,40 @@ Signed-normalized `k_2_10_10_10` (used for `NORMAL` and `TANGENT`) has no DXGI
 equivalent. It passes through as `R10G10B10A2_UINT` with
 `Unpack::kSnorm2_10_10_10` so the shader finishes the conversion.
 
-### Render targets — done, and instrumented
+### Render targets — instrumented, and the cap was three short
 
 Each guest colour surface gets its own host target. The device offsets are in
 [docs/guest_binary.md](docs/guest_binary.md); `EnsureGameRenderTarget` in
 `src/gfx/d3d12_game.cpp` owns the routing, capped at `kMaxGameRenderTargets`
-(64).
+(256 since 2026-08-12; it was 64).
 
 **The failure mode is silent:** when the cap is exhausted, or an object is
 reused at a new size, `EnsureGameRenderTarget` returns nullptr and the caller
 falls back to the main target — reinstating the overpainting this exists to
 prevent. `game RT routing:` counts it, splitting draws that never wanted an
-offscreen target from those that asked and were refused. Measured healthy:
-**OVERPAINT 0, refusals 0, 22/64 live targets**, flat over a 420s run. Note the
-D3D9 hook logs ~53 distinct render-target *objects* — only 22 become routable
-targets, so that number is not the one to compare against the cap.
+offscreen target from those that asked and were refused. `m_gameRenderTargets`
+is **never evicted**, so once the cap trips it stays tripped for the rest of the
+run.
+
+**This section previously read "Measured healthy: OVERPAINT 0, refusals 0,
+22/64 live targets, flat over a 420s run." That was true and it was
+misleading** — it had only ever been measured on a menu-only run. A loaded level
+wants **67**, so the old cap of 64 was three short:
+
+| `--force_load=NAT_Farm` | cap 64 (mx_1036) | cap 256 (mx_1037) |
+|---|---|---|
+| peak live targets | 64/64, pinned | **67**/256 |
+| OVERPAINT | 2765 | **0** |
+| refused: budget | 5530 | **0** |
+| srv | 301/1024 | 299/1024 |
+
+That overpaint is what made `--force_load` useless for looking at level
+geometry: level draws were refused their own targets and painted onto the shared
+one. **Measure this subsystem with a level loaded** — the front end fits
+comfortably and will report healthy no matter how wrong the cap is.
+
+Note the D3D9 hook logs ~53 distinct render-target *objects* — only some become
+routable targets, so that number is not the one to compare against the cap.
 
 ## Guest architecture
 

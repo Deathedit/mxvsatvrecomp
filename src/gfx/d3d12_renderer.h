@@ -1029,7 +1029,25 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_gameRtvHeap;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_gameDsvHeap;
   uint32_t m_gameRtvDescriptorSize = 0;
-  static constexpr uint32_t kMaxGameRenderTargets = 64;
+  // 64 was a bring-up number sized against the front end, which uses 22. A
+  // LOADED LEVEL does not fit: measured 2026-08-12 with --force_load=NAT_Farm,
+  // this pinned at 64/64 with 5530 draws refused and OVERPAINT climbing to
+  // 2765, against the "OVERPAINT 0, refusals 0, 22/64" that a menu-only run
+  // reports and that AGENTS.md had recorded as healthy.
+  //
+  // The consequence is the reason force_load stopped being usable for looking
+  // at level geometry. A refused draw falls back to the MAIN target and paints
+  // over the scene, and m_gameRenderTargets is never evicted -- so once a level
+  // pushes past the cap it stays past it for the rest of the run, and the
+  // fallback is silent apart from that one counter.
+  //
+  // Same defect and same fix as kMaxGameSnapshots below, found the same day:
+  // a cap sized against the menu, met by scene content. RTV descriptors are
+  // non-shader-visible and cost nothing to reserve, and the real bound is the
+  // SRV budget (kMaxGameTextures), checked on the same line and sitting at
+  // 301 of 1024 in that run. Raised to 4x the point of failure rather than
+  // uncapped, so a runaway allocator is still caught.
+  static constexpr uint32_t kMaxGameRenderTargets = 256;
   // Snapshots get their OWN cap, and it is not this one. 64 bounds the RTV heap
   // (`kMaxGameRenderTargets + 1` descriptors, see the heap desc), and a snapshot
   // has no RTV -- EnsureGameSnapshot sets rtvIndex = 0 and says so. Charging
