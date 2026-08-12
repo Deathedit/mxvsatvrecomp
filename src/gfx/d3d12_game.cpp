@@ -649,7 +649,19 @@ void D3D12Renderer::FillVertexTextureSigns(const GameDraw& d, uint8_t* cb,
 }
 
 bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
-                                           D3D12_GPU_DESCRIPTOR_HANDLE& out) {
+                                           D3D12_GPU_DESCRIPTOR_HANDLE& out,
+                                           bool vertex) {
+  // Which stage's slots this call is filling. The descriptor block, the
+  // snapshot lookup and every failure counter are identical either way -- only
+  // the source arrays differ, and the root parameter the caller binds the
+  // result to.
+  const uint32_t stageSamplerCount =
+      vertex ? d.vertexSamplerCount : d.pixelSamplerCount;
+  const uint32_t stageSamplerArrayMask =
+      vertex ? d.vertexSamplerArrayMask : d.pixelSamplerArrayMask;
+  const auto& stageSampledObjects =
+      vertex ? d.vertexSampledObjects : d.pixelSampledObjects;
+  const auto& stageTextures = vertex ? d.vertexTextures : d.pixelTextures;
   // A shader that fetches NO texture is allowed through. It used to be refused
   // here and at the translated gate, purely because the count was zero -- which
   // is exactly backwards: a shader sampling nothing is the one case that needs
@@ -673,8 +685,8 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
     bool useSwizzle = false;
   };
   Slot slots[kTranslatedSamplerSlots];
-  for (uint32_t i = 0; i < d.pixelSamplerCount; ++i) {
-    if (const uint32_t object = d.pixelSampledObjects[i]) {
+  for (uint32_t i = 0; i < stageSamplerCount; ++i) {
+    if (const uint32_t object = stageSampledObjects[i]) {
       // A resolve result: sample the snapshot the guest resolved into, which is
       // the same resource the stand-in path samples for this object.
       auto it = m_gameSnapshots.find(object);
@@ -730,7 +742,7 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
               "0x{:08X} {}x{}, compact slot {} of {}, destination texture "
               "0x{:08X}, class {}",
               d.pixelShaderHandle, d.targetObject, d.targetWidth,
-              d.targetHeight, i, d.pixelSamplerCount, object, kindName);
+              d.targetHeight, i, stageSamplerCount, object, kindName);
         }
         ++m_translatedNoSnapshot;
         return false;
@@ -744,7 +756,7 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
       slots[i].format = it->second.resource->GetDesc().Format;
       continue;
     }
-    const auto& tex = d.pixelTextures[i];
+    const auto& tex = stageTextures[i];
     if (!tex) {
       ++m_translatedNoTexture;
       return false;
@@ -783,7 +795,7 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
     static std::unordered_set<uint32_t> s_censused;
     if (s_censused.size() < 64 && s_censused.insert(d.pixelShaderHandle).second) {
       std::string slotDesc;
-      for (uint32_t i = 0; i < d.pixelSamplerCount && i < kTranslatedSamplerSlots;
+      for (uint32_t i = 0; i < stageSamplerCount && i < kTranslatedSamplerSlots;
            ++i) {
         if (!slots[i].resource) {
           slotDesc += fmt::format(" [{}]=NONE", i);
@@ -797,8 +809,8 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
                                 slots[i].useSwizzle ? "" : " (no swizzle)");
       }
       REXLOG_INFO("d3d12: PS 0x{:08X} slot census: count {}, array mask 0x{:X};{}",
-                  d.pixelShaderHandle, d.pixelSamplerCount,
-                  d.pixelSamplerArrayMask, slotDesc);
+                  d.pixelShaderHandle, stageSamplerCount,
+                  stageSamplerArrayMask, slotDesc);
     }
   }
 
@@ -809,7 +821,7 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
     // Slots past what the shader declares still need a valid descriptor: the
     // table's range covers all of them whether or not they are sampled. They
     // repeat slot 0 rather than being left undefined.
-    const uint32_t from = i < d.pixelSamplerCount ? i : 0;
+    const uint32_t from = i < stageSamplerCount ? i : 0;
     const Slot& s = slots[from];
     // No resource at all (a shader that samples nothing): a null descriptor is
     // legal and reads as zero. It still needs a concrete format -- UNKNOWN is
@@ -833,7 +845,7 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
     // resource: a one-slice array view over a DepthOrArraySize=1 resource is
     // legal, and D3D clamps the slice index, so every face reads slice 0. Wrong
     // colour, never a garbage descriptor. Counted so it is visible.
-    if ((d.pixelSamplerArrayMask >> from) & 1u) {
+    if ((stageSamplerArrayMask >> from) & 1u) {
       const UINT16 arraySize =
           s.resource ? s.resource->GetDesc().DepthOrArraySize : 1;
       if (arraySize < 2) ++m_translatedArraySlotNot2DArray;
@@ -862,7 +874,15 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
 }
 
 bool D3D12Renderer::BindTranslatedSamplers(const GameDraw& d,
-                                           D3D12_GPU_DESCRIPTOR_HANDLE& out) {
+                                           D3D12_GPU_DESCRIPTOR_HANDLE& out,
+                                           bool vertex) {
+  const uint32_t stageSamplerCount =
+      vertex ? d.vertexSamplerCount : d.pixelSamplerCount;
+  const auto& stageSampledObjects =
+      vertex ? d.vertexSampledObjects : d.pixelSampledObjects;
+  const auto& stageTextures = vertex ? d.vertexTextures : d.pixelTextures;
+  const auto& stageSamplerSigns =
+      vertex ? d.vertexSamplerSigns : d.pixelSamplerSigns;
   if (!m_samplerHeap) return false;
 
   // The configuration first, as a key. Slots past what the shader declares
@@ -872,14 +892,14 @@ bool D3D12Renderer::BindTranslatedSamplers(const GameDraw& d,
   uint32_t variants[kSamplerBlockSlots] = {};
   uint64_t key = 0;
   for (uint32_t i = 0; i < kSamplerBlockSlots; ++i) {
-    const uint32_t slot = i < d.pixelSamplerCount ? i : 0;
+    const uint32_t slot = i < stageSamplerCount ? i : 0;
     // A resolve snapshot is a host render target, not a guest texture: there is
     // no fetch constant to read a mode off, and it is sampled 1:1, so it takes
     // the clamped point variant rather than inheriting slot 0's.
-    if (slot < d.pixelSampledObjects.size() && d.pixelSampledObjects[slot]) {
+    if (slot < stageSampledObjects.size() && stageSampledObjects[slot]) {
       variants[i] = kSamplerClampU | kSamplerClampV | kSamplerPoint;
-    } else if (slot < d.pixelTextures.size() && d.pixelTextures[slot]) {
-      variants[i] = SamplerVariantFor(*d.pixelTextures[slot]);
+    } else if (slot < stageTextures.size() && stageTextures[slot]) {
+      variants[i] = SamplerVariantFor(*stageTextures[slot]);
     }
     key |= uint64_t(variants[i] & 7u) << (i * 3);
   }
@@ -3394,6 +3414,25 @@ void D3D12Renderer::RenderGameFrame() {
       D3D12_GPU_DESCRIPTOR_HANDLE samp = {};
       if (BindTranslatedSamplers(d, samp))
         m_commandList->SetGraphicsRootDescriptorTable(3, samp);
+      // The vertex stage's own tables, at t17+/s16+. Bound only when its shader
+      // samples: root parameters a shader does not reference need no binding,
+      // and the overwhelming majority of draws have no sampling vertex stage.
+      //
+      // Both must succeed or neither is bound. A shader that declares textures
+      // with only its samplers bound reads undefined descriptors, which is the
+      // confident-wrong-answer failure the slot fill is all-or-nothing to avoid.
+      if (d.vertexSamplerCount) {
+        D3D12_GPU_DESCRIPTOR_HANDLE vsSrv = {};
+        D3D12_GPU_DESCRIPTOR_HANDLE vsSamp = {};
+        if (BindTranslatedTextures(d, vsSrv, /*vertex=*/true) &&
+            BindTranslatedSamplers(d, vsSamp, /*vertex=*/true)) {
+          m_commandList->SetGraphicsRootDescriptorTable(5, vsSrv);
+          m_commandList->SetGraphicsRootDescriptorTable(6, vsSamp);
+          ++m_vertexSampledDraws;
+        } else {
+          ++m_vertexSampleBindFailed;
+        }
+      }
       m_commandList->IASetPrimitiveTopology(d.topology);
       if (d.gpuVertexFetch) {
         // No vertex buffers at all. The stage's only input is SV_VertexID and
@@ -3522,14 +3561,17 @@ void D3D12Renderer::RenderGameFrame() {
                   "guest shaders: %llu draws TRANSLATED (%llu of them running "
                   "the guest VERTEX shader too, %llu of those fetching their "
                   "own vertices, %llu dropped for want of one), "
-                  "%llu stand-in; %llu pipelines built, %llu failed",
+                  "%llu stand-in; %llu pipelines built, %llu failed; "
+                  "vertex-sampled %llu (bind failed %llu)",
                   static_cast<unsigned long long>(m_translatedDraws),
                   static_cast<unsigned long long>(m_gpuVertexDraws),
                   static_cast<unsigned long long>(m_gpuVertexFetchDraws),
                   static_cast<unsigned long long>(m_gpuVertexDropped),
                   static_cast<unsigned long long>(m_standInDraws),
                   static_cast<unsigned long long>(m_translatedOk),
-                  static_cast<unsigned long long>(m_translatedFailed));
+                  static_cast<unsigned long long>(m_translatedFailed),
+                  static_cast<unsigned long long>(m_vertexSampledDraws),
+                  static_cast<unsigned long long>(m_vertexSampleBindFailed));
     LogInfo(message);
     // Which of the four bind failures sent a translatable draw to the stand-in.
     // The counts are what decide the next move: block-exhausted means the ring
@@ -3986,6 +4028,21 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
       d.pixelTextures[i] = pixelTextures[i];
       d.pixelSampledObjects[i] = pixelSampledObjects[i];
     }
+  }
+  // The vertex stage's own textures, bound through a separate descriptor range.
+  // Copied here, before the translated gate below, so that the sign table the
+  // fetch path writes into the cbuffer tail can read them.
+  if (vertexStage && vertexStage->samplerCount && vertexStage->textures &&
+      vertexStage->sampledObjects) {
+    d.vertexSamplerCount = vertexStage->samplerCount;
+    d.vertexSamplerArrayMask = vertexStage->samplerArrayMask;
+    for (uint32_t i = 0; i < kTranslatedSamplerSlots; ++i) {
+      d.vertexTextures[i] = vertexStage->textures[i];
+      d.vertexSampledObjects[i] = vertexStage->sampledObjects[i];
+    }
+    if (vertexStage->samplerSigns)
+      std::memcpy(d.vertexSamplerSigns.data(), vertexStage->samplerSigns,
+                  d.vertexSamplerSigns.size());
   }
 
   // Does this draw bring the guest's own vertex stage? Decided BEFORE the

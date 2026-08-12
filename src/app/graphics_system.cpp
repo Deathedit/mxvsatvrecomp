@@ -401,6 +401,16 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
             vertexStage.constDwords =
                 static_cast<uint32_t>(d->vertex_constants.size());
           }
+          // The vertex stage's textures, if its shader samples any. Set for
+          // BOTH forms above -- a displacement fetch is orthogonal to whether
+          // the stage fetches its own attributes.
+          if (vertexStage.handle && d->vertex_sampler_count) {
+            vertexStage.samplerCount = d->vertex_sampler_count;
+            vertexStage.samplerArrayMask = d->vertex_sampler_array_mask;
+            vertexStage.textures = d->vertex_textures.data();
+            vertexStage.sampledObjects = d->vertex_sampled_objects.data();
+            vertexStage.samplerSigns = d->vertex_sampler_signs.data();
+          }
           ++addDrawCalls;
           m_renderer->AddGameDraw(d->vertices.data(),
                                   static_cast<uint32_t>(d->vertices.size()),

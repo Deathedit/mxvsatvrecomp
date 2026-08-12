@@ -1246,7 +1246,7 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
     //
     // The comment this replaces said the vertex stage needed no texture sign
     // "because no vertex shader in this game samples anything". That was
-    // measured false: 35,938 draws in mx_1037 were refused the GPU vertex path
+    // measured false: 230,720 draws in mx_1038 were refused the GPU vertex path
     // for having a sampler, and the interpreter they fell to has no texture
     // fetch at all -- so their vertex positions came out as silent zeros.
     src += "  float4 xe_texsign[" +

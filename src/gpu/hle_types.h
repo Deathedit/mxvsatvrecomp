@@ -351,7 +351,12 @@ struct DrawCall {
   // that made this necessary -- used to be refused the GPU vertex path
   // outright, and the CPU interpreter it fell back to has no texture fetch at
   // all. Its samples came out as zeros, so the positions were silently wrong,
-  // not merely slow: 35,938 draws in mx_1037.
+  // not merely slow: 230,720 draws in mx_1038.
+  //
+  // FREEROAM content, specifically. Every --force_load=NAT_Farm run measured
+  // (mx_1036, mx_1037, mx_1040) has ZERO vertex shaders with samplers, so that
+  // configuration cannot exercise or verify this path at all. mx_1038 reached
+  // FR_Dunes through the menus and is where they appear.
   //
   // These are a SEPARATE descriptor range from the pixel ones (t17+/s16+, see
   // HlslShader::kVertexTextureBaseRegister) because the two stages are

@@ -96,6 +96,21 @@ struct GpuVertexStage {
   // xe_vf[]. 4 dwords each, matching DrawCall::RawFetch.
   const uint32_t* rawFetch = nullptr;
   uint32_t rawFetchCount = 0;
+
+  // --- textures this stage samples -----------------------------------------
+  //
+  // Zero for almost every draw. A vertex shader that samples is terrain
+  // displacement and similar; those used to be refused the GPU path outright
+  // and fell to an interpreter with no texture fetch at all, so their samples
+  // came back as zeros and their positions were silently wrong.
+  //
+  // Carried here rather than as five more AddGameDraw parameters, which is
+  // already the widest signature in the renderer.
+  uint32_t samplerCount = 0;
+  uint32_t samplerArrayMask = 0;
+  const std::shared_ptr<const mx::hle::HleTexturePayload>* textures = nullptr;
+  const uint32_t* sampledObjects = nullptr;
+  const uint8_t* samplerSigns = nullptr;
 };
 
 void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
@@ -612,8 +627,11 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // shader would apply as "sample becomes constant white".
   static void FillVertexTextureSigns(const GameDraw& d, uint8_t* cb,
                                      uint32_t cbBytes, uint32_t constDwords);
+  // `vertex` fills from the VERTEX stage's slot arrays instead of the pixel
+  // ones; the caller binds the result to a different root parameter.
   bool BindTranslatedTextures(const GameDraw& d,
-                              D3D12_GPU_DESCRIPTOR_HANDLE& out);
+                              D3D12_GPU_DESCRIPTOR_HANDLE& out,
+                              bool vertex = false);
   // Points `out` at a block holding one sampler per texture slot, matching the
   // per-slot filter and address mode the guest asked for.
   //
@@ -624,7 +642,12 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // off the end of the heap entirely. This makes the table as wide as the range
   // that describes it.
   bool BindTranslatedSamplers(const GameDraw& d,
-                              D3D12_GPU_DESCRIPTOR_HANDLE& out);
+                              D3D12_GPU_DESCRIPTOR_HANDLE& out,
+                              bool vertex = false);
+  // Draws whose vertex stage sampled a texture, and those refused because its
+  // descriptor tables could not both be bound.
+  uint64_t m_vertexSampledDraws = 0;
+  uint64_t m_vertexSampleBindFailed = 0;
   // Sampler blocks, keyed by their slot configuration -- 3 bits per slot, so
   // 48 bits of key. Distinct configurations, not draws: the cache is what keeps
   // 16-wide blocks inside a 2048-descriptor heap.

@@ -2693,7 +2693,17 @@ ShaderApplyResult ApplyShaderOutputs(
   } else if (!vs_translated || !vs_translated->source) {
     gpu_vertex = false;
     ++g_gpuVertexNoVs;
-  } else if (vs_translated->sampler_count != 0) {
+  } else if (vs_translated->sampler_count != 0 &&
+             dc.vertex_sampler_count != vs_translated->sampler_count) {
+    // A sampling vertex shader is allowed through now that it has its own
+    // descriptor range (t17+/s16+) -- but only once every one of its slots
+    // resolved to a texture. Refusing on a short fill keeps the all-or-nothing
+    // rule the pixel stage already has: a slot left unbound samples whatever
+    // descriptor happens to sit at that index, which is a confident wrong
+    // answer rather than a visible failure.
+    //
+    // This counter therefore changes meaning. It used to mean "has a sampler";
+    // it now means "has a sampler we could not fill", which should be rare.
     gpu_vertex = false;
     ++g_gpuVertexVsSamplers;
   } else if (!VportScaleEnabled(device, base)) {
@@ -5035,10 +5045,25 @@ void NoteUnhandledSign(uint32_t guest_format, uint32_t mode) {
               guest_format, kName[mode & 3], n);
 }
 
+// `vertex` selects which stage's slot arrays the result lands in. Everything
+// else -- the fetch-constant read, the resolve-snapshot match, the blank-decode
+// retry, every counter -- is identical for the two stages, because the question
+// "what texture is bound to guest sampler N" does not depend on who is asking.
+// Splitting this into two functions would have meant two copies of 250 lines
+// that must agree.
+//
+// dc.pixel_shader_handle is still read for the blank-texture key regardless of
+// stage: that key identifies the DRAW's material, and a vertex fetch of the
+// same guest memory wants the same memoisation.
 bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
                              uint32_t guest_sampler, uint32_t device,
-                             uint8_t* base) {
+                             uint8_t* base, bool vertex = false) {
   using namespace mx::hle;
+  auto& out_textures = vertex ? dc.vertex_textures : dc.pixel_textures;
+  auto& out_objects =
+      vertex ? dc.vertex_sampled_objects : dc.pixel_sampled_objects;
+  auto& out_signs =
+      vertex ? dc.vertex_sampler_signs : dc.pixel_sampler_signs;
   if (slot >= DrawCall::kMaxPixelTextures || guest_sampler >= kMaxSamplers) {
     ++g_slotFailRange;
     ReportSlotFailures();
@@ -5065,7 +5090,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   if (texture_state.object &&
       g_resolvedTextureTargets.contains(texture_state.object)) {
     if (ResolvedDestinationIsMostlyWritten(texture_state.object)) {
-      dc.pixel_sampled_objects[slot] = texture_state.object;
+      out_objects[slot] = texture_state.object;
       return true;
     }
     partial_snapshot_object = texture_state.object;
@@ -5104,7 +5129,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
       p->data.assign(4, 0);
       return p;
     }();
-    dc.pixel_textures[slot] = s_unbound;
+    out_textures[slot] = s_unbound;
     ++g_slotBoundUnbound;
     ReportBoundZero();
     return true;
@@ -5141,7 +5166,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
                !IsFloatGuestFormat(source.guest_format))
         NoteUnhandledSign(source.guest_format, mode);
     }
-    dc.pixel_sampler_signs[slot] = biased;
+    out_signs[slot] = biased;
   }
 
   // The same memory a resolve wrote into, reached through a different texture
@@ -5154,7 +5179,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // to be skipped.
   if (const ResolvedTargetByAddress* resolved =
           ResolvedTargetForAddress(source)) {
-    dc.pixel_sampled_objects[slot] = resolved->dest_object;
+    out_objects[slot] = resolved->dest_object;
     ++g_resolveAddressMatches;
     return true;
   }
@@ -5178,7 +5203,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     // A glyph atlas the guest has repacked since this was decoded falls
     // through to a fresh decode; everything else is served from the cache.
     if (!GlyphCacheStale(*cached->second)) {
-      dc.pixel_textures[slot] = cached->second;
+      out_textures[slot] = cached->second;
       return true;
     }
     g_hleCpuTextures.erase(cached);
@@ -5189,12 +5214,12 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     if (partial_snapshot_object && g_hleBlankPayloads.contains(key)) {
       // Known blank and not due a re-read: the snapshot's tiles are the best
       // available answer until the retry says otherwise.
-      dc.pixel_sampled_objects[slot] = partial_snapshot_object;
+      out_objects[slot] = partial_snapshot_object;
       return true;
     }
     if (auto payload = g_hleBlankPayloads.find(key);
         payload != g_hleBlankPayloads.end()) {
-      dc.pixel_textures[slot] = payload->second;
+      out_textures[slot] = payload->second;
       ++g_slotBoundZero;
       NoteBlankTexture(key, guest_sampler, source);
       ReportBoundZero();
@@ -5222,7 +5247,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     // tiles beat zeros everywhere, and the blank is still recorded above so the
     // retry keeps looking.
     if (partial_snapshot_object) {
-      dc.pixel_sampled_objects[slot] = partial_snapshot_object;
+      out_objects[slot] = partial_snapshot_object;
       return true;
     }
     ++g_slotBoundZero;
@@ -5244,13 +5269,13 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     // one.
     payload->key = key ^ kBlankTextureKeyMarker;
     g_hleBlankPayloads[key] = payload;
-    dc.pixel_textures[slot] = std::move(payload);
+    out_textures[slot] = std::move(payload);
     return true;
   }
   NoteBlankRecovered(key);
   payload->key = key;
   payload->content_version = g_glyphCacheGeneration;
-  dc.pixel_textures[slot] = payload;
+  out_textures[slot] = payload;
   g_hleCpuTextures.emplace(key, std::move(payload));
   return true;
 }
@@ -5541,6 +5566,48 @@ void AttachTranslatedPixelShader(mx::hle::DrawCall& dc, uint32_t handle,
         dc.pixel_sampled_objects = {};
       } else {
         ++s_slotOk;
+      }
+
+      // The VERTEX stage's textures, by exactly the same rule. A vertex shader
+      // that samples -- terrain displacement is the case here -- used to be
+      // refused the GPU path for having a sampler at all, and the interpreter
+      // it fell back to has no texture fetch, so its samples were silent zeros
+      // and the positions silently wrong.
+      //
+      // All-or-nothing like the pixel stage, and for the same reason: a slot
+      // left unfilled samples whatever descriptor sits at that index. Falling
+      // short here clears the count rather than the shader, which puts the draw
+      // back on the CPU path it used to take unconditionally.
+      constexpr uint32_t kDeviceVertexShaderAt = 0x3248;
+      uint32_t vs_handle = 0;
+      if (HostPageReadable(REX_RAW_ADDR(device + kDeviceVertexShaderAt)))
+        vs_handle = REX_LOAD_U32(device + kDeviceVertexShaderAt);
+      if (const TranslatedShader* vt =
+              vs_handle ? TranslatedVertexShader(vs_handle) : nullptr) {
+        if (vt->sampler_count) {
+          uint32_t vfilled = 0;
+          for (uint32_t s = 0; s < vt->sampler_count &&
+                               s < mx::hle::DrawCall::kMaxPixelTextures; ++s) {
+            if (ResolvePixelSlotTexture(dc, s, vt->slot_guest[s], device, base,
+                                        /*vertex=*/true))
+              ++vfilled;
+          }
+          static uint64_t s_vsSlotOk = 0, s_vsSlotShort = 0;
+          if (vfilled < vt->sampler_count) {
+            ++s_vsSlotShort;
+            dc.vertex_textures = {};
+            dc.vertex_sampled_objects = {};
+            dc.vertex_sampler_count = 0;
+          } else {
+            ++s_vsSlotOk;
+            dc.vertex_sampler_count = vt->sampler_count;
+            dc.vertex_sampler_array_mask = vt->sampler_array_mask;
+          }
+          if (((s_vsSlotOk + s_vsSlotShort) % 5000) == 1) {
+            REXLOG_INFO("d3d9: VERTEX texture slots: {} draws bound, {} short",
+                        s_vsSlotOk, s_vsSlotShort);
+          }
+        }
       }
       if (((s_slotOk + s_slotShort) % 5000) == 0) {
         // The resolve-address counters ride here rather than in ReportBoundZero,
