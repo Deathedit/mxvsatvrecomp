@@ -159,29 +159,43 @@ so they describe what a plain run already does, not what you can turn on.
 
 | cvar | default | |
 |---|---|---|
-| `hle_gpu_vertex` | **on** | Run the guest vertex shader on the GPU when both stages translate. Off keeps every draw on the CPU interpreter |
-| `hle_gpu_vertex_fetch` | **on** | Let the translated vertex shader fetch and decode the vertex buffer itself. Requires `hle_gpu_vertex` |
-| `hle_shader_fetch_constants` | **on** | Honour fetch constants embedded in a shader's state-patch list, not just the device shadow at `device+0x480` |
-| `hle_ps_device_fallback` | **on** | Resolve a draw's pixel shader from the last one bound on its device when neither the setter nor `device+0x3244` has one |
-| `hle_texture_signs` | **on** | Apply the fetch constant's `kUnsignedBiased` sign (2*c-1) in the pixel shader |
 | `hle_sanitize_constants` | **on** | Zero any non-finite pixel shader constant before upload |
 | `d3d9_page_cache_persist` | **on** | Keep the page-readability cache across frames instead of clearing every swap |
 | `hle_diag` | off | Per-draw and per-vertex diagnostics: transform probe, prim-type and vfetch censuses, fetch addressing self-check. They cost real frame time |
 | `hle_capture` | off | Score every draw against the state shadow and report what fraction is fully described. Capture only — submits nothing |
 | `hle_shader_exec` | 0 | Execute the bound guest vertex shader for one draw in N. Requires `hle_capture` |
 | `hle_shader_verts` | 8 | How many vertices per executed draw. Only with `hle_shader_exec` |
-| `hle_main_viewport_only` | off | Submit only draws using the resolved 1280x720 viewport |
 | `d3d9_page_cache_verify` | off | Re-query the OS on every cache hit and log mismatches. Slow; correctness check |
 | `d3d9_hooks_passthrough` | off | Pass the D3D9 hooks through in native mode. **Breaks rendering by design** — an A/B instrument, not a mode |
 | `force_load` | — | Load a scene directly. A diagnostic lever, not a fix — see "Why there is no menu" |
 | `registry_override` | — | Force a registry key, e.g. `ReadyToLaunch=1`. Same caveat |
 
-**`hle_sanitize_constants`'s own help text is stale** and says the menu's 3D
-layer is black because a shader takes +Inf into a multiply. That was the
-hypothesis, and it was wrong — the cause was the D3D9 legacy multiply, where
-`0 * INF` is `+0` on Xenos and NaN on host hardware. The cvar still defaults on
-and still zeroes non-finite constants; whether it is doing anything now that the
-real cause is fixed has not been measured.
+**Six were retired on 2026-08-12**, by the same test that retired four on
+2026-08-07: none had ever been flipped, so the other branch was dead weight that
+still had to be reasoned about wherever it was read, and the shipped default was
+a configuration nobody had tested.
+
+| retired | was | frozen at |
+|---|---|---|
+| `hle_gpu_vertex` | on | on — the CPU interpreter is still exercised every frame by draws that do not qualify, so nothing went untested by dropping the flag |
+| `hle_gpu_vertex_fetch` | on | on |
+| `hle_shader_fetch_constants` | on | on — off meant ignoring constants shaders DMA themselves |
+| `hle_ps_device_fallback` | on | on — off meant losing the bound shader on worker threads |
+| `hle_texture_signs` | on | on — off meant rendering `kUnsignedBiased` without the 2*c−1 expansion |
+| `hle_main_viewport_only` | off | **deleted** — its own help text called it superseded once render targets were modelled per surface |
+
+The first five all had one read site and an "off" that only meant *be wrong*, so
+freezing them changes no behaviour. `hle_main_viewport_only` defaulted off, so
+deleting its branch changes none either.
+
+**`hle_sanitize_constants` was NOT retired, deliberately.** Its help text is
+stale — it says the menu's 3D layer is black because a shader takes +Inf into a
+multiply, which was the hypothesis and was wrong; the cause was the D3D9 legacy
+multiply, where `0 * INF` is `+0` on Xenos and NaN on host. But it defaults
+**on** and is actively firing (`CONSTANTS sanitized: 3287 draws, 114270
+components` in mx_1040), so removing it would be *choosing a behaviour*, not
+deleting a dead branch. Run once with `--hle_sanitize_constants=false` and
+compare before deciding.
 
 Seven more (`alu_execute`, `skip_untransformable_draws`, `tint_by_color_source`,
 `transcode_confirmed_formats_only`, `transcode_trust_export`,

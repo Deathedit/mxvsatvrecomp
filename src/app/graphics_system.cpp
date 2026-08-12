@@ -89,42 +89,6 @@ REXCVAR_DEFINE_UINT32(hle_shader_verts, 8, "Debug",
                       "guest vertex shader on. Only has effect when "
                       "hle_shader_exec is non-zero");
 
-// The GPU vertex path is a replacement for the CPU interpreter, not an
-// addition to it, so the only honest way to judge it is the same scene with and
-// without. Both configurations have to be ONE binary or the comparison is
-// between two builds rather than between two paths.
-REXCVAR_DEFINE_BOOL(hle_gpu_vertex, true, "Debug",
-                    "Run the guest's own vertex shader on the GPU for draws "
-                    "whose vertex AND pixel shaders both translate. Off keeps "
-                    "every draw on the CPU interpreter");
-
-// The vertex FETCH, as opposed to the vertex shader. With hle_gpu_vertex alone
-// the shader runs on the GPU but the CPU still unpacks every attribute of every
-// vertex into input registers -- measured at 145ms of a 159ms frame over
-// 289,000 vertices. This makes the shader read the guest's raw vertex buffer
-// and decode it itself.
-//
-// Default on, because it is strictly an accelerated form of the same path: a
-// draw it refuses falls back to hle_gpu_vertex rather than failing. Off is the
-// A/B, and the two must produce the same picture.
-REXCVAR_DEFINE_BOOL(hle_gpu_vertex_fetch, true, "Debug",
-                    "Let the translated vertex shader fetch and decode the "
-                    "guest vertex buffer itself, instead of the CPU unpacking "
-                    "attributes per vertex. Requires hle_gpu_vertex");
-
-// Texture fetch constants embedded in a shader object's state-patch list. The
-// guest copies these to the device shadow when binding the shader, but a draw on
-// another record device may not have that copy even though the shader owns the
-// complete descriptor.
-//
-// Default on: without it those samplers bind a 1x1 black stand-in, which is
-// what left the menu's HUD panels and arena backdrop black. Off is the A/B --
-// the picture must differ, and if it does not, the diagnosis was wrong.
-REXCVAR_DEFINE_BOOL(hle_shader_fetch_constants, true, "Debug",
-                    "Honour texture fetch constants embedded in a shader's "
-                    "state-patch list, not just those currently present in "
-                    "the device shadow at device+0x480");
-
 // The per-draw and per-vertex diagnostics this investigation accumulated.
 //
 // Default OFF. They are not free — the Stage-3 transform probe alone reads 256
@@ -145,39 +109,6 @@ REXCVAR_DEFINE_BOOL(hle_sanitize_constants, true, "Debug",
                     "Zero any non-finite pixel shader constant before upload. "
                     "The menu's 3D layer is black because a shader takes +Inf "
                     "into a multiply and outputs NaN");
-
-// When a draw arrives with no pixel shader from either the setter argument or
-// device+0x3244, fall back to the last shader bound on that DEVICE.
-//
-// Default on: it is worth 4.45 -> 9.88 fps at the menu, because a draw with no
-// translated pixel shader cannot take the GPU vertex path and runs the software
-// interpreter instead. It is also the change that introduced ~69,000 draws a
-// frame with samplers s0/s1/s2 unbound, which no run before it shows. Keep both
-// facts measurable from one build.
-REXCVAR_DEFINE_BOOL(hle_ps_device_fallback, true, "Debug",
-                    "Resolve a draw's pixel shader from the last one bound on "
-                    "its device when neither the setter nor device+0x3244 has "
-                    "one");
-
-// TEX_FORMAT_COMP / GPUSIGN. Off leaves every xe_texsign at 1.0, which is the
-// exact behaviour of every build before this one, so a suspected regression is
-// one run to bisect rather than a rebuild -- the same reason hle_gpu_vertex and
-// hle_gpu_vertex_fetch have switches. Worth having because this change and the
-// D3D9-legacy-multiply change landed back to back and both touch every
-// translated pixel shader.
-REXCVAR_DEFINE_BOOL(hle_texture_signs, true, "Debug",
-                    "Apply the fetch constant's kUnsignedBiased texture sign "
-                    "(2*c-1) in the pixel shader");
-
-// HLE does not yet create a host target for every guest render target. Until
-// it does, mixing the 129x129 shadow pass and other off-screen viewports into
-// the 1280x720 scene produces the long white wedges seen in ST_Southwest.
-// This selector comes from D3D9's resolved, render-target-clamped viewport.
-REXCVAR_DEFINE_BOOL(hle_main_viewport_only, false, "Debug",
-                    "In HLE rendering, submit only draws using the resolved "
-                    "1280x720 D3D9 viewport. Diagnostic fallback now that "
-                    "separate render targets are modelled");
-
 
 namespace rex {
 namespace system {
@@ -251,7 +182,6 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       // histogram below is now a list of those gaps rather than of the guest's
       // strides.
       static std::map<uint32_t, uint32_t> s_skippedStrides;
-      static std::map<uint64_t, uint32_t> s_skippedViewports;
       static uint64_t s_skippedUntransformable = 0;
       // Filter first, bind second. The renderer's list is only replaced once we
       // know the new frame has something in it — a frame whose draws were all
@@ -303,24 +233,14 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
           ++s_skippedStrides[d.vertex_stride];
           continue;
         }
-        // A frame touches ~16 distinct guest colour surfaces (measured) and we
-        // have one host render target, so without a filter every off-screen
-        // pass overpaints the main scene and whichever runs last decides what
-        // is on screen. That is what made the window cycle through colours.
-        //
-        // The surface filter this used to run was main_surface_only, keyed on
-        // RB_SURFACE_INFO — a PM4 register the D3D9 path never sees, so it is
-        // gone with the translator. The viewport extent is the stand-in until
-        // render targets are modelled from D3D9 state; it is a weaker signal
-        // and it is off by default, because dropping draws on a guess would be
-        // indistinguishable from "HLE produced nothing".
-        if (REXCVAR_GET(hle_main_viewport_only) &&
-            (d.viewport_width != 1280 || d.viewport_height != 720)) {
-          ++skipped;
-          ++s_skippedViewports[(uint64_t(d.viewport_width) << 32) |
-                               d.viewport_height];
-          continue;
-        }
+        // RETIRED 2026-08-12: hle_main_viewport_only, which dropped any draw
+        // whose viewport was not 1280x720. It was a stand-in for modelling
+        // render targets from D3D9 state, from when a frame's ~16 guest colour
+        // surfaces all landed on one host target and whichever pass ran last
+        // decided what was on screen. Render targets ARE modelled now
+        // (EnsureGameRenderTarget routes each surface to its own), so the
+        // filter's own help text already called it superseded — and it was
+        // off by default, so no run has ever used it.
         submittable.push_back(&d);
         ++submitted;
       }
@@ -494,18 +414,11 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
         std::string hist;
         for (const auto& [stride, count] : s_skippedStrides)
           hist += fmt::format("{}:{} ", stride, count);
-        std::string viewports;
-        for (const auto& [key, count] : s_skippedViewports)
-          viewports += fmt::format("{}x{}:{} ", uint32_t(key >> 32),
-                                   uint32_t(key & 0xFFFFFFFF), count);
         REXLOG_INFO("RenderThread: frame #{} submitted {} draws, skipped {} "
                     "— skipped strides (cumulative) {} — host ticks with/without "
-                    "new draws {}/{} — skipped viewports {} — skipped "
-                    "untransformable (cumulative) {}",
+                    "new draws {}/{} — skipped untransformable (cumulative) {}",
                     s_frame, submitted, skipped, hist.empty() ? "none" : hist,
-                    s_ticksWithDraws, s_ticksEmpty,
-                    viewports.empty() ? "none" : viewports,
-                    s_skippedUntransformable);
+                    s_ticksWithDraws, s_ticksEmpty, s_skippedUntransformable);
       }
       // BeginFrame and EndFrame own the whole frame: BeginFrame opens the
       // command list, transitions and clears the targets and then calls

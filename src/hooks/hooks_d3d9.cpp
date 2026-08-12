@@ -67,13 +67,8 @@
 REXCVAR_DECLARE(bool, hle_capture);
 REXCVAR_DECLARE(uint32_t, hle_shader_exec);
 REXCVAR_DECLARE(uint32_t, hle_shader_verts);
-REXCVAR_DECLARE(bool, hle_gpu_vertex);
-REXCVAR_DECLARE(bool, hle_gpu_vertex_fetch);
 REXCVAR_DECLARE(bool, hle_diag);
 REXCVAR_DECLARE(bool, hle_sanitize_constants);
-REXCVAR_DECLARE(bool, hle_ps_device_fallback);
-REXCVAR_DECLARE(bool, hle_texture_signs);
-REXCVAR_DECLARE(bool, hle_shader_fetch_constants);
 
 // A NAMED namespace, not an anonymous one, so that the guest entry points can
 // move to their own translation unit and still reach the state they operate on.
@@ -1436,9 +1431,9 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
       // finding:
       //   ps_tl     - DeviceState().pixel_shader. thread_local, and these draws
       //               come off worker threads, so it is empty for them.
-      //   ps_strict - THIS device's record only. What the real draw path uses
-      //               (see the hle_ps_device_fallback branch below), so this is
-      //               the one that decides what actually renders.
+      //   ps_strict - THIS device's record only. What the real draw path falls
+      //               back to when neither the setter nor device+0x3244 has a
+      //               shader, so this is the one that decides what renders.
       //   ps_any    - strict, else the last shader seen on ANY device. A guess
       //               across devices; fine for a diagnostic, wrong for binding.
       // If ps_strict is 0 while ps_any is not, this device never received
@@ -1592,7 +1587,6 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     in.defer_transcode =
         vst && vst->source && vst->fetch_source && vst->sampler_count == 0 &&
         prim_type != uint32_t(mx::hle::PrimitiveType::kRectangleList) &&
-        REXCVAR_GET(hle_gpu_vertex) && REXCVAR_GET(hle_gpu_vertex_fetch) &&
         VportScaleEnabled(device, base);
     if (in.defer_transcode) ++g_transcodeDeferred;
   }
@@ -2420,7 +2414,7 @@ uint64_t g_gpuVertexUndeclared = 0;
 // shader that samples a texture is refused by `sampler_count == 0` and then
 // falls to an interpreter that has no texture fetch at all, so its result is a
 // silent zero rather than a fallback.
-uint64_t g_gpuVertexNoCvar = 0, g_gpuVertexNoVs = 0, g_gpuVertexVsSamplers = 0;
+uint64_t g_gpuVertexNoVs = 0, g_gpuVertexVsSamplers = 0;
 uint64_t g_gpuVertexNoVte = 0, g_gpuVertexNoPs = 0, g_gpuVertexTooManyInputs = 0;
 // The GPU vertex FETCH path: draws taking it, and why a draw that qualified for
 // the GPU vertex stage still could not.
@@ -2501,7 +2495,7 @@ ShaderApplyResult ApplyShaderOutputs(
           "{} off {} unreadable {}, disagrees with old tie-break {}); live "
           "shader resolved {} no-match {} ambiguous {} unreadable {}; GPU "
           "vertex path {} draws qualify, {} skipped ({} undeclared reg, "
-          "{} cvar-off, {} no-VS, {} VS-samplers, {} no-VTE, {} no-PS, "
+          "{} no-VS, {} VS-samplers, {} no-VTE, {} no-PS, "
           "{} too-many-inputs); GPU FETCH {} draws (refused: rectlist {}, "
           "ordinal-mismatch {}, out-of-range {}, unaligned {})",
           g_hleShaderAttempts, g_hleShaderDraws, g_hleShaderVertices,
@@ -2511,7 +2505,7 @@ ShaderApplyResult ApplyShaderOutputs(
           g_vteSeen[1], g_vteSeen[0], g_hleShaderMvpDisagree,
           g_liveVertexResolved, g_liveVertexNoMatch, g_liveVertexAmbiguous,
           g_liveVertexUnreadable, g_gpuVertexDraws, g_gpuVertexSkipped,
-          g_gpuVertexUndeclared, g_gpuVertexNoCvar, g_gpuVertexNoVs,
+          g_gpuVertexUndeclared, g_gpuVertexNoVs,
           g_gpuVertexVsSamplers, g_gpuVertexNoVte, g_gpuVertexNoPs,
           g_gpuVertexTooManyInputs, g_gpuFetchDraws, g_gpuFetchRectList,
           g_gpuFetchOrdinalMismatch, g_gpuFetchOutOfRange, g_gpuFetchUnaligned);
@@ -2687,10 +2681,7 @@ ShaderApplyResult ApplyShaderOutputs(
   // counted against the first — read the counters as "the reason that fired",
   // not as a partition of independent causes.
   bool gpu_vertex = true;
-  if (!REXCVAR_GET(hle_gpu_vertex)) {
-    gpu_vertex = false;
-    ++g_gpuVertexNoCvar;
-  } else if (!vs_translated || !vs_translated->source) {
+  if (!vs_translated || !vs_translated->source) {
     gpu_vertex = false;
     ++g_gpuVertexNoVs;
   } else if (vs_translated->sampler_count != 0 &&
@@ -2734,8 +2725,8 @@ ShaderApplyResult ApplyShaderOutputs(
   // Strictly an accelerated form of gpu_vertex: everything that refuses that
   // refuses this, and anything this refuses falls back to it rather than
   // failing. So a defect here costs frame time, not pixels.
-  bool gpu_fetch = gpu_vertex && REXCVAR_GET(hle_gpu_vertex_fetch) &&
-                   vs_translated && vs_translated->fetch_source;
+  bool gpu_fetch =
+      gpu_vertex && vs_translated && vs_translated->fetch_source;
   if (gpu_fetch && dc.prim_type == uint32_t(mx::hle::PrimitiveType::kRectangleList)) {
     // ExpandRectangleList synthesizes a fourth vertex as v1 + v2 - v0 from the
     // host vertices AND from vertex_inputs. The fetch path produces neither,
@@ -4341,7 +4332,7 @@ bool ReadLiveTextureFetch(uint32_t device, uint8_t* base, uint32_t sampler,
   // Second, and only when the device shadow has nothing: the descriptor the
   // shader published for itself. A live SetTexture must still win, so this sits
   // below the shadow rather than above it.
-  if (ps_handle && REXCVAR_GET(hle_shader_fetch_constants)) {
+  if (ps_handle) {
     uint32_t published[6] = {};
     if (ShaderPublishedFetch(ps_handle, sampler, published) &&
         (published[0] & 3u) == 2u) {
@@ -5154,7 +5145,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // a scale; both are counted by NoteUnhandledSign and left alone rather than
   // approximated, since the census over a full menu run finds no kGamma at all
   // and kSigned on one FMT_4_4_4_4 texture.
-  if (REXCVAR_GET(hle_texture_signs)) {
+  {
     const uint8_t swizzled =
         mx::hle::SwizzleTextureSigns(source.signs, source.swizzle);
     uint8_t biased = 0;
@@ -5736,7 +5727,7 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
       REXLOG_INFO("d3d9: SETTER DEVICES:{}", PixelShaderDeviceSummary());
     }
   }
-  if (REXCVAR_GET(hle_ps_device_fallback) && !resolved) {
+  if (!resolved) {
     resolved = PixelShaderForDeviceStrict(device);
     if (resolved) ++g_psFromDeviceRecord;
   }
