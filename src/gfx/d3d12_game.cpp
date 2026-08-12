@@ -3750,7 +3750,10 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
     rd.Width = size; rd.Height = 1; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
     rd.Format = DXGI_FORMAT_UNKNOWN; rd.SampleDesc.Count = 1;
     rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-    return SUCCEEDED(m_device->CreateCommittedResource(
+    // Counted and timed. This is the call the PERF note above is about, and it
+    // runs up to nine times per draw for several hundred draws a frame; whether
+    // it is getting slower per call as the session goes on is the open question.
+    return SUCCEEDED(CreateTimedCommittedResource(
         &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
         nullptr, IID_PPV_ARGS(&buf)));
   };

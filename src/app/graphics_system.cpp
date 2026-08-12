@@ -392,6 +392,12 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       if (!draws.empty()) {
         m_renderer->ClearGameDraws();
       }
+      // The AddGameDraw loop, timed. It allocates every per-draw upload buffer
+      // for the frame — up to nine committed resources per draw — and it is the
+      // one phase of the render tick that runs out here rather than inside the
+      // renderer, so the renderer cannot time it for itself.
+      const auto addDrawsStart = std::chrono::steady_clock::now();
+      uint32_t addDrawCalls = 0;
       if (!submittable.empty()) {
         for (const auto* d : submittable) {
           if (d->resolve_dest_texture) {
@@ -453,6 +459,7 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
             vertexStage.constDwords =
                 static_cast<uint32_t>(d->vertex_constants.size());
           }
+          ++addDrawCalls;
           m_renderer->AddGameDraw(d->vertices.data(),
                                   static_cast<uint32_t>(d->vertices.size()),
                                   d->vertex_stride, d->indices.data(),
@@ -524,6 +531,12 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
           }
         }
       }
+      m_renderer->ReportAddGameDrawsCost(
+          uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - addDrawsStart)
+                       .count()),
+          addDrawCalls);
+
       static uint32_t s_frame = 0;
       if ((submitted || skipped) && (++s_frame % 100) == 1) {
         std::string hist;

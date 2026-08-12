@@ -34,7 +34,40 @@ const float* GameClearColor() {
   static const float kDarkBlue[4] = {0.05f, 0.08f, 0.18f, 1.0f};
   return kDarkBlue;
 }
+
+// Scoped microsecond timer for the render-thread phase breakdown. Accumulates
+// rather than assigns, because a phase can be entered more than once in a tick.
+struct PhaseTimer {
+  uint64_t& sink;
+  std::chrono::steady_clock::time_point t0{std::chrono::steady_clock::now()};
+  explicit PhaseTimer(uint64_t& s) : sink(s) {}
+  ~PhaseTimer() {
+    sink += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - t0)
+                         .count());
+  }
+};
 }  // namespace
+
+HRESULT D3D12Renderer::CreateTimedCommittedResource(
+    const D3D12_HEAP_PROPERTIES* heap, D3D12_HEAP_FLAGS flags,
+    const D3D12_RESOURCE_DESC* desc, D3D12_RESOURCE_STATES state,
+    const D3D12_CLEAR_VALUE* clear, REFIID riid, void** out) {
+  const auto t0 = std::chrono::steady_clock::now();
+  const HRESULT hr = m_device->CreateCommittedResource(heap, flags, desc, state,
+                                                       clear, riid, out);
+  m_committedUs += uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - t0)
+                                .count());
+  ++m_committedCalls;
+  return hr;
+}
+
+void D3D12Renderer::ReportAddGameDrawsCost(uint64_t microseconds,
+                                           uint32_t draws) {
+  m_phaseAddDrawsUs += microseconds;
+  m_phaseAddDraws += draws;
+}
 
 D3D12Renderer::~D3D12Renderer() {
   Shutdown();
@@ -268,11 +301,20 @@ void D3D12Renderer::BeginFrame() {
   m_commandList->ClearRenderTargetView(rtvHandle, GameClearColor(), 1,
                                        &m_scissorRect);
 
-  RenderGameFrame();
+  {
+    PhaseTimer _record{m_phaseRecordUs};
+    RenderGameFrame();
+  }
 }
 
 void D3D12Renderer::EndFrame() {
   assert(m_initialized);
+
+  // Opened here and closed before the report below, so the report sees the
+  // finished figure. Everything from the present blit to Present() itself is one
+  // phase: it is all "hand this frame to the GPU", and splitting it further is
+  // only worth doing if it turns out to be the phase that grows.
+  auto submit = std::make_unique<PhaseTimer>(m_phaseSubmitUs);
 
   PresentGameFrame();
 
@@ -307,6 +349,8 @@ void D3D12Renderer::EndFrame() {
     // the old ordering the one line naming the cause was never printed.
     DrainD3D12Messages();
     RecoverCommandList();
+    submit.reset();
+    ReportTickPhases();
     return;
   }
 
@@ -329,7 +373,62 @@ void D3D12Renderer::EndFrame() {
     LogError(rbuf);
   }
 
+  submit.reset();
   MoveToNextFrame();
+  ReportTickPhases();
+}
+
+// One line per 20 ticks, matching the cadence of the routing counters so the two
+// can be read side by side.
+//
+// Sampled rather than averaged: these are the phases of THIS tick, not a mean
+// over twenty. The question is how the split changes as the session goes on, and
+// a mean over a window that spans a scene change answers it for neither scene.
+void D3D12Renderer::ReportTickPhases() {
+  const auto now = std::chrono::steady_clock::now();
+  uint64_t tickUs = 0;
+  if (m_tickEnd.time_since_epoch().count() != 0)
+    tickUs = uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(
+                          now - m_tickEnd)
+                          .count());
+  m_tickEnd = now;
+
+  static uint32_t s_tick = 0;
+  if ((++s_tick % 20) == 1) {
+    // The four phases plus the render thread's 16ms sleep account for the tick
+    // period; anything left over is unmeasured and the residual says how much.
+    const uint64_t measured = m_phaseAddDrawsUs + m_phaseRecordUs +
+                              m_phaseSubmitUs + m_phaseFenceWaitUs +
+                              m_phaseRetireUs;
+    char message[512];
+    std::snprintf(
+        message, sizeof(message),
+        "render tick #%u %llums = add-draws %llums (%u calls) + record %llums + "
+        "submit %llums + FENCE-WAIT %llums + retire %llums, unmeasured %lldms; "
+        "CreateCommittedResource %llu calls %llums (mean %.1fus/call)",
+        s_tick, static_cast<unsigned long long>(tickUs / 1000),
+        static_cast<unsigned long long>(m_phaseAddDrawsUs / 1000),
+        m_phaseAddDraws,
+        static_cast<unsigned long long>(m_phaseRecordUs / 1000),
+        static_cast<unsigned long long>(m_phaseSubmitUs / 1000),
+        static_cast<unsigned long long>(m_phaseFenceWaitUs / 1000),
+        static_cast<unsigned long long>(m_phaseRetireUs / 1000),
+        static_cast<long long>(int64_t(tickUs) - int64_t(measured)) / 1000,
+        static_cast<unsigned long long>(m_committedCalls),
+        static_cast<unsigned long long>(m_committedUs / 1000),
+        m_committedCalls ? double(m_committedUs) / double(m_committedCalls)
+                         : 0.0);
+    LogInfo(message);
+  }
+
+  m_phaseAddDrawsUs = 0;
+  m_phaseAddDraws = 0;
+  m_phaseRecordUs = 0;
+  m_phaseSubmitUs = 0;
+  m_phaseFenceWaitUs = 0;
+  m_phaseRetireUs = 0;
+  m_committedCalls = 0;
+  m_committedUs = 0;
 }
 
 bool D3D12Renderer::CreateFactory() {
@@ -711,17 +810,29 @@ void D3D12Renderer::MoveToNextFrame() {
 
   m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
 
-  if (m_fence->GetCompletedValue() < m_fenceValues[m_frameIndex]) {
-    if (FAILED(m_fence->SetEventOnCompletion(m_fenceValues[m_frameIndex],
-                                              m_fenceEvent))) {
-      LogError("MoveToNextFrame: SetEventOnCompletion failed");
-      return;
+  // The one phase that is GPU time rather than CPU time. If the tick's growth
+  // lives here the work being submitted is genuinely getting slower to execute;
+  // if it does not, the render thread is spending the time itself and the GPU is
+  // idle waiting for us.
+  {
+    PhaseTimer _wait{m_phaseFenceWaitUs};
+    if (m_fence->GetCompletedValue() < m_fenceValues[m_frameIndex]) {
+      if (FAILED(m_fence->SetEventOnCompletion(m_fenceValues[m_frameIndex],
+                                                m_fenceEvent))) {
+        LogError("MoveToNextFrame: SetEventOnCompletion failed");
+        return;
+      }
+      WaitForSingleObject(m_fenceEvent, INFINITE);
     }
-    WaitForSingleObject(m_fenceEvent, INFINITE);
   }
 
   // Release the per-draw upload buffers the GPU has now finished with. Done
   // here rather than in ClearGameDraws because this is the only place that
   // knows the fence has moved.
+  //
+  // Timed because releasing ~4,800 committed resources is the other half of
+  // creating them, and a driver allocator that has become slow to allocate is
+  // usually slow to free as well.
+  PhaseTimer _retire{m_phaseRetireUs};
   DrainRetired();
 }

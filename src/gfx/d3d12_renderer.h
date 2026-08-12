@@ -16,6 +16,7 @@
 #include <wrl/client.h>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -166,6 +167,19 @@ void AddGameSurface(uint32_t object, uint32_t width, uint32_t height,
 // arrives, including one whose draws are all filtered; an empty render-thread
 // tick still re-presents the previous frame.
 void ClearGameDraws();
+
+// Hand this tick's AddGameDraw cost to the phase breakdown reported at the end
+// of EndFrame.
+//
+// Every figure we have had about the render tick so far was inferred from how
+// far apart two periodic log lines landed, and two hypotheses built that way --
+// a retirement list that failed to drain, and a per-vertex cost -- were both
+// wrong. This is the one phase the renderer cannot time for itself: the loop
+// runs in the render thread's own function, before BeginFrame is called.
+//
+// `draws` is the number of AddGameDraw calls, not the number that survived
+// them, so a per-call figure can be taken from it.
+void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
 
   [[nodiscard]] ID3D12Device* GetDevice() const noexcept { return m_device.Get(); }
   [[nodiscard]] ID3D12GraphicsCommandList* GetCommandList() const noexcept {
@@ -905,6 +919,50 @@ void ClearGameDraws();
 
   // Release everything the GPU has finished with. Cheap and called per frame.
   void DrainRetired();
+
+  // RENDER-THREAD PHASE TIMING.
+  //
+  // The render tick is the whole of the frame cost: the guest's own VdSwap never
+  // once exceeded 50ms (`VdSwap orig` has zero log lines in mx_1032), its
+  // translation work is ~470ms of `FRAME COST`, and the remaining ~3.7s is the
+  // guest parked in SetDrawCalls waiting for this thread. Yet nothing here was
+  // ever timed, so which of the four phases spends it is unknown -- and the
+  // spacing-of-log-lines estimates that stood in for a measurement produced two
+  // hypotheses that were both wrong.
+  //
+  // Microseconds, accumulated for one tick and reset when it is reported. The
+  // four are disjoint and, with the sleep, sum to the tick period, so a phase
+  // that fails to account for the growth is ruled out rather than argued about.
+  uint64_t m_phaseAddDrawsUs = 0;    // the caller's AddGameDraw loop
+  uint32_t m_phaseAddDraws = 0;      // how many calls that was
+  uint64_t m_phaseRecordUs = 0;      // RenderGameFrame
+  uint64_t m_phaseSubmitUs = 0;      // PresentGameFrame + Close + Execute + Present
+  uint64_t m_phaseFenceWaitUs = 0;   // MoveToNextFrame waiting on the GPU
+  uint64_t m_phaseRetireUs = 0;      // DrainRetired
+  // Wall clock between consecutive EndFrame exits: the tick period the guest is
+  // actually blocked behind, including the render thread's 16ms sleep.
+  std::chrono::steady_clock::time_point m_tickEnd{};
+
+  // Print the split and reset it. Called at both of EndFrame's exits, so a tick
+  // that died on a failed Close still reports where it had got to.
+  void ReportTickPhases();
+
+  // CreateCommittedResource, counted and timed.
+  //
+  // The leading suspect for the growth is the upload-heap churn in AddGameDraw
+  // (see the PERF note there): ~4,800 committed resources created and retired
+  // per guest frame, ~1.4 million over a session. The call COUNT is fixed by the
+  // draw count and is not the question; whether each call gets slower as the
+  // driver's allocator fragments is. Reported as a mean per call so that is
+  // legible directly.
+  uint64_t m_committedCalls = 0;
+  uint64_t m_committedUs = 0;
+  HRESULT CreateTimedCommittedResource(const D3D12_HEAP_PROPERTIES* heap,
+                                       D3D12_HEAP_FLAGS flags,
+                                       const D3D12_RESOURCE_DESC* desc,
+                                       D3D12_RESOURCE_STATES state,
+                                       const D3D12_CLEAR_VALUE* clear,
+                                       REFIID riid, void** out);
 
   Microsoft::WRL::ComPtr<ID3D12Resource> m_gameRT;
   Microsoft::WRL::ComPtr<ID3D12Resource> m_gameDepth;
