@@ -17,8 +17,17 @@ Two entry points over one decoder:
 
   verify      python tools/xenos_shader_disasm.py --verify logs/hlsldump/*.txt
               Cross-checks this decoder against the renderer's C++ one over a
-              corpus of real dumps. The C++ side is the oracle. Currently
-              agrees with it on all 160 dumps that carry microcode.
+              corpus of real dumps. The C++ side is the oracle. Note that both
+              are ours, so a mistake shared by the two agrees with itself --
+              which is exactly what happened with mask-less scalar ops. Prefer
+              --xenia when a Xenia dump is available.
+
+  xenia       python tools/xenos_shader_disasm.py --xenia <dir> [dumps...]
+              Diffs this decoder against XENIA's disassembly of the same
+              microcode, paired by SHA-1 of the bytes rather than by name.
+              <dir> is a Xenia shader dump (the *.ucode.bin.* / *.ucode.*
+              pairs). Defaults to logs/hlsldump/*.txt when no dumps are given.
+              An independent implementation, so it catches what --verify cannot.
 
   scan-file   python tools/xenos_shader_disasm.py --scan-file <binary>
               Scans a raw binary. Note that assets/default.xex is LZX
@@ -53,6 +62,8 @@ contain an exec or terminate, produced 586,594 "shader blocks" of which 522k
 were 1-2 "ops". None of them were shaders.
 """
 
+import glob
+import hashlib
 import os
 import re
 import struct
@@ -391,6 +402,16 @@ class AluInstruction(object):
     scalar_clamp = property(lambda s: bool(bits(s.w0, 25, 1)))
     scalar_opcode = property(lambda s: bits(s.w0, 26, 6))
 
+    # Exports mask differently: both halves write vector_dest, and components
+    # neither half claims can come from the constant 0/1 encoding instead.
+    # Transcribed from ucode.h:1992-2003.
+    const0_write_mask = property(
+        lambda s: (0xF & ~(s.vector_write_mask | s.scalar_write_mask))
+        if (s.is_export and s.scalar_dest_rel) else 0)
+    const1_write_mask = property(
+        lambda s: (s.vector_write_mask & s.scalar_write_mask)
+        if s.is_export else 0)
+
     # -- word 1 ------------------------------------------------------------
     src3_swiz = property(lambda s: bits(s.w1, 0, 8))
     src2_swiz = property(lambda s: bits(s.w1, 8, 8))
@@ -567,7 +588,12 @@ def format_alu(alu):
 
     vop = alu.vector_opcode_name
     vmask = alu.vector_write_mask
-    if vmask or vop.startswith("kill") or vop.startswith("setp"):
+    # An export with an empty vector mask can still write through the constant
+    # 0/1 encoding (`max oC0._000, r0, r0`), and maxa is issued for a0 alone.
+    # Same rule as has_vector in shader_hlsl.cpp.
+    if (vmask or alu.const0_write_mask or alu.const1_write_mask
+            or vop == "maxa"
+            or vop.startswith("kill") or vop.startswith("setp")):
         if alu.is_export:
             dest = "export%d" % alu.vector_dest
             if alu.vector_dest == POSITION_EXPORT_REGISTER:
@@ -584,20 +610,25 @@ def format_alu(alu):
 
     sop = alu.scalar_opcode_name
     smask = alu.scalar_write_mask
-    if smask or sop.startswith("kills") or sop.startswith("setp") \
-            or sop == "retain_prev":
-        if alu.is_export:
-            dest = "export%d" % alu.scalar_dest
-        elif alu.scalar_dest_rel:
-            dest = "r[aL+%d]" % alu.scalar_dest
-        else:
-            dest = "r%d" % alu.scalar_dest
-        srcs = format_scalar_sources(alu, sop)
-        lines.append("%s%s%s %s%s%s" % (
-            pred, sop, "_sat" if alu.scalar_clamp else "",
-            dest, write_mask_str(smask), (", " + srcs) if srcs else ""))
+    # The scalar half prints unconditionally. An empty write mask does NOT mean
+    # the slot is idle: ps is written by every scalar issue, and the ops that
+    # exist purely for that side effect (a maxs feeding the next instruction's
+    # muls_prev) carry no mask at all. Gating the print on the mask hid exactly
+    # those -- which is why --verify agreeing with the C++ decoder proved
+    # nothing, since both had the same blind spot. Xenia prints them with an
+    # empty mask as `r0._`; so do we.
+    if alu.is_export:
+        dest = "export%d" % alu.scalar_dest
+    elif alu.scalar_dest_rel:
+        dest = "r[aL+%d]" % alu.scalar_dest
+    else:
+        dest = "r%d" % alu.scalar_dest
+    srcs = format_scalar_sources(alu, sop)
+    lines.append("%s%s%s %s%s%s" % (
+        pred, sop, "_sat" if alu.scalar_clamp else "",
+        dest, write_mask_str(smask), (", " + srcs) if srcs else ""))
 
-    return lines or ["nop"]
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -1321,6 +1352,190 @@ def run_verify_mode(paths):
 
 
 # ---------------------------------------------------------------------------
+# Xenia cross-check - the only reference that is not us
+# ---------------------------------------------------------------------------
+
+# `/*   31   */` is an instruction slot; `/*    3.1 */` is a control-flow slot.
+XENIA_SLOT_RE = re.compile(r"^\s*/\*\s*(\d+)\s*\*/\s*(.*)$")
+XENIA_COISSUE_RE = re.compile(r"^\s*\+\s*(.*)$")
+
+
+def parse_xenia_listing(path):
+    """Xenia's own disassembly, as {address: [mnemonic, ...]}.
+
+    First entry is the vector or fetch half, any second entry the co-issued
+    scalar. Mnemonics only: the operand notation differs between the two
+    disassemblers in ways that are cosmetic, while a mnemonic disagreement never
+    is.
+    """
+    slots = {}
+    current = None
+    # Xenia prints the serialize flag on a line of its own, with the actual
+    # instruction on the next line and no slot marker of its own.
+    continued = False
+    with open(path, "r") as handle:
+        for line in handle:
+            match = XENIA_SLOT_RE.match(line)
+            if match:
+                current = int(match.group(1))
+                body = match.group(2).strip()
+                continued = body == "serialize"
+                if body and not continued:
+                    slots.setdefault(current, []).append(body.split())
+                continue
+            match = XENIA_COISSUE_RE.match(line)
+            if match and current is not None:
+                body = match.group(1).strip()
+                if body:
+                    slots.setdefault(current, []).append(body.split())
+                continue
+            if continued and current is not None and line.strip():
+                slots.setdefault(current, []).append(line.split())
+                continued = False
+    return slots
+
+
+def _normalise_mnemonic(mnemonic):
+    """Drop the notation the two disassemblers spell differently.
+
+    The saturate suffix rides on the operands here and on the mnemonic there,
+    the predicate prefix is a separate token, and Xenia capitalises tfetchCube.
+    None of the three is a decode disagreement.
+    """
+    mnemonic = mnemonic.lower()
+    if mnemonic.endswith("_sat"):
+        mnemonic = mnemonic[:-4]
+    return mnemonic
+
+
+def _mnemonics(token_lists):
+    """Mnemonic per printed half, with notation and empty slots removed."""
+    out = []
+    for tokens in token_lists:
+        # A predicate prefix, "(p0)" or "(!p0)", is its own token on both sides.
+        tokens = [t for t in tokens if not t.startswith("(")]
+        if tokens:
+            out.append(_normalise_mnemonic(tokens[0]))
+    return out
+
+
+def run_xenia_mode(xenia_dir, paths):
+    """Diff this decoder against Xenia's disassembly of the same microcode.
+
+    --verify only ever compared this file to the renderer's C++ decoder, so a
+    mistake both of them made agreed with itself. Xenia is an independent
+    implementation, and its shader dump carries the raw microcode alongside the
+    listing, so pairing is exact rather than by name: SHA-1 over the bytes.
+    Xenia writes them little-endian, the renderer's dumps are big-endian hex.
+    """
+    index = {}
+    for entry in sorted(glob.glob(os.path.join(xenia_dir, "*.ucode.bin.*"))):
+        listing = entry.replace(".ucode.bin.", ".ucode.")
+        if not os.path.exists(listing):
+            continue
+        # A dump directory can be written while this runs, so a path from the
+        # glob is not a promise the file is still there.
+        try:
+            with open(entry, "rb") as handle:
+                index[hashlib.sha1(handle.read()).hexdigest()] = listing
+        except (IOError, OSError):
+            continue
+
+    print("Diff against Xenia's disassembly")
+    print("  %d Xenia listings indexed from %s" % (len(index), xenia_dir))
+
+    paired = unpaired = 0
+    divergent = []
+    for path in sorted(paths):
+        try:
+            dwords = load_dwords(path)
+        except (IOError, OSError, NoMicrocodeError, struct.error):
+            continue
+        if not dwords:
+            continue
+        digest = hashlib.sha1(
+            b"".join(struct.pack("<I", w & 0xFFFFFFFF) for w in dwords)
+        ).hexdigest()
+        listing = index.get(digest)
+        if listing is None:
+            unpaired += 1
+            continue
+        paired += 1
+
+        try:
+            shader = decode_shader(dwords)
+        except DecodeError as exc:
+            divergent.append((path, listing, ["decode failed: %s" % exc]))
+            continue
+
+        theirs = parse_xenia_listing(listing)
+        notes = []
+        for address, is_fetch, instruction in shader.instructions:
+            printed = _mnemonics(theirs.get(address, []))
+            if not printed:
+                continue
+            if is_fetch:
+                mine = [_normalise_mnemonic(format_fetch(instruction).split()[0])]
+                if mine != printed:
+                    notes.append("  %4d  fetch mine=%-22s xenia=%s"
+                                 % (address, mine[0], "+".join(printed)))
+                continue
+
+            # Xenia prints one line per half but omits a half it considers
+            # idle, and the surviving line is not tagged, so position cannot say
+            # which half it is. Classify each printed mnemonic against THIS
+            # instruction's two decoded opcode names instead, and compare only
+            # the halves Xenia actually printed. What is being checked is the
+            # decode; whether either disassembler chooses to print an idle half
+            # is presentation, and the two disagree about that harmlessly.
+            vname = _normalise_mnemonic(instruction.vector_opcode_name)
+            sname = _normalise_mnemonic(instruction.scalar_opcode_name)
+            unclaimed = []
+            for mnemonic in printed:
+                if mnemonic == vname or mnemonic == sname:
+                    continue
+                unclaimed.append(mnemonic)
+            for mnemonic in unclaimed:
+                notes.append("  %4d  xenia=%-22s mine: vector=%s scalar=%s"
+                             % (address, mnemonic, vname, sname))
+
+            # Printing policy is presentation, with one exception worth a guard:
+            # if Xenia shows both halves and we show fewer lines, we are hiding
+            # a half it considers live. That is the exact shape of the mask-less
+            # scalar bug this mode was written to catch, so it stays checked.
+            shown = len(_mnemonics(line.split() for line in
+                                   format_alu(instruction)))
+            if len(printed) > shown:
+                notes.append("  %4d  xenia prints %d half/halves, we print %d"
+                             % (address, len(printed), shown))
+        if notes:
+            divergent.append((path, listing, notes))
+
+    print("  %d paired, %d with no Xenia counterpart" % (paired, unpaired))
+    # Nothing compared is not the same as nothing wrong. Reporting "ok" over an
+    # empty set is the false all-clear this whole mode exists to prevent.
+    if not paired:
+        print("  FAIL  nothing to compare -- no dump paired with a Xenia "
+              "listing. Check the directory is a Xenia shader dump and is "
+              "not mid-write.")
+        return 1
+    if not divergent:
+        print("  ok    every paired shader agrees, slot for slot")
+        return 0
+
+    print("  FAIL  %d shader(s) diverge" % len(divergent))
+    for path, listing, notes in divergent:
+        print("")
+        print("  %s  vs  %s" % (os.path.basename(path),
+                                os.path.basename(listing)))
+        for note in notes[:12]:
+            print(note)
+        if len(notes) > 12:
+            print("        ... %d more" % (len(notes) - 12))
+    return 1
+
+
+# ---------------------------------------------------------------------------
 # Self-test
 # ---------------------------------------------------------------------------
 
@@ -1491,6 +1706,18 @@ def main():
     if "--verify" in args:
         args.remove("--verify")
         return run_verify_mode([a for a in args if not a.startswith("-")])
+
+    if "--xenia" in args:
+        at = args.index("--xenia")
+        if at + 1 >= len(args):
+            print("--xenia needs the directory holding Xenia's shader dump")
+            return 1
+        xenia_dir = args[at + 1]
+        del args[at:at + 2]
+        targets = [a for a in args if not a.startswith("-")]
+        if not targets:
+            targets = glob.glob(os.path.join("logs", "hlsldump", "*.txt"))
+        return run_xenia_mode(xenia_dir, targets)
 
     if "--scan-file" in args:
         args.remove("--scan-file")
