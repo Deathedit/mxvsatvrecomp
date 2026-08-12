@@ -481,6 +481,17 @@ bool D3D12Renderer::CreateTranslatedRootSignature() {
   samplerRange.BaseShaderRegister = 0;
   samplerRange.OffsetInDescriptorsFromTableStart = 0;
 
+  // The VERTEX stage's own ranges, at t17+/s16+. Separate tables rather than
+  // making the pixel ones ALL-visible: the two stages are translated and cached
+  // independently, so their compact slot 0 is a different guest sampler, and
+  // one shared table would hand the vertex stage the pixel stage's textures.
+  // t16 is skipped -- it is the raw vertex buffer's root SRV below.
+  D3D12_DESCRIPTOR_RANGE vsSrvRange = srvRange;
+  vsSrvRange.BaseShaderRegister = mx::hle::HlslShader::kVertexTextureBaseRegister;
+  D3D12_DESCRIPTOR_RANGE vsSamplerRange = samplerRange;
+  vsSamplerRange.BaseShaderRegister =
+      mx::hle::HlslShader::kVertexSamplerBaseRegister;
+
   D3D12_ROOT_PARAMETER rootParams[3] = {};
   // b0, vertex: the same transform CBV the stand-in vertex shader takes, so the
   // passthrough VS below can share the per-draw constant buffer already built.
@@ -524,9 +535,27 @@ bool D3D12Renderer::CreateTranslatedRootSignature() {
   params[4].Descriptor.RegisterSpace = 0;
   params[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
 
+  // t17.., s16..: the vertex stage's textures. Always present in the signature
+  // even though most draws have no sampling vertex shader — a root signature is
+  // per-pipeline and these cost two unused root parameters on the draws that do
+  // not use them, against recompiling a second signature for the ones that do.
+  D3D12_ROOT_PARAMETER vsTex[2] = {};
+  vsTex[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  vsTex[0].DescriptorTable.NumDescriptorRanges = 1;
+  vsTex[0].DescriptorTable.pDescriptorRanges = &vsSrvRange;
+  vsTex[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+  vsTex[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+  vsTex[1].DescriptorTable.NumDescriptorRanges = 1;
+  vsTex[1].DescriptorTable.pDescriptorRanges = &vsSamplerRange;
+  vsTex[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+
+  D3D12_ROOT_PARAMETER allParams[7] = {params[0], params[1], params[2],
+                                       params[3], params[4], vsTex[0],
+                                       vsTex[1]};
+
   D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
-  rootDesc.NumParameters = 5;
-  rootDesc.pParameters = params;
+  rootDesc.NumParameters = 7;
+  rootDesc.pParameters = allParams;
   rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
 
   Microsoft::WRL::ComPtr<ID3DBlob> sigBlob, errBlob;
@@ -592,6 +621,31 @@ bool D3D12Renderer::CreateTranslatedRootSignature() {
   }
   LogInfo("CreateTranslatedRootSignature: ready");
   return true;
+}
+
+// xe_texsign for the VERTEX stage, which lives at the very end of that stage's
+// cbuffer -- after xe_vf, so that the fixed vfOffset the fetch path writes to
+// does not move. See the declaration in EmitShaderHlsl.
+//
+// The default is 1.0, NOT the 0 the surrounding memset leaves. The shader
+// computes `v * xe_texsign + (1 - xe_texsign)`, so a zero scale turns every
+// sample into a constant 1.0 -- white -- rather than into an unmodified sample.
+// A plain unsigned fetch needs a scale of exactly one.
+void D3D12Renderer::FillVertexTextureSigns(const GameDraw& d, uint8_t* cb,
+                                           uint32_t cbBytes,
+                                           uint32_t constDwords) {
+  const uint32_t at = constDwords * 4 + kTranslatedSamplerSlots * 16 +
+                      mx::hle::HlslShader::kMaxVertexFetches * 16;
+  if (!cb || at + kTranslatedSamplerSlots * 16 > cbBytes) return;
+  auto* sign = reinterpret_cast<float*>(cb + at);
+  for (uint32_t s = 0; s < kTranslatedSamplerSlots; ++s) {
+    // Two bits per component, host order, exactly as the pixel path decodes it:
+    // 0 is plain unsigned (scale 1) and kUnsignedBiased is 2*c-1 (scale 2).
+    const uint8_t signs =
+        s < d.vertexSamplerCount ? d.vertexSamplerSigns[s] : 0u;
+    for (uint32_t c = 0; c < 4; ++c)
+      sign[s * 4 + c] = ((signs >> (c * 2)) & 3u) == 2u ? 2.0f : 1.0f;
+  }
 }
 
 bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
@@ -4142,9 +4196,17 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
     // xe_texinv, so its cbuffer is longer. Sized for it unconditionally: the
     // tail is zeroed either way and 512 spare bytes per draw is not worth a
     // second size.
+    //
+    // float4 xe_texsign[slots] follows xe_vf and is counted here too. It is
+    // LAST on purpose: the renderer writes xe_vf at a fixed offset computed
+    // from the two members before it, so appending is the only way to add to
+    // this cbuffer without moving that. Leaving it out of the size was the
+    // trap this comment already warns about -- the shader declares it either
+    // way, so an unsized tail is a read past the end of the resource.
     const uint32_t vsConstBytes =
         ((vertexStage->constDwords * 4 + kTranslatedSamplerSlots * 16 +
-          mx::hle::HlslShader::kMaxVertexFetches * 16) + 255u) & ~255u;
+          mx::hle::HlslShader::kMaxVertexFetches * 16 +
+          kTranslatedSamplerSlots * 16) + 255u) & ~255u;
     if (vertexStage->rawBytes) {
       // The fetch path: one raw buffer, no vertex buffer view, and xe_vf[]
       // written into the cbuffer tail immediately after xe_texinv.
@@ -4164,6 +4226,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
             vertexStage->constDwords * 4 + kTranslatedSamplerSlots * 16;
         std::memcpy(p + vfOffset, vertexStage->rawFetch,
                     vertexStage->rawFetchCount * 16);
+        FillVertexTextureSigns(d, p, vsConstBytes, vertexStage->constDwords);
         d.vertexShaderHandle = vertexStage->handle;
         d.vertexShaderHlsl = vertexStage->hlsl;
         d.vertexInputCount = 0;
@@ -4186,6 +4249,8 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
       std::memset(d.vscb.cpu, 0, vsConstBytes);
       std::memcpy(d.vscb.cpu, vertexStage->constants,
                   vertexStage->constDwords * 4);
+      FillVertexTextureSigns(d, d.vscb.cpu, vsConstBytes,
+                             vertexStage->constDwords);
       d.vertexShaderHandle = vertexStage->handle;
       d.vertexShaderHlsl = vertexStage->hlsl;
       d.vertexInputCount = vertexStage->regCount;

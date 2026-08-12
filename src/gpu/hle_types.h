@@ -343,6 +343,26 @@ struct DrawCall {
   // Per-BINDING state, not per-texture -- the same guest memory is bound with
   // different sign modes by different draws.
   std::array<uint8_t, kMaxPixelTextures> pixel_sampler_signs = {};
+
+  // The VERTEX stage's samplers, in exactly the same shape as the pixel ones
+  // above and resolved by the same code.
+  //
+  // A vertex shader that fetches a texture -- terrain displacement is the case
+  // that made this necessary -- used to be refused the GPU vertex path
+  // outright, and the CPU interpreter it fell back to has no texture fetch at
+  // all. Its samples came out as zeros, so the positions were silently wrong,
+  // not merely slow: 35,938 draws in mx_1037.
+  //
+  // These are a SEPARATE descriptor range from the pixel ones (t17+/s16+, see
+  // HlslShader::kVertexTextureBaseRegister) because the two stages are
+  // translated and cached independently, so their compact slot 0 means
+  // different guest samplers.
+  uint32_t vertex_sampler_count = 0;
+  uint32_t vertex_sampler_array_mask = 0;
+  std::array<std::shared_ptr<const HleTexturePayload>, kMaxPixelTextures>
+      vertex_textures;
+  std::array<uint32_t, kMaxPixelTextures> vertex_sampled_objects = {};
+  std::array<uint8_t, kMaxPixelTextures> vertex_sampler_signs = {};
   // The interpolators the translated pixel shader reads, one float4 per
   // linkage slot per vertex, in a buffer parallel to `vertices`.
   //

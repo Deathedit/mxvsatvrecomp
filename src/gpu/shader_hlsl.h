@@ -141,6 +141,23 @@ struct HlslShader {
   uint32_t sampler_count = 0;
   uint32_t sampler_slot_guest[kMaxSamplerSlots] = {};
 
+  // Base HLSL register for this stage's textures and samplers.
+  //
+  // The two stages CANNOT share t0/s0. They are translated and cached
+  // independently, keyed by guest shader handle, so a vertex shader's compact
+  // slot 0 and a pixel shader's compact slot 0 are different guest samplers
+  // that happen to have the same index -- one descriptor table serving both
+  // would hand the vertex stage the pixel stage's textures.
+  //
+  // So the vertex stage is moved out of the way: t17..t32 and s16..s31, and the
+  // pixel stage keeps t0..t15 / s0..s15 so nothing about the common path
+  // changes. t16 is skipped because it is the raw vertex buffer's root SRV
+  // (see the note on params[4] in the translated root signature).
+  static constexpr uint32_t kPixelTextureBaseRegister = 0;
+  static constexpr uint32_t kPixelSamplerBaseRegister = 0;
+  static constexpr uint32_t kVertexTextureBaseRegister = 17;
+  static constexpr uint32_t kVertexSamplerBaseRegister = 16;
+
   // Bit i set = compact slot i is declared Texture2DArray, not Texture2D,
   // because its fetches are cube. The binder MUST create a TEXTURE2DARRAY SRV
   // for those slots: an SRV whose dimension contradicts the declaration is

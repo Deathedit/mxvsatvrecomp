@@ -607,6 +607,11 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // Points `out` at a block holding this draw's textures. False when a block
   // could not be allocated or a slot had no resource, in which case the draw
   // must fall back rather than sample an undefined descriptor.
+  // Writes xe_texsign for the VERTEX stage into the tail of its constant
+  // buffer. Defaults to 1.0 rather than the surrounding memset's 0, which the
+  // shader would apply as "sample becomes constant white".
+  static void FillVertexTextureSigns(const GameDraw& d, uint8_t* cb,
+                                     uint32_t cbBytes, uint32_t constDwords);
   bool BindTranslatedTextures(const GameDraw& d,
                               D3D12_GPU_DESCRIPTOR_HANDLE& out);
   // Points `out` at a block holding one sampler per texture slot, matching the
@@ -919,6 +924,19 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // kUnsignedBiased and the shader must expand it as 2*c-1. Already
     // permuted into host component order by the hooks side.
     std::array<uint8_t, kTranslatedSamplerSlots> pixelSamplerSigns = {};
+
+    // The VERTEX stage's samplers, same shape as the pixel ones above. Bound
+    // through a SEPARATE descriptor range (t17+/s16+) because the two stages
+    // are translated and cached independently, so their compact slot 0 names
+    // different guest samplers. Zero for the overwhelming majority of draws --
+    // a vertex shader that samples is terrain displacement and similar.
+    uint32_t vertexSamplerCount = 0;
+    uint32_t vertexSamplerArrayMask = 0;
+    std::array<std::shared_ptr<const mx::hle::HleTexturePayload>,
+               kTranslatedSamplerSlots> vertexTextures;
+    std::array<uint32_t, kTranslatedSamplerSlots> vertexSampledObjects = {};
+    std::array<uint8_t, kTranslatedSamplerSlots> vertexSamplerSigns = {};
+
     // Zero when disabled, otherwise one plus SQ_CONTEXT_MISC.param_gen_pos.
     uint32_t pixelParamGen = 0;
     bool translated = false;

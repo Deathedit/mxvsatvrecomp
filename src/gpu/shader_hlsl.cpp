@@ -818,10 +818,11 @@ class Emitter {
     // kSigned needs the texture's bits reinterpreted and so is a host-side
     // decode, not this; kGamma is a curve and cannot ride a scale. Both are
     // refused upstream rather than silently approximated by a mad.
-    if (pixel()) {
-      Line("xe_v = xe_v * xe_texsign[" + s + "] + (1.0 - xe_texsign[" + s +
-           "]);");
-    }
+    // Both stages. xe_texsign is declared for the vertex stage too (at the end
+    // of its cbuffer, past xe_vf), so a sampling vertex shader gets the same
+    // correction rather than silently reading a biased texture as unsigned.
+    Line("xe_v = xe_v * xe_texsign[" + s + "] + (1.0 - xe_texsign[" + s +
+         "]);");
     EmitFetchDestination(tf);
   }
 
@@ -1217,10 +1218,7 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   src += "  float4 xe_texinv[" + std::to_string(HlslShader::kMaxSamplerSlots) +
          "];\n";
   // Per-component TextureSign scale, host component order, 1.0 where the fetch
-  // is plain unsigned. See the note at the fetch site. Pixel stage only, both
-  // because no vertex shader in this game samples anything and because the
-  // vertex cbuffer's xe_vf is addressed by the renderer at a fixed offset just
-  // past xe_texinv -- adding a member there would silently move it.
+  // is plain unsigned. See the note at the fetch site.
   if (stage == HlslStage::kPixel) {
     src += "  float4 xe_texsign[" +
            std::to_string(HlslShader::kMaxSamplerSlots) + "];\n";
@@ -1239,6 +1237,20 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   if (stage != HlslStage::kPixel) {
     src += "  uint4 xe_vf[" + std::to_string(HlslShader::kMaxVertexFetches) +
            "];\n";
+    // AFTER xe_vf, deliberately. The renderer writes xe_vf at a FIXED byte
+    // offset computed as constDwords*4 + kMaxSamplerSlots*16 (d3d12_game.cpp,
+    // the vfOffset in the fetch path), so anything inserted between xe_texinv
+    // and xe_vf silently moves the vertex fetch table and corrupts every
+    // GPU-fetched attribute. Appending leaves that offset exactly where it was
+    // and puts the new member somewhere nothing indexes by hand.
+    //
+    // The comment this replaces said the vertex stage needed no texture sign
+    // "because no vertex shader in this game samples anything". That was
+    // measured false: 35,938 draws in mx_1037 were refused the GPU vertex path
+    // for having a sampler, and the interpreter they fell to has no texture
+    // fetch at all -- so their vertex positions came out as silent zeros.
+    src += "  float4 xe_texsign[" +
+           std::to_string(HlslShader::kMaxSamplerSlots) + "];\n";
   }
   src += "};\n";
   // RECIP_FF / RECIPSQ_FF: an infinity becomes a signed zero. See the note at
@@ -1372,19 +1384,28 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
         "               XeSwap8in16(v.w));\n"
         "}\n";
   }
-  // Declared for EVERY slot up to sampler_count, contiguously from t0/s0, so
-  // the registers match a descriptor table of exactly that width.
+  // Declared for EVERY slot up to sampler_count, contiguously from this stage's
+  // base register, so the registers match a descriptor table of exactly that
+  // width. The two stages use different bases and so different tables — see
+  // HlslShader::kVertexTextureBaseRegister for why they cannot share one.
   //
   // A slot fetched as a cube is declared Texture2DArray: the guest projects the
   // direction to (S, T, face) itself, so an array indexed by face is what its
   // operands already describe. BindTranslatedTextures must give that slot a
   // TEXTURE2DARRAY SRV to match — see HlslShader::sampler_array_mask.
+  const uint32_t tex_base = stage == HlslStage::kPixel
+                                ? HlslShader::kPixelTextureBaseRegister
+                                : HlslShader::kVertexTextureBaseRegister;
+  const uint32_t smp_base = stage == HlslStage::kPixel
+                                ? HlslShader::kPixelSamplerBaseRegister
+                                : HlslShader::kVertexSamplerBaseRegister;
   for (uint32_t s = 0; s < em.sampler_count; ++s) {
     const std::string n = std::to_string(s);
     const bool array = (em.slot_array_mask >> s) & 1u;
     src += array ? "Texture2DArray<float4> xe_tex" : "Texture2D<float4> xe_tex";
-    src += n + " : register(t" + n + ");\n";
-    src += "SamplerState xe_smp" + n + " : register(s" + n + ");\n";
+    src += n + " : register(t" + std::to_string(tex_base + s) + ");\n";
+    src += "SamplerState xe_smp" + n + " : register(s" +
+           std::to_string(smp_base + s) + ");\n";
   }
 
   const uint32_t link = interpolator_count;
