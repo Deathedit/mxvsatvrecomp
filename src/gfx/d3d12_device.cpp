@@ -254,12 +254,30 @@ bool D3D12Renderer::Initialize(HWND hwnd) {
     size_t len = 0;
     if (getenv_s(&len, value, sizeof(value), "MX_D3D12_DRED") == 0 && len)
       dred = std::atoi(value) != 0;
-    Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dredSettings;
-    if (dred &&
-        SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dredSettings)))) {
-      dredSettings->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-      dredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
-      LogInfo("DRED enabled (auto-breadcrumbs + page fault).");
+    if (dred) {
+      Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedDataSettings> dredSettings;
+      const HRESULT dhr = D3D12GetDebugInterface(IID_PPV_ARGS(&dredSettings));
+      if (SUCCEEDED(dhr)) {
+        dredSettings->SetAutoBreadcrumbsEnablement(
+            D3D12_DRED_ENABLEMENT_FORCED_ON);
+        dredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        LogInfo("DRED enabled (auto-breadcrumbs + page fault).");
+      } else {
+        // Logged loudly rather than skipped. The first build of this reported
+        // only on success, so a failure looked exactly like a run where the
+        // fault never happened -- an instrument that cannot say "I am not
+        // armed" is worse than none. 0x887E0003 is DXGI_ERROR_SDK_COMPONENT_
+        // MISSING: D3D12GetDebugInterface needs the "Graphics Tools" optional
+        // Windows feature, which is not installed by default.
+        char buf[160] = {};
+        std::snprintf(buf, sizeof(buf),
+                      "DRED NOT ENABLED: D3D12GetDebugInterface HR=0x%08lX%s",
+                      dhr,
+                      dhr == 0x887E0003
+                          ? " (install the Graphics Tools optional feature)"
+                          : "");
+        LogError(buf);
+      }
     }
   }
 
