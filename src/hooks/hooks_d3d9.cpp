@@ -3667,7 +3667,13 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
       static uint32_t s_dumped = 0;
       static uint32_t s_dumpedFailed = 0;
       uint32_t& budget = compiled ? s_dumped : s_dumpedFailed;
-      const uint32_t cap = compiled ? 160u : 32u;
+      // 160 was a menu-sized budget: a freeroam session saturates it, and a
+      // saturated cap silently truncates the corpus that
+      // `xenos_shader_disasm.py --xenia` diffs against Xenia. Xenia's dump of
+      // this title holds 269 distinct blobs (70 vertex, 199 pixel), so 512
+      // leaves headroom without pretending to be unbounded. The directory is
+      // emptied once per process, and a dump is ~15 KB.
+      const uint32_t cap = compiled ? 512u : 64u;
       if (budget < cap) {
         ++budget;
         std::error_code ec;
@@ -3694,6 +3700,12 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
             << out.input_mask << " export_mask 0x" << out.export_mask
             << " dropped_export_mask 0x" << out.dropped_export_mask << std::dec
             << " writes_position " << (out.writes_position ? 1 : 0);
+          // Only when non-zero, so its presence in a dump means something.
+          if (out.unhonoured_predicate_ops)
+            f << "\n; UNHONOURED PREDICATE OPS: "
+              << out.unhonoured_predicate_ops
+              << " (setp_* translated for its value; p0 is not acted on, so "
+                 "this shader may run instructions the console skipped)";
           if (!compiled) f << "\n; FXC REJECTED: " << compile_error;
           // The guest's own bits, so a translation can be checked against its
           // INPUT instead of against itself.
@@ -3789,7 +3801,8 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
           // why. Written before the source is moved out of `fetched`.
           {
             static uint32_t s_vf_dumped = 0;
-            if (s_vf_dumped < 96) {
+            // Saturated at 96 in a freeroam run; see the cap note above.
+            if (s_vf_dumped < 256) {
               ++s_vf_dumped;
               EnsureHlslDumpDir();
               char vpath[128];
