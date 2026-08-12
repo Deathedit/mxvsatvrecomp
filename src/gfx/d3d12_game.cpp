@@ -1355,13 +1355,15 @@ bool D3D12Renderer::EnsureYuvPlanes(const GameDraw& draw,
       // dropping them here: the GPU may still be reading last frame's plane.
       // See RetiredFrame in the header — a command list does not keep the
       // resources it references alive.
-      RetiredFrame& r =
-          (!m_retired.empty() && m_retired.back().fence == m_fenceValue)
-              ? m_retired.back()
-              : m_retired.emplace_back(RetiredFrame{m_fenceValue, {}});
-      if (plane.resource) r.res.push_back(std::move(plane.resource));
+      //
+      // Through RetireResource rather than building a RetiredFrame inline. The
+      // inline form was copied to three sites and every copy carried the same
+      // off-by-one fence tag; one owner means one place to be wrong. It
+      // coalesces into the same RetiredFrame when the fence matches, so this
+      // still produces a single entry.
+      RetireResource(std::move(plane.resource));
       for (auto& up : plane.upload) {
-        if (up) r.res.push_back(std::move(up));
+        RetireResource(std::move(up));
         up.Reset();
       }
       plane.resource.Reset();
@@ -1524,11 +1526,7 @@ bool D3D12Renderer::UploadGameTexture(GameTexture& entry,
     if (upload) {
       // Retire rather than release: a command list does not keep the resources
       // it references alive. Same list the YUV planes use.
-      RetiredFrame& r =
-          (!m_retired.empty() && m_retired.back().fence == m_fenceValue)
-              ? m_retired.back()
-              : m_retired.emplace_back(RetiredFrame{m_fenceValue, {}});
-      r.res.push_back(std::move(upload));
+      RetireResource(std::move(upload));
       upload.Reset();
     }
     if (FAILED(m_device->CreateCommittedResource(
@@ -1724,9 +1722,26 @@ bool D3D12Renderer::EnsureGameTexture(
 void D3D12Renderer::RetireResource(
     Microsoft::WRL::ComPtr<ID3D12Resource>&& res) {
   if (!res) return;
-  RetiredFrame& r = (!m_retired.empty() && m_retired.back().fence == m_fenceValue)
+  // Tag with the fence the frame BEING RECORDED will signal -- m_fenceValue + 1
+  // -- not m_fenceValue itself.
+  //
+  // MoveToNextFrame does `++m_fenceValue` and *then* signals it, so while a
+  // frame is being recorded m_fenceValue names the PREVIOUS submission. Tagging
+  // with it told DrainRetired ("free everything with fence <= completed") that
+  // the resource was reclaimable the moment the previous frame finished -- while
+  // the command list still referencing it was executing. A use-after-free with
+  // a one-frame window.
+  //
+  // Found by DRED: CopyTextureRegion faulting on a page fault at 0x11870000
+  // whose allocations were all RECENTLY FREED, type 34 (RESOURCE). Intermittent
+  // because retirement only happens when a target is REPLACED -- a guest heap
+  // address reused at a different size -- so it needs a level load or an effect
+  // changing resolution to bite at all, and then only if the GPU is still behind
+  // when the next frame drains.
+  const uint64_t pending = m_fenceValue + 1;
+  RetiredFrame& r = (!m_retired.empty() && m_retired.back().fence == pending)
                         ? m_retired.back()
-                        : m_retired.emplace_back(RetiredFrame{m_fenceValue, {}});
+                        : m_retired.emplace_back(RetiredFrame{pending, {}});
   r.res.push_back(std::move(res));
 }
 
