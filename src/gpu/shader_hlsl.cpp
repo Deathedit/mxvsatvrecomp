@@ -202,6 +202,23 @@ class Emitter {
 
   bool pixel() const { return stage_ == HlslStage::kPixel; }
 
+  // How this stage is allowed to spell a texture fetch. `Sample` needs implicit
+  // derivatives, and only a pixel shader has them — FXC answers it in vs_5_0
+  // with "X4532: cannot map expression to vs_5_0 instruction set", which is
+  // what rejected VS 0x26EFD9A0 whole (mx_1030). SampleLevel at an explicit LOD
+  // of 0 is the vertex-stage form; the Xenos fetch carries no gradient either
+  // way, so nothing is lost by naming the level.
+  //
+  // A VERTEX shader that samples is a real shape in this game, not a curiosity:
+  // the engine binds the bone-matrix palette as a texture rather than as a
+  // constant array (see the VS census in hooks_d3d9.cpp).
+  const char* SampleOp() const {
+    return pixel() ? ".Sample(" : ".SampleLevel(";
+  }
+  // Paired with SampleOp: the extra argument SampleLevel takes and Sample does
+  // not. Emitted immediately before the closing paren of the fetch.
+  const char* SampleLod() const { return pixel() ? "" : ", 0"; }
+
   void Line(const std::string& s) { body += "  " + s + "\n"; }
 
   // A temp register read. Recording it as an input the first time it is read
@@ -756,8 +773,9 @@ class Emitter {
       const std::string src = Temp(tf.src());
       const std::string face = std::string(1, kComponent[(swiz >> 4) & 3]);
       const std::string s3 = std::to_string(slot);
-      Line("xe_v = xe_tex" + s3 + ".Sample(xe_smp" + s3 + ", float3(" + src +
-           "." + uv + " - 1.0, " + src + "." + face + "));");
+      Line("xe_v = xe_tex" + s3 + SampleOp() + "xe_smp" + s3 + ", float3(" +
+           src + "." + uv + " - 1.0, " + src + "." + face + ")" + SampleLod() +
+           ");");
       EmitFetchDestination(tf);
       return;
     }
@@ -782,7 +800,8 @@ class Emitter {
       coord = "float2(" + coord + ", 0.5)";
     }
     const std::string s = std::to_string(slot);
-    Line("xe_v = xe_tex" + s + ".Sample(xe_smp" + s + ", " + coord + ");");
+    Line("xe_v = xe_tex" + s + SampleOp() + "xe_smp" + s + ", " + coord +
+         SampleLod() + ");");
     // TEX_FORMAT_COMP / GPUSIGN, applied here because it is per-BINDING state,
     // not per-texture: the same guest memory is bound with different sign modes
     // by different draws, so baking it into the decode would poison a cache
