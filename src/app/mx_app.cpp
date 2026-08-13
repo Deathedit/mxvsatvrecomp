@@ -3,6 +3,7 @@
 #include <rex/cvar.h>
 #include <rex/graphics/flags.h>
 #include <rex/logging.h>
+#include <rex/ppc/context.h>
 
 #include "hooks/native_bridge.h"
 #include "mx_init.h"
@@ -13,6 +14,71 @@ std::unique_ptr<rex::ui::WindowedApp> MxApp::Create(
 }
 
 namespace {
+
+// Which recompiled guest function does a host RIP land in?
+//
+// A host RVA on its own is unusable: the release build ships no PDB, so the
+// first fault of this kind cost an afternoon of PE archaeology — parse the
+// section table, find PPCFuncMappings by its shape, binary-search it by hand —
+// to turn one address into the guest function to open in IDA. The recompiler
+// already publishes that table; the handler may as well read it.
+//
+// PPCFuncMappings is sorted by GUEST address, not by host, so this is a linear
+// sweep for the greatest host entry at or below the RIP, plus the smallest
+// above it. Those two bracket the function, which is what makes the answer a
+// containment result rather than a nearest-neighbour guess: a RIP outside
+// [best, next) is not in recompiled code at all, and saying so is the point.
+// Linear is fine — this runs once, on the way down.
+struct GuestFuncHit {
+  uint32_t guest = 0;
+  uint64_t host = 0;
+  uint64_t next_host = 0;
+};
+
+GuestFuncHit ResolveGuestFunction(uint64_t rip) {
+  GuestFuncHit hit;
+  for (const PPCFuncMapping* m = PPCFuncMappings; m->guest; ++m) {
+    const uint64_t host = reinterpret_cast<uint64_t>(m->host);
+    if (host <= rip) {
+      if (host > hit.host) {
+        hit.host = host;
+        hit.guest = static_cast<uint32_t>(m->guest);
+      }
+    } else if (!hit.next_host || host < hit.next_host) {
+      hit.next_host = host;
+    }
+  }
+  return hit;
+}
+
+bool Readable(const void* p, size_t bytes) {
+  MEMORY_BASIC_INFORMATION mbi{};
+  if (!VirtualQuery(p, &mbi, sizeof(mbi))) return false;
+  if (mbi.State != MEM_COMMIT) return false;
+  const DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                         PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                         PAGE_EXECUTE_WRITECOPY;
+  if ((mbi.Protect & readable) == 0) return false;
+  if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
+  const uint64_t end = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
+  return reinterpret_cast<uint64_t>(p) + bytes <= end;
+}
+
+// Recompiled functions are PPCFunc(PPCContext&, uint8_t* base) and this build
+// passes them in rdi/rsi. Rather than trust that, the guest memory base is the
+// discriminator: whichever argument register pair has the base in its second
+// slot is the live one, and if neither does we are not in recompiled code and
+// print nothing rather than dereferencing a guess inside an exception handler.
+const PPCContext* GuestContextFrom(const CONTEXT* c, uint64_t gbase) {
+  if (!gbase) return nullptr;
+  const uint64_t pairs[][2] = {{c->Rdi, c->Rsi}, {c->Rcx, c->Rdx}};
+  for (const auto& p : pairs) {
+    if (p[1] != gbase) continue;
+    const auto* ctx = reinterpret_cast<const PPCContext*>(p[0]);
+    if (Readable(ctx, sizeof(PPCContext))) return ctx;
+  }
+  return nullptr;
+}
 
 // Crash reporter. The log loses its last lines on a hard fault, which made
 // bisecting the native LoaderTick path unreliable — a probe would appear to
@@ -32,11 +98,59 @@ LONG CALLBACK CrashReporter(EXCEPTION_POINTERS* info) {
     uint64_t rip = reinterpret_cast<uint64_t>(rec->ExceptionAddress);
     REXLOG_ERROR("*** ACCESS VIOLATION: {} at 0x{:016X}, host RIP=0x{:016X} (RVA 0x{:X})", op,
                  fault, rip, rip - modbase);
-    if (gbase && fault >= gbase && fault < gbase + 0x100000000ull) {
+    const bool in_guest =
+        gbase && fault >= gbase && fault < gbase + 0x100000000ull;
+    const uint32_t guest_fault =
+        in_guest ? static_cast<uint32_t>(fault - gbase) : 0;
+    if (in_guest) {
       REXLOG_ERROR("***   -> guest address 0x{:08X} (base 0x{:016X})",
-                   static_cast<uint32_t>(fault - gbase), gbase);
+                   guest_fault, gbase);
     } else {
       REXLOG_ERROR("***   -> NOT in guest range (base 0x{:016X}) — host-side pointer", gbase);
+    }
+
+    const GuestFuncHit hit = ResolveGuestFunction(rip);
+    if (hit.guest && (!hit.next_host || rip < hit.next_host)) {
+      REXLOG_ERROR("***   -> in recompiled guest function 0x{:08X} (+0x{:X} of host code)",
+                   hit.guest, rip - hit.host);
+    } else {
+      REXLOG_ERROR("***   -> not inside any recompiled guest function (nearest below 0x{:08X})",
+                   hit.guest);
+    }
+
+    // The registers are the whole point of catching this: they name which
+    // pointer was bad, and every field of it the guest had already loaded.
+    if (const PPCContext* ctx = GuestContextFrom(info->ContextRecord, gbase)) {
+      // Indexed by hand because PPCContext stores r3 first, ahead of r0, so
+      // the registers are not an array and pointer arithmetic would silently
+      // report the wrong one.
+      const PPCRegister* gpr[32] = {
+          &ctx->r0,  &ctx->r1,  &ctx->r2,  &ctx->r3,  &ctx->r4,  &ctx->r5,
+          &ctx->r6,  &ctx->r7,  &ctx->r8,  &ctx->r9,  &ctx->r10, &ctx->r11,
+          &ctx->r12, &ctx->r13, &ctx->r14, &ctx->r15, &ctx->r16, &ctx->r17,
+          &ctx->r18, &ctx->r19, &ctx->r20, &ctx->r21, &ctx->r22, &ctx->r23,
+          &ctx->r24, &ctx->r25, &ctx->r26, &ctx->r27, &ctx->r28, &ctx->r29,
+          &ctx->r30, &ctx->r31};
+      for (int i = 0; i < 32; i += 4) {
+        REXLOG_ERROR("***   r{:<2}=0x{:08X}  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}  r{:<2}=0x{:08X}",
+                     i, gpr[i]->u32, i + 1, gpr[i + 1]->u32, i + 2,
+                     gpr[i + 2]->u32, i + 3, gpr[i + 3]->u32);
+      }
+      REXLOG_ERROR("***   lr=0x{:08X} ctr=0x{:08X} last-indirect=0x{:08X}",
+                   static_cast<uint32_t>(ctx->lr), ctx->ctr.u32,
+                   ctx->last_indirect_target);
+      // Name the base pointer the faulting access was derived from. A load is
+      // almost always reg+displacement, so the register holding the object is
+      // a little below the fault, not equal to it.
+      if (in_guest) {
+        for (int i = 0; i < 32; ++i) {
+          const uint32_t v = gpr[i]->u32;
+          if (v && guest_fault >= v && guest_fault - v < 0x1000) {
+            REXLOG_ERROR("***   -> faulting access is r{} (0x{:08X}) + 0x{:X}",
+                         i, v, guest_fault - v);
+          }
+        }
+      }
     }
     rex::FlushLogging();
   }
