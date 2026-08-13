@@ -232,10 +232,22 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // A UI font atlas blitted one texel to one pixel is exactly the case that
   // asks for point, and filtering it linearly blends each glyph edge with its
   // neighbour in both axes -- the smeared menu text.
+  // kSamplerBaseMap is the guest's mip_filter == kBaseMap: sample level 0 and
+  // never minify past it. It pins MaxLOD back to MinLOD, which is what MaxLOD
+  // was unconditionally before the mip chain was uploaded.
   static constexpr uint32_t kSamplerClampU = 1;
   static constexpr uint32_t kSamplerClampV = 2;
   static constexpr uint32_t kSamplerPoint = 4;
-  static constexpr uint32_t kSamplerVariantCount = 8;
+  static constexpr uint32_t kSamplerBaseMap = 8;
+  static constexpr uint32_t kSamplerVariantCount = 16;
+  // Both of the limits this sits inside are now EXACTLY full: sixteen variants
+  // fill the reserved block below, and the block cache's key packs four bits
+  // per slot into a uint64_t across sixteen slots. A fifth bit needs the
+  // reserved region sized separately from kSamplerBlockSlots -- 32 + 16 * 126
+  // is still 2048, and only 24 blocks are ever used -- and a key wider than a
+  // uint64_t. Neither is hard; neither is free either.
+  static_assert(kSamplerVariantCount * 4 <= 64,
+                "the sampler block key packs four bits per slot");
 
   // A shader-visible sampler heap is capped at 2048 descriptors, which is what
   // sizes everything below. The first block holds the single-descriptor

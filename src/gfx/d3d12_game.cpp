@@ -73,10 +73,13 @@ using mx::gfx::LogInfo;
 // which is the distinction that matters at a surface edge. Mirror and border
 // are not modelled.
 //
-// MaxLOD is pinned to 0 because only the base mip is ever uploaded, so there is
-// no mip chain for a filter to select from.
+// MaxLOD used to be pinned to 0 because only the base mip was ever uploaded, so
+// there was no chain for a filter to select from. Now there is, and the pin
+// survives only for kSamplerBaseMap -- the guest's own "never minify past level
+// 0", which the reference expresses the same way (MaxLOD = MinLOD, see
+// xenia/gpu/d3d12/d3d12_texture_cache.cc:1086).
 D3D12_SAMPLER_DESC D3D12Renderer::SamplerVariantDesc(uint32_t variant) {
-  variant &= kSamplerClampU | kSamplerClampV | kSamplerPoint;
+  variant &= kSamplerClampU | kSamplerClampV | kSamplerPoint | kSamplerBaseMap;
   D3D12_SAMPLER_DESC sd = {};
   sd.Filter = (variant & kSamplerPoint) ? D3D12_FILTER_MIN_MAG_MIP_POINT
                                         : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -88,7 +91,12 @@ D3D12_SAMPLER_DESC D3D12Renderer::SamplerVariantDesc(uint32_t variant) {
   sd.MaxAnisotropy = 1;
   sd.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
   sd.MinLOD = 0.0f;
-  sd.MaxLOD = 0.0f;
+  // Filtering BETWEEN levels is always linear where a chain exists, even when
+  // the guest asked for point. That is a stated approximation, not an
+  // oversight: honouring it needs a fifth variant bit, and both limits below
+  // are now exactly full. The census counts how often the game asks, so the
+  // question can be settled on a number.
+  sd.MaxLOD = (variant & kSamplerBaseMap) ? sd.MinLOD : D3D12_FLOAT32_MAX;
   return sd;
 }
 
@@ -102,6 +110,11 @@ uint32_t D3D12Renderer::SamplerVariantFor(
   if (tex.clamp_x >= 2) variant |= kSamplerClampU;
   if (tex.clamp_y >= 2) variant |= kSamplerClampV;
   if (!tex.linear_filter) variant |= kSamplerPoint;
+  // TextureFilter::kBaseMap. A payload that asked for it never carries a chain
+  // -- the decode declines to build one -- so this only matters for a texture
+  // whose chain was suppressed while some OTHER texture in the same block has
+  // one. Set anyway, because a sampler is chosen per slot, not per resource.
+  if (tex.mip_filter == mx::hle::kMipFilterBaseMap) variant |= kSamplerBaseMap;
   return variant;
 }
 
@@ -206,7 +219,7 @@ bool D3D12Renderer::CreateGamePipeline() {
     // The reserved first block. The stand-in path indexes these directly by
     // variant; the translated path copies them into its own per-slot blocks.
     auto cpu = m_samplerHeap->GetCPUDescriptorHandleForHeapStart();
-    for (uint32_t i = 0; i < kSamplerBlockSlots; ++i) {
+    for (uint32_t i = 0; i < kSamplerVariantCount; ++i) {
       const D3D12_SAMPLER_DESC sd = SamplerVariantDesc(i);
       m_device->CreateSampler(&sd, cpu);
       cpu.ptr += SIZE_T(m_samplerDescriptorSize);
@@ -860,11 +873,11 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
           s.resource ? s.resource->GetDesc().DepthOrArraySize : 1;
       if (arraySize < 2) ++m_translatedArraySlotNot2DArray;
       srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
-      srv.Texture2DArray.MipLevels = 1;
+      srv.Texture2DArray.MipLevels = UINT(-1);
       srv.Texture2DArray.ArraySize = std::max<UINT>(arraySize, 1);
     } else {
       srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-      srv.Texture2D.MipLevels = 1;
+      srv.Texture2D.MipLevels = UINT(-1);
     }
     srv.Format = s.format;
     srv.Shader4ComponentMapping =
@@ -911,7 +924,7 @@ bool D3D12Renderer::BindTranslatedSamplers(const GameDraw& d,
     } else if (slot < stageTextures.size() && stageTextures[slot]) {
       variants[i] = SamplerVariantFor(*stageTextures[slot]);
     }
-    key |= uint64_t(variants[i] & 7u) << (i * 3);
+    key |= uint64_t(variants[i] & 0xFu) << (i * 4);
   }
 
   if (auto it = m_samplerBlocks.find(key); it != m_samplerBlocks.end()) {
@@ -1534,18 +1547,27 @@ bool D3D12Renderer::UploadGameTexture(GameTexture& entry,
   if (!entry.resource || src.data.empty() || !src.row_pitch) return false;
   const D3D12_RESOURCE_DESC td = entry.resource->GetDesc();
 
-  // One subresource per array slice. A cube arrives as six tightly packed 2D
+  // One subresource per (level, slice). A cube arrives as six tightly packed 2D
   // images in `src.data`; the host wants each at its own aligned footprint
   // offset, so the footprints are laid out here in one pass and copied
-  // slice-by-slice below.
+  // subresource-by-subresource below.
+  //
+  // The two sides nest OPPOSITELY. The guest stores array slices inside a
+  // level, and the payload keeps that order; D3D12 numbers subresources
+  // mip + slice * MipLevels, slices outermost. Hence the two-index walk rather
+  // than a stride.
   const uint32_t slices = std::max<uint32_t>(td.DepthOrArraySize, 1);
-  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[6] = {};
-  UINT rowCounts[6] = {};
-  UINT64 rowByteCounts[6] = {};
+  const uint32_t levels = std::max<uint32_t>(td.MipLevels, 1);
+  constexpr uint32_t kMaxSubresources = 6 * 14;  // slices * kTextureMaxMips
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[kMaxSubresources] = {};
+  UINT rowCounts[kMaxSubresources] = {};
+  UINT64 rowByteCounts[kMaxSubresources] = {};
   UINT64 uploadBytes = 0;
-  if (slices > std::size(footprints)) return false;
-  m_device->GetCopyableFootprints(&td, 0, slices, 0, footprints, rowCounts,
-                                  rowByteCounts, &uploadBytes);
+  const uint32_t subresources = slices * levels;
+  if (subresources > kMaxSubresources || levels > std::size(src.levels))
+    return false;
+  m_device->GetCopyableFootprints(&td, 0, subresources, 0, footprints,
+                                  rowCounts, rowByteCounts, &uploadBytes);
 
   auto& upload = entry.upload[m_frameIndex % kFrameCount];
   if (!upload || upload->GetDesc().Width < uploadBytes) {
@@ -1576,21 +1598,28 @@ bool D3D12Renderer::UploadGameTexture(GameTexture& entry,
   uint8_t* mapped = nullptr;
   if (FAILED(upload->Map(0, nullptr, reinterpret_cast<void**>(&mapped))))
     return false;
-  // Rows available per slice in the payload. The decoder packs slices back to
-  // back with no padding, so slice n starts at n * srcRows * row_pitch.
-  const uint32_t srcRowsTotal = uint32_t(src.data.size() / src.row_pitch);
-  const uint32_t srcRowsPerSlice = srcRowsTotal / slices;
-  for (uint32_t s = 0; s < slices; ++s) {
-    const uint32_t copyRows =
-        std::min<uint32_t>(rowCounts[s], srcRowsPerSlice);
-    const size_t copyBytes =
-        std::min<size_t>(src.row_pitch, size_t(rowByteCounts[s]));
-    const uint8_t* srcSlice =
-        src.data.data() + size_t(s) * srcRowsPerSlice * src.row_pitch;
-    for (uint32_t y = 0; y < copyRows; ++y) {
-      std::memcpy(mapped + footprints[s].Offset +
-                      size_t(y) * footprints[s].Footprint.RowPitch,
-                  srcSlice + size_t(y) * src.row_pitch, copyBytes);
+  // The payload states its own geometry per level. It used to be reconstructed
+  // arithmetically -- data.size() / row_pitch for the row count, divided by the
+  // slice count -- which is only ever right while the buffer holds one level,
+  // and would have quietly mangled every array texture once a chain was
+  // appended to it.
+  for (uint32_t l = 0; l < levels; ++l) {
+    const mx::hle::HleTextureLevelData& lv = src.levels[l];
+    if (!lv.row_pitch || !lv.rows) continue;
+    const size_t sliceBytes = size_t(lv.row_pitch) * lv.rows;
+    for (uint32_t s = 0; s < slices; ++s) {
+      const uint32_t sub = l + s * levels;
+      const uint32_t copyRows = std::min<uint32_t>(rowCounts[sub], lv.rows);
+      const size_t copyBytes =
+          std::min<size_t>(lv.row_pitch, size_t(rowByteCounts[sub]));
+      const size_t srcOffset = size_t(lv.offset) + size_t(s) * sliceBytes;
+      if (srcOffset + sliceBytes > src.data.size()) continue;
+      const uint8_t* srcSlice = src.data.data() + srcOffset;
+      for (uint32_t y = 0; y < copyRows; ++y) {
+        std::memcpy(mapped + footprints[sub].Offset +
+                        size_t(y) * footprints[sub].Footprint.RowPitch,
+                    srcSlice + size_t(y) * lv.row_pitch, copyBytes);
+      }
     }
   }
   upload->Unmap(0, nullptr);
@@ -1603,15 +1632,15 @@ bool D3D12Renderer::UploadGameTexture(GameTexture& entry,
   barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
   m_commandList->ResourceBarrier(1, &barrier);
 
-  for (uint32_t s = 0; s < slices; ++s) {
+  for (uint32_t sub = 0; sub < subresources; ++sub) {
     D3D12_TEXTURE_COPY_LOCATION dst = {};
     dst.pResource = entry.resource.Get();
     dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dst.SubresourceIndex = s;
+    dst.SubresourceIndex = sub;
     D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
     srcLoc.pResource = upload.Get();
     srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    srcLoc.PlacedFootprint = footprints[s];
+    srcLoc.PlacedFootprint = footprints[sub];
     m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &srcLoc, nullptr);
   }
 
@@ -1735,7 +1764,10 @@ bool D3D12Renderer::EnsureGameTexture(
   // resource, because the shader samples it by face index rather than by
   // direction. See the cube note in EmitTextureFetch.
   td.DepthOrArraySize = UINT16(std::max<uint32_t>(texture->array_size, 1));
-  td.MipLevels = 1;
+  // As many levels as the guest supplied, which is often fewer than a full
+  // chain -- mip_max_level is the guest's own cap, and a texture it stops at
+  // level 2 should clamp there rather than be invented past it.
+  td.MipLevels = UINT16(std::max<uint32_t>(texture->level_count, 1));
   td.Format = format;
   td.SampleDesc.Count = 1;
   td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
@@ -1769,7 +1801,7 @@ bool D3D12Renderer::EnsureGameTexture(
   srv.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
       (texture->swizzle >> 0) & 7u, (texture->swizzle >> 3) & 7u,
       (texture->swizzle >> 6) & 7u, (texture->swizzle >> 9) & 7u);
-  srv.Texture2D.MipLevels = 1;
+  srv.Texture2D.MipLevels = UINT(-1);  // however many the resource has
   auto cpu = m_gameSrvHeap->GetCPUDescriptorHandleForHeapStart();
   cpu.ptr += SIZE_T(entry.descriptorIndex) * m_gameSrvDescriptorSize;
   m_device->CreateShaderResourceView(entry.resource.Get(), &srv, cpu);
@@ -3676,6 +3708,8 @@ void D3D12Renderer::RenderGameFrame() {
       // paths agree on what a variant index means.
       uint32_t variant = d.samplerIndex & (kSamplerClampU | kSamplerClampV);
       if (d.texture && !d.texture->linear_filter) variant |= kSamplerPoint;
+      if (d.texture && d.texture->mip_filter == mx::hle::kMipFilterBaseMap)
+        variant |= kSamplerBaseMap;
       auto samp = m_samplerHeap->GetGPUDescriptorHandleForHeapStart();
       samp.ptr += UINT64(std::min(variant, kSamplerVariantCount - 1)) *
                   m_samplerDescriptorSize;

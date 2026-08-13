@@ -4293,6 +4293,12 @@ uint32_t GuestTextureFingerprint(const mx::hle::HleTextureSource& source,
   // fingerprint even when its opening bytes agree.
   h ^= bytes;
   h *= 1099511628211ull;
+  // So does where the mip chain points. Only the base level's bytes are
+  // sampled below -- that is the discriminator for a rider swap, which streams
+  // new artwork into the same slot -- but a texture that keeps its base and
+  // repoints its chain has still changed, and this catches it for free.
+  h ^= source.mip_address;
+  h *= 1099511628211ull;
 
   bool ok = true;
   const auto eat = [&](uint32_t offset, uint32_t n) {
@@ -5016,27 +5022,60 @@ bool ReadBoundPixelShader(uint32_t device, uint8_t* base, uint32_t& handle,
   return true;
 }
 
-bool CopyTexturePhysical(const mx::hle::HleTextureSource& source, uint8_t* base,
-                         std::vector<uint8_t>& out) {
-  const uint32_t candidates[] = {
-      source.address, source.address | 0xA0000000u,
-      source.address | 0xC0000000u, source.address | 0xE0000000u};
+// Copy one guest allocation into `dst` at `at`, trying each address mirror in
+// turn and refusing any that is not resident for its whole extent. Returns the
+// mirror that worked, or 0.
+//
+// `base` looks unused and is not: REX_RAW_ADDR expands to reference a variable
+// of that name in scope.
+uint32_t CopyGuestExtent(uint32_t address, uint32_t bytes, uint8_t* base,
+                         std::vector<uint8_t>& dst, size_t at) {
+  if (!address || !bytes) return 0;
+  const uint32_t candidates[] = {address, address | 0xA0000000u,
+                                 address | 0xC0000000u, address | 0xE0000000u};
   for (uint32_t candidate : candidates) {
     bool readable = true;
-    for (uint64_t o = 0; o < source.source_bytes; o += kHostPageSize) {
+    for (uint64_t o = 0; o < bytes; o += kHostPageSize) {
       if (!HostPageReadable(REX_RAW_ADDR(candidate + uint32_t(o)))) {
         readable = false;
         break;
       }
     }
-    if (!readable || !HostPageReadable(
-                         REX_RAW_ADDR(candidate + source.source_bytes - 1)))
+    if (!readable || !HostPageReadable(REX_RAW_ADDR(candidate + bytes - 1)))
       continue;
-    out.resize(source.source_bytes);
-    std::memcpy(out.data(), REX_RAW_ADDR(candidate), source.source_bytes);
-    return true;
+    std::memcpy(dst.data() + at, REX_RAW_ADDR(candidate), bytes);
+    return candidate;
   }
-  return false;
+  return 0;
+}
+
+uint64_t g_mipCopyFailed = 0;
+
+// The base level, then the mip chain appended straight after it.
+//
+// The two are SEPARATE guest allocations at unrelated addresses, so each is
+// resolved through the mirrors independently -- they need not agree on which
+// one is mapped. Concatenating them here rather than handing the decoder two
+// buffers is what keeps DecodeHleTexture2D's signature, and its three call
+// sites, unchanged: the level plan already carries offsets into this blob.
+//
+// A mip allocation that will not resolve is not fatal. The base is copied
+// regardless and the decoder truncates the chain to what it can read, so an
+// unmapped chain costs mip levels rather than the texture.
+bool CopyTexturePhysical(const mx::hle::HleTextureSource& source, uint8_t* base,
+                         std::vector<uint8_t>& out) {
+  const uint32_t mip_bytes =
+      source.level_count > 1 ? source.mip_source_bytes : 0;
+  out.resize(size_t(source.source_bytes) + mip_bytes);
+  if (!CopyGuestExtent(source.address, source.source_bytes, base, out, 0))
+    return false;
+  if (mip_bytes &&
+      !CopyGuestExtent(source.mip_address, mip_bytes, base, out,
+                       source.source_bytes)) {
+    out.resize(source.source_bytes);
+    ++g_mipCopyFailed;
+  }
+  return true;
 }
 
 // Resolve the texture a translated shader reads at one compact sampler slot.
@@ -5248,6 +5287,201 @@ void NoteSignedBind(const mx::hle::HleTextureSource& source) {
               by);
 }
 
+// Did we read the mip chain from the RIGHT PLACE?
+//
+// A wrong offset, pitch or packed-tail displacement does not fail: it returns
+// plausible bytes from somewhere else in the allocation, and the result is only
+// visible on minified surfaces at a distance, which is exactly where nobody
+// looks closely. Neither the blank-texture counters nor the decode's own bounds
+// check can see it -- the same blind spot that let the packed base level read
+// another texture's bytes for months.
+//
+// So measure it instead. The guest's mips are a reduction of their parent, so
+// box-filtering level n-1 down by two should land close to level n. Small mean
+// absolute difference (call it under ~12 of 255) means the addressing is right;
+// two uncorrelated images average about 85. Uncompressed formats only -- block
+// compression cannot be averaged without decoding it -- but the addressing
+// maths is parameterised by block size rather than special-cased per format, so
+// what holds here holds for BC too. The BC formats are checked in RenderDoc.
+// The mean colour of one texel or one compressed block, as an RGB triple in
+// 0..255, or false when this format is not sampled by the check.
+//
+// Block-compressed formats have to be included or the check is close to
+// worthless: this game's art is overwhelmingly BC1/BC3/BC5, and a check that
+// only understands kRgba8 would have reported nothing at all while the very
+// textures the mip chain was built for went unverified.
+//
+// A block is not decoded, only averaged. Every BC variant stores two endpoints
+// at a known offset and interpolates between them, so the midpoint of the
+// endpoints approximates the block's mean well enough to tell "a smaller
+// version of its parent" from "bytes belonging to something else" -- which is
+// the only question being asked.
+bool BlockMeanColor(mx::hle::HostTextureFormat format, const uint8_t* p,
+                    uint32_t out[3]) {
+  using F = mx::hle::HostTextureFormat;
+  auto rgb565 = [](const uint8_t* q, uint32_t acc[3]) {
+    const uint32_t v = uint32_t(q[0]) | (uint32_t(q[1]) << 8);
+    acc[0] += ((v >> 11) & 31) * 255 / 31;
+    acc[1] += ((v >> 5) & 63) * 255 / 63;
+    acc[2] += (v & 31) * 255 / 31;
+  };
+  uint32_t acc[3] = {0, 0, 0};
+  switch (format) {
+    case F::kRgba8:
+      out[0] = p[0]; out[1] = p[1]; out[2] = p[2];
+      return true;
+    case F::kR8:
+      out[0] = out[1] = out[2] = p[0];
+      return true;
+    // BC1 colour endpoints at +0; BC3 the same after 8 bytes of alpha.
+    case F::kBc1:
+    case F::kBc2:
+    case F::kBc3: {
+      const uint8_t* c = p + (format == F::kBc1 ? 0 : 8);
+      rgb565(c, acc);
+      rgb565(c + 2, acc);
+      for (uint32_t i = 0; i < 3; ++i) out[i] = acc[i] / 2;
+      return true;
+    }
+    // BC5 is two BC4 blocks, each an 8-bit endpoint pair.
+    case F::kBc5:
+      out[0] = (uint32_t(p[0]) + p[1]) / 2;
+      out[1] = (uint32_t(p[8]) + p[9]) / 2;
+      out[2] = 0;
+      return true;
+    default:
+      return false;
+  }
+}
+
+void NoteMipLevelAgreement(const mx::hle::HleTexturePayload& payload) {
+  if (payload.level_count < 2) return;
+  uint32_t probe[3];
+  if (payload.data.empty() ||
+      !BlockMeanColor(payload.format, payload.data.data(), probe))
+    return;
+  static std::atomic<uint32_t> s_checked{0};
+  if (s_checked.fetch_add(1, std::memory_order_relaxed) >= 16) return;
+
+  // Block units, so compressed and uncompressed walk the same loop.
+  const uint32_t bpb =
+      payload.format == mx::hle::HostTextureFormat::kRgba8 ? 4
+      : payload.format == mx::hle::HostTextureFormat::kR8 ? 1
+      : payload.format == mx::hle::HostTextureFormat::kBc1 ? 8
+                                                           : 16;
+  std::string report;
+  double worst = 0.0;
+  for (uint32_t l = 1; l < payload.level_count; ++l) {
+    const auto& prev = payload.levels[l - 1];
+    const auto& cur = payload.levels[l];
+    const uint32_t prev_cols = prev.row_pitch / bpb, cur_cols = cur.row_pitch / bpb;
+    if (!cur_cols || !cur.rows || prev_cols < 2 || prev.rows < 2) break;
+    if (size_t(prev.offset) + size_t(prev.row_pitch) * prev.rows >
+            payload.data.size() ||
+        size_t(cur.offset) + size_t(cur.row_pitch) * cur.rows >
+            payload.data.size())
+      break;
+    // Measured twice: once against the parent region this level should have
+    // reduced, and once against a region half the texture away.
+    //
+    // An absolute threshold cannot do this job. The guest does not box-filter
+    // its mips, block endpoints only approximate a block's mean, and small
+    // levels are a small sample -- so a perfectly correct level can score 30
+    // while another correct one scores 3. The first version of this check
+    // called half the textures SUSPECT on exactly that basis, including two
+    // 512x256 BC1 textures whose addressing maths is necessarily identical.
+    //
+    // The CONTROL is what settles it, with no magic number: whatever the
+    // content does to the aligned score, it does to the misaligned one too.
+    // Aligned much lower than control means this level really is its parent
+    // reduced. The two being equal is the signature of reading someone else's
+    // bytes.
+    uint64_t sum = 0, control_sum = 0, n = 0;
+    for (uint32_t y = 0; y < cur.rows; ++y) {
+      for (uint32_t x = 0; x < cur_cols; ++x) {
+        uint32_t want[3] = {0, 0, 0}, control[3] = {0, 0, 0};
+        for (uint32_t dy = 0; dy < 2; ++dy) {
+          for (uint32_t dx = 0; dx < 2; ++dx) {
+            const uint32_t sy = std::min(y * 2 + dy, prev.rows - 1);
+            const uint32_t sx = std::min(x * 2 + dx, prev_cols - 1);
+            uint32_t c[3];
+            BlockMeanColor(payload.format,
+                           payload.data.data() + prev.offset +
+                               size_t(sy) * prev.row_pitch + size_t(sx) * bpb,
+                           c);
+            for (uint32_t i = 0; i < 3; ++i) want[i] += c[i];
+            const uint32_t oy = (sy + prev.rows / 2) % prev.rows;
+            const uint32_t ox = (sx + prev_cols / 2) % prev_cols;
+            BlockMeanColor(payload.format,
+                           payload.data.data() + prev.offset +
+                               size_t(oy) * prev.row_pitch + size_t(ox) * bpb,
+                           c);
+            for (uint32_t i = 0; i < 3; ++i) control[i] += c[i];
+          }
+        }
+        uint32_t got[3];
+        BlockMeanColor(payload.format,
+                       payload.data.data() + cur.offset +
+                           size_t(y) * cur.row_pitch + size_t(x) * bpb,
+                       got);
+        for (uint32_t i = 0; i < 3; ++i) {
+          sum += uint64_t(std::abs(int32_t(want[i] / 4) - int32_t(got[i])));
+          control_sum +=
+              uint64_t(std::abs(int32_t(control[i] / 4) - int32_t(got[i])));
+          ++n;
+        }
+      }
+    }
+    if (!n) continue;
+    const double mad = double(sum) / double(n);
+    const double control_mad = double(control_sum) / double(n);
+    // Ratio, not difference: a flat texture scores low on both and a busy one
+    // high on both, and only their relationship carries the signal. Guarded
+    // against a genuinely uniform level, where both are ~0 and neither says
+    // anything.
+    const double ratio = control_mad > 1.0 ? mad / control_mad : 0.0;
+    worst = std::max(worst, ratio);
+    report += fmt::format(" L{}({}x{})={:.1f}/{:.1f}", l, cur.width, cur.height,
+                          mad, control_mad);
+  }
+  if (report.empty()) return;
+  REXLOG_INFO("d3d9: MIP AGREEMENT {}x{} fmt{} {} levels: {} -- aligned/control"
+              " mean |box(n-1) - n|, worst ratio {:.2f}:{}",
+              payload.width, payload.height, uint32_t(payload.format),
+              payload.level_count,
+              worst < 0.7 ? "ALIGNED" : "SUSPECT (aligned is no better than a"
+                                        " half-texture offset)",
+              worst, report);
+}
+
+// The chain census, and the deliberate gaps in it.
+//
+// Called per BIND, deliberately. The first version of this hung off the decode
+// path, which only runs on a cache miss -- so in a menu-only run it printed
+// once, three seconds in, and never again. The numbers it did print (74
+// textures described, none with a chain) said nothing about the run at all.
+void NoteMipCensus() {
+  static std::atomic<uint64_t> s_binds{0};
+  const uint64_t n = s_binds.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n != 1 && (n % 20000) != 0) return;
+  const mx::hle::HleMipCensus c = mx::hle::HleMipChainStats();
+  std::string levels;
+  for (uint32_t i = 0; i < 16; ++i)
+    if (c.by_max_level[i]) levels += fmt::format(" max{}={}", i,
+                                                 c.by_max_level[i]);
+  REXLOG_INFO(
+      "d3d9: MIP CHAIN over {} binds: {} carry one ({} levels total, mean"
+      " {:.1f}); mip_address set {}; declared but no address {}; suppressed"
+      " base-map {} min-level {}; layout empty {}; truncated at decode {};"
+      " chain copy failed {}; deferred: mip_filter=point {} lod_bias {};"
+      " raw mip_max_level:{}",
+      c.described, c.with_chain, c.levels_planned,
+      c.with_chain ? double(c.levels_planned) / double(c.with_chain) : 0.0,
+      c.raw_mip_address_set, c.no_address, c.suppressed_base_map,
+      c.suppressed_min_level, c.layout_empty, c.truncated, g_mipCopyFailed,
+      c.mip_filter_point, c.lod_bias_set, levels);
+}
+
 // Blast radius of the packed mip tail. A texture whose base is packed used to
 // be read from the origin of the tail rather than from its own offset within
 // it, so every one of these was returning another texture's bytes. Counted by
@@ -5408,6 +5642,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   }
   NoteSignedBind(source);
   NotePackedBase(source);
+  NoteMipCensus();
   // WHICH guest surface does each sampler slot actually ask for?
   //
   // Traced from the rider's gear rendering green. Its material computes
@@ -5556,6 +5791,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     return false;
   }
   NoteSwizzleCensus(source);
+  NoteMipLevelAgreement(*payload);
   // Still recorded, so the single-texture path above keeps skipping it as a
   // representative and the count stays visible -- but no longer a refusal here.
   if (!HleTextureHasNonzeroData(*payload)) {

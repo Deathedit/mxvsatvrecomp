@@ -1,6 +1,7 @@
 #include "gpu/d3d9_texture.h"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstring>
 
@@ -30,7 +31,162 @@ void SwapBlock(uint8_t* p, uint32_t bytes, xenos::Endian endian) {
     std::memcpy(p + i, &v, 4);
   }
 }
+
+std::atomic<uint64_t> g_mipDescribed{0};
+std::atomic<uint64_t> g_mipWithChain{0};
+std::atomic<uint64_t> g_mipLevelsPlanned{0};
+std::atomic<uint64_t> g_mipNoAddress{0};
+std::atomic<uint64_t> g_mipBaseMap{0};
+std::atomic<uint64_t> g_mipMinLevel{0};
+std::atomic<uint64_t> g_mipLayoutEmpty{0};
+std::atomic<uint64_t> g_mipFilterPoint{0};
+std::atomic<uint64_t> g_mipLodBias{0};
+std::atomic<uint64_t> g_mipTruncated{0};
+std::atomic<uint64_t> g_mipRawAddressSet{0};
+std::atomic<uint64_t> g_mipByMaxLevel[16];
+
+// Plan levels 1.. of the guest's mip chain onto out.levels.
+//
+// The chain is a SEPARATE ALLOCATION at fetch.mip_address, and it is not laid
+// out like the base level. Three rules from the reference
+// (xenia/gpu/texture_util.cc, the only implementation of the SDK's
+// texture_util.h on this machine) that a "halve everything" guess gets wrong:
+//
+//  - A mip's pitch ignores the fetch constant's pitch entirely. It is
+//    max(next_pow2(width) >> level, 1) -- NEXT_POW2, so an 80x260 texture's
+//    level 3 derives from 512 >> 3, not from 260 >> 3 -- then aligned to 32
+//    blocks, and for linear textures to 256 bytes on top of that.
+//  - A level's EXTENT uses a different rule from its stride: plain
+//    max(width >> level, 1) on the raw width, no rounding. Aligning the extent
+//    up can fault, because titles allocate exactly what they use.
+//  - At and beyond the packed level, several levels share ONE image and are
+//    sub-rected out of it. GetPackedMipOffset takes the texture's BASE
+//    dimensions, never the level's, and it does not reject levels below the
+//    tail -- it underflows -- so the caller does the gating.
+//
+// None of that is derived here: GetGuestTextureLayout returns all of it, and
+// this walks its output.
+void DescribeHleMipChain(const xenos::xe_gpu_texture_fetch_t& fetch,
+                         xenos::TextureFormat format, HleTextureSource& out) {
+  g_mipDescribed.fetch_add(1, std::memory_order_relaxed);
+  out.mip_address = fetch.mip_address << 12;
+  out.mip_min_level = fetch.mip_min_level;
+  out.mip_max_level = fetch.mip_max_level;
+  out.mip_filter = uint8_t(fetch.mip_filter);
+  out.packed_mips = fetch.packed_mips != 0;
+  if (fetch.lod_bias) g_mipLodBias.fetch_add(1, std::memory_order_relaxed);
+  if (fetch.mip_address)
+    g_mipRawAddressSet.fetch_add(1, std::memory_order_relaxed);
+  g_mipByMaxLevel[fetch.mip_max_level & 15].fetch_add(
+      1, std::memory_order_relaxed);
+
+  // The SDK's own normalisation of the two addresses against the two level
+  // bounds. It is the authority on the awkward encodings -- notably that a zero
+  // mip_address WINS over a non-zero mip_max_level, which is how this title
+  // spells "no chain" for 82,000 binds a run.
+  uint32_t base_page = 0, mip_page = 0, mip_min = 0, mip_max = 0;
+  tu::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr,
+                                       &base_page, &mip_page, &mip_min,
+                                       &mip_max);
+  if (!mip_page || !mip_max) {
+    if (fetch.mip_max_level)
+      g_mipNoAddress.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  // kBaseMap is the guest saying it never wants to minify past level 0, so the
+  // cheapest way to honour it is to not decode a chain it will not sample.
+  //
+  // The reference keeps the chain and clamps the SAMPLER instead, because a
+  // shader's own tfetch can override the fetch constant's mip filter. Our HLSL
+  // emitter does not model that override at all, so the two are equivalent
+  // today -- but if it ever does, this has to move back into the sampler.
+  static_assert(uint8_t(xenos::TextureFilter::kBaseMap) == kMipFilterBaseMap,
+                "the renderer's copy of kBaseMap has drifted from the SDK's");
+  if (fetch.mip_filter == xenos::TextureFilter::kBaseMap) {
+    g_mipBaseMap.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  if (fetch.mip_filter == xenos::TextureFilter::kPoint)
+    g_mipFilterPoint.fetch_add(1, std::memory_order_relaxed);
+  // mip_min_level != 0 means the base level is not meant to be sampled at all,
+  // and the reference responds by zeroing base_page and turning the level into
+  // the sampler's MinLOD. We do neither yet, so the honest thing is to leave
+  // such a texture exactly as it decoded before this function existed and count
+  // it -- if the counter stays at zero the case does not arise, and if it does
+  // not, it gets handled with a real population to size the fix against.
+  if (mip_min) {
+    g_mipMinLevel.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+
+  const tu::TextureGuestLayout layout = tu::GetGuestTextureLayout(
+      fetch.dimension, fetch.pitch, out.width, out.height,
+      std::max(out.array_size, 1u), out.tiled, format,
+      /*has_packed_levels=*/out.packed_mips, /*has_base=*/true,
+      /*max_level=*/mip_max);
+  if (!layout.mips_total_extent_bytes) {
+    g_mipLayoutEmpty.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+
+  // UINT32_MAX when the texture has no tail, which makes every `level >=
+  // packed_level` test below false without a special case.
+  const uint32_t packed_level = layout.packed_level;
+  uint32_t planned = 1;
+  for (uint32_t level = 1; level <= mip_max && level < kMaxTextureLevels;
+       ++level) {
+    // Levels at or past the tail all live in the tail's storage, so they read
+    // the tail's stride and offset and differ only in where inside it they sit.
+    const uint32_t storage = std::min(level, packed_level);
+    if (storage >= kMaxTextureLevels) break;
+    const tu::TextureGuestLayout::Level& src = layout.mips[storage];
+    if (!src.row_pitch_bytes) break;
+
+    HleTextureLevel& dst = out.levels[level];
+    dst.offset_bytes = out.source_bytes + layout.mip_offsets_bytes[storage];
+    dst.pitch_blocks = src.row_pitch_bytes / out.bytes_per_block;
+    dst.slice_stride_bytes = src.array_slice_stride_bytes;
+    dst.width = std::max(out.width >> level, 1u);
+    dst.height = std::max(out.height >> level, 1u);
+    dst.width_blocks =
+        (dst.width + out.block_width - 1) / out.block_width;
+    dst.height_blocks =
+        (dst.height + out.block_height - 1) / out.block_height;
+    if (level >= packed_level) {
+      uint32_t px = 0, py = 0, pz = 0;
+      if (tu::GetPackedMipOffset(out.width, out.height, 1, format, level, px,
+                                 py, pz)) {
+        dst.packed_offset_x_blocks = px;
+        dst.packed_offset_y_blocks = py;
+      }
+    }
+    ++planned;
+  }
+  if (planned <= 1) return;
+  out.level_count = planned;
+  out.mip_source_bytes = layout.mips_total_extent_bytes;
+  g_mipWithChain.fetch_add(1, std::memory_order_relaxed);
+  g_mipLevelsPlanned.fetch_add(planned, std::memory_order_relaxed);
+}
 }  // namespace
+
+HleMipCensus HleMipChainStats() {
+  HleMipCensus c;
+  c.described = g_mipDescribed.load(std::memory_order_relaxed);
+  c.with_chain = g_mipWithChain.load(std::memory_order_relaxed);
+  c.levels_planned = g_mipLevelsPlanned.load(std::memory_order_relaxed);
+  c.no_address = g_mipNoAddress.load(std::memory_order_relaxed);
+  c.suppressed_base_map = g_mipBaseMap.load(std::memory_order_relaxed);
+  c.suppressed_min_level = g_mipMinLevel.load(std::memory_order_relaxed);
+  c.layout_empty = g_mipLayoutEmpty.load(std::memory_order_relaxed);
+  c.mip_filter_point = g_mipFilterPoint.load(std::memory_order_relaxed);
+  c.lod_bias_set = g_mipLodBias.load(std::memory_order_relaxed);
+  c.truncated = g_mipTruncated.load(std::memory_order_relaxed);
+  c.raw_mip_address_set = g_mipRawAddressSet.load(std::memory_order_relaxed);
+  for (uint32_t i = 0; i < 16; ++i)
+    c.by_max_level[i] = g_mipByMaxLevel[i].load(std::memory_order_relaxed);
+  return c;
+}
 
 // Transcribed from the guest's own GPUTEXTUREFORMAT name table: a 64-entry
 // pointer array at 0x82d24378 (near-duplicate at 0x82d59d00), indexing the
@@ -92,8 +248,15 @@ uint64_t HleTextureKey(const uint32_t fetch_words[6]) {
 
 bool HleTextureHasNonzeroData(const HleTexturePayload& texture,
                               size_t* nonzero_bytes) {
+  // Level 0 only. This asks whether the guest's backing store was ever written,
+  // and the base level answers that; scanning the mip chain as well would cost
+  // a third more per bind to reach the same conclusion.
+  const size_t base_bytes =
+      texture.level_count > 1
+          ? std::min<size_t>(texture.levels[1].offset, texture.data.size())
+          : texture.data.size();
   const size_t count = std::count_if(
-      texture.data.begin(), texture.data.end(),
+      texture.data.begin(), texture.data.begin() + base_bytes,
       [](uint8_t value) { return value != 0; });
   if (nonzero_bytes) *nonzero_bytes = count;
   return count != 0;
@@ -288,6 +451,8 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
   }
   if (!out.source_bytes || out.source_bytes > 256u * 1024u * 1024u)
     return reject("texture extent out of range");
+
+  DescribeHleMipChain(fetch, format, out);
   return true;
 }
 
@@ -301,59 +466,119 @@ bool DecodeHleTexture2D(const HleTextureSource& source,
   if (fail) *fail = nullptr;
   if (!guest || guest_bytes < source.source_bytes)
     return reject("texture source is truncated");
-  const uint32_t wb =
-      (source.width + source.block_width - 1) / source.block_width;
-  const uint32_t hb =
-      (source.height + source.block_height - 1) / source.block_height;
-  // One slice's worth, then multiplied up: the host wants the slices TIGHTLY
-  // packed one after another (that is what GetCopyableFootprints will be handed
-  // per subresource), which is not how the guest stores them -- guest slices are
-  // 4 KB-aligned and may be tiled, so the gap between them is
-  // source.slice_stride_bytes on the way in and nothing on the way out.
-  const uint64_t slice_tight = uint64_t(wb) * hb * source.bytes_per_block;
   const uint32_t slices = std::max(source.array_size, 1u);
-  const uint64_t tight = slice_tight * slices;
-  if (!tight || tight > UINT32_MAX) return reject("decoded extent overflow");
+  const uint32_t planned = std::clamp(source.level_count, 1u,
+                                      kMaxTextureLevels);
+
+  // Where each level lands in the output. The host wants every subresource
+  // TIGHTLY packed -- that is what GetCopyableFootprints will be handed -- which
+  // is not how the guest stores anything: guest slices are 4 KB-aligned, levels
+  // sit at their own offsets in a second allocation, and both may be tiled. So
+  // the gaps are source-side strides on the way in and nothing on the way out.
+  //
+  // Level-major, slices inside each level, matching the guest's own nesting.
+  // D3D12 nests the other way round (subresource = mip + slice * MipLevels), so
+  // the upload walks this table rather than striding through the buffer.
+  //
+  // Level 0 is assembled from the flat fields, which are the only description
+  // of it -- source.levels[0] is unused on purpose, so a source built by hand
+  // still decodes and the base geometry has exactly one statement.
+  HleTextureLevel geo[kMaxTextureLevels] = {};
+  geo[0].pitch_blocks = source.pitch_blocks;
+  geo[0].slice_stride_bytes = source.slice_stride_bytes;
+  geo[0].width = source.width;
+  geo[0].height = source.height;
+  geo[0].width_blocks =
+      (source.width + source.block_width - 1) / source.block_width;
+  geo[0].height_blocks =
+      (source.height + source.block_height - 1) / source.block_height;
+  geo[0].packed_offset_x_blocks = source.packed_offset_x_blocks;
+  geo[0].packed_offset_y_blocks = source.packed_offset_y_blocks;
+  for (uint32_t l = 1; l < planned; ++l) geo[l] = source.levels[l];
+
+  HleTextureLevelData plan[kMaxTextureLevels] = {};
+  uint64_t tight = 0;
+  for (uint32_t l = 0; l < planned; ++l) {
+    const HleTextureLevel& lv = geo[l];
+    if (!lv.width_blocks || !lv.height_blocks)
+      return reject("texture level is empty");
+    plan[l].offset = uint32_t(tight);
+    plan[l].row_pitch = lv.width_blocks * source.bytes_per_block;
+    plan[l].rows = lv.height_blocks;
+    plan[l].width = lv.width;
+    plan[l].height = lv.height;
+    tight += uint64_t(plan[l].row_pitch) * lv.height_blocks * slices;
+    if (tight > UINT32_MAX) return reject("decoded extent overflow");
+  }
+  if (!tight) return reject("decoded extent overflow");
 
   out = {};
   out.width = source.width;
   out.height = source.height;
   out.array_size = slices;
-  out.row_pitch = wb * source.bytes_per_block;
+  out.row_pitch = plan[0].row_pitch;
   out.format = source.host_format;
   out.swizzle = source.swizzle;
   out.clamp_x = uint8_t(source.clamp_x);
   out.clamp_y = uint8_t(source.clamp_y);
   out.linear_filter = source.linear_filter;
+  out.mip_filter = source.mip_filter;
   out.data.resize(size_t(tight));
 
   const auto endian = static_cast<xenos::Endian>(source.endian);
   const uint32_t bpb_log2 = std::bit_width(source.bytes_per_block) - 1;
-  for (uint32_t slice = 0; slice < slices; ++slice) {
-    const uint64_t slice_base = uint64_t(slice) * source.slice_stride_bytes;
-    uint8_t* slice_out = out.data.data() + uint64_t(slice) * slice_tight;
-    for (uint32_t y = 0; y < hb; ++y) {
-      for (uint32_t x = 0; x < wb; ++x) {
-        // Read coordinates, which are the write coordinates displaced into the
-        // packed mip tail. Both zero for any texture bigger than 16 texels, so
-        // this is the identity for the overwhelming majority of textures.
-        const uint32_t sx = x + source.packed_offset_x_blocks;
-        const uint32_t sy = y + source.packed_offset_y_blocks;
-        const uint64_t src = slice_base +
-            (source.tiled
-                 ? uint64_t(tu::GetTiledOffset2D(sx, sy, source.pitch_blocks,
-                                                 bpb_log2))
-                 : (uint64_t(sy) * source.pitch_blocks + sx) *
-                       source.bytes_per_block);
-        if (src + source.bytes_per_block > guest_bytes)
-          return reject("tiled block outside source");
-        uint8_t* dst =
-            slice_out + (uint64_t(y) * wb + x) * source.bytes_per_block;
-        std::memcpy(dst, guest + src, source.bytes_per_block);
-        SwapBlock(dst, source.bytes_per_block, endian);
+  uint32_t decoded = planned;
+  for (uint32_t l = 0; l < planned; ++l) {
+    // Every address rule that differs between the base level and a mip is
+    // already resolved into this entry, so the loop below is the one it always
+    // was: pitch, packed displacement and extent just come from the level
+    // rather than from the texture.
+    const HleTextureLevel& lv = geo[l];
+    const uint64_t slice_tight = uint64_t(plan[l].row_pitch) * plan[l].rows;
+    bool level_ok = true;
+    for (uint32_t slice = 0; slice < slices && level_ok; ++slice) {
+      const uint64_t slice_base =
+          uint64_t(lv.offset_bytes) + uint64_t(slice) * lv.slice_stride_bytes;
+      uint8_t* slice_out =
+          out.data.data() + plan[l].offset + uint64_t(slice) * slice_tight;
+      for (uint32_t y = 0; y < lv.height_blocks && level_ok; ++y) {
+        for (uint32_t x = 0; x < lv.width_blocks; ++x) {
+          // Read coordinates, which are the write coordinates displaced into a
+          // packed mip tail. Both zero unless this level is packed -- the base
+          // level of a texture 16 texels or smaller, or any level at or beyond
+          // the packed level, all of which share one tail image.
+          const uint32_t sx = x + lv.packed_offset_x_blocks;
+          const uint32_t sy = y + lv.packed_offset_y_blocks;
+          const uint64_t src = slice_base +
+              (source.tiled
+                   ? uint64_t(tu::GetTiledOffset2D(sx, sy, lv.pitch_blocks,
+                                                   bpb_log2))
+                   : (uint64_t(sy) * lv.pitch_blocks + sx) *
+                         source.bytes_per_block);
+          if (src + source.bytes_per_block > guest_bytes) {
+            level_ok = false;
+            break;
+          }
+          uint8_t* dst = slice_out +
+              (uint64_t(y) * lv.width_blocks + x) * source.bytes_per_block;
+          std::memcpy(dst, guest + src, source.bytes_per_block);
+          SwapBlock(dst, source.bytes_per_block, endian);
+        }
       }
     }
+    if (level_ok) continue;
+    // Level 0 is the texture; without it there is nothing to bind. A mip level
+    // that runs off the end is a different matter -- the chain lives in its own
+    // allocation, which may be shorter than the layout says or only partly
+    // resident, and serving fewer levels beats serving none.
+    if (l == 0) return reject("tiled block outside source");
+    decoded = l;
+    out.data.resize(plan[l].offset);
+    g_mipTruncated.fetch_add(1, std::memory_order_relaxed);
+    break;
   }
+  out.level_count = decoded;
+  for (uint32_t l = 0; l < decoded; ++l) out.levels[l] = plan[l];
 
   // Depth is the one accepted format whose BYTES are not already the host's.
   // Every other entry is a straight copy plus an endian swap, so this is the

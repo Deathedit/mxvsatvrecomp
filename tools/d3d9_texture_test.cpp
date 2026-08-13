@@ -239,6 +239,233 @@ int main() {
           "a zero offset is the identity");
   }
 
+  // THE MIP CHAIN. A 256x256 k_8_8_8_8 with packed mips, which is the shape
+  // that matters: log2_ceil(256) - 4 == 4, so levels 1..3 have their own
+  // storage and levels 4..8 share the packed tail. Both addressing paths in one
+  // case.
+  //
+  // The guest side is placed using GetGuestTextureLayout -- the same function
+  // the describe path reads -- so this does not re-verify the SDK's layout. It
+  // verifies OUR use of it: the per-level offset, the per-level pitch (which is
+  // NOT the fetch pitch), the packed displacement, the level count, and the
+  // level-major packing of the output.
+  //
+  // The dimensions are chosen so the test can FAIL. Two ways this went wrong
+  // while being written, both found by mutating the decode and watching the
+  // test still pass:
+  //
+  //  - At 64 texels wide, LINEAR proves nothing. A linear mip's pitch is
+  //    rounded up to 256 bytes, which for a 64-wide RGBA8 texture lands exactly
+  //    on the base pitch -- so a decode that used the base pitch for every
+  //    level was indistinguishable from a correct one.
+  //  - At 64 texels wide, TILED proves nothing either. Level 1 is then 32x32,
+  //    a single tile, and GetTiledOffset2D only consults the pitch across tile
+  //    boundaries -- (y >> 5) * (pitch >> 5). Inside one tile any pitch gives
+  //    the same address. 256 makes level 1 a 4x4 grid of tiles.
+  for (int tiled_case = 0; tiled_case < 2; ++tiled_case) {
+    namespace xg = rex::graphics::xenos;
+    namespace tu = rex::graphics::texture_util;
+    const bool is_tiled = tiled_case != 0;
+    const char* tag = is_tiled ? "tiled" : "linear";
+    constexpr uint32_t kDim = 256, kMaxLevel = 8;
+    xg::xe_gpu_texture_fetch_t f{};
+    f.type = xg::FetchConstantType::kTexture;
+    f.dimension = xg::DataDimension::k2DOrStacked;
+    f.format = xg::TextureFormat::k_8_8_8_8;
+    f.base_address = 1;
+    f.mip_address = 2;
+    f.pitch = kDim / 32;
+    f.size_2d.width = kDim - 1;
+    f.size_2d.height = kDim - 1;
+    f.tiled = is_tiled ? 1 : 0;
+    f.packed_mips = 1;
+    f.mip_max_level = kMaxLevel;
+    f.mip_filter = xg::TextureFilter::kLinear;
+
+    HleTextureSource src{};
+    Check(DescribeHleTexture2D(reinterpret_cast<const uint32_t*>(&f), src, &why),
+          "mip chain descriptor accepted");
+    Check(src.level_count == kMaxLevel + 1, "every declared level is planned");
+    Check(src.mip_source_bytes != 0, "the chain has an extent");
+
+    const tu::TextureGuestLayout layout = tu::GetGuestTextureLayout(
+        f.dimension, f.pitch, kDim, kDim, 1, is_tiled,
+        xg::TextureFormat::k_8_8_8_8, /*has_packed_levels=*/true,
+        /*has_base=*/true, kMaxLevel);
+    // The whole point of the tiled case: these must not be equal, or the case
+    // proves nothing.
+    if (is_tiled)
+      Check(layout.mips[1].row_pitch_bytes / 4 != src.pitch_blocks,
+            "the tiled case distinguishes level pitch from base pitch");
+
+    // Paint level n's texels with the value n, where the guest would store them.
+    std::vector<uint8_t> guest(size_t(src.source_bytes) + src.mip_source_bytes,
+                               0xEE);
+    const uint32_t packed_level = layout.packed_level;
+    for (uint32_t l = 0; l <= kMaxLevel; ++l) {
+      const uint32_t w = std::max(kDim >> l, 1u), h = std::max(kDim >> l, 1u);
+      uint32_t px = 0, py = 0, pz = 0;
+      size_t at = 0;
+      uint32_t pitch_blocks = src.pitch_blocks;
+      if (l) {
+        const uint32_t storage = std::min(l, packed_level);
+        at = size_t(src.source_bytes) + layout.mip_offsets_bytes[storage];
+        pitch_blocks = layout.mips[storage].row_pitch_bytes / 4;
+        if (l >= packed_level)
+          tu::GetPackedMipOffset(kDim, kDim, 1, xg::TextureFormat::k_8_8_8_8, l,
+                                 px, py, pz);
+      }
+      for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+          const size_t texel =
+              is_tiled ? size_t(tu::GetTiledOffset2D(px + x, py + y,
+                                                     pitch_blocks, 2))
+                       : (size_t(py + y) * pitch_blocks + px + x) * 4;
+          for (uint32_t c = 0; c < 4; ++c) guest[at + texel + c] = uint8_t(l);
+        }
+      }
+    }
+
+    HleTexturePayload mips;
+    Check(DecodeHleTexture2D(src, guest.data(), guest.size(), mips, &why),
+          "mip chain decode");
+    Check(mips.level_count == kMaxLevel + 1, "every level survived the decode");
+    bool geometry = true, content = true;
+    for (uint32_t l = 0; l <= kMaxLevel && l < mips.level_count; ++l) {
+      const uint32_t w = std::max(kDim >> l, 1u), h = std::max(kDim >> l, 1u);
+      const auto& lv = mips.levels[l];
+      if (lv.width != w || lv.height != h || lv.rows != h ||
+          lv.row_pitch != w * 4)
+        geometry = false;
+      for (uint32_t y = 0; y < h && content; ++y)
+        for (uint32_t x = 0; x < w * 4; ++x)
+          if (mips.data[lv.offset + size_t(y) * lv.row_pitch + x] != l) {
+            content = false;
+            break;
+          }
+    }
+    char msg[96];
+    std::snprintf(msg, sizeof(msg), "[%s] each level halves its geometry", tag);
+    Check(geometry, msg);
+    std::snprintf(msg, sizeof(msg),
+                  "[%s] each level reads the bytes stored for it", tag);
+    Check(content, msg);
+    Check(mips.width == kDim && mips.row_pitch == kDim * 4,
+          "the payload still presents level 0 to old consumers");
+
+    // mip_address zero is the guest's "no chain", and it WINS over a non-zero
+    // mip_max_level -- 82,000 binds a run take this path.
+    xg::xe_gpu_texture_fetch_t none = f;
+    none.mip_address = 0;
+    HleTextureSource flat{};
+    Check(DescribeHleTexture2D(reinterpret_cast<const uint32_t*>(&none), flat,
+                               &why) &&
+              flat.level_count == 1 && flat.mip_source_bytes == 0,
+          "no mip_address means no chain whatever mip_max_level says");
+
+    // kBaseMap is the guest declining the chain it allocated.
+    xg::xe_gpu_texture_fetch_t base_map = f;
+    base_map.mip_filter = xg::TextureFilter::kBaseMap;
+    HleTextureSource bm{};
+    Check(DescribeHleTexture2D(reinterpret_cast<const uint32_t*>(&base_map), bm,
+                               &why) && bm.level_count == 1,
+          "mip_filter kBaseMap suppresses the chain");
+
+    // A short read costs levels, not the texture.
+    HleTexturePayload partial;
+    Check(DecodeHleTexture2D(src, guest.data(), src.source_bytes + 1, partial,
+                             &why) &&
+              partial.level_count == 1,
+          "an unreadable chain degrades to the base level");
+  }
+
+  // A CUBE WITH MIPS. Array slices live INSIDE a level on the guest and outside
+  // it on the host, and each level has its own slice stride -- so a decode that
+  // reused the base level's stride for the chain would return face 0's bytes
+  // for five of six faces, at every level but the first. Nothing in the
+  // single-slice case above can see that: it was written after mutating the
+  // stride and watching the test pass anyway.
+  {
+    namespace xg = rex::graphics::xenos;
+    namespace tu = rex::graphics::texture_util;
+    constexpr uint32_t kDim = 64, kMaxLevel = 6, kFaces = 6;
+    xg::xe_gpu_texture_fetch_t f{};
+    f.type = xg::FetchConstantType::kTexture;
+    f.dimension = xg::DataDimension::kCube;
+    f.format = xg::TextureFormat::k_8_8_8_8;
+    f.base_address = 1;
+    f.mip_address = 2;
+    f.pitch = kDim / 32;
+    f.size_2d.width = kDim - 1;
+    f.size_2d.height = kDim - 1;
+    f.size_2d.stack_depth = 5;
+    f.tiled = 1;
+    f.packed_mips = 1;
+    f.mip_max_level = kMaxLevel;
+    f.mip_filter = xg::TextureFilter::kLinear;
+
+    HleTextureSource src{};
+    Check(DescribeHleTexture2D(reinterpret_cast<const uint32_t*>(&f), src, &why),
+          "cube mip descriptor accepted");
+    Check(src.array_size == kFaces, "a cube is six faces");
+    Check(src.level_count == kMaxLevel + 1, "cube chain is planned");
+
+    const tu::TextureGuestLayout layout = tu::GetGuestTextureLayout(
+        f.dimension, f.pitch, kDim, kDim, kFaces, true,
+        xg::TextureFormat::k_8_8_8_8, true, true, kMaxLevel);
+    Check(layout.mips[1].array_slice_stride_bytes !=
+              src.slice_stride_bytes,
+          "a level's slice stride differs from the base's");
+
+    // Value encodes BOTH level and face, so a mix-up in either is visible.
+    std::vector<uint8_t> guest(size_t(src.source_bytes) + src.mip_source_bytes,
+                               0xEE);
+    const uint32_t packed_level = layout.packed_level;
+    for (uint32_t l = 0; l <= kMaxLevel; ++l) {
+      const uint32_t w = std::max(kDim >> l, 1u), h = w;
+      uint32_t px = 0, py = 0, pz = 0;
+      size_t at = 0, stride = src.slice_stride_bytes;
+      uint32_t pitch_blocks = src.pitch_blocks;
+      if (l) {
+        const uint32_t storage = std::min(l, packed_level);
+        at = size_t(src.source_bytes) + layout.mip_offsets_bytes[storage];
+        pitch_blocks = layout.mips[storage].row_pitch_bytes / 4;
+        stride = layout.mips[storage].array_slice_stride_bytes;
+        if (l >= packed_level)
+          tu::GetPackedMipOffset(kDim, kDim, 1, xg::TextureFormat::k_8_8_8_8, l,
+                                 px, py, pz);
+      }
+      for (uint32_t s = 0; s < kFaces; ++s)
+        for (uint32_t y = 0; y < h; ++y)
+          for (uint32_t x = 0; x < w; ++x) {
+            const size_t texel = size_t(tu::GetTiledOffset2D(
+                px + x, py + y, pitch_blocks, 2));
+            for (uint32_t c = 0; c < 4; ++c)
+              guest[at + s * stride + texel + c] = uint8_t(l * 16 + s);
+          }
+    }
+
+    HleTexturePayload cube;
+    Check(DecodeHleTexture2D(src, guest.data(), guest.size(), cube, &why),
+          "cube mip decode");
+    Check(cube.level_count == kMaxLevel + 1,
+          "every cube level survived the decode");
+    bool faces = true;
+    for (uint32_t l = 0; l < cube.level_count && faces; ++l) {
+      const auto& lv = cube.levels[l];
+      const size_t slice_bytes = size_t(lv.row_pitch) * lv.rows;
+      for (uint32_t s = 0; s < kFaces && faces; ++s)
+        for (uint32_t y = 0; y < lv.rows && faces; ++y)
+          for (uint32_t x = 0; x < lv.row_pitch; ++x)
+            if (cube.data[lv.offset + s * slice_bytes +
+                          size_t(y) * lv.row_pitch + x] != l * 16 + s) {
+              faces = false;
+              break;
+            }
+    }
+    Check(faces, "every face of every level reads its own bytes");
+  }
+
   Check(!DecodeHleTexture2D(linear, rgba, sizeof(rgba) - 1, decoded, &why),
         "truncated source rejected");
   uint32_t fetchA[6] = {1,2,3,4,5,6};

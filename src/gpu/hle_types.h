@@ -29,7 +29,28 @@ enum class HostTextureFormat : uint8_t {
   kR32Float,
 };
 
-// Immutable CPU-side base mip shared by all draws that reference it. The hook
+// xenos::TextureFilter::kBaseMap -- "sample level 0 and never minify past it".
+// Named here so the renderer can test for it without comparing against a bare 2
+// and without including the SDK's xenos.h.
+constexpr uint8_t kMipFilterBaseMap = 2;
+
+// One decoded mip level inside HleTexturePayload::data.
+//
+// This table is not decoration. Before it existed the upload path reconstructed
+// the payload's geometry arithmetically -- `data.size() / row_pitch` for the
+// row count, split by array_size for the slices -- which works only while the
+// buffer holds exactly one level. Appending a mip chain to that vector without
+// saying where the levels are would silently corrupt every array texture, so
+// the geometry is stated rather than inferred.
+struct HleTextureLevelData {
+  uint32_t offset = 0;     // byte offset of slice 0 of this level in `data`
+  uint32_t row_pitch = 0;  // tightly packed: width_in_blocks * bytes_per_block
+  uint32_t rows = 0;       // block rows per slice
+  uint32_t width = 0;      // texels
+  uint32_t height = 0;
+};
+
+// Immutable CPU-side texture shared by all draws that reference it. The hook
 // owns guest-memory access; the renderer only sees validated host bytes.
 struct HleTexturePayload {
   uint64_t key = 0;
@@ -55,6 +76,20 @@ struct HleTexturePayload {
   // and go, which froze the menu text as whatever the atlas held when it was
   // first sampled. Zero means never rewritten.
   uint32_t content_version = 0;
+  // The guest's mip chain, decoded from its own allocation. 1 means the base
+  // level only, which is what every payload held before the chain was read and
+  // what a texture with no chain still holds.
+  //
+  // `data` is LEVEL-MAJOR with the slices inside each level, matching how the
+  // guest stores it. D3D12 nests the other way round -- subresource index is
+  // mip + slice * MipLevels -- so the upload walks this table rather than
+  // striding through the buffer.
+  uint32_t level_count = 1;
+  // TextureFilter, from the fetch constant. Carried for the sampler; kBaseMap
+  // never reaches here with level_count > 1, because a chain the guest does not
+  // want is not decoded in the first place.
+  uint8_t mip_filter = 0;
+  HleTextureLevelData levels[14] = {};
   std::vector<uint8_t> data;
 };
 
