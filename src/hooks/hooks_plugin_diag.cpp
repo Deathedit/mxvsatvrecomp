@@ -636,13 +636,7 @@ MX_SCRIPT_PROBE(sub_824CC218, orig_LoadUIAssetDbPackage,
                 "LoadUIAssetDatabasePackage")
 MX_SCRIPT_PROBE(sub_824D0F18, orig_SwitchToUIWorld, "SwitchToUIWorld")
 MX_SCRIPT_PROBE(sub_824CD280, orig_StartWorldLoad, "StartWorldLoad")
-
-// The registration site is 0x824F1E1C; its enclosing function is
-// `sub_824F1C98` — resolved from the recompiled sources, where the next
-// definition after it is `sub_824F1F78`, not guessed from the site address. If
-// this never runs, the script environment was never set up at all, which is a
-// different failure from "set up but never fed".
-MX_SCRIPT_PROBE(sub_824F1C98, orig_ScriptBindingRegister, "BindingRegister")
+MX_SCRIPT_PROBE(sub_824F1D80, orig_ScriptBindingRegister, "BindingRegister")
 
 // The script VM's native-call dispatcher, `sub_82AA7638`, used to be probed
 // here with MX_SCRIPT_PROBE. It answered its original question — the VM fires a
