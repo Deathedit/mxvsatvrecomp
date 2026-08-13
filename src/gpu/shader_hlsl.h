@@ -78,7 +78,11 @@ enum class HlslStatus : uint8_t {
   kFetchRelative,         // src or dest indexed by a register
   kFetchCube,             // UNUSED: cube fetches translate, see EmitTextureFetch
   kFetch1D,               // UNUSED: 1D fetches translate through a 2D binding
-  kFetch3D,               // dimension k3DOrStacked
+  // UNUSED: k3DOrStacked translates through a Texture2DArray. The instruction
+  // cannot say whether the texture is a stack or a true volume -- only the
+  // fetch constant can -- so the volume case is refused where that is known,
+  // in DescribeHleTexture2D, and this status has no reachable cause left.
+  kFetch3D,
   // Two fetches on one sampler slot at different dimensions. The slot gets one
   // HLSL declaration and one descriptor, so neither choice can serve both.
   kFetchDimensionConflict,
@@ -161,9 +165,10 @@ struct HlslShader {
   static constexpr uint32_t kVertexSamplerBaseRegister = 0;
 
   // Bit i set = compact slot i is declared Texture2DArray, not Texture2D,
-  // because its fetches are cube. The binder MUST create a TEXTURE2DARRAY SRV
-  // for those slots: an SRV whose dimension contradicts the declaration is
-  // undefined, not merely wrong-looking.
+  // because its fetches are cube or 3D/stacked — both address a third
+  // coordinate that a Texture2D has no axis for. The binder MUST create a
+  // TEXTURE2DARRAY SRV for those slots: an SRV whose dimension contradicts the
+  // declaration is undefined, not merely wrong-looking.
   uint32_t sampler_array_mask = 0;
 
   // A cube fetch appeared in a shader that never ran the `cube` ALU op, so the

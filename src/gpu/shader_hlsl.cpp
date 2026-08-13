@@ -822,15 +822,38 @@ class Emitter {
     // six times. Xenos does not filter across face edges either, so the one thing
     // this gives up costs nothing against the console.
     //
-    // 3D/stacked still needs a real Texture3D or a stack-sized array and is
-    // refused by name.
+    // 3D/STACKED joins the array path too, for the same reason cube does. One
+    // opcode serves two storage layouts -- ucode.h: "3D (used for both 3D and
+    // stacked 2D texture): U, V, W" -- and they are told apart by the FETCH
+    // CONSTANT's DataDimension, not by the instruction. A stacked texture is
+    // stack_depth+1 ordinary 2D images at 4 KB-aligned strides, which is
+    // exactly what DescribeHleTexture2D already produces and the binder already
+    // views as a TEXTURE2DARRAY. So the stacked case costs nothing new here.
+    //
+    // A true 3D volume interleaves its slices INSIDE a tile and does need a
+    // resource type we do not build; DescribeHleTexture2D refuses those by name
+    // ("texture is a 3D volume") and the draw falls back, which is the same
+    // outcome as today minus the shader-wide refusal that also cost the stacked
+    // case. Refusing at the texture, where the dimension is actually known,
+    // rather than at the instruction, where it is not, is the whole change.
+    //
+    // The reference reaches the same two destinations by declaring BOTH a
+    // Texture3D and a Texture2DArray and branching per-fetch on fetch constant
+    // word 5 bits 9:10 (dxbc_shader_translator_fetch.cc:903). It needs the
+    // branch because its shaders are cached against fetch constants it has not
+    // resolved at translate time; we resolve the binding per draw, so the
+    // branch collapses into which resource the binder hands us.
     using Dim = rex::graphics::xenos::FetchOpDimension;
     const bool is_cube = tf.dimension() == Dim::kCube;
-    if (!is_cube && tf.dimension() != Dim::k2D && tf.dimension() != Dim::k1D) {
+    const bool is_3d = tf.dimension() == Dim::k3DOrStacked;
+    if (!is_cube && !is_3d && tf.dimension() != Dim::k2D &&
+        tf.dimension() != Dim::k1D) {
       status = HlslStatus::kFetch3D;
       blocking_opcode = uint32_t(tf.opcode());
       return;
     }
+    // Both spellings that need a third coordinate share one declaration.
+    const bool is_array = is_cube || is_3d;
     const uint32_t sampler = tf.fetch_constant_index();
     PixelTextureBinding binding;
     binding.sampler = sampler;
@@ -846,18 +869,20 @@ class Emitter {
     // dimension would contradict whichever declaration the preamble writes, so
     // the shader is refused rather than emitted with a descriptor that cannot
     // match both of its fetches.
+    // Compared against is_ARRAY, not is_cube: cube and 3D/stacked both declare
+    // Texture2DArray, so a slot fetched both ways is still served by one
+    // declaration and one descriptor. Only array-versus-plain-2D is a real
+    // contradiction.
     const uint32_t slot_bit = 1u << slot;
     if ((slot_fetched_mask & slot_bit) &&
-        bool(slot_array_mask & slot_bit) != is_cube) {
+        bool(slot_array_mask & slot_bit) != is_array) {
       status = HlslStatus::kFetchDimensionConflict;
       blocking_opcode = uint32_t(tf.opcode());
       return;
     }
     slot_fetched_mask |= slot_bit;
-    if (is_cube) {
-      slot_array_mask |= slot_bit;
-      if (!uses_cube) cube_fetch_without_cube_op = true;
-    }
+    if (is_array) slot_array_mask |= slot_bit;
+    if (is_cube && !uses_cube) cube_fetch_without_cube_op = true;
 
     // The fetch source swizzle is ABSOLUTE, two bits per component — unlike an
     // ALU swizzle, which is component-relative. Reading it the ALU way sends
@@ -907,6 +932,43 @@ class Emitter {
       // A Xenos 1D texture is one row, described to the host as width x 1, so
       // the row centre is v = 0.5 in normalized space whatever the width.
       coord = "float2(" + coord + ", 0.5)";
+    }
+    if (is_3d) {
+      // W selects the slice. Which units it arrives in is the SAME question the
+      // reference answers with a runtime branch, and it has a static answer:
+      //
+      //   unnormalized -- W is already a layer index (`tx_coord_denorm` means
+      //     the guest addresses this texture in texels, and the layer axis has
+      //     no sub-texel meaning for a stack), so it passes through.
+      //   normalized -- W is a fraction of the stack, so it scales by the layer
+      //     COUNT to become an index. That count rides in xe_texinv[slot].z,
+      //     which was previously left zero.
+      //
+      // Scaling by a count rather than count-1 matches the hardware's own
+      // treatment of the stack as a texel axis, and the sampler clamps the top
+      // slice, so the last layer is reachable without the coordinate running
+      // off the end.
+      //
+      // A zero .z (no texture bound at this slot) collapses every fetch to
+      // slice 0 rather than producing a NaN coordinate -- the same reason
+      // xe_texinv is stored reciprocated for the 2D case.
+      //
+      // KNOWN DIVERGENCE, and the reason a real Texture3D is still worth
+      // building later: Xenos filters BETWEEN stack layers under VolMagFilter /
+      // VolMinFilter, and ucode.h names colour correction as the use for it. A
+      // Texture2DArray slice index does not filter -- D3D clamps it and picks
+      // one slice. So a graded frame comes out with quantised steps along the
+      // LUT's third axis rather than smooth ones. Correct hues, visible
+      // banding; a straight improvement on not drawing the pass at all, and
+      // deliberately not hidden by rounding the index.
+      const std::string src = Temp(tf.src());
+      const std::string w =
+          src + "." + std::string(1, kComponent[(swiz >> 4) & 3]);
+      coord = "float3(" + coord + ", " +
+              (tf.unnormalized_coordinates()
+                   ? w
+                   : "(" + w + " * xe_texinv[" + std::to_string(slot) + "].z)") +
+              ")";
     }
     const std::string s = std::to_string(slot);
     Line("xe_v = xe_tex" + s + SampleOp() + "xe_smp" + s + ", " + coord +

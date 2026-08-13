@@ -4,6 +4,7 @@
 #include <atomic>
 #include <bit>
 #include <cstring>
+#include <mutex>
 
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
@@ -13,6 +14,120 @@ namespace mx::hle {
 namespace {
 namespace xenos = rex::graphics::xenos;
 namespace tu = rex::graphics::texture_util;
+
+// The 3D tiled address, TRANSCRIBED from xenia-edge
+// (src/xenia/gpu/texture_util.cc:473, itself "reconstructed from disassembly of
+// XGRAPHICS::TileVolume"), not re-derived and not taken from the rexglue SDK.
+//
+// The SDK declares GetTiledOffset3D and would link, but its xenos layer is
+// known to lag xenia-edge, and there is no way to read its implementation from
+// here to check. A wrong address function does not fail loudly -- it produces a
+// plausible garbage image -- so the version that can be diffed against its
+// source wins.
+//
+// A tile is 32x32x4 BLOCKS. Note xenos.h:1204: "3D tiled texture slices 0:3 and
+// 4:7 are stored separately in memory, in non-overlapping ranges, but
+// addressing in 4:7 is different than in 0:3" -- that asymmetry is what
+// `offset_outer` and the odd/even split below encode, and it is exactly the
+// part a hand-rolled "z * slice_size" guess gets wrong.
+int32_t TiledOffset3D(int32_t x, int32_t y, int32_t z, uint32_t pitch,
+                      uint32_t height, uint32_t bytes_per_block_log2) {
+  constexpr uint32_t kTile = 32;
+  pitch = (pitch + (kTile - 1)) & ~(kTile - 1);
+  height = (height + (kTile - 1)) & ~(kTile - 1);
+  const int32_t macro_outer =
+      ((y >> 4) + (z >> 2) * int32_t(height >> 4)) * int32_t(pitch >> 5);
+  const int32_t macro =
+      ((((x >> 5) + macro_outer) << (bytes_per_block_log2 + 6)) & 0xFFFFFFF)
+      << 1;
+  const int32_t micro =
+      (((x & 7) + ((y & 6) << 2)) << (bytes_per_block_log2 + 6)) >> 6;
+  const int32_t offset_outer = ((y >> 3) + (z >> 2)) & 1;
+  const int32_t offset1 =
+      offset_outer + ((((x >> 3) + (offset_outer << 1)) & 3) << 1);
+  const int32_t offset2 = ((macro + (micro & ~15)) << 1) + (micro & 15) +
+                          ((z & 3) << (bytes_per_block_log2 + 6)) +
+                          ((y & 1) << 4);
+  int32_t address = (offset1 & 1) << 3;
+  address += (offset2 >> 6) & 7;
+  address <<= 3;
+  address += offset1 & ~1;
+  address <<= 2;
+  address += offset2 & ~511;
+  address <<= 3;
+  address += offset2 & 63;
+  return address;
+}
+
+// Xenia-edge's own GetTiledOffset2D (src/xenia/gpu/texture_util.cc:455),
+// transcribed so the SDK's version can be DIFFED against it rather than trusted.
+//
+// Every tiled 2D texture in the game -- which is nearly all of them -- is
+// addressed by the SDK's tu::GetTiledOffset2D, and nothing has ever checked it
+// against anything. The mip self-check cannot: it compares level n against a
+// box-filtered level n-1, so an addressing error applied CONSISTENTLY to both
+// levels scrambles them identically and still passes. It is a relative check,
+// and this is the absolute one it cannot be.
+int32_t XeniaTiledOffset2D(int32_t x, int32_t y, uint32_t pitch,
+                           uint32_t bytes_per_block_log2) {
+  constexpr uint32_t kTile = 32;
+  pitch = (pitch + (kTile - 1)) & ~(kTile - 1);
+  const int32_t macro = ((x >> 5) + (y >> 5) * int32_t(pitch >> 5))
+                        << (bytes_per_block_log2 + 7);
+  const int32_t micro = ((x & 7) + ((y & 0xE) << 2)) << bytes_per_block_log2;
+  const int32_t offset =
+      macro + ((micro & ~0xF) << 1) + (micro & 0xF) + ((y & 1) << 4);
+  return ((offset & ~0x1FF) << 3) + ((y & 16) << 7) + ((offset & 0x1C0) << 2) +
+         (((((y & 8) >> 2) + (x >> 3)) & 3) << 6) + (offset & 0x3F);
+}
+
+// One sweep, once per run, comparing the SDK's tiled addressing against the
+// transcription above. Silent when they agree; a single line naming the first
+// disagreement when they do not.
+//
+// Cheap enough to be unconditional (a few thousand integer ops at startup, not
+// per draw), and it must be unconditional: a mismatch here would mean every
+// tiled texture in the game is being read from the wrong bytes, which is not a
+// thing to leave behind a diagnostic flag that defaults off.
+HleTiledAddressCheck g_tiledCheck;
+
+void VerifyTiledAddressing() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    uint64_t checked = 0, mismatched = 0;
+    int32_t first_x = 0, first_y = 0, first_sdk = 0, first_xenia = 0;
+    uint32_t first_pitch = 0, first_bpb = 0;
+    // Pitches that are and are not tile-aligned, since internal alignment is
+    // exactly the kind of contract that drifts between versions -- xenia-edge's
+    // newer texture_address::Tiled2D asserts the caller pre-aligned it, while
+    // this entry point still aligns internally.
+    for (uint32_t bpb_log2 = 0; bpb_log2 <= 4; ++bpb_log2) {
+      for (uint32_t pitch : {32u, 64u, 96u, 128u, 260u, 512u}) {
+        for (int32_t y = 0; y < 72; ++y) {
+          for (int32_t x = 0; x < 72; ++x) {
+            const int32_t sdk = tu::GetTiledOffset2D(x, y, pitch, bpb_log2);
+            const int32_t ref = XeniaTiledOffset2D(x, y, pitch, bpb_log2);
+            ++checked;
+            if (sdk == ref) continue;
+            if (!mismatched) {
+              first_x = x; first_y = y; first_sdk = sdk; first_xenia = ref;
+              first_pitch = pitch; first_bpb = bpb_log2;
+            }
+            ++mismatched;
+          }
+        }
+      }
+    }
+    g_tiledCheck.checked = checked;
+    g_tiledCheck.mismatched = mismatched;
+    g_tiledCheck.first_x = first_x;
+    g_tiledCheck.first_y = first_y;
+    g_tiledCheck.first_sdk = first_sdk;
+    g_tiledCheck.first_reference = first_xenia;
+    g_tiledCheck.first_pitch = first_pitch;
+    g_tiledCheck.first_bytes_per_block_log2 = first_bpb;
+  });
+}
 
 void SwapBlock(uint8_t* p, uint32_t bytes, xenos::Endian endian) {
   // A 2-byte block never entered the dword loop below, so every 16-bit format
@@ -262,8 +377,14 @@ bool HleTextureHasNonzeroData(const HleTexturePayload& texture,
   return count != 0;
 }
 
+HleTiledAddressCheck HleTiledAddressStats() {
+  VerifyTiledAddressing();
+  return g_tiledCheck;
+}
+
 bool DescribeHleTexture2D(const uint32_t fetch_words[6],
                           HleTextureSource& out, const char** fail) {
+  VerifyTiledAddressing();
   auto reject = [&](const char* why) {
     if (fail) *fail = why;
     return false;
@@ -291,12 +412,28 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
   // interleave INSIDE a tile, need a resource type we do not build.
   const bool one_d = fetch.dimension == xenos::DataDimension::k1D;
   const bool cube = fetch.dimension == xenos::DataDimension::kCube;
-  if (fetch.dimension == xenos::DataDimension::k3D)
-    return reject("texture is a 3D volume");
+  // A TRUE VOLUME. Its slices interleave inside the tile rather than sitting a
+  // stride apart, which is the one thing the paragraph above says needs a
+  // resource type we do not build -- but only the ADDRESSING differs. Decoded
+  // slice by slice into the same tightly-packed output and bound as the same
+  // Texture2DArray, so nothing downstream changes; see HleTextureSource::volume.
+  //
+  // Refusing this was the red gameplay screen. Guest pixel shader 0x216012A0 is
+  // a full-screen pass with three samplers, one of them a volume; the refusal
+  // failed its slot fill, which reset an already-translated shader, which sent
+  // the draw to the vertex-colour stand-in, which painted flat red over a
+  // correctly tonemapped frame ([[red-screen-is-standin-overpaint]]).
+  out.volume = fetch.dimension == xenos::DataDimension::k3D;
   if (cube) {
     // size_2d.stack_depth is documented as 5 for a cube but "not very
     // meaningful"; a cube has six faces by definition, so do not read it.
     out.array_size = 6;
+  } else if (out.volume) {
+    // A volume's extents live in their OWN union member -- size_3d is 11/11/10
+    // bits where size_2d is 13/13/6 -- so reading it the 2D way would truncate
+    // the width and read the depth out of the height's high bits. The same trap
+    // size_1d already documents above.
+    out.array_size = fetch.size_3d.depth + 1;
   } else if (!one_d && fetch.stacked) {
     out.array_size = fetch.size_2d.stack_depth + 1;
   }
@@ -376,8 +513,13 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
   if (fi->bytes_per_block() & (fi->bytes_per_block() - 1))
     return reject("non-power-of-two block size");
 
-  out.width = (one_d ? fetch.size_1d.width : fetch.size_2d.width) + 1;
-  out.height = one_d ? 1u : fetch.size_2d.height + 1;
+  out.width = (one_d      ? fetch.size_1d.width
+               : out.volume ? fetch.size_3d.width
+                            : fetch.size_2d.width) +
+              1;
+  out.height = one_d        ? 1u
+               : out.volume ? fetch.size_3d.height + 1
+                            : fetch.size_2d.height + 1;
   out.block_width = fi->block_width;
   out.block_height = fi->block_height;
   out.bytes_per_block = fi->bytes_per_block();
@@ -443,10 +585,17 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
         fetch.dimension, fetch.pitch, out.width, out.height, out.array_size,
         out.tiled, format, /*has_packed_levels=*/false, /*has_base=*/true,
         /*max_level=*/0);
-    if (!layout.base.array_slice_stride_bytes ||
-        !layout.base.level_data_extent_bytes)
+    if (!layout.base.level_data_extent_bytes)
       return reject("array texture layout is empty");
-    out.slice_stride_bytes = layout.base.array_slice_stride_bytes;
+    // A VOLUME has no slice stride to demand -- its slices interleave inside
+    // the tile, so the layout reports one extent covering all of them and
+    // array_slice_stride_bytes is meaningless. Requiring it here was what made
+    // the whole branch reject volumes even after the dimension gate opened.
+    if (!out.volume) {
+      if (!layout.base.array_slice_stride_bytes)
+        return reject("array texture layout is empty");
+      out.slice_stride_bytes = layout.base.array_slice_stride_bytes;
+    }
     out.source_bytes = layout.base.level_data_extent_bytes;
   }
   if (!out.source_bytes || out.source_bytes > 256u * 1024u * 1024u)
@@ -537,8 +686,19 @@ bool DecodeHleTexture2D(const HleTextureSource& source,
     const uint64_t slice_tight = uint64_t(plan[l].row_pitch) * plan[l].rows;
     bool level_ok = true;
     for (uint32_t slice = 0; slice < slices && level_ok; ++slice) {
-      const uint64_t slice_base =
-          uint64_t(lv.offset_bytes) + uint64_t(slice) * lv.slice_stride_bytes;
+      // A TILED volume interleaves its slices inside the tile, so z goes into
+      // the address function and the base must NOT advance -- its
+      // slice_stride_bytes is 0 for exactly that reason. UNTILED, there is no
+      // interleaving and the slices are plain consecutive planes, which the
+      // linear formula below cannot express because it never sees z.
+      const uint64_t volume_plane =
+          (source.volume && !source.tiled)
+              ? uint64_t(lv.pitch_blocks) * lv.height_blocks *
+                    source.bytes_per_block
+              : 0;
+      const uint64_t slice_base = uint64_t(lv.offset_bytes) +
+                                  uint64_t(slice) * lv.slice_stride_bytes +
+                                  uint64_t(slice) * volume_plane;
       uint8_t* slice_out =
           out.data.data() + plan[l].offset + uint64_t(slice) * slice_tight;
       for (uint32_t y = 0; y < lv.height_blocks && level_ok; ++y) {
@@ -549,10 +709,21 @@ bool DecodeHleTexture2D(const HleTextureSource& source,
           // the packed level, all of which share one tail image.
           const uint32_t sx = x + lv.packed_offset_x_blocks;
           const uint32_t sy = y + lv.packed_offset_y_blocks;
-          const uint64_t src = slice_base +
+          // A volume addresses by (x, y, z) into one interleaved allocation; a
+          // stack or cube addresses by (x, y) into a slice that slice_base has
+          // already displaced. Untiled is the same linear formula either way,
+          // with the slice reached through slice_base as before.
+          const uint64_t src =
+              slice_base +
               (source.tiled
-                   ? uint64_t(tu::GetTiledOffset2D(sx, sy, lv.pitch_blocks,
-                                                   bpb_log2))
+                   ? (source.volume
+                          ? uint64_t(TiledOffset3D(int32_t(sx), int32_t(sy),
+                                                   int32_t(slice),
+                                                   lv.pitch_blocks,
+                                                   lv.height_blocks, bpb_log2))
+                          : uint64_t(tu::GetTiledOffset2D(sx, sy,
+                                                          lv.pitch_blocks,
+                                                          bpb_log2)))
                    : (uint64_t(sy) * lv.pitch_blocks + sx) *
                          source.bytes_per_block);
           if (src + source.bytes_per_block > guest_bytes) {

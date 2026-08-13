@@ -1572,16 +1572,28 @@ bool D3D12Renderer::UploadGameTexture(GameTexture& entry,
   // than a stride.
   const uint32_t slices = std::max<uint32_t>(td.DepthOrArraySize, 1);
   const uint32_t levels = std::max<uint32_t>(td.MipLevels, 1);
-  constexpr uint32_t kMaxSubresources = 6 * 14;  // slices * kTextureMaxMips
-  D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprints[kMaxSubresources] = {};
-  UINT rowCounts[kMaxSubresources] = {};
-  UINT64 rowByteCounts[kMaxSubresources] = {};
-  UINT64 uploadBytes = 0;
   const uint32_t subresources = slices * levels;
-  if (subresources > kMaxSubresources || levels > std::size(src.levels))
-    return false;
-  m_device->GetCopyableFootprints(&td, 0, subresources, 0, footprints,
-                                  rowCounts, rowByteCounts, &uploadBytes);
+  if (levels > std::size(src.levels)) return false;
+  // Heap-allocated, deliberately. These were fixed arrays of 6 * 14 -- six
+  // slices, because six is a cube and a cube was the only array texture that
+  // existed. A true 3D VOLUME has up to 1024 slices (size_3d.depth is 10 bits),
+  // and a colour-grading LUT of 16 or 32 sailed past the guard and returned
+  // false: 428 `upload-failed` in the first run with volumes enabled, which is
+  // the whole texture silently absent rather than a visible error.
+  //
+  // Sized from the resource rather than from a constant, so the next dimension
+  // that turns up cannot reintroduce the same cap. Reused across calls to keep
+  // the allocation off the per-texture path.
+  static thread_local std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints;
+  static thread_local std::vector<UINT> rowCounts;
+  static thread_local std::vector<UINT64> rowByteCounts;
+  footprints.assign(subresources, {});
+  rowCounts.assign(subresources, 0);
+  rowByteCounts.assign(subresources, 0);
+  UINT64 uploadBytes = 0;
+  m_device->GetCopyableFootprints(&td, 0, subresources, 0, footprints.data(),
+                                  rowCounts.data(), rowByteCounts.data(),
+                                  &uploadBytes);
 
   auto& upload = entry.upload[m_frameIndex % kFrameCount];
   if (!upload || upload->GetDesc().Width < uploadBytes) {
@@ -3670,6 +3682,44 @@ void D3D12Renderer::RenderGameFrame() {
       e.object = d.targetObject;
       if (d.translated) ++e.translated;
       if (d.pixelSamplerCount) ++e.wantedSlots;
+      // PROBE: WHICH draws are still being skipped on the two scene bands.
+      //
+      // After the colorWrite clause the menu goes to zero on 1280x640 / 1280x80
+      // but freeroam keeps 65-79 per interval, and the counters cannot say what
+      // they are. The guest-side probe reports the whole null-PS colour
+      // population as "WOULD PAINT 0, masked off 29436, mask unreadable 0", so
+      // every one of them should already be exempt -- these are something else,
+      // and a tally across four separately-sampled counters cannot identify it.
+      // A colorMaskKnown flag was tried on the theory that the mask was simply
+      // unobserved for them; it changed nothing, because "mask unreadable 0"
+      // had already ruled that out and I read past it. Reverted.
+      //
+      // One line per distinct (target, shader), so a handful of lines names the
+      // population instead of 65 copies of one draw.
+      {
+        static std::mutex s_mu;
+        static std::set<uint64_t> s_seen;
+        const uint64_t key =
+            (uint64_t(d.targetObject) << 32) | d.pixelShaderHandle;
+        bool fresh = false;
+        {
+          std::lock_guard<std::mutex> lk(s_mu);
+          fresh = s_seen.size() < 24 && s_seen.insert(key).second;
+        }
+        if (fresh) {
+          char line[256];
+          std::snprintf(line, sizeof(line),
+                        "WHITE-SKIP WHO: target 0x%08X %ux%u ps 0x%08X "
+                        "colorWrite %d colorSource %u textured %d translated %d "
+                        "samplers %u depth %d blend %d",
+                        d.targetObject, d.targetWidth, d.targetHeight,
+                        d.pixelShaderHandle, d.colorWrite ? 1 : 0,
+                        unsigned(d.colorSource), d.texture ? 1 : 0,
+                        d.translated ? 1 : 0, d.pixelSamplerCount,
+                        d.depthEnable ? 1 : 0, d.blendEnable ? 1 : 0);
+          LogInfo(line);
+        }
+      }
       continue;
     }
     if (translatedPso) {
@@ -4465,14 +4515,22 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
         // scene composite at s13, that slot is a snapshot, its texinv was zero,
         // and an unnormalized fetch times zero reads texel (0,0) and paints it
         // flat over 21753 indices of character mesh.
+        //
+        // .z is the LAYER COUNT, not a reciprocal, and it is the one component
+        // here that scales up rather than down: a 3D/stacked fetch with
+        // normalized coordinates delivers W as a fraction of the stack, and the
+        // Texture2DArray it samples wants a slice index. See EmitTextureFetch.
+        // Left at zero for a snapshot or an absent texture, which pins such a
+        // fetch to slice 0 instead of sampling off the end.
         for (uint32_t s = 0; s < kTranslatedSamplerSlots; ++s) {
-          uint32_t w = 0, h = 0;
+          uint32_t w = 0, h = 0, layers = 0;
           const auto& tex = s < d.pixelTextures.size() && d.pixelTextures[s]
                                 ? d.pixelTextures[s]
                                 : (s == 0 ? d.texture : nullptr);
           if (tex && tex->width && tex->height) {
             w = tex->width;
             h = tex->height;
+            layers = tex->array_size;
           } else if (s < d.pixelSampledObjects.size() &&
                      d.pixelSampledObjects[s]) {
             const auto snap = m_gameSnapshots.find(d.pixelSampledObjects[s]);
@@ -4482,7 +4540,8 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
             }
           }
           if (!w || !h) continue;
-          const float ts[4] = {1.0f / float(w), 1.0f / float(h), 0.0f, 0.0f};
+          const float ts[4] = {1.0f / float(w), 1.0f / float(h),
+                               float(layers), 0.0f};
           std::memcpy(static_cast<uint8_t*>(p) + bankBytes + s * 16, ts,
                       sizeof(ts));
         }

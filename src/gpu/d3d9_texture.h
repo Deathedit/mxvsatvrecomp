@@ -69,6 +69,19 @@ struct HleTextureSource {
   // (0 when array_size is 1). Both come from GetGuestTextureLayout.
   uint32_t array_size = 1;
   uint32_t slice_stride_bytes = 0;
+  // A TRUE 3D VOLUME, as opposed to a stack. Both report array_size > 1 and both
+  // decode into the same tightly-packed per-slice output, but they are laid out
+  // in guest memory in completely different ways:
+  //
+  //   stack  -- each slice is a separate 2D image, slice_stride_bytes apart.
+  //   volume -- slices INTERLEAVE inside a 32x32x4-block tile, so there is no
+  //             stride at all and the address needs the z coordinate.
+  //
+  // So this selects the address function in DecodeHleTexture2D, and
+  // slice_stride_bytes stays 0 for a volume. The host resource is a
+  // Texture2DArray either way -- see the note on the layer axis in
+  // shader_hlsl.cpp's 3D fetch.
+  bool volume = false;
   // PACKED MIP TAIL. A texture whose width OR height is 16 or smaller does not
   // store its BASE level plainly at base_address: the level lives inside a mip
   // tail, offset by these block counts. From the SDK,
@@ -166,6 +179,27 @@ struct HleMipCensus {
   uint64_t by_max_level[16] = {};
 };
 HleMipCensus HleMipChainStats();
+
+// Does the SDK's tiled addressing agree with xenia-edge's?
+//
+// Nothing has ever asked. Every tiled 2D texture in the game goes through
+// tu::GetTiledOffset2D, and the mip self-check cannot cover it: that compares
+// level n against a box-filtered level n-1, so an addressing error applied
+// consistently to both levels scrambles them identically and still passes. It is
+// a relative check; this is the absolute one.
+//
+// Run once per process over a coordinate sweep at every block size, against a
+// transcription of xenia-edge's own implementation. `mismatched == 0` is the
+// only acceptable result -- anything else means every tiled texture is read from
+// the wrong bytes, so the first disagreement is carried here to name it.
+struct HleTiledAddressCheck {
+  uint64_t checked = 0;
+  uint64_t mismatched = 0;
+  int32_t first_x = 0, first_y = 0;
+  int32_t first_sdk = 0, first_reference = 0;
+  uint32_t first_pitch = 0, first_bytes_per_block_log2 = 0;
+};
+HleTiledAddressCheck HleTiledAddressStats();
 
 bool DescribeHleTexture2D(const uint32_t fetch_words[6],
                           HleTextureSource& out, const char** fail = nullptr);
