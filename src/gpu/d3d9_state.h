@@ -27,7 +27,26 @@
 namespace mx::hle {
 
 constexpr uint32_t kMaxStreams  = 4;
-constexpr uint32_t kMaxSamplers = 16;
+// Xenos has THIRTY-TWO texture fetch constants, not sixteen. A tfetch's
+// fetch_constant_index is five bits, so a shader may name any of tf0..tf31, and
+// this was silently rejecting every fetch at or above 16 as "out of range" —
+// which surfaced as slot-fill failures that discarded an already-translated
+// pixel shader and sent the draw to the stand-in.
+//
+// Confirmed two independent ways rather than assumed:
+//   - xenia-edge registers run XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 through
+//     ..._FETCH_31_5, i.e. 32 constants of 6 dwords.
+//   - the guest device's own layout agrees exactly. The fetch file is at
+//     device+0x480 with a 24-byte stride (ReadLiveTextureFetch), and
+//     0x480 + 32*24 = 0x780, which is precisely kDeviceVsConstFile, where the
+//     vertex constant file begins. Sixteen entries would end at 0x600 and leave
+//     0x600..0x780 unexplained.
+//
+// CollectPixelShaderBlob already noted "the guest block itself contains all 32"
+// while keeping only the first half. Nothing else here assumes 16: every other
+// use is a bounds check or an array size, and texture_seen_mask is a uint32_t,
+// which holds exactly 32 bits.
+constexpr uint32_t kMaxSamplers = 32;
 
 //===========================================================================
 // Vertex streams.
