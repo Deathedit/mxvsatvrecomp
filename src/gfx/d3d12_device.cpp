@@ -329,6 +329,10 @@ void D3D12Renderer::Shutdown() {
   m_gameSrvHeap.Reset();
   m_gameSrvDescriptorSize = 0;
   m_nextGameSrvDescriptor = 0;
+  // With the bump allocator. Slots recycled from evicted textures index into
+  // the heap being released here, so keeping them would hand out descriptors
+  // into freed storage on the next device.
+  m_freeGameSrvDescriptors.clear();
   m_hasGamePipeline = false;
 
   m_gameDraws.clear();

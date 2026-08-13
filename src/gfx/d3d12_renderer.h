@@ -700,6 +700,10 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // mismatch means the guest repacked the texture under a stable key and the
     // resource is showing stale bytes -- see HleTexturePayload::content_version.
     uint32_t uploadedVersion = 0;
+    // m_fenceValue when this texture was last bound. The LRU stamp for
+    // eviction, and the guard that stops a texture in use by the frame being
+    // recorded from being evicted out from under it.
+    uint64_t lastUsedFence = 0;
   };
   // Every surface object ever seen as a resolve source, and ever sampled by a
   // later draw. Historical rather than per frame because the offscreen routing
@@ -731,6 +735,27 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   uint64_t m_translatedPsoCapped = 0;   // PSO cache at kMaxTranslatedPSOs
   uint64_t m_translatedNoRootSig = 0;   // root signature or VS blob absent
   std::unordered_map<uint64_t, GameTexture> m_gameTextures;
+  // SRV slots returned by evicted textures, safe to hand out again. Without
+  // this m_nextGameSrvDescriptor is a pure bump allocator and the heap is a
+  // one-way ratchet: the cache key is an FNV-1a hash over all six fetch-constant
+  // dwords INCLUDING base_address, so the same artwork streamed to a different
+  // guest allocation is a new key and burns another slot forever. Measured
+  // 53 -> 740 of 1024 in five minutes of swapping riders, with live render
+  // targets flat at 27/256 throughout. On exhaustion EnsureGameTexture returns
+  // false and every texture after it renders as vertex colour, permanently.
+  std::vector<uint32_t> m_freeGameSrvDescriptors;
+  // Evict down to this before the heap is exhausted rather than at the wall.
+  // Hitting the cap is not a soft failure -- it is untextured for the rest of
+  // the process -- so the cache is kept clear of it by a margin.
+  // Verified by temporarily forcing this to 96, which made eviction run
+  // continuously instead of never: 656 evictions, srv flat at 230/1024, the
+  // free list cycling 2..16, evict-blocked 0, no device-removed and no page
+  // fault. At the real threshold a menu session peaks around 293 cached and
+  // this never fires -- which is why it had to be tested at a value that does.
+  static constexpr uint32_t kGameTextureHighWater = kMaxGameTextures * 7 / 8;
+  uint64_t m_gameTextureEvictions = 0;
+  uint64_t m_gameTextureEvictBlocked = 0;
+  void EvictGameTexturesToHighWater();
   bool UploadGameTexture(GameTexture& entry,
                          const mx::hle::HleTexturePayload& src);
   // The video plane descriptors sit at the head of the heap; the general
@@ -1015,6 +1040,12 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   struct RetiredFrame {
     uint64_t fence = 0;
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> res;
+    // Game-texture SRV slots freed with this batch. A descriptor is not safe to
+    // overwrite the moment its texture is evicted: it lives in a SHADER-VISIBLE
+    // heap, and any command list already submitted may still dereference it.
+    // Carried on the same fence as the resources for exactly that reason --
+    // same lifetime question, same answer.
+    std::vector<uint32_t> srv;
   };
   std::deque<RetiredFrame> m_retired;
 

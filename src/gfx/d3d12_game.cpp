@@ -1628,6 +1628,9 @@ bool D3D12Renderer::EnsureGameTexture(
   if (!texture || texture->data.empty() || !m_gameSrvHeap) return false;
   if (auto it = m_gameTextures.find(texture->key); it != m_gameTextures.end()) {
     descriptorIndex = it->second.descriptorIndex;
+    // The LRU stamp. Also what makes this entry un-evictable for the rest of
+    // the frame being recorded, which is the point: it is about to be sampled.
+    it->second.lastUsedFence = m_fenceValue;
     // The guest repacked this texture under a stable key -- a Scaleform glyph
     // atlas. Refill the existing resource rather than making a new one: the
     // key does not change, so a new resource would leak one per repack, and
@@ -1636,11 +1639,28 @@ bool D3D12Renderer::EnsureGameTexture(
       UploadGameTexture(it->second, *texture);
     return true;
   }
-  if (m_nextGameSrvDescriptor >= kMaxGameTextures) {
-    static bool s_logged = false;
-    if (!s_logged) {
-      s_logged = true;
-      LogError("game texture cache full; falling back to vertex colour");
+  // A miss is about to claim a slot, so make sure there is one to claim. Done
+  // here rather than per frame because this is the only place demand grows,
+  // and an eviction pass that runs when nothing was inserted is pure cost.
+  EvictGameTexturesToHighWater();
+  if (m_freeGameSrvDescriptors.empty() &&
+      m_nextGameSrvDescriptor >= kMaxGameTextures) {
+    // Now genuinely unrecoverable rather than merely unhandled: eviction ran
+    // and freed nothing, which means a single frame is binding more distinct
+    // textures than the heap holds. Rate-limited rather than once-only -- the
+    // old `static bool` reported the first occurrence in a run and hid every
+    // later one, so a transient exhaustion and a permanent one read alike.
+    static uint64_t s_full = 0;
+    if (++s_full == 1 || (s_full % 1000) == 0) {
+      char message[192];
+      std::snprintf(message, sizeof(message),
+                    "game texture cache full (%llu times); %zu live, %llu "
+                    "evicted, %llu passes freed nothing",
+                    static_cast<unsigned long long>(s_full),
+                    m_gameTextures.size(),
+                    static_cast<unsigned long long>(m_gameTextureEvictions),
+                    static_cast<unsigned long long>(m_gameTextureEvictBlocked));
+      LogError(message);
     }
     return false;
   }
@@ -1730,8 +1750,19 @@ bool D3D12Renderer::EnsureGameTexture(
     return false;
   if (!UploadGameTexture(entry, *texture)) return false;
 
-  if (m_nextGameSrvDescriptor >= kMaxGameTextures) return false;
-  entry.descriptorIndex = m_nextGameSrvDescriptor++;
+  // A recycled slot before a fresh one, so the heap stops being a ratchet.
+  // Claimed only now, after the resource exists and the upload succeeded --
+  // claiming earlier leaks the slot on every failure, which is the bug the note
+  // in CreatePooledSurface records.
+  if (!m_freeGameSrvDescriptors.empty()) {
+    entry.descriptorIndex = m_freeGameSrvDescriptors.back();
+    m_freeGameSrvDescriptors.pop_back();
+  } else if (m_nextGameSrvDescriptor < kMaxGameTextures) {
+    entry.descriptorIndex = m_nextGameSrvDescriptor++;
+  } else {
+    return false;
+  }
+  entry.lastUsedFence = m_fenceValue;
   D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
   srv.Format = format;
   srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -1754,6 +1785,60 @@ bool D3D12Renderer::EnsureGameTexture(
     LogInfo(message);
   }
   return true;
+}
+
+// Unload the least recently used guest textures until the cache is back under
+// the high-water mark.
+//
+// The cache had no unload path at all -- find and emplace, no erase anywhere --
+// so every distinct fetch constant a session ever saw held its SRV slot until
+// the device died. Swapping riders is the pathological case: each one streams
+// its gear, helmet and goggles to fresh guest allocations, every one a new key.
+//
+// LRU by the fence a texture was last bound on, which is monotonic and already
+// maintained. Textures touched by the frame being recorded are NOT evictable:
+// their descriptors are referenced by a command list that has not been
+// submitted yet, and no fence has been signalled that could ever release them.
+// That is also why eviction can legitimately fail -- if a single frame really
+// does bind more than the high-water mark of distinct textures, there is
+// nothing safe to drop, and the honest outcome is to say so rather than to
+// corrupt a live descriptor.
+void D3D12Renderer::EvictGameTexturesToHighWater() {
+  const size_t live = m_gameTextures.size();
+  if (live <= kGameTextureHighWater) return;
+
+  // Never the frame being recorded; see above.
+  const uint64_t in_flight = m_fenceValue;
+  std::vector<std::pair<uint64_t, uint64_t>> candidates;  // (lastUsed, key)
+  candidates.reserve(live);
+  for (const auto& [key, entry] : m_gameTextures)
+    if (entry.lastUsedFence < in_flight)
+      candidates.emplace_back(entry.lastUsedFence, key);
+
+  const size_t want = live - kGameTextureHighWater;
+  if (candidates.size() < want) ++m_gameTextureEvictBlocked;
+  const size_t take = std::min(want, candidates.size());
+  if (!take) return;
+  std::partial_sort(candidates.begin(), candidates.begin() + take,
+                    candidates.end());
+
+  for (size_t i = 0; i < take; ++i) {
+    auto it = m_gameTextures.find(candidates[i].second);
+    if (it == m_gameTextures.end()) continue;
+    // Resource and descriptor retire together, on the same fence. RetireResource
+    // stamps m_fenceValue + 1 -- the frame being recorded -- so the slot comes
+    // back only once that submission has completed.
+    const uint32_t index = it->second.descriptorIndex;
+    RetireResource(std::move(it->second.resource));
+    for (auto& up : it->second.upload) RetireResource(std::move(up));
+    const uint64_t pending = m_fenceValue + 1;
+    RetiredFrame& r = (!m_retired.empty() && m_retired.back().fence == pending)
+                          ? m_retired.back()
+                          : m_retired.emplace_back(RetiredFrame{pending, {}, {}});
+    r.srv.push_back(index);
+    m_gameTextures.erase(it);
+    ++m_gameTextureEvictions;
+  }
 }
 
 void D3D12Renderer::RetireResource(
@@ -3612,14 +3697,18 @@ void D3D12Renderer::RenderGameFrame() {
     std::snprintf(message, sizeof(message),
                   "game RT routing: offscreen %llu, main %llu, OVERPAINT %llu "
                   "(refused: budget %llu, resized %llu); live targets %u/%u, "
-                  "srv %u/%u",
+                  "srv %u/%u (cached %zu, free %zu, evicted %llu, "
+                  "evict-blocked %llu)",
                   static_cast<unsigned long long>(m_rtDrawsOffscreen),
                   static_cast<unsigned long long>(m_rtDrawsMain),
                   static_cast<unsigned long long>(m_rtDrawsOverpaint),
                   static_cast<unsigned long long>(m_rtRejectBudget),
                   static_cast<unsigned long long>(m_rtRejectResized),
                   uint32_t(m_gameRenderTargets.size()), kMaxGameRenderTargets,
-                  m_nextGameSrvDescriptor, kMaxGameTextures);
+                  m_nextGameSrvDescriptor, kMaxGameTextures,
+                  m_gameTextures.size(), m_freeGameSrvDescriptors.size(),
+                  static_cast<unsigned long long>(m_gameTextureEvictions),
+                  static_cast<unsigned long long>(m_gameTextureEvictBlocked));
     LogInfo(message);
     // The figure that says whether the guest's own shaders are actually
     // carrying the picture. Translated against stand-in, because the translated
@@ -3926,6 +4015,11 @@ void D3D12Renderer::DrainRetired() {
   if (m_retired.empty() || !m_fence) return;
   const uint64_t completed = m_fence->GetCompletedValue();
   while (!m_retired.empty() && m_retired.front().fence <= completed) {
+    // The descriptors come back on the same fence as the resources. Returning
+    // them any earlier would let a live command list sample a slot that has
+    // been rewritten to point at a different texture.
+    for (uint32_t index : m_retired.front().srv)
+      m_freeGameSrvDescriptors.push_back(index);
     m_retired.pop_front();
   }
 }
