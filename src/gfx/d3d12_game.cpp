@@ -79,10 +79,20 @@ using mx::gfx::LogInfo;
 // 0", which the reference expresses the same way (MaxLOD = MinLOD, see
 // xenia/gpu/d3d12/d3d12_texture_cache.cc:1086).
 D3D12_SAMPLER_DESC D3D12Renderer::SamplerVariantDesc(uint32_t variant) {
-  variant &= kSamplerClampU | kSamplerClampV | kSamplerPoint | kSamplerBaseMap;
+  variant &= kSamplerClampU | kSamplerClampV | kSamplerPoint | kSamplerBaseMap |
+             kSamplerMipPoint;
   D3D12_SAMPLER_DESC sd = {};
-  sd.Filter = (variant & kSamplerPoint) ? D3D12_FILTER_MIN_MAG_MIP_POINT
-                                        : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+  // Two independent choices: how to filter WITHIN a level (the guest's min/mag
+  // filter) and how to filter BETWEEN levels (its mip filter). D3D12 spells the
+  // four combinations as four enumerants.
+  if (variant & kSamplerPoint)
+    sd.Filter = (variant & kSamplerMipPoint)
+                    ? D3D12_FILTER_MIN_MAG_MIP_POINT
+                    : D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR;
+  else
+    sd.Filter = (variant & kSamplerMipPoint)
+                    ? D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT
+                    : D3D12_FILTER_MIN_MAG_MIP_LINEAR;
   sd.AddressU = (variant & kSamplerClampU) ? D3D12_TEXTURE_ADDRESS_MODE_CLAMP
                                            : D3D12_TEXTURE_ADDRESS_MODE_WRAP;
   sd.AddressV = (variant & kSamplerClampV) ? D3D12_TEXTURE_ADDRESS_MODE_CLAMP
@@ -91,11 +101,6 @@ D3D12_SAMPLER_DESC D3D12Renderer::SamplerVariantDesc(uint32_t variant) {
   sd.MaxAnisotropy = 1;
   sd.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
   sd.MinLOD = 0.0f;
-  // Filtering BETWEEN levels is always linear where a chain exists, even when
-  // the guest asked for point. That is a stated approximation, not an
-  // oversight: honouring it needs a fifth variant bit, and both limits below
-  // are now exactly full. The census counts how often the game asks, so the
-  // question can be settled on a number.
   sd.MaxLOD = (variant & kSamplerBaseMap) ? sd.MinLOD : D3D12_FLOAT32_MAX;
   return sd;
 }
@@ -115,6 +120,13 @@ uint32_t D3D12Renderer::SamplerVariantFor(
   // whose chain was suppressed while some OTHER texture in the same block has
   // one. Set anyway, because a sampler is chosen per slot, not per resource.
   if (tex.mip_filter == mx::hle::kMipFilterBaseMap) variant |= kSamplerBaseMap;
+  // Gated on there BEING a chain. mip_filter's zero value is kPoint, which is
+  // also what a payload built by anything other than the guest texture path
+  // carries, so an ungated test would put every Bink plane and resolve snapshot
+  // into its own variant to express a distinction that cannot arise with one
+  // level.
+  if (tex.level_count > 1 && tex.mip_filter == mx::hle::kMipFilterPoint)
+    variant |= kSamplerMipPoint;
   return variant;
 }
 
@@ -912,47 +924,49 @@ bool D3D12Renderer::BindTranslatedSamplers(const GameDraw& d,
   // repeat slot 0, matching how BindTranslatedTextures fills the SRV table --
   // the range covers all sixteen whether or not the shader samples them, so
   // every one needs a defined descriptor.
-  uint32_t variants[kSamplerBlockSlots] = {};
-  uint64_t key = 0;
+  // The variants ARE the key. They used to be packed a few bits each into a
+  // uint64_t, which ran out at five bits across sixteen slots.
+  std::array<uint8_t, kSamplerBlockSlots> key{};
   for (uint32_t i = 0; i < kSamplerBlockSlots; ++i) {
     const uint32_t slot = i < stageSamplerCount ? i : 0;
+    uint32_t variant = 0;
     // A resolve snapshot is a host render target, not a guest texture: there is
     // no fetch constant to read a mode off, and it is sampled 1:1, so it takes
     // the clamped point variant rather than inheriting slot 0's.
     if (slot < stageSampledObjects.size() && stageSampledObjects[slot]) {
-      variants[i] = kSamplerClampU | kSamplerClampV | kSamplerPoint;
+      variant = kSamplerClampU | kSamplerClampV | kSamplerPoint;
     } else if (slot < stageTextures.size() && stageTextures[slot]) {
-      variants[i] = SamplerVariantFor(*stageTextures[slot]);
+      variant = SamplerVariantFor(*stageTextures[slot]);
     }
-    key |= uint64_t(variants[i] & 0xFu) << (i * 4);
+    key[i] = uint8_t(variant);
   }
 
   if (auto it = m_samplerBlocks.find(key); it != m_samplerBlocks.end()) {
     out = m_samplerHeap->GetGPUDescriptorHandleForHeapStart();
-    out.ptr += UINT64(it->second) * kSamplerBlockSlots * m_samplerDescriptorSize;
+    out.ptr += UINT64(SamplerBlockBase(it->second)) * m_samplerDescriptorSize;
     return true;
   }
   if (m_samplerBlockNext >= kSamplerBlockCount) {
-    // Out of distinct configurations. Fall back to the reserved first block
-    // rather than failing the draw: its slot 0 is the plain linear-wrap variant,
-    // which is what every slot got before this function existed.
+    // Out of distinct configurations. Fall back to the reserved region rather
+    // than failing the draw: its slot 0 is the plain linear-wrap variant, which
+    // is what every slot got before this function existed. The region is at
+    // least a block wide, so reading a whole table out of it stays in bounds.
     ++m_samplerBlockExhausted;
     out = m_samplerHeap->GetGPUDescriptorHandleForHeapStart();
     return true;
   }
 
-  // Block 0 is the reserved variant block, so the caches start at 1.
-  const uint32_t block = 1 + m_samplerBlockNext++;
+  const uint32_t block = m_samplerBlockNext++;
   auto cpu = m_samplerHeap->GetCPUDescriptorHandleForHeapStart();
-  cpu.ptr += SIZE_T(block) * kSamplerBlockSlots * m_samplerDescriptorSize;
+  cpu.ptr += SIZE_T(SamplerBlockBase(block)) * m_samplerDescriptorSize;
   for (uint32_t i = 0; i < kSamplerBlockSlots; ++i) {
-    const D3D12_SAMPLER_DESC sd = SamplerVariantDesc(variants[i]);
+    const D3D12_SAMPLER_DESC sd = SamplerVariantDesc(key[i]);
     m_device->CreateSampler(&sd, cpu);
     cpu.ptr += SIZE_T(m_samplerDescriptorSize);
   }
   m_samplerBlocks.emplace(key, block);
   out = m_samplerHeap->GetGPUDescriptorHandleForHeapStart();
-  out.ptr += UINT64(block) * kSamplerBlockSlots * m_samplerDescriptorSize;
+  out.ptr += UINT64(SamplerBlockBase(block)) * m_samplerDescriptorSize;
   return true;
 }
 
@@ -3710,6 +3724,9 @@ void D3D12Renderer::RenderGameFrame() {
       if (d.texture && !d.texture->linear_filter) variant |= kSamplerPoint;
       if (d.texture && d.texture->mip_filter == mx::hle::kMipFilterBaseMap)
         variant |= kSamplerBaseMap;
+      if (d.texture && d.texture->level_count > 1 &&
+          d.texture->mip_filter == mx::hle::kMipFilterPoint)
+        variant |= kSamplerMipPoint;
       auto samp = m_samplerHeap->GetGPUDescriptorHandleForHeapStart();
       samp.ptr += UINT64(std::min(variant, kSamplerVariantCount - 1)) *
                   m_samplerDescriptorSize;

@@ -33,6 +33,10 @@ enum class HostTextureFormat : uint8_t {
 // Named here so the renderer can test for it without comparing against a bare 2
 // and without including the SDK's xenos.h.
 constexpr uint8_t kMipFilterBaseMap = 2;
+// xenos::TextureFilter::kPoint -- pick the nearest mip rather than blending the
+// two. Zero, which is also what a payload that never set the field carries, so
+// test it alongside level_count > 1 rather than on its own.
+constexpr uint8_t kMipFilterPoint = 0;
 
 // One decoded mip level inside HleTexturePayload::data.
 //

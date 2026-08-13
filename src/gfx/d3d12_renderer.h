@@ -235,37 +235,48 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // kSamplerBaseMap is the guest's mip_filter == kBaseMap: sample level 0 and
   // never minify past it. It pins MaxLOD back to MinLOD, which is what MaxLOD
   // was unconditionally before the mip chain was uploaded.
+  // kSamplerMipPoint is mip_filter == kPoint: pick the nearest level rather
+  // than blending the two. Measured at 3,455 of 8,990 chains in one freeroam
+  // run -- 38%, which is why it is a variant bit and not a rounding error.
+  // Only meaningful where a chain exists, so it is set only then; with one
+  // level the two filters are identical and the extra variants would be churn.
   static constexpr uint32_t kSamplerClampU = 1;
   static constexpr uint32_t kSamplerClampV = 2;
   static constexpr uint32_t kSamplerPoint = 4;
   static constexpr uint32_t kSamplerBaseMap = 8;
-  static constexpr uint32_t kSamplerVariantCount = 16;
-  // Both of the limits this sits inside are now EXACTLY full: sixteen variants
-  // fill the reserved block below, and the block cache's key packs four bits
-  // per slot into a uint64_t across sixteen slots. A fifth bit needs the
-  // reserved region sized separately from kSamplerBlockSlots -- 32 + 16 * 126
-  // is still 2048, and only 24 blocks are ever used -- and a key wider than a
-  // uint64_t. Neither is hard; neither is free either.
-  static_assert(kSamplerVariantCount * 4 <= 64,
-                "the sampler block key packs four bits per slot");
+  static constexpr uint32_t kSamplerMipPoint = 16;
+  static constexpr uint32_t kSamplerVariantCount = 32;
 
   // A shader-visible sampler heap is capped at 2048 descriptors, which is what
-  // sizes everything below. The first block holds the single-descriptor
-  // variants the stand-in path indexes directly; the remaining blocks are
-  // kTranslatedSamplerSlots wide, because the translated root signature's
-  // sampler range is that wide and a table must be contiguous.
+  // sizes everything below. The reserved region at the front holds the
+  // single-descriptor variants the stand-in path indexes directly; the blocks
+  // after it are kTranslatedSamplerSlots wide, because the translated root
+  // signature's sampler range is that wide and a table must be contiguous.
+  //
+  // The two used to share one width, which worked only while the variants
+  // happened to fit in a block. The fifth variant bit broke that tie, so they
+  // are sized independently now: 32 + 16 * 126 is still exactly 2048, and no
+  // run has ever used more than 24 blocks.
   //
   // Blocks are CACHED by their slot configuration rather than allocated per
-  // draw: the configuration is a tuple of 3-bit variants, and this game uses a
-  // handful of distinct ones, so a ring sized for draws was never needed.
+  // draw: this game uses a handful of distinct ones, so a ring sized for draws
+  // was never needed.
   static constexpr uint32_t kSamplerBlockSlots = 16;
-  static constexpr uint32_t kSamplerBlockCount = 127;
+  static constexpr uint32_t kSamplerReservedSlots = kSamplerVariantCount;
+  static constexpr uint32_t kSamplerBlockCount = 126;
   static constexpr uint32_t kSamplerHeapSize =
-      kSamplerBlockSlots * (1 + kSamplerBlockCount);
-  static_assert(kSamplerVariantCount <= kSamplerBlockSlots,
-                "the variants must fit in the reserved first block");
+      kSamplerReservedSlots + kSamplerBlockSlots * kSamplerBlockCount;
   static_assert(kSamplerHeapSize <= 2048,
                 "a shader-visible sampler heap is capped at 2048 descriptors");
+  static_assert(kSamplerBlockSlots <= kSamplerReservedSlots,
+                "the exhausted-block fallback reads a translated table's worth "
+                "of descriptors from the reserved region");
+  // Descriptor index of cached block n. The reserved variants come first, so
+  // this is not a plain multiply -- every site that offsets into the heap must
+  // go through it.
+  static constexpr uint32_t SamplerBlockBase(uint32_t block) {
+    return kSamplerReservedSlots + block * kSamplerBlockSlots;
+  }
 
   // Frame internals. BeginFrame picks between the two Render* and EndFrame
   // calls PresentGameFrame, so nothing outside this class should ever invoke
@@ -660,10 +671,16 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // descriptor tables could not both be bound.
   uint64_t m_vertexSampledDraws = 0;
   uint64_t m_vertexSampleBindFailed = 0;
-  // Sampler blocks, keyed by their slot configuration -- 3 bits per slot, so
-  // 48 bits of key. Distinct configurations, not draws: the cache is what keeps
-  // 16-wide blocks inside a 2048-descriptor heap.
-  std::map<uint64_t, uint32_t> m_samplerBlocks;
+  // Sampler blocks, keyed by their slot configuration. Distinct
+  // configurations, not draws: the cache is what keeps 16-wide blocks inside a
+  // 2048-descriptor heap.
+  //
+  // The key is the variants themselves rather than a packing of them. It was
+  // three bits per slot in a uint64_t, which stopped fitting at five bits
+  // across sixteen slots (80). Hashing them down would have reintroduced the
+  // possibility of two configurations colliding onto one block -- silently
+  // giving a draw someone else's filter -- so the whole tuple is the key.
+  std::map<std::array<uint8_t, kSamplerBlockSlots>, uint32_t> m_samplerBlocks;
   uint32_t m_samplerBlockNext = 0;
   uint64_t m_samplerBlockExhausted = 0;
   static D3D12_SAMPLER_DESC SamplerVariantDesc(uint32_t variant);
