@@ -636,7 +636,7 @@ MX_SCRIPT_PROBE(sub_824CC218, orig_LoadUIAssetDbPackage,
                 "LoadUIAssetDatabasePackage")
 MX_SCRIPT_PROBE(sub_824D0F18, orig_SwitchToUIWorld, "SwitchToUIWorld")
 MX_SCRIPT_PROBE(sub_824CD280, orig_StartWorldLoad, "StartWorldLoad")
-MX_SCRIPT_PROBE(sub_824F1D80, orig_ScriptBindingRegister, "BindingRegister")
+MX_SCRIPT_PROBE(rex_MXRavage_Xenon_00cb, orig_ScriptBindingRegister, "BindingRegister")
 
 // The script VM's native-call dispatcher, `sub_82AA7638`, used to be probed
 // here with MX_SCRIPT_PROBE. It answered its original question — the VM fires a
