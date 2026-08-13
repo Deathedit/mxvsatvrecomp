@@ -1198,6 +1198,10 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // Resolves whose source target has never been drawn into: the snapshot they
   // produce is blank by construction.
   uint64_t m_snapshotBlankSource = 0;
+  // Resolves served from a surface twice their size in each axis at the same
+  // EDRAM base and format -- the 1x partner of a 4x-MSAA source, which is the
+  // image we actually hold because we render everything at 1x.
+  uint64_t m_msaaPartnerResolves = 0;
   // Draws that wanted a snapshot which exists but was left unrefreshed by a
   // dropped resolve. Each one is a full previous frame NOT painted over this
   // one. A large count means the drop upstream is the defect, not this refusal.

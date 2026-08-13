@@ -2796,32 +2796,88 @@ void D3D12Renderer::RenderGameFrame() {
       // we hold. PROVISIONAL: this is the one step here not established from
       // evidence, so it is counted separately and judged on the picture. If the
       // luminance it produces looks wrong, the row mapping is what to revisit.
-      if (!srcRes && !d.resolveSourceIsDepth && d.resolveSourceBase &&
+      // HOLDING A SURFACE IS NOT HOLDING ITS CONTENTS. This used to run only
+      // when the object lookup found nothing, and so it never ran at all --
+      // `aliased-source matches 0 (+0 contained)` across whole runs, with the
+      // 640x720 partner named in the comment above sitting right there in the
+      // pool, drawn.
+      //
+      // The failing case is not a missing resource, it is a resource nothing
+      // ever rendered into. 0x2653C8E0 is 640x360 at base 0x2D0 and is in the
+      // colour pool with everDrawn false, while 0x2123C9BC is 640x720 at the
+      // same base and pitch and IS drawn. We had a blank surface for the object
+      // the resolve named, bound it, and copied its zeros -- which is what the
+      // auto-exposure ladder then measured, giving luminance 0, ln(1e-4) two
+      // rungs down, and an exposure that climbs until the frame saturates.
+      GameRenderTarget* msaaPartner = nullptr;
+      uint32_t srcScale = 1;
+      if ((!srcRes || (srcEntry && !srcEntry->everDrawn)) &&
+          !d.resolveSourceIsDepth && d.resolveSourceBase &&
           d.resolveSourceWidth && d.resolveSourceHeight) {
         GameRenderTarget* exact = nullptr;
         GameRenderTarget* contains = nullptr;
+        GameRenderTarget* blank_exact = nullptr;
+        // THE MULTISAMPLE PARTNER, and the one this case actually wants.
+        //
+        // 4x MSAA on Xenos is 2x2, so a 640x360 4x surface occupies the same
+        // EDRAM samples as a 1280x720 surface at 1x. We render everything at
+        // 1x, so the partner IS the image the guest would have resolved down.
+        //
+        // Matched on FORMAT as well as extent, which is what the first attempt
+        // at this got wrong: searching on base and width alone found the
+        // 640x720 RGBA8 at this base -- an LDR surface from an unrelated pass
+        // -- and 1120 "contained" matches later the exposure was still
+        // diverging. At base 0x2D0 the drawn RGBA16F is 1280x720, exactly twice
+        // the source in both axes, and that is the HDR scene.
         for (auto& [obj, t] : m_gameRenderTargets) {
-          if (!t.resource || t.edramBase != d.resolveSourceBase ||
-              t.width != d.resolveSourceWidth)
+          if (!t.resource || t.edramBase != d.resolveSourceBase) continue;
+          if (t.everDrawn && t.format == snapFormat &&
+              t.width == d.resolveSourceWidth * 2 &&
+              t.height == d.resolveSourceHeight * 2) {
+            msaaPartner = &t;
             continue;
+          }
+          if (t.width != d.resolveSourceWidth) continue;
           if (t.height == d.resolveSourceHeight) {
-            exact = &t;
-            break;
+            // A same-extent twin is only an improvement if it was DRAWN into.
+            // Taking the first one regardless would have picked 0x2653C860 --
+            // the other blank 640x360 at this base -- and copied zeros again.
+            if (t.everDrawn) {
+              exact = &t;
+              break;
+            }
+            if (!blank_exact) blank_exact = &t;
+            continue;
           }
           if (t.height > d.resolveSourceHeight && t.everDrawn &&
               (!contains || t.height < contains->height))
             contains = &t;
         }
-        if (GameRenderTarget* hit = exact ? exact : contains) {
+        GameRenderTarget* hit = exact ? exact : (msaaPartner ? msaaPartner
+                                                             : contains);
+        // Only when we had nothing at all. With a blank surface already in
+        // hand, swapping it for a different blank surface is not progress, and
+        // it would spend the containment match on a no-op.
+        if (!hit && !srcRes) hit = blank_exact;
+        if (hit) {
           srcEntry = hit;
           srcRes = hit->resource.Get();
-          srcWidth = d.resolveSourceWidth;
-          srcHeight = d.resolveSourceHeight;
+          // The partner is twice the size in each axis, so its extent is its
+          // own -- and the guest's source rectangle, which is in the 1x
+          // coordinates it thinks it resolved, has to be doubled to match. The
+          // snapshot then comes out at full resolution, and the shader's
+          // normalized UVs map [0,1] across it exactly as they did across the
+          // smaller image.
+          srcScale = hit == msaaPartner ? 2u : 1u;
+          srcWidth = d.resolveSourceWidth * srcScale;
+          srcHeight = d.resolveSourceHeight * srcScale;
           srcState = hit->state;
           snapFormat = hit->format;
           if (exact)
             ++m_aliasedSourceResolves;
-          else
+          else if (hit == msaaPartner)
+            ++m_msaaPartnerResolves;
+          else if (contains)
             ++m_containedSourceResolves;
         }
       }
@@ -2991,14 +3047,18 @@ void D3D12Renderer::RenderGameFrame() {
       // survives the clamp, an out-of-range band one does not and takes its
       // whole surface — which is exactly the band.
       uint32_t sx = 0, sy = 0, copyW = srcWidth, copyH = srcHeight;
+      // Scaled by srcScale, which is 1 for every source but a multisample
+      // partner. The guest states its rectangle in the resolution it believes
+      // it rendered; taking it unscaled off a 2x partner would copy the
+      // top-left quarter of the scene and call it the whole image.
       if (d.resolveSrcX2 > d.resolveSrcX1 && d.resolveSrcY2 > d.resolveSrcY1 &&
-          uint32_t(d.resolveSrcX2) <= srcWidth &&
-          uint32_t(d.resolveSrcY2) <= srcHeight && d.resolveSrcX1 >= 0 &&
-          d.resolveSrcY1 >= 0) {
-        sx = uint32_t(d.resolveSrcX1);
-        sy = uint32_t(d.resolveSrcY1);
-        copyW = uint32_t(d.resolveSrcX2) - sx;
-        copyH = uint32_t(d.resolveSrcY2) - sy;
+          uint32_t(d.resolveSrcX2) * srcScale <= srcWidth &&
+          uint32_t(d.resolveSrcY2) * srcScale <= srcHeight &&
+          d.resolveSrcX1 >= 0 && d.resolveSrcY1 >= 0) {
+        sx = uint32_t(d.resolveSrcX1) * srcScale;
+        sy = uint32_t(d.resolveSrcY1) * srcScale;
+        copyW = (uint32_t(d.resolveSrcX2) - uint32_t(d.resolveSrcX1)) * srcScale;
+        copyH = (uint32_t(d.resolveSrcY2) - uint32_t(d.resolveSrcY1)) * srcScale;
       }
       const uint32_t dx = d.resolveDestX > 0 ? uint32_t(d.resolveDestX) : 0;
       const uint32_t dy = d.resolveDestY > 0 ? uint32_t(d.resolveDestY) : 0;
@@ -3522,8 +3582,27 @@ void D3D12Renderer::RenderGameFrame() {
     // colour output goes to a scratch target nothing samples. Skipping them
     // would leave the depth surface empty, which is the whole thing this pass
     // exists to fill.
+    // A draw with its colour mask off is exempt, and this is the clause the two
+    // earlier reverts were missing. Both of those exempted draws by WHY they
+    // lost their translation, which is not a property that says anything about
+    // what they paint; this exempts them by whether they can paint at all.
+    //
+    // The population is the guest's depth passes: 60,000 draws in mx_1098 with
+    // NO pixel shader, because SetPixelShader(NULL) is legal for a pass that
+    // writes only depth -- one 48-dword program, writes_position 1, export 0x0.
+    // They bind a COLOUR target as well as depth (extents only the 1280x640 and
+    // 1280x80 EDRAM scene bands), so they fail depthOnlyPass, which requires
+    // !d.targetObject. But RB_COLOR_MASK is 0 for every one of them measured
+    // ("WOULD PAINT 0, masked off 22894"), and colorWrite already carries that.
+    //
+    // Skipping them threw away their DEPTH write, and the scene draws that
+    // depth-test against it then rendered wrong -- which is why letting them
+    // through brought the menu rider and bike back into the 1280x640 band
+    // (white-menu.rdc) even though these draws paint nothing themselves.
+    //
+    // Fabricating white requires writing colour. These cannot.
     const bool fabricatedWhite =
-        !depthOnlyPass &&
+        !depthOnlyPass && d.colorWrite &&
         d.colorSource == uint8_t(mx::hle::DrawCall::ColorSource::kNone) &&
         !textured;
 
@@ -3827,7 +3906,8 @@ void D3D12Renderer::RenderGameFrame() {
                   "(REFUSED-BUDGET %llu), "
                   "DEPTH resolves %llu (%llu band-stitched) from %zu depth "
                   "surfaces, stand-in depth refused %llu, "
-                  "aliased-source matches %llu (+%llu contained)",
+                  "aliased-source matches %llu (+%llu contained, +%llu "
+                  "msaa-partner)",
                   static_cast<unsigned long long>(m_snapshotCopies),
                   static_cast<unsigned long long>(m_snapshotHits),
                   static_cast<unsigned long long>(m_snapshotFallbacks),
@@ -3843,7 +3923,8 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(
                       m_standInDepthSnapshotRefused),
                   static_cast<unsigned long long>(m_aliasedSourceResolves),
-                  static_cast<unsigned long long>(m_containedSourceResolves));
+                  static_cast<unsigned long long>(m_containedSourceResolves),
+                  static_cast<unsigned long long>(m_msaaPartnerResolves));
     LogInfo(message);
     // DIAG (remove before commit): what the WHITE-SKIPPED draws were aimed at.
     for (const auto& [extent, e] : m_skipByTarget) {
