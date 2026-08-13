@@ -82,6 +82,14 @@ struct HleTextureSource {
   // Texture2DArray either way -- see the note on the layer axis in
   // shader_hlsl.cpp's 3D fetch.
   bool volume = false;
+  // Set alongside a REJECT to say which kind of reject it was: the fetch
+  // constant is not merely a shape we do not support, it is one the reference
+  // itself calls invalid. Xenia's response is to drop the BINDING and keep
+  // drawing -- an invalid key samples zero -- so a caller that would otherwise
+  // fail the whole draw should bind zero instead and let the guest's shader
+  // run. The distinction matters: refusing the draw discards every other
+  // slot's correct shading over one slot the shader may not even read.
+  bool sample_as_zero = false;
   // PACKED MIP TAIL. A texture whose width OR height is 16 or smaller does not
   // store its BASE level plainly at base_address: the level lives inside a mip
   // tail, offset by these block counts. From the SDK,
@@ -200,6 +208,20 @@ struct HleTiledAddressCheck {
   uint32_t first_pitch = 0, first_bytes_per_block_log2 = 0;
 };
 HleTiledAddressCheck HleTiledAddressStats();
+
+// 1D textures, which this title had never been shown to use. `seen` is the
+// number that reached the describe at all, so a run of zeros means the whole
+// 1D path -- including the three divergences from xenia-edge it used to carry
+// -- is unexercised, and a non-zero `seen` with zero everything else means it
+// is exercised and correct. Without `seen` the other four are unreadable.
+struct HleOneDCensus {
+  uint64_t seen = 0;
+  uint64_t tiled = 0;     // refused: tiling is meaningless for one row
+  uint64_t packed = 0;    // refused: a one-row texture has no packed tail
+  uint64_t wide = 0;      // over 8192: works here, remapped by the reference
+  uint64_t too_wide = 0;  // over 16384: refused, needs the reference's remap
+};
+HleOneDCensus HleOneDStats();
 
 bool DescribeHleTexture2D(const uint32_t fetch_words[6],
                           HleTextureSource& out, const char** fail = nullptr);

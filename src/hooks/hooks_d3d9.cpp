@@ -1860,6 +1860,45 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     if (st.render_state.value[kRsZEnable]) dc.depth_control = (1u << 1) | (1u << 2);
     dc.om_seen |= 1u << 1;
   }
+  // The window scissor. Offsets from IDA's own D3DDevice layout rather than
+  // arithmetic: m_WindowPacket sits at device+0x28C0 and is three dwords, and
+  // D3DDevice_SetScissorRect (0x8254B678) writes its TL/BR members directly.
+  // That base also cross-checks the packet convention the two neighbouring
+  // reads above rely on -- 0x28C0 is register 0x2080 exactly as 0x28CC is
+  // 0x2100 and 0x2934 is 0x2200, three packets agreeing on one rule.
+  //
+  // Field widths are the reference's (`registers.h:622`): 14 bits per edge,
+  // bit 31 of TL disables the window offset. D3D9's setter happens to mask
+  // with 15 bits, which only matters above 8191 -- past any real target.
+  constexpr uint32_t kPaScWindowOffset = 0x28C0;     // PA_SC_WINDOW_OFFSET
+  constexpr uint32_t kPaScWindowScissorTl = 0x28C4;  // PA_SC_WINDOW_SCISSOR_TL
+  constexpr uint32_t kPaScWindowScissorBr = 0x28C8;  // PA_SC_WINDOW_SCISSOR_BR
+  if (device && HostPageReadable(REX_RAW_ADDR(device + kPaScWindowOffset))) {
+    const uint32_t tl = REX_LOAD_U32(device + kPaScWindowScissorTl);
+    const uint32_t br = REX_LOAD_U32(device + kPaScWindowScissorBr);
+    int32_t left = int32_t(tl & 0x3FFFu);
+    int32_t top = int32_t((tl >> 16) & 0x3FFFu);
+    int32_t right = int32_t(br & 0x3FFFu);
+    int32_t bottom = int32_t((br >> 16) & 0x3FFFu);
+    if ((tl & 0x80000000u) == 0) {
+      // The offsets are SIGNED 15-bit fields, so they must be sign-extended
+      // before they are added -- a negative offset read as unsigned would push
+      // the rectangle off the far side of the target instead of toward zero.
+      const uint32_t off = REX_LOAD_U32(device + kPaScWindowOffset);
+      auto s15 = [](uint32_t v) {
+        return int32_t(v & 0x7FFFu) - int32_t((v & 0x4000u) ? 0x8000 : 0);
+      };
+      const int32_t ox = s15(off & 0x7FFFu);
+      const int32_t oy = s15((off >> 16) & 0x7FFFu);
+      left += ox; right += ox;
+      top += oy; bottom += oy;
+    }
+    dc.scissor_left = left;
+    dc.scissor_top = top;
+    dc.scissor_right = right;
+    dc.scissor_bottom = bottom;
+    dc.scissor_seen = true;
+  }
   // Read the effective Xenos equation, not the D3D9-side requested state at
   // device+0x2EF8/0x2EFC. D3DDevice_DrawVertices flushes the 0x2200 register
   // block from device+0x2934, putting RB_BLENDCONTROL0 (0x2201) at +0x2938.
@@ -2515,7 +2554,8 @@ ShaderApplyResult ApplyShaderOutputs(
           "vertex path {} draws qualify, {} skipped ({} undeclared reg, "
           "{} no-VS, {} VS-samplers, {} no-VTE, {} no-PS, "
           "{} too-many-inputs); GPU FETCH {} draws (refused: rectlist {}, "
-          "ordinal-mismatch {}, out-of-range {}, unaligned {})",
+          "ordinal-mismatch {}, out-of-range {}, unaligned {}); rect "
+          "arrangement 0123 {} / 1203 {} / 2013 {} (degenerate {})",
           g_hleShaderAttempts, g_hleShaderDraws, g_hleShaderVertices,
           g_hleShaderNoCode, g_hleShaderBadDecode, g_hleShaderBadStream,
           g_hleShaderBadConstants, g_hleShaderBadVertex,
@@ -2526,7 +2566,11 @@ ShaderApplyResult ApplyShaderOutputs(
           g_gpuVertexUndeclared, g_gpuVertexNoVs,
           g_gpuVertexVsSamplers, g_gpuVertexNoVte, g_gpuVertexNoPs,
           g_gpuVertexTooManyInputs, g_gpuFetchDraws, g_gpuFetchRectList,
-          g_gpuFetchOrdinalMismatch, g_gpuFetchOutOfRange, g_gpuFetchUnaligned);
+          g_gpuFetchOrdinalMismatch, g_gpuFetchOutOfRange, g_gpuFetchUnaligned,
+          mx::hle::g_rectArrangement[0].load(),
+          mx::hle::g_rectArrangement[1].load(),
+          mx::hle::g_rectArrangement[2].load(),
+          mx::hle::g_rectDegenerate.load());
     }
   } report{attempt};
   if (!handle || !device) {
@@ -5228,6 +5272,22 @@ uint64_t g_boundZeroReported = 0;
 // same texture once it has real contents. Both would otherwise share the
 // fetch-word key that EnsureGameTexture caches on, and the recovered texture
 // would hit the black resource uploaded before it.
+// The value an unbound Xenos sampler actually returns: one black texel. Shared
+// by every path that has to bind SOMETHING for a slot the guest did not supply,
+// so those paths cannot drift into fabricating different placeholders.
+std::shared_ptr<mx::hle::HleTexturePayload> UnboundTexturePayload() {
+  static const auto s_unbound = [] {
+    auto p = std::make_shared<mx::hle::HleTexturePayload>();
+    p->width = p->height = 1;
+    p->row_pitch = 4;
+    p->format = mx::hle::HostTextureFormat::kRgba8;
+    p->linear_filter = false;
+    p->data.assign(4, 0);
+    return p;
+  }();
+  return s_unbound;
+}
+
 constexpr uint64_t kBlankTextureKeyMarker = 0x8000000000000000ull;
 
 struct BlankTexture {
@@ -5573,6 +5633,18 @@ void NoteMipCensus() {
       }
     }
   }
+  // Printed with every census tick, including when every field is zero.
+  // "This title binds no 1D textures"
+  // is a finding, and it is the finding that decides whether the wide-1D remap
+  // is worth writing -- but only if the line appears at all. A census that
+  // stays silent when it counts nothing is indistinguishable from one that was
+  // never wired up.
+  {
+    const mx::hle::HleOneDCensus d = mx::hle::HleOneDStats();
+    REXLOG_INFO("d3d9: 1D textures: {} described (refused: tiled {}, packed "
+                "mips {}, wider than 16384 {}); over 8192 and accepted {}",
+                d.seen, d.tiled, d.packed, d.too_wide, d.wide);
+  }
   const mx::hle::HleMipCensus c = mx::hle::HleMipChainStats();
   std::string levels;
   for (uint32_t i = 0; i < 16; ++i)
@@ -5729,16 +5801,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     //
     // This is a bound zero, not a fabricated colour: nothing here invents a
     // plausible texture, it supplies the value an unbound fetch actually has.
-    static const auto s_unbound = [] {
-      auto p = std::make_shared<mx::hle::HleTexturePayload>();
-      p->width = p->height = 1;
-      p->row_pitch = 4;
-      p->format = mx::hle::HostTextureFormat::kRgba8;
-      p->linear_filter = false;
-      p->data.assign(4, 0);
-      return p;
-    }();
-    out_textures[slot] = s_unbound;
+    out_textures[slot] = UnboundTexturePayload();
     ++g_slotBoundUnbound;
     ReportBoundZero();
     return true;
@@ -5747,6 +5810,19 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   const char* why = nullptr;
   if (!DescribeHleTexture2D(fetch, source, &why)) {
     NoteRejectedTextureFormat("slot", guest_sampler, source, why, fetch);
+    // A fetch constant the reference calls invalid rather than unsupported.
+    // Xenia drops the BINDING and keeps drawing -- its key stays invalid, the
+    // sampler reads zero, and the guest's own shader still runs. Failing the
+    // draw here would be a strictly worse answer than the reference's:
+    // the stand-in discards every other slot's real shading over one slot the
+    // shader may not even use. Same trade as the unbound-sampler path above,
+    // for the same reason.
+    if (source.sample_as_zero) {
+      out_textures[slot] = UnboundTexturePayload();
+      ++g_slotBoundUnbound;
+      ReportBoundZero();
+      return true;
+    }
     ++g_slotFailDescribe;
     ReportSlotFailures();
     return false;

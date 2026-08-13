@@ -62,8 +62,8 @@ HostTopology MapTopology(uint32_t prim_type) {
 namespace {
 
 // Expand a PER-VERTEX byte array the same way ExpandRectangleList expands the
-// vertex buffer: three supplied vertices per rect, plus a synthesized fourth
-// at v1 + v2 - v0.
+// vertex buffer: three supplied vertices per rect, permuted so the diagonal is
+// first, plus a synthesized fourth.
 //
 // This exists because the vertex buffer was not the only per-vertex stream.
 // The GPU vertex stage's input registers (dc.vertex_inputs) and the CPU path's
@@ -80,25 +80,36 @@ namespace {
 // chain drove the average luminance toward zero.
 //
 // Every register here is affine across the rectangle -- position, colour, UV
-// and any other interpolant alike -- so the same v1 + v2 - v0 rule that gives
-// the fourth corner gives the fourth vertex's registers.
+// and any other interpolant alike -- so the same rule that gives the fourth
+// corner gives the fourth vertex's registers.
+//
+// `starts` is the per-rect permutation ExpandRectangleList chose from the
+// POSITIONS. It has to be passed in rather than recomputed, because this
+// stream may not contain a position at all: choosing independently would let
+// the interpolators be permuted differently from the vertices they belong to,
+// which is worse than either choice made consistently.
 void ExpandRectStream(std::vector<uint8_t>& stream, uint32_t stride,
-                      uint32_t rects) {
+                      uint32_t rects, const std::vector<uint8_t>& starts) {
   if (stream.empty() || !stride) return;
   if (stream.size() < size_t(rects) * 3 * stride) return;
+  if (starts.size() < rects) return;
   std::vector<uint8_t> out;
   out.resize(size_t(rects) * 4 * stride);
   const uint32_t floats = stride / 4;
   for (uint32_t r = 0; r < rects; ++r) {
     const uint8_t* src = stream.data() + size_t(r) * 3 * stride;
     uint8_t* dst = out.data() + size_t(r) * 4 * stride;
-    std::memcpy(dst, src, size_t(3) * stride);
+    const uint32_t i0 = starts[r], i1 = (starts[r] + 1) % 3,
+                   i2 = (starts[r] + 2) % 3;
+    std::memcpy(dst + size_t(0) * stride, src + size_t(i0) * stride, stride);
+    std::memcpy(dst + size_t(1) * stride, src + size_t(i1) * stride, stride);
+    std::memcpy(dst + size_t(2) * stride, src + size_t(i2) * stride, stride);
     uint8_t* v3 = dst + size_t(3) * stride;
     for (uint32_t c = 0; c < floats; ++c) {
       float p0, p1, p2;
-      std::memcpy(&p0, src + c * 4, 4);
-      std::memcpy(&p1, src + stride + c * 4, 4);
-      std::memcpy(&p2, src + size_t(2) * stride + c * 4, 4);
+      std::memcpy(&p0, src + size_t(i0) * stride + c * 4, 4);
+      std::memcpy(&p1, src + size_t(i1) * stride + c * 4, 4);
+      std::memcpy(&p2, src + size_t(i2) * stride + c * 4, 4);
       const float p3 = p1 + p2 - p0;
       std::memcpy(v3 + c * 4, &p3, 4);
     }
@@ -107,6 +118,12 @@ void ExpandRectStream(std::vector<uint8_t>& stream, uint32_t stride,
 }
 
 }  // namespace
+
+// How often each of the three rectangle arrangements was seen, indexed by the
+// chosen first vertex. [0] is the case the old code assumed unconditionally,
+// so [1] and [2] are exactly the rectangles it built wrong.
+std::atomic<uint64_t> g_rectArrangement[3] = {};
+std::atomic<uint64_t> g_rectDegenerate{0};
 
 // See the note beside the declaration: the renderer writes these, the D3D9
 // layer reads them, and neither can do the other's half of the job.
@@ -130,51 +147,93 @@ uint32_t ExpandRectangleList(DrawCall& dc) {
   std::vector<uint32_t> idx;
   idx.reserve(size_t(rects) * 6);
 
+  // Which of the three supplied vertices starts the strip, per rect. Chosen
+  // from the positions here and reused for every other per-vertex stream.
+  std::vector<uint8_t> starts(rects, 0);
+
   for (uint32_t r = 0; r < rects; ++r) {
     const uint8_t* src = dc.vertices.data() + size_t(r) * 3 * stride;
     const uint32_t base = r * 4;
-    verts.insert(verts.end(), src, src + size_t(3) * stride);
 
-    // The three supplied vertices are three corners of the rectangle, and the
-    // fourth is derived:
+    // Three corners of a rectangle arrive, and which three is NOT fixed: the
+    // right-angle corner can be any of them, so the diagonal can be any edge.
+    // Transcribed from xenia-edge `spirv_builtin_geometry_shader.cc:671`,
+    // which mirrors a vertex across the LONGEST edge:
     //
-    //     v0 ---- v1
-    //      |       |
-    //     v2 ---- (v3)
+    //   0---1        1---2        2---0
+    //   |  /|        |  /|        |  /|
+    //   | / |        | / |        | / |
+    //   |/  |        |/  |        |/  |
+    //   2--[3]       0--[3]       1--[3]
+    //   12 longest   20 longest   01 longest
+    //   strip 0123   strip 1203   strip 2013
     //
-    // so v3 is the corner opposite v0: v3 = v1 + v2 - v0, for every host
-    // interpolant. Position, colour and UV describe the same affine plane;
-    // copying v2's UV makes textured rectangles collapse one edge into a smear.
+    // and in every case the fourth corner is v_i1 + v_i2 - v_i0 over the
+    // PERMUTED triple. This code used to assume the first arrangement always,
+    // which is why the formula has been flipped once before on the evidence of
+    // a single menu quad — a case-dependent rule tuned to one case. The other
+    // two arrangements built a quad from the wrong corner: one triangle a
+    // wedge, the other folded away off-screen.
     //
-    // This was v0 + v2 - v1, which is a different corner entirely — measured on
-    // a menu quad whose corners came out (-1,1) (1,1) (-1,-1) and (-3,-1). The
-    // second triangle then lay wholly off-screen and the first was left painting
-    // a diagonal wedge across half the frame.
-    verts.insert(verts.end(), src + size_t(2) * stride,
-                 src + size_t(3) * stride);
+    // Squared lengths, x/y only and no perspective divide, exactly as the
+    // reference does it. These positions are the guest vertex shader's own
+    // clip-space exports (FinalizeHleTopology runs after execution), so this
+    // measures the same space the reference's geometry stage measures.
+    auto pos = [&](uint32_t v, uint32_t c) {
+      float f;
+      std::memcpy(&f, src + size_t(v) * stride + c * 4, 4);
+      return f;
+    };
+    float edge[3];
+    for (uint32_t i = 0; i < 3; ++i) {
+      const uint32_t a = (1 + i) % 3, b = (2 + i) % 3;
+      const float dx = pos(b, 0) - pos(a, 0);
+      const float dy = pos(b, 1) - pos(a, 1);
+      edge[i] = dx * dx + dy * dy;
+    }
+    const uint32_t start = (edge[0] > edge[1] && edge[0] > edge[2]) ? 0u
+                           : (edge[1] > edge[2])                    ? 1u
+                                                                   : 2u;
+    starts[r] = uint8_t(start);
+    ++g_rectArrangement[start];
+    // All three edges equal means there is no diagonal to find and the choice
+    // above is arbitrary. Counted rather than handled: a degenerate rectangle
+    // covers nothing whichever corner is synthesized.
+    if (edge[0] == edge[1] && edge[1] == edge[2]) ++g_rectDegenerate;
+
+    const uint32_t i0 = start, i1 = (start + 1) % 3, i2 = (start + 2) % 3;
+    for (uint32_t v : {i0, i1, i2})
+      verts.insert(verts.end(), src + size_t(v) * stride,
+                   src + size_t(v + 1) * stride);
+
+    // Placeholder bytes for the synthesized corner, overwritten component by
+    // component below. Every float of the vertex is interpolated, not the
+    // first nine: the host vertex is 40 bytes, so a nine-float clamp left
+    // TEXCOORD0.y alone and collapsed one edge's V into a smear — the exact
+    // failure the old comment here warned about while still committing it.
+    verts.insert(verts.end(), src + size_t(i2) * stride,
+                 src + size_t(i2 + 1) * stride);
     uint8_t* v3 = verts.data() + (size_t(base) + 3) * stride;
-    const uint32_t float_components = std::min(stride / 4, 9u);
-    for (uint32_t c = 0; c < float_components; ++c) {
-      float p0, p1, p2;
-      std::memcpy(&p0, src + c * 4, 4);
-      std::memcpy(&p1, src + stride + c * 4, 4);
-      std::memcpy(&p2, src + size_t(2) * stride + c * 4, 4);
-      const float p3 = p1 + p2 - p0;
+    for (uint32_t c = 0; c < stride / 4; ++c) {
+      const float p3 = pos(i1, c) + pos(i2, c) - pos(i0, c);
       std::memcpy(v3 + c * 4, &p3, 4);
     }
 
     // v0..v3 do not run round the perimeter — v3 is opposite v0 — so the two
     // triangles share the v1-v2 diagonal rather than v0-v2. Both wind the same
-    // way, which the {0,1,2, 0,2,3} order did not once v3 moved.
+    // way, which the {0,1,2, 0,2,3} order did not once v3 moved. This is the
+    // triangle-list spelling of the reference's four-vertex strip.
     const uint32_t order[6] = {0, 1, 2, 2, 1, 3};
     for (uint32_t i = 0; i < 6; ++i) idx.push_back(base + order[i]);
   }
 
-  // The other per-vertex streams have to grow with it. See ExpandRectStream.
-  ExpandRectStream(dc.vertex_inputs, dc.vertex_input_count * 16u, rects);
+  // The other per-vertex streams have to grow with it, under the SAME
+  // permutation. See ExpandRectStream.
+  ExpandRectStream(dc.vertex_inputs, dc.vertex_input_count * 16u, rects,
+                   starts);
   ExpandRectStream(dc.interpolators,
                    kHlslInterpolatorLinkage * 4u * uint32_t(sizeof(float)),
-                   rects);
+                   rects, starts);
 
   dc.vertices = std::move(verts);
   dc.vertex_count = rects * 4;

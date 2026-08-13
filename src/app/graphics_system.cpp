@@ -299,6 +299,8 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
             vertexStage.samplerSigns = d->vertex_sampler_signs.data();
           }
           ++addDrawCalls;
+          const int32_t scissor[4] = {d->scissor_left, d->scissor_top,
+                                      d->scissor_right, d->scissor_bottom};
           m_renderer->AddGameDraw(d->vertices.data(),
                                   static_cast<uint32_t>(d->vertices.size()),
                                   d->vertex_stride, d->indices.data(),
@@ -355,7 +357,8 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   d->depth_target_width,
                                   d->depth_target_height,
                                   d->depth_target_base, d->surface_base,
-                                  (d->render_target_color_info >> 16) & 0xFu);
+                                  (d->render_target_color_info >> 16) & 0xFu,
+                                  d->scissor_seen ? scissor : nullptr);
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;

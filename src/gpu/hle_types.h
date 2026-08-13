@@ -595,6 +595,23 @@ struct DrawCall {
   bool alpha_state_seen = false;
   uint32_t mode_control = 0;   // RB_MODECONTROL   0x2208, bits 0-2 = edram_mode
 
+  // SCISSOR, in guest render-target pixels, already offset and normalised.
+  //
+  // Read from PA_SC_WINDOW_SCISSOR rather than from D3DDevice_SetScissorRect's
+  // arguments, and the difference is not a matter of taste. D3D9 has a separate
+  // D3DRS_SCISSORTESTENABLE, so the last rect the guest passed to the setter is
+  // NOT necessarily in force -- disabling the test makes the runtime write the
+  // full surface into the same register. The register is the state the hardware
+  // actually rasterises against, which is why the reference reads it too
+  // (`draw_util.cc:632`) and why there is no enable bit to look for.
+  //
+  // `seen` false means the register was unreadable, not that there is no
+  // scissor: a scissor covering everything is spelled as the full rect, never
+  // as an absence.
+  int32_t scissor_left = 0, scissor_top = 0;
+  int32_t scissor_right = 0, scissor_bottom = 0;
+  bool scissor_seen = false;
+
   // Which of the five above had actually been written this frame, at the time
   // this draw was finalized. Bit i corresponds to register i in the order
   // listed. WITHOUT THIS THE VALUES ABOVE ARE UNREADABLE.
@@ -665,11 +682,20 @@ const char* ExportSpaceName(ExportSpace s);
 HostTopology MapTopology(uint32_t prim_type);
 
 // Rewrite a RectangleList draw into a triangle list in place. D3D12 has no
-// rectangle topology. Each group of 3 vertices is a rectangle whose implied
-// 4th corner is v3 = v0 + v2 - v1; the synthesized vertex takes that
-// arithmetic on the leading 3 floats and copies its remaining bytes from v2.
-// Returns the number of rectangles expanded, 0 if the draw could not be.
+// rectangle topology. Each group of 3 vertices gives three corners of a
+// rectangle, and WHICH three is not fixed — the diagonal may be any of the
+// three edges. The longest edge picks the arrangement, the triple is permuted
+// so the diagonal runs from the second vertex to the third, and the fourth
+// corner is v1 + v2 - v0 over the permuted triple, on every float of the
+// vertex. Returns the number of rectangles expanded, 0 if the draw could not
+// be.
 uint32_t ExpandRectangleList(DrawCall& dc);
+
+// How often each arrangement was chosen, indexed by the first vertex of the
+// permuted triple. [0] is what the expansion used to assume unconditionally,
+// so [1] + [2] counts the rectangles it built from the wrong corner.
+extern std::atomic<uint64_t> g_rectArrangement[3];
+extern std::atomic<uint64_t> g_rectDegenerate;
 
 // Rewrite a QuadList draw into a triangle list in place. D3D12 has no quad
 // topology either, but a quad needs no synthesized corner: all four are

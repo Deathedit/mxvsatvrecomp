@@ -144,7 +144,13 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  uint32_t pixelParamGen = 0,
                  uint32_t depthObject = 0, uint32_t depthWidth = 0,
                  uint32_t depthHeight = 0, uint32_t depthBase = 0,
-                 uint32_t targetBase = 0, uint32_t targetColorFormat = 0);
+                 uint32_t targetBase = 0, uint32_t targetColorFormat = 0,
+                 // {left, top, right, bottom} in guest render-target pixels, or
+                 // null when the guest's scissor register could not be read.
+                 // One pointer rather than four more scalars, for the same
+                 // reason GpuVertexStage is a struct: a call site reading
+                 // `..., 0, 0, 0, 0)` cannot be checked by eye.
+                 const int32_t* scissor = nullptr);
 
 // Append a resolve to this frame's list, in order with the draws around it.
 //
@@ -592,6 +598,15 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // zero — anything else is geometry missing from the picture.
   uint64_t m_gpuVertexDropped = 0;
 
+  // Draws whose guest scissor actually clips something, and draws whose scissor
+  // register could not be read. `clipped` at zero means honouring the scissor
+  // changed nothing on screen -- which is a finding, not a silence, so it is
+  // reported either way. `unreadable` must stay at zero: a draw with no
+  // readable scissor is drawn unclipped, which is the old behaviour and the
+  // bug this pair exists to detect the return of.
+  uint64_t m_scissorClipped = 0;
+  uint64_t m_scissorUnreadable = 0;
+
   // A shader's textures have to sit in ONE contiguous descriptor range, and the
   // cached per-texture descriptors in m_gameSrvHeap are scattered — a texture
   // gets its slot when it is first uploaded, not when a shader binds it. So a
@@ -892,6 +907,11 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     uint32_t srcBlend = 0;
     uint32_t destBlend = 0;
     uint32_t blendOp = 0;
+    // The guest's scissor, in its own render-target pixels. See the note on
+    // DrawCall::scissor_left for why this comes from the register and not from
+    // D3DDevice_SetScissorRect.
+    bool scissorSeen = false;
+    int32_t scissorLeft = 0, scissorTop = 0, scissorRight = 0, scissorBottom = 0;
     std::shared_ptr<const mx::hle::HleTexturePayload> texture;
     uint32_t targetObject = 0;
     uint32_t targetWidth = 0;

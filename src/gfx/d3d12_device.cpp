@@ -921,17 +921,21 @@ void D3D12Renderer::CreateViewportAndScissor() {
       draw_h = win_w / kGuestAspect;   // taller — bars top and bottom
     }
   }
-  // Draw the guest's 1280x720 at 1:1 when the window is larger, rather than
-  // scaling it up to fill the pillarboxed area. Nothing is stretched, filtered
-  // or resampled, so what reaches the screen is exactly what the guest
-  // produced, and a screenshot pixel maps to a guest pixel.
+  // The guest's image fills the pillarboxed region at whatever size the window
+  // is, rather than being pinned to 1280x720 in the middle of a larger one.
   //
-  // The size guard is not optional: below 720p there is no 1:1 image to draw
-  // and the fitted region computed above is the only correct answer.
-  if (win_w >= kGuestWidth && win_h >= kGuestHeight) {
-    draw_w = kGuestWidth;
-    draw_h = kGuestHeight;
-  }
+  // It used to be pinned, so that nothing was stretched or resampled and a
+  // screenshot pixel mapped to a guest pixel — which was the right trade while
+  // every question was "what exact colour did this draw write", and it is worth
+  // knowing that trade is now gone: at a larger window a screenshot pixel no
+  // longer corresponds to a guest pixel, so pixel-exact work belongs in a
+  // capture rather than in a screenshot.
+  //
+  // This is only the VIEWPORT. Geometry rasterises at the larger size because
+  // the main target is window-sized, but every guest-allocated render target,
+  // resolve and snapshot is still 1280x720 — so the post chain and anything
+  // sampled through it is unchanged. This is a bigger window, not a resolution
+  // scale.
 
   const float off_x = (win_w - draw_w) * 0.5f;
   const float off_y = (win_h - draw_h) * 0.5f;

@@ -2550,6 +2550,11 @@ void D3D12Renderer::RenderGameFrame() {
   // QueueLuminanceReadback.
   uint32_t oneByOneSeen = 0;
   uint32_t boundTargetObject = 0;  // zero is the final m_gameRT.
+  // The scissor last handed to the command list. Tracked so the per-draw
+  // scissor costs one comparison rather than a state change per draw, and so
+  // the target-binding blocks below no longer own the scissor at all -- they
+  // set the viewport, this owns the rectangle.
+  D3D12_RECT boundScissor = {-1, -1, -1, -1};
   // Zero means "no DSV bound", which is a distinct state from any depth object.
   uint32_t boundDepthObject = 0;
   static const float kOffscreenClear[4] = {0, 0, 0, 0};
@@ -3397,10 +3402,10 @@ void D3D12Renderer::RenderGameFrame() {
         viewport.Height = float(drawTarget->height);
         viewport.MinDepth = 0.0f;
         viewport.MaxDepth = 1.0f;
-        D3D12_RECT scissor = {0, 0, LONG(drawTarget->width),
-                              LONG(drawTarget->height)};
+        // No scissor here: the per-draw block below owns the rectangle for
+        // every draw, and a second setter would leave boundScissor describing
+        // a state the command list is not in.
         m_commandList->RSSetViewports(1, &viewport);
-        m_commandList->RSSetScissorRects(1, &scissor);
         boundTargetObject = targetObject;
       }
       if (!drawTarget->usedThisFrame) {
@@ -3428,11 +3433,70 @@ void D3D12Renderer::RenderGameFrame() {
       m_commandList->OMSetRenderTargets(1, &rtv, FALSE,
                                         m_gameDepth ? &dsv : nullptr);
       m_commandList->RSSetViewports(1, &m_viewport);
-      m_commandList->RSSetScissorRects(1, &m_scissorRect);
       boundTargetObject = 0;
       // The main target binds m_gameDepth, which is not one of the per-object
       // depth surfaces, so the offscreen path must treat this as "not mine".
       boundDepthObject = 0;
+    }
+
+    // THE GUEST'S SCISSOR.
+    //
+    // Ignoring it drew the compass strip across the whole frame: the guest
+    // clips it to a window in the middle of the screen, and every label on the
+    // strip was visible instead of the three that fit. Anything else the guest
+    // clips to a sub-rectangle -- bars, wipes, masked panels -- was equally
+    // unclipped, so this is not one widget's bug.
+    //
+    // The guest rectangle is in its own render-target pixels. Off-screen
+    // targets are created at the guest's dimensions, so it maps 1:1 there; the
+    // main target is letterboxed into the window by m_viewport, so the same
+    // linear map the viewport applies is applied here. Both are then
+    // INTERSECTED with the full-target rectangle rather than replacing it,
+    // which is what makes a stale scissor from a larger target harmless: it can
+    // only ever shrink what is already allowed, never open the letterbox bars.
+    {
+      const D3D12_RECT full =
+          drawTarget ? D3D12_RECT{0, 0, LONG(drawTarget->width),
+                                  LONG(drawTarget->height)}
+                     : m_scissorRect;
+      D3D12_RECT want = full;
+      if (d.scissorSeen) {
+        LONG l, t, r, b;
+        if (drawTarget) {
+          l = LONG(d.scissorLeft);
+          t = LONG(d.scissorTop);
+          r = LONG(d.scissorRight);
+          b = LONG(d.scissorBottom);
+        } else {
+          const float sx = m_viewport.Width / kGuestWidth;
+          const float sy = m_viewport.Height / kGuestHeight;
+          l = LONG(std::floor(m_viewport.TopLeftX + float(d.scissorLeft) * sx));
+          t = LONG(std::floor(m_viewport.TopLeftY + float(d.scissorTop) * sy));
+          r = LONG(std::ceil(m_viewport.TopLeftX + float(d.scissorRight) * sx));
+          b = LONG(std::ceil(m_viewport.TopLeftY + float(d.scissorBottom) * sy));
+        }
+        want.left = std::max(full.left, l);
+        want.top = std::max(full.top, t);
+        want.right = std::min(full.right, r);
+        want.bottom = std::min(full.bottom, b);
+        // An empty or inverted rectangle is not a reason to draw everything.
+        // The guest asking for nothing means nothing, and D3D12 rejects a
+        // rectangle whose right is below its left, so it is collapsed rather
+        // than widened.
+        if (want.right < want.left) want.right = want.left;
+        if (want.bottom < want.top) want.bottom = want.top;
+        if (want.left != full.left || want.top != full.top ||
+            want.right != full.right || want.bottom != full.bottom)
+          ++m_scissorClipped;
+      } else {
+        ++m_scissorUnreadable;
+      }
+      if (want.left != boundScissor.left || want.top != boundScissor.top ||
+          want.right != boundScissor.right ||
+          want.bottom != boundScissor.bottom) {
+        m_commandList->RSSetScissorRects(1, &want);
+        boundScissor = want;
+      }
     }
 
     uint32_t textureDescriptor = 0;
@@ -3946,7 +4010,8 @@ void D3D12Renderer::RenderGameFrame() {
                   "the guest VERTEX shader too, %llu of those fetching their "
                   "own vertices, %llu dropped for want of one), "
                   "%llu stand-in; %llu pipelines built, %llu failed; "
-                  "vertex-sampled %llu (bind failed %llu)",
+                  "vertex-sampled %llu (bind failed %llu); scissor clipped "
+                  "%llu, unreadable %llu",
                   static_cast<unsigned long long>(m_translatedDraws),
                   static_cast<unsigned long long>(m_gpuVertexDraws),
                   static_cast<unsigned long long>(m_gpuVertexFetchDraws),
@@ -3955,7 +4020,9 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_translatedOk),
                   static_cast<unsigned long long>(m_translatedFailed),
                   static_cast<unsigned long long>(m_vertexSampledDraws),
-                  static_cast<unsigned long long>(m_vertexSampleBindFailed));
+                  static_cast<unsigned long long>(m_vertexSampleBindFailed),
+                  static_cast<unsigned long long>(m_scissorClipped),
+                  static_cast<unsigned long long>(m_scissorUnreadable));
     LogInfo(message);
     // Which of the four bind failures sent a translatable draw to the stand-in.
     // The counts are what decide the next move: block-exhausted means the ring
@@ -4285,7 +4352,8 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t depthObject, uint32_t depthWidth,
                                  uint32_t depthHeight, uint32_t depthBase,
                                  uint32_t targetBase,
-                                 uint32_t targetColorFormat) {
+                                 uint32_t targetColorFormat,
+                                 const int32_t* scissor) {
   // PERF(per-frame-allocs): DONE. This used to create an ID3D12Resource on the
   // UPLOAD heap for each of the buffers below — up to nine per call, once per
   // submitted draw — and the note here called for "a ring of upload buffers
@@ -4743,6 +4811,13 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.srcBlend = srcBlend;
   d.destBlend = destBlend;
   d.blendOp = blendOp;
+  if (scissor) {
+    d.scissorSeen = true;
+    d.scissorLeft = scissor[0];
+    d.scissorTop = scissor[1];
+    d.scissorRight = scissor[2];
+    d.scissorBottom = scissor[3];
+  }
   if (planes && planeCount >= 3) {
     d.planeCount = std::min<uint32_t>(planeCount,
                                       kMaxDrawPlanes);

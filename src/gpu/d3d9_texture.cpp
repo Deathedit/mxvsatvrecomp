@@ -90,6 +90,7 @@ int32_t XeniaTiledOffset2D(int32_t x, int32_t y, uint32_t pitch,
 // tiled texture in the game is being read from the wrong bytes, which is not a
 // thing to leave behind a diagnostic flag that defaults off.
 HleTiledAddressCheck g_tiledCheck;
+HleOneDCensus g_oneDCensus;
 
 void VerifyTiledAddressing() {
   static std::once_flag once;
@@ -382,6 +383,8 @@ HleTiledAddressCheck HleTiledAddressStats() {
   return g_tiledCheck;
 }
 
+HleOneDCensus HleOneDStats() { return g_oneDCensus; }
+
 bool DescribeHleTexture2D(const uint32_t fetch_words[6],
                           HleTextureSource& out, const char** fail) {
   VerifyTiledAddressing();
@@ -412,6 +415,53 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
   // interleave INSIDE a tile, need a resource type we do not build.
   const bool one_d = fetch.dimension == xenos::DataDimension::k1D;
   const bool cube = fetch.dimension == xenos::DataDimension::kCube;
+  if (one_d) {
+    ++g_oneDCensus.seen;
+    // xenia-edge treats both of these as "completely wrong" for a 1D texture
+    // and drops the binding entirely (`texture_cache.cc:1067`, `:1078`), which
+    // makes the sampler read zero. We used to carry both flags into the 2D
+    // path instead, and neither is harmless there:
+    //
+    //   tiled -- 2D tiling arranges 32x32 blocks. Applied to a single row it
+    //     scatters the row across tiles that hold no data for it.
+    //   packed_mips -- GetPackedMipLevel(w, 1) is log2_ceil(1) = 0, so level 0
+    //     itself counts as inside the tail and the base level gets a packed
+    //     sub-rect offset applied to it. Nothing about a one-row texture has a
+    //     packed tail to offset into.
+    //
+    // The reference's LOG says "ignoring", but its code sets is_invalid_1d and
+    // returns with the key still invalid — so the binding is dropped, not the
+    // flag. Matching the code, not the message: sample_as_zero tells the caller
+    // to bind zero and keep the draw, which is what an invalid key does there.
+    // Reading the wrong bytes would be the worse answer, and dropping the whole
+    // draw would be worse still.
+    if (fetch.tiled) {
+      ++g_oneDCensus.tiled;
+      out.sample_as_zero = true;
+      return reject("1D texture claims tiled storage");
+    }
+    if (fetch.packed_mips) {
+      ++g_oneDCensus.packed;
+      out.sample_as_zero = true;
+      return reject("1D texture claims packed mips");
+    }
+    // Not fixed here, only counted. The reference remaps a 1D texture wider
+    // than 8192 onto a 2D grid of 8192-wide rows and has the shader convert
+    // the coordinate back, because its own key packs width in 13 bits. Our
+    // limit is D3D12's, 16384, so the range 8193..16384 works here and is
+    // remapped there; only past 16384 are we actually short, and the remap
+    // needs a shader-side change to go with it. Counted so the decision is
+    // measured rather than argued.
+    if (fetch.size_1d.width + 1u > 16384u) {
+      ++g_oneDCensus.too_wide;
+      // Zero rather than a dropped draw for the same reason as above. This one
+      // IS a divergence from the reference, which would render it; we do not
+      // have the remap yet, so the honest failure is the defined value.
+      out.sample_as_zero = true;
+      return reject("1D texture wider than the host limit");
+    }
+    if (fetch.size_1d.width + 1u > 8192u) ++g_oneDCensus.wide;
+  }
   // A TRUE VOLUME. Its slices interleave inside the tile rather than sitting a
   // stride apart, which is the one thing the paragraph above says needs a
   // resource type we do not build -- but only the ADDRESSING differs. Decoded
