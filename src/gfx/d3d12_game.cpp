@@ -1804,18 +1804,26 @@ bool D3D12Renderer::EnsureGameTexture(
 // nothing safe to drop, and the honest outcome is to say so rather than to
 // corrupt a live descriptor.
 void D3D12Renderer::EvictGameTexturesToHighWater() {
-  const size_t live = m_gameTextures.size();
-  if (live <= kGameTextureHighWater) return;
+  // DESCRIPTOR PRESSURE, not texture count. The SRV heap is shared: render
+  // targets, snapshots and the video planes hold slots too -- measured at 117
+  // in a menu session, srv 824 against 707 cached textures. Thresholding on
+  // m_gameTextures.size() against a figure derived from the whole heap
+  // therefore leaves the real margin unknown, and in that session it was 11
+  // slots rather than the intended 128: eviction would not have started until
+  // the heap was all but exhausted. Ask the allocator how full it is instead.
+  const uint32_t in_use =
+      m_nextGameSrvDescriptor - uint32_t(m_freeGameSrvDescriptors.size());
+  if (in_use <= kGameTextureHighWater) return;
 
   // Never the frame being recorded; see above.
   const uint64_t in_flight = m_fenceValue;
   std::vector<std::pair<uint64_t, uint64_t>> candidates;  // (lastUsed, key)
-  candidates.reserve(live);
+  candidates.reserve(m_gameTextures.size());
   for (const auto& [key, entry] : m_gameTextures)
     if (entry.lastUsedFence < in_flight)
       candidates.emplace_back(entry.lastUsedFence, key);
 
-  const size_t want = live - kGameTextureHighWater;
+  const size_t want = in_use - kGameTextureHighWater;
   if (candidates.size() < want) ++m_gameTextureEvictBlocked;
   const size_t take = std::min(want, candidates.size());
   if (!take) return;

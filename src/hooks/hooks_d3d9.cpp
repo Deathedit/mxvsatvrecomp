@@ -4248,11 +4248,111 @@ bool IsGlyphCacheFormat(mx::hle::HostTextureFormat format) {
   return format == mx::hle::HostTextureFormat::kR8;
 }
 
-// True when this cached payload predates the newest glyph-cache flush and so
-// may be showing glyphs that have since been repacked.
-bool GlyphCacheStale(const mx::hle::HleTexturePayload& payload) {
-  return IsGlyphCacheFormat(payload.format) &&
-         payload.content_version != g_glyphCacheGeneration;
+// Fingerprint of the GUEST BYTES behind a texture, so the caches can notice
+// that an address has been refilled with different artwork.
+//
+// The cache key is FNV-1a over the six fetch dwords -- where the texture lives
+// and what shape it is, never what it contains. Swapping riders streams new
+// gear into the SAME allocation at the same dimensions and format, so the key
+// does not change and BOTH caches keep serving the previous rider: the decoded
+// payload in g_hleCpuTextures (whose emplace never overwrites) and the GPU
+// resource in m_gameTextures. That is the wrong-livery and wrong-gear defect,
+// and it is why it looked order-dependent -- the only thing that ever
+// invalidated anything was a Scaleform font repack, which is unrelated and
+// happened to fire sometimes.
+//
+// Bounded so it can run on every bind. Textures of 4 KB or less are hashed
+// WHOLE; larger ones are sampled at 32 fixed offsets, ~2 KB against the ~580
+// binds a frame this title makes. Hashing everything in full would be ~100 MB
+// a frame. The sampled form could in principle miss artwork that is
+// byte-identical at all 32 offsets; the whole-hash cutoff covers the small
+// textures where that is most plausible, and for real art it does not happen.
+//
+// Returns 0 for memory it cannot read, which callers treat as "no opinion"
+// rather than as a change -- a texture mid-stream must not be invalidated on
+// the strength of a failed read.
+uint32_t GuestTextureFingerprint(const mx::hle::HleTextureSource& source,
+                                 uint8_t* base) {
+  const uint32_t bytes = source.source_bytes;
+  if (!source.address || !bytes) return 0;
+
+  // The bare address is often not the readable one; walk the same mirrors
+  // CopyTexturePhysical does.
+  uint32_t addr = 0;
+  for (uint32_t m : {0u, 0xA0000000u, 0xC0000000u, 0xE0000000u}) {
+    const uint32_t candidate = source.address | m;
+    if (HostPageReadable(REX_RAW_ADDR(candidate))) {
+      addr = candidate;
+      break;
+    }
+  }
+  if (!addr) return 0;
+
+  uint64_t h = 1469598103934665603ull;
+  // Length participates, so the same address resized is a different
+  // fingerprint even when its opening bytes agree.
+  h ^= bytes;
+  h *= 1099511628211ull;
+
+  bool ok = true;
+  const auto eat = [&](uint32_t offset, uint32_t n) {
+    if (!ok) return;
+    // Checked per slice rather than once at each end: the pages between are
+    // not guaranteed mapped, and a fingerprint is not worth a fault.
+    if (!HostPageReadable(REX_RAW_ADDR(addr + offset)) ||
+        !HostPageReadable(REX_RAW_ADDR(addr + offset + n - 1))) {
+      ok = false;
+      return;
+    }
+    const auto* q = reinterpret_cast<const uint8_t*>(REX_RAW_ADDR(addr + offset));
+    for (uint32_t i = 0; i < n; ++i) {
+      h ^= q[i];
+      h *= 1099511628211ull;
+    }
+  };
+
+  constexpr uint32_t kWholeHashLimit = 4096;
+  constexpr uint32_t kSlices = 32, kSliceBytes = 64;
+  if (bytes <= kWholeHashLimit) {
+    eat(0, bytes);
+  } else {
+    for (uint32_t i = 0; i < kSlices && ok; ++i)
+      eat(uint32_t((uint64_t(bytes - kSliceBytes) * i) / (kSlices - 1)),
+          kSliceBytes);
+  }
+  if (!ok) return 0;
+  const uint32_t folded = uint32_t(h ^ (h >> 32));
+  return folded ? folded : 1u;  // 0 is reserved for "could not read".
+}
+
+// What a payload's content_version should hold, and what it is later compared
+// against. One function so the store and the test cannot drift apart -- storing
+// a fingerprint and comparing it to a generation would invalidate that texture
+// on every single bind.
+//
+// The glyph atlas KEEPS the guest's own flush generation rather than moving to
+// the fingerprint. That fix was hard won, the guest tells us outright when the
+// atlas is repacked, and an explicit signal beats a sampled read of the same
+// memory. The fingerprint covers everything else, which until now was covered
+// by nothing at all: GlyphCacheStale was gated on IsGlyphCacheFormat, so every
+// BC1/BC3/BC5/RGBA8 texture in the game -- all the rider and vehicle art -- was
+// never tested for staleness in the first place.
+uint32_t TextureContentVersion(const mx::hle::HleTextureSource& source,
+                               uint8_t* base,
+                               mx::hle::HostTextureFormat format) {
+  if (IsGlyphCacheFormat(format)) return g_glyphCacheGeneration;
+  return GuestTextureFingerprint(source, base);
+}
+
+// True when a cached payload no longer matches what the guest memory holds.
+bool TextureContentStale(const mx::hle::HleTextureSource& source,
+                         uint8_t* base,
+                         const mx::hle::HleTexturePayload& payload) {
+  const uint32_t now = TextureContentVersion(source, base, payload.format);
+  // A fingerprint of 0 means the memory could not be read. Not evidence of a
+  // change, so the cached copy stands; the generation is never 0.
+  if (!IsGlyphCacheFormat(payload.format) && !now) return false;
+  return now != payload.content_version;
 }
 
 void NoteBlankDecode(uint64_t key) {
@@ -5419,7 +5519,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
       cached != g_hleCpuTextures.end()) {
     // A glyph atlas the guest has repacked since this was decoded falls
     // through to a fresh decode; everything else is served from the cache.
-    if (!GlyphCacheStale(*cached->second)) {
+    if (!TextureContentStale(source, base, *cached->second)) {
       out_textures[slot] = cached->second;
       return true;
     }
@@ -5491,7 +5591,8 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   }
   NoteBlankRecovered(key);
   payload->key = key;
-  payload->content_version = g_glyphCacheGeneration;
+  payload->content_version =
+      TextureContentVersion(source, base, payload->format);
   out_textures[slot] = payload;
   g_hleCpuTextures.emplace(key, std::move(payload));
   return true;
@@ -6185,7 +6286,7 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
   }
   auto cached = g_hleCpuTextures.find(key);
   if (cached != g_hleCpuTextures.end()) {
-    if (!GlyphCacheStale(*cached->second)) {
+    if (!TextureContentStale(source, base, *cached->second)) {
       dc.texture = cached->second;
       ++s_ready;
       return true;
@@ -6224,7 +6325,8 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
   }
   NoteBlankRecovered(key);
   payload->key = key;
-  payload->content_version = g_glyphCacheGeneration;
+  payload->content_version =
+      TextureContentVersion(source, base, payload->format);
   dc.texture = payload;
   g_hleCpuTextures.emplace(key, std::move(payload));
   ++s_ready;
