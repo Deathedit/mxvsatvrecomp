@@ -5780,6 +5780,21 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // for the pre-pass" from "the guest asked for the scene and we handed it the
   // pre-pass".
   //
+  // The ADDRESS fallback, resolved BEFORE the log rather than after it.
+  //
+  // `resolved=` below reports only the OBJECT lookup, and this used to run
+  // afterwards -- so a slot whose guest object is not a registered resolve
+  // destination printed resolved=0 whether or not the address match then
+  // rescued it. Two very different outcomes, one field, and the field named the
+  // one that does not decide anything.
+  //
+  // That is exactly the composite's case: ps 0x215F8620 slot 0 binds object
+  // 0x7010F7F0 while three other shaders bind object 0x2123C2A4 for the SAME
+  // guest address 0x1EDA0000 -- one guest texture object aliasing another's
+  // resolve destination. Whether that slot samples the depth snapshot or a
+  // zero-decoding guest allocation was unanswerable from the log.
+  const ResolvedTargetByAddress* addr_match = ResolvedTargetForAddress(source);
+
   // Deduplicated per (shader, slot) and capped: one line per distinct binding,
   // not per draw.
   {
@@ -5796,15 +5811,17 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     if (fresh) {
       REXLOG_INFO(
           "d3d9: SLOT MAP ps 0x{:08X} slot {} (guest sampler {}): object "
-          "0x{:08X} resolved={} mostly_written={} | fetch addr 0x{:08X} "
-          "{}x{} fmt {} bytes {}",
+          "0x{:08X} resolved={} mostly_written={} addr_match={} (dest 0x{:08X})"
+          " | fetch addr 0x{:08X} {}x{} fmt {} bytes {}",
           dc.pixel_shader_handle, slot, guest_sampler, texture_state.object,
           texture_state.object &&
                   g_resolvedTextureTargets.contains(texture_state.object)
               ? 1
               : 0,
-          partial_snapshot_object ? 0 : 1, source.address, source.width,
-          source.height, source.guest_format, source.source_bytes);
+          partial_snapshot_object ? 0 : 1, addr_match ? 1 : 0,
+          addr_match ? addr_match->dest_object : 0u, source.address,
+          source.width, source.height, source.guest_format,
+          source.source_bytes);
     }
   }
   // Permuted into host component order here, at the bind, because this is
@@ -5840,9 +5857,11 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // Placed after the describe because the address and extent it matches on come
   // out of it, and before the decode because the decode is precisely what has
   // to be skipped.
-  if (const ResolvedTargetByAddress* resolved =
-          ResolvedTargetForAddress(source)) {
-    out_objects[slot] = resolved->dest_object;
+  // Decided from the same lookup the log above reported, not a second call:
+  // one question, one answer, so the line cannot say something the binding then
+  // contradicts.
+  if (addr_match) {
+    out_objects[slot] = addr_match->dest_object;
     ++g_resolveAddressMatches;
     return true;
   }
