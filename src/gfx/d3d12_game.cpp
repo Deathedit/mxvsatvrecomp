@@ -3804,6 +3804,45 @@ void D3D12Renderer::RenderGameFrame() {
     }
     ++m_standInDraws;
 
+    // WHICH stand-in draws actually PAINT, named by target and shader.
+    //
+    // The complement of WHITE-SKIP WHO above: that one names the draws the gate
+    // discards, this one names the draws it lets through, and only the second
+    // population can put wrong colour on screen. The vast majority of stand-in
+    // draws are the guest's null-PS depth passes, which carry RB_COLOR_MASK 0
+    // and paint nothing (NULL-PS TARGETS: "WOULD PAINT 0"), so filtering on
+    // colorWrite is what separates the noise from the suspects.
+    //
+    // This is what named the red gameplay screen. One line, carrying a guest
+    // shader handle a capture could not give, identified ps 0x216012A0 as the
+    // draw painting full-screen red -- and the same probe going quiet is how
+    // the fix was confirmed.
+    if (d.colorWrite && d.targetObject) {
+      static std::mutex s_mu;
+      static std::set<uint64_t> s_seen;
+      const uint64_t key =
+          (uint64_t(d.targetObject) << 32) | d.pixelShaderHandle;
+      bool fresh = false;
+      {
+        std::lock_guard<std::mutex> lk(s_mu);
+        fresh = s_seen.size() < 24 && s_seen.insert(key).second;
+      }
+      if (fresh) {
+        char line[256];
+        std::snprintf(line, sizeof(line),
+                      "STAND-IN PAINTS: target 0x%08X %ux%u ps 0x%08X "
+                      "colorSource %u textured %d translated %d samplers %u "
+                      "indices %u depth %d blend %d src %u dest %u",
+                      d.targetObject, d.targetWidth, d.targetHeight,
+                      d.pixelShaderHandle, unsigned(d.colorSource),
+                      d.texture ? 1 : 0, d.translated ? 1 : 0,
+                      d.pixelSamplerCount, d.indexCount,
+                      d.depthEnable ? 1 : 0, d.blendEnable ? 1 : 0,
+                      d.srcBlend, d.destBlend);
+        LogInfo(line);
+      }
+    }
+
     // Offscreen targets do not yet have per-surface depth resources. The
     // post-processing/resolve chain observed in ST_Southwest is colour-only;
     // keep depth disabled there rather than bind the 1280x720 DSV against a
@@ -4443,8 +4482,17 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   // "2000 draws with an untranslated shader" and "27015 stand-in draws" describe
   // different populations and cannot be subtracted from one another. Every
   // attempt to reason about the difference between them has been wrong.
-  if (!d.pixelShaderHlsl) ++m_standInNoHlsl;
-  else if (!d.pixelShaderHandle) ++m_standInNoHandle;
+  //
+  // no-HANDLE is tested FIRST, and the order is the whole point. A draw with no
+  // pixel shader bound has no handle AND no HLSL, so with the two the other way
+  // round every one of them was counted as no-hlsl and `no-handle 0` could
+  // never be anything but zero -- an unreachable branch reading exactly like a
+  // measured absence. That cost a session: "no-handle 0, no-hlsl 28257" was
+  // read as "every stand-in draw has a shader whose translation is missing",
+  // which sent the search into the translator when the shaders were translating
+  // fine. A counter that cannot fire is worse than no counter.
+  if (!d.pixelShaderHandle) ++m_standInNoHandle;
+  else if (!d.pixelShaderHlsl) ++m_standInNoHlsl;
   else if (!hasVertexStage && !(interpolators && interpBytes))
     ++m_standInNoVertexInputs;
   else if (!pixelConstants || !pixelConstDwords) ++m_standInNoConstants;

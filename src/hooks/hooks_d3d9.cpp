@@ -1289,6 +1289,62 @@ void OverlayShaderConstants(uint32_t shader, uint8_t* base,
   }
 }
 
+// PROBE: which VERTEX constant registers arrive as NaN, and whether any of them
+// is ever finite.
+//
+// The legal screen's white backdrop traces to vertex c136-c139 reading NaN at
+// draw 1010 of legal-2.rdc: the VS computes o3 = r0.y*c137 + c139 + r0.x*c136,
+// so the interpolator arrives NaN and the pixel shader saturates to (1,1,1,1).
+// That white is then resolved into three snapshots which the backdrop shader
+// samples, and the whole HDR chain downstream is a constant from there.
+//
+// IDA cannot answer who writes those registers: the setter at 0x82550320 has
+// 20+ callers and no call site passes a literal StartRegister, so the index is
+// computed. The question this probe settles instead is much narrower and is the
+// one that decides the next move:
+//
+//   ever_finite == 0  -> the guest never writes the register at all, and the
+//                        shader is reading a slot only the hardware constant
+//                        file would have held from an earlier frame
+//   ever_finite  > 0  -> the guest does write it and we are sampling a window
+//                        where it is stale, which is OUR bug to fix
+//
+// Read AFTER OverlayShaderConstants so it reports the bank the shader actually
+// sees, not the raw device shadow -- the overlay is exactly the thing that could
+// be filling these and being missed.
+void NoteVertexConstantNaN(const std::array<uint32_t, kD3d9ConstRegs * 4>& bank,
+                           uint32_t shader) {
+  static std::mutex s_mu;
+  static uint64_t s_nan[kD3d9ConstRegs] = {};
+  static uint64_t s_finite[kD3d9ConstRegs] = {};
+  static uint64_t s_draws = 0;
+  // A NaN is exponent all-ones with a non-zero mantissa. Testing the bits keeps
+  // this independent of the host's floating-point flags.
+  const auto is_nan = [](uint32_t b) {
+    return (b & 0x7F800000u) == 0x7F800000u && (b & 0x007FFFFFu) != 0;
+  };
+  std::string report;
+  {
+    std::lock_guard<std::mutex> lock(s_mu);
+    for (uint32_t r = 0; r < kD3d9ConstRegs; ++r) {
+      bool nan = false;
+      for (uint32_t c = 0; c < 4; ++c) nan = nan || is_nan(bank[r * 4 + c]);
+      ++(nan ? s_nan[r] : s_finite[r]);
+    }
+    if ((++s_draws % 20000) != 0) return;
+    for (uint32_t r = 0; r < kD3d9ConstRegs; ++r) {
+      if (!s_nan[r]) continue;
+      report += fmt::format(" c{}={}nan/{}ok", r, s_nan[r], s_finite[r]);
+    }
+  }
+  if (report.empty()) {
+    REXLOG_INFO("d3d9: VS CONST NaN probe over {} draws: none", s_draws);
+    return;
+  }
+  REXLOG_INFO("d3d9: VS CONST NaN probe over {} draws (last vs 0x{:08X}):{}",
+              s_draws, shader, report);
+}
+
 bool CaptureVertexConstants(uint32_t device, uint8_t* base, uint32_t shader,
                             std::array<uint32_t, kD3d9ConstRegs * 4>& out) {
   const uint32_t bytes = kD3d9ConstRegs * 16;
@@ -1298,6 +1354,7 @@ bool CaptureVertexConstants(uint32_t device, uint8_t* base, uint32_t shader,
   for (uint32_t i = 0; i < out.size(); ++i)
     out[i] = REX_LOAD_U32(device + 0x780 + i * 4);
   OverlayShaderConstants(shader, base, out);
+  NoteVertexConstantNaN(out, shader);
   return true;
 }
 
@@ -4618,8 +4675,21 @@ void NoteRejectedTextureFormat(const char* site, uint32_t sampler,
                                const mx::hle::HleTextureSource& source,
                                const char* why, const uint32_t fetch[6]) {
   const uint32_t fmt = source.guest_format;
-  const bool first = ++g_hleRejectedFormats[fmt] == 1;
-  if (!first) return;
+  ++g_hleRejectedFormats[fmt];
+  // Logged once per (format, REASON), not once per format. The tally above
+  // stays keyed on format alone because that is what RejectedFormatSummary
+  // ranks, but the gate cannot: a format already turned down for one reason
+  // would silently swallow every later reason for the same format, and the
+  // reason is the only part that says what work would fix it.
+  //
+  // This matters right now for "texture is a 3D volume". tfetch3D shaders used
+  // to be refused whole by the HLSL emitter, so their textures were never
+  // described and that reason had never once been reachable. Now that the
+  // stacked case translates, a volume is the one remaining refusal, and
+  // whether it ever fires decides whether a real Texture3D decode is worth
+  // building.
+  static std::set<std::pair<uint32_t, std::string>> s_seen;
+  if (!s_seen.emplace(fmt, why ? why : "?").second) return;
   REXLOG_INFO("d3d9: HLE texture reject [{}]: sampler {} format {} ({}) — {}; "
               "words {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}",
               site, sampler, fmt, mx::hle::GuestTextureFormatName(fmt),
@@ -5109,17 +5179,33 @@ uint64_t g_slotBoundUnbound = 0;  // sampler the guest never bound; sampled zero
 // 0-7 do: a failure spread evenly over low samplers means genuinely unbound
 // slots, whereas one concentrated at and above 8 means the indexing is wrong.
 std::map<uint32_t, uint64_t> g_slotFailFetchBySampler;
+// Which guest sampler tripped the range check, and which half of it. `range`
+// was the largest slot-fill failure in mx_1108 with nothing saying why, and the
+// two conditions want opposite fixes: a compact slot at or above 16 is our
+// bookkeeping, a guest sampler at or above kMaxSamplers was the file being read
+// at half its width.
+std::map<uint32_t, uint64_t> g_slotFailRangeBySampler;
+uint64_t g_slotFailRangeSlot = 0;
 
 void ReportSlotFailures() {
   const uint64_t total = g_slotFailRange + g_slotFailFetch +
                          g_slotFailDescribe + g_slotFailCopy + g_slotFailDecode;
-  if (!total || (total % 5000) != 0) return;
+  // Every 5000 AND on the first one. `(total % 5000) != 0` alone meant a run
+  // with fewer than 5000 failures printed NOTHING -- mx_1110 had 2389 short
+  // draws and not one outcome line, which reads exactly like zero failures.
+  // The same trap as the unreachable stand-in counter; see the note there.
+  if (!total || (total != 1 && (total % 5000) != 0)) return;
   std::string by;
   for (const auto& [sampler, n] : g_slotFailFetchBySampler)
     by += fmt::format(" s{}={}", sampler, n);
-  REXLOG_INFO("d3d9: slot fill outcomes {}: range {} describe {} copy {} "
-              "decode {} (these still fail the draw); unbound by sampler:{}",
-              total, g_slotFailRange, g_slotFailDescribe, g_slotFailCopy,
+  std::string rby;
+  for (const auto& [sampler, n] : g_slotFailRangeBySampler)
+    rby += fmt::format(" s{}={}", sampler, n);
+  REXLOG_INFO("d3d9: slot fill outcomes {}: range {} (slot-too-wide {}, guest "
+              "sampler:{}) describe {} copy {} decode {} (these still fail the "
+              "draw); unbound by sampler:{}",
+              total, g_slotFailRange, g_slotFailRangeSlot,
+              rby.empty() ? " none" : rby, g_slotFailDescribe, g_slotFailCopy,
               g_slotFailDecode, by.empty() ? " none" : by);
 }
 
@@ -5464,6 +5550,29 @@ void NoteMipCensus() {
   static std::atomic<uint64_t> s_binds{0};
   const uint64_t n = s_binds.fetch_add(1, std::memory_order_relaxed) + 1;
   if (n != 1 && (n % 20000) != 0) return;
+  // The absolute check on the tiled addressing, printed once. It answers a
+  // question the mip self-check structurally cannot -- see HleTiledAddressCheck
+  // -- and it prints even when it passes, because "no line" is how a check that
+  // never ran looks, and that has cost this project twice today.
+  {
+    static std::atomic<bool> s_reported{false};
+    if (!s_reported.exchange(true)) {
+      const mx::hle::HleTiledAddressCheck t = mx::hle::HleTiledAddressStats();
+      if (t.mismatched) {
+        REXLOG_ERROR(
+            "d3d9: TILED ADDRESSING DISAGREES with xenia-edge: {} of {} "
+            "coordinates; first at ({},{}) pitch {} bpb_log2 {} -- SDK {} vs "
+            "reference {}. Every tiled texture is being read from the wrong "
+            "bytes.",
+            t.mismatched, t.checked, t.first_x, t.first_y, t.first_pitch,
+            t.first_bytes_per_block_log2, t.first_sdk, t.first_reference);
+      } else {
+        REXLOG_INFO("d3d9: tiled addressing self-check: {} coordinates agree "
+                    "with xenia-edge across every block size",
+                    t.checked);
+      }
+    }
+  }
   const mx::hle::HleMipCensus c = mx::hle::HleMipChainStats();
   std::string levels;
   for (uint32_t i = 0; i < 16; ++i)
@@ -5539,6 +5648,8 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
       vertex ? dc.vertex_sampler_signs : dc.pixel_sampler_signs;
   if (slot >= DrawCall::kMaxPixelTextures || guest_sampler >= kMaxSamplers) {
     ++g_slotFailRange;
+    if (slot >= DrawCall::kMaxPixelTextures) ++g_slotFailRangeSlot;
+    else ++g_slotFailRangeBySampler[guest_sampler];
     ReportSlotFailures();
     return false;
   }
@@ -5943,8 +6054,9 @@ void ApplyShaderFetchPatchTable(uint32_t shader, uint32_t table_at,
   }
 
   // Second list: inline device-shadow copies. Offset zero is fetch constant 0;
-  // six dwords later begins fetch constant 1. Only retain the first 16 slots,
-  // which is the HLE binding width; the guest block itself contains all 32.
+  // six dwords later begins fetch constant 1. This retained only the first 16
+  // while noting that "the guest block itself contains all 32" — kMaxSamplers is
+  // now 32 and the truncation is gone. See the note on that constant.
   constexpr uint32_t kFetchBytes = mx::hle::kMaxSamplers *
                                    ShaderFetchConstants::kDwords * 4;
   while (at + 4 <= end && HostPageReadable(REX_RAW_ADDR(at + 2))) {
