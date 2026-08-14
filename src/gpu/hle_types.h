@@ -27,6 +27,10 @@ enum class HostTextureFormat : uint8_t {
   kR8,
   kR16,
   kR32Float,
+  // Appended rather than filed next to kR8, deliberately: these values are
+  // printed raw by the texture-fallback log line, so renumbering the existing
+  // ones would silently reinterpret every log already written.
+  kRg8,
 };
 
 // xenos::TextureFilter::kBaseMap -- "sample level 0 and never minify past it".

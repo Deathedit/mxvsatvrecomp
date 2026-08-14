@@ -558,6 +558,25 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
     case xenos::TextureFormat::k_8:
       out.host_format = HostTextureFormat::kR8;
       break;
+    // Two 8-bit channels, 1x1 blocks, 2 bytes -- the reference's own entry for
+    // it (d3d12_texture_cache.h, "// k_8_8") is R8G8_UNORM loaded by the plain
+    // 16bpb copy shader, so nothing but the accept-list entry is needed here.
+    // Component 0 is the LOW half of the 16-bit texel, and SwapBlock's 2-byte
+    // case already turns the guest's big-endian pair into that order, so host
+    // R is guest x and host G is guest y.
+    //
+    // WHERE WE STILL DIVERGE: the reference gives this format the host swizzle
+    // RGGG, replicating the last real channel into z and w, because a Xenos
+    // fetch of a two-channel texture returns y there rather than 0/1. We apply
+    // the guest swizzle raw against an identity host swizzle (see the note in
+    // d3d12_game.cpp's SRV branch), so a shader asking for .z or .w of a k_8_8
+    // reads what DXGI supplies for the missing channels -- 0 and 1 -- not y.
+    // Not fixed here: the composition affects kR8 (the glyph format) as well,
+    // so it is its own change with its own screenshot, and every observed use
+    // of a two-channel texture reads .xy.
+    case xenos::TextureFormat::k_8_8:
+      out.host_format = HostTextureFormat::kRg8;
+      break;
     case xenos::TextureFormat::k_16:
       out.host_format = HostTextureFormat::kR16;
       break;

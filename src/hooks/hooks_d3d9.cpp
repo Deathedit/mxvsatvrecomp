@@ -5218,7 +5218,8 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
          source.host_format == mx::hle::HostTextureFormat::kRgba16Float ||
          source.host_format == mx::hle::HostTextureFormat::kR8 ||
          source.host_format == mx::hle::HostTextureFormat::kR16 ||
-         source.host_format == mx::hle::HostTextureFormat::kR32Float))
+         source.host_format == mx::hle::HostTextureFormat::kR32Float ||
+         source.host_format == mx::hle::HostTextureFormat::kRg8))
       continue;
     // An 8x8 immutable texture is a lookup table, not a material. Both that
     // this front end owns are ordered-dither matrices the guest thresholds
@@ -5269,6 +5270,10 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
         score += mapped_render_target ? 30 : 0;
         break;
       case mx::hle::HostTextureFormat::kBc5:
+      // k_8_8 is the uncompressed two-channel format and lands here for the
+      // same reason as BC5: two channels is a normal map, a mask pair or a
+      // flow field, never the visible base colour of a material.
+      case mx::hle::HostTextureFormat::kRg8:
         // DXN/BC5 is a normal map. Keep support for inspection and future
         // shader translation, but never prefer it as visible base colour.
         score += mapped_render_target ? 10 : 0;
@@ -7141,12 +7146,19 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
   // surface grey. They are decoded rather than rejected so the counters can
   // tell "we cannot read this" apart from "we choose not to show this" — the
   // distinction the old shared "unsupported" string destroyed.
+  //
+  // kRg8 (k_8_8) is two-channel and joins them: the stand-in shader has no
+  // idea what the second channel means, so binding one as base colour paints
+  // the surface in red and green. The translated path, which is where these
+  // 1273 rejections a run were actually losing draws, goes through
+  // ResolvePixelSlotTexture and is deliberately not gated by this.
   if (source.host_format == HostTextureFormat::kBc5 ||
       source.host_format == HostTextureFormat::kR16Float ||
       source.host_format == HostTextureFormat::kRgba16Float ||
       source.host_format == HostTextureFormat::kR8 ||
       source.host_format == HostTextureFormat::kR16 ||
-      source.host_format == HostTextureFormat::kR32Float) {
+      source.host_format == HostTextureFormat::kR32Float ||
+      source.host_format == HostTextureFormat::kRg8) {
     ++s_semantic_reject;
     if (s_semantic_reject <= 12) {
       // Named in guest terms as well: this drop is a policy choice about a

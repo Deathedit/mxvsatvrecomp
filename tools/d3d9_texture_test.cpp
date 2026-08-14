@@ -164,6 +164,17 @@ int main() {
   Check(DescribeHleTexture2D(fetch16Words, expanded, &why) &&
             expanded.host_format == HostTextureFormat::kR16,
         "k_16 maps to R16 storage");
+  // FMT_8_8, the format the reject tally has been naming: 1273 descriptors in
+  // one run, every one of them a translated shader's slot that then failed the
+  // whole draw back to the stand-in. 1x1 blocks of 2 bytes, matching the
+  // reference's own R8G8_UNORM / 16bpb entry.
+  fetch16.format = rex::graphics::xenos::TextureFormat::k_8_8;
+  Check(DescribeHleTexture2D(fetch16Words, expanded, &why) &&
+            expanded.host_format == HostTextureFormat::kRg8,
+        "k_8_8 maps to RG8 storage");
+  Check(expanded.bytes_per_block == 2 && expanded.block_width == 1 &&
+            expanded.block_height == 1,
+        "k_8_8 is a 2-byte 1x1 block");
 
   // A rejected descriptor must still name its format, or the reject log
   // cannot say what to add next.
@@ -198,6 +209,18 @@ int main() {
               out16.data[1] == 0x12 && out16.data[2] == 0x78 &&
               out16.data[3] == 0x56,
           "2-byte blocks are endian-swapped");
+
+    // The same swap, stated as the claim that matters for k_8_8: the guest
+    // stores the texel big-endian and component 0 is its LOW half, so after
+    // the swap host R must be component 0 and host G component 1. Get this
+    // backwards and every two-channel texture samples with its channels
+    // exchanged -- which for a normal map is a sign flip nothing else catches.
+    narrow.host_format = HostTextureFormat::kRg8;
+    const uint8_t rg[4] = {0xAA, 0xBB, 0xCC, 0xDD};
+    Check(DecodeHleTexture2D(narrow, rg, sizeof(rg), out16, &why),
+          "k_8_8 decode");
+    Check(out16.data[0] == 0xBB && out16.data[1] == 0xAA,
+          "k_8_8 host R is guest component 0");
   }
 
   // PACKED MIP TAIL. A texture 16 texels or smaller stores its base level at an
