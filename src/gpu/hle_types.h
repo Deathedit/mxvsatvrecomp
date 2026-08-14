@@ -93,6 +93,21 @@ struct HleTexturePayload {
   // never reaches here with level_count > 1, because a chain the guest does not
   // want is not decoded in the first place.
   uint8_t mip_filter = 0;
+  // DIAGNOSTIC ONLY. The level-0, slice-0 centre block as it sat in guest
+  // memory and as it ended up after SwapBlock, plus the endian that was
+  // applied. Carried on the payload because the decoder has no logger and the
+  // renderer's slot census does -- and because the two halves have to come from
+  // the SAME decode to mean anything.
+  //
+  // The question they answer: the terrain heightmap's guest swizzle selects
+  // decoded byte 1, and byte 1 is 00 in every texel while bytes 0/2/3 all carry
+  // data. Either our byte order is reversed relative to the channel numbering
+  // the swizzle is expressed in, or the texture really does have a dead channel
+  // and the height comes from elsewhere. Raw beside decoded settles which.
+  uint8_t probe_raw[16] = {};
+  uint8_t probe_swapped[16] = {};
+  uint32_t probe_bytes = 0;
+  uint32_t probe_endian = 0;
   HleTextureLevelData levels[14] = {};
   std::vector<uint8_t> data;
 };
@@ -382,6 +397,19 @@ struct DrawCall {
   // Per-BINDING state, not per-texture -- the same guest memory is bound with
   // different sign modes by different draws.
   std::array<uint8_t, kMaxPixelTextures> pixel_sampler_signs = {};
+  // Per compact slot: the fetch constant's SWIZZLE, for slots served by a
+  // resolve SNAPSHOT rather than a decoded texture.
+  //
+  // The decoded-texture path carries its swizzle on the payload, so only the
+  // snapshot path needed a carrier -- and having none is why the renderer bound
+  // every snapshot slot with an identity component mapping and threw the
+  // guest's swizzle away. Measured in mx_1156: pixel slots asking for 03012,
+  // the BGRA->RGBA correction, were sampling red and blue SWAPPED, and slots
+  // asking for 05510 read real channels where the guest wants constant 1.0.
+  // Xenia composes the guest swizzle for every texture regardless of where the
+  // data came from (TextureCache::GuestToHostSwizzle); this is the missing half
+  // of that on our side. 0 means "not a snapshot slot / nothing to apply".
+  std::array<uint16_t, kMaxPixelTextures> pixel_sampled_swizzles = {};
 
   // The VERTEX stage's samplers, in exactly the same shape as the pixel ones
   // above and resolved by the same code.
@@ -407,6 +435,8 @@ struct DrawCall {
       vertex_textures;
   std::array<uint32_t, kMaxPixelTextures> vertex_sampled_objects = {};
   std::array<uint8_t, kMaxPixelTextures> vertex_sampler_signs = {};
+  // The vertex stage's half of pixel_sampled_swizzles above.
+  std::array<uint16_t, kMaxPixelTextures> vertex_sampled_swizzles = {};
   // The interpolators the translated pixel shader reads, one float4 per
   // linkage slot per vertex, in a buffer parallel to `vertices`.
   //

@@ -1121,14 +1121,25 @@ uint64_t g_resolveAddressPartial = 0;  // matched, but barely written by the GPU
 //
 // Extent agreeing, or the object being named by a resolve, is not the same as
 // the GPU having WRITTEN the surface. A destination the resolves reach only a
-// corner of is mostly clear colour, and claiming it is strictly worse than
-// letting the CPU decode run: it paints the same black AND suppresses the
-// re-read that would pick the texture up once the guest fills it.
+// corner of is mostly clear colour, so this refuses the claim and lets the CPU
+// decode run instead -- which keeps alive the re-read that picks the texture up
+// once the guest fills its memory.
+//
+// STALE UNTIL 2026-08-14: this used to justify itself with "it paints the same
+// black AND suppresses the re-read". Both halves are wrong for a surface the CPU
+// never writes. The terrain heightmap is one: guest memory for it decodes to a
+// uniform 0xFF, so refusing the claim paints WHITE, not black, and the re-read
+// this protects never arrives -- zero `RECOVERED` lines across a whole freeroam
+// run (mx_1147). Returning false here is still correct; what was missing is the
+// downstream fallback, which now treats a uniform decode as empty whenever a
+// partly-written snapshot exists. See the `decode_is_uniform` note at the bind.
 //
 // A quarter of the area is the threshold. A genuine render target is resolved
 // whole, or in full-width bands that reach the full extent between them, so
 // nothing legitimate sits near it -- while the 2048x2048 menu atlas that
-// motivated this reaches 256x256, one sixty-fourth.
+// motivated this reaches 256x256, one sixty-fourth. The terrain heightmap at
+// phys 0x1A2E3000 reaches 768x256 of 2048x2048, 4.7%, and is the case the
+// fallback exists for.
 //
 // Unknown coverage allows the claim: a destination whose fetch constant could
 // not be read has no entry, and refusing on absent evidence would undo the
@@ -5939,13 +5950,26 @@ void NoteUnhandledSign(uint32_t guest_format, uint32_t mode) {
 // dc.pixel_shader_handle is still read for the blank-texture key regardless of
 // stage: that key identifies the DRAW's material, and a vertex fetch of the
 // same guest memory wants the same memoisation.
+// `stage_handle` names the shader whose slot this is, for diagnostics only.
+// The vertex caller must pass it: `dc.vertex_shader_handle` is assigned in a
+// different function that has not necessarily run yet, so reading it here
+// printed `SLOT MAP vs 0x00000000` and left every vertex shader's slots hashing
+// to the same dedupe key -- the third variant of the same mistake in one
+// session, after the renderer census and the uniform-decode line.
 bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
                              uint32_t guest_sampler, uint32_t device,
-                             uint8_t* base, bool vertex = false) {
+                             uint8_t* base, bool vertex = false,
+                             uint32_t stage_handle_hint = 0) {
   using namespace mx::hle;
   auto& out_textures = vertex ? dc.vertex_textures : dc.pixel_textures;
   auto& out_objects =
       vertex ? dc.vertex_sampled_objects : dc.pixel_sampled_objects;
+  auto& out_swizzles =
+      vertex ? dc.vertex_sampled_swizzles : dc.pixel_sampled_swizzles;
+  const uint32_t stage_handle =
+      stage_handle_hint ? stage_handle_hint
+                        : (vertex ? dc.vertex_shader_handle
+                                  : dc.pixel_shader_handle);
   auto& out_signs =
       vertex ? dc.vertex_sampler_signs : dc.pixel_sampler_signs;
   if (slot >= DrawCall::kMaxPixelTextures || guest_sampler >= kMaxSamplers) {
@@ -5971,6 +5995,11 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // instead. So: try memory first, and fall back to the snapshot when memory
   // has nothing -- which also keeps the blank-retry path alive, so the day the
   // guest fills that memory it wins on its own.
+  //
+  // "Has nothing" meant all-zero until 2026-08-14, and that read the terrain
+  // heightmap as real data for months: nothing CPU-writes it, so its memory
+  // decodes to a uniform 0xFF rather than to zeros. A UNIFORM decode counts as
+  // nothing too, but only here, where a partly-written snapshot is standing by.
   uint32_t partial_snapshot_object = 0;
   const auto& texture_state = DeviceState().texture[guest_sampler];
   if (texture_state.object &&
@@ -5984,7 +6013,9 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
       // never bound. See the note at the other call for why this matters.
       static std::mutex s_mu;
       static std::set<uint64_t> s_seen;
-      const uint64_t key = (uint64_t(dc.pixel_shader_handle) << 8) | slot;
+      // Stage-qualified, for the reason spelled out at the function header.
+      const uint64_t key = (uint64_t(stage_handle) << 9) |
+                           (uint64_t(vertex ? 1u : 0u) << 8) | slot;
       bool fresh = false;
       {
         std::lock_guard<std::mutex> lk(s_mu);
@@ -5994,14 +6025,33 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
         // investigation ever bound.
         fresh = s_seen.size() < 1024 && s_seen.insert(key).second;
       }
+      // Read regardless of whether this line is fresh: the swizzle is no
+      // longer only a diagnostic, it is what the renderer binds the snapshot
+      // with. Gating it on the log's dedupe would leave every slot after the
+      // first with an identity mapping again.
+      uint32_t sfetch[6] = {};
+      uint32_t swz = 0;
+      bool have_swz = false;
+      if (ReadLiveTextureFetch(device, base, guest_sampler, sfetch,
+                               dc.pixel_shader_handle)) {
+        // dword 3: num_format:1 then swizzle:12, per the fetch constant layout
+        // (xenos.h) -- so the swizzle starts at bit 1.
+        swz = (sfetch[3] >> 1) & 0xFFFu;
+        have_swz = true;
+      }
       if (fresh) {
         REXLOG_INFO(
-            "d3d9: SLOT MAP ps 0x{:08X} slot {} (guest sampler {}): object "
+            "d3d9: SLOT MAP {} 0x{:08X} slot {} (guest sampler {}): object "
             "0x{:08X} -> SNAPSHOT of a resolve destination (no guest-memory "
-            "decode)",
-            dc.pixel_shader_handle, slot, guest_sampler, texture_state.object);
+            "decode); guest swizzle {}",
+            vertex ? "vs" : "ps", stage_handle, slot, guest_sampler,
+            texture_state.object,
+            have_swz ? fmt::format("{:#o}", swz) : std::string("unreadable"));
       }
       out_objects[slot] = texture_state.object;
+      // The renderer has no fetch constant of its own for a snapshot slot; this
+      // is the only place the guest swizzle is in hand. See the field's note.
+      out_swizzles[slot] = have_swz ? uint16_t(swz) : uint16_t(0);
       return true;
     }
     partial_snapshot_object = texture_state.object;
@@ -6107,7 +6157,14 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     static std::mutex s_mu;
     static std::set<uint64_t> s_seen;
     static uint32_t s_lines = 0;
-    const uint64_t key = (uint64_t(dc.pixel_shader_handle) << 8) | slot;
+    // Keyed on the handle of the stage this slot belongs to, and tagged with
+    // the stage. Keying both stages on `dc.pixel_shader_handle` hid the one
+    // binding under investigation: the terrain depth prepass runs the depth-only
+    // pixel stand-in and carries no pixel handle, so its VERTEX slot hashed to
+    // (0 << 8) | 0 and was deduped away against the first pixel slot 0 ever
+    // seen. Three runs went by with the terrain's heightmap address unprinted.
+    const uint64_t key = (uint64_t(stage_handle) << 9) |
+                         (uint64_t(vertex ? 1u : 0u) << 8) | slot;
     bool fresh = false;
     {
       std::lock_guard<std::mutex> lk(s_mu);
@@ -6116,10 +6173,12 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     }
     if (fresh) {
       REXLOG_INFO(
-          "d3d9: SLOT MAP ps 0x{:08X} slot {} (guest sampler {}): object "
+          "d3d9: SLOT MAP {} 0x{:08X} slot {} (guest sampler {}): object "
           "0x{:08X} resolved={} mostly_written={} addr_match={} (dest 0x{:08X})"
-          " | fetch addr 0x{:08X} {}x{} fmt {} bytes {}",
-          dc.pixel_shader_handle, slot, guest_sampler, texture_state.object,
+          " | fetch addr 0x{:08X} {}x{} fmt {} bytes {} swizzle {:#o} signs"
+          " {:#x}",
+          vertex ? "vs" : "ps", stage_handle, slot, guest_sampler,
+          texture_state.object,
           texture_state.object &&
                   g_resolvedTextureTargets.contains(texture_state.object)
               ? 1
@@ -6127,7 +6186,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
           partial_snapshot_object ? 0 : 1, addr_match ? 1 : 0,
           addr_match ? addr_match->dest_object : 0u, source.address,
           source.width, source.height, source.guest_format,
-          source.source_bytes);
+          source.source_bytes, source.swizzle, source.signs);
     }
   }
   // Permuted into host component order here, at the bind, because this is
@@ -6230,11 +6289,65 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   NoteMipLevelAgreement(*payload);
   // Still recorded, so the single-texture path above keeps skipping it as a
   // representative and the count stays visible -- but no longer a refusal here.
-  if (!HleTextureHasNonzeroData(*payload)) {
+  // A decode that carries no information. Two forms, and until 2026-08-14 only
+  // the first was recognised.
+  //
+  //   all zero  -- the long-known case: storage the guest has not filled yet.
+  //   UNIFORM   -- every byte the same non-zero value. Guest memory that the CPU
+  //                never writes at all reads back whatever is there, and for the
+  //                terrain heightmap that is 0xFF: a uniformly white 2048x2048
+  //                (gameplay-9.rdc ResourceId::733). It passes the nonzero test
+  //                as real data, so no `bound-zero` line was ever printed for it
+  //                and this fallback never fired. The vertex stage read a
+  //                constant 1.0, the terrain came out flat at world Y = 1 under
+  //                a camera at Y = 616, and the whole ground sat 615 units below
+  //                the view at far-plane depth.
+  //
+  // The uniform form is only treated as empty when `partial_snapshot_object` is
+  // set -- i.e. this surface IS a resolve destination the GPU has written part
+  // of, so a better source demonstrably exists. A flat texture with no snapshot
+  // behind it is legal and is left alone; that restraint is what keeps this from
+  // becoming the blanket substitution the notes above record as a regression.
+  const bool decode_is_blank = !HleTextureHasNonzeroData(*payload);
+  uint8_t uniform_value = 0;
+  // Detected UNCONDITIONALLY, acted on only below. The first cut of this
+  // computed `decode_is_uniform` as `partial_snapshot_object && ...` and put its
+  // log line inside the `if (partial_snapshot_object)` branch -- so when the
+  // question was "is partial_snapshot_object even set for this slot?", the
+  // diagnostic that would answer it could not print. mx_1148 reached freeroam
+  // with the terrain still flat and not one line to say which half had failed.
+  // Exactly the shape of [[counter-that-cannot-fire]], committed twice in one
+  // session. Measure first, gate second.
+  const bool decode_is_uniform =
+      !decode_is_blank && HleTextureIsConstant(*payload, &uniform_value);
+  if (decode_is_uniform) {
+    static std::set<uint64_t> s_uniform;
+    if (s_uniform.insert(key).second && s_uniform.size() <= 32) {
+      REXLOG_INFO(
+          "d3d9: uniform decode 0x{:02X} for sampler {} {}x{} guest format {} "
+          "addr 0x{:08X} -- carries no data; snapshot to fall back on: {}",
+          uniform_value, guest_sampler, source.width, source.height,
+          source.guest_format, source.address,
+          partial_snapshot_object
+              ? fmt::format("0x{:08X}", partial_snapshot_object)
+              : std::string("NONE, binding the constant anyway"));
+    }
+  }
+  // REVERTED 2026-08-14: `decode_is_uniform` used to be admitted here alongside
+  // the blank case, on the theory that a uniformly-0xFF decode was as empty as
+  // an all-zero one. The texture that motivated it was MISIDENTIFIED -- it was
+  // picked out of a RenderDoc resource list by size and format, and the real
+  // sampler read a different resource entirely. Every uniform decode measured
+  // since has reported no snapshot to fall back on, so the branch never once
+  // fired; it is removed rather than left in as a plausible-looking no-op.
+  //
+  // The DETECTION stays, and its log line with it: a uniform decode is worth
+  // knowing about, and the line now says outright whether a fallback exists.
+  if (decode_is_blank) {
     NoteBlankDecode(key);
     // Memory had nothing and a partly-written snapshot exists: its resolved
-    // tiles beat zeros everywhere, and the blank is still recorded above so the
-    // retry keeps looking.
+    // tiles beat a constant everywhere, and the blank is still recorded above so
+    // the retry keeps looking.
     if (partial_snapshot_object) {
       out_objects[slot] = partial_snapshot_object;
       return true;
@@ -6650,7 +6763,7 @@ void AttachTranslatedPixelShader(mx::hle::DrawCall& dc, uint32_t handle,
           for (uint32_t s = 0; s < vt->sampler_count &&
                                s < mx::hle::DrawCall::kMaxPixelTextures; ++s) {
             if (ResolvePixelSlotTexture(dc, s, vt->slot_guest[s], device, base,
-                                        /*vertex=*/true))
+                                        /*vertex=*/true, vs_handle))
               ++vfilled;
           }
           static uint64_t s_vsSlotOk = 0, s_vsSlotShort = 0;

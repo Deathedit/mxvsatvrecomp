@@ -378,6 +378,34 @@ bool HleTextureHasNonzeroData(const HleTexturePayload& texture,
   return count != 0;
 }
 
+bool HleTextureIsConstant(const HleTexturePayload& texture, uint8_t* value) {
+  // The same question as HleTextureHasNonzeroData, asked for the case that test
+  // is blind to. All-zero is not the only meaningless decode: guest memory the
+  // CPU never writes can just as easily read back all-0xFF, and that passes the
+  // nonzero test as though it were real data.
+  //
+  // Measured: the terrain heightmap is a GPU resolve destination, so nothing
+  // ever CPU-writes its backing store. Decoding it yielded a uniformly WHITE
+  // 2048x2048 (gameplay-9.rdc ResourceId::733), the vertex stage read a constant
+  // 1.0 for every texel, and the whole terrain came out flat at world Y = 1
+  // against a camera at Y = 616 -- 615 units below the view, off the bottom of
+  // the screen and at far-plane depth. No `bound-zero` line was ever printed for
+  // it, because it is not zero.
+  //
+  // Level 0 only, for the reason above.
+  const size_t base_bytes =
+      texture.level_count > 1
+          ? std::min<size_t>(texture.levels[1].offset, texture.data.size())
+          : texture.data.size();
+  if (base_bytes == 0) return false;
+  const uint8_t first = texture.data[0];
+  const bool uniform =
+      std::all_of(texture.data.begin(), texture.data.begin() + base_bytes,
+                  [first](uint8_t v) { return v == first; });
+  if (uniform && value) *value = first;
+  return uniform;
+}
+
 HleTiledAddressCheck HleTiledAddressStats() {
   VerifyTiledAddressing();
   return g_tiledCheck;
@@ -783,7 +811,21 @@ bool DecodeHleTexture2D(const HleTextureSource& source,
           uint8_t* dst = slice_out +
               (uint64_t(y) * lv.width_blocks + x) * source.bytes_per_block;
           std::memcpy(dst, guest + src, source.bytes_per_block);
+          // Raw beside decoded, for the centre block of the base level. Taken
+          // BEFORE the swap so the pair is the swap's input and output rather
+          // than two readings of the same thing. See HleTexturePayload's note.
+          // Blocks, not pixels, so for a compressed format this is the block
+          // containing the centre -- which is what the decoder actually moved.
+          if (l == 0 && slice == 0 && source.bytes_per_block <= 16 &&
+              x == (lv.width_blocks >> 1) && y == (lv.height_blocks >> 1)) {
+            out.probe_bytes = source.bytes_per_block;
+            out.probe_endian = source.endian;
+            std::memcpy(out.probe_raw, guest + src, source.bytes_per_block);
+          }
           SwapBlock(dst, source.bytes_per_block, endian);
+          if (out.probe_bytes && l == 0 && slice == 0 &&
+              x == (lv.width_blocks >> 1) && y == (lv.height_blocks >> 1))
+            std::memcpy(out.probe_swapped, dst, source.bytes_per_block);
         }
       }
     }

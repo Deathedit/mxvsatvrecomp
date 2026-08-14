@@ -111,6 +111,9 @@ struct GpuVertexStage {
   const std::shared_ptr<const mx::hle::HleTexturePayload>* textures = nullptr;
   const uint32_t* sampledObjects = nullptr;
   const uint8_t* samplerSigns = nullptr;
+  // Per slot, for snapshot-backed slots only: the guest fetch swizzle. See
+  // DrawCall::vertex_sampled_swizzles.
+  const uint16_t* sampledSwizzles = nullptr;
 };
 
 void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
@@ -138,6 +141,7 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  const std::shared_ptr<const mx::hle::HleTexturePayload>*
                      pixelTextures = nullptr,
                  const uint32_t* pixelSampledObjects = nullptr,
+                 const uint16_t* pixelSampledSwizzles = nullptr,
                  const GpuVertexStage* vertexStage = nullptr,
                  uint32_t pixelSamplerArrayMask = 0,
                  const uint8_t* pixelSamplerSigns = nullptr,
@@ -1017,6 +1021,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     std::array<std::shared_ptr<const mx::hle::HleTexturePayload>,
                kTranslatedSamplerSlots> pixelTextures;
     std::array<uint32_t, kTranslatedSamplerSlots> pixelSampledObjects = {};
+    std::array<uint16_t, kTranslatedSamplerSlots> pixelSampledSwizzles = {};
     // Per slot, bit c set = host component c of this fetch is
     // kUnsignedBiased and the shader must expand it as 2*c-1. Already
     // permuted into host component order by the hooks side.
@@ -1032,6 +1037,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     std::array<std::shared_ptr<const mx::hle::HleTexturePayload>,
                kTranslatedSamplerSlots> vertexTextures;
     std::array<uint32_t, kTranslatedSamplerSlots> vertexSampledObjects = {};
+    std::array<uint16_t, kTranslatedSamplerSlots> vertexSampledSwizzles = {};
     std::array<uint8_t, kTranslatedSamplerSlots> vertexSamplerSigns = {};
 
     // Zero when disabled, otherwise one plus SQ_CONTEXT_MISC.param_gen_pos.

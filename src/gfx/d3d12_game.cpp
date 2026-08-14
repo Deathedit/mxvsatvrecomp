@@ -697,6 +697,8 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
   const auto& stageSampledObjects =
       vertex ? d.vertexSampledObjects : d.pixelSampledObjects;
   const auto& stageTextures = vertex ? d.vertexTextures : d.pixelTextures;
+  const auto& stageSampledSwizzles =
+      vertex ? d.vertexSampledSwizzles : d.pixelSampledSwizzles;
   // A shader that fetches NO texture is allowed through. It used to be refused
   // here and at the translated gate, purely because the count was zero -- which
   // is exactly backwards: a shader sampling nothing is the one case that needs
@@ -768,15 +770,18 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
         // absent. Keep this bounded by the naturally small tuple population;
         // repeated frames do not produce repeated log lines.
         static std::unordered_set<std::string> s_missingLinks;
-        const std::string link =
-            fmt::format("{:08X}/{}/{:08X}/{}", d.pixelShaderHandle, i,
-                        object, kindName);
+        const std::string link = fmt::format(
+            "{}{:08X}/{}/{:08X}/{}", vertex ? "V" : "P",
+            vertex ? d.vertexShaderHandle : d.pixelShaderHandle, i, object,
+            kindName);
         if (s_missingLinks.size() < 64 && s_missingLinks.insert(link).second) {
           REXLOG_INFO(
-              "d3d12: translated snapshot MISSING: PS 0x{:08X}, target "
+              "d3d12: translated snapshot MISSING: {} 0x{:08X}, target "
               "0x{:08X} {}x{}, compact slot {} of {}, destination texture "
               "0x{:08X}, class {}",
-              d.pixelShaderHandle, d.targetObject, d.targetWidth,
+              vertex ? "VS" : "PS",
+              vertex ? d.vertexShaderHandle : d.pixelShaderHandle,
+              d.targetObject, d.targetWidth,
               d.targetHeight, i, stageSamplerCount, object, kindName);
         }
         ++m_translatedNoSnapshot;
@@ -789,11 +794,50 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
       // rejects it as a cross-family format and D3D12 removes the device
       // (DXGI_ERROR_INVALID_CALL). That was the hang.
       slots[i].format = it->second.resource->GetDesc().Format;
+      // The guest's swizzle applies to a SNAPSHOT exactly as it does to a
+      // decoded texture -- Xenia composes it for every texture regardless of
+      // origin. This branch used to leave `useSwizzle` false, so the descriptor
+      // below fell back to D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING and the
+      // guest's request was silently dropped. Measured in mx_1156: slots asking
+      // for 03012 (the BGRA->RGBA correction) sampled red and blue SWAPPED, and
+      // slots asking for 05510 read real channels where the guest wants a
+      // constant 1.0.
+      //
+      // Zero means the hooks side had no fetch constant to read, which is not
+      // the same as "identity" -- leave those on the default mapping rather than
+      // encoding a swizzle of all-X.
+      if (const uint16_t swz = stageSampledSwizzles[i]) {
+        slots[i].swizzle = swz;
+        slots[i].useSwizzle = true;
+      }
       continue;
     }
+    // The other two ways a slot refuses. These used to increment a counter and
+    // return with no line at all, which is a worse silence than the snapshot
+    // case above: the bind is ALL-OR-NOTHING, so one unsatisfiable slot drops
+    // the stage's whole table, and an aggregate "bind failed N" cannot say
+    // which shader, which slot, or which of the three reasons. Same bounded
+    // distinct-tuple shape as the snapshot line, so a steady state costs
+    // nothing.
+    const auto refused = [&](const char* why) {
+      static std::unordered_set<std::string> s_refusedLinks;
+      const std::string link = fmt::format(
+          "{}{:08X}/{}/{}", vertex ? "V" : "P",
+          vertex ? d.vertexShaderHandle : d.pixelShaderHandle, i, why);
+      if (s_refusedLinks.size() < 64 && s_refusedLinks.insert(link).second) {
+        REXLOG_INFO(
+            "d3d12: translated slot REFUSED ({}): {} 0x{:08X}, compact slot {} "
+            "of {}, target 0x{:08X} {}x{} — whole {} table dropped",
+            why, vertex ? "VS" : "PS",
+            vertex ? d.vertexShaderHandle : d.pixelShaderHandle, i,
+            stageSamplerCount, d.targetObject, d.targetWidth, d.targetHeight,
+            vertex ? "vertex" : "pixel");
+      }
+    };
     const auto& tex = stageTextures[i];
     if (!tex) {
       ++m_translatedNoTexture;
+      refused("no texture described");
       return false;
     }
     uint32_t unusedDescriptor = 0;
@@ -802,11 +846,13 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
     // and the resource it creates are exactly what this needs.
     if (!EnsureGameTexture(tex, unusedDescriptor)) {
       ++m_translatedUploadFailed;
+      refused("upload failed");
       return false;
     }
     auto it = m_gameTextures.find(tex->key);
     if (it == m_gameTextures.end() || !it->second.resource) {
       ++m_translatedUploadFailed;
+      refused("uploaded but absent from cache");
       return false;
     }
     slots[i].resource = it->second.resource.Get();
@@ -822,13 +868,27 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
   // mapping slot to resource there means brute-forcing every resource in the
   // frame. It is one line from this side, where both halves are in hand.
   //
-  // Once per pixel shader handle, bounded, so it costs nothing after the first
-  // sighting of each. What it answers: whether pixelSamplerCount agrees with
-  // what the shader declares, and for every slot, whether it came from a
+  // Once per shader handle, bounded, so it costs nothing after the first
+  // sighting of each. What it answers: whether the stage's sampler count agrees
+  // with what the shader declares, and for every slot, whether it came from a
   // resolve snapshot or a CPU texture, and at what format and extent.
-  if (d.pixelShaderHandle) {
-    static std::unordered_set<uint32_t> s_censused;
-    if (s_censused.size() < 64 && s_censused.insert(d.pixelShaderHandle).second) {
+  //
+  // Keyed on the handle of the stage BEING FILLED. It used to key on
+  // `d.pixelShaderHandle` for both stages, which made it silent for exactly the
+  // draws that needed it: the terrain depth prepass runs the depth-only
+  // pixel stand-in and carries no pixel handle, so its VERTEX slot -- the
+  // heightmap the whole terrain's world Y comes from -- was censused zero
+  // times. That heightmap reads a constant 1.0 (measured in gameplay-8.rdc:
+  // every one of 4225 vertices solves back to world Y = 1.000 against a camera
+  // at Y = 616), and naming the resource actually bound is the one thing this
+  // side can answer that a capture cannot. Two separate caps so a flood of
+  // pixel shaders cannot starve the vertex ones.
+  const uint32_t censusHandle =
+      vertex ? d.vertexShaderHandle : d.pixelShaderHandle;
+  if (censusHandle) {
+    static std::unordered_set<uint32_t> s_censusedPs, s_censusedVs;
+    auto& censused = vertex ? s_censusedVs : s_censusedPs;
+    if (censused.size() < 64 && censused.insert(censusHandle).second) {
       std::string slotDesc;
       for (uint32_t i = 0; i < stageSamplerCount && i < kTranslatedSamplerSlots;
            ++i) {
@@ -837,14 +897,78 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
           continue;
         }
         const D3D12_RESOURCE_DESC rd = slots[i].resource->GetDesc();
-        slotDesc += fmt::format(" [{}]={} {}x{} fmt{}{}", i,
-                                slots[i].useSwizzle ? "tex" : "snap",
-                                uint32_t(rd.Width), rd.Height,
-                                uint32_t(slots[i].format),
-                                slots[i].useSwizzle ? "" : " (no swizzle)");
+        slotDesc += fmt::format(
+            " [{}]={} {}x{} fmt{} res={}{}", i,
+            slots[i].useSwizzle ? "tex" : "snap", uint32_t(rd.Width), rd.Height,
+            uint32_t(slots[i].format),
+            static_cast<const void*>(slots[i].resource),
+            slots[i].useSwizzle ? "" : " (no swizzle)");
+        // PROBE: the decoded bytes this slot will actually sample, read from the
+        // payload rather than matched up in a capture afterwards.
+        //
+        // Every previous attempt to name this resource went through RenderDoc's
+        // resource list, and twice picked the wrong one of two same-size
+        // same-format candidates -- once an all-zero texture whose alpha of 0
+        // renders WHITE in the exporter, which is exactly the trap
+        // rdc-png-alpha-reads-as-white records. The guest address, the swizzle
+        // and the sampled value are all known from the two sides of this
+        // question; only the bytes in between were ever inferred. This closes
+        // that, and it is the last inference in the chain.
+        //
+        // Four texels spread across the base level, printed as raw bytes in
+        // decoded order (BEFORE the SRV swizzle, which the census prints
+        // separately). The terrain heightmap samples near the middle, so the
+        // centre texel is the one to read against a measured vertex height.
+        if (const auto& payload = stageTextures[i]) {
+          const uint32_t bpp =
+              payload->width ? payload->row_pitch / payload->width : 0;
+          if (bpp && bpp <= 16 && !payload->data.empty()) {
+            const uint32_t pts[4][2] = {{payload->width / 2, payload->height / 2},
+                                        {payload->width / 4, payload->height / 4},
+                                        {0, 0},
+                                        {payload->width - 1, payload->height - 1}};
+            std::string probe;
+            for (const auto& pt : pts) {
+              const size_t off = size_t(pt[1]) * payload->row_pitch +
+                                 size_t(pt[0]) * bpp;
+              if (off + bpp > payload->data.size()) continue;
+              probe += fmt::format(" ({},{})=", pt[0], pt[1]);
+              for (uint32_t b = 0; b < bpp; ++b)
+                probe += fmt::format("{:02X}", payload->data[off + b]);
+              // What the SHADER's .x actually receives, resolved here rather
+              // than left to be matched against a capture afterwards. The probe
+              // bytes and the sampled value were previously measured in
+              // DIFFERENT runs, which is not a comparison at all -- addresses
+              // and handles differ per run. Applying the slot's own swizzle to
+              // the slot's own bytes states the answer in one line.
+              const uint32_t sx = (slots[i].swizzle >> 0) & 7u;
+              if (sx >= 6u) probe += "->x:KEEP";
+              else if (sx == 5u) probe += "->x:ONE";
+              else if (sx == 4u) probe += "->x:ZERO";
+              else if (sx < bpp) probe += fmt::format("->x:{:02X}",
+                                                      payload->data[off + sx]);
+              else probe += "->x:PAST-END";
+            }
+            slotDesc += fmt::format(" probe[{}]{}", i, probe);
+            // The endian swap's input and output, from the decode itself. If
+            // these are byte-reverses of each other then the swap is what put
+            // the dead channel where the swizzle reads, and the fix is in
+            // SwapBlock; if they are equal, the decode is faithful and the
+            // texture genuinely has a dead channel.
+            if (payload->probe_bytes) {
+              std::string raw, swapped;
+              for (uint32_t b = 0; b < payload->probe_bytes; ++b) {
+                raw += fmt::format("{:02X}", payload->probe_raw[b]);
+                swapped += fmt::format("{:02X}", payload->probe_swapped[b]);
+              }
+              slotDesc += fmt::format(" centre raw={} swapped={} endian={}", raw,
+                                      swapped, payload->probe_endian);
+            }
+          }
+        }
       }
-      REXLOG_INFO("d3d12: PS 0x{:08X} slot census: count {}, array mask 0x{:X};{}",
-                  d.pixelShaderHandle, stageSamplerCount,
+      REXLOG_INFO("d3d12: {} 0x{:08X} slot census: count {}, array mask 0x{:X};{}",
+                  vertex ? "VS" : "PS", censusHandle, stageSamplerCount,
                   stageSamplerArrayMask, slotDesc);
     }
   }
@@ -892,11 +1016,28 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
       srv.Texture2D.MipLevels = UINT(-1);
     }
     srv.Format = s.format;
+    // Guest GPUSWIZZLE values are 0-3 = XYZW, 4 = constant 0, 5 = constant 1,
+    // 7 = KEEP (fetch instructions only). D3D12_SHADER_COMPONENT_MAPPING defines
+    // only 0-5, so 6 and 7 are undefined here and were being handed to the
+    // driver raw. Xenia sanitises them the same way, and says why:
+    //
+    //   // Get rid of 6 and 7 values (to prevent host GPU errors if the game has
+    //   // something broken) the simple way - by changing them to 4 (0) and 5 (1).
+    //   host_swizzle_component = guest_swizzle_component & 0b101;
+    //       -- texture_cache.cc, TextureCache::GuestToHostSwizzle
+    //
+    // `& 5` maps 6 -> 4 and 7 -> 5 and leaves 0-5 alone. Note what that means
+    // for a KEEP component: it becomes a forced 1.0, on Xenia as much as here.
+    const auto host_component = [](uint32_t c) -> UINT {
+      return c >= 4u ? UINT(c & 5u) : UINT(c);
+    };
     srv.Shader4ComponentMapping =
         s.useSwizzle
             ? D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
-                  (s.swizzle >> 0) & 7u, (s.swizzle >> 3) & 7u,
-                  (s.swizzle >> 6) & 7u, (s.swizzle >> 9) & 7u)
+                  host_component((s.swizzle >> 0) & 7u),
+                  host_component((s.swizzle >> 3) & 7u),
+                  host_component((s.swizzle >> 6) & 7u),
+                  host_component((s.swizzle >> 9) & 7u))
             : UINT(D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING);
     m_device->CreateShaderResourceView(s.resource, &srv, cpu);
     cpu.ptr += SIZE_T(m_gameSrvDescriptorSize);
@@ -4354,6 +4495,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t pixelSamplerCount,
                                  const std::shared_ptr<const mx::hle::HleTexturePayload>* pixelTextures,
                                  const uint32_t* pixelSampledObjects,
+                                 const uint16_t* pixelSampledSwizzles,
                                  const GpuVertexStage* vertexStage,
                                  uint32_t pixelSamplerArrayMask,
                                  const uint8_t* pixelSamplerSigns,
@@ -4495,6 +4637,8 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
     for (uint32_t i = 0; i < kTranslatedSamplerSlots; ++i) {
       d.pixelTextures[i] = pixelTextures[i];
       d.pixelSampledObjects[i] = pixelSampledObjects[i];
+      d.pixelSampledSwizzles[i] =
+          pixelSampledSwizzles ? pixelSampledSwizzles[i] : uint16_t(0);
     }
   }
   // The vertex stage's own textures, bound through a separate descriptor range.
@@ -4507,6 +4651,9 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
     for (uint32_t i = 0; i < kTranslatedSamplerSlots; ++i) {
       d.vertexTextures[i] = vertexStage->textures[i];
       d.vertexSampledObjects[i] = vertexStage->sampledObjects[i];
+      d.vertexSampledSwizzles[i] = vertexStage->sampledSwizzles
+                                       ? vertexStage->sampledSwizzles[i]
+                                       : uint16_t(0);
     }
     if (vertexStage->samplerSigns)
       std::memcpy(d.vertexSamplerSigns.data(), vertexStage->samplerSigns,

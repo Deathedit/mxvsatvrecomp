@@ -297,6 +297,8 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
             vertexStage.textures = d->vertex_textures.data();
             vertexStage.sampledObjects = d->vertex_sampled_objects.data();
             vertexStage.samplerSigns = d->vertex_sampler_signs.data();
+            vertexStage.sampledSwizzles =
+                d->vertex_sampled_swizzles.data();
           }
           ++addDrawCalls;
           const int32_t scissor[4] = {d->scissor_left, d->scissor_top,
@@ -349,6 +351,7 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   d->pixel_sampler_count,
                                   d->pixel_textures.data(),
                                   d->pixel_sampled_objects.data(),
+                                  d->pixel_sampled_swizzles.data(),
                                   vertexStage.handle ? &vertexStage : nullptr,
                                   d->pixel_sampler_array_mask,
                                   d->pixel_sampler_signs.data(),

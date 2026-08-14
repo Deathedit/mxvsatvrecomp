@@ -235,5 +235,13 @@ uint64_t HleTextureKey(const uint32_t fetch_words[6]);
 // GPU dispatch is skipped, not an attempt to classify texture semantics.
 bool HleTextureHasNonzeroData(const HleTexturePayload& texture,
                               size_t* nonzero_bytes = nullptr);
+// Returns true when every byte of the decoded base mip is the same value, and
+// reports it. The companion to the test above for the case it cannot see: guest
+// memory the CPU never writes reads back all-0xFF as readily as all-zero, and
+// only the zero form is "empty" to HleTextureHasNonzeroData. Callers should use
+// this ONLY where a better source exists to fall back to -- a uniform decode is
+// suspicious, not proof, and a genuinely flat texture is legal.
+bool HleTextureIsConstant(const HleTexturePayload& texture,
+                          uint8_t* value = nullptr);
 
 }  // namespace mx::hle
