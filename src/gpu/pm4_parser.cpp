@@ -17,17 +17,9 @@ struct OpcodeEntry {
   const char* name;
 };
 
-// The complete Xenos Type3 opcode set, transcribed from PM4_* in
-// C:\rexglue-sdk\include\rex\graphics\xenos.h. Nothing here is inferred.
-//
-// This table used to carry a trailing block of "legacy aliases (AMD R600
-// naming)" for 0x60-0x6F, and every one of them was wrong for this hardware.
-// Xenos reuses that range for the binning registers and the swap packet, so
-// 0x60 printed as "SET_CONFIG_REG" when it is SET_BIN_MASK_LO, and 0x64 as
-// "SET_LOOP_CONST" when it is XE_SWAP — which is why a single 0x64 shows up
-// once per frame in every captured dump. 0x65-0x6F are not Xenos opcodes at
-// all. They are deleted rather than kept alongside the right names: a
-// confidently wrong name is worse than "???".
+
+// https://github.com/freedreno/amd-gpu/blob/master/include/api/gsl_pm4types.h
+
 constexpr OpcodeEntry kOpcodeNames[] = {
   {0x10, "NOP"},
   {0x21, "REG_RMW"},
