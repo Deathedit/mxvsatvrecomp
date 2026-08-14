@@ -54,13 +54,64 @@ inline uint32_t RdIndex32(const uint8_t* p) {
 // vertex mixes 16-bit positions with 32-bit colours — a blanket 8in32 over a
 // 16-bit position exchanges its components as well as their bytes. The swap now
 // happens inside ReadHleElement, which knows the format. Pass `s.endian` there.
+//
+// ---------------------------------------------------------------------------
+// A stream that ends before the vertex does is NOT a reason to lose the draw.
+// This used to `return false`, which became kVertexOutOfRange and discarded the
+// whole draw -- 27713 of 172500, 16% of every frame, and the single largest
+// reason draws never reached the renderer at all. It is also why those draws
+// were invisible in a GPU capture: they were thrown away before one existed.
+// Zero-filling instead is what brought the ground back.
+//
+// The guest binds streams whose fetch-constant size is smaller than the range a
+// draw indexes, and our snapshot of that constant AGREES with the device's, so
+// the size is not misread -- the hardware simply tolerates the overrun and
+// returns zero, which is what the reference does too. Zero-filling from the end
+// of the stream reproduces that; the position then reads 0 and the primitive
+// collapses, exactly as it would on hardware, instead of the draw vanishing.
+//
+// `stream_index` exists only for the census below. The overrun is far larger
+// than "a few vertices at the tail" -- 304 million fills in one run -- and the
+// terrain came back streaked, so the open question is WHICH stream is short and
+// by how much. Three hypotheses died to reasoning about that without data
+// (instance-data streams, stale bindings, a measurement artifact); this is the
+// measurement that replaces them.
 bool CopyVertex(const HleStream& s, uint32_t index, uint8_t* dst,
-                uint32_t dst_bytes) {
+                uint32_t dst_bytes, uint32_t stream_index) {
   const uint64_t byte_off =
       uint64_t(index) * s.stride + s.offset_bytes;
-  if (byte_off + s.stride > s.size_bytes) return false;
   const uint32_t n = s.stride < dst_bytes ? s.stride : dst_bytes;
-  std::memcpy(dst, s.host + byte_off, n);
+  const uint64_t avail =
+      s.size_bytes > byte_off ? uint64_t(s.size_bytes) - byte_off : 0;
+  const uint32_t copy = avail < n ? uint32_t(avail) : n;
+  if (copy < n) {
+    std::memset(dst, 0, n);
+    ++HleVertexZeroFillCount();
+    auto& c = HleZeroFillCensus();
+    if (stream_index < HleZeroFillCensusStreams) {
+      auto& st = c.stream[stream_index];
+      ++st.fills;
+      // How far past the end, in whole vertices. A tail of 1 is a buffer that
+      // is simply one vertex short; a number in the thousands means the index
+      // has no relationship to this stream's contents at all, and those two
+      // want completely different fixes.
+      const uint64_t over = byte_off + n > s.size_bytes
+                                ? (byte_off + n) - s.size_bytes : 0;
+      const uint64_t over_verts = s.stride ? over / s.stride : 0;
+      if (over_verts > st.worst_vertices_past_end)
+        st.worst_vertices_past_end = over_verts;
+      if (st.first.fills == 0) {
+        st.first.fills = 1;
+        st.first.stride = s.stride;
+        st.first.size_bytes = s.size_bytes;
+        st.first.offset_bytes = s.offset_bytes;
+        st.first.index = index;
+        st.first.byte_off = byte_off;
+      }
+    }
+  }
+  // byte_off past the end leaves copy == 0, so s.host is never touched there.
+  if (copy) std::memcpy(dst, s.host + byte_off, copy);
   return true;
 }
 
@@ -132,6 +183,10 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
     skip = HleSkip::kBadTopology;
     return false;
   }
+  // What the renderer is finally told. It differs from `topo` only where a
+  // primitive restart forces a strip to be walked into a list below, which is a
+  // decision that cannot be made until the indices have been read.
+  HostTopology final_topo = topo;
 
   // The declaration states which element is the position. No inference, no
   // fallback — this is the single biggest difference from the PM4 path, where
@@ -164,38 +219,135 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
     // Read once, find the referenced range, and rebase — so a draw that
     // indexes a small window of a large shared buffer uploads that window and
     // not the whole thing.
+    // Condition each index exactly as the hardware does before it reaches the
+    // vertex fetch -- see HleDrawInputs' index_* fields for the reference this
+    // transcribes. Doing none of this is what lost the terrain: a single
+    // 0xFFFF restart index put vmax at 65535, which made the referenced range
+    // 65536 vertices wide, which ran past the stream and refused the draw.
+    // Not a valid 24-bit index, so it cannot collide with a real one.
+    constexpr uint32_t kRestartSlot = 0xFFFFFFFFu;
     uint32_t vmin = 0xFFFFFFFFu, vmax = 0;
     std::vector<uint32_t> raw(in.count);
+    bool any_vertex = false;
+    bool any_restart = false;
     for (uint32_t i = 0; i < in.count; ++i) {
       const uint8_t* p = in.index.host + uint64_t(in.first + i) * w;
-      uint32_t v = (w == 4) ? RdIndex32(p) : RdIndex16(p);
+      uint32_t v = ((w == 4) ? RdIndex32(p) : RdIndex16(p)) & 0xFFFFFFu;
+      // A restart is not a vertex. It keeps a slot in `raw` so the primitive
+      // walk below can see WHERE the cut is; it is never turned into an index.
+      if (in.index_reset_enabled && v == in.index_reset) {
+        raw[i] = kRestartSlot;
+        any_restart = true;
+        ++HleRestartCutCount();
+        continue;
+      }
+      // base_vertex ONLY. D3D9's BaseVertexIndex is what the runtime programs
+      // into VGT_INDX_OFFSET, so they are the same number arriving by two
+      // routes -- adding both double-counts it, pushes every index past the
+      // real range, and the clamp below then squashes the draw onto index_max.
+      // That is what erased the terrain a second time after the restart fix.
+      // index_offset is read and reported so the equality can be checked
+      // rather than assumed, but it is deliberately NOT added here.
       const int64_t adjusted = int64_t(v) + in.base_vertex;
       if (adjusted < 0) { skip = HleSkip::kVertexOutOfRange; return false; }
-      v = uint32_t(adjusted);
+      v = uint32_t(adjusted) & 0xFFFFFFu;
+      if (v < in.index_min) v = in.index_min;
+      if (v > in.index_max) v = in.index_max;
       raw[i] = v;
       if (v < vmin) vmin = v;
       if (v > vmax) vmax = v;
+      any_vertex = true;
     }
+    if (!any_vertex) { skip = HleSkip::kEmpty; return false; }
     lo = vmin;
     hi = vmax;
     if (uint64_t(hi - lo) + 1 > kMaxHleVertices) {
       skip = HleSkip::kTooManyVertices;
       return false;
     }
-    indices.resize(size_t(in.count) * 2);
-    for (uint32_t i = 0; i < in.count; ++i) {
-      const uint32_t r = raw[i] - lo;
-      if (r > 0xFFFF) {
-        // The renderer's index view is 16-bit here; a window wider than that
-        // is counted rather than silently truncated.
-        skip = HleSkip::kTooManyVertices;
-        return false;
-      }
-      indices[i * 2 + 0] = uint8_t(r & 0xFF);
-      indices[i * 2 + 1] = uint8_t(r >> 8);
+    // The renderer's index view is 16-bit here; a window wider than that is
+    // counted rather than silently truncated. Checked once against the window
+    // rather than per index, which is the same test: every index kept below
+    // lies in [lo, hi] by construction, because lo and hi ARE their extremes.
+    if (uint64_t(hi - lo) > 0xFFFFu) {
+      skip = HleSkip::kTooManyVertices;
+      return false;
     }
+    indices.reserve(size_t(in.count) * 2);
+    auto emit = [&](uint32_t v) {
+      const uint32_t r = v - lo;
+      indices.push_back(uint8_t(r & 0xFF));
+      indices.push_back(uint8_t(r >> 8));
+    };
+
+    if (!any_restart) {
+      for (uint32_t i = 0; i < in.count; ++i) emit(raw[i]);
+    } else {
+      // A restart cannot be expressed AS an index, and substituting one -- which
+      // is what this did first -- does not end a strip. It welds the last
+      // vertices of one patch to the first of the next, and since consecutive
+      // patches sit anywhere on the map, those welds were the flat sheets
+      // stretching across the terrain and up over the horizon.
+      //
+      // D3D12 can cut a strip in the IA (IBStripCutValue), but that is a PSO
+      // property, and these indices are rebased onto the draw's own vertex
+      // window where 0xFFFF is a legal vertex -- the cut value would collide
+      // with real geometry. So the cut is resolved here instead: the strip is
+      // walked into a list, a form no marker has to survive into.
+      ++HleRestartCutDraws();
+      switch (topo) {
+        case HostTopology::kTriangleStrip:
+        case HostTopology::kLineStrip: {
+          const bool tri = topo == HostTopology::kTriangleStrip;
+          const uint32_t need = tri ? 2u : 1u;
+          uint32_t run = 0;   // first vertex of the strip currently being walked
+          for (uint32_t i = 0; i < in.count; ++i) {
+            if (raw[i] == kRestartSlot) { run = i + 1; continue; }
+            const uint32_t at = i - run;
+            if (at < need) continue;     // this strip has no primitive yet
+            if (!tri) { emit(raw[i - 1]); emit(raw[i]); continue; }
+            // Strip winding alternates, and it alternates from the start of THIS
+            // strip: a cut resets the parity along with the vertices. Getting
+            // that wrong flips every other triangle in every patch after the
+            // first cut, which back-face culling then removes.
+            if (at & 1) { emit(raw[i - 1]); emit(raw[i - 2]); }
+            else        { emit(raw[i - 2]); emit(raw[i - 1]); }
+            emit(raw[i]);
+          }
+          final_topo = tri ? HostTopology::kTriangleList
+                           : HostTopology::kLineList;
+          break;
+        }
+        default: {
+          if (topo == HostTopology::kUndefined) {
+            // RectangleList and QuadList, which are not topologies yet. Their
+            // index stream has to keep its shape for the expansion that rewrites
+            // it later, so a marker degenerates against the draw's own lowest
+            // vertex here instead of removing a slot.
+            for (uint32_t i = 0; i < in.count; ++i)
+              emit(raw[i] == kRestartSlot ? vmin : raw[i]);
+            break;
+          }
+          // A list topology with a marker in it. The marker is not a vertex, so
+          // the primitive containing it is short a corner and is dropped whole
+          // rather than closed with a substitute.
+          const uint32_t n = (topo == HostTopology::kTriangleList) ? 3u
+                           : (topo == HostTopology::kLineList)     ? 2u
+                                                                   : 1u;
+          for (uint32_t i = 0; i + n <= in.count; i += n) {
+            bool whole = true;
+            for (uint32_t k = 0; k < n; ++k)
+              if (raw[i + k] == kRestartSlot) whole = false;
+            if (!whole) continue;
+            for (uint32_t k = 0; k < n; ++k) emit(raw[i + k]);
+          }
+          break;
+        }
+      }
+    }
+    if (indices.empty()) { skip = HleSkip::kEmpty; return false; }
     out.index_16bit = true;
-    out.index_count = in.count;
+    out.index_count = uint32_t(indices.size() / 2);
   } else {
     lo = in.first;
     hi = in.first + in.count - 1;
@@ -237,8 +389,8 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
     }
     uint8_t probe[256];
     float pp[4] = {0, 0, 0, 1};
-    if (!CopyVertex(s, lo, probe, sizeof(probe)) ||
-        !CopyVertex(s, hi, probe, sizeof(probe))) {
+    if (!CopyVertex(s, lo, probe, sizeof(probe), pos->stream) ||
+        !CopyVertex(s, hi, probe, sizeof(probe), pos->stream)) {
       skip = HleSkip::kVertexOutOfRange;
       return false;
     }
@@ -261,7 +413,7 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
 
   out.indices = std::move(indices);
   out.prim_type = in.prim_type;
-  out.topology = topo;
+  out.topology = final_topo;
 
   // The same two expansions the PM4 path uses, shared rather than reimplemented
   // — a second copy could drift from the one the renderer already agrees with.
@@ -305,7 +457,7 @@ bool TranscodeHleVertices(const HleDrawInputs& in, DrawCall& out,
     {
       const HleStream& s = in.streams[pos->stream];
       if (s.stride > sizeof(vtx)) { skip = HleSkip::kZeroStride; return false; }
-      if (!CopyVertex(s, src_index, vtx, sizeof(vtx))) {
+      if (!CopyVertex(s, src_index, vtx, sizeof(vtx), pos->stream)) {
         skip = HleSkip::kVertexOutOfRange;
         return false;
       }
@@ -344,7 +496,8 @@ bool TranscodeHleVertices(const HleDrawInputs& in, DrawCall& out,
     float c[4] = {1, 1, 1, 1};
     if (col) {
       const HleStream& s = in.streams[col->stream];
-      if (s.stride <= sizeof(vtx) && CopyVertex(s, src_index, vtx, sizeof(vtx))) {
+      if (s.stride <= sizeof(vtx) &&
+          CopyVertex(s, src_index, vtx, sizeof(vtx), col->stream)) {
         if (!ReadHleElement(vtx, s.stride, *col, s.endian, c)) {
           c[0] = c[1] = c[2] = c[3] = 1.0f;
         }
@@ -354,7 +507,8 @@ bool TranscodeHleVertices(const HleDrawInputs& in, DrawCall& out,
     float t[4] = {0, 0, 0, 0};
     if (tex) {
       const HleStream& s = in.streams[tex->stream];
-      if (s.stride <= sizeof(vtx) && CopyVertex(s, src_index, vtx, sizeof(vtx))) {
+      if (s.stride <= sizeof(vtx) &&
+          CopyVertex(s, src_index, vtx, sizeof(vtx), tex->stream)) {
         if (!ReadHleElement(vtx, s.stride, *tex, s.endian, t)) {
           t[0] = t[1] = 0.0f;
         }
@@ -463,6 +617,26 @@ uint64_t* HleSkipCounts() {
 uint64_t& HleBuiltCount() {
   static uint64_t n = 0;
   return n;
+}
+
+uint64_t& HleVertexZeroFillCount() {
+  static uint64_t n = 0;
+  return n;
+}
+
+uint64_t& HleRestartCutDraws() {
+  static uint64_t n = 0;
+  return n;
+}
+
+uint64_t& HleRestartCutCount() {
+  static uint64_t n = 0;
+  return n;
+}
+
+HleZeroFillCensusData& HleZeroFillCensus() {
+  static HleZeroFillCensusData c;
+  return c;
 }
 
 //===========================================================================

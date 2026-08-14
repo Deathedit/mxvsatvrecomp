@@ -219,6 +219,22 @@ struct HlslShader {
   // gap is real and this is how it stays visible.
   uint32_t unhonoured_predicate_ops = 0;
 
+  // Count of fetch instructions skipped because their opcode is not one this
+  // emitter implements — the getTextureGradients / getTextureWeights /
+  // getCompTexLOD / getBCF family, everything in FetchOpcode at 16 and above
+  // except setTexLOD.
+  //
+  // Skipped and counted rather than refused, deliberately. Before the three-way
+  // classification below existed, `!= kTextureFetch` sent every one of these
+  // into the VERTEX fetch branch, where a pixel shader dropped it on
+  // `!emit_vertex_fetch` and a vertex shader read its bits as a
+  // VertexFetchInstruction and refused the whole shader on the garbage that
+  // landed in exp_adjust. Refusing them outright now would newly break the one
+  // pixel shader that uses getGradients and compiles fine without it, so the
+  // status quo is preserved for the ops we cannot honour and only the misread
+  // is fixed.
+  uint32_t unhonoured_fetch_ops = 0;
+
   // --- vertex fetch, only when the caller asked for it ----------------------
   //
   // The number of vfetches emitted into the body, and for each one the guest

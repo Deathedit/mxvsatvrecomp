@@ -53,6 +53,27 @@ struct HleDrawInputs {
   uint32_t count       = 0;   // VertexCount, or IndexCount when indexed
   int32_t  base_vertex = 0;   // DrawIndexedVertices' BaseVertexIndex
 
+  // How the hardware conditions an index before it reaches the vertex fetch.
+  // Ignoring these is what lost the ground: one 0xFFFF primitive-restart index
+  // made vmax 65535, the vertex window exploded to 65536, and the draw was
+  // refused as out of range.
+  //
+  // From draw_extent_estimator.cc:173-197, in order:
+  //   index &= 0xFFFFFF                      -- only 24 bits are used
+  //   if (reset_enabled && index == reset)   -- restart, not a vertex
+  //   index = (index + offset) & 0xFFFFFF
+  //   index = clamp(index, min_index, max_index)
+  //
+  // The clamp is the important one and is why an overrun can never read past a
+  // buffer on hardware: a wild index reads the LAST VALID vertex, it does not
+  // read zero. Defaults leave every step inert, so a caller that does not fill
+  // these behaves exactly as before.
+  uint32_t index_max     = 0xFFFFFF;  // VGT_MAX_VTX_INDX.max_indx  (0x2100)
+  uint32_t index_min     = 0;         // VGT_MIN_VTX_INDX.min_indx  (0x2101)
+  uint32_t index_offset  = 0;         // VGT_INDX_OFFSET            (0x2102)
+  uint32_t index_reset   = 0xFFFFFF;  // ..._IB_RESET_INDX.reset_indx (0x2103)
+  bool     index_reset_enabled = false;  // PA_SU_SC_MODE_CNTL bit 21
+
   // 16 row-major floats, or null for identity. Stage 3: the caller decides the
   // transform, this file only applies it — so changing where the matrix comes
   // from never means touching the vertex path.
@@ -181,6 +202,47 @@ void HleMergeWorkerDraws();
 // Why draws did not build, by reason. Indexed by HleSkip.
 uint64_t* HleSkipCounts();
 uint64_t& HleBuiltCount();
+
+// Vertices whose stream ran out before the end of the stride, and which were
+// zero-filled from that point rather than costing the whole draw. See
+// CopyVertex: this is the gate that `kVertexOutOfRange` used to be, and it
+// discarded 16% of every frame's draws.
+uint64_t& HleVertexZeroFillCount();
+
+// Primitive restart. `Draws` counts draws that contained at least one marker and
+// were therefore walked into a list topology; `Count` counts the markers.
+//
+// Both matter, and for different reasons. A marker is not a vertex, so it cannot
+// be turned into an index: substituting one does not end a strip, it welds the
+// last vertices of one patch onto the first of the next. Those welds were the
+// sheets of terrain stretching over the horizon. If `Draws` is 0 on a run with
+// ground in frame, the walk never executed and nothing here has been tested.
+uint64_t& HleRestartCutDraws();
+uint64_t& HleRestartCutCount();
+
+// Who is actually short, and by how much. The bare count above says 304 million
+// and nothing about whether that is every stream a little or one stream
+// completely -- and those are different bugs. `worst_vertices_past_end` is the
+// discriminator: 1 is a buffer one vertex short, thousands means the index does
+// not address this stream at all.
+constexpr uint32_t HleZeroFillCensusStreams = 4;
+struct HleZeroFillCensusData {
+  struct First {
+    uint64_t fills = 0;      // doubles as "have I recorded one yet"
+    uint32_t stride = 0;
+    uint32_t size_bytes = 0;
+    uint32_t offset_bytes = 0;
+    uint32_t index = 0;
+    uint64_t byte_off = 0;
+  };
+  struct Stream {
+    uint64_t fills = 0;
+    uint64_t worst_vertices_past_end = 0;
+    First first;
+  };
+  Stream stream[HleZeroFillCensusStreams];
+};
+HleZeroFillCensusData& HleZeroFillCensus();
 
 //===========================================================================
 // Stage 3 — where the transform comes from.

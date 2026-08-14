@@ -747,6 +747,11 @@ constexpr uint32_t kDevicePaClVteCntl =
     kDeviceRegBlock2200 + (kRegPaClVteCntl - 0x2200) * 4;
 
 uint64_t g_hleShaderMvpDisagree = 0;
+// Draws whose index-conditioning registers were readable, and how many had
+// primitive restart enabled. If `read` is 0 the offsets are wrong and every
+// index is unconditioned -- which is the state that lost the ground -- so this
+// must not be allowed to sit silently at zero.
+uint64_t g_indexCondRead = 0, g_indexCondResetOn = 0;
 uint64_t g_vteSeen[4] = {};  // [0]=unreadable [1]=scale off [2]=scale on
 
 // True when the GPU applies the viewport scale itself, meaning the vertex
@@ -754,6 +759,69 @@ uint64_t g_vteSeen[4] = {};  // [0]=unreadable [1]=scale off [2]=scale on
 // read — means the export is window space and needs the viewport inverse,
 // which is the measured case for this game (PA_CL_VTE_CNTL = 0x300) and the
 // safe default: it is what the code did unconditionally before.
+// The VGT block at register 0x2100 is m_ValuesPacket, device+0x28CC -- the same
+// packet convention kDeviceRegBlock2200 above uses for 0x2200, and the one the
+// scissor read verified against IDA (0x28C0 is 0x2080, 0x2934 is 0x2200).
+constexpr uint32_t kDeviceRegBlock2100 = 0x28CC;
+constexpr uint32_t kDeviceVgt(uint32_t reg) {
+  return kDeviceRegBlock2100 + (reg - 0x2100) * 4;
+}
+constexpr uint32_t kRegPaSuScModeCntl = 0x2205;
+constexpr uint32_t kDevicePaSuScModeCntl =
+    kDeviceRegBlock2200 + (kRegPaSuScModeCntl - 0x2200) * 4;
+
+// Register numbers from register_table.inc:1262-1265 and 1304 -- note MAX comes
+// BEFORE MIN, which is the opposite of the obvious guess. Field widths from
+// registers.h:354/382/393 (24 bits each) and 480 (multi_prim_ib_ena, bit 21).
+//
+// Every field defaults to the inert value in HleDrawInputs, so a device whose
+// pages cannot be read leaves the conditioning switched off rather than
+// clamping every index to a bogus bound.
+void ReadIndexConditioning(uint32_t device, uint8_t* base,
+                           mx::hle::HleDrawInputs& in) {
+  if (!device || !base) return;
+  if (!HostPageReadable(REX_RAW_ADDR(device + kDeviceVgt(0x2100))) ||
+      !HostPageReadable(REX_RAW_ADDR(device + kDeviceVgt(0x2103))) ||
+      !HostPageReadable(REX_RAW_ADDR(device + kDevicePaSuScModeCntl)))
+    return;
+  in.index_max = REX_LOAD_U32(device + kDeviceVgt(0x2100)) & 0xFFFFFFu;
+  in.index_min = REX_LOAD_U32(device + kDeviceVgt(0x2101)) & 0xFFFFFFu;
+  in.index_offset = REX_LOAD_U32(device + kDeviceVgt(0x2102)) & 0xFFFFFFu;
+  in.index_reset = REX_LOAD_U32(device + kDeviceVgt(0x2103)) & 0xFFFFFFu;
+  in.index_reset_enabled =
+      (REX_LOAD_U32(device + kDevicePaSuScModeCntl) & (1u << 21)) != 0;
+  // A max of 0 would clamp the whole draw onto vertex 0 and erase the frame.
+  // Treat it as "not set" rather than obeying it: the register is 0xFFFF or
+  // 0xFFFFFF in every sane state (registers.h:392), so 0 means we read the
+  // wrong dword and the safe response is to leave the clamp inert.
+  if (in.index_max == 0) {
+    in.index_max = 0xFFFFFFu;
+    in.index_min = 0;
+  }
+  if (in.index_min > in.index_max) in.index_min = 0;
+  ++g_indexCondRead;
+  if (in.index_reset_enabled) ++g_indexCondResetOn;
+  // The values themselves, not just that they were read. Clamping to a bound
+  // nobody has looked at is how the terrain got erased a second time: a small
+  // max_indx squashes an entire draw onto one vertex and the frame goes blank
+  // with the draw count unchanged, which reads like "the geometry collapsed"
+  // and not like "a register said so". Sampled, capped, distinct values only.
+  {
+    static std::map<uint64_t, uint64_t> s_seen;
+    const uint64_t key = (uint64_t(in.index_max) << 40) ^
+                         (uint64_t(in.index_min) << 16) ^ in.index_offset;
+    auto it = s_seen.find(key);
+    if (it == s_seen.end() && s_seen.size() < 8) {
+      s_seen.emplace(key, 1);
+      REXLOG_INFO(
+          "d3d9: index conditioning regs: max {} min {} offset {} reset 0x{:X} "
+          "restart {} | this draw base_vertex {}",
+          in.index_max, in.index_min, in.index_offset, in.index_reset,
+          in.index_reset_enabled ? "on" : "off", in.base_vertex);
+    }
+  }
+}
+
 bool VportScaleEnabled(uint32_t device, uint8_t* base) {
   (void)base;
   if (!device || !HostPageReadable(REX_RAW_ADDR(device + kDevicePaClVteCntl))) {
@@ -1532,6 +1600,7 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   in.first = first;
   in.count = count;
   in.base_vertex = base_vertex;
+  ReadIndexConditioning(device, base, in);
 
   const int id = g_currentDecl;
   if (id >= 0 && g_declLayoutOk[id]) in.layout = &g_declLayout[id];
@@ -2483,11 +2552,39 @@ uint64_t g_gpuVertexUndeclared = 0;
 // silent zero rather than a fallback.
 uint64_t g_gpuVertexNoVs = 0, g_gpuVertexVsSamplers = 0;
 uint64_t g_gpuVertexNoVte = 0, g_gpuVertexNoPs = 0, g_gpuVertexTooManyInputs = 0;
+// Of the no-PS draws, the ones now allowed onto the GPU vertex path anyway
+// because they cannot write colour. A subset of g_gpuVertexNoPs, not a peer of
+// it: both are incremented for the same draw, so the refused population is
+// NoPs - DepthOnly. Kept that way on purpose -- the no-PS count is the thing
+// this branch has been reasoning about for several sessions and silently
+// changing its meaning would invalidate every earlier number.
+uint64_t g_gpuVertexDepthOnly = 0;
 // The GPU vertex FETCH path: draws taking it, and why a draw that qualified for
 // the GPU vertex stage still could not.
 uint64_t g_gpuFetchDraws = 0, g_gpuFetchRectList = 0;
-uint64_t g_gpuFetchOrdinalMismatch = 0, g_gpuFetchOutOfRange = 0;
+uint64_t g_gpuFetchOrdinalMismatch = 0;
 uint64_t g_gpuFetchUnaligned = 0;
+// Draws whose vertex shader has no fetch variant at all, because the emitter
+// refused to translate one. This had NO counter: the refusal was folded into
+// the `gpu_fetch = ... && vs_translated->fetch_source` initialiser, so 243,162
+// draws left the fetch path and the reasons listed here accounted for 40,146 of
+// them. The other 203,000 were invisible -- one shader, refused for exp_adjust,
+// carrying 30% of the frame. Same shape as the no-HANDLE ordering bug: a
+// refusal with no counter reads as no refusal.
+uint64_t g_gpuFetchNoVariant = 0;
+// Streams whose window ran past the bound size and were shortened. NOT a
+// refusal: the draw takes the GPU path, and the shader reads zero past
+// RawFetch::limit. This replaces g_gpuFetchOutOfRange rather than sitting
+// beside it -- that counter can no longer be incremented, and a counter that
+// cannot fire reads as a measurement of zero instead of as dead code.
+uint64_t g_gpuFetchClamped = 0;
+// Vertices the CPU path zero-filled because the stream ran short, where it
+// used to abandon the whole draw. Same rule as the clamp above, same reason.
+uint64_t g_hleShaderZeroFilledVertex = 0;
+// Attributes ReadVertexAttribute refused because they extend past the stride
+// (shader_ucode.cpp:220). A different rule from the window bound, still fatal
+// to the draw, counted apart so this change is judged on the window alone.
+uint64_t g_hleShaderBadAttribute = 0;
 
 // Where the frame goes. The guest's RenderPipeline call is measured whole in
 // hooks_gameloop.cpp, which says the frame is slow but not which of our stages
@@ -2552,9 +2649,13 @@ ShaderApplyResult ApplyShaderOutputs(
           "{} off {} unreadable {}, disagrees with old tie-break {}); live "
           "shader resolved {} no-match {} ambiguous {} unreadable {}; GPU "
           "vertex path {} draws qualify, {} skipped ({} undeclared reg, "
-          "{} no-VS, {} VS-samplers, {} no-VTE, {} no-PS, "
-          "{} too-many-inputs); GPU FETCH {} draws (refused: rectlist {}, "
-          "ordinal-mismatch {}, out-of-range {}, unaligned {}); rect "
+          "{} no-VS, {} VS-samplers, {} no-VTE, {} no-PS (of which {} "
+          "depth-only, allowed), "
+          "{} too-many-inputs); GPU FETCH {} draws (refused: no-variant {}, "
+          "rectlist {}, "
+          "ordinal-mismatch {}, unaligned {}; CLAMPED {} streams, CPU "
+          "zero-filled {} vertices, attribute-past-stride {}); BUILD "
+          "zero-filled {} vertices; rect "
           "arrangement 0123 {} / 1203 {} / 2013 {} (degenerate {})",
           g_hleShaderAttempts, g_hleShaderDraws, g_hleShaderVertices,
           g_hleShaderNoCode, g_hleShaderBadDecode, g_hleShaderBadStream,
@@ -2565,14 +2666,47 @@ ShaderApplyResult ApplyShaderOutputs(
           g_liveVertexUnreadable, g_gpuVertexDraws, g_gpuVertexSkipped,
           g_gpuVertexUndeclared, g_gpuVertexNoVs,
           g_gpuVertexVsSamplers, g_gpuVertexNoVte, g_gpuVertexNoPs,
-          g_gpuVertexTooManyInputs, g_gpuFetchDraws, g_gpuFetchRectList,
-          g_gpuFetchOrdinalMismatch, g_gpuFetchOutOfRange, g_gpuFetchUnaligned,
+          g_gpuVertexDepthOnly,
+          g_gpuVertexTooManyInputs, g_gpuFetchDraws, g_gpuFetchNoVariant,
+          g_gpuFetchRectList,
+          g_gpuFetchOrdinalMismatch, g_gpuFetchUnaligned, g_gpuFetchClamped,
+          g_hleShaderZeroFilledVertex, g_hleShaderBadAttribute,
+          mx::hle::HleVertexZeroFillCount(),
           mx::hle::g_rectArrangement[0].load(),
           mx::hle::g_rectArrangement[1].load(),
           mx::hle::g_rectArrangement[2].load(),
           mx::hle::g_rectDegenerate.load());
     }
   } report{attempt};
+  // Who is short, and by how much. Printed on the same cadence and NOT behind
+  // hle_capture: the bare BUILD zero-fill total above is 304 million and says
+  // nothing actionable, and the run that would have answered this was spent
+  // guessing instead. `past-end` is the discriminator -- 1 vertex means a
+  // buffer one short, thousands means the index does not address that stream.
+  struct ReportZeroFill {
+    uint64_t attempt;
+    ~ReportZeroFill() {
+      if (attempt > 10 && (attempt % 250) != 0) return;
+      const auto& c = mx::hle::HleZeroFillCensus();
+      std::string s;
+      for (uint32_t i = 0; i < mx::hle::HleZeroFillCensusStreams; ++i) {
+        const auto& st = c.stream[i];
+        if (!st.fills) continue;
+        s += fmt::format(
+            " | s{} x{} worst-past-end {}v (first: stride {} size {} off {} "
+            "index {} at {})",
+            i, st.fills, st.worst_vertices_past_end, st.first.stride,
+            st.first.size_bytes, st.first.offset_bytes, st.first.index,
+            st.first.byte_off);
+      }
+      REXLOG_INFO(
+          "d3d9: index conditioning: registers read {} draws, restart enabled "
+          "{}, cut {} draws at {} markers{}",
+          g_indexCondRead, g_indexCondResetOn,
+          mx::hle::HleRestartCutDraws(), mx::hle::HleRestartCutCount(),
+          s.empty() ? " | zero-fill: none" : s);
+    }
+  } zreport{attempt};
   if (!handle || !device) {
     ++g_hleShaderNoCode;
     return ShaderApplyResult::kNoCode;
@@ -2626,6 +2760,29 @@ ShaderApplyResult ApplyShaderOutputs(
   // exp_adjust is decoded and applied nowhere at all -- a non-zero one is a
   // silently dropped power-of-two scale. Both are cheap to see and expensive to
   // get wrong, so they are measured before anything is built on them.
+  // exp_adjust, unconditionally and once. The census below is behind hle_diag,
+  // so the claim that this is "always 0 in this game" -- written into
+  // shader_hlsl.cpp's refusal -- has only ever been checked on runs nobody
+  // makes. VFETCH coverage says one shader IS refused for it. This is the line
+  // that decides whether applying the scale changes anything at all: if it
+  // never prints, the emitter and the CPU path are both inert and any
+  // difference in the picture came from somewhere else.
+  {
+    static bool s_logged = false;
+    if (!s_logged) {
+      for (const auto& a : attrs) {
+        if (a.exp_adjust == 0) continue;
+        s_logged = true;
+        REXLOG_INFO(
+            "d3d9: VFETCH exp_adjust {} (scale {:g}) on vs 0x{:08X} fmt {} "
+            "slot {} dest r{} -- this shader's fetches are scaled by a power "
+            "of two that used to be dropped",
+            a.exp_adjust, std::ldexp(1.0f, a.exp_adjust), handle, a.format,
+            a.fetch_slot, a.dest_reg);
+        break;
+      }
+    }
+  }
   if (g_diag) {
     static std::map<uint64_t, bool> s_seen;
     for (const auto& a : attrs) {
@@ -2763,8 +2920,38 @@ ShaderApplyResult ApplyShaderOutputs(
     gpu_vertex = false;
     ++g_gpuVertexNoVte;
   } else if (dc.pixel_shader_hlsl == nullptr) {
-    gpu_vertex = false;
+    // A null pixel shader used to end the GPU vertex path outright, and that
+    // cost this population the whole vertex stage: ~45 draws and ~21,000
+    // vertices a frame on the software interpreter, 27-36ms of a FRAME COST
+    // vertex bucket that is otherwise almost empty. They are the most expensive
+    // vertices left on the CPU by a wide margin -- five times the per-vertex
+    // cost of the ones the fetch path already took.
+    //
+    // What they ARE is the guest's DEPTH passes: SetPixelShader(NULL) is legal
+    // for a pass that writes only depth, and the guest emits one 48-dword
+    // program that writes position and exports no interpolators at all.
+    //
+    // So they need no pixel stage worth the name -- and crucially, no colour.
+    // Measured over 70,000 of them in mx_1142: "colour+depth 54428, depth only
+    // 15572, colour only 0 ... WOULD PAINT 0, masked off 54428". EVERY one that
+    // binds a colour target has RB_COLOR_MASK 0. The renderer pairs this with a
+    // depth-only stand-in pixel shader whose output is discarded by a zero
+    // write mask it already applies.
+    //
+    // Gated on that rather than assumed: `paints_colour` is the renderer's own
+    // `colorWrite` rule, spelled identically so the two cannot drift. A no-PS
+    // draw that CAN write colour keeps the old refusal, because for that one
+    // the stand-in would have to invent a colour -- which is the question the
+    // plan's original design answered with a texture fetch and a white
+    // modulation identity, and which this population never asks.
     ++g_gpuVertexNoPs;
+    const bool paints_colour =
+        (dc.om_seen & (1u << 0)) == 0 || (dc.colour_mask & 0xFu) != 0;
+    if (paints_colour) {
+      gpu_vertex = false;
+    } else {
+      ++g_gpuVertexDepthOnly;
+    }
   }
   // Which bucket this draw's loop time lands in, if it reaches the loop at all.
   // Set at the point of refusal so it names the reason that actually fired
@@ -2787,8 +2974,11 @@ ShaderApplyResult ApplyShaderOutputs(
   // Strictly an accelerated form of gpu_vertex: everything that refuses that
   // refuses this, and anything this refuses falls back to it rather than
   // failing. So a defect here costs frame time, not pixels.
-  bool gpu_fetch =
-      gpu_vertex && vs_translated && vs_translated->fetch_source;
+  bool gpu_fetch = gpu_vertex && vs_translated;
+  if (gpu_fetch && !vs_translated->fetch_source) {
+    gpu_fetch = false;
+    ++g_gpuFetchNoVariant;
+  }
   if (gpu_fetch && dc.prim_type == uint32_t(mx::hle::PrimitiveType::kRectangleList)) {
     // ExpandRectangleList synthesizes a fourth vertex as v1 + v2 - v0 from the
     // host vertices AND from vertex_inputs. The fetch path produces neither,
@@ -2824,7 +3014,13 @@ ShaderApplyResult ApplyShaderOutputs(
     // Merge the used streams into one buffer, in first-use order, and describe
     // each fetch's window into it.
     uint32_t region_of_stream[kMaxStreams];
+    // One past each region's valid bytes. Separate from region_of_stream
+    // because several attributes commonly share one stream and each RawFetch
+    // needs the same limit, and because a clamped region is shorter than
+    // vertex_count * stride so the end cannot be re-derived from the base.
+    uint32_t limit_of_stream[kMaxStreams];
     std::memset(region_of_stream, 0xFF, sizeof(region_of_stream));
+    std::memset(limit_of_stream, 0, sizeof(limit_of_stream));
     dc.raw_vertex_bytes.clear();
     dc.raw_fetch_count = 0;
     for (size_t a = 0; a < attrs.size() && gpu_fetch; ++a) {
@@ -2838,15 +3034,27 @@ ShaderApplyResult ApplyShaderOutputs(
       if (region_of_stream[si] == 0xFFFFFFFFu) {
         const uint64_t start = uint64_t(s.offset_bytes) +
                                uint64_t(dc.first_vertex) * s.stride;
-        const uint64_t bytes = uint64_t(dc.vertex_count) * s.stride;
-        if (start + bytes > s.size_bytes) {
-          // The same bound BuildHleDraw enforces per vertex, applied once to
-          // the whole window. A stream the shader indexes past is a refusal,
-          // not a clamp into whatever follows the buffer.
-          gpu_fetch = false;
-          ++g_gpuFetchOutOfRange;
-          break;
-        }
+        const uint64_t want = uint64_t(dc.vertex_count) * s.stride;
+        // This used to refuse the draw outright when the window ran past the
+        // stream, on the grounds that a clamp would read "whatever follows the
+        // buffer". That was the right call while the shader had no bound to
+        // check -- but it cost the draw entirely, and the hardware does not do
+        // that: an over-long vertex fetch reads zero and the draw still
+        // renders (metal_command_processor.cc:2377-2382). Now that
+        // RawFetch::limit gives the shader the bound, the window is clamped to
+        // what is actually readable and the shader zeroes the rest.
+        //
+        // Copying `bytes` rather than `want` also closes a latent host-side
+        // overrun: the old insert() below read s.host + start + want, past the
+        // guest mapping, in exactly the case it was refusing.
+        //
+        // start >= size_bytes falls out correctly with no special case: avail
+        // and bytes are 0, the region is empty, limit == base, and every fetch
+        // in the shader reads zero.
+        const uint64_t avail =
+            s.size_bytes > start ? uint64_t(s.size_bytes) - start : 0;
+        const uint64_t bytes = std::min(want, avail);
+        if (bytes < want) ++g_gpuFetchClamped;
         // ByteAddressBuffer.Load needs 4-byte alignment, and every address the
         // shader forms is base + vid * stride + a dword-derived offset. Guest
         // strides and offsets are dword counts so this should always hold --
@@ -2861,11 +3069,13 @@ ShaderApplyResult ApplyShaderOutputs(
         region_of_stream[si] = uint32_t(dc.raw_vertex_bytes.size());
         dc.raw_vertex_bytes.insert(dc.raw_vertex_bytes.end(),
                                    s.host + start, s.host + start + bytes);
+        limit_of_stream[si] = uint32_t(dc.raw_vertex_bytes.size());
       }
       auto& rf = dc.raw_fetch[dc.raw_fetch_count++];
       rf.base = region_of_stream[si];
       rf.stride = s.stride;
       rf.endian = s.endian;
+      rf.limit = limit_of_stream[si];
     }
     if (!gpu_fetch) {
       dc.raw_vertex_bytes.clear();
@@ -3079,16 +3289,32 @@ ShaderApplyResult ApplyShaderOutputs(
       const HleStream& s = streams[si];
       if (!have[si]) {
         const uint64_t byte_off = src * s.stride + s.offset_bytes;
-        if (byte_off + s.stride > s.size_bytes) {
-          ++g_hleShaderBadVertex;
-          return ShaderApplyResult::kFailed;
+        // Short window: zero what is missing rather than abandoning the draw.
+        // The same rule and the same reason as the GPU clamp above -- this is
+        // the fallback those refusals used to land in, so leaving it dropping
+        // would keep every rectlist and no-PS draw dying on a bound the
+        // hardware does not enforce. Zeroing the WHOLE stride first means a
+        // partially readable vertex reads its valid bytes and zeros past them,
+        // which is what the shader now does on the GPU side.
+        const uint64_t avail =
+            s.size_bytes > byte_off ? uint64_t(s.size_bytes) - byte_off : 0;
+        const uint32_t copy =
+            uint32_t(std::min<uint64_t>(avail, s.stride));
+        if (copy < s.stride) {
+          std::memset(vtx[si], 0, s.stride);
+          ++g_hleShaderZeroFilledVertex;
         }
-        std::memcpy(vtx[si], s.host + byte_off, s.stride);
+        if (copy) std::memcpy(vtx[si], s.host + byte_off, copy);
         have[si] = true;
       }
       float f[4] = {0, 0, 0, 1};
       if (!ReadVertexAttribute(vtx[si], s.stride, attrs[a], s.endian, f)) {
-        ++g_hleShaderBadVertex;
+        // A different rule: the attribute extends past the STRIDE, not past
+        // the buffer (shader_ucode.cpp:220). Left fatal on purpose so this
+        // change is judged on the window bound alone; counted apart so its
+        // share is visible rather than folded into the number that should now
+        // be falling.
+        ++g_hleShaderBadAttribute;
         return ShaderApplyResult::kFailed;
       }
       values[a] = {f[0], f[1], f[2], f[3]};
@@ -3838,6 +4064,10 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
               << out.unhonoured_predicate_ops
               << " (setp_* translated for its value; p0 is not acted on, so "
                  "this shader may run instructions the console skipped)";
+          if (out.unhonoured_fetch_ops)
+            f << "\n; UNHONOURED FETCH OPS: " << out.unhonoured_fetch_ops
+              << " (getCompTexLOD/getGradients/getWeights/getBCF/setGradients "
+                 "skipped; their destination keeps its previous value)";
           if (!compiled) f << "\n; FXC REJECTED: " << compile_error;
           // The guest's own bits, so a translation can be checked against its
           // INPUT instead of against itself.

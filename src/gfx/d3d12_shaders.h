@@ -53,6 +53,29 @@ float4 main(float4 pos : SV_POSITION, float4 col : COLOR) : SV_TARGET {
 }
 )";
 
+// The pixel stage for a guest DEPTH pass, paired with a translated vertex stage.
+//
+// SetPixelShader(NULL) is legal on the console for a pass that writes only
+// depth, and this game uses it heavily — measured 70,000 such draws in mx_1142,
+// every single one of which binds RB_COLOR_MASK 0 ("WOULD PAINT 0, masked off
+// 54428"). Without a pixel stage to pair with, the whole draw used to fall back
+// to the software vertex interpreter; with this it keeps its GPU vertex stage
+// and its depth write.
+//
+// Returning zero is not a colour decision. TranslatedPSO already sets
+// RenderTargetWriteMask to 0 for these draws (key.flags bit 2, from
+// d.colorWrite), so nothing this returns can reach the target — and the hooks
+// side only routes a draw here when it has established exactly that. If this
+// shader's output is ever visible, the gate upstream is wrong, not this value.
+//
+// Declaring only SV_Position is deliberate: a pixel shader's input signature
+// must be a SUBSET of the vertex stage's output, and every translated vertex
+// stage emits SV_Position plus its interpolators. Naming just the one both
+// shapes always carry means this pairs with any of them and needs no variant.
+inline constexpr const char* kTranslatedDepthOnlyPS = R"(
+float4 main(float4 pos : SV_Position) : SV_TARGET { return 0; }
+)";
+
 // Bink's frame composite. The guest binds three single-channel planes — Y at
 // full resolution, Cr and Cb at half — and optionally a fourth alpha plane,
 // then runs its own YUV->RGB shader. Measured 3/3 runs; see

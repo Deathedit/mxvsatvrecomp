@@ -1038,6 +1038,16 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     uint32_t pixelParamGen = 0;
     bool translated = false;
 
+    // This draw is a guest DEPTH pass: a translated vertex stage with NO pixel
+    // shader, paired with shaders::kTranslatedDepthOnlyPS. Set only when the
+    // draw cannot write colour, so the stand-in's output is discarded by a write
+    // mask that is already zero — see the note on that shader.
+    //
+    // Distinct from `depthOnlyPass` in RenderGameFrame, which asks whether a
+    // COLOUR TARGET is bound. These draws mostly do bind one; what they do not
+    // do is write to it.
+    bool depthOnlyStandIn = false;
+
     // The guest VERTEX shader on the GPU. `gpuVertex` is only set once every
     // piece is present, on the same all-or-nothing rule as `translated`: a
     // vertex stage missing its attribute stream or its constant bank computes

@@ -3716,7 +3716,16 @@ void D3D12Renderer::RenderGameFrame() {
                           (d.colorWrite ? 0u : 4u) |
                           (d.blendEnable ? 8u : 0u) |
                           (d.gpuVertexFetch ? 16u : 0u));
-      translatedPso = TranslatedPSO(key, *d.pixelShaderHlsl, d);
+      // A depth pass has no guest pixel shader to compile, so it takes the
+      // stand-in. key.handle is 0 for these — no real shader has that handle,
+      // so m_translatedPsBlobs caches exactly one compilation of it for the
+      // whole run, and the rest of the key still separates them by vertex
+      // shader, blend, topology and target format the way it does for any other
+      // pixel stage.
+      static const std::string kDepthOnlyPs{
+          mx::gfx::shaders::kTranslatedDepthOnlyPS};
+      translatedPso = TranslatedPSO(
+          key, d.depthOnlyStandIn ? kDepthOnlyPs : *d.pixelShaderHlsl, d);
     }
     // Every texture the shader reads must be bindable, or the draw falls back:
     // a shader sampling a descriptor that was never written reads whatever is
@@ -4559,23 +4568,47 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   // read as "every stand-in draw has a shader whose translation is missing",
   // which sent the search into the translator when the shaders were translating
   // fine. A counter that cannot fire is worse than no counter.
-  if (!d.pixelShaderHandle) ++m_standInNoHandle;
-  else if (!d.pixelShaderHlsl) ++m_standInNoHlsl;
+  // A guest DEPTH pass: a translated VERTEX stage and no pixel shader at all.
+  //
+  // It needs none of the four things the clause below demands of a normal
+  // translated draw — no handle, no HLSL, no constant bank, no samplers —
+  // because kTranslatedDepthOnlyPS reads nothing and its output is discarded by
+  // a zero write mask. What it DOES need is the vertex stage, which is the whole
+  // point: without this the draw loses it and runs on the software interpreter.
+  //
+  // `!colorWrite` is the load-bearing term and is checked here as well as on the
+  // hooks side. The two decide it from the same guest register, in different
+  // processes' worth of code, and this is the one that the write mask is
+  // actually built from — so if they ever disagree, the draw falls back rather
+  // than painting a stand-in colour the guest never asked for.
+  const bool depthOnlyStandIn =
+      !pixelShaderHlsl && hasVertexStage && !colorWrite;
+  d.depthOnlyStandIn = depthOnlyStandIn;
+
+  if (!d.pixelShaderHandle && !depthOnlyStandIn) ++m_standInNoHandle;
+  else if (!d.pixelShaderHlsl && !depthOnlyStandIn) ++m_standInNoHlsl;
   else if (!hasVertexStage && !(interpolators && interpBytes))
     ++m_standInNoVertexInputs;
-  else if (!pixelConstants || !pixelConstDwords) ++m_standInNoConstants;
+  else if ((!pixelConstants || !pixelConstDwords) && !depthOnlyStandIn)
+    ++m_standInNoConstants;
   else if (pixelSamplerCount > kTranslatedSamplerSlots) ++m_standInTooManySamplers;
 
-  if (d.pixelShaderHlsl && d.pixelShaderHandle &&
-      (hasVertexStage || (interpolators && interpBytes)) && pixelConstants &&
-      pixelConstDwords && pixelSamplerCount <= kTranslatedSamplerSlots) {
+  if ((depthOnlyStandIn ||
+       (d.pixelShaderHlsl && d.pixelShaderHandle && pixelConstants &&
+        pixelConstDwords)) &&
+      (hasVertexStage || (interpolators && interpBytes)) &&
+      pixelSamplerCount <= kTranslatedSamplerSlots) {
     // The shader's cbuffer is xe_c[256], then xe_texinv[slots],
     // xe_texsign[slots], and xe_param_gen, so the buffer must cover all four.
     // Sizing it to the
     // constant bank alone would leave the shader reading past the end of the
     // resource for every unnormalized fetch. Rounded up to 256 bytes, the
     // constant-buffer granularity.
-    const uint32_t bankBytes = pixelConstDwords * 4;
+    // Zero for a depth pass, which brings no constant bank. The three payloads
+    // after it still have to exist because the cbuffer is declared with them,
+    // so the buffer is built and sized exactly as usual — only the bank part of
+    // it is empty, and the stand-in reads none of it anyway.
+    const uint32_t bankBytes = depthOnlyStandIn ? 0u : pixelConstDwords * 4;
     const uint32_t texInvBytes = kTranslatedSamplerSlots * 16;
     const uint32_t texSignBytes = kTranslatedSamplerSlots * 16;
     const uint32_t paramGenBytes = 16;
@@ -4597,7 +4630,9 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
       {
         uint8_t* p = d.pscb.cpu;
         std::memset(p, 0, constBytes);
-        std::memcpy(p, pixelConstants, bankBytes);
+        // Guarded: a depth pass has bankBytes 0 and pixelConstants null, and
+        // memcpy from a null pointer is undefined even for a zero count.
+        if (bankBytes) std::memcpy(p, pixelConstants, bankBytes);
         // xe_texinv, immediately after the bank. An unnormalized fetch
         // addresses the texture in TEXELS, so the shader multiplies by this to
         // normalize — it is therefore 1/extent of the texture actually bound at

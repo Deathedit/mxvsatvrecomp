@@ -474,11 +474,23 @@ struct DrawCall {
   // `base` already includes first_vertex * stride and the stream's own byte
   // offset, so the shader indexes with SV_VertexID and needs no bias. `endian`
   // is the stream's, applied per attribute as the CPU path applies it.
+  //
+  // `limit` is the exclusive byte offset one past this stream's valid region,
+  // and it is what makes reading the merged buffer safe. The buffer reaches the
+  // GPU as a ROOT SRV (d3d12_game.cpp), which carries a virtual address and no
+  // size, so the hardware bounds-checks nothing: a read past the end takes the
+  // next stream's region, then another draw's suballocation in the same upload
+  // page, then undefined memory. Per stream rather than per buffer for exactly
+  // that reason -- the regions are packed with no gap, so a buffer-wide bound
+  // would still let one stream read the next one's vertices.
+  //
+  // Beyond `limit` the shader reads zero, which is what the hardware and the
+  // reference do with an over-long fetch (metal_command_processor.cc:2377).
   struct RawFetch {
     uint32_t base = 0;
     uint32_t stride = 0;
     uint32_t endian = 0;
-    uint32_t pad = 0;
+    uint32_t limit = 0;
   };
   static constexpr uint32_t kMaxRawFetches = 32;
   std::array<RawFetch, kMaxRawFetches> raw_fetch = {};

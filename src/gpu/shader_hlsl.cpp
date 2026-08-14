@@ -160,6 +160,13 @@ class Emitter {
   // nothing acts on, because predicated issue is not implemented. Non-zero means
   // this shader may take a branch or an instruction it should have skipped.
   uint32_t unhonoured_predicate_ops = 0;
+  // Fetch opcodes at 16 and above that this emitter skips. See
+  // HlslShader::unhonoured_fetch_ops for why they are skipped and not refused.
+  uint32_t unhonoured_fetch_ops = 0;
+  // Does any instruction touch the register LOD -- setTexLOD writing it, or a
+  // tfetch reading it back? Gates the `xe_lod` declaration so that every shader
+  // which does not use one emits byte-identical HLSL to before.
+  bool uses_reg_lod = false;
   std::vector<PixelTextureBinding> fetches;
   uint32_t sampler_mask = 0;
   // Guest sampler -> compact register slot, assigned in order of first fetch.
@@ -216,12 +223,53 @@ class Emitter {
   // A VERTEX shader that samples is a real shape in this game, not a curiosity:
   // the engine binds the bone-matrix palette as a texture rather than as a
   // constant array (see the VS census in hooks_d3d9.cpp).
-  const char* SampleOp() const {
-    return pixel() ? ".Sample(" : ".SampleLevel(";
+  //
+  // A fetch that names its LOD in a register (`use_reg_lod`, written by a
+  // preceding setTexLOD) needs SampleLevel in EITHER stage: the point of the
+  // instruction is that the shader chooses the level rather than the hardware's
+  // derivatives, so answering it with an implicit-derivative Sample discards it.
+  // That is what used to happen to every pixel shader carrying one, because
+  // setTexLOD was classified as a vertex fetch and never reached the emitter.
+  bool ExplicitLod(const uc::TextureFetchInstruction& tf) const {
+    return tf.use_register_lod() || !pixel();
+  }
+  const char* SampleOp(const uc::TextureFetchInstruction& tf) const {
+    return ExplicitLod(tf) ? ".SampleLevel(" : ".Sample(";
   }
   // Paired with SampleOp: the extra argument SampleLevel takes and Sample does
   // not. Emitted immediately before the closing paren of the fetch.
-  const char* SampleLod() const { return pixel() ? "" : ", 0"; }
+  //
+  // The level is the register value plus the instruction's own bias, in the
+  // D3D11.3 accumulation order the reference uses
+  // (dxbc_shader_translator_fetch.cc:1541-1556). The FETCH CONSTANT's bias is
+  // the third term there and is NOT applied: it is runtime state that would have
+  // to ride in a cbuffer, and no fetch constant reaches this emitter. A shader
+  // whose guest bias is non-zero therefore samples a level too sharp or too soft
+  // by that amount — stated because it is the one term of the three missing.
+  //
+  // lod_bias is a 7-bit signed field scaled by 1/16, so every value it can take
+  // has at most four decimal places and std::to_string reproduces it exactly.
+  std::string SampleLod(const uc::TextureFetchInstruction& tf) {
+    if (!ExplicitLod(tf)) return "";
+    if (!tf.use_register_lod()) return ", 0";
+    uses_reg_lod = true;
+    const float bias = tf.lod_bias();
+    if (bias == 0.0f) return ", xe_lod";
+    return ", (xe_lod + " + std::to_string(bias) + ")";
+  }
+
+  // setTexLOD: store the level this shader wants its later fetches to sample at.
+  //
+  // The operand is one component, selected by the source swizzle's first slot —
+  // the same absolute two-bits-per-component encoding a tfetch coordinate uses,
+  // not the component-relative ALU form. The reference is
+  // dxbc_shader_translator_fetch.cc:608-616, which moves
+  // `LoadOperand(operands[0], 0b0001).SelectFromSwizzled(0)` into the LOD slot.
+  void EmitSetTextureLod(const uc::TextureFetchInstruction& tf) {
+    uses_reg_lod = true;
+    Line("xe_lod = " + Temp(tf.src()) + "." +
+         std::string(1, kComponent[tf.src_swizzle() & 3]) + ";");
+  }
 
   void Line(const std::string& s) { body += "  " + s + "\n"; }
 
@@ -907,9 +955,9 @@ class Emitter {
       const std::string src = Temp(tf.src());
       const std::string face = std::string(1, kComponent[(swiz >> 4) & 3]);
       const std::string s3 = std::to_string(slot);
-      Line("xe_v = xe_tex" + s3 + SampleOp() + "xe_smp" + s3 + ", float3(" +
-           src + "." + uv + " - 1.0, " + src + "." + face + ")" + SampleLod() +
-           ");");
+      Line("xe_v = xe_tex" + s3 + SampleOp(tf) + "xe_smp" + s3 + ", float3(" +
+           src + "." + uv + " - 1.0, " + src + "." + face + ")" +
+           SampleLod(tf) + ");");
       EmitFetchDestination(tf);
       return;
     }
@@ -971,8 +1019,8 @@ class Emitter {
               ")";
     }
     const std::string s = std::to_string(slot);
-    Line("xe_v = xe_tex" + s + SampleOp() + "xe_smp" + s + ", " + coord +
-         SampleLod() + ");");
+    Line("xe_v = xe_tex" + s + SampleOp(tf) + "xe_smp" + s + ", " + coord +
+         SampleLod(tf) + ");");
     // TEX_FORMAT_COMP / GPUSIGN, applied here because it is per-BINDING state,
     // not per-texture: the same guest memory is bound with different sign modes
     // by different draws, so baking it into the decode would poison a cache
@@ -1064,7 +1112,42 @@ class Emitter {
     const char* load = dwords == 1 ? "Load" : dwords == 2 ? "Load2"
                      : dwords == 3 ? "Load3" : "Load4";
     const std::string uty = dwords == 1 ? "uint" : "uint" + std::to_string(dwords);
-    Line(uty + " xe_vr = xe_vb." + load + "(xe_vfa);");
+
+    // Bounds. xe_vb is bound as a ROOT SRV, which carries a virtual address and
+    // no size, so nothing here is bounds-checked by the hardware: a read past
+    // this stream's region takes the next stream's vertices, then another
+    // draw's suballocation in the same upload page, then undefined memory.
+    //
+    // `.w` is one past this stream's valid bytes (DrawCall::RawFetch::limit).
+    // Past it the fetch yields zero, which is what the hardware and the
+    // reference do with an over-long fetch rather than dropping the draw. The
+    // decode below then runs on zeros, so an out-of-range attribute reaches the
+    // shader as (0,0,0,1) exactly as ReadVertexAttributeAs leaves it.
+    //
+    // This also covers a fetch whose xe_vf[] slot was never filled: limit is 0
+    // there, so it reads zero rather than whatever address 0 happens to hold.
+    //
+    // The add cannot wrap in practice -- xe_vfa is an offset into a buffer the
+    // upload allocator caps well below 2^32 -- and is written this way rather
+    // than as `xe_vfa <= .w - N` precisely because THAT form underflows when a
+    // stream's region is shorter than one attribute.
+    //
+    // The ADDRESS is clamped, not just the result. `?:` around the Load itself
+    // would not be enough: HLSL does not guarantee short-circuit evaluation,
+    // and fxc routinely evaluates both sides of a select, which would issue the
+    // out-of-range Load regardless. A root SRV has no size for the hardware to
+    // clamp against, so that load is not merely garbage-but-discarded -- it can
+    // cross a page and fault. Loading from 0 instead is always in bounds: the
+    // suballocator rounds every region up to 256 bytes and the fetch stage is
+    // only taken when rawByteCount is non-zero, so the first 16 bytes always
+    // exist. The value is then discarded anyway.
+    std::string zeros = uty + "(0u";
+    for (uint32_t i = 1; i < dwords; ++i) zeros += ", 0u";
+    zeros += ")";
+    Line("bool xe_vin = xe_vfa + " + std::to_string(dwords * 4) + "u <= " +
+         base + ".w;");
+    Line(uty + " xe_vr = xe_vb." + load + "(xe_vin ? xe_vfa : 0u);");
+    Line("if (!xe_vin) xe_vr = " + zeros + ";");
 
     // Endian, exactly as ApplyFetchEndianFor does it on the CPU: reverse fixed
     // width units across the attribute, 4-byte units for mode 2 and 2-byte for
@@ -1319,7 +1402,24 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
         // Bit 0 of each 2-bit sequence slot says "this is a fetch", exactly as
         // DecodePixelTextureFetches reads it.
         if ((seq >> (n * 2)) & 0x1) {
-          if ((dwords[at] & 0x1F) != uint32_t(uc::FetchOpcode::kTextureFetch)) {
+          // FetchOpcode is NOT two-valued. It is {kVertexFetch=0,
+          // kTextureFetch=1, kGetTextureBorderColorFrac=16,
+          // kGetTextureComputedLod=17, kGetTextureGradients=18,
+          // kGetTextureWeights=19, kSetTextureLod=20,
+          // kSetTextureGradientsHorz=21, kSetTextureGradientsVert=22}, so a
+          // two-way split on `!= kTextureFetch` sends all seven of the high
+          // opcodes down the VERTEX branch. There they were memcpy'd into a
+          // VertexFetchInstruction and read as one: for a vertex shader, word
+          // 1 bits 13:18 landed in exp_adjust as garbage and refused the whole
+          // shader — measured as `VFETCH coverage: 114 of 115 ... vertex fetch
+          // exp_adjust=1`, one shader, ~89k-100k draws a run kept off the GPU
+          // fetch path. The shader in question carries a plain setTexLOD and
+          // has an exp_adjust of 0 on every one of its four real vfetches.
+          //
+          // Test each opcode for what it IS. The high ops are skipped and
+          // counted rather than refused; see HlslShader::unhonoured_fetch_ops.
+          const uint32_t fetch_op = dwords[at] & 0x1F;
+          if (fetch_op == uint32_t(uc::FetchOpcode::kVertexFetch)) {
             // A vertex fetch. Without emit_vertex_fetch the host input assembler
             // performs it and skipping is what leaves the destination register
             // unwritten, which is precisely how input_mask is produced. With it,
@@ -1345,10 +1445,25 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
             em.EmitVertexFetch(vf, vfetch_ordinal);
             fetch_slot_of[vfetch_ordinal] = last_full_slot;
             ++vfetch_ordinal;
-          } else {
+          } else if (fetch_op == uint32_t(uc::FetchOpcode::kTextureFetch)) {
             uc::TextureFetchInstruction tf{};
             std::memcpy(&tf, dwords + at, sizeof(tf));
             em.EmitTextureFetch(tf);
+          } else if (fetch_op == uint32_t(uc::FetchOpcode::kSetTextureLod)) {
+            // Emitted in BOTH stages. It writes a shader register, samples
+            // nothing and needs no binding, so there is no reason a vertex
+            // shader may not have one — and the one shader this whole change
+            // is about is exactly that case.
+            uc::TextureFetchInstruction tf{};
+            std::memcpy(&tf, dwords + at, sizeof(tf));
+            em.EmitSetTextureLod(tf);
+          } else {
+            // getCompTexLOD / getGradients / getWeights / getBCF and the two
+            // setGradients. Not implemented; skipped with the destination left
+            // holding whatever it had, which is what already happened to these
+            // in a pixel shader. Counted so the population stays visible rather
+            // than being silently approximated.
+            ++em.unhonoured_fetch_ops;
           }
         } else {
           uc::AluInstruction alu{};
@@ -1631,6 +1746,14 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
          "; ++xe_i) r[xe_i] = float4(0, 0, 0, 0);\n";
   src += "  float4 xe_v = float4(0, 0, 0, 0);\n";
   src += "  float xe_s = 0.0, xe_ps = 0.0;\n";
+  // Written by setTexLOD, read by any later tfetch whose use_reg_lod is set.
+  // Declared only when one of those exists, so a shader with neither emits
+  // exactly the HLSL it emitted before this was added.
+  //
+  // Zero-initialised because the two can appear in either order: a fetch that
+  // reads the register before any setTexLOD has run gets level 0, which is the
+  // level that stage sampled at before register LOD was honoured at all.
+  if (em.uses_reg_lod) src += "  float xe_lod = 0.0;\n";
   // Written by setp_*, read by nothing yet — see unhonoured_predicate_ops.
   src += "  bool xe_p0 = false;\n";
   src += "  int xe_a0 = 0;\n";
@@ -1719,6 +1842,7 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   out.max_const_index = em.max_const_index;
   out.reads_constants = em.reads_constants;
   out.unhonoured_predicate_ops = em.unhonoured_predicate_ops;
+  out.unhonoured_fetch_ops = em.unhonoured_fetch_ops;
   out.vertex_fetch_count = em.vertex_fetch_count;
   for (uint32_t i = 0; i < em.vertex_fetch_count; ++i)
     out.vertex_fetch_slot[i] = fetch_slot_of[i];
