@@ -794,22 +794,27 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
       // rejects it as a cross-family format and D3D12 removes the device
       // (DXGI_ERROR_INVALID_CALL). That was the hang.
       slots[i].format = it->second.resource->GetDesc().Format;
-      // The guest's swizzle applies to a SNAPSHOT exactly as it does to a
-      // decoded texture -- Xenia composes it for every texture regardless of
-      // origin. This branch used to leave `useSwizzle` false, so the descriptor
-      // below fell back to D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING and the
-      // guest's request was silently dropped. Measured in mx_1156: slots asking
-      // for 03012 (the BGRA->RGBA correction) sampled red and blue SWAPPED, and
-      // slots asking for 05510 read real channels where the guest wants a
-      // constant 1.0.
+      // A SNAPSHOT keeps the DEFAULT identity mapping. The guest's swizzle is
+      // recorded (stageSampledSwizzles, printed by SLOT MAP) but deliberately
+      // NOT applied here.
       //
-      // Zero means the hooks side had no fetch constant to read, which is not
-      // the same as "identity" -- leave those on the default mapping rather than
-      // encoding a swizzle of all-X.
-      if (const uint16_t swz = stageSampledSwizzles[i]) {
-        slots[i].swizzle = swz;
-        slots[i].useSwizzle = true;
-      }
+      // TRIED AND REVERTED 2026-08-14, with a screenshot: applying it turned the
+      // menu's yellow rider gear and bike CYAN -- a clean red<->blue swap, which
+      // is precisely what the 03012 slots ask for. The swizzle was not being
+      // dropped by accident; identity is already right for these slots.
+      //
+      // Why: a snapshot is a host render-target COPY, already in host channel
+      // order, because the guest colour format was resolved when the host target
+      // was created. The guest swizzle is expressed against the guest format's
+      // channel order, so applying it on top double-applies the correction. This
+      // is exactly the composition Xenia does with GetHostFormatSwizzle -- guest
+      // swizzle composed THROUGH the host format's own swizzle, not applied raw
+      // -- and we have no host-format swizzle table. Until we do, identity is
+      // the correct behaviour for a snapshot and the recorded swizzle is a
+      // diagnostic only.
+      //
+      // The decoded-texture branch below is different and unaffected: it uploads
+      // guest bytes in guest channel order, so the guest swizzle applies raw.
       continue;
     }
     // The other two ways a slot refuses. These used to increment a counter and
