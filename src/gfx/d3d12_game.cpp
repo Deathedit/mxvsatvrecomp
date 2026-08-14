@@ -2208,7 +2208,7 @@ void D3D12Renderer::DrainLuminanceReadback() {
   D3D12_RANGE noWrite = {0, 0};
   rb->Unmap(0, &noWrite);
   const uint32_t half = texel & 0xFFFFu;
-  // DIAG (remove before commit): whether the GPU's own answer is non-zero.
+  // DIAG: whether the GPU's own answer is non-zero.
   // If this only ever reports 0x0000 the write-back is faithful and the
   // reduction chain is the thing producing nothing -- a different defect from
   // the value not reaching the guest.
@@ -3748,7 +3748,7 @@ void D3D12Renderer::RenderGameFrame() {
     // render, not starting to render correctly.
     if (!translatedPso && fabricatedWhite) {
       ++m_sampleMissSkipped;
-      // DIAG (remove before commit): what the skipped draws are aimed at.
+      // DIAG: what the skipped draws are aimed at.
       auto& e =
           m_skipByTarget[(uint64_t(d.targetWidth) << 32) | d.targetHeight];
       ++e.count;
@@ -4091,7 +4091,7 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_containedSourceResolves),
                   static_cast<unsigned long long>(m_msaaPartnerResolves));
     LogInfo(message);
-    // DIAG (remove before commit): what the WHITE-SKIPPED draws were aimed at.
+    // DIAG: what the WHITE-SKIPPED draws were aimed at.
     for (const auto& [extent, e] : m_skipByTarget) {
       std::snprintf(message, sizeof(message),
                     "  WHITE-SKIPPED target %ux%u obj 0x%08X: %llu draws, "
@@ -4102,7 +4102,7 @@ void D3D12Renderer::RenderGameFrame() {
                     static_cast<unsigned long long>(e.wantedSlots));
       LogInfo(message);
     }
-    // DIAG (remove before commit): the COLOUR pool with its EDRAM bases. The
+    // DIAG: the COLOUR pool with its EDRAM bases. The
     // 640x360 resolve source (0x21B0F320, base 0x2D0, pitch 640, 4x MSAA in
     // its surface word) has no host target of its own, while a 640x720 surface
     // (0x2123C9BC) sits at the same base and pitch at 1x. Whether that 640x720
@@ -4116,7 +4116,7 @@ void D3D12Renderer::RenderGameFrame() {
                     uint32_t(t.format), t.everDrawn ? "Y" : "N");
       LogInfo(message);
     }
-    // DIAG (remove before commit): what the depth pool actually holds. The
+    // DIAG: what the depth pool actually holds. The
     // shadow resolve names a 768x1024 depth surface while the pass appears to
     // render two EDRAM bands (768x640 at base 0x580, 768x384 at base 0x710),
     // so the object the resolve asks for may be one no draw ever bound.

@@ -942,7 +942,7 @@ extern "C" REX_FUNC(sub_8254C3B0) {
   // depth target we have ever created arrived paired with a colour target, so
   // a depth-only pass instantiated nothing at all.
   NoteSurfaceBind(st.depth_stencil, /*is_depth=*/true);
-  // DIAG (remove before commit): the depth surfaces the guest binds, and their
+  // DIAG: the depth surfaces the guest binds, and their
   // OWN extents. Sizing a host depth surface to the colour target instead
   // collapsed the frame, because one depth object is bound alongside colour
   // targets of several extents (the 1280x720 surface and its 1280x640 and

@@ -1517,7 +1517,7 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   using namespace mx::hle;
   const auto& st = DeviceState();
 
-  // DIAG (remove before commit): census SQ_PROGRAM_CNTL per VS/PS pair, read
+  // DIAG: census SQ_PROGRAM_CNTL per VS/PS pair, read
   // AT DRAW TIME.
   //
   // Third site for this log, and the previous two were both wrong in a way that
@@ -3987,7 +3987,7 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
         out.source.data(), out.source.size(), nullptr, nullptr, nullptr,
         "main", target, D3DCOMPILE_OPTIMIZATION_LEVEL0, 0, &blob, &errors);
     compiled = SUCCEEDED(hr) && blob;
-    // DIAG (remove before commit): dump the generated HLSL beside the DXBC the
+    // DIAG: dump the generated HLSL beside the DXBC the
     // compiler produced from it, for every pixel shader that compiles.
     //
     // The reason both halves are needed: a RenderDoc pixel trace numbers its
@@ -4155,7 +4155,7 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
             nullptr, "main", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL0, 0,
             &fblob, &ferrors);
         if (SUCCEEDED(fhr) && fblob) {
-          // DIAG (remove before commit): dump the FETCH variant separately.
+          // DIAG: dump the FETCH variant separately.
           // This is the form that actually runs for a gpuVertexFetch draw, and
           // it is NOT the blob dumped at the main compile site above -- a
           // light-prepass draw was found exporting a correct SV_Position and

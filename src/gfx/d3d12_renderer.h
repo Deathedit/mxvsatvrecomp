@@ -1217,7 +1217,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // used to fall through to the untextured PSO and paint fabricated opaque
   // white over the frame; they are now skipped. See RenderGameFrame.
   uint64_t m_sampleMissSkipped = 0;
-  // DIAG (remove before commit): WHITE-SKIPPED draws grouped by target extent.
+  // DIAG: WHITE-SKIPPED draws grouped by target extent.
   struct SkipTargetInfo {
     uint64_t count = 0;
     uint64_t translated = 0;
