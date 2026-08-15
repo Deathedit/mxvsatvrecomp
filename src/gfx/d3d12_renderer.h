@@ -154,7 +154,12 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  // One pointer rather than four more scalars, for the same
                  // reason GpuVertexStage is a struct: a call site reading
                  // `..., 0, 0, 0, 0)` cannot be checked by eye.
-                 const int32_t* scissor = nullptr);
+                 const int32_t* scissor = nullptr,
+                 // RB_COLORCONTROL as read from the guest's register shadow:
+                 // bits 0-2 the comparison, bit 3 its enable. Zero means the
+                 // registers were unreadable, which decodes as "disabled" and
+                 // so keeps the draw on the path it has today.
+                 uint32_t alphaControl = 0, float alphaRef = 0.0f);
 
 // Append a resolve to this frame's list, in order with the draws around it.
 //
@@ -1042,6 +1047,11 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
 
     // Zero when disabled, otherwise one plus SQ_CONTEXT_MISC.param_gen_pos.
     uint32_t pixelParamGen = 0;
+    // The guest alpha test, uploaded into the pixel cbuffer's xe_alphatest.
+    // Raw RB_COLORCONTROL rather than the decoded pair, so a wrong bit
+    // assignment shows up as a wrong number here instead of a plausible test.
+    uint32_t alphaControl = 0;
+    float alphaRef = 0.0f;
     bool translated = false;
 
     // This draw is a guest DEPTH pass: a translated vertex stage with NO pixel
@@ -1223,6 +1233,22 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // used to fall through to the untextured PSO and paint fabricated opaque
   // white over the frame; they are now skipped. See RenderGameFrame.
   uint64_t m_sampleMissSkipped = 0;
+  // Draws whose guest alpha test is ENABLED, split by whether the path they
+  // actually took can honour it. The discard lives in the translated pixel
+  // shader, so a draw that fell to the stand-in gets no test at all and still
+  // paints its masked-away pixels.
+  //
+  // Two counters rather than one because the second is the only thing that
+  // says whether this change is finished: `honoured` rising on its own proves
+  // the plumbing works, and only `standIn` staying at zero proves there is no
+  // second population still rendering as filled quads. A single total could
+  // not tell those apart.
+  uint64_t m_alphaTestHonoured = 0;
+  uint64_t m_alphaTestStandIn = 0;
+  // Draws whose colour output was remapped from the guest's -32...32 fixed
+  // point into -1...1. Zero here would mean the scale never fired and any
+  // improvement came from something else.
+  uint64_t m_fixed16Scaled = 0;
   // DIAG: WHITE-SKIPPED draws grouped by target extent.
   struct SkipTargetInfo {
     uint64_t count = 0;

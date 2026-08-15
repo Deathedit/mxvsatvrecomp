@@ -31,6 +31,30 @@ enum class HostTextureFormat : uint8_t {
   // printed raw by the texture-fallback log line, so renumbering the existing
   // ones would silently reinterpret every log already written.
   kRg8,
+  // The G-buffer formats, appended for the same reason kRg8 was. All four guest
+  // formats behind them are 1x1 blocks whose bytes are already the host's after
+  // the endian swap, so nothing but these entries and the DXGI mapping is
+  // needed to carry them.
+  //
+  // k_16_16 and k_16_16_16_16 get TWO entries each because the guest's
+  // TEX_FORMAT_COMP decides how the same bits are read: the reference gives
+  // these formats a UNORM view and an SNORM view over one typeless resource
+  // (d3d12_texture_cache.h, the k_16_16 and k_16_16_16_16 rows, whose
+  // load_shader_signed is kLoadShaderIndexUnknown -- meaning the BYTES are
+  // identical and only the view differs). We create the resource with a
+  // concrete format rather than a typeless one, so the choice moves here.
+  //
+  // This makes them the first formats where kSigned is honoured rather than
+  // counted by NoteUnhandledSign. That is safe to do per-texture only because
+  // HleTextureKey hashes all six fetch words, sign fields included, so the same
+  // guest memory bound signed and unsigned decodes into two cached textures
+  // instead of one with the wrong view.
+  kRg16Float,
+  kRg16Unorm,
+  kRg16Snorm,
+  kRgba16Unorm,
+  kRgba16Snorm,
+  kRg32Float,
 };
 
 // xenos::TextureFilter::kBaseMap -- "sample level 0 and never minify past it".

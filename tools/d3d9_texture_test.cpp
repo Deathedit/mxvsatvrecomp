@@ -176,6 +176,93 @@ int main() {
             expanded.block_height == 1,
         "k_8_8 is a 2-byte 1x1 block");
 
+  // THE G-BUFFER FORMATS. Four entries out of the guest's own render-target
+  // format table (0x82D54414) that used to hit the accept-list default and drop
+  // the draw. Each is checked for its host format AND its block geometry,
+  // because a wrong bytes_per_block does not fail -- it reads plausible bytes
+  // from the wrong place, which is the failure mode the packed-mip work already
+  // paid for once.
+  fetch16.format = rex::graphics::xenos::TextureFormat::k_16_16_FLOAT;
+  Check(DescribeHleTexture2D(fetch16Words, expanded, &why) &&
+            expanded.host_format == HostTextureFormat::kRg16Float,
+        "k_16_16_FLOAT maps to RG16 float storage");
+  Check(expanded.bytes_per_block == 4 && expanded.block_width == 1 &&
+            expanded.block_height == 1,
+        "k_16_16_FLOAT is a 4-byte 1x1 block");
+  // The EXPAND spelling of the same thing, which is what the guest's table
+  // actually stores (0x2D22AB9C). It must fold to the identical host format --
+  // if GetBaseFormat ever stops folding it, this catches it here rather than as
+  // a rejection in a run.
+  fetch16.format = rex::graphics::xenos::TextureFormat::k_16_16_EXPAND;
+  Check(DescribeHleTexture2D(fetch16Words, expanded, &why) &&
+            expanded.host_format == HostTextureFormat::kRg16Float,
+        "k_16_16_EXPAND folds onto the same RG16 float storage");
+
+  fetch16.format = rex::graphics::xenos::TextureFormat::k_32_32_FLOAT;
+  Check(DescribeHleTexture2D(fetch16Words, expanded, &why) &&
+            expanded.host_format == HostTextureFormat::kRg32Float,
+        "k_32_32_FLOAT maps to RG32 float storage");
+  Check(expanded.bytes_per_block == 8, "k_32_32_FLOAT is an 8-byte block");
+
+  // The two fixed-point ones, whose host format depends on TEX_FORMAT_COMP.
+  // Both directions are asserted: a mapping that ignored the sign bits would
+  // still pass the unsigned half.
+  fetch16.format = rex::graphics::xenos::TextureFormat::k_16_16;
+  Check(DescribeHleTexture2D(fetch16Words, expanded, &why) &&
+            expanded.host_format == HostTextureFormat::kRg16Unorm,
+        "k_16_16 with unsigned components maps to RG16 UNORM");
+  Check(expanded.bytes_per_block == 4, "k_16_16 is a 4-byte block");
+  fetch16.format = rex::graphics::xenos::TextureFormat::k_16_16_16_16;
+  Check(DescribeHleTexture2D(fetch16Words, expanded, &why) &&
+            expanded.host_format == HostTextureFormat::kRgba16Unorm,
+        "k_16_16_16_16 with unsigned components maps to RGBA16 UNORM");
+  Check(expanded.bytes_per_block == 8, "k_16_16_16_16 is an 8-byte block");
+
+  // ONE signed component is enough, per the reference's IsAnySignSigned: the
+  // storage is two's complement or it is not, and a format cannot be half of
+  // each. Set only y, so a test that happened to read sign_x would fail.
+  fetch16.sign_y = rex::graphics::xenos::TextureSign::kSigned;
+  Check(DescribeHleTexture2D(fetch16Words, expanded, &why) &&
+            expanded.host_format == HostTextureFormat::kRgba16Snorm,
+        "k_16_16_16_16 with one signed component maps to RGBA16 SNORM");
+  fetch16.format = rex::graphics::xenos::TextureFormat::k_16_16;
+  Check(DescribeHleTexture2D(fetch16Words, expanded, &why) &&
+            expanded.host_format == HostTextureFormat::kRg16Snorm,
+        "k_16_16 with one signed component maps to RG16 SNORM");
+  // kUnsignedBiased is NOT kSigned. It rides the shader's xe_texsign scale and
+  // must leave the storage unsigned; treating "not plain unsigned" as "signed"
+  // would reinterpret every biased texel as two's complement.
+  fetch16.sign_y = rex::graphics::xenos::TextureSign::kUnsignedBiased;
+  Check(DescribeHleTexture2D(fetch16Words, expanded, &why) &&
+            expanded.host_format == HostTextureFormat::kRg16Unorm,
+        "kUnsignedBiased does not select the signed storage");
+  fetch16.sign_y = rex::graphics::xenos::TextureSign::kUnsigned;
+  Check(DescribeHleTexture2D(fetch16Words, expanded, &why) &&
+            expanded.signs == 0,
+        "signs are carried out of the descriptor");
+
+  // The 8-byte block claim the accept-list comment makes: SwapBlock's dword
+  // loop runs TWICE over one block and each dword is swapped on its own. An
+  // implementation that reversed all eight bytes would pass a 4-byte test and
+  // fail here, which is exactly why this is checked at 8 and not at 4.
+  {
+    HleTextureSource wide{};
+    wide.source_bytes = 8;
+    wide.width = wide.height = wide.pitch_blocks = 1;
+    wide.block_width = wide.block_height = 1;
+    wide.bytes_per_block = 8;
+    wide.host_format = HostTextureFormat::kRgba16Unorm;
+    wide.endian = uint32_t(rex::graphics::xenos::Endian::k8in32);
+    const uint8_t src64[8] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
+    HleTexturePayload out64;
+    Check(DecodeHleTexture2D(wide, src64, sizeof(src64), out64, &why),
+          "8-byte block decode");
+    const uint8_t want[8] = {0x44, 0x33, 0x22, 0x11, 0x88, 0x77, 0x66, 0x55};
+    Check(out64.data.size() == 8 &&
+              std::memcmp(out64.data.data(), want, 8) == 0,
+          "8-byte blocks swap as two independent dwords");
+  }
+
   // A rejected descriptor must still name its format, or the reject log
   // cannot say what to add next.
   fetch16.format = rex::graphics::xenos::TextureFormat::k_10_11_11;

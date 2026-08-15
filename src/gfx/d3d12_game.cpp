@@ -1904,6 +1904,28 @@ bool D3D12Renderer::EnsureGameTexture(
     case mx::hle::HostTextureFormat::kRg8:
       format = DXGI_FORMAT_R8G8_UNORM;
       break;
+    // The G-buffer formats. Each is the reference's own choice for the guest
+    // format behind it (d3d12_texture_cache.h host_formats_), and none of them
+    // is an integer view: an integer DXGI format cannot be Sample()d, only
+    // Load()ed, and every one of these is bound to a sampler.
+    case mx::hle::HostTextureFormat::kRg16Float:
+      format = DXGI_FORMAT_R16G16_FLOAT;
+      break;
+    case mx::hle::HostTextureFormat::kRg16Unorm:
+      format = DXGI_FORMAT_R16G16_UNORM;
+      break;
+    case mx::hle::HostTextureFormat::kRg16Snorm:
+      format = DXGI_FORMAT_R16G16_SNORM;
+      break;
+    case mx::hle::HostTextureFormat::kRgba16Unorm:
+      format = DXGI_FORMAT_R16G16B16A16_UNORM;
+      break;
+    case mx::hle::HostTextureFormat::kRgba16Snorm:
+      format = DXGI_FORMAT_R16G16B16A16_SNORM;
+      break;
+    case mx::hle::HostTextureFormat::kRg32Float:
+      format = DXGI_FORMAT_R32G32_FLOAT;
+      break;
   }
   if (format == DXGI_FORMAT_UNKNOWN || !texture->width || !texture->height)
     return false;
@@ -1973,9 +1995,23 @@ bool D3D12Renderer::EnsureGameTexture(
   D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
   srv.Format = format;
   srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+  // Same sanitisation as the snapshot SRV branch above, and for the same
+  // reason: guest GPUSWIZZLE is 3 bits per component, so 6 and 7 are
+  // representable, but D3D12_SHADER_COMPONENT_MAPPING defines only 0-5.
+  // DescribeHleTexture2D stores `out.swizzle = fetch.swizzle` raw, so whatever
+  // the fetch constant holds arrives here unfiltered -- this used to hand the
+  // driver an undefined component mapping. `& 5` maps 6 -> 4 (constant 0) and
+  // 7 -> 5 (constant 1) and leaves 0-5 alone; see the fuller note beside
+  // host_component in the snapshot branch for Xenia's wording and for what it
+  // means that a KEEP component becomes a forced 1.0.
+  const auto host_component = [](uint32_t c) -> UINT {
+    return c >= 4u ? UINT(c & 5u) : UINT(c);
+  };
   srv.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
-      (texture->swizzle >> 0) & 7u, (texture->swizzle >> 3) & 7u,
-      (texture->swizzle >> 6) & 7u, (texture->swizzle >> 9) & 7u);
+      host_component((texture->swizzle >> 0) & 7u),
+      host_component((texture->swizzle >> 3) & 7u),
+      host_component((texture->swizzle >> 6) & 7u),
+      host_component((texture->swizzle >> 9) & 7u));
   srv.Texture2D.MipLevels = UINT(-1);  // however many the resource has
   auto cpu = m_gameSrvHeap->GetCPUDescriptorHandleForHeapStart();
   cpu.ptr += SIZE_T(entry.descriptorIndex) * m_gameSrvDescriptorSize;
@@ -3882,6 +3918,16 @@ void D3D12Renderer::RenderGameFrame() {
     D3D12_GPU_DESCRIPTOR_HANDLE translatedSrvTable = {};
     if (translatedPso && !BindTranslatedTextures(d, translatedSrvTable))
       translatedPso = nullptr;
+    // Counted HERE rather than where the alpha state arrives, because the
+    // question is not "does this draw have an alpha test" but "did the path it
+    // ended up on run one". translatedPso is only final after the texture bind
+    // above has had its chance to revoke it.
+    if ((d.alphaControl >> 3) & 1u) {
+      if (translatedPso && !d.depthOnlyStandIn)
+        ++m_alphaTestHonoured;
+      else
+        ++m_alphaTestStandIn;
+    }
     // Now that the translated path has had its chance, a draw still heading for
     // the untextured stand-in with an invented colour is the fabricated white
     // the guard was written for. See the note beside fabricatedWhite.
@@ -4240,6 +4286,16 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_containedSourceResolves),
                   static_cast<unsigned long long>(m_msaaPartnerResolves));
     LogInfo(message);
+    // The guest alpha test. STAND-IN is the figure to watch: those draws have
+    // an enabled test and took a path with no shader to discard in, so they are
+    // still painting the pixels the guest masks away.
+    std::snprintf(message, sizeof(message),
+                  "alpha test: honoured %llu, STAND-IN %llu; "
+                  "fixed16 -32..32 remapped %llu draws",
+                  static_cast<unsigned long long>(m_alphaTestHonoured),
+                  static_cast<unsigned long long>(m_alphaTestStandIn),
+                  static_cast<unsigned long long>(m_fixed16Scaled));
+    LogInfo(message);
     // DIAG: what the WHITE-SKIPPED draws were aimed at.
     for (const auto& [extent, e] : m_skipByTarget) {
       std::snprintf(message, sizeof(message),
@@ -4512,7 +4568,8 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t depthHeight, uint32_t depthBase,
                                  uint32_t targetBase,
                                  uint32_t targetColorFormat,
-                                 const int32_t* scissor) {
+                                 const int32_t* scissor,
+                                 uint32_t alphaControl, float alphaRef) {
   // PERF(per-frame-allocs): DONE. This used to create an ID3D12Resource on the
   // UPLOAD heap for each of the buffers below — up to nine per call, once per
   // submitted draw — and the note here called for "a ring of upload buffers
@@ -4632,6 +4689,8 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.pixelSamplerCount = pixelSamplerCount;
   d.pixelSamplerArrayMask = pixelSamplerArrayMask;
   d.pixelParamGen = pixelParamGen;
+  d.alphaControl = alphaControl;
+  d.alphaRef = alphaRef;
   if (pixelSamplerSigns)
     std::memcpy(d.pixelSamplerSigns.data(), pixelSamplerSigns,
                 d.pixelSamplerSigns.size());
@@ -4754,7 +4813,8 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
       (hasVertexStage || (interpolators && interpBytes)) &&
       pixelSamplerCount <= kTranslatedSamplerSlots) {
     // The shader's cbuffer is xe_c[256], then xe_texinv[slots],
-    // xe_texsign[slots], and xe_param_gen, so the buffer must cover all four.
+    // xe_texsign[slots], xe_param_gen and xe_alphatest, so the buffer must
+    // cover all five.
     // Sizing it to the
     // constant bank alone would leave the shader reading past the end of the
     // resource for every unnormalized fetch. Rounded up to 256 bytes, the
@@ -4767,8 +4827,12 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
     const uint32_t texInvBytes = kTranslatedSamplerSlots * 16;
     const uint32_t texSignBytes = kTranslatedSamplerSlots * 16;
     const uint32_t paramGenBytes = 16;
+    const uint32_t alphaTestBytes = 16;
+    const uint32_t colorScaleBytes = 16;
     const uint32_t constBytes =
-        ((bankBytes + texInvBytes + texSignBytes + paramGenBytes) + 255u) &
+        ((bankBytes + texInvBytes + texSignBytes + paramGenBytes +
+          alphaTestBytes + colorScaleBytes) +
+         255u) &
         ~255u;
     // Built only for the CPU-vertex shape. A zero-byte buffer is not a valid
     // D3D12 resource, so this cannot simply fall out of interpBytes == 0.
@@ -4884,6 +4948,38 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
         std::memcpy(static_cast<uint8_t*>(p) + bankBytes + texInvBytes +
                         texSignBytes,
                     pg, sizeof(pg));
+        // xe_alphatest follows xe_param_gen. RB_COLORCONTROL is decoded here
+        // rather than in the shader so that the shader carries no knowledge of
+        // the register layout, and so a wrong bit assignment is one edit away
+        // from the comment that justifies it (hle_types.h, DrawCall::
+        // colour_control -- bits 0-2 the comparison, bit 3 its enable).
+        //
+        // The reference is passed as raw bits through a uint4 rather than
+        // converted: it is a float, and rounding it through an integer member
+        // would quietly move every threshold.
+        uint32_t refBits = 0;
+        std::memcpy(&refBits, &d.alphaRef, 4);
+        const uint32_t at[4] = {d.alphaControl & 7u,
+                                (d.alphaControl >> 3) & 1u, refBits, 0};
+        std::memcpy(static_cast<uint8_t*>(p) + bankBytes + texInvBytes +
+                        texSignBytes + paramGenBytes,
+                    at, sizeof(at));
+        // xe_colorscale follows xe_alphatest. Guest colour formats 4 (k_16_16)
+        // and 5 (k_16_16_16_16) are signed fixed point -32...32; every other
+        // format is already in the range its host format expects.
+        //
+        // ONLY these two. Format 7 (k_16_16_16_16_FLOAT) is a genuine half
+        // float and shares R16G16B16A16_FLOAT with format 5 -- scaling it too
+        // would divide a correct HDR buffer by 32. The guest nibble is the only
+        // thing that separates them, which is exactly why it is carried per
+        // draw instead of being inferred from the host format.
+        const bool fixed16 =
+            d.targetColorFormat == 4u || d.targetColorFormat == 5u;
+        const float cs[4] = {fixed16 ? (1.0f / 32.0f) : 1.0f, 0.0f, 0.0f, 0.0f};
+        std::memcpy(static_cast<uint8_t*>(p) + bankBytes + texInvBytes +
+                        texSignBytes + paramGenBytes + alphaTestBytes,
+                    cs, sizeof(cs));
+        if (fixed16) ++m_fixed16Scaled;
         d.translated = true;
       }
     }

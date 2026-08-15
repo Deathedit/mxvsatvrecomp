@@ -1512,6 +1512,31 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
     // .y classifies the primitive (0 triangle, 1 point, 2 line). This remains
     // draw state because host shaders are cached by guest shader handle.
     src += "  uint4 xe_param_gen;\n";
+    // The guest alpha test: RB_COLORCONTROL's comparison and enable, plus
+    // RB_ALPHA_REF. .x is the xenos::CompareFunction, .y the enable, .z the
+    // reference as raw float bits (the cbuffer member is uint4, so it is
+    // reinterpreted in the shader rather than stored twice).
+    //
+    // DRAW STATE, not a shader permutation, for the same reason xe_param_gen
+    // is: host shaders are cached by guest shader handle, and making the test
+    // part of the key would compile the same shader once per alpha state.
+    src += "  uint4 xe_alphatest;\n";
+    // Colour output scale, .x only. 1/32 for a k_16_16 / k_16_16_16_16 target,
+    // 1.0 for everything else.
+    //
+    // Those two RENDER TARGET formats are signed fixed point -32...32, and a
+    // resolve out of them is NOT bitwise equivalent to the texture format
+    // (SDK xenos.h:566). We resolve with CopyTextureRegion, which IS bitwise,
+    // so the range has to be applied somewhere else -- and the reference puts
+    // it here, on the write, rather than on the copy:
+    //
+    //   "Remap from -32...32 to -1...1, getting the full range."
+    //   color_exp_bias -= 5;        (d3d12_command_processor.cc:4243)
+    //
+    // -5 as an exponent bias is exactly this 1/32. Doing it on the write keeps
+    // the host target holding -1...1, which makes both the resolve and any
+    // direct sample of the target correct without a scaling blit.
+    src += "  float4 xe_colorscale;\n";
   }
   // One entry per emitted vertex fetch: .x the byte offset of this attribute's
   // stream within the merged raw buffer (with first_vertex already folded in),
@@ -1807,6 +1832,52 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   src += em.body;
 
   if (stage == HlslStage::kPixel) {
+    // The alpha test, as a discard. D3D12 has no fixed-function equivalent --
+    // it is the one piece of Xenos output-merger state with nowhere else to go,
+    // and the reference implementation puts it here too
+    // (dxbc_shader_translator_om.cc). Ignoring it is why alpha-cutout geometry
+    // rendered as filled quads: brake rotors as solid discs, and UI plates the
+    // guest masks away entirely as opaque rectangles over the scene.
+    //
+    // Against colour target 0's alpha only, which is the only one the hardware
+    // tests. A shader that writes no target 0 has no alpha to test, so the test
+    // cannot be emitted for it -- xe_color0 does not exist there.
+    //
+    // kNotEqual is spelled `!=` rather than `<` combined with `>`: it must pass
+    // for NaN, and the pair of comparisons does not.
+    if (em.color_mask & 1u) {
+      src +=
+          "  if (xe_alphatest.y != 0) {\n"
+          "    float xe_at_a = xe_color0.w;\n"
+          "    float xe_at_ref = asfloat(xe_alphatest.z);\n"
+          "    bool xe_at_pass;\n"
+          "    switch (xe_alphatest.x) {\n"
+          "      case 0: xe_at_pass = false; break;\n"
+          "      case 1: xe_at_pass = xe_at_a <  xe_at_ref; break;\n"
+          "      case 2: xe_at_pass = xe_at_a == xe_at_ref; break;\n"
+          "      case 3: xe_at_pass = xe_at_a <= xe_at_ref; break;\n"
+          "      case 4: xe_at_pass = xe_at_a >  xe_at_ref; break;\n"
+          "      case 5: xe_at_pass = xe_at_a != xe_at_ref; break;\n"
+          "      case 6: xe_at_pass = xe_at_a >= xe_at_ref; break;\n"
+          "      default: xe_at_pass = true; break;\n"
+          "    }\n"
+          "    if (!xe_at_pass) discard;\n"
+          "  }\n";
+    }
+    // AFTER the alpha test, never before. RB_ALPHA_REF is in the guest's own
+    // colour units, so the test has to compare against the unscaled alpha --
+    // scaling first would divide every fragment's alpha by 32 and compare it
+    // against an unscaled reference, which fails or passes essentially every
+    // pixel depending on the function.
+    //
+    // Scaling here rather than in the emitted ALU also keeps it linear with
+    // respect to blending: every factor the guest uses is linear in the source
+    // colour, so a uniform scale on the output commutes with the blend.
+    for (uint32_t t = 0; t < kMaxColorTargets; ++t) {
+      if (!(em.color_mask & (1u << t))) continue;
+      const std::string n = std::to_string(t);
+      src += "  xe_color" + n + " *= xe_colorscale.x;\n";
+    }
     src += "  XePsOut xe_out;\n";
     for (uint32_t t = 0; t < kMaxColorTargets; ++t) {
       if (!(em.color_mask & (1u << t))) continue;

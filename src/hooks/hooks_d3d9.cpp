@@ -1936,8 +1936,61 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     dc.colour_mask = st.render_state.value[kRsColorWriteEnable] & 0xFu;
     dc.om_seen |= 1u << 0;
   }
-  if (st.render_state.Seen(kRsZEnable)) {
-    if (st.render_state.value[kRsZEnable]) dc.depth_control = (1u << 1) | (1u << 2);
+  // RB_DEPTHCONTROL, from the device's register shadow — the same block base
+  // and the same reason as RB_COLOR_MASK above, RB_BLENDCONTROL0 and
+  // RB_COLORCONTROL below. Register 0x2200 is the m_ControlPacket base itself,
+  // so it sits at device+0x2934 exactly; its two neighbours 0x2201 and 0x2202
+  // are already read at 0x2938 and 0x293C, which is three registers agreeing on
+  // one offset rule.
+  //
+  // This was the LAST output-merger state still coming from the thread-local
+  // D3D9 setter shadow, and it carried both of that shadow's defects:
+  //
+  //   - A draw submitted by a worker that never called SetRenderState(ZENABLE)
+  //     read `Seen` false and got depth_control 0 -- depth silently off -- while
+  //     a worker that had called it once applied that value to every later draw.
+  //     The colour-mask comment above spells out why the shadow cannot be
+  //     trusted for this; depth simply never got the same treatment.
+  //   - z_write was FABRICATED: `if (ZEnable) depth_control = z_enable |
+  //     z_write` set the write bit from the test bit, so D3DRS_ZWRITEENABLE was
+  //     ignored entirely. A UI plate drawn depth-testing but NOT depth-writing
+  //     wrote depth here anyway and occluded everything drawn after it -- which
+  //     is the menu bike disappearing behind the submenu plates, per-pixel, with
+  //     the nearer parts of the bike still showing through.
+  //
+  // Stored RAW, like the other three, so a misread shows up as a wrong number
+  // rather than as a plausible depth mode. Bit layout verified against the
+  // reference (`registers.h:799`): stencil_enable +0, z_enable +1,
+  // z_write_enable +2, zfunc +4..6.
+  //
+  // NOTE: zfunc is carried here but still not honoured downstream -- the
+  // pipelines hardcode LESS_EQUAL. That is a separate known gap and is
+  // deliberately not fixed in the same change, so that a regression in either
+  // one can be attributed.
+  constexpr uint32_t kRbDepthControl = 0x2934;  // RB_DEPTHCONTROL 0x2200
+  if (device && HostPageReadable(REX_RAW_ADDR(device + kRbDepthControl))) {
+    dc.depth_control = REX_LOAD_U32(device + kRbDepthControl);
+    dc.om_seen |= 1u << 1;
+    // One line per DISTINCT value, not the first N draws. A cap on occurrences
+    // would sample whatever happens to run first and say nothing about the
+    // population that matters -- which is exactly how the alpha-test probe
+    // above ended up reporting "enable 0" for a game that uses it 160 times a
+    // frame. Every depth mode the guest actually programs appears here exactly
+    // once, and the set is small.
+    static std::map<uint32_t, uint64_t> s_depth;
+    if (++s_depth[dc.depth_control] == 1 && s_depth.size() <= 32) {
+      REXLOG_INFO("d3d9: RB_DEPTHCONTROL 0x{:08X}: z_enable {} z_write {} "
+                  "zfunc {} stencil {}",
+                  dc.depth_control, (dc.depth_control >> 1) & 1u,
+                  (dc.depth_control >> 2) & 1u, (dc.depth_control >> 4) & 7u,
+                  dc.depth_control & 1u);
+    }
+  } else if (st.render_state.Seen(kRsZEnable)) {
+    // Unreadable register only. Still the old approximation, because there is
+    // nothing better to approximate from -- but it no longer hides the register
+    // read, and it is now the exception rather than the rule.
+    if (st.render_state.value[kRsZEnable])
+      dc.depth_control = (1u << 1) | (1u << 2);
     dc.om_seen |= 1u << 1;
   }
   // The window scissor. Offsets from IDA's own D3DDevice layout rather than
@@ -5219,7 +5272,19 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
          source.host_format == mx::hle::HostTextureFormat::kR8 ||
          source.host_format == mx::hle::HostTextureFormat::kR16 ||
          source.host_format == mx::hle::HostTextureFormat::kR32Float ||
-         source.host_format == mx::hle::HostTextureFormat::kRg8))
+         source.host_format == mx::hle::HostTextureFormat::kRg8 ||
+         // The G-buffer formats join the list on the strongest version of the
+         // same reasoning: they are not merely unlikely to be base colour,
+         // they are render-target storage by construction -- the guest's own
+         // format table only ever asks for them with D3DUSAGE_RENDERTARGET.
+         // An unmapped copy of one is guest memory the skipped dispatch never
+         // wrote.
+         source.host_format == mx::hle::HostTextureFormat::kRg16Float ||
+         source.host_format == mx::hle::HostTextureFormat::kRg16Unorm ||
+         source.host_format == mx::hle::HostTextureFormat::kRg16Snorm ||
+         source.host_format == mx::hle::HostTextureFormat::kRgba16Unorm ||
+         source.host_format == mx::hle::HostTextureFormat::kRgba16Snorm ||
+         source.host_format == mx::hle::HostTextureFormat::kRg32Float))
       continue;
     // An 8x8 immutable texture is a lookup table, not a material. Both that
     // this front end owns are ordered-dither matrices the guest thresholds
@@ -5264,6 +5329,11 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
         break;
       case mx::hle::HostTextureFormat::kR16Float:
       case mx::hle::HostTextureFormat::kRgba16Float:
+      // The four-channel G-buffer formats score with the other render/resolve
+      // intermediates: same origin, same reason they can only be selected
+      // through a mapped host target.
+      case mx::hle::HostTextureFormat::kRgba16Unorm:
+      case mx::hle::HostTextureFormat::kRgba16Snorm:
         // Float descriptors observed in ST_Southwest are render/resolve
         // intermediates. Only the mapped host-target path above may select
         // them; immutable guest copies are black while GPU dispatch is skipped.
@@ -5274,6 +5344,12 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
       // same reason as BC5: two channels is a normal map, a mask pair or a
       // flow field, never the visible base colour of a material.
       case mx::hle::HostTextureFormat::kRg8:
+      // The two-channel G-buffer formats, for the same reason as kRg8: two
+      // channels is never the visible base colour of a material.
+      case mx::hle::HostTextureFormat::kRg16Float:
+      case mx::hle::HostTextureFormat::kRg16Unorm:
+      case mx::hle::HostTextureFormat::kRg16Snorm:
+      case mx::hle::HostTextureFormat::kRg32Float:
         // DXN/BC5 is a normal map. Keep support for inspection and future
         // shader translation, but never prefer it as visible base colour.
         score += mapped_render_target ? 10 : 0;

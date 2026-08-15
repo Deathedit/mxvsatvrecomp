@@ -517,6 +517,28 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
   }
   if (!fetch.base_address) return reject("texture has no base level");
 
+  // Read BEFORE the accept-list, not with the rest of the fetch fields below,
+  // because k_16_16 and k_16_16_16_16 pick their host format from it. Nothing
+  // else in the switch consults it, and the value is a pure function of the
+  // fetch constant, so hoisting it changes nothing for any other format.
+  out.signs = uint8_t((uint32_t(fetch.sign_x) & 3u) |
+                      ((uint32_t(fetch.sign_y) & 3u) << 2) |
+                      ((uint32_t(fetch.sign_z) & 3u) << 4) |
+                      ((uint32_t(fetch.sign_w) & 3u) << 6));
+  // "At least one component is two's complement", the reference's
+  // IsAnySignSigned (texture_util.h:347) spelled out: XOR each 2-bit field
+  // against kSigned(01) and a field that was kSigned becomes 00, so the fold
+  // below finds a zero field exactly when one component was signed.
+  //
+  // The RAW signs, not the swizzled ones. The swizzle decides which host
+  // channel receives which guest component -- and can substitute a literal 0 or
+  // 1, which SwizzleTextureSigns rightly calls unsigned -- but whether the
+  // STORED bits are two's complement is a property of the guest components
+  // themselves, which is what picks the storage format here.
+  const uint32_t sign_xor = uint32_t(out.signs) ^ 0b01010101u;
+  const bool any_component_signed =
+      ((sign_xor | (sign_xor >> 1)) & 0b01010101u) != 0b01010101u;
+
   const auto format = rex::graphics::GetBaseFormat(fetch.format);
   // Recorded before the accept-list so the reject path can name what it hit.
   out.guest_format = uint32_t(format);
@@ -565,15 +587,33 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
     // case already turns the guest's big-endian pair into that order, so host
     // R is guest x and host G is guest y.
     //
-    // WHERE WE STILL DIVERGE: the reference gives this format the host swizzle
+    // WHERE WE STILL DIVERGE -- read this before adding another two-channel
+    // format. The reference gives EVERY two-component row the host swizzle
     // RGGG, replicating the last real channel into z and w, because a Xenos
     // fetch of a two-channel texture returns y there rather than 0/1. We apply
     // the guest swizzle raw against an identity host swizzle (see the note in
-    // d3d12_game.cpp's SRV branch), so a shader asking for .z or .w of a k_8_8
-    // reads what DXGI supplies for the missing channels -- 0 and 1 -- not y.
-    // Not fixed here: the composition affects kR8 (the glyph format) as well,
-    // so it is its own change with its own screenshot, and every observed use
-    // of a two-channel texture reads .xy.
+    // d3d12_game.cpp's SRV branch), so a shader asking for .z or .w of one of
+    // them reads what DXGI supplies for the missing channels -- 0 and 1 -- not
+    // y.
+    //
+    // The affected population is now FOUR formats, not just this one:
+    //
+    //   k_8_8         RGGG   here
+    //   k_16_16       RGGG   below
+    //   k_16_16_FLOAT RGGG   below
+    //   k_32_32_FLOAT RGGG   below
+    //
+    // (k_16_16_16_16 is RGBA -- identity -- so it is NOT affected.) The rows
+    // are d3d12_texture_cache.h's, and the composition is
+    // GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(key)) in
+    // texture_cache.cc:310 -- the guest selector INDEXES the host swizzle, so
+    // a guest .z on an RGGG format resolves to G rather than passing through.
+    //
+    // Still not fixed here, for the original reason: the composition affects
+    // kR8 (the glyph format) as well, so it is its own change with its own
+    // screenshot, and every observed use of a two-channel texture reads .xy.
+    // Adding the three formats below did not change that -- it only widened
+    // the population it would apply to.
     case xenos::TextureFormat::k_8_8:
       out.host_format = HostTextureFormat::kRg8;
       break;
@@ -582,6 +622,53 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
       break;
     case xenos::TextureFormat::k_32_FLOAT:
       out.host_format = HostTextureFormat::kR32Float;
+      break;
+    // THE G-BUFFER FORMATS. The guest's own render-target format table (two
+    // parallel arrays at 0x82D54414 tiled / 0x82D5448C linear, indexed by an
+    // engine format enum and read at 0x82AC3058 and 0x82AC319C with
+    // Usage = D3DUSAGE_RENDERTARGET) asks for nine formats. Five of its nine
+    // were already here; these are the other four, and every one of them is a
+    // surface the deferred passes render into and then sample.
+    //
+    // Sampling one usually takes the resolve-snapshot branch in
+    // BindTranslatedTextures and never reaches this function at all, so these
+    // entries matter on the snapshot MISS path -- which is a real population,
+    // not a hypothetical one, and until now every miss on these four formats
+    // failed the slot fill and dropped the draw to a stand-in.
+    //
+    // Straight passthrough, all four: 1x1 blocks of 4 or 8 bytes whose bytes
+    // are the host's once SwapBlock has run (its dword loop covers both sizes;
+    // an 8-byte block is two dwords, and GpuSwap handles k8in16 within each).
+    // Nothing here needs the value conversion k_24_8 needs below.
+    //
+    // THREE of the four are two-channel, and so inherit the RGGG host-swizzle
+    // divergence written up at k_8_8 above: a guest fetch of .z or .w on
+    // k_16_16, k_16_16_FLOAT or k_32_32_FLOAT reads 0 and 1 here where Xenos
+    // returns y. k_16_16_16_16 is RGBA and is unaffected.
+    case xenos::TextureFormat::k_16_16_FLOAT:
+      out.host_format = HostTextureFormat::kRg16Float;
+      break;
+    case xenos::TextureFormat::k_32_32_FLOAT:
+      out.host_format = HostTextureFormat::kRg32Float;
+      break;
+    // The two FIXED-POINT ones. Not float, and not the -32..32 the render-target
+    // side of these same formats uses: that scale belongs to
+    // ColorRenderTargetFormat 4 and 5 on the WRITE path, where the pixel shader
+    // already divides by 32 (see xe_colorscale in d3d12_game.cpp), so what is
+    // actually in memory is normalized and is read back normalized. Getting
+    // this backwards would be a silent 32x on everything sampled from a
+    // G-buffer.
+    //
+    // UNORM or SNORM by the fetch's own sign bits, exactly as the reference
+    // does it -- see the note on kRg16Unorm in hle_types.h for why the choice
+    // lives here rather than in a typeless resource.
+    case xenos::TextureFormat::k_16_16:
+      out.host_format = any_component_signed ? HostTextureFormat::kRg16Snorm
+                                             : HostTextureFormat::kRg16Unorm;
+      break;
+    case xenos::TextureFormat::k_16_16_16_16:
+      out.host_format = any_component_signed ? HostTextureFormat::kRgba16Snorm
+                                             : HostTextureFormat::kRgba16Unorm;
       break;
     // Depth sampled as a texture. This was the ONLY format rejected across
     // whole runs while it was rejected once per run -- a shader read it, gave
@@ -633,10 +720,7 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
   out.swizzle = fetch.swizzle;
   out.clamp_x = uint32_t(fetch.clamp_x);
   out.clamp_y = uint32_t(fetch.clamp_y);
-  out.signs = uint8_t((uint32_t(fetch.sign_x) & 3u) |
-                      ((uint32_t(fetch.sign_y) & 3u) << 2) |
-                      ((uint32_t(fetch.sign_z) & 3u) << 4) |
-                      ((uint32_t(fetch.sign_w) & 3u) << 6));
+  // out.signs is set above the accept-list, which needs it.
   out.tiled = fetch.tiled != 0;
   out.linear_filter = fetch.min_filter != xenos::TextureFilter::kPoint &&
                       fetch.mag_filter != xenos::TextureFilter::kPoint;

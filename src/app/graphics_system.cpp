@@ -361,7 +361,18 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   d->depth_target_height,
                                   d->depth_target_base, d->surface_base,
                                   (d->render_target_color_info >> 16) & 0xFu,
-                                  d->scissor_seen ? scissor : nullptr);
+                                  d->scissor_seen ? scissor : nullptr,
+                                  // Only when the register shadow was actually
+                                  // readable. `alpha_state_seen` false means we
+                                  // could not read it, not that the test is
+                                  // off, and passing a zeroed control would
+                                  // spell that unreadable state as a decoded
+                                  // "disabled" — which is the same thing here,
+                                  // but only by accident, and would stop being
+                                  // so the moment the enable bit's polarity or
+                                  // position is ever revisited.
+                                  d->alpha_state_seen ? d->colour_control : 0u,
+                                  d->alpha_state_seen ? d->alpha_ref : 0.0f);
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;
