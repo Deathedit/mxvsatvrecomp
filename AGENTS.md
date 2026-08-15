@@ -72,12 +72,6 @@ timestamps, not from `FRAME COST` buckets.
 C++-only change (~15s):
 
 ```bash
-cmake --build out/build/win-amd64-debug --target mx
-```
-
-Release, for anything where frame time is the measurement:
-
-```bash
 cmake --build out/build/win-amd64-release --target mx
 ```
 
