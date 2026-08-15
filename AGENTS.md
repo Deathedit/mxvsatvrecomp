@@ -89,7 +89,7 @@ After editing `mx_config.toml` (mid-ASM hooks, function sizes) — ~70s codegen
 plus a full rebuild:
 
 ```bash
-rexglue codegen --force mx_manifest.toml && cmake --preset win-amd64-debug && cmake --build out/build/win-amd64-debug --target mx
+rexglue codegen --force mx_manifest.toml && cmake --preset win-amd64-release && cmake --build out/build/win-amd64-release --target mx
 ```
 
 **Adding a whole-function hook needs no codegen.** `REX_IMPORT` + `REX_FUNC` in a
