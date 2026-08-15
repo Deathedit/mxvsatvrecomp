@@ -122,7 +122,7 @@ the `ffmpeg/` tree nor the five av*/sw* DLLs are needed, and both are deleted.
 ### Running
 
 ```bash
-./mx.exe --game_data_root=assets --user_data_root=userdata --force_load=NAT_Farm --registry_override=ReadyToLaunch=1
+./mx.exe --game_data_root=assets --user_data_root=userdata
 ```
 
 `--game_data_root` and `--user_data_root` are mandatory — without them the
