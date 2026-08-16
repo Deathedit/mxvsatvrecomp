@@ -15,6 +15,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -163,9 +165,19 @@ extern "C" REX_FUNC(sub_82B6D230) {
 
 // sub_8253AA40 — AssetDB_LoadStateMachine (LoaderTick's gate, 12-state)
 REX_IMPORT(__imp__sub_8253AA40, orig_LoadStateMachine, void());
-// Logs in BOTH modes: in native this is currently unreachable (mid-ASM hooks
-// #7/#8 delete LoaderTick's vt[6] call site), so its absence from the log is
-// itself the signal, and it starts reporting the moment those hooks come off.
+// Logs in BOTH modes. The note that used to sit here — "in native this is
+// currently unreachable (mid-ASM hooks #7/#8 delete LoaderTick's vt[6] call
+// site), so its absence from the log is itself the signal" — is STALE. Every
+// mid-ASM hook in mx_config.toml is commented out, so LoaderTick's vt[6] gate
+// runs and this fires continuously: 1600 calls in a two-minute native run
+// (mx_1196, 2026-08-16). Its absence would now mean something is wrong, not
+// something is skipped.
+//
+// What that run showed: the machine goes 0 -> 1 -> 2 and then stays at 2 for
+// every subsequent tick. State 2 is idle-awaiting-a-request — sub_82534980 is
+// what moves it 2 -> 3, and in a front-end-only run nothing calls it. The
+// AssetDB is healthy and unasked, which is why the UI's own world (UI_World)
+// never loads and the main menu has no stadium behind it.
 extern "C" REX_FUNC(sub_8253AA40) {
   const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
   static int sm = 0;
@@ -878,6 +890,67 @@ std::string BindingName(uint8_t* base, uint32_t fn) {
   return {};
 }
 
+// ---- Binding census --------------------------------------------------------
+//
+// The 5-second sampler below cannot answer "did this binding ever fire". A
+// one-shot call like SwitchToUIWorld [110] fires once in a run and has no
+// meaningful chance of landing on a sampling boundary, so its absence from the
+// log has never been evidence of anything. This is the census that makes the
+// absence mean something — the same mistake as `counter-that-cannot-fire` and
+// the two one-sided probes that hid the frame-pacing bug.
+//
+// One line the first time each distinct C binding is seen, plus a periodic
+// roll-up with counts. `std::map` keyed by guest function address so the
+// roll-up is ordered and stable between runs.
+//
+// Cost: one map lookup per dispatch (~700/min in the front end). BindingName's
+// 228-entry linear scan runs only on a miss, so at most once per distinct
+// binding per run.
+//
+// The precall fires on at least three guest threads (t11624, t17392, t20020 in
+// mx_1196), so the map needs the lock. Do not "optimise" it away.
+std::mutex g_bindingCensusMu;
+std::map<uint32_t, uint64_t> g_bindingCensus;
+
+// Bindings whose absence is the current open question, reported explicitly so a
+// zero is stated rather than inferred from a name missing off a list. Addresses
+// from docs/guest_binary.md "Binding tables".
+struct WatchedBinding {
+  uint32_t addr;
+  const char* name;
+};
+constexpr WatchedBinding kWatchedBindings[] = {
+    {0x824D0F18, "SwitchToUIWorld"},
+    {0x824CD308, "EnableWorld"},
+    {0x824CD280, "StartWorldLoad"},
+    {0x824CBF90, "LoadUIAssetPackage"},
+    {0x824CC218, "LoadUIAssetDatabasePackage"},
+    {0x824CC120, "IsUIAssetPackageLoaded"},
+    {0x824AF3C0, "LoadAssetDB"},
+};
+
+void ReportBindingCensus(uint8_t* base, const char* tag) {
+  std::map<uint32_t, uint64_t> snapshot;
+  {
+    std::lock_guard<std::mutex> lk(g_bindingCensusMu);
+    snapshot = g_bindingCensus;
+  }
+  REXLOG_INFO("{}: BINDING CENSUS — {} distinct C bindings called", tag,
+              snapshot.size());
+  for (const auto& [fn, count] : snapshot) {
+    const std::string name = BindingName(base, fn);
+    REXLOG_INFO("{}:   0x{:08X} x{} {}", tag, fn, count,
+                name.empty() ? "(not in the 228-entry table)" : name);
+  }
+  // State the zeroes. This is the half that a "which bindings fired" list
+  // cannot give you, and it is the half the UI_World question needs.
+  for (const auto& w : kWatchedBindings) {
+    const auto it = snapshot.find(w.addr);
+    REXLOG_INFO("{}:   WATCHED {:<28} 0x{:08X} x{}", tag, w.name, w.addr,
+                it == snapshot.end() ? 0 : it->second);
+  }
+}
+
 }  // namespace
 
 // Replaces the MX_SCRIPT_PROBE that used to sit next to the other script probes
@@ -901,13 +974,34 @@ extern "C" REX_FUNC(sub_82AA7638) {
     }
   }
 
+  // Census first, before the sampler, because this is the part that has to see
+  // every call. `first_sight` is what catches a binding that fires once.
+  bool first_sight = false;
+  if (is_c && cfunc) {
+    std::lock_guard<std::mutex> lk(g_bindingCensusMu);
+    auto [it, inserted] = g_bindingCensus.try_emplace(cfunc, 0);
+    ++it->second;
+    first_sight = inserted;
+  }
+
   static uint64_t s_count = 0;
   static std::chrono::steady_clock::time_point s_last{};
+  static std::chrono::steady_clock::time_point s_last_census{};
   const uint64_t n = ++s_count;
   // Was 200 while this was the instrument hunting the frame-pacing bug. Now
   // that both modes run the front end it fires ~700 times a minute, so the head
   // is small and the rest is sampled. It stays because it is the cheapest
   // "is the front end actually running" signal there is.
+  const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
+
+  // A binding seen for the first time always logs, whatever the sampler says.
+  if (first_sight) {
+    const std::string name = BindingName(base, cfunc);
+    REXLOG_INFO("{}: BINDING FIRST CALL 0x{:08X} {} at dispatch #{} from lr=0x{:08X}",
+                tag, cfunc,
+                name.empty() ? "(not in the 228-entry table)" : name, n, from);
+  }
+
   bool due = n <= 8;
   if (!due) {
     const auto now = std::chrono::steady_clock::now();
@@ -918,10 +1012,21 @@ extern "C" REX_FUNC(sub_82AA7638) {
   }
   if (due) {
     const std::string name = is_c ? BindingName(base, cfunc) : std::string();
-    REXLOG_INFO("{}: vm dispatch #{} {} cfunc=0x{:08X}{}{} from lr=0x{:08X}",
-                mx::native::g_plugin_mode ? "plugin" : "native", n,
+    REXLOG_INFO("{}: vm dispatch #{} {} cfunc=0x{:08X}{}{} from lr=0x{:08X}", tag, n,
                 !is_fn ? "non-function" : (is_c ? "C" : "lua"), cfunc,
                 name.empty() ? "" : " name=", name, from);
+  }
+
+  // Roll-up every 30s. Timestamped, so a binding that fires on a menu
+  // transition can be placed against what was on screen at the time.
+  {
+    const auto now = std::chrono::steady_clock::now();
+    if (s_last_census.time_since_epoch().count() == 0) {
+      s_last_census = now;
+    } else if ((now - s_last_census) >= std::chrono::seconds(30)) {
+      s_last_census = now;
+      ReportBindingCensus(base, tag);
+    }
   }
 
   orig_ScriptDispatch(ctx, base);
