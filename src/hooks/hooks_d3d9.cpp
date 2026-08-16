@@ -1526,6 +1526,75 @@ bool CaptureVertexConstants(uint32_t device, uint8_t* base, uint32_t shader,
   return true;
 }
 
+//---------------------------------------------------------------------------
+// Stencil sizing census.
+//
+// MEASUREMENT ONLY -- nothing branches on any of this. It exists to answer one
+// question before the stencil work is scheduled: how many draws actually want
+// stencil, and how many distinct configurations would have to be translated.
+// We have no stencil at all today (depth surfaces are D32_FLOAT with no
+// stencil plane and StencilEnable is never set), and implementing it means
+// changing the depth format on every surface and DSV, so it should not start
+// on a guess about how much of the frame cares.
+//
+// The population has to be right or the number is worthless. Two traps:
+//
+//   - RB_DEPTHCONTROL.stencil_enable ALONE over-counts. Xenia gates the whole
+//     register on RB_MODECONTROL.edram_mode: outside kColorDepth (4) and
+//     kDepthOnly (5) both depth AND stencil are ignored by the hardware, and
+//     it returns a zeroed RB_DEPTHCONTROL
+//     (xenia/gpu/draw_util.cc:90, GetNormalizedDepthControl). So a draw can
+//     have the bit set and mean nothing by it. Both are counted separately
+//     here and the honest figure is the AND.
+//   - Draws whose register was unreadable are counted too, so the denominator
+//     is every draw that reached the read rather than only the ones that
+//     answered.
+//
+// Register offsets follow the block rule this file already establishes three
+// times over (see the window-scissor comment below): 0x28C0 is register
+// 0x2080, 0x28CC is 0x2100, 0x2934 is 0x2200, four bytes per register within
+// a block. RB_MODECONTROL is 0x2208 -> 0x2954; RB_STENCILREFMASK is 0x210D ->
+// 0x2900. Field layouts are the reference's (`registers.h:798` and `:821`).
+std::mutex g_stencilCensusMu;
+uint64_t g_stencilDrawsSeen = 0;        // reached the RB_DEPTHCONTROL read
+uint64_t g_stencilDrawsUnreadable = 0;  // ...and could not read it
+uint64_t g_stencilBitSet = 0;           // stencil_enable, mode ignored
+uint64_t g_stencilEffective = 0;        // stencil_enable AND edram_mode says so
+std::map<uint32_t, uint64_t> g_edramModes;  // edram_mode -> draws
+// (depth_control, stencilrefmask) -> draws, for stencil-effective draws only.
+std::map<std::pair<uint32_t, uint32_t>, uint64_t> g_stencilConfigs;
+
+void NoteStencilCensusUnreadable() {
+  std::lock_guard<std::mutex> lk(g_stencilCensusMu);
+  ++g_stencilDrawsSeen;
+  ++g_stencilDrawsUnreadable;
+}
+
+void NoteStencilCensus(uint32_t depth_control, uint32_t device, uint8_t* base) {
+  constexpr uint32_t kRbModeControl = 0x2954;      // RB_MODECONTROL   0x2208
+  constexpr uint32_t kRbStencilRefMask = 0x2900;   // RB_STENCILREFMASK 0x210D
+  // 0xFFFFFFFF distinguishes "could not read" from any real register value;
+  // edram_mode is 3 bits so no genuine reading can collide with it.
+  uint32_t edram_mode = 0xFFFFFFFFu;
+  uint32_t refmask = 0xFFFFFFFFu;
+  if (device && HostPageReadable(REX_RAW_ADDR(device + kRbModeControl)))
+    edram_mode = REX_LOAD_U32(device + kRbModeControl) & 0x7u;
+  if (device && HostPageReadable(REX_RAW_ADDR(device + kRbStencilRefMask)))
+    refmask = REX_LOAD_U32(device + kRbStencilRefMask);
+
+  const bool bit = (depth_control & 1u) != 0;
+  const bool mode_honours = (edram_mode == 4u || edram_mode == 5u);
+
+  std::lock_guard<std::mutex> lk(g_stencilCensusMu);
+  ++g_stencilDrawsSeen;
+  ++g_edramModes[edram_mode];
+  if (bit) ++g_stencilBitSet;
+  if (bit && mode_honours) {
+    ++g_stencilEffective;
+    ++g_stencilConfigs[{depth_control, refmask}];
+  }
+}
+
 bool FinishHleDraw(mx::hle::DrawCall& dc) {
   mx::hle::HleSkip skip = mx::hle::HleSkip::kNone;
   if (!mx::hle::FinalizeHleTopology(dc, skip)) {
@@ -2074,6 +2143,7 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
                   (dc.depth_control >> 2) & 1u, (dc.depth_control >> 4) & 7u,
                   dc.depth_control & 1u);
     }
+    NoteStencilCensus(dc.depth_control, device, base);
   } else if (st.render_state.Seen(kRsZEnable)) {
     // Unreadable register only. Still the old approximation, because there is
     // nothing better to approximate from -- but it no longer hides the register
@@ -2081,6 +2151,7 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     if (st.render_state.value[kRsZEnable])
       dc.depth_control = (1u << 1) | (1u << 2);
     dc.om_seen |= 1u << 1;
+    NoteStencilCensusUnreadable();
   }
   // The window scissor. Offsets from IDA's own D3DDevice layout rather than
   // arithmetic: m_WindowPacket sits at device+0x28C0 and is three dwords, and
@@ -8523,6 +8594,44 @@ void ReportDrawCounts(uint8_t* base) {
   REXLOG_INFO("d3d9: draws — DrawIndexedVertices={} DrawVertices={} "
               "DrawVerticesUP={} total={}",
               g_indexed_draws, g_draws, g_up_draws, total);
+  // Stencil sizing. See the census at its definition for why the effective
+  // count is not just the enable bit. Printed here rather than at first sight
+  // of each config because sizing needs the TOTALS, and a first-sight line
+  // always reports a count of one.
+  {
+    std::lock_guard<std::mutex> lk(g_stencilCensusMu);
+    std::string modes;
+    for (const auto& [mode, n] : g_edramModes) {
+      const char* name = mode == 0   ? "NoOperation"
+                         : mode == 4 ? "ColorDepth"
+                         : mode == 5 ? "DepthOnly"
+                         : mode == 6 ? "Copy"
+                         : mode == 0xFFFFFFFFu ? "UNREADABLE"
+                                               : "reserved";
+      modes += fmt::format(" {}({})={}", name, mode, n);
+    }
+    REXLOG_INFO("d3d9: STENCIL census — {} draws reached the read ({} could "
+                "not); enable bit set {}, of which {} are in an edram_mode "
+                "that honours it; {} distinct configs; edram_mode:{}",
+                g_stencilDrawsSeen, g_stencilDrawsUnreadable, g_stencilBitSet,
+                g_stencilEffective, g_stencilConfigs.size(), modes);
+    // One line per distinct configuration, so the translation work is a
+    // countable list rather than an impression.
+    for (const auto& [key, n] : g_stencilConfigs) {
+      const uint32_t dc_bits = key.first;
+      const uint32_t rm = key.second;
+      REXLOG_INFO("d3d9:   stencil cfg depthcontrol=0x{:08X} refmask=0x{:08X}"
+                  " x{} — func {} fail {} zpass {} zfail {} backface {}"
+                  " (bf func {} fail {} zpass {} zfail {});"
+                  " ref {} mask 0x{:02X} writemask 0x{:02X}",
+                  dc_bits, rm, n, (dc_bits >> 8) & 7u, (dc_bits >> 11) & 7u,
+                  (dc_bits >> 14) & 7u, (dc_bits >> 17) & 7u,
+                  (dc_bits >> 7) & 1u, (dc_bits >> 20) & 7u,
+                  (dc_bits >> 23) & 7u, (dc_bits >> 26) & 7u,
+                  (dc_bits >> 29) & 7u, rm & 0xFFu, (rm >> 8) & 0xFFu,
+                  (rm >> 16) & 0xFFu);
+    }
+  }
   // The ALU constant file. `repaired 0` is only meaningful next to a non-zero
   // `constants seen` — with zero seen, the PM4 feed is not reaching the file and
   // the repair count says nothing at all.
