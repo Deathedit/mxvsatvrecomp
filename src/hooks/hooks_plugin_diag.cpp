@@ -915,6 +915,59 @@ std::string BindingName(uint8_t* base, uint32_t fn) {
 // improved on: a bounds check against p+48 would rest on an offset the game
 // never reads here, which is the kind of extrapolation this file keeps paying
 // for.
+// ---- Which CHUNKS execute at all -------------------------------------------
+//
+// The binding census can only name a script that calls a C binding, so
+// "FE_Background is not in the list" was never evidence that it did not run.
+// This closes that: executing a Lua chunk means CALLING its main function, so
+// every chunk that runs at all passes through precall as a Lua callee.
+//
+// The population to compare against is the shipped manifest --
+// `assets/Database/MXUI.xenon.database` declares 539 script assets over 82
+// distinct names, readable with tools/bxml_full_decoder.py. Anything in that 82
+// and absent here never executed.
+//
+// Keyed by PROTO address, not by name: one chunk has many Protos and the name
+// resolution is a guest string walk, so keying by proto makes it one map lookup
+// per dispatch and one string build per distinct function per run -- the same
+// shape as the binding census. Names collapse in the report.
+std::mutex g_chunkCensusMu;
+std::map<uint32_t, std::string> g_chunkCensus;
+
+std::string ProtoSource(uint8_t* base, uint32_t p) {
+  if (!p) return {};
+  const uint32_t source = REX_LOAD_U32(p + 32);
+  // getstr(): the chars follow the TString header at +16. Confirmed against
+  // sub_82AA9B70 -- see LuaCallerSite.
+  if (!source) return {};
+  std::string s = GuestString(base, source + 16, 96);
+  // A chunk name is NOT always a name. Lua uses the loaded string itself as the
+  // chunkname for a loadstring() chunk, and this title leans on that: the UI
+  // instantiates every page with `FE_Background_33 = FE_Background:New()` and
+  // that whole snippet arrives here as the "source". Some carry comment text
+  // and EMBEDDED NEWLINES, which put a single log entry across many lines and
+  // break every grep the log is read with -- the first census printed 134
+  // chunks across ~70 physical lines and looked empty.
+  for (char& c : s)
+    if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+  if (s.size() > 72) s = s.substr(0, 69) + "...";
+  return s;
+}
+
+void NoteChunk(uint8_t* base, uint32_t proto) {
+  if (!proto) return;
+  {
+    std::lock_guard<std::mutex> lk(g_chunkCensusMu);
+    if (g_chunkCensus.count(proto)) return;
+  }
+  // Resolved outside the lock; a duplicate resolve on a race is harmless and
+  // costs one string.
+  std::string s = ProtoSource(base, proto);
+  if (s.empty()) return;
+  std::lock_guard<std::mutex> lk(g_chunkCensusMu);
+  g_chunkCensus.emplace(proto, std::move(s));
+}
+
 std::string LuaCallerSite(uint8_t* base, uint32_t L) {
   if (!L) return {};
   // L->ci is still the CALLER's frame -- precall pushes the callee's, and this
@@ -1008,6 +1061,24 @@ void ReportBindingCensus(uint8_t* base, const char* tag) {
                 name.empty() ? "(not in the 228-entry table)" : name,
                 e.first_caller.empty() ? "?" : e.first_caller);
   }
+  // Every Lua chunk that has executed, collapsed by name. Compare against the
+  // 82 distinct script names in MXUI.xenon.database: a name shipped there and
+  // missing here never ran, and FE_Background is the one that question was
+  // asked for.
+  {
+    std::map<uint32_t, std::string> chunks;
+    {
+      std::lock_guard<std::mutex> lk(g_chunkCensusMu);
+      chunks = g_chunkCensus;
+    }
+    std::map<std::string, uint32_t> by_name;
+    for (const auto& [proto, name] : chunks) ++by_name[name];
+    std::string list;
+    for (const auto& [name, protos] : by_name)
+      list += fmt::format(" {}({})", name, protos);
+    REXLOG_INFO("{}: CHUNK CENSUS — {} distinct Lua chunks executed, {} protos:{}",
+                tag, by_name.size(), chunks.size(), list);
+  }
   // State the zeroes. This is the half that a "which bindings fired" list
   // cannot give you, and it is the half the UI_World question needs.
   for (const auto& w : kWatchedBindings) {
@@ -1040,7 +1111,10 @@ extern "C" REX_FUNC(sub_82AA7638) {
     closure = REX_LOAD_U32(func);
     if (closure) {
       is_c = REX_LOAD_U8(closure + 6) != 0;
+      // +16 is the C function for a C closure and the Proto for a Lua one --
+      // the union the reference calls `c.f` / `l.p`.
       if (is_c) cfunc = REX_LOAD_U32(closure + 16);
+      else NoteChunk(base, REX_LOAD_U32(closure + 16));
     }
   }
 
