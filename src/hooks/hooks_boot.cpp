@@ -93,7 +93,15 @@ extern "C" REX_FUNC(sub_82373660) {
     orig_TexManager(ctx, base);
     return;
   }
-  REXLOG_INFO("native: TexManager (0x82373660)");
+  // Same cap as the plugin branch above, deliberately — the second instance of
+  // the GpuAlloc gate mismatch. This branch had no cap at all and logged every
+  // call: 7,910 lines in mx_1270, 9.7% of the whole log, on the guest's own
+  // thread. The counter is carried so the surviving lines say WHICH call they
+  // are, which an uncapped line could not.
+  static int tm = 0;
+  ++tm;
+  if (tm <= 5 || (tm % 1000) == 0)
+    REXLOG_INFO("native: TexManager #{} (0x82373660)", tm);
   orig_TexManager(ctx, base);
 }
 
