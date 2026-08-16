@@ -1038,8 +1038,21 @@ extern "C" REX_FUNC(sub_8255B258) {
     clear.render_target_height = target.height;
     clear.surface_base = target.color_info & 0xFFFu;
     mx::hle::HleFrameDraws().push_back(std::move(clear));
-    static std::set<uint32_t> s_logged;
-    if (s_logged.insert(target.object).second && s_logged.size() <= 32) {
+    // Keyed on (target, COLOUR), not on the target alone. Deduping by target
+    // logged only the FIRST colour each surface was ever cleared to and
+    // silently swallowed every later one -- so a run whose targets are first
+    // cleared to black reads as "this game only ever clears to 0x00000000",
+    // which is not a measurement of the clear colours at all. That reading was
+    // used to argue a mid-grey clear could not be the guest's, and it could not
+    // support the claim.
+    //
+    // Same correction as the texture-reject log above, which is keyed on
+    // (format, reason) for exactly this reason. The budget is per distinct
+    // pair, so a surface cleared to two colours costs two lines, not one per
+    // clear.
+    static std::set<std::pair<uint32_t, uint32_t>> s_logged;
+    if (s_logged.insert({target.object, color}).second &&
+        s_logged.size() <= 64) {
       REXLOG_INFO("d3d9: CLEAR target 0x{:08X} {}x{} color=0x{:08X} "
                   "flags=0x{:X}",
                   target.object, target.width, target.height, color, flags);
@@ -1353,8 +1366,17 @@ extern "C" REX_FUNC(sub_8255CE98) {
       }
       mx::hle::HleFrameDraws().push_back(std::move(clear));
 
-      static uint32_t s_resolveClearLogs = 0;
-      if (s_resolveClearLogs++ < 12) {
+      // Was a flat "first 12" cap, which spends its whole budget on whatever
+      // happens at boot -- here, twelve identical (0,0,0,0) lines -- and can
+      // never show a DIFFERENT colour arriving later. Keyed on the colour
+      // itself instead, so each distinct clear colour reports once however late
+      // it first appears. Same correction as the CLEAR log above.
+      static std::set<std::array<uint32_t, 4>> s_resolveClearColors;
+      const auto& cc = mx::hle::HleFrameDraws().back().clear_color_float;
+      std::array<uint32_t, 4> key{};
+      for (uint32_t i = 0; i < 4; ++i) std::memcpy(&key[i], &cc[i], 4);
+      if (s_resolveClearColors.insert(key).second &&
+          s_resolveClearColors.size() <= 32) {
         const auto& c = mx::hle::HleFrameDraws().back().clear_color_float;
         REXLOG_INFO(
             "d3d9: resolve 0x{:08X} clears source 0x{:08X} after copy to "
