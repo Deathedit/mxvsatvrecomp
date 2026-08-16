@@ -4,8 +4,10 @@
 // command ring is still parsed and applied to the Xenos register shadow here,
 // but purely as diagnostics — the translation to draw calls is gone, and the
 // frame's draws now come from the D3D9 HLE path. The rest are the guest's
-// Begin/End frame entry points, which the native path stubs out because there
-// is no Xenos GPU behind them.
+// Begin/End frame entry points. Those used to be stubbed out natively because
+// "there is no Xenos GPU behind them"; that predates the D3D9 HLE layer and
+// four of the five were unhooked on 2026-08-16 — see the GPU-call-stubs block
+// below. Only the frame-pending poll still returns a fabricated value.
 //
 // Two ranges, and the distinction matters more than anything else in this file:
 //
@@ -217,6 +219,22 @@ extern "C" REX_FUNC(sub_82566B58) {
     auto& frame_packets = frame_parser.Packets();
     auto& swap_packets = swap_parser.Packets();
 
+    // Feed the ALU constant file on EVERY parsed swap, deliberately outside the
+    // gate below. That gate exists to keep the noisy per-packet logging and the
+    // register-diff dump off the hot path, and it only lets swaps <= 20 plus
+    // three checkpoints through — so anything hung off it stops updating ~20
+    // frames into a run. A constant file that stale is worse than none.
+    //
+    // Cheap by construction: one range test per Type0 packet, and only ALU
+    // constants (0x4000..0x47FF) are stored. See mx::gpu::alu.
+    for (const auto* list : {&frame_packets, &swap_packets}) {
+      for (const auto& p : *list) {
+        if (p.type != mx::pm4::PacketType::Type0 || p.body.empty()) continue;
+        mx::gpu::alu::NoteType0Write(p.reg_base, p.body.data(),
+                                     static_cast<uint32_t>(p.body.size()));
+      }
+    }
+
     // Only write dump files for spot-check swaps — keeps the disk clean when
     // we're parsing every swap looking for indexed draws.
     bool should_dump_file = (swap_count <= 20) ||
@@ -427,52 +445,70 @@ extern "C" REX_FUNC(sub_82BFBF30) {
 }
 
 //=============================================================================
-// GPU call stubs
+// GPU call stubs — UNHOOKED 2026-08-16
+//
+// These four ran an empty body in native mode and the guest original only under
+// the plugin. That divergence is now closed: all four call the original in both
+// modes, and the only thing left mode-specific is the log tag.
+//
+// Why: the plugin path loads `UI_World` — the 3D level the UI system owns, and
+// the main menu's stadium backdrop — and native does not. Native issues exactly
+// one AssetDB_RequestLoad in a whole run (`FR_Dunes`) and never asks for
+// `UI_World` at all, while submitting every draw the guest gives it (1,709,357
+// translated, 0 dropped). So the divergence is upstream of the renderer, and
+// these were the only native-only overrides left in the frame path.
+//
+// The stubs date from before the D3D9 HLE layer, when "there is no Xenos GPU
+// behind them" was true of the whole backend. It is not any more.
+//
+// If this reintroduces a hang or an access violation, the two to suspect are
+// BeginFrame (sub_82ABF828), which reaches XenonRenderer at gs+80, and
+// GpuStateXenos, whose original had not run past call #3 in native since it was
+// written. Revert per-hook rather than wholesale — knowing WHICH one is the
+// point of the change.
 //=============================================================================
 
 REX_IMPORT(__imp__sub_8255D430, orig_BeginFrameXenos, void());
 extern "C" REX_FUNC(sub_8255D430) {
-  if (mx::native::g_plugin_mode) { orig_BeginFrameXenos(ctx, base); return; }
+  orig_BeginFrameXenos(ctx, base);
 }
 
 REX_IMPORT(__imp__sub_8255D470, orig_EndFrameXenos, void());
 extern "C" REX_FUNC(sub_8255D470) {
-  if (mx::native::g_plugin_mode) { orig_EndFrameXenos(ctx, base); return; }
+  orig_EndFrameXenos(ctx, base);
 }
 
+// The native branch used to call the original INSIDE `if (gs <= 3)`, so what
+// reads as a log throttle was a stub: from call #4 the guest function never ran.
+// The log shows exactly that — `GpuState #1/#2/#3`, then silence for the rest of
+// the run. The throttle now covers only the logging, which is what its shape
+// always implied.
 REX_IMPORT(__imp__sub_8255D520, orig_GpuStateXenos, void());
 extern "C" REX_FUNC(sub_8255D520) {
-  if (mx::native::g_plugin_mode) {
-    static int gs = 0;
-    ++gs;
-    if (gs <= 3)
-      REXLOG_INFO("plugin: GpuState #{}", gs);
-    orig_GpuStateXenos(ctx, base);
-    return;
-  }
+  const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
   static int gs = 0;
   ++gs;
-  if (gs <= 3) {
-    REXLOG_INFO("native: GpuState #{} — calling orig", gs);
-    orig_GpuStateXenos(ctx, base);
-    REXLOG_INFO("native: GpuState #{} — returned", gs);
-  }
+  const bool loud = gs <= 3 || (gs % 600) == 0;
+  if (loud) REXLOG_INFO("{}: GpuState #{} — calling orig", tag, gs);
+  orig_GpuStateXenos(ctx, base);
+  if (loud) REXLOG_INFO("{}: GpuState #{} — returned", tag, gs);
 }
 
 //=============================================================================
-// sub_82ABF828 — Begin frame (stubbed — accesses XenonRenderer at gs+80)
+// sub_82ABF828 — Begin frame. UNHOOKED 2026-08-16, see the block above.
+//
+// The old comment read "(stubbed — accesses XenonRenderer at gs+80)". That is
+// still the hazard to watch: if this faults, gs+80 is where to look, and this
+// is the first of the four to put back.
 //=============================================================================
 
 REX_IMPORT(__imp__sub_82ABF828, orig_BeginFrame, void());
 extern "C" REX_FUNC(sub_82ABF828) {
-  if (mx::native::g_plugin_mode) {
-    static int bf = 0;
-    ++bf;
-    if (bf <= 3 || (bf % 600) == 0)
-      REXLOG_INFO("plugin: BeginFrame #{}", bf);
-    orig_BeginFrame(ctx, base);
-    return;
-  }
+  static int bf = 0;
+  ++bf;
+  if (bf <= 3 || (bf % 600) == 0)
+    REXLOG_INFO("{}: BeginFrame #{}", mx::native::g_plugin_mode ? "plugin" : "native", bf);
+  orig_BeginFrame(ctx, base);
 }
 
 //=============================================================================
@@ -498,6 +534,13 @@ extern "C" REX_FUNC(sub_82ABF930) {
 // sub_8255CFE0 — GPU frame-pending poll (spin loop in VdSwap at 0x82567178).
 // Without GPU, the counter never advances → infinite spin. Stub to return 0
 // ("not pending") to break the loop and let EndFrame #2+ complete.
+//
+// DELIBERATELY NOT UNHOOKED with the other four on 2026-08-16. This one is not
+// an empty body that discards work — it returns a value the guest spins on, and
+// the counter it would poll is a Xenos GPU register that our D3D12 backend does
+// not advance. Passing it through hangs VdSwap on the second frame rather than
+// telling us anything. If the other four turn out not to be the UI_World lever,
+// this needs the counter written from the host first, not the guard removed.
 //=============================================================================
 REX_IMPORT(__imp__sub_8255CFE0, orig_FramePendingPoll, int());
 extern "C" REX_FUNC(sub_8255CFE0) {

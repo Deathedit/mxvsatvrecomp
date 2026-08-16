@@ -9,6 +9,60 @@
 
 namespace mx::gpu {
 
+// ---- The ALU constant file, as the GPU actually receives it ----------------
+//
+// Some guest ALU constants never pass through the D3D9 device shadow OR a
+// shader's constant-load table: the runtime writes them straight into the
+// register file as Type-0 PM4, and on hardware that file is PERSISTENT. We
+// rebuild the bank per draw from the two sources we do model, so any register
+// published only that way is left as whatever was in the upload buffer.
+//
+// Measured 2026-08-16 across every pm4_dump_native_frame_*.txt:
+//
+//     122 x  Type0 reg=SHADER_CONSTANT_384_X(0x4600) cnt=48
+//
+// 0x4600 is ALU dword 1536 = constant c384, and 48 dwords is 12 float4s, so
+// that one packet publishes c384..c395. Guest c394 is xe_c[138] in the rebased
+// pixel bank, and it read as NaN — which saturated a full-screen draw to white
+// and is why the legal, start and main-menu screens have no background. See the
+// `white-backdrop-is-nan-c138` note.
+//
+// This is NOT the LOAD_ALU_CONSTANT path. That one only ever targets index
+// 0x3F0/0x7F0 (c252-255, c508-511) in this title and ApplyShaderLoadTable
+// already handles it correctly, verified against sub_825656A0 in IDA.
+namespace alu {
+
+// Registers are Xenos register indices, i.e. 0x4000 + 4*constant. Writes
+// outside [0x4000, 0x4800) are ignored; this file holds ALU constants only.
+constexpr uint32_t kAluRegBase = 0x4000;
+constexpr uint32_t kAluRegEnd = 0x4800;   // fetch constants start here
+constexpr uint32_t kAluConstants = 512;   // float4s, vertex 0-255 / pixel 256-511
+
+void NoteType0Write(uint32_t reg_base, const uint32_t* data, uint32_t count);
+
+// Fill non-finite entries of `bank` from the file, for the `reg_count` float4
+// constants starting at `first_reg`. Returns how many dwords were replaced.
+//
+// Deliberately narrow: it only touches components our own sources left as NaN
+// or Inf, so a register the device shadow or the load table set correctly can
+// never be clobbered by an end-of-frame PM4 value. It also does NOT invent a
+// value — a register the PM4 stream never wrote either is left alone, which is
+// the line `hle_sanitize_constants` crossed when it zeroed non-finites and was
+// retired for it.
+uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
+                          uint32_t reg_count);
+
+// Dwords written by PM4, dwords repaired, and how many distinct constants the
+// file has ever seen written. For the report line.
+// `zeroed` counts NaN components nothing ever published, set to the register
+// file's power-on 0.0. Reported separately from `repaired` because the two are
+// different claims: one replays a value the GPU was given, the other supplies
+// the hardware default.
+void Stats(uint64_t& written, uint64_t& repaired, uint32_t& constants_seen,
+           uint64_t& zeroed);
+
+}  // namespace alu
+
 class XenosGpuState {
  public:
   XenosGpuState() = default;

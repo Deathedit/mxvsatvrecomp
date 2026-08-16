@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <array>
+#include <mutex>
 
 #include <rex/logging.h>
 
@@ -56,8 +57,121 @@ uint32_t XenosGpuState::ReadRegister(uint32_t reg) const {
   return it != regs_.end() ? it->second : 0;
 }
 
+namespace alu {
+namespace {
+
+constexpr uint32_t kFileDwords = kAluConstants * 4;
+
+std::mutex g_mu;
+uint32_t g_file[kFileDwords] = {};
+// One bit per dword. Without it "never written" and "written as 0.0" are the
+// same value, and repairing a register nobody published would be inventing one.
+uint32_t g_have[kFileDwords / 32] = {};
+uint64_t g_written = 0;
+uint64_t g_repaired = 0;
+uint64_t g_zeroed = 0;
+
+bool NonFinite(uint32_t bits) {
+  // IEEE-754: exponent all ones is Inf (mantissa 0) or NaN (mantissa non-zero).
+  return (bits & 0x7F800000u) == 0x7F800000u;
+}
+
+}  // namespace
+
+void NoteType0Write(uint32_t reg_base, const uint32_t* data, uint32_t count) {
+  if (reg_base >= kAluRegEnd || reg_base + count <= kAluRegBase) return;
+  std::lock_guard<std::mutex> lk(g_mu);
+  for (uint32_t i = 0; i < count; ++i) {
+    const uint32_t reg = reg_base + i;
+    if (reg < kAluRegBase || reg >= kAluRegEnd) continue;
+    const uint32_t d = reg - kAluRegBase;
+    if (d >= kFileDwords) continue;
+    // A NaN never counts as PUBLISHED. Two reasons, and the second is the one
+    // that bit:
+    //
+    //  - no guest ever means NaN as a constant, so recording one as
+    //    authoritative can only ever suppress a better answer;
+    //  - the frame-range walk covers [prev_after, write_before) of the ring,
+    //    which can include bytes the guest has not written this frame. Garbage
+    //    there decodes as a plausible Type0 write and would otherwise stamp a
+    //    `have` bit over a register nothing really published.
+    //
+    // Measured 2026-08-16: with NaN allowed to publish, the file claimed 362
+    // constants and 4.2M dwords — far more than the ALU-range Type0 writes
+    // present in any pm4_dump_native_frame_*.txt — and c136..c139 stayed NaN
+    // because OverlayNonFinite saw them as published and declined to substitute
+    // the power-on 0.0.
+    if ((data[i] & 0x7F800000u) == 0x7F800000u && (data[i] & 0x007FFFFFu) != 0)
+      continue;
+    g_file[d] = data[i];
+    g_have[d >> 5] |= 1u << (d & 31);
+    ++g_written;
+  }
+}
+
+uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
+                          uint32_t reg_count) {
+  if (!bank || first_reg >= kAluConstants) return 0;
+  const uint32_t regs = std::min(reg_count, kAluConstants - first_reg);
+  uint32_t fixed = 0;
+  std::lock_guard<std::mutex> lk(g_mu);
+  for (uint32_t i = 0; i < regs * 4; ++i) {
+    const uint32_t cur = bank[i];
+    if (!NonFinite(cur)) continue;
+    const uint32_t d = first_reg * 4 + i;
+    const bool published = (g_have[d >> 5] & (1u << (d & 31))) != 0;
+    if (published && !NonFinite(g_file[d])) {
+      bank[i] = g_file[d];
+      ++fixed;
+      continue;
+    }
+    // Nothing published it. On hardware the constant is not garbage — the Xenos
+    // register file POWERS ON ZEROED, and a title reading a constant it never
+    // wrote gets 0.0. Xenia models exactly that: RegisterFile::RegisterFile()
+    // is `memset(values, 0, sizeof(values))` with non-zero reset defaults for a
+    // handful of context registers, none of them ALU constants
+    // (register_file.cc:18). We rebuild the bank per draw out of a device
+    // shadow whose backing memory the guest has not written yet, so we hand the
+    // shader dirty heap instead.
+    //
+    // Measured: c136..c139 are NaN for a BOUNDED PREFIX of each shader's draws
+    // and finite forever after — the NaN counts freeze while the finite counts
+    // climb — so this is startup order, not a missing publisher. The legal,
+    // loading and start screens all live in that prefix, which is why they have
+    // no background: a NaN interpolator saturates the backdrop draw to white.
+    //
+    // NaN ONLY, never Inf, and that limit is the whole difference from
+    // `hle_sanitize_constants`, which was retired for zeroing every non-finite
+    // constant on every draw forever. A guest can legitimately compute +Inf and
+    // mean it (see the divide-by-zero exposure path); no guest ever means NaN.
+    if (!published && (cur & 0x007FFFFFu) != 0) {
+      bank[i] = 0;
+      ++g_zeroed;
+    }
+  }
+  g_repaired += fixed;
+  return fixed;
+}
+
+void Stats(uint64_t& written, uint64_t& repaired, uint32_t& constants_seen,
+           uint64_t& zeroed) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  written = g_written;
+  repaired = g_repaired;
+  zeroed = g_zeroed;
+  uint32_t seen = 0;
+  for (uint32_t c = 0; c < kAluConstants; ++c) {
+    const uint32_t d = c * 4;
+    if (g_have[d >> 5] & (1u << (d & 31))) ++seen;
+  }
+  constants_seen = seen;
+}
+
+}  // namespace alu
+
 void XenosGpuState::ApplyType0Write(uint32_t reg_base, const uint32_t* data,
                                      uint32_t count) {
+  alu::NoteType0Write(reg_base, data, count);
   for (uint32_t i = 0; i < count; ++i) {
     WriteRegister(reg_base + i, data[i]);
   }
