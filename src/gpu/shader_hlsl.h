@@ -219,6 +219,21 @@ struct HlslShader {
   // gap is real and this is how it stays visible.
   uint32_t unhonoured_predicate_ops = 0;
 
+  // Count of PREDICATED EXEC blocks — kCondExecPred / kCondExecPredClean and
+  // their *End forms. These are the other half of the same gap, and the more
+  // dangerous half: the emitter walks them like ordinary execs, so their body
+  // runs UNCONDITIONALLY. A shader with a non-zero count here is not merely
+  // missing p0's effect, it is running instructions the console gated off.
+  //
+  // Counted rather than refused, for now, and the distinction matters. The
+  // refusal rule in IsUnsupportedCf exists because "a straight-line body for a
+  // shader that branches produces confidently wrong pixels" — which is exactly
+  // what this is. The reason it is a counter first is that the population was
+  // never measured: if it is zero on this game, the setp_* value translation is
+  // harmless and there is nothing to refuse. If it is non-zero, this names the
+  // shaders to decide about, instead of refusing a working draw on suspicion.
+  uint32_t predicated_exec_blocks = 0;
+
   // Count of fetch instructions skipped because their opcode is not one this
   // emitter implements — the getTextureGradients / getTextureWeights /
   // getCompTexLOD / getBCF family, everything in FetchOpcode at 16 and above

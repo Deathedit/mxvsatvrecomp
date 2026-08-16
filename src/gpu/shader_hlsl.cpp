@@ -484,10 +484,51 @@ class Emitter {
             ") ? 1.0 : 0.0)";
         break;
       }
+      // The setp_*_push family, opcodes 20..23. The comment that used to sit in
+      // `default` said these "have not appeared in a shader captured here".
+      // That was true when it was written and is not any more: in mx_1270,
+      // ps 0x267C2620 is the ONLY untranslated pixel shader in the run (175 of
+      // 176 translate), it is refused for exactly this opcode, and it is aimed
+      // at the 1280x720 scene target 1785 times -- every one of those draws
+      // then dropped by the fabricated-white guard because an untranslated
+      // draw has no colour source.
+      //
+      // Transcribed from ucode.h (kSetpEqPush..kSetpGePush), which specifies
+      // both halves exactly:
+      //
+      //   p0   = (src0.w == 0.0 && src1.w CMP 0.0)
+      //   dest = (src0.x == 0.0 && src1.x CMP 0.0) ? 0.0 : src0.x + 1.0
+      //
+      // CMP is ==, !=, > or >= per opcode. Note the asymmetry: the src0 side is
+      // ALWAYS "== 0.0" and only the src1 comparison varies -- these count a
+      // predicate chain rather than compare two operands, so mirroring the
+      // kill family's `a CMP b` shape here would be wrong.
+      case Op::kSetpEqPush:
+      case Op::kSetpNePush:
+      case Op::kSetpGtPush:
+      case Op::kSetpGePush: {
+        const char* cmp = op == Op::kSetpEqPush   ? "=="
+                          : op == Op::kSetpNePush ? "!="
+                          : op == Op::kSetpGtPush ? ">"
+                                                  : ">=";
+        const std::string c = std::string(" ") + cmp + " 0.0";
+        // The predicate write is emitted as a statement, and FIRST, because it
+        // is the side effect: it has to survive an empty write mask. The
+        // has_vector gate below was extended for that; the SDK's operand table
+        // agrees, still reading .w for these when the result is unused
+        // (ucode.h: `components = used_result_components ? 0b1001 : 0b1000`).
+        //
+        // p0 is set but not yet read, same as the scalar setp_* family above --
+        // counted so the two report through one number.
+        Line("xe_p0 = (((" + a + ").w == 0.0) && ((" + b + ").w" + c + "));");
+        ++unhonoured_predicate_ops;
+        r = "(((" + a + ").x == 0.0) && ((" + b + ").x" + c + ") ? 0.0 : (" + a +
+            ").x + 1.0).xxxx";
+        break;
+      }
       default:
-        // The setp_*_push family. Has not appeared in a shader captured here.
-        // Reported by opcode, not guessed. (kCube used to be listed here too;
-        // it is implemented above.)
+        // Reported by opcode, not guessed. (kCube and the setp_*_push family
+        // used to be listed here; both are implemented above.)
         status = HlslStatus::kUnsupportedVectorOp;
         blocking_opcode = uint32_t(op);
         return "float4(0,0,0,0)";
@@ -723,10 +764,36 @@ class Emitter {
         alu.scalar_opcode() == uc::AluScalarOpcode::kMaxAs ||
         alu.scalar_opcode() == uc::AluScalarOpcode::kMaxAsf;
 
+    // a0 is NOT the only side effect that outlives an empty write mask, and the
+    // list above is not the whole rule -- it only ever named the a0 flag. The
+    // SDK's operand table states the other two outright, by keeping operand
+    // components live when the result is unused (ucode.h, the switch on
+    // vector_opcode in the operand-components helper):
+    //
+    //   setp_*_push  components = used_result_components ? 0b1001 : 0b1000
+    //                             -- .w still read with no result: it feeds p0
+    //   kill_*       components = 0b1111
+    //                             -- unconditional: the side effect is discard
+    //
+    // Both were absent here, so either one with an empty write mask was skipped
+    // outright and took its side effect with it. That is the same shape as the
+    // a0 bug described above, which cost the rider its pose.
+    const bool vector_sets_p0 =
+        alu.vector_opcode() == uc::AluVectorOpcode::kSetpEqPush ||
+        alu.vector_opcode() == uc::AluVectorOpcode::kSetpNePush ||
+        alu.vector_opcode() == uc::AluVectorOpcode::kSetpGtPush ||
+        alu.vector_opcode() == uc::AluVectorOpcode::kSetpGePush;
+    const bool vector_discards =
+        alu.vector_opcode() == uc::AluVectorOpcode::kKillEq ||
+        alu.vector_opcode() == uc::AluVectorOpcode::kKillGt ||
+        alu.vector_opcode() == uc::AluVectorOpcode::kKillGe ||
+        alu.vector_opcode() == uc::AluVectorOpcode::kKillNe;
+
     // VectorOp still runs when vmask is 0 and this is an export, because
     // kMaxA's address-register side effect depends on it; nothing consumes the
-    // value in that case.
-    const bool has_vector = vmask != 0 || is_export || vector_sets_a0;
+    // value in that case. Same for the p0 and discard families beside it.
+    const bool has_vector = vmask != 0 || is_export || vector_sets_a0 ||
+                            vector_sets_p0 || vector_discards;
 
     std::string vexpr, sexpr;
     if (has_vector) vexpr = VectorOp(alu, vmask != 0);
@@ -1385,6 +1452,20 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
         return false;
       }
       if (!uc::IsControlFlowOpcodeExec(cf[j].opcode())) continue;
+
+      // Counted BEFORE the body is walked, and counted even though the body is
+      // then walked UNCONDITIONALLY — that gap is the whole point of the
+      // number. See HlslShader::predicated_exec_blocks.
+      switch (cf[j].opcode()) {
+        case uc::ControlFlowOpcode::kCondExecPred:
+        case uc::ControlFlowOpcode::kCondExecPredEnd:
+        case uc::ControlFlowOpcode::kCondExecPredClean:
+        case uc::ControlFlowOpcode::kCondExecPredCleanEnd:
+          ++out.predicated_exec_blocks;
+          break;
+        default:
+          break;
+      }
 
       const uint32_t addr = ExecAddress(cf[j]);
       const uint32_t count = ExecCount(cf[j]);

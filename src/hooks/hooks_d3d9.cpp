@@ -4226,6 +4226,10 @@ struct HlslCoverage {
   uint64_t compile_failed = 0;  // emitted, but FXC rejected the source
   std::map<std::string, uint64_t> failures;      // status name -> shaders
   std::map<uint32_t, uint64_t> blocking_opcode;  // opcode -> shaders
+  // Shaders (not blocks) carrying a predicated exec we run unconditionally.
+  // Counted at run level as well as per dump, because the question "does this
+  // game predicate at all" is answered by one number and was never asked.
+  uint64_t predicated = 0;
 };
 HlslCoverage g_hlslVs, g_hlslPs;
 // map rather than set only because <map> is already included here and <set> is
@@ -4324,6 +4328,10 @@ void SaveShaderDxbc(mx::hle::HlslStage stage, uint64_t key, ID3DBlob* blob) {
 
 std::string HlslCoverageSummary(const HlslCoverage& c) {
   std::string s = fmt::format("{} translated+compiled", c.ok);
+  // Deliberately NOT gated on non-zero: zero here is the finding that makes the
+  // setp_* value translation safe, and a counter that vanishes when it reads
+  // zero cannot report that.
+  s += fmt::format(", PREDICATED-EXEC={}", c.predicated);
   if (c.compile_failed) s += fmt::format(", FXC-REJECTED={}", c.compile_failed);
   for (const auto& [why, n] : c.failures) s += fmt::format(", {}={}", why, n);
   if (!c.blocking_opcode.empty()) {
@@ -4493,6 +4501,12 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
               << out.unhonoured_predicate_ops
               << " (setp_* translated for its value; p0 is not acted on, so "
                  "this shader may run instructions the console skipped)";
+          // The stronger of the two. Above, p0 is merely discarded; here a
+          // block the console gated on p0 is executed regardless.
+          if (out.predicated_exec_blocks)
+            f << "\n; PREDICATED EXEC BLOCKS: " << out.predicated_exec_blocks
+              << " (cond_exec_pred walked as a plain exec — this shader's "
+                 "body RUNS UNCONDITIONALLY where the console gated it)";
           if (out.unhonoured_fetch_ops)
             f << "\n; UNHONOURED FETCH OPS: " << out.unhonoured_fetch_ops
               << " (getCompTexLOD/getGradients/getWeights/getBCF/setGradients "
@@ -4581,6 +4595,11 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
 
   // Read before the move below; the report prints it.
   const size_t source_size = out.source.size();
+
+  // Counted for every shader that EMITTED, whether or not FXC then took it:
+  // predication is a property of the guest microcode, not of our compile, and
+  // scoping it to the compiled ones would under-report the population.
+  if (out.predicated_exec_blocks) ++cov.predicated;
 
   if (out.status != mx::hle::HlslStatus::kOk) {
     ++cov.failures[mx::hle::HlslStatusName(out.status)];
