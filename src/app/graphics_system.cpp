@@ -266,6 +266,7 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
             // shader reads the raw buffer itself.
             vertexStage.handle = d->vertex_shader_handle;
             vertexStage.hlsl = d->vertex_shader_hlsl;
+            vertexStage.dxbc = d->vertex_shader_dxbc;
             vertexStage.constants = d->vertex_constants.data();
             vertexStage.constDwords =
                 static_cast<uint32_t>(d->vertex_constants.size());
@@ -279,6 +280,7 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                      d->vertex_input_count && !d->vertex_constants.empty()) {
             vertexStage.handle = d->vertex_shader_handle;
             vertexStage.hlsl = d->vertex_shader_hlsl;
+            vertexStage.dxbc = d->vertex_shader_dxbc;
             vertexStage.inputs = d->vertex_inputs.data();
             vertexStage.inputBytes =
                 static_cast<uint32_t>(d->vertex_inputs.size());
@@ -342,6 +344,7 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                       (d->clamp_y >= 2 ? 2u : 0u),
                                   d->pixel_shader_handle,
                                   d->pixel_shader_hlsl,
+                                  d->pixel_shader_dxbc,
                                   d->interpolators.data(),
                                   static_cast<uint32_t>(
                                       d->interpolators.size()),

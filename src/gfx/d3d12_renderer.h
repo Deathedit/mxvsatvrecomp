@@ -71,6 +71,10 @@ class D3D12Renderer {
 struct GpuVertexStage {
   uint32_t handle = 0;
   std::shared_ptr<const std::string> hlsl;
+  // The compiled DXBC matching `hlsl` (the fetch variant's bytecode when the
+  // stage is the fetch form). Null falls back to compiling `hlsl` here, which
+  // is the pre-cache behaviour and costs an FXC compile per new handle.
+  std::shared_ptr<const std::vector<uint8_t>> dxbc;
   // One float4 per declared register per vertex, in `regs` order.
   const uint8_t* inputs = nullptr;
   uint32_t inputBytes = 0;
@@ -133,6 +137,8 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  uint8_t colorSource = 0, uint32_t samplerIndex = 0,
                  uint32_t pixelShaderHandle = 0,
                  std::shared_ptr<const std::string> pixelShaderHlsl = {},
+                 std::shared_ptr<const std::vector<uint8_t>> pixelShaderDxbc =
+                     {},
                  const uint8_t* interpolators = nullptr,
                  uint32_t interpBytes = 0,
                  const uint32_t* pixelConstants = nullptr,
@@ -1027,6 +1033,9 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // the source is only read the first time a shader is seen.
     uint32_t pixelShaderHandle = 0;
     std::shared_ptr<const std::string> pixelShaderHlsl;
+    // Precompiled bytecode for pixelShaderHlsl when the hooks-side content
+    // cache held it; see GpuVertexStage::dxbc for the fallback contract.
+    std::shared_ptr<const std::vector<uint8_t>> pixelShaderDxbc;
     // The guest interpolator stream, as a second vertex buffer, and the guest's
     // pixel constant bank. Both are required for the translated path: without
     // them the shader would read undefined inputs and compute from zeros, which
@@ -1096,6 +1105,9 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // interpolates what the vertex stage exports, which is the entire point.
     uint32_t vertexShaderHandle = 0;
     std::shared_ptr<const std::string> vertexShaderHlsl;
+    // Precompiled bytecode for vertexShaderHlsl (fetch or inputs form,
+    // whichever `hlsl` carries) — same contract as pixelShaderDxbc.
+    std::shared_ptr<const std::vector<uint8_t>> vertexShaderDxbc;
     UploadAlloc vsvb;
     D3D12_VERTEX_BUFFER_VIEW vsvbv = {};
     UploadAlloc vscb;

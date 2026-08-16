@@ -33,6 +33,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <set>
@@ -1262,6 +1263,10 @@ struct TranslatedShader {
   uint32_t sampler_array_mask = 0;
   uint32_t slot_guest[mx::hle::HlslShader::kMaxSamplerSlots] = {};
   uint32_t max_const_index = 0;
+  // The compiled DXBC for `source`, when the persisted cache held it or the
+  // first compile wrote it. Null falls back to the renderer compiling the
+  // source itself, which is the pre-cache behaviour.
+  std::shared_ptr<const std::vector<uint8_t>> dxbc;
 
   // The same vertex shader emitted a second way: performing its own vfetches
   // out of the raw guest vertex buffer, indexed by SV_VertexID. Null when that
@@ -1274,6 +1279,8 @@ struct TranslatedShader {
   std::shared_ptr<const std::string> fetch_source;
   uint32_t vertex_fetch_count = 0;
   uint32_t vertex_fetch_slot[mx::hle::HlslShader::kMaxVertexFetches] = {};
+  // The fetch variant's compiled DXBC, same contract as `dxbc`.
+  std::shared_ptr<const std::vector<uint8_t>> fetch_dxbc;
 };
 // Vertex fetch translation coverage, keyed by refusal reason.
 std::map<std::string, uint64_t> g_vfetchRefused;
@@ -3438,6 +3445,7 @@ ShaderApplyResult ApplyShaderOutputs(
     dc.vertex_input_count = 0;
     dc.vertex_shader_handle = handle;
     dc.vertex_shader_hlsl = vs_translated->fetch_source;
+    dc.vertex_shader_dxbc = vs_translated->fetch_dxbc;
     dc.vertex_constants = consts;
     ++g_gpuVertexDraws;
     ++g_gpuFetchDraws;
@@ -3449,6 +3457,7 @@ ShaderApplyResult ApplyShaderOutputs(
     dc.vertex_inputs.assign(size_t(dc.vertex_count) * input_stride, 0);
     dc.vertex_shader_handle = handle;
     dc.vertex_shader_hlsl = vs_translated->source;
+    dc.vertex_shader_dxbc = vs_translated->dxbc;
     dc.vertex_constants = consts;
     ++g_gpuVertexDraws;
   } else {
@@ -4247,6 +4256,72 @@ void EnsureHlslDumpDir() {
   std::filesystem::create_directories("logs/hlsldump", ec);
 }
 
+// Persisted DXBC cache, keyed by the EMITTED HLSL rather than the shader object
+// handle. Bink re-creates its shader objects for every video, so a handle-keyed
+// cache misses at every video start and pays FXC again — 18-145ms per shader at
+// O0, which is the Bink-start hang. The handle-keyed maps above still serve
+// same-object repeats; this one serves repeats across objects, across videos
+// and across runs.
+//
+// Keyed on the SOURCE, not on the guest microcode it was translated from. The
+// first version hashed the microcode, which is wrong in the one way that costs
+// days: the cached bytes are the output of EmitShaderHlsl, so any change to the
+// emitter leaves every already-cached shader loading its stale DXBC while the
+// log reports a healthy hit rate. A translation fix would then render nothing
+// and read as "no visual change" — the exact symptom this project spends its
+// time chasing. Hashing the source makes the key change whenever the emitter
+// does, with no version stamp to remember to bump.
+//
+// Free to compute: the lookup sites below all run AFTER EmitShaderHlsl, so the
+// source string is already in hand.
+//
+// Lives under userdata/cache, the canonical cache root, so nothing wipes it
+// between runs (logs/hlsldump IS wiped, which is why it is not used).
+namespace {
+uint64_t g_dxbcCacheHits = 0;
+uint64_t g_dxbcCacheMisses = 0;
+
+uint64_t ShaderSourceKey(mx::hle::HlslStage stage, const std::string& source) {
+  uint64_t h = 1469598103934665603ull;
+  h ^= (stage == mx::hle::HlslStage::kPixel ? 0xA5A5ull : 0x3C3Cull);
+  for (const char c : source) {
+    h ^= uint64_t(uint8_t(c));
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+
+std::string ShaderCachePath(mx::hle::HlslStage stage, uint64_t key) {
+  return fmt::format("userdata/cache/shaders/{}_{:016X}.dxbc",
+                     stage == mx::hle::HlslStage::kPixel ? "ps" : "vs", key);
+}
+
+std::shared_ptr<const std::vector<uint8_t>> LoadShaderDxbc(
+    mx::hle::HlslStage stage, uint64_t key) {
+  std::ifstream f(ShaderCachePath(stage, key), std::ios::binary);
+  if (!f) return nullptr;
+  std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(f)),
+                             std::istreambuf_iterator<char>());
+  // DXBC starts with the magic 'DXBC'. A file that fails this is truncated or
+  // written by something else; treat it as a miss rather than handing the
+  // renderer a blob D3D will reject at PSO time.
+  if (bytes.size() < 4 || std::memcmp(bytes.data(), "DXBC", 4) != 0)
+    return nullptr;
+  return std::make_shared<const std::vector<uint8_t>>(std::move(bytes));
+}
+
+void SaveShaderDxbc(mx::hle::HlslStage stage, uint64_t key, ID3DBlob* blob) {
+  if (!blob) return;
+  std::error_code ec;
+  std::filesystem::create_directories("userdata/cache/shaders", ec);
+  std::ofstream f(ShaderCachePath(stage, key),
+                  std::ios::trunc | std::ios::binary);
+  if (f)
+    f.write(static_cast<const char*>(blob->GetBufferPointer()),
+            std::streamsize(blob->GetBufferSize()));
+}
+}  // namespace
+
 std::string HlslCoverageSummary(const HlslCoverage& c) {
   std::string s = fmt::format("{} translated+compiled", c.ok);
   if (c.compile_failed) s += fmt::format(", FXC-REJECTED={}", c.compile_failed);
@@ -4278,6 +4353,20 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
                                                    : g_hlslReportedVs;
   if (!seen.emplace(handle, true).second) return;
   auto& cov = stage == mx::hle::HlslStage::kPixel ? g_hlslPs : g_hlslVs;
+  // First-use cost split: translation vs FXC vs the dump/disassembly tail.
+  //
+  // Written to find the phase that stalled Bink start; that turned out to be
+  // FXC at 18-145ms per shader, which the persisted cache below now absorbs.
+  // KEPT rather than removed, because it is the only thing that can show that
+  // cache regressing: a run where `compile` goes back to tens of milliseconds
+  // per shader means the cache is missing, and the hits/misses line alone
+  // cannot distinguish "missing" from "nothing to hit yet".
+  //
+  // Costs three steady_clock reads per NEW shader — this function runs once per
+  // handle, not once per draw — and the log line is capped at the first eight
+  // of each stage.
+  const auto t_first_use = std::chrono::steady_clock::now();
+  auto t_emit = t_first_use, t_compile = t_first_use;
 
   mx::hle::HlslShader out;
   // MUST match the width the renderer's vertex stage offers, or the two
@@ -4285,6 +4374,7 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
   // kHlslInterpolatorLinkage.
   mx::hle::EmitShaderHlsl(code, count, stage,
                           mx::hle::kHlslInterpolatorLinkage, out);
+  t_emit = std::chrono::steady_clock::now();
 
   // Emitting is only half the claim. Source FXC rejects is exactly as useless
   // as a shader the emitter refused, and the two failures have entirely
@@ -4292,14 +4382,40 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
   // is logged, since "it did not compile" without the reason is not a finding.
   std::string compile_error;
   bool compiled = false;
+  std::shared_ptr<const std::vector<uint8_t>> dxbc_bytes;
   if (out.status == mx::hle::HlslStatus::kOk) {
     Microsoft::WRL::ComPtr<ID3DBlob> blob, errors;
     const char* target =
         stage == mx::hle::HlslStage::kPixel ? "ps_5_0" : "vs_5_0";
-    const HRESULT hr = D3DCompile(
-        out.source.data(), out.source.size(), nullptr, nullptr, nullptr,
-        "main", target, D3DCOMPILE_OPTIMIZATION_LEVEL0, 0, &blob, &errors);
-    compiled = SUCCEEDED(hr) && blob;
+    const uint64_t content_key = ShaderSourceKey(stage, out.source);
+    dxbc_bytes = LoadShaderDxbc(stage, content_key);
+    if (dxbc_bytes) {
+      // Cache hit: same microcode seen in an earlier run or an earlier
+      // video. Skip FXC entirely -- the emitter still ran above (0ms) for
+      // the metadata the draw path needs.
+      ++g_dxbcCacheHits;
+      D3DCreateBlob(dxbc_bytes->size(), &blob);
+      if (blob)
+        std::memcpy(blob->GetBufferPointer(), dxbc_bytes->data(),
+                    dxbc_bytes->size());
+      compiled = blob != nullptr;
+    } else {
+      const HRESULT hr = D3DCompile(
+          out.source.data(), out.source.size(), nullptr, nullptr, nullptr,
+          "main", target, D3DCOMPILE_OPTIMIZATION_LEVEL0, 0, &blob, &errors);
+      compiled = SUCCEEDED(hr) && blob;
+      if (compiled) {
+        ++g_dxbcCacheMisses;
+        SaveShaderDxbc(stage, content_key, blob.Get());
+        // Carry the fresh bytes too, so the renderer skips its own O3
+        // recompile of a first-sight shader — the O0 compile here already
+        // produced everything the PSO needs.
+        const auto* p = static_cast<const uint8_t*>(blob->GetBufferPointer());
+        dxbc_bytes = std::make_shared<const std::vector<uint8_t>>(
+            p, p + blob->GetBufferSize());
+      }
+    }
+    t_compile = std::chrono::steady_clock::now();
     // DIAG: dump the generated HLSL beside the DXBC the
     // compiler produced from it, for every pixel shader that compiles.
     //
@@ -4426,6 +4542,43 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
     }
   }
 
+  {
+    static uint32_t s_timed = 0;
+    if (s_timed < 8) {
+      ++s_timed;
+      const auto now = std::chrono::steady_clock::now();
+      const auto emit_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               t_emit - t_first_use)
+                               .count();
+      const auto compile_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(t_compile -
+                                                                t_emit)
+              .count();
+      const auto tail_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(now - t_compile)
+              .count();
+      REXLOG_INFO("d3d9: HLSL {} 0x{:08X} first-use: emit {}ms compile {}ms "
+                  "dump/disasm/vfetch {}ms",
+                  stage == mx::hle::HlslStage::kPixel ? "PS" : "VS", handle,
+                  emit_ms, compile_ms, tail_ms);
+    }
+  }
+
+  // Cache health, every 256 lookups. The number to watch is MISSES on a second
+  // run of the same content: it should be ~0, and anything else means the key
+  // is not stable. Note what a HIGH hit rate does not prove — the key is the
+  // emitted HLSL, so a hit only says "this exact source compiled before". If
+  // the emitter changes, every affected key changes and the misses are correct.
+  {
+    static uint64_t s_last_reported = 0;
+    const uint64_t total = g_dxbcCacheHits + g_dxbcCacheMisses;
+    if (total - s_last_reported >= 256) {
+      s_last_reported = total;
+      REXLOG_INFO("d3d9: HLSL dxbc cache: {} hits {} misses",
+                  g_dxbcCacheHits, g_dxbcCacheMisses);
+    }
+  }
+
   // Read before the move below; the report prints it.
   const size_t source_size = out.source.size();
 
@@ -4448,6 +4601,7 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
     for (uint32_t i = 0; i < out.sampler_count; ++i)
       kept.slot_guest[i] = out.sampler_slot_guest[i];
     kept.max_const_index = out.max_const_index;
+    kept.dxbc = dxbc_bytes;
 
     // The vertex fetch variant of the same blob. Emitted and compiled here,
     // beside the one that already works, so a shader whose fetch form is
@@ -4463,11 +4617,32 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
         ++g_vfetchRefused[mx::hle::HlslStatusName(fetched.status)];
       } else {
         Microsoft::WRL::ComPtr<ID3DBlob> fblob, ferrors;
-        const HRESULT fhr = D3DCompile(
-            fetched.source.data(), fetched.source.size(), nullptr, nullptr,
-            nullptr, "main", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL0, 0,
-            &fblob, &ferrors);
-        if (SUCCEEDED(fhr) && fblob) {
+        std::shared_ptr<const std::vector<uint8_t>> fetch_dxbc;
+        // No fetch-variant salt any more: the fetch form IS a different source
+        // string, so keying on the source separates the two by construction.
+        const uint64_t fetch_key = ShaderSourceKey(stage, fetched.source);
+        fetch_dxbc = LoadShaderDxbc(stage, fetch_key);
+        if (fetch_dxbc) {
+          ++g_dxbcCacheHits;
+          D3DCreateBlob(fetch_dxbc->size(), &fblob);
+          if (fblob)
+            std::memcpy(fblob->GetBufferPointer(), fetch_dxbc->data(),
+                        fetch_dxbc->size());
+        } else {
+          const HRESULT fhr = D3DCompile(
+              fetched.source.data(), fetched.source.size(), nullptr, nullptr,
+              nullptr, "main", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL0, 0,
+              &fblob, &ferrors);
+          if (SUCCEEDED(fhr) && fblob) {
+            ++g_dxbcCacheMisses;
+            SaveShaderDxbc(stage, fetch_key, fblob.Get());
+            const auto* p =
+                static_cast<const uint8_t*>(fblob->GetBufferPointer());
+            fetch_dxbc = std::make_shared<const std::vector<uint8_t>>(
+                p, p + fblob->GetBufferSize());
+          }
+        }
+        if (fblob) {
           // DIAG: dump the FETCH variant separately.
           // This is the form that actually runs for a gpuVertexFetch draw, and
           // it is NOT the blob dumped at the main compile site above -- a
@@ -4509,6 +4684,7 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
           }
           kept.fetch_source =
               std::make_shared<const std::string>(std::move(fetched.source));
+          kept.fetch_dxbc = fetch_dxbc;
           kept.vertex_fetch_count = fetched.vertex_fetch_count;
           for (uint32_t i = 0; i < fetched.vertex_fetch_count; ++i)
             kept.vertex_fetch_slot[i] = fetched.vertex_fetch_slot[i];
@@ -7171,6 +7347,7 @@ void AttachTranslatedPixelShader(mx::hle::DrawCall& dc, uint32_t handle,
   }
   if (const TranslatedShader* t = TranslatedPixelShader(handle)) {
     dc.pixel_shader_hlsl = t->source;
+    dc.pixel_shader_dxbc = t->dxbc;
     dc.pixel_sampler_count = t->sampler_count;
     dc.pixel_sampler_array_mask = t->sampler_array_mask;
     // The PIXEL constant bank, ALU constants 256-511 at device+0x1780. Captured
@@ -7202,6 +7379,7 @@ void AttachTranslatedPixelShader(mx::hle::DrawCall& dc, uint32_t handle,
       if (filled < t->sampler_count) {
         ++s_slotShort;
         dc.pixel_shader_hlsl.reset();
+        dc.pixel_shader_dxbc.reset();
         dc.pixel_textures = {};
         dc.pixel_sampled_objects = {};
       } else {
@@ -7270,6 +7448,7 @@ void AttachTranslatedPixelShader(mx::hle::DrawCall& dc, uint32_t handle,
       // Without its constants the shader would compute from zeros, which is a
       // confident wrong answer. Drop the translation and keep the stand-in.
       dc.pixel_shader_hlsl.reset();
+      dc.pixel_shader_dxbc.reset();
       static uint32_t s_logged = 0;
       if (s_logged++ < 4)
         REXLOG_INFO("d3d9: pixel constant bank unreadable at device+0x{:X}",

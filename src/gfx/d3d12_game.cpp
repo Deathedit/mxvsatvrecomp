@@ -1214,9 +1214,20 @@ ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
   entry.failed = true;
 
   // Compiled once per shader, not once per blend state: one shader commonly
-  // appears under several states, and FXC is the expensive part.
+  // appears under several states, and FXC is the expensive part. When the
+  // hooks side carried precompiled bytecode (the content-keyed cache), use it
+  // directly — a cache hit costs a D3DCreateBlob instead of a compile.
   auto& cached = m_translatedPsBlobs[key.handle];
-  if (!cached) cached = CompileShader(hlsl.c_str(), "ps_5_0", "main");
+  if (!cached) {
+    if (draw.pixelShaderDxbc) {
+      D3DCreateBlob(draw.pixelShaderDxbc->size(), &cached);
+      if (cached)
+        std::memcpy(cached->GetBufferPointer(), draw.pixelShaderDxbc->data(),
+                    draw.pixelShaderDxbc->size());
+    } else {
+      cached = CompileShader(hlsl.c_str(), "ps_5_0", "main");
+    }
+  }
   auto ps = cached;
   if (!ps) {
     // The hooks-side probe already compiles what it emits, so reaching here
@@ -1249,8 +1260,14 @@ ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
     const bool fetch = (key.flags & 16) != 0;
     auto& cachedVs = fetch ? m_translatedVsFetchBlobs[key.vsHandle]
                            : m_translatedVsBlobs[key.vsHandle];
-    if (!cachedVs && draw.vertexShaderHlsl)
+    if (!cachedVs && draw.vertexShaderDxbc) {
+      D3DCreateBlob(draw.vertexShaderDxbc->size(), &cachedVs);
+      if (cachedVs)
+        std::memcpy(cachedVs->GetBufferPointer(),
+                    draw.vertexShaderDxbc->data(), draw.vertexShaderDxbc->size());
+    } else if (!cachedVs && draw.vertexShaderHlsl) {
       cachedVs = CompileShader(draw.vertexShaderHlsl->c_str(), "vs_5_0", "main");
+    }
     if (!cachedVs) {
       LogError("TranslatedPSO: vertex shader failed to compile in the renderer");
       ++m_translatedFailed;
@@ -4740,6 +4757,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint8_t colorSource, uint32_t samplerIndex,
                                  uint32_t pixelShaderHandle,
                                  std::shared_ptr<const std::string> pixelShaderHlsl,
+                                 std::shared_ptr<const std::vector<uint8_t>> pixelShaderDxbc,
                                  const uint8_t* interpolators,
                                  uint32_t interpBytes,
                                  const uint32_t* pixelConstants,
@@ -4874,6 +4892,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.samplerIndex = samplerIndex;
   d.pixelShaderHandle = pixelShaderHandle;
   d.pixelShaderHlsl = std::move(pixelShaderHlsl);
+  d.pixelShaderDxbc = std::move(pixelShaderDxbc);
   d.pixelSamplerCount = pixelSamplerCount;
   d.pixelSamplerArrayMask = pixelSamplerArrayMask;
   d.pixelParamGen = pixelParamGen;
@@ -5237,6 +5256,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
         FillVertexTextureSigns(d, p, vsConstBytes, vertexStage->constDwords);
         d.vertexShaderHandle = vertexStage->handle;
         d.vertexShaderHlsl = vertexStage->hlsl;
+        d.vertexShaderDxbc = vertexStage->dxbc;
         d.vertexInputCount = 0;
         d.gpuVertex = true;
         d.gpuVertexFetch = true;
@@ -5261,6 +5281,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                              vertexStage->constDwords);
       d.vertexShaderHandle = vertexStage->handle;
       d.vertexShaderHlsl = vertexStage->hlsl;
+      d.vertexShaderDxbc = vertexStage->dxbc;
       d.vertexInputCount = vertexStage->regCount;
       for (uint32_t i = 0; i < vertexStage->regCount; ++i)
         d.vertexInputRegs[i] = vertexStage->regs[i];

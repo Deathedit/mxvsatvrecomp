@@ -388,6 +388,12 @@ struct DrawCall {
   // a later frame can still be compiled.
   uint32_t pixel_shader_handle = 0;
   std::shared_ptr<const std::string> pixel_shader_hlsl;
+  // The compiled DXBC of pixel_shader_hlsl, when the persisted content-keyed
+  // cache held it (or the first compile wrote it). Carried so the renderer can
+  // build the PSO without an FXC compile of its own — FXC is the expensive
+  // part, measured at 18-145ms per shader at O0 on this machine. Null means
+  // "compile from hlsl", the pre-cache behaviour.
+  std::shared_ptr<const std::vector<uint8_t>> pixel_shader_dxbc;
   // Zero when SQ_PROGRAM_CNTL.param_gen is disabled; otherwise one plus
   // SQ_CONTEXT_MISC.param_gen_pos. The bias leaves zero as the disabled value
   // while still allowing the hardware destination r0.
@@ -490,6 +496,10 @@ struct DrawCall {
   // migration is per draw and takes both stages together or neither.
   uint32_t vertex_shader_handle = 0;
   std::shared_ptr<const std::string> vertex_shader_hlsl;
+  // The compiled DXBC of vertex_shader_hlsl — same contract as
+  // pixel_shader_dxbc, and the fetch variant of the shader carries the fetch
+  // variant's bytecode here.
+  std::shared_ptr<const std::vector<uint8_t>> vertex_shader_dxbc;
 
   // The registers the translated vertex shader reads, ascending. This is the
   // same order `EmitShaderHlsl` walks `input_mask` to declare
