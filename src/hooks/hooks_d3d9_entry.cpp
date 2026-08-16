@@ -141,6 +141,15 @@ REXCVAR_DEFINE_BOOL(d3d9_hooks_passthrough, false, "Debug",
 // The pending-rect count at +28 is read BEFORE the original runs, because the
 // original clears it on the way out. Zero pending means this call updates
 // nothing, so frames where no glyph moved cost one load and no invalidation.
+//
+// The atlas EXTENT at +0 and +4 is read here too, and unconditionally -- it is
+// the cache's own answer to "how big are the textures I create", straight from
+// sub_8293A888's InitTexture(cache[0], cache[1], 9, 0, 16). That pair is what
+// lets the invalidation name the glyph atlases instead of every single-channel
+// texture in the game; see the note by g_glyphCacheGeneration for the 5 MB of
+// unrelated kR8 the format-only test used to sweep up. Unconditional because a
+// flush with nothing pending still tells the truth about the geometry, and the
+// registration is a relaxed atomic compare on all but the first call.
 //=============================================================================
 REX_IMPORT(__imp__sub_8293C778, orig_GlyphCacheFlush, void());
 extern "C" REX_FUNC(sub_8293C778) {
@@ -148,6 +157,13 @@ extern "C" REX_FUNC(sub_8293C778) {
   uint32_t pending = 0;
   if (cache && HostPageReadable(REX_RAW_ADDR(cache + 28)))
     pending = REX_LOAD_U32(cache + 28);
+  uint32_t atlas_w = 0, atlas_h = 0;
+  if (cache && HostPageReadable(REX_RAW_ADDR(cache)) &&
+      HostPageReadable(REX_RAW_ADDR(cache + 4))) {
+    atlas_w = REX_LOAD_U32(cache);
+    atlas_h = REX_LOAD_U32(cache + 4);
+    NoteGlyphCacheGeometry(atlas_w, atlas_h);
+  }
 
   orig_GlyphCacheFlush(ctx, base);
 
@@ -155,9 +171,14 @@ extern "C" REX_FUNC(sub_8293C778) {
   ++g_glyphCacheGeneration;
   ++g_glyphCacheFlushes;
   if (g_glyphCacheFlushes <= 8 || (g_glyphCacheFlushes % 250) == 0) {
+    // The extent is printed because it is now load-bearing, not decoration: it
+    // is the whole discriminator between a glyph atlas and the 4 MB kR8 that
+    // used to be invalidated alongside it. A 0x0 here means the cache object
+    // did not read and every kR8 texture has fallen back to the fingerprint.
     REXLOG_INFO("d3d9: glyph cache flushed {} times ({} rects this time); "
-                "atlas generation {}",
-                g_glyphCacheFlushes, pending, g_glyphCacheGeneration);
+                "atlas generation {}; atlas extent {}x{}",
+                g_glyphCacheFlushes, pending, g_glyphCacheGeneration, atlas_w,
+                atlas_h);
   }
 }
 

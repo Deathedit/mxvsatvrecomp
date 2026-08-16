@@ -61,6 +61,7 @@
 #include <cmath>
 #include "gpu/d3d9_state.h"
 #include "gpu/hle_types.h"      // g_luminanceReadbackBits/Seq
+#include "gpu/xenos_gpu_state.h"  // mx::gpu::alu — the PM4 ALU constant file
 #include "hooks/hooks_d3d9_internal.h"  // shared with hooks_d3d9_entry.cpp
 
 // Defined in src/app/graphics_system.cpp with the rest of the Debug cvars.
@@ -1391,37 +1392,105 @@ void OverlayShaderConstants(uint32_t shader, uint8_t* base,
 // Read AFTER OverlayShaderConstants so it reports the bank the shader actually
 // sees, not the raw device shadow -- the overlay is exactly the thing that could
 // be filling these and being missed.
+// NARROWED 2026-08-16, and the old shape is why this probe was misleading.
+//
+// It used to tally NaN per register over EVERY draw, which made its own stated
+// rule unsound. `c136=10977nan/9023ok` was read as "ever_finite > 0, therefore
+// the guest writes it and we are sampling stale" — but the denominator included
+// every draw whose shader never reads c136 at all, and OverlayShaderConstants
+// writes shader literals into the same bank, so an unrelated shader publishing
+// c136 scores as "the guest writes it". Two opposite defects, one number.
+//
+// Keyed by SHADER now, and a register is only counted for a shader that can
+// actually read it (`r <= max_const_index`, the highest constant the translated
+// microcode references). `max_const_index` is a BOUND, not a read set, so a
+// shader can still be charged for a register it happens not to touch — but it
+// can never be charged for one it provably cannot touch, which is the half that
+// was wrong before.
+//
+// The question this now answers, for the one VS that computes
+// `o3 = r0.y*c137 + c139 + r0.x*c136`:
+//
+//   that shader's c136 never finite -> nothing publishes it; hunt the writer,
+//                                      and indirect buffers are the last place
+//                                      left to look (the PM4 parser knows
+//                                      INDIRECT_BUFFER by name and never
+//                                      follows one)
+//   that shader's c136 sometimes finite -> real staleness in our per-draw
+//                                          rebuild; the fix is ordering
+// `before` is one bit per register, set if that register held a NaN in any
+// component BEFORE OverlayShaderConstants ran. It turns this from "is the bank
+// NaN" into "which side made it NaN", which is the question the per-shader
+// spread raised: c136 is 100% finite for vs 0x2160DD20 and 0% finite for
+// vs 0x216066A0, and the only per-shader step between the device file and here
+// is the shader's own literal overlay.
 void NoteVertexConstantNaN(const std::array<uint32_t, kD3d9ConstRegs * 4>& bank,
-                           uint32_t shader) {
+                           uint32_t shader,
+                           const std::array<uint32_t, kD3d9ConstRegs / 32>& before) {
+  struct PerShader {
+    uint64_t nan[kD3d9ConstRegs] = {};
+    uint64_t finite[kD3d9ConstRegs] = {};
+    // Transitions across OverlayShaderConstants. `f2n` is the one that would
+    // mean the overlay is the corruption rather than the cure.
+    uint64_t n2n[kD3d9ConstRegs] = {};
+    uint64_t n2f[kD3d9ConstRegs] = {};
+    uint64_t f2n[kD3d9ConstRegs] = {};
+    uint64_t draws = 0;
+    uint32_t max_const = 0;
+  };
   static std::mutex s_mu;
-  static uint64_t s_nan[kD3d9ConstRegs] = {};
-  static uint64_t s_finite[kD3d9ConstRegs] = {};
+  static std::map<uint32_t, PerShader> s_byShader;
   static uint64_t s_draws = 0;
   // A NaN is exponent all-ones with a non-zero mantissa. Testing the bits keeps
   // this independent of the host's floating-point flags.
   const auto is_nan = [](uint32_t b) {
     return (b & 0x7F800000u) == 0x7F800000u && (b & 0x007FFFFFu) != 0;
   };
+  // Read outside the lock -- TranslatedVertexShader takes its own.
+  const TranslatedShader* ts = shader ? TranslatedVertexShader(shader) : nullptr;
+  const uint32_t max_const = ts ? ts->max_const_index : 0;
+
   std::string report;
   {
     std::lock_guard<std::mutex> lock(s_mu);
-    for (uint32_t r = 0; r < kD3d9ConstRegs; ++r) {
+    auto& e = s_byShader[shader];
+    ++e.draws;
+    // Untranslated shaders report 0 here; keep the largest ever seen so a draw
+    // taken before translation finished cannot shrink the gate.
+    if (max_const > e.max_const) e.max_const = max_const;
+    const uint32_t limit = std::min<uint32_t>(e.max_const + 1, kD3d9ConstRegs);
+    for (uint32_t r = 0; r < limit; ++r) {
       bool nan = false;
       for (uint32_t c = 0; c < 4; ++c) nan = nan || is_nan(bank[r * 4 + c]);
-      ++(nan ? s_nan[r] : s_finite[r]);
+      ++(nan ? e.nan[r] : e.finite[r]);
+      const bool was = (before[r >> 5] >> (r & 31)) & 1u;
+      if (was && nan) ++e.n2n[r];
+      else if (was && !nan) ++e.n2f[r];
+      else if (!was && nan) ++e.f2n[r];
     }
     if ((++s_draws % 20000) != 0) return;
-    for (uint32_t r = 0; r < kD3d9ConstRegs; ++r) {
-      if (!s_nan[r]) continue;
-      report += fmt::format(" c{}={}nan/{}ok", r, s_nan[r], s_finite[r]);
+    for (const auto& [h, s] : s_byShader) {
+      std::string regs;
+      for (uint32_t r = 0; r <= s.max_const && r < kD3d9ConstRegs; ++r) {
+        if (!s.nan[r] && !s.f2n[r] && !s.n2f[r]) continue;
+        // NN = NaN on both sides (neither source has it)
+        // NF = the overlay REPAIRED it (device file was the problem)
+        // FN = the overlay CORRUPTED it (the overlay is the bug)
+        regs += fmt::format(" c{}={}nan/{}ok[{}NN {}NF {}FN]", r, s.nan[r],
+                            s.finite[r], s.n2n[r], s.n2f[r], s.f2n[r]);
+      }
+      if (regs.empty()) continue;
+      report += fmt::format("\n  vs 0x{:08X} maxc c{} over {} draws:{}", h,
+                            s.max_const, s.draws, regs);
     }
   }
   if (report.empty()) {
     REXLOG_INFO("d3d9: VS CONST NaN probe over {} draws: none", s_draws);
     return;
   }
-  REXLOG_INFO("d3d9: VS CONST NaN probe over {} draws (last vs 0x{:08X}):{}",
-              s_draws, shader, report);
+  REXLOG_INFO("d3d9: VS CONST NaN probe over {} draws, per shader, counting "
+              "only registers the shader can reach:{}",
+              s_draws, report);
 }
 
 bool CaptureVertexConstants(uint32_t device, uint8_t* base, uint32_t shader,
@@ -1432,8 +1501,28 @@ bool CaptureVertexConstants(uint32_t device, uint8_t* base, uint32_t shader,
     return false;
   for (uint32_t i = 0; i < out.size(); ++i)
     out[i] = REX_LOAD_U32(device + 0x780 + i * 4);
+  // Repair registers the device file never held, from the ALU constant file the
+  // PM4 stream publishes. Vertex constants are 0..255, so first_reg is 0.
+  // Applied BEFORE the shader's own load table so a per-draw literal still
+  // wins its slots — the hardware order, same reasoning as the comment on
+  // OverlayShaderConstants.
+  mx::gpu::alu::OverlayNonFinite(0, out.data(), kD3d9ConstRegs);
+  // One bit per register: did it hold a NaN before the shader's literal overlay
+  // ran? Everything up to this point is per-DEVICE and shared by every draw;
+  // OverlayShaderConstants is the only per-SHADER step, so this is the split
+  // that explains a register being 100% finite for one shader and 0% for
+  // another. Cheap: 256 bit-sets, against a 4096-dword read we already did.
+  std::array<uint32_t, kD3d9ConstRegs / 32> before{};
+  for (uint32_t r = 0; r < kD3d9ConstRegs; ++r) {
+    bool nan = false;
+    for (uint32_t c = 0; c < 4; ++c) {
+      const uint32_t b = out[r * 4 + c];
+      nan = nan || ((b & 0x7F800000u) == 0x7F800000u && (b & 0x007FFFFFu) != 0);
+    }
+    if (nan) before[r >> 5] |= 1u << (r & 31);
+  }
   OverlayShaderConstants(shader, base, out);
-  NoteVertexConstantNaN(out, shader);
+  NoteVertexConstantNaN(out, shader, before);
   return true;
 }
 
@@ -2688,6 +2777,54 @@ struct PhaseTimer {
   }
 };
 
+// INSIDE the texture bucket. The note above says a finer breakdown is worth
+// having only once one bucket is known to dominate -- it now is: texture runs
+// 156-182ms against 29-35ms for the whole vertex path, about 80% of a steady
+// frame, and 215us per draw is far more than a cache hit should ever cost.
+//
+// Split so the answer cannot be argued: a hit that is expensive points at the
+// staleness fingerprint, and a miss that is expensive points at copy + decode.
+// The two have completely different fixes, and guessing between them is how the
+// page-probe theory ate a measurement before the existing VirtualQuery counter
+// disproved it in one line.
+//
+// `scan` is the pair of whole-buffer passes that follow every decode
+// (HleTextureHasNonzeroData, then HleTextureIsConstant). Counted separately
+// from the decode because they are OURS, not the guest's, and a 2048x2048 BC1
+// gets walked twice by them on top of being untiled.
+uint64_t g_texDescribeUs = 0, g_texStaleUs = 0, g_texCopyUs = 0;
+uint64_t g_texDecodeUs = 0, g_texScanUs = 0;
+uint64_t g_texSlotCalls = 0, g_texCacheHits = 0, g_texStaleEvicts = 0;
+uint64_t g_texDecodes = 0, g_texDecodedBytes = 0;
+
+// WHICH textures re-decode, and WHY the cache did not hold them.
+//
+// The breakdown above got as far as "three decodes, 32 MB, every frame, 104ms"
+// with a 99.6% hit rate on the other 1600 binds. That is the whole cost, and it
+// is a property of three specific textures rather than of the path -- so the
+// next thing needed is their identity and their miss reason, not another timer.
+//
+// Keyed by guest address, which survives across frames where the fetch-constant
+// hash does not. That difference is itself a candidate answer: the cache key is
+// FNV over all six fetch dwords, so one texture bound with two different
+// sampler states is two entries and two decodes of the same bytes.
+enum class TexMissReason : uint8_t {
+  kNotInCache,   // key never seen
+  kStaleEvicted, // present, but the content fingerprint changed
+  kBlankRetry,   // decoded blank before; never cached, retried on a backoff
+};
+struct TexDecodeSite {
+  uint64_t decodes = 0;
+  uint64_t bytes = 0;
+  uint32_t width = 0, height = 0, format = 0;
+  uint64_t by_reason[3] = {0, 0, 0};
+  uint64_t distinct_keys = 0;
+};
+// Cumulative, NOT per frame: the question is whether the same texture repeats
+// across frames, which a per-frame counter cannot show.
+std::map<uint32_t, TexDecodeSite> g_texDecodeSites;
+std::set<std::pair<uint32_t, uint64_t>> g_texDecodeKeys;
+
 uint64_t g_liveVertexResolved = 0, g_liveVertexAmbiguous = 0;
 uint64_t g_liveVertexUnreadable = 0, g_liveVertexNoMatch = 0;
 
@@ -3932,6 +4069,41 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
                 mx::hle::g_transcodeUs / 1000, mx::hle::g_transcodeVerts,
                 g_transcodeDeferred, g_transcodeLate, g_transcodeLost,
                 g_phaseTextureUs / 1000, finalize_us / 1000);
+    // Inside the texture bucket. Printed beside it for the same reason as
+    // LOOP BY REASON below: the parts must be checkable against the total
+    // rather than trusted on their own. describe + stale + copy + decode +
+    // scan should account for most of `texture Nms`; a large remainder means
+    // the cost is somewhere none of these five timers is watching.
+    REXLOG_INFO(
+        "d3d9: TEXTURE COST {} slot calls -- describe {}ms, stale-check {}ms, "
+        "copy {}ms, decode {}ms, scan {}ms | {} cache hits, {} stale evictions,"
+        " {} decodes over {} KB",
+        g_texSlotCalls, g_texDescribeUs / 1000, g_texStaleUs / 1000,
+        g_texCopyUs / 1000, g_texDecodeUs / 1000, g_texScanUs / 1000,
+        g_texCacheHits, g_texStaleEvicts, g_texDecodes,
+        g_texDecodedBytes / 1024);
+    // The repeat offenders, cumulative, worst first. Three textures own this
+    // whole bucket; this names them and says why each one misses.
+    {
+      std::vector<std::pair<uint32_t, const TexDecodeSite*>> worst;
+      worst.reserve(g_texDecodeSites.size());
+      for (const auto& [addr, s] : g_texDecodeSites) worst.emplace_back(addr, &s);
+      std::sort(worst.begin(), worst.end(), [](const auto& a, const auto& b) {
+        return a.second->bytes > b.second->bytes;
+      });
+      std::string top;
+      for (size_t i = 0; i < worst.size() && i < 5; ++i) {
+        const TexDecodeSite& s = *worst[i].second;
+        top += fmt::format(
+            " [0x{:08X} {}x{} fmt{} {}x={}MB keys={} miss:{}nocache/{}stale/"
+            "{}blank]",
+            worst[i].first, s.width, s.height, s.format, s.decodes,
+            s.bytes / (1024 * 1024), s.distinct_keys, s.by_reason[0],
+            s.by_reason[1], s.by_reason[2]);
+      }
+      REXLOG_INFO("d3d9: TEXTURE REPEATS {} addresses:{}",
+                  g_texDecodeSites.size(), top.empty() ? " (none)" : top);
+    }
     // Who owns the loop. Printed beside the total so the two can be checked
     // against each other rather than trusted separately.
     std::string split;
@@ -3947,6 +4119,12 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
   g_transcodeDeferred = g_transcodeLate = g_transcodeLost = 0;
   g_phaseVertexUs = g_phaseInterpUs = g_phaseTextureUs = 0;
   g_phaseVertexLoopUs = g_phaseVertexCount = 0;
+  // Per frame, like every other bucket here -- these are a frame's cost, not a
+  // run's, and the report above has already consumed them.
+  g_texDescribeUs = g_texStaleUs = g_texCopyUs = 0;
+  g_texDecodeUs = g_texScanUs = 0;
+  g_texSlotCalls = g_texCacheHits = g_texStaleEvicts = 0;
+  g_texDecodes = g_texDecodedBytes = 0;
   g_phaseDrawCount = 0;
 }
 
@@ -4601,6 +4779,7 @@ bool BlankRetryDue(uint64_t key) {
   return now >= it->second.last_frame + BlankRetryDelay(it->second.strikes);
 }
 
+
 //===========================================================================
 // Scaleform's raster glyph cache, and why a texture cache keyed on the fetch
 // constant cannot see it change.
@@ -4631,16 +4810,68 @@ bool BlankRetryDue(uint64_t key) {
 // is why it is worth decompiling for rather than hashing every texture every
 // frame.
 //
-// It does NOT say which host texture changed, only that the glyph atlases did.
-// Invalidating every cached single-channel texture is precise enough: kR8 is
-// the glyph format, and the only other kR8 textures in a run are two 32x32
-// ones, so the over-invalidation costs two trivial re-decodes.
+// It does NOT say which host texture changed, only that the glyph atlases did,
+// so the invalidation has to name them some other way.
+//
+// It used to name them by FORMAT alone -- every cached kR8 texture -- on the
+// stated grounds that "the only other kR8 textures in a run are two 32x32
+// ones". Measured 2026-08-16, that is wrong by three orders of magnitude. The
+// kR8 population in a loaded pause frame is 5.00 MB: four 512x512 glyph atlases
+// and one 2048x2048 that is not a glyph atlas at all (30 binds, swizzle
+// 0o05000). In the menu and event captures it also sweeps in the Bink Y/U/V
+// planes (640x216, 320x108 x2), a 1024x512 and two 512x256. Every one of those
+// re-decoded on every flush, and mx_1189 alone logged 8 flushes.
+//
+// Worse than the waste: routing a texture here ALSO routes it away from
+// GuestTextureFingerprint, so those same non-glyph textures were never
+// content-checked at all. A 2048x2048 R8 restreamed without a glyph flush was
+// invisible to us.
+//
+// So name them by GEOMETRY, learned from the cache object rather than assumed.
+// sub_8293A888 creates each atlas with InitTexture(cache[0], cache[1], ...), so
+// the flush hook reads those two dwords and registers the pair here. A kR8
+// texture is a glyph atlas only if its extent matches one the guest actually
+// built; everything else falls through to the fingerprint, which is the right
+// test for it and the test it should have been getting all along.
+//
+// Before the first flush the set is empty, so a glyph atlas decoded that early
+// stores a fingerprint. Once the geometry registers it compares against the
+// generation instead, mismatches once, and re-decodes into the right regime.
+// Self-correcting, and it costs one decode.
 //===========================================================================
 uint32_t g_glyphCacheGeneration = 1;
 uint64_t g_glyphCacheFlushes = 0;
 
-bool IsGlyphCacheFormat(mx::hle::HostTextureFormat format) {
-  return format == mx::hle::HostTextureFormat::kR8;
+// Tiny -- one entry per distinct atlas geometry, which is one or two. The
+// atomic is the fast path: the flush hook runs once per guest DrawText, and the
+// geometry is the same on essentially every call, so the lock is taken only
+// when a genuinely new one appears.
+std::mutex g_glyphGeometryMu;
+std::set<uint64_t> g_glyphGeometries;
+std::atomic<uint64_t> g_glyphGeometryLast{0};
+
+uint64_t GlyphGeometryKey(uint32_t width, uint32_t height) {
+  return (uint64_t(width) << 32) | height;
+}
+
+void NoteGlyphCacheGeometry(uint32_t width, uint32_t height) {
+  if (!width || !height || width > 8192 || height > 8192) return;
+  const uint64_t key = GlyphGeometryKey(width, height);
+  if (g_glyphGeometryLast.load(std::memory_order_relaxed) == key) return;
+  {
+    std::lock_guard<std::mutex> lk(g_glyphGeometryMu);
+    g_glyphGeometries.insert(key);
+  }
+  g_glyphGeometryLast.store(key, std::memory_order_relaxed);
+}
+
+bool IsGlyphCacheTexture(mx::hle::HostTextureFormat format, uint32_t width,
+                         uint32_t height) {
+  if (format != mx::hle::HostTextureFormat::kR8) return false;
+  const uint64_t key = GlyphGeometryKey(width, height);
+  if (g_glyphGeometryLast.load(std::memory_order_relaxed) == key) return true;
+  std::lock_guard<std::mutex> lk(g_glyphGeometryMu);
+  return g_glyphGeometries.contains(key);
 }
 
 // Fingerprint of the GUEST BYTES behind a texture, so the caches can notice
@@ -4734,14 +4965,21 @@ uint32_t GuestTextureFingerprint(const mx::hle::HleTextureSource& source,
 // The glyph atlas KEEPS the guest's own flush generation rather than moving to
 // the fingerprint. That fix was hard won, the guest tells us outright when the
 // atlas is repacked, and an explicit signal beats a sampled read of the same
-// memory. The fingerprint covers everything else, which until now was covered
-// by nothing at all: GlyphCacheStale was gated on IsGlyphCacheFormat, so every
+// memory -- the fingerprint samples 2 KB of a 256 KB atlas, so a localised
+// glyph write lands between its sample points and reads as unchanged. That is
+// what broke the pause HUD once already.
+//
+// The fingerprint covers everything else, which until now was covered by
+// nothing at all: GlyphCacheStale was gated on IsGlyphCacheFormat, so every
 // BC1/BC3/BC5/RGBA8 texture in the game -- all the rider and vehicle art -- was
-// never tested for staleness in the first place.
+// never tested for staleness in the first place. As of the geometry test above
+// that "everything else" correctly includes the single-channel textures that
+// are NOT glyph atlases, which the format-only gate had also been excluding.
 uint32_t TextureContentVersion(const mx::hle::HleTextureSource& source,
                                uint8_t* base,
                                mx::hle::HostTextureFormat format) {
-  if (IsGlyphCacheFormat(format)) return g_glyphCacheGeneration;
+  if (IsGlyphCacheTexture(format, source.width, source.height))
+    return g_glyphCacheGeneration;
   return GuestTextureFingerprint(source, base);
 }
 
@@ -4752,7 +4990,8 @@ bool TextureContentStale(const mx::hle::HleTextureSource& source,
   const uint32_t now = TextureContentVersion(source, base, payload.format);
   // A fingerprint of 0 means the memory could not be read. Not evidence of a
   // change, so the cached copy stands; the generation is never 0.
-  if (!IsGlyphCacheFormat(payload.format) && !now) return false;
+  if (!IsGlyphCacheTexture(payload.format, source.width, source.height) && !now)
+    return false;
   return now != payload.content_version;
 }
 
@@ -6169,7 +6408,13 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   }
   HleTextureSource source;
   const char* why = nullptr;
-  if (!DescribeHleTexture2D(fetch, source, &why)) {
+  ++g_texSlotCalls;
+  bool described = false;
+  {
+    PhaseTimer t(g_texDescribeUs);
+    described = DescribeHleTexture2D(fetch, source, &why);
+  }
+  if (!described) {
     NoteRejectedTextureFormat("slot", guest_sampler, source, why, fetch);
     // A fetch constant the reference calls invalid rather than unsupported.
     // Xenia drops the BINDING and keeps drawing -- its key stays invalid, the
@@ -6326,22 +6571,50 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // sample that was never wrong. That cost 10,890 draws in mx_706, from just
   // nine distinct all-zero textures, because the refusal is cached per key.
   const uint64_t key = HleTextureKey(fetch);
+  TexMissReason miss_reason = TexMissReason::kNotInCache;
   if (auto cached = g_hleCpuTextures.find(key);
       cached != g_hleCpuTextures.end()) {
     // A glyph atlas the guest has repacked since this was decoded falls
     // through to a fresh decode; everything else is served from the cache.
-    if (!TextureContentStale(source, base, *cached->second)) {
+    bool stale = false;
+    {
+      PhaseTimer t(g_texStaleUs);
+      stale = TextureContentStale(source, base, *cached->second);
+    }
+    if (!stale) {
+      ++g_texCacheHits;
       out_textures[slot] = cached->second;
       return true;
     }
+    // Counted apart from a plain miss. A key that is present but keeps testing
+    // stale is a re-decode every bind, which costs the same as having no cache
+    // at all while looking like a working one from the outside.
+    ++g_texStaleEvicts;
+    miss_reason = TexMissReason::kStaleEvicted;
     g_hleCpuTextures.erase(cached);
+  } else if (g_hleEmptyTextures.count(key)) {
+    // Never entered the cache because it decoded blank; the backoff above let
+    // it through for another look.
+    miss_reason = TexMissReason::kBlankRetry;
   }
   // A key found blank recently and not yet due another look: bind the decode
   // the earlier draw made rather than repeating it.
   if (!BlankRetryDue(key)) {
-    if (partial_snapshot_object && g_hleBlankPayloads.contains(key)) {
-      // Known blank and not due a re-read: the snapshot's tiles are the best
-      // available answer until the retry says otherwise.
+    // Known blank and not due a re-read: the snapshot's tiles are the best
+    // available answer until the retry says otherwise.
+    //
+    // Gated on the BLANK SET, not on g_hleBlankPayloads. It used to require a
+    // blank payload, and that made this branch unreachable for precisely the
+    // textures it exists to serve: the blank path below returns as soon as it
+    // has a snapshot to bind, so a key with a snapshot never gets a payload
+    // recorded, so `contains` was never true, so every bind fell through and
+    // re-decoded. Measured on 0x1A2E3000 -- 2 x 16 MB every frame, 21 GB over a
+    // 100-frame run, and forcing BlankRetryDue to false changed nothing at all,
+    // which is what proved the guard rather than the backoff was the problem.
+    //
+    // The payload was never needed here in the first place: this binds an
+    // OBJECT and does not read one.
+    if (partial_snapshot_object && g_hleEmptyTextures.count(key)) {
       out_objects[slot] = partial_snapshot_object;
       return true;
     }
@@ -6355,13 +6628,41 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     }
   }
   std::vector<uint8_t> guest;
-  if (!CopyTexturePhysical(source, base, guest)) {
+  bool copied = false;
+  {
+    PhaseTimer t(g_texCopyUs);
+    copied = CopyTexturePhysical(source, base, guest);
+  }
+  if (!copied) {
     ++g_slotFailCopy;
     ReportSlotFailures();
     return false;
   }
   auto payload = std::make_shared<HleTexturePayload>();
-  if (!DecodeHleTexture2D(source, guest.data(), guest.size(), *payload, &why)) {
+  bool decoded_ok = false;
+  {
+    PhaseTimer t(g_texDecodeUs);
+    decoded_ok =
+        DecodeHleTexture2D(source, guest.data(), guest.size(), *payload, &why);
+  }
+  ++g_texDecodes;
+  g_texDecodedBytes += guest.size();
+  {
+    TexDecodeSite& site = g_texDecodeSites[source.address];
+    ++site.decodes;
+    site.bytes += guest.size();
+    site.width = source.width;
+    site.height = source.height;
+    site.format = source.guest_format;
+    ++site.by_reason[size_t(miss_reason)];
+    // How many DISTINCT cache keys one guest address has produced. Greater
+    // than one means the same bytes are being decoded under several keys --
+    // the fetch-constant hash splitting on sampler state -- which is a
+    // different fix from a texture whose content genuinely changes.
+    if (g_texDecodeKeys.emplace(source.address, key).second)
+      ++site.distinct_keys;
+  }
+  if (!decoded_ok) {
     ++g_slotFailDecode;
     ReportSlotFailures();
     return false;
@@ -6389,7 +6690,10 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // of, so a better source demonstrably exists. A flat texture with no snapshot
   // behind it is legal and is left alone; that restraint is what keeps this from
   // becoming the blanket substitution the notes above record as a regression.
-  const bool decode_is_blank = !HleTextureHasNonzeroData(*payload);
+  const bool decode_is_blank = [&] {
+    PhaseTimer t(g_texScanUs);
+    return !HleTextureHasNonzeroData(*payload);
+  }();
   uint8_t uniform_value = 0;
   // Detected UNCONDITIONALLY, acted on only below. The first cut of this
   // computed `decode_is_uniform` as `partial_snapshot_object && ...` and put its
@@ -6399,8 +6703,10 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // with the terrain still flat and not one line to say which half had failed.
   // Exactly the shape of [[counter-that-cannot-fire]], committed twice in one
   // session. Measure first, gate second.
-  const bool decode_is_uniform =
-      !decode_is_blank && HleTextureIsConstant(*payload, &uniform_value);
+  const bool decode_is_uniform = !decode_is_blank && [&] {
+    PhaseTimer t(g_texScanUs);
+    return HleTextureIsConstant(*payload, &uniform_value);
+  }();
   if (decode_is_uniform) {
     static std::set<uint64_t> s_uniform;
     if (s_uniform.insert(key).second && s_uniform.size() <= 32) {
@@ -6714,6 +7020,11 @@ void ApplyPixelShaderLoadTable(
     uint32_t shader, uint32_t device, uint8_t* base,
     std::vector<uint32_t>& bank) {
   ShaderFetchConstants fetch;
+  // Same repair as the vertex side, before the load tables. The pixel bank is
+  // guest c256..c511, so first_reg is 256 — this is the one that matters, since
+  // the measured NaN block is c392..c395 and lands here as xe_c[136..139].
+  if (bank.size() >= 256 * 4)
+    mx::gpu::alu::OverlayNonFinite(256, bank.data(), 256);
   ApplyShaderLoadTable(shader, 0x28, 0x18, base, bank);
   ApplyShaderFetchPatchTable(shader, 0x28, base, fetch);
   // device+0x3248 is the vertex shader object; its table sits at +0x368 with
@@ -8209,6 +8520,18 @@ void ReportDrawCounts(uint8_t* base) {
   REXLOG_INFO("d3d9: draws — DrawIndexedVertices={} DrawVertices={} "
               "DrawVerticesUP={} total={}",
               g_indexed_draws, g_draws, g_up_draws, total);
+  // The ALU constant file. `repaired 0` is only meaningful next to a non-zero
+  // `constants seen` — with zero seen, the PM4 feed is not reaching the file and
+  // the repair count says nothing at all.
+  {
+    uint64_t written = 0, repaired = 0, zeroed = 0;
+    uint32_t seen = 0;
+    mx::gpu::alu::Stats(written, repaired, seen, zeroed);
+    REXLOG_INFO("d3d9: ALU constant file — {} dwords written by PM4 over {} "
+                "distinct constants; {} repaired from PM4, {} NaN set to the "
+                "power-on 0.0; shader load-table overlays {}",
+                written, seen, repaired, zeroed, g_shaderConstOverlays);
+  }
   ReportDeclHistogram();
   if (REXCVAR_GET(hle_capture)) ReportCoverage(base);
 }

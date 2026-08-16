@@ -196,6 +196,13 @@ extern uint64_t g_patchCalls;
 extern uint32_t g_glyphCacheGeneration;
 extern uint64_t g_glyphCacheFlushes;
 
+// The extent of a Scaleform glyph atlas, read off the cache object by the flush
+// hook. This is what makes the flush invalidation name the atlases instead of
+// every single-channel texture in the game -- see the note by
+// g_glyphCacheGeneration. A function rather than an exported container, per the
+// rule at the top of this header.
+void NoteGlyphCacheGeometry(uint32_t width, uint32_t height);
+
 // Stream-binding recency, for the "was this stream bound for this draw" check.
 extern uint32_t g_lastBindD0;
 extern uint32_t g_lastBindD1;
