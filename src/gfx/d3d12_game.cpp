@@ -3013,6 +3013,12 @@ void D3D12Renderer::RenderGameFrame() {
       // rungs down, and an exposure that climbs until the frame saturates.
       GameRenderTarget* msaaPartner = nullptr;
       uint32_t srcScale = 1;
+      // Why the substitution search below did or did not save a blank source.
+      // Read at the BLANK-SOURCE counter further down; see BlankSourceInfo.
+      // 0 = never attempted, 1 = no other surface at this EDRAM base,
+      // 2 = candidates existed but none was ever drawn into, 3 = rescued.
+      uint8_t blankRescue = 0;
+      uint32_t blankCandidates = 0;
       if ((!srcRes || (srcEntry && !srcEntry->everDrawn)) &&
           !d.resolveSourceIsDepth && d.resolveSourceBase &&
           d.resolveSourceWidth && d.resolveSourceHeight) {
@@ -3033,6 +3039,10 @@ void D3D12Renderer::RenderGameFrame() {
         // the source in both axes, and that is the HDR scene.
         for (auto& [obj, t] : m_gameRenderTargets) {
           if (!t.resource || t.edramBase != d.resolveSourceBase) continue;
+          // Counted before any shape test: "nothing shares this EDRAM base" and
+          // "something does but no shape matched" are different answers, and
+          // only the first means the surface is genuinely absent from the pool.
+          if (&t != srcEntry) ++blankCandidates;
           if (t.everDrawn && t.format == snapFormat &&
               t.width == d.resolveSourceWidth * 2 &&
               t.height == d.resolveSourceHeight * 2) {
@@ -3081,6 +3091,9 @@ void D3D12Renderer::RenderGameFrame() {
             ++m_msaaPartnerResolves;
           else if (contains)
             ++m_containedSourceResolves;
+          blankRescue = 3;
+        } else {
+          blankRescue = blankCandidates ? 2 : 1;
         }
       }
       // A BANDED depth resolve, which no object-identity lookup can satisfy.
@@ -3240,7 +3253,28 @@ void D3D12Renderer::RenderGameFrame() {
       // snapshot, which is worse — but it is counted, because a large number
       // here means compositor quads are painting blanks over the frame and the
       // real defect is upstream, in whatever should have rendered that target.
-      if (srcEntry && !srcEntry->everDrawn) ++m_snapshotBlankSource;
+      if (srcEntry && !srcEntry->everDrawn) {
+        ++m_snapshotBlankSource;
+        // The population behind that count. Keyed by SOURCE extent, so one line
+        // describes a surface instead of an event, and carrying the frame range
+        // because the whole question is whether these are boot-only (the legal /
+        // loading / start screens) or ongoing.
+        auto& b = m_blankSourceByExtent[(uint64_t(d.resolveSourceWidth) << 32) |
+                                        d.resolveSourceHeight];
+        if (!b.count) b.firstFrame = m_gameFrame;
+        b.lastFrame = m_gameFrame;
+        ++b.count;
+        b.object = d.resolveSource;
+        b.edramBase = d.resolveSourceBase;
+        b.format = uint32_t(srcEntry->format);
+        b.dest = d.resolveDest;
+        switch (blankRescue) {
+          case 1: ++b.rescueNoCandidate; break;
+          case 2: ++b.rescueAllBlank; break;
+          case 3: break;  // rescued, yet still blank: the stand-in was blank too
+          default: ++b.rescueNotAttempted; break;
+        }
+      }
       // Which part of the source this band takes. The guest's rectangle is in
       // the coordinates of the full image, not of the band's own surface, so a
       // band at y 640..720 arrives as a rectangle our 1280x80 source resource
@@ -4305,6 +4339,29 @@ void D3D12Renderer::RenderGameFrame() {
                     static_cast<unsigned long long>(e.count),
                     static_cast<unsigned long long>(e.translated),
                     static_cast<unsigned long long>(e.wantedSlots));
+      LogInfo(message);
+    }
+    // DIAG: the population behind BLANK-SOURCE. A blank snapshot is a
+    // compositor quad painting nothing, so if a full-screen extent shows up
+    // here with a frame range that ends early, that is a boot-time screen whose
+    // backdrop never arrived. `rescue` says why the substitution search did not
+    // save it: no-cand = nothing else sits at that EDRAM base (the surface is
+    // genuinely absent from the pool), all-blank = something does but nothing
+    // was ever drawn into it either (the defect is upstream, in whatever should
+    // have rendered it), n/a = depth source or no base to search from.
+    for (const auto& [extent, b] : m_blankSourceByExtent) {
+      std::snprintf(message, sizeof(message),
+                    "  BLANK-SOURCE %ux%u src 0x%08X base 0x%03X fmt %u -> dest "
+                    "0x%08X: %llu resolves, frames %llu..%llu; rescue no-cand "
+                    "%llu all-blank %llu n/a %llu",
+                    uint32_t(extent >> 32), uint32_t(extent), b.object,
+                    b.edramBase, b.format, b.dest,
+                    static_cast<unsigned long long>(b.count),
+                    static_cast<unsigned long long>(b.firstFrame),
+                    static_cast<unsigned long long>(b.lastFrame),
+                    static_cast<unsigned long long>(b.rescueNoCandidate),
+                    static_cast<unsigned long long>(b.rescueAllBlank),
+                    static_cast<unsigned long long>(b.rescueNotAttempted));
       LogInfo(message);
     }
     // DIAG: the COLOUR pool with its EDRAM bases. The

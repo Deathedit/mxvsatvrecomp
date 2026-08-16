@@ -1260,6 +1260,31 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // Resolves whose source target has never been drawn into: the snapshot they
   // produce is blank by construction.
   uint64_t m_snapshotBlankSource = 0;
+  // ...and WHICH ones, because the bare count above has been quoted for three
+  // days without anyone able to say what it covers. Measured 2026-08-16: it
+  // reads 353 in a two-minute menu-only run AND 353 in a nine-minute run that
+  // also loaded a level -- identical, so the whole population lands during
+  // boot/legal/loading/start and never grows. That is the same set of screens
+  // reported as having no background, which is why this breakdown exists.
+  //
+  // Keyed by resolve-source extent so one line covers a surface rather than an
+  // event. `rescue*` record why the substitution search at the top of the
+  // resolve path failed to find a drawn stand-in, which is the actual question:
+  // a blank source with no candidate at its EDRAM base is a different defect
+  // from one whose candidates were all blank too.
+  struct BlankSourceInfo {
+    uint64_t count = 0;
+    uint32_t object = 0;
+    uint32_t edramBase = 0;
+    uint32_t format = 0;
+    uint32_t dest = 0;
+    uint64_t rescueNoCandidate = 0;   // nothing else at this EDRAM base
+    uint64_t rescueAllBlank = 0;      // candidates existed, none everDrawn
+    uint64_t rescueNotAttempted = 0;  // depth source, or no base/extent to search
+    uint64_t firstFrame = 0;
+    uint64_t lastFrame = 0;
+  };
+  std::map<uint64_t, BlankSourceInfo> m_blankSourceByExtent;
   // Resolves served from a surface twice their size in each axis at the same
   // EDRAM base and format -- the 1x partner of a 4x-MSAA source, which is the
   // image we actually hold because we render everything at 1x.
