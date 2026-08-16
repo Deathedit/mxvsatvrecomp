@@ -1207,6 +1207,17 @@ ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
   // and nothing is cached, so the cap bounds memory without hiding shaders.
   if (m_translatedPSOs.size() >= kMaxTranslatedPSOs) {
     ++m_translatedPsoCapped;
+    // Once, and loudly. Reaching the cap is not a throttle, it is the point
+    // after which a share of every frame is drawn with the wrong shader, and
+    // the only previous evidence of it was a counter buried in a summary line
+    // that had to be read against the total to mean anything.
+    static bool s_reported = false;
+    if (!s_reported) {
+      s_reported = true;
+      LogError("TranslatedPSO: PSO cache FULL at kMaxTranslatedPSOs — every "
+               "new shader/state combination from here on renders as a "
+               "stand-in");
+    }
     return nullptr;
   }
 

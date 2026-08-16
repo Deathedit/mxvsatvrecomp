@@ -544,7 +544,21 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   static constexpr uint32_t kTranslatedInterpolators = 8;
   // Bounded for the same reason as m_blendPSOs: a shader set that grew without
   // limit would otherwise grow this without limit.
-  static constexpr size_t kMaxTranslatedPSOs = 256;
+  //
+  // The bound was 256 and was never sized against a loaded level. Measured in
+  // mx_1264: the menu and intro fit inside it, freeroam does not. The 256th
+  // pipeline is built 84s in, at level load, and from that instant every draw
+  // whose key is new falls back to the stand-in — 331,785 of 1,312,382 draws,
+  // 25% of the level, drawn flat for the rest of the run. That is not a memory
+  // bound doing its job, it is a silent 25% correctness hole, and it looks
+  // exactly like "assets are not loading".
+  //
+  // The key is (ps handle, vs handle, blend src/dest/op, flags, rtv format,
+  // topology), so the working set is a shader set times its output-merger
+  // states; a few thousand is the expected order for a level. The bytecode is
+  // cached per handle either side of this, so a new key past first sight costs
+  // one CreateGraphicsPipelineState, not a compile.
+  static constexpr size_t kMaxTranslatedPSOs = 4096;
   Microsoft::WRL::ComPtr<ID3D12RootSignature> m_translatedRootSig;
   Microsoft::WRL::ComPtr<ID3DBlob> m_translatedVsBlob;
   struct TranslatedPipeline {
