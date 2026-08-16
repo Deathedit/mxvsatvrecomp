@@ -30,7 +30,10 @@ extern "C" REX_FUNC(sub_82AB7848) {
   uint32_t sz = ctx.r3.u32;
   orig_GpuAlloc(ctx, base);
   uint32_t addr = ctx.r3.u32;
-  if (ga <= 8) {
+  // Same cap as the plugin branch above, deliberately. It used to be 8, which
+  // made native look like it stopped allocating after #8 while the plugin ran
+  // on to #30 — a divergence that was purely the two gates disagreeing.
+  if (ga <= 30) {
     REXLOG_INFO("native: GpuAlloc #{} size=0x{:08X} -> 0x{:08X}", ga, sz, addr);
   }
 }
