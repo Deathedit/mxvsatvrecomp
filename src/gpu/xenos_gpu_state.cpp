@@ -187,40 +187,66 @@ void XenosGpuState::ApplyType3Packet(const pm4::Pm4Packet& pkt) {
     case 0x03:  // WAIT_REG_MEM — sync only, no state mutation
       break;
 
-    // BUG(wrong-opcode): these two cases are misnamed, and the opcodes are not
-    // the ones intended. Per the SDK's PM4_* list, 0x21 is REG_RMW — a
-    // read-modify-write of a single register, whose body is (mask, or-value),
-    // NOT a base plus a run of values — and 0x20 is not a Xenos opcode at all.
-    // Xenos has no SET_CONTEXT_REG/SET_CONFIG_REG; register writes arrive as
-    // Type0 packets, which ApplyType0Write already handles correctly.
+    // PM4_REG_RMW (xenos.h:1571) — read-modify-write of ONE register. Body is
+    // three dwords: (rmw_info, and-operand, or-operand), with the target
+    // register in the low bits of rmw_info.
     //
-    // Left as-is deliberately. Neither opcode appears in any captured dump
-    // (frame 600's Type3 histogram has no 0x21 and no 0x20), so this is dead
-    // in practice, and the round this comment was written in is a
-    // measurement round that must not move any number. Deleting these cases,
-    // or implementing REG_RMW properly, belongs with the PM4 parser resync
-    // work where it can be measured on its own.
-    case 0x21:  // labelled SET_CONTEXT_REG; actually REG_RMW — see above
-      if (pkt.body.size() >= 2) {
-        uint32_t base = pkt.body[0] & 0xFFFF;
-        REXLOG_INFO("gpu_state: opcode 0x21 base=0x{:04X} count={}",
-                    base, pkt.body.size() - 1);
-        for (size_t i = 1; i < pkt.body.size(); ++i) {
-          WriteRegister(base + (uint32_t)(i - 1), pkt.body[i]);
-        }
-      }
-      break;
+    // This used to treat rmw_info as a base and the two operands as a RUN of
+    // register values, writing the and-mask to reg and the or-mask to reg+1.
+    // The comment that stood here called the case dead — "frame 600's Type3
+    // histogram has no 0x21" — and that was wrong: it fires 23 times in a menu
+    // run (22x 0x1841, 1x 0x1E4E), in BOTH native and plugin mode, because this
+    // parser does not sit behind the D3D9 passthrough. A claim that a branch
+    // cannot fire is worth as little here as a counter that cannot fire.
+    //
+    // The damage was nil, which is why it survived: every register it reaches
+    // is scanout, not 3D. 0x1841 D1GRPH_CONTROL, 0x1842
+    // D1GRPH_LUT_10BIT_BYPASS_CNTL, 0x1E4E XDVO_FORCE_OUTPUT_CNTL, 0x1E4F
+    // XDVO_FORCE_DATA (register_table.inc). Nothing downstream reads any of
+    // them — we do not emulate scanout — so this fix corrects the register file
+    // and should change no pixel. If a frame moves, something reads a display
+    // register and that is the finding, not this.
+    case 0x21: {
+      if (pkt.body.size() < 3) break;
+      const uint32_t rmw_info = pkt.body[0];
+      const uint32_t and_operand = pkt.body[1];
+      const uint32_t or_operand = pkt.body[2];
 
-    case 0x20:  // not a Xenos opcode — see above
-      if (pkt.body.size() >= 2) {
-        uint32_t base = pkt.body[0] & 0xFFFF;
-        REXLOG_INFO("gpu_state: opcode 0x20 base=0x{:04X} count={}",
-                    base, pkt.body.size() - 1);
-        for (size_t i = 1; i < pkt.body.size(); ++i) {
-          WriteRegister(base + (uint32_t)(i - 1), pkt.body[i]);
-        }
+      // Encoding verified against the Xenia source at
+      // xenia/gpu/pm4_command_processor_implement.h:925 (the tree at
+      // C:\Users\VM\Desktop\xenia-edge-edge, which carries implementations the
+      // SDK headers do not):
+      //
+      //   reg = rmw_info & 0x1FFF
+      //   bit 31 set -> AND operand is a register index, else an immediate
+      //   bit 30 set -> OR  operand is a register index, else an immediate
+      //
+      // The address field really is 13 bits, and that is NOT an array clamp:
+      // Xenia's own register file is 0x5003 entries, so it could address more
+      // and deliberately does not. An earlier version of this masked 0xFFFF on
+      // the reasoning that the register table runs to 0x8D07; that reasoning
+      // was wrong, and the two masks happen to agree on all observed traffic
+      // (0x1841, 0x1E4E) which is exactly why it would not have shown up.
+      const uint32_t reg = rmw_info & 0x1FFFu;
+      const uint32_t and_mask = ((rmw_info >> 31) & 1u)
+                                    ? ReadRegister(and_operand & 0x1FFFu)
+                                    : and_operand;
+      const uint32_t or_mask = ((rmw_info >> 30) & 1u)
+                                   ? ReadRegister(or_operand & 0x1FFFu)
+                                   : or_operand;
+      const uint32_t before = ReadRegister(reg);
+      const uint32_t after = (before & and_mask) | or_mask;
+      WriteRegister(reg, after);
+
+      static int s_logged = 0;
+      if (++s_logged <= 8) {
+        REXLOG_INFO("gpu_state: REG_RMW #{} reg=0x{:04X} and=0x{:08X} "
+                    "or=0x{:08X} (indirect and={} or={}) : 0x{:08X} -> 0x{:08X}",
+                    s_logged, reg, and_mask, or_mask, (rmw_info >> 31) & 1u,
+                    (rmw_info >> 30) & 1u, before, after);
       }
       break;
+    }
 
     default:
       break;
