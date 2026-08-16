@@ -968,6 +968,40 @@ void NoteChunk(uint8_t* base, uint32_t proto) {
   g_chunkCensus.emplace(proto, std::move(s));
 }
 
+// ---- Which chunks are ACTIVE -----------------------------------------------
+//
+// `first_caller` on the binding census answers "who called this binding FIRST",
+// and that is not the same question as "which chunks call bindings". A chunk
+// that only ever calls bindings some earlier chunk already touched never
+// appears in it.
+//
+// That distinction is not academic; it produced a wrong reading on 2026-08-16.
+// The first-caller list was read as "FE_Background loads and instantiates but
+// calls no binding, unlike FE_Home / FE_Home_Cameras / FE_Smoke", and that
+// asymmetry was an ARTIFACT. Playing the credits proves it: FE_Credits is
+// plainly active and on screen, and it is absent from the first-caller list too
+// -- because everything it calls (SendEvent, PlayUISound, ...) was already
+// first-seen elsewhere. Same shape as `counter-that-cannot-fire`.
+//
+// So count binding calls PER CALLING CHUNK. Keyed by the caller's Proto so the
+// hot path is 5 guest loads and one map lookup, with the name resolved once
+// through the chunk cache.
+std::mutex g_callerCensusMu;
+std::map<uint32_t, uint64_t> g_callerCensus;  // caller Proto -> binding calls
+
+// The caller's Proto, or 0 for a C caller / no frame. See LuaCallerSite for why
+// L->ci is the CALLER's frame here and where the offsets come from.
+uint32_t LuaCallerProto(uint8_t* base, uint32_t L) {
+  if (!L) return 0;
+  const uint32_t ci = REX_LOAD_U32(L + 20);
+  if (!ci) return 0;
+  const uint32_t func = REX_LOAD_U32(ci + 4);
+  if (!func || REX_LOAD_U32(func + 8) != 6) return 0;
+  const uint32_t closure = REX_LOAD_U32(func);
+  if (!closure || REX_LOAD_U8(closure + 6)) return 0;
+  return REX_LOAD_U32(closure + 16);
+}
+
 std::string LuaCallerSite(uint8_t* base, uint32_t L) {
   if (!L) return {};
   // L->ci is still the CALLER's frame -- precall pushes the callee's, and this
@@ -1079,6 +1113,35 @@ void ReportBindingCensus(uint8_t* base, const char* tag) {
     REXLOG_INFO("{}: CHUNK CENSUS — {} distinct Lua chunks executed, {} protos:{}",
                 tag, by_name.size(), chunks.size(), list);
   }
+  // Binding calls per calling chunk, worst first. THIS is the "which scripts
+  // are doing anything" list; the `<-` column on the census above is only ever
+  // the first caller of each binding.
+  {
+    std::map<uint32_t, uint64_t> callers;
+    std::map<uint32_t, std::string> chunks;
+    {
+      std::lock_guard<std::mutex> lk(g_callerCensusMu);
+      callers = g_callerCensus;
+    }
+    {
+      std::lock_guard<std::mutex> lk(g_chunkCensusMu);
+      chunks = g_chunkCensus;
+    }
+    std::map<std::string, uint64_t> by_name;
+    for (const auto& [proto, count] : callers) {
+      const auto it = chunks.find(proto);
+      by_name[it == chunks.end() ? "(unnamed)" : it->second] += count;
+    }
+    std::vector<std::pair<std::string, uint64_t>> sorted(by_name.begin(),
+                                                         by_name.end());
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::string list;
+    for (const auto& [name, count] : sorted)
+      list += fmt::format(" {}={}", name, count);
+    REXLOG_INFO("{}: CALLER CENSUS — {} chunks made binding calls:{}", tag,
+                sorted.size(), list);
+  }
   // State the zeroes. This is the half that a "which bindings fired" list
   // cannot give you, and it is the half the UI_World question needs.
   for (const auto& w : kWatchedBindings) {
@@ -1143,6 +1206,13 @@ extern "C" REX_FUNC(sub_82AA7638) {
         auto& e = g_bindingCensus[cfunc];
         if (e.first_caller.empty()) e.first_caller = std::move(site);
       }
+    }
+    // EVERY binding call, attributed to its calling chunk -- the population the
+    // first-caller list above cannot give. See the note on g_callerCensus.
+    if (const uint32_t cp = LuaCallerProto(base, ctx.r3.u32)) {
+      NoteChunk(base, cp);
+      std::lock_guard<std::mutex> lk(g_callerCensusMu);
+      ++g_callerCensus[cp];
     }
   }
 
