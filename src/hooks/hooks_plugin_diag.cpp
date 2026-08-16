@@ -890,6 +890,62 @@ std::string BindingName(uint8_t* base, uint32_t fn) {
   return {};
 }
 
+// ---- Who CALLED it ---------------------------------------------------------
+//
+// The dispatch lines used to report `lr` and nothing else, and that number is
+// worthless as a caller: decompiled 2026-08-16, 0x82AABA74 is the `bl` to this
+// function inside luaV_execute (sub_82AAAFD0), so lr=0x82AABA78 is the
+// interpreter's OP_CALL and EVERY script-level call in the game reports it.
+// luaD_precall has four call sites in total -- OP_CALL, OP_TAILCALL
+// (0x82AABAC0, nresults = -1), and two C entry paths -- so the only thing an lr
+// distinguishes here is "from a script" versus "from C".
+//
+// The CallInfo can name the caller, and the offsets are not carried over from
+// the Lua 5.1 headers: sub_82AA9B70 is this title's `addinfo`, and it performs
+// exactly the sequence below, field for field, to build its "%s:%d: %s" error
+// prefix. Every load here is one the game itself does.
+//
+//   L+20   ci                        ci+4   func      func+8  TValue.tt (6 = fn)
+//   *func  Closure                   +6     isC       +16     Proto (Lua only)
+//   L+24   savedpc                   p+12   code      p+20    lineinfo
+//   p+32   source (TString)          getstr = TString + 16
+//
+// currentline is `lineinfo[((savedpc - code) >> 2) - 1]`, and addinfo guards it
+// with nothing but `pc >= 0` and `lineinfo != 0`. Matched rather than
+// improved on: a bounds check against p+48 would rest on an offset the game
+// never reads here, which is the kind of extrapolation this file keeps paying
+// for.
+std::string LuaCallerSite(uint8_t* base, uint32_t L) {
+  if (!L) return {};
+  // L->ci is still the CALLER's frame -- precall pushes the callee's, and this
+  // runs before the original. For the same reason savedpc is read off L and not
+  // off the CallInfo: precall's first statement copies one to the other, so the
+  // CallInfo's copy is a statement stale until it has run.
+  const uint32_t ci = REX_LOAD_U32(L + 20);
+  if (!ci) return {};
+  const uint32_t func = REX_LOAD_U32(ci + 4);
+  if (!func || REX_LOAD_U32(func + 8) != 6) return {};
+  const uint32_t closure = REX_LOAD_U32(func);
+  // A C caller has no source and no line. That is the boot path and the
+  // engine's own lua_call sites, and reporting it as such is the point: it
+  // separates "a script asked for this" from "the engine did".
+  if (!closure || REX_LOAD_U8(closure + 6)) return "[C]";
+  const uint32_t p = REX_LOAD_U32(closure + 16);
+  if (!p) return {};
+  const int32_t pc =
+      static_cast<int32_t>((REX_LOAD_U32(L + 24) - REX_LOAD_U32(p + 12)) >> 2) -
+      1;
+  const uint32_t lineinfo = REX_LOAD_U32(p + 20);
+  const int32_t line =
+      (pc >= 0 && lineinfo)
+          ? static_cast<int32_t>(REX_LOAD_U32(lineinfo + 4 * uint32_t(pc)))
+          : -1;
+  const uint32_t source = REX_LOAD_U32(p + 32);
+  std::string name = source ? GuestString(base, source + 16, 96) : std::string();
+  if (name.empty()) name = fmt::format("proto 0x{:08X}", p);
+  return fmt::format("{}:{}", name, line);
+}
+
 // ---- Binding census --------------------------------------------------------
 //
 // The 5-second sampler below cannot answer "did this binding ever fire". A
@@ -910,7 +966,16 @@ std::string BindingName(uint8_t* base, uint32_t fn) {
 // The precall fires on at least three guest threads (t11624, t17392, t20020 in
 // mx_1196), so the map needs the lock. Do not "optimise" it away.
 std::mutex g_bindingCensusMu;
-std::map<uint32_t, uint64_t> g_bindingCensus;
+// The call site is kept from the FIRST sighting only. A binding called from two
+// places would hide the second, and that is the deliberate trade: the open
+// question is which script reaches a binding at all, and a per-site breakdown
+// costs a set per binding on the dispatch path. Widen it when a binding is
+// known to have two callers, not before.
+struct BindingCensusEntry {
+  uint64_t count = 0;
+  std::string first_caller;
+};
+std::map<uint32_t, BindingCensusEntry> g_bindingCensus;
 
 // Bindings whose absence is the current open question, reported explicitly so a
 // zero is stated rather than inferred from a name missing off a list. Addresses
@@ -930,24 +995,29 @@ constexpr WatchedBinding kWatchedBindings[] = {
 };
 
 void ReportBindingCensus(uint8_t* base, const char* tag) {
-  std::map<uint32_t, uint64_t> snapshot;
+  std::map<uint32_t, BindingCensusEntry> snapshot;
   {
     std::lock_guard<std::mutex> lk(g_bindingCensusMu);
     snapshot = g_bindingCensus;
   }
   REXLOG_INFO("{}: BINDING CENSUS — {} distinct C bindings called", tag,
               snapshot.size());
-  for (const auto& [fn, count] : snapshot) {
+  for (const auto& [fn, e] : snapshot) {
     const std::string name = BindingName(base, fn);
-    REXLOG_INFO("{}:   0x{:08X} x{} {}", tag, fn, count,
-                name.empty() ? "(not in the 228-entry table)" : name);
+    REXLOG_INFO("{}:   0x{:08X} x{} {} <- {}", tag, fn, e.count,
+                name.empty() ? "(not in the 228-entry table)" : name,
+                e.first_caller.empty() ? "?" : e.first_caller);
   }
   // State the zeroes. This is the half that a "which bindings fired" list
   // cannot give you, and it is the half the UI_World question needs.
   for (const auto& w : kWatchedBindings) {
     const auto it = snapshot.find(w.addr);
-    REXLOG_INFO("{}:   WATCHED {:<28} 0x{:08X} x{}", tag, w.name, w.addr,
-                it == snapshot.end() ? 0 : it->second);
+    REXLOG_INFO("{}:   WATCHED {:<28} 0x{:08X} x{} <- {}", tag, w.name, w.addr,
+                it == snapshot.end() ? 0 : it->second.count,
+                it == snapshot.end() ? "(never called)"
+                                     : (it->second.first_caller.empty()
+                                            ? "?"
+                                            : it->second.first_caller.c_str()));
   }
 }
 
@@ -976,12 +1046,30 @@ extern "C" REX_FUNC(sub_82AA7638) {
 
   // Census first, before the sampler, because this is the part that has to see
   // every call. `first_sight` is what catches a binding that fires once.
+  //
+  // The caller walk runs only on a binding's FIRST sighting, so it costs a
+  // handful of guest loads per RUN rather than per dispatch. Resolved before
+  // the lock -- it reads guest memory and takes no lock of its own, and holding
+  // the census mutex across it would put the walk on three threads' critical
+  // path for no reason.
   bool first_sight = false;
   if (is_c && cfunc) {
-    std::lock_guard<std::mutex> lk(g_bindingCensusMu);
-    auto [it, inserted] = g_bindingCensus.try_emplace(cfunc, 0);
-    ++it->second;
-    first_sight = inserted;
+    bool need_caller = false;
+    {
+      std::lock_guard<std::mutex> lk(g_bindingCensusMu);
+      auto [it, inserted] = g_bindingCensus.try_emplace(cfunc);
+      ++it->second.count;
+      first_sight = inserted;
+      need_caller = it->second.first_caller.empty();
+    }
+    if (need_caller) {
+      std::string site = LuaCallerSite(base, ctx.r3.u32);
+      if (!site.empty()) {
+        std::lock_guard<std::mutex> lk(g_bindingCensusMu);
+        auto& e = g_bindingCensus[cfunc];
+        if (e.first_caller.empty()) e.first_caller = std::move(site);
+      }
+    }
   }
 
   static uint64_t s_count = 0;
@@ -995,11 +1083,20 @@ extern "C" REX_FUNC(sub_82AA7638) {
   const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
 
   // A binding seen for the first time always logs, whatever the sampler says.
+  // `lr` is kept only to separate a script caller from a C one -- see
+  // LuaCallerSite for why it can say nothing more than that -- and the script
+  // site is what the line is actually for.
   if (first_sight) {
     const std::string name = BindingName(base, cfunc);
-    REXLOG_INFO("{}: BINDING FIRST CALL 0x{:08X} {} at dispatch #{} from lr=0x{:08X}",
-                tag, cfunc,
-                name.empty() ? "(not in the 228-entry table)" : name, n, from);
+    std::string site;
+    {
+      std::lock_guard<std::mutex> lk(g_bindingCensusMu);
+      site = g_bindingCensus[cfunc].first_caller;
+    }
+    REXLOG_INFO(
+        "{}: BINDING FIRST CALL 0x{:08X} {} at dispatch #{} from {} (lr=0x{:08X})",
+        tag, cfunc, name.empty() ? "(not in the 228-entry table)" : name, n,
+        site.empty() ? "?" : site, from);
   }
 
   bool due = n <= 8;
@@ -1012,9 +1109,14 @@ extern "C" REX_FUNC(sub_82AA7638) {
   }
   if (due) {
     const std::string name = is_c ? BindingName(base, cfunc) : std::string();
-    REXLOG_INFO("{}: vm dispatch #{} {} cfunc=0x{:08X}{}{} from lr=0x{:08X}", tag, n,
+    // The sampler is the "is the front end alive" signal, and a sampled line
+    // naming the calling script says where it is alive -- which is the whole
+    // question while the post-composite draw list is short. It runs at most
+    // once every 5s, so the walk is free here.
+    REXLOG_INFO("{}: vm dispatch #{} {} cfunc=0x{:08X}{}{} from {}", tag, n,
                 !is_fn ? "non-function" : (is_c ? "C" : "lua"), cfunc,
-                name.empty() ? "" : " name=", name, from);
+                name.empty() ? "" : " name=", name,
+                LuaCallerSite(base, ctx.r3.u32));
   }
 
   // Roll-up every 30s. Timestamped, so a binding that fires on a menu
