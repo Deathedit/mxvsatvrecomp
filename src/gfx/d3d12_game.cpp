@@ -427,6 +427,44 @@ bool D3D12Renderer::CreatePresentQuad() {
 
 namespace {
 
+// An HRESULT with its name where there is one.
+//
+// Every D3D12 creation failure in this file used to log the fact and discard
+// the code, which makes a bare "creation failed" indistinguishable between
+// out-of-memory, an invalid format combination and a device that has already
+// gone. That cost a session: a depth-format change removed the device, and the
+// only evidence was `resolve snapshot: creation FAILED for 64x64` with no code
+// and 40,000 lines of downstream noise after it.
+//
+// It matters more here than in most codebases because the D3D12 debug layer
+// and DRED are NOT available on this machine -- D3D12GetDebugInterface returns
+// E_NOINTERFACE (Graphics Tools is not installed), so there is no validation
+// message coming. The HRESULT is the only thing the runtime will tell us.
+const char* HrName(HRESULT hr) {
+  switch (hr) {
+    case E_OUTOFMEMORY:            return "E_OUTOFMEMORY";
+    case E_INVALIDARG:             return "E_INVALIDARG";
+    case E_NOINTERFACE:            return "E_NOINTERFACE";
+    case E_NOTIMPL:                return "E_NOTIMPL";
+    case E_FAIL:                   return "E_FAIL";
+    case DXGI_ERROR_DEVICE_REMOVED: return "DXGI_ERROR_DEVICE_REMOVED";
+    case DXGI_ERROR_DEVICE_HUNG:   return "DXGI_ERROR_DEVICE_HUNG";
+    case DXGI_ERROR_DEVICE_RESET:  return "DXGI_ERROR_DEVICE_RESET";
+    case DXGI_ERROR_INVALID_CALL:  return "DXGI_ERROR_INVALID_CALL";
+    case DXGI_ERROR_UNSUPPORTED:   return "DXGI_ERROR_UNSUPPORTED";
+    default:                       return "";
+  }
+}
+
+// "0x887A0005 DXGI_ERROR_DEVICE_REMOVED", or just the number if unnamed.
+std::string HrText(HRESULT hr) {
+  char buf[64];
+  const char* name = HrName(hr);
+  std::snprintf(buf, sizeof(buf), "0x%08lX%s%s", static_cast<unsigned long>(hr),
+                *name ? " " : "", name);
+  return buf;
+}
+
 // Guest blend factor -> D3D12_BLEND.
 //
 // These are the Xenos hardware values, NOT the PC D3D9 D3DBLEND enum. Measured:
@@ -1252,7 +1290,19 @@ ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
   const HRESULT hr =
       m_device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&entry.pso));
   if (FAILED(hr)) {
-    LogError("TranslatedPSO: CreateGraphicsPipelineState failed");
+    // The RTV/DSV formats are named because they are what a PSO is most often
+    // refused for, and because the depth format is a thing this project
+    // changes. DEVICE_REMOVED here means the failure is somewhere else
+    // entirely and every later PSO will fail too -- read the FIRST one.
+    char message[224];
+    std::snprintf(message, sizeof(message),
+                  "TranslatedPSO: CreateGraphicsPipelineState failed hr=%s "
+                  "(rtv fmt %u, dsv fmt %u, depth %u/%u)",
+                  HrText(hr).c_str(), uint32_t(pso.RTVFormats[0]),
+                  uint32_t(pso.DSVFormat),
+                  uint32_t(pso.DepthStencilState.DepthEnable),
+                  uint32_t(pso.DepthStencilState.StencilEnable));
+    LogError(message);
     ++m_translatedFailed;
     m_translatedPSOs[key] = entry;
     return nullptr;
@@ -1424,13 +1474,22 @@ ID3D12PipelineState* D3D12Renderer::OpaquePSO(
       color_write ? D3D12_COLOR_WRITE_ENABLE_ALL : 0;
 
   Microsoft::WRL::ComPtr<ID3D12PipelineState> created;
-  if (FAILED(m_device->CreateGraphicsPipelineState(&pso,
-                                                   IID_PPV_ARGS(&created)))) {
+  const HRESULT hr =
+      m_device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&created));
+  if (FAILED(hr)) {
     // Fall back to the RGBA8 variant rather than dropping the draw. It will be
     // refused by the debug layer against a mismatched RTV, which is visible,
     // whereas a silently missing draw is not.
-    LogError("OpaquePSO: variant creation failed for a non-RGBA8 target or a "
-             "non-triangle topology");
+    static uint32_t s_logged = 0;
+    if (++s_logged <= 16) {
+      char message[224];
+      std::snprintf(message, sizeof(message),
+                    "OpaquePSO: variant creation failed hr=%s (rtv fmt %u, dsv "
+                    "fmt %u, topo %u, variant %u)",
+                    HrText(hr).c_str(), uint32_t(rtvFormat),
+                    uint32_t(pso.DSVFormat), uint32_t(topoType), variant);
+      LogError(message);
+    }
     return m_gamePSOs[variant].Get();
   }
   auto [it, ok] = m_gamePSOsByFormat.emplace(key, std::move(created));
@@ -1500,9 +1559,22 @@ ID3D12PipelineState* D3D12Renderer::BlendedPSO(const BlendKey& key) {
       color_write ? D3D12_COLOR_WRITE_ENABLE_ALL : 0;
 
   Microsoft::WRL::ComPtr<ID3D12PipelineState> created;
-  if (FAILED(m_device->CreateGraphicsPipelineState(&pso,
-                                                   IID_PPV_ARGS(&created)))) {
-    LogError("BlendedPSO: pipeline creation failed — drawing opaque");
+  const HRESULT hr =
+      m_device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(&created));
+  if (FAILED(hr)) {
+    // Rate-limited: once the device is removed every call here fails, and this
+    // site alone produced 40,000 identical lines that buried the one error
+    // that mattered.
+    static uint32_t s_logged = 0;
+    if (++s_logged <= 16) {
+      char message[224];
+      std::snprintf(message, sizeof(message),
+                    "BlendedPSO: pipeline creation failed hr=%s — drawing "
+                    "opaque (rtv fmt %u, dsv fmt %u, src %u dest %u op %u)",
+                    HrText(hr).c_str(), uint32_t(pso.RTVFormats[0]),
+                    uint32_t(pso.DSVFormat), key.src, key.dest, key.op);
+      LogError(message);
+    }
     return nullptr;
   }
   // Each distinct blend mode the guest uses, once. A frame that renders wrong
@@ -2134,10 +2206,28 @@ bool D3D12Renderer::CreatePooledSurface(GameRenderTarget& entry, uint32_t width,
   rd.SampleDesc.Count = 1;
   rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
   rd.Flags = spec.flags;
-  if (FAILED(m_device->CreateCommittedResource(
-          &hp, D3D12_HEAP_FLAG_NONE, &rd, spec.initialState, spec.clear,
-          IID_PPV_ARGS(&entry.resource))))
+  const HRESULT hr = m_device->CreateCommittedResource(
+      &hp, D3D12_HEAP_FLAG_NONE, &rd, spec.initialState, spec.clear,
+      IID_PPV_ARGS(&entry.resource));
+  if (FAILED(hr)) {
+    // Everything the call was asked for, because a format combination is the
+    // likeliest reason for a small surface to be refused and the caller's own
+    // message only knows the extent. Rate-limited: the caller retries the same
+    // surface every frame, so an unbounded log buries the rest of the run.
+    static uint32_t s_logged = 0;
+    if (++s_logged <= 16) {
+      char message[256];
+      std::snprintf(message, sizeof(message),
+                    "CreatePooledSurface: %ux%u FAILED hr=%s — resource fmt %u,"
+                    " srv fmt %u, flags 0x%X, state 0x%X, clear %s",
+                    width, height, HrText(hr).c_str(),
+                    uint32_t(spec.resourceFormat), uint32_t(spec.srvFormat),
+                    uint32_t(spec.flags), uint32_t(spec.initialState),
+                    spec.clear ? "yes" : "no");
+      LogError(message);
+    }
     return false;
+  }
   // Recorded HERE, from what the resource was actually created with, rather
   // than by each caller. EnsureGameRenderTarget set it and EnsureGameSnapshot
   // did not, so every snapshot claimed to be R8G8B8A8_UNORM — the struct
