@@ -5842,6 +5842,12 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
       // through a mapped host target.
       case mx::hle::HostTextureFormat::kRgba16Unorm:
       case mx::hle::HostTextureFormat::kRgba16Snorm:
+      // k_2_10_10_10 scores here rather than with the colour assets above for
+      // the same reason: every sighting of it so far is a full-screen 1280x720
+      // render target, not a material. Scoring it as base colour would let a
+      // scene intermediate outrank a BC1 diffuse, which is the regression the
+      // comment above this switch describes.
+      case mx::hle::HostTextureFormat::kRgb10A2Unorm:
         // Float descriptors observed in ST_Southwest are render/resolve
         // intermediates. Only the mapped host-target path above may select
         // them; immutable guest copies are black while GPU dispatch is skipped.

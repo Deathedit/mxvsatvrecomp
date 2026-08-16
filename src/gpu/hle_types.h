@@ -55,6 +55,12 @@ enum class HostTextureFormat : uint8_t {
   kRgba16Unorm,
   kRgba16Snorm,
   kRg32Float,
+  // k_2_10_10_10 (and k_2_10_10_10_AS_16_16_16_16, which GetBaseFormat folds
+  // onto it). Three 10-bit channels and a 2-bit alpha in one dword — the same
+  // 32bpp passthrough as kRgba8, so nothing in the decode path needs to know
+  // about it beyond the DXGI format. Appended rather than inserted: the enum
+  // is compared by value across the hooks/renderer boundary.
+  kRgb10A2Unorm,
 };
 
 // xenos::TextureFilter::kBaseMap -- "sample level 0 and never minify past it".

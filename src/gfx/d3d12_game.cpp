@@ -2055,6 +2055,9 @@ bool D3D12Renderer::EnsureGameTexture(
     case mx::hle::HostTextureFormat::kRg32Float:
       format = DXGI_FORMAT_R32G32_FLOAT;
       break;
+    case mx::hle::HostTextureFormat::kRgb10A2Unorm:
+      format = DXGI_FORMAT_R10G10B10A2_UNORM;
+      break;
   }
   if (format == DXGI_FORMAT_UNKNOWN || !texture->width || !texture->height)
     return false;

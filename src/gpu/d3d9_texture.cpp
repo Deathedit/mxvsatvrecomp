@@ -546,6 +546,21 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
     case xenos::TextureFormat::k_8_8_8_8:
       out.host_format = HostTextureFormat::kRgba8;
       break;
+    // The other 32bpp passthrough. Rejecting it was worth a full-screen
+    // surface: mx_1264-era runs showed a 1280x720 tiled descriptor turned down
+    // here (raw format 54, k_2_10_10_10_AS_16_16_16_16, which GetBaseFormat
+    // folds to this), and a rejected descriptor leaves the slot with no
+    // resource, so the sampler reads zero rather than failing visibly.
+    //
+    // One case covers both spellings precisely because the fold already
+    // happened above. The reference gives both rows R10G10B10A2_UNORM with
+    // load shader 32bpb and an identity RGBA host swizzle
+    // (d3d12_texture_cache.h:251 and :489) — so this is a straight copy, and
+    // being four-channel it does NOT inherit the RGGG divergence written up at
+    // k_8_8 above.
+    case xenos::TextureFormat::k_2_10_10_10:
+      out.host_format = HostTextureFormat::kRgb10A2Unorm;
+      break;
     case xenos::TextureFormat::k_DXT1:
       out.host_format = HostTextureFormat::kBc1;
       break;
