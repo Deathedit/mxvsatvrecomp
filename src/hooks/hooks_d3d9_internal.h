@@ -203,6 +203,24 @@ extern uint64_t g_glyphCacheFlushes;
 // rule at the top of this header.
 void NoteGlyphCacheGeometry(uint32_t width, uint32_t height);
 
+// Guest D3D9 draw calls, counted in BOTH native and plugin mode.
+//
+// Every other draw counter in this file lives AFTER
+// MX_D3D9_PLUGIN_PASSTHROUGH, so it reads zero under --gpu_plugin=xenos and
+// the two modes cannot be compared on it. That comparison is the one that
+// matters: plugin mode renders the main-menu backdrop and native does not, and
+// native measures 339 guest draw calls per frame against a Xenia reference
+// frame carrying far more. Either the guest issues the same work in both --
+// in which case our 339 draws produce the wrong image and nothing is missing --
+// or it issues less under our hooks, which would mean this layer is changing
+// guest behaviour upstream of the renderer. A counter that only runs in one
+// mode cannot tell those apart.
+//
+// Incremented before the passthrough return, so it is the guest's own call
+// count and nothing else. Atomic because the three record workers drive it and
+// there is no lock on this path in plugin mode.
+extern std::atomic<uint64_t> g_guestDrawCalls;
+
 // Stream-binding recency, for the "was this stream bound for this draw" check.
 extern uint32_t g_lastBindD0;
 extern uint32_t g_lastBindD1;

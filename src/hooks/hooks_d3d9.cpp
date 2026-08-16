@@ -4839,6 +4839,9 @@ bool BlankRetryDue(uint64_t key) {
 // generation instead, mismatches once, and re-decodes into the right regime.
 // Self-correcting, and it costs one decode.
 //===========================================================================
+// Counted in both modes -- see the note in hooks_d3d9_internal.h.
+std::atomic<uint64_t> g_guestDrawCalls{0};
+
 uint32_t g_glyphCacheGeneration = 1;
 uint64_t g_glyphCacheFlushes = 0;
 
@@ -8537,3 +8540,11 @@ void ReportDrawCounts(uint8_t* base) {
 }
 
 }  // namespace mx::hooks::d3d9
+
+// Declared in hooks_d3d9.h. A free function rather than the atomic itself
+// because hooks_frame.cpp reads this and cannot include the internal header --
+// that header needs mx::hle types (HleStream, D3D9Element, LayoutError) which
+// hooks_frame.cpp does not pull in.
+uint64_t GuestDrawCalls() {
+  return mx::hooks::d3d9::g_guestDrawCalls.load(std::memory_order_relaxed);
+}

@@ -358,6 +358,8 @@ extern "C" REX_FUNC(sub_82564C50) {
 
 REX_IMPORT(__imp__sub_825565C8, orig_DrawIndexedVertices, void());
 extern "C" REX_FUNC(sub_825565C8) {
+  // BEFORE the passthrough return, so the count is comparable across modes.
+  g_guestDrawCalls.fetch_add(1, std::memory_order_relaxed);
   MX_D3D9_PLUGIN_PASSTHROUGH(orig_DrawIndexedVertices);
   const uint32_t primitive_type = ctx.r4.u32;
   const int32_t base_vertex = ctx.r5.s32;
@@ -404,6 +406,7 @@ extern "C" REX_FUNC(sub_825565C8) {
 
 REX_IMPORT(__imp__sub_825561B0, orig_DrawVertices, void());
 extern "C" REX_FUNC(sub_825561B0) {
+  g_guestDrawCalls.fetch_add(1, std::memory_order_relaxed);
   MX_D3D9_PLUGIN_PASSTHROUGH(orig_DrawVertices);
   const uint32_t primitive_type = ctx.r4.u32;
   const uint32_t start_vertex = ctx.r5.u32;
@@ -455,6 +458,7 @@ extern "C" REX_FUNC(sub_825561B0) {
 //-----------------------------------------------------------------------------
 REX_IMPORT(__imp__sub_82555B88, orig_DrawVerticesUP, void());
 extern "C" REX_FUNC(sub_82555B88) {
+  g_guestDrawCalls.fetch_add(1, std::memory_order_relaxed);
   MX_D3D9_PLUGIN_PASSTHROUGH(orig_DrawVerticesUP);
   const uint32_t device = ctx.r3.u32;
   const uint32_t primitive_type = ctx.r4.u32;

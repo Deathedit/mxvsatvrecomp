@@ -163,6 +163,45 @@ extern "C" REX_FUNC(sub_82566B58) {
           : 0;
   if (frame_size >= 1024 * 1024) frame_size = 0;
 
+  // GUEST DRAWS per frame, reported HERE rather than from BeginFrame, and the
+  // reason is a measurement that was nearly read as a finding.
+  //
+  // The first cut printed this from sub_82ABF828 (BeginFrame) at
+  // `bf <= 3 || bf % 600 == 0`. A native run ended at 424 swaps and so logged
+  // only #1..#3, while a plugin run reached 760 and logged #600 -- which reads
+  // as "BeginFrame fires 3 times natively and 600 times under the plugin" and
+  // is nothing of the sort. It is the modulus. VdSwap is the right site: it
+  // ticks once per present in BOTH modes, unlike almost everything else in this
+  // file, and the interval is short enough that a run reaching the menu always
+  // produces several lines.
+  //
+  // What the number decides, and it is the whole reason it exists: plugin mode
+  // renders the main-menu backdrop and native does not, so
+  //
+  //   same per-frame count in both -> the guest submits the same work and our
+  //                                   draws produce the wrong image; the defect
+  //                                   is state, not submission.
+  //   lower under native           -> this hook layer is changing guest
+  //                                   behaviour upstream of the renderer.
+  //
+  // Averaged over the interval, not sampled from one frame: the front end
+  // alternates cheap and expensive frames.
+  {
+    static uint64_t s_prev_draws = 0;
+    static int s_prev_swap = 0;
+    if (swap_count <= 3 || (swap_count % 100) == 0) {
+      const uint64_t now = GuestDrawCalls();
+      const int frames = swap_count - s_prev_swap;
+      REXLOG_INFO("{}: GUEST DRAWS #{} — {} total, {} per frame over the last "
+                  "{} frames",
+                  tag, swap_count, now,
+                  frames > 0 ? (now - s_prev_draws) / uint64_t(frames) : 0,
+                  frames);
+      s_prev_draws = now;
+      s_prev_swap = swap_count;
+    }
+  }
+
   // Log VdSwap at sparse checkpoints, plus the first 40 swaps and every wrap
   // (either range) so the ring span can be pinned down from one run.
   bool log_this_swap = (swap_count <= 40) || (swap_count % 100 == 0) ||
@@ -507,7 +546,8 @@ extern "C" REX_FUNC(sub_82ABF828) {
   static int bf = 0;
   ++bf;
   if (bf <= 3 || (bf % 600) == 0)
-    REXLOG_INFO("{}: BeginFrame #{}", mx::native::g_plugin_mode ? "plugin" : "native", bf);
+    REXLOG_INFO("{}: BeginFrame #{}",
+                mx::native::g_plugin_mode ? "plugin" : "native", bf);
   orig_BeginFrame(ctx, base);
 }
 

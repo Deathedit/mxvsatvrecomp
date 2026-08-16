@@ -12,3 +12,13 @@ void FinalizePendingD3D9Draws(uint8_t* base);
 // time is ~85% this file (see AGENTS.md); this says how much of that is the
 // page-readability syscall.
 void ReportHostPageQueryStats();
+
+// Guest D3D9 draw calls so far, counted in BOTH native and plugin mode.
+//
+// Every other draw counter in this layer sits after
+// MX_D3D9_PLUGIN_PASSTHROUGH and so reads zero under --gpu_plugin=xenos, which
+// makes the two modes incomparable on the one number that decides where the
+// missing main-menu backdrop lives. See the note at its definition in
+// hooks_d3d9_internal.h. Exposed as a function rather than the atomic itself
+// because hooks_frame.cpp cannot include the internal header.
+uint64_t GuestDrawCalls();
