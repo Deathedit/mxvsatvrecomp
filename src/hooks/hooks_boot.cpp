@@ -192,21 +192,21 @@ extern "C" REX_FUNC(sub_82AEBF40) {
       gpu_base);
   }
 }
-
-REX_IMPORT(__imp__sub_82BA7F58, orig_EngineInit, void());
-extern "C" REX_FUNC(sub_82BA7F58) {
-  if (mx::native::g_plugin_mode) {
-    LogEngSlot8(base, "EngineInit ENTER");
-    orig_EngineInit(ctx, base);
-    LogEngSlot8(base, "EngineInit RETURNED");
-    return;
-  }
-  mx::native::NativeGraphics::Get().SetGuestMemory(base);
-  REXLOG_INFO("native: EngineInit (0x82BA7F58)");
-  REXLOG_INFO("native: EngineInit — calling orig");
-  orig_EngineInit(ctx, base);
-  REXLOG_INFO("native: EngineInit returned — keeping alive");
-  for (;;) {
-    ::Sleep(16);
-  }
-}
+// The sub_82BA7F58 (EngineInit) hook is REMOVED 2026-08-16, having run disabled
+// for ~3-4 hours of sessions covering boot, menu, level load and level exit.
+//
+// It did three things, and the middle one is why it could not stay:
+//
+//   NativeGraphics::SetGuestMemory(base) -- and that was the ONLY caller. With
+//     the hook gone, m_guest_base is set by nobody; GetGuestMemory() was already
+//     called by nobody. The accessor pair and the member in native_bridge.h are
+//     therefore dead, and should go with the next change that touches that file.
+//
+//   `for (;;) ::Sleep(16);` after calling the original -- it parked the guest's
+//     init thread forever to keep the process alive. That is a bring-up scaffold
+//     from before the render thread owned the frame loop, and it means this hook
+//     never returned.
+//
+//   Two log lines and the eng+8 slot dump.
+//
+// git history has the body.

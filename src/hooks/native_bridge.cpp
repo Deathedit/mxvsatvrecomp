@@ -45,6 +45,13 @@ void NativeGraphics::Shutdown() {
   // A guest VdSwap may be waiting for the render thread to consume the
   // previous frame. Release it when that consumer is being torn down.
   m_drawConsumed.notify_all();
+  m_drawAvailable.notify_all();
+}
+
+void NativeGraphics::WaitForDrawsOrShutdown() {
+  std::unique_lock<std::mutex> lock(m_drawMutex);
+  m_drawAvailable.wait(
+      lock, [this] { return !m_drawCalls.empty() || !m_acceptDrawCalls; });
 }
 
 void NativeGraphics::BeginFrame() {
@@ -68,6 +75,7 @@ void NativeGraphics::SetDrawCalls(const std::vector<mx::hle::DrawCall>& calls) {
       lock, [this] { return m_drawCalls.empty() || !m_acceptDrawCalls; });
   if (!m_acceptDrawCalls) return;
   m_drawCalls = calls;
+  m_drawAvailable.notify_one();
   if (waited) {
     static std::atomic<bool> s_logged = false;
     if (!s_logged.exchange(true)) {

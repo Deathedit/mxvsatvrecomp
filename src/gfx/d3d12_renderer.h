@@ -240,6 +240,20 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
  private:
   static constexpr uint32_t kFrameCount = 3;
   static constexpr DXGI_FORMAT kBackBufferFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+  // Present's sync interval. This was 1 — vsync — and is deliberately 0.
+  //
+  // Named rather than passed as a literal because turning vsync off is a
+  // measurement decision with a short shelf life, not a property of the
+  // renderer. It was set to 0 while establishing where the frame actually goes,
+  // and the answer was that the render thread does ~16ms of work and then idles
+  // waiting for the guest, which spends ~40-60ms per frame in the D3D9 hooks.
+  // So uncapping Present does NOT buy frames here: the loop it uncaps is not the
+  // one that is slow. What it does buy is tearing, since the swap chain is
+  // created with ALLOW_TEARING whenever the adapter reports it.
+  //
+  // Put it back to 1 once the guest-side cost is the thing being worked on, or
+  // promote it to config if it needs to be switchable at runtime.
+  static constexpr UINT kPresentSyncInterval = 0;
   // The offscreen game depth buffer's format. Named because it has to appear in
   // three places that must agree — the resource, its clear value, and the PSO's
   // DSVFormat — and the PSO's copy was the one that got left out.

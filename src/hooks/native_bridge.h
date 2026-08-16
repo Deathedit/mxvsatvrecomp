@@ -45,6 +45,9 @@ class NativeGraphics {
   void SetDrawCalls(const std::vector<mx::hle::DrawCall>& calls);
   std::vector<mx::hle::DrawCall> GetDrawCalls();
   void ClearDrawCalls();
+  // Blocks until the guest posts a draw list or Shutdown() runs. The render
+  // thread's idle state: the mailbox is the wakeup source, not a clock.
+  void WaitForDrawsOrShutdown();
 
  private:
   NativeGraphics() = default;
@@ -52,7 +55,8 @@ class NativeGraphics {
   uint8_t* m_guest_base = nullptr;
 
   std::mutex m_drawMutex;
-  std::condition_variable m_drawConsumed;
+  std::condition_variable m_drawConsumed;   // guest waits: list must be empty
+  std::condition_variable m_drawAvailable;  // render thread waits: list non-empty
   std::vector<mx::hle::DrawCall> m_drawCalls;
   bool m_acceptDrawCalls = true;
 };

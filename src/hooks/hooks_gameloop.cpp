@@ -1,167 +1,59 @@
-// Game loop hooks — MainLoop and RenderPipeline.
+// Game loop hooks — RenderPipeline.
 //
-// MainLoop is what keeps the process ticking at 60fps: it forces the render
-// flag on, applies the eng+8 self-ref workaround that keeps MainLoop's vt[36]
-// call landing on Bootstrap's nullsub_1, forces r3=1 so the guest's
-// `while (MainLoop != 0)` never exits, and paces the loop with Sleep(16).
+// The MainLoop hook that used to live here is gone; see the note below. What
+// remains is a timing probe around the guest's own RenderPipeline.
 
 #include "hooks/hook_common.h"
 
 #include <chrono>
 
 //=============================================================================
-// sub_82B70760 — Main game loop
+// sub_82B70760 — Main game loop (HOOK REMOVED 2026-08-16)
 //=============================================================================
-
-REX_IMPORT(__imp__sub_82B70760, orig_MainLoop, void());
-extern "C" REX_FUNC(sub_82B70760) {
-  if (mx::native::g_plugin_mode) {
-    static int plm = 0;
-    ++plm;
-    if (plm == 1 || (plm % 600) == 0)
-      REXLOG_INFO("plugin: MainLoop #{}", plm);
-    // At frame 60 and 600, dump engine sub-entity state
-    if (plm == 60 || plm == 600 || plm == 1800) {
-      REXLOG_INFO("plugin: === engine state dump at MainLoop #{} ===", plm);
-      uint32_t eng = REX_LOAD_U32(0x830BE400);
-      REXLOG_INFO("plugin: eng=0x{:08X} eng+8=0x{:08X}", eng, eng ? REX_LOAD_U32(eng+8) : 0);
-      // Engine sub-entity list (offsets +0x1C..+0x24 per AGENTS.md post-dispatch body)
-      if (eng) {
-        for (int off = 0x1C; off <= 0x24; off += 4) {
-          uint32_t sub_entity_ptr = REX_LOAD_U32(eng + off);
-          REXLOG_INFO("plugin: eng+0x{:X}=0x{:08X}", off, sub_entity_ptr);
-          if (sub_entity_ptr) {
-            uint32_t vt = REX_LOAD_U32(sub_entity_ptr);
-            uint32_t f3C = REX_LOAD_U32(sub_entity_ptr + 0x3C);
-            REXLOG_INFO("plugin:   vt=0x{:08X} +0x3C=0x{:08X}", vt, f3C);
-          }
-        }
-      }
-      // Entity counts
-      REXLOG_INFO("plugin: pass0=0x{:08X} pass1=0x{:08X} pass2=0x{:08X}",
-        REX_LOAD_U32(0x830C2150), REX_LOAD_U32(0x830C4560), REX_LOAD_U32(0x830C6970));
-      // byte_82D57994 (render flag)
-      REXLOG_INFO("plugin: byte_82D57994={}", REX_LOAD_U8(0x82D57994));
-      // dword_830BE190
-      REXLOG_INFO("plugin: dword_830BE190=0x{:08X}", REX_LOAD_U32(0x830BE190));
-    }
-    orig_MainLoop(ctx, base);
-    return;
-  }
-  static int ml = 0;
-  ++ml;
-  mx::native::GuestTick();  // arms the stall watchdog in hooks_wait.cpp
-
-  // byte_82D57994 gates MainLoop's call to RenderPipeline: at 0x82B707B0 and
-  // again at 0x82B7080C a zero here jumps straight to the vt[36] tail, so the
-  // guest render path never runs. The only guest write to this byte is in
-  // Transition (mx_recomp.82.cpp:67620), and it writes 0 on loader exit —
-  // nothing in the guest sets it, so forcing it is load-bearing.
-  //
-  // The old code also cleared it at frame 600, a leftover fabricated
-  // "loading complete" signal. That closed the render window ~20s in, entirely
-  // inside the 47.4s Bink intro, so RenderPipeline was skipped every time it
-  // was reached. The clear is REMOVED 2026-08-02; log when the guest clears it
-  // underneath us so the tug-of-war with Transition stays visible.
-  {
-    uint8_t before = REX_LOAD_U8(0x82D57994);
-    static uint8_t s_last = 1;
-    if (before != s_last) {
-      REXLOG_INFO("native: byte_82D57994 changed {} -> {} by guest at MainLoop #{}",
-                  s_last, before, ml);
-      s_last = before;
-    }
-    REX_STORE_U8(0x82D57994, 1);
-  }
-
-  if (ml == 1) {
-    uint32_t eng = REX_LOAD_U32(0x830BE400);
-    uint32_t sub = REX_LOAD_U32(eng + 12);
-    uint32_t sub_vt = sub ? REX_LOAD_U32(sub) : 0;
-    uint32_t sub_f36 = sub_vt ? REX_LOAD_U32(sub_vt + 144) : 0;
-    uint32_t sub_f0 = sub_vt ? REX_LOAD_U32(sub_vt) : 0;
-    // Diagnostic: dump the AssetDB global (dword_830577C0) and its vtable.
-    // Goal: determine whether writing eng+8 = AssetDB would give MainLoop's
-    // vt[36] call a real function (low 0x82XXXXXX address) or string data
-    // (high non-function-range value that would crash on call). The Bootstrap
-    // vtable's vt[36]=nullsub_1 is the current safe workaround; we want to
-    // know if the real AssetDB's vt[36] is also safe to call.
-    uint32_t assetdb = REX_LOAD_U32(0x830577C0);
-    uint32_t assetdb_vt = assetdb ? REX_LOAD_U32(assetdb) : 0;
-    uint32_t assetdb_f0 = assetdb_vt ? REX_LOAD_U32(assetdb_vt) : 0;
-    uint32_t assetdb_f36 = assetdb_vt ? REX_LOAD_U32(assetdb_vt + 144) : 0;
-    // Also dump the transition_renderer+8 (= dword_830EC250) which EngineInit
-    // writes at 0x82ba7fe4 from sub_8253CF08. This is the slot LoaderTick's
-    // (a1+8)->vtable[6] = *(a1+0x1C) gating check reads — NOT engine+8.
-    uint32_t tr_assetdb = REX_LOAD_U32(0x830EC250);
-    uint32_t tr_assetdb_vt = tr_assetdb ? REX_LOAD_U32(tr_assetdb) : 0;
-    uint32_t tr_assetdb_f0 = tr_assetdb_vt ? REX_LOAD_U32(tr_assetdb_vt) : 0;
-    uint32_t tr_assetdb_f6 = tr_assetdb_vt ? REX_LOAD_U32(tr_assetdb_vt + 24) : 0;
-    // SELF-REF WORKAROUND DISABLED 2026-08-02. `REX_STORE_U32(eng + 8, eng)`
-    // was needed when hooks #2/#5 skipped the engine init: eng+8 held junk and
-    // MainLoop's eng+8->vt[36] had to be forced onto Bootstrap's nullsub_1.
-    // Now that the real init runs, vt[17] populates eng+8 with the genuine
-    // AssetDB (logged as "eng+8 already populated") and overwriting it sends
-    // vt[36] into garbage — the AV at guest 0x4D5854F1 inside orig_MainLoop.
-    REXLOG_INFO("native: eng+8=0x{:08X} (self-ref override disabled)",
-                REX_LOAD_U32(eng + 8));
-    REXLOG_INFO("native: eng+12=0x{:08X} vt=0x{:08X} vt[0]=0x{:08X} vt[36]=0x{:08X}",
-      sub, sub_vt, sub_f0, sub_f36);
-    REXLOG_INFO("native: assetdb=0x{:08X} vt=0x{:08X} vt[0]=0x{:08X} vt[36]=0x{:08X}",
-      assetdb, assetdb_vt, assetdb_f0, assetdb_f36);
-    REXLOG_INFO("native: tr+8(0x830EC250)=0x{:08X} vt=0x{:08X} vt[0]=0x{:08X} vt[6]=0x{:08X}",
-      tr_assetdb, tr_assetdb_vt, tr_assetdb_f0, tr_assetdb_f6);
-  }
-
-  // Drive the loader. LoaderTick's first instruction is Wait(*(tr+0x194), -1):
-  // a per-frame handshake the guest renderer thread would satisfy. Hook #6
-  // skips that renderer because our D3D12 backend replaces it, so nothing
-  // ticks the loader and the Transition thread parks forever. Signal it here,
-  // once per frame, which is the cadence the renderer would have used.
-  {
-    uint32_t loader_evt = REX_LOAD_U32(0x830EC248 + 0x194);
-    if (loader_evt) {
-      uint32_t s3 = ctx.r3.u32, s4 = ctx.r4.u32;
-      ctx.r3.u32 = loader_evt;
-      ctx.r4.u32 = 0;                      // NtSetEvent(handle, prev_state=NULL)
-      REX_CALL_INDIRECT_FUNC(0x82BFB748);  // sub_82BFB748 — NtSetEvent
-      ctx.r3.u32 = s3;
-      ctx.r4.u32 = s4;
-    }
-  }
-
-  // Time the guest's own body. This is the number that tracked the whole
-  // native-vs-plugin gap: 300ms rising to 3100ms before the page-readability
-  // cache, ~105ms after. The threshold sits above the normal body so a healthy
-  // run stays quiet and a regression announces itself.
-  const auto t0 = std::chrono::steady_clock::now();
-  orig_MainLoop(ctx, base);
-  const auto body_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                           std::chrono::steady_clock::now() - t0)
-                           .count();
-  if (ml <= 8 || body_ms >= 250)
-    REXLOG_INFO("native: MainLoop #{} body={}ms", ml, body_ms);
-  ctx.r3.u32 = 1;
-  if ((ml % 60) == 1) {
-    REXLOG_INFO("native: MainLoop #{}", ml);
-    // Is the AssetDB alive, and what state does its load machine sit in?
-    // State is *(AssetDB+28), the 0..11 selector of sub_8253AA40's jump table
-    // (mx_recomp.31.cpp:36836). tr+8 (0x830EC250) is the slot LoaderTick's
-    // (a1+8)->vt[6] actually reads.
-    uint32_t adb = REX_LOAD_U32(0x830577C0);
-    uint32_t tr8 = REX_LOAD_U32(0x830EC250);
-    REXLOG_INFO("native: assetdb=0x{:08X} state={} tr+8=0x{:08X}",
-                adb, adb ? REX_LOAD_U32(adb + 28) : 0xFFFFFFFF, tr8);
-    // RenderPipeline now runs every frame and its PM4 is present-only: no
-    // DRAW_* and no INDIRECT_BUFFER, just SWAP/scanout registers. If these
-    // three per-pass entity counts are zero, the scene really is empty and the
-    // missing draws are a guest-side content problem, not a translator one.
-    REXLOG_INFO("native: entities pass0={} pass1={} pass2={} gpu_phys=0x{:08X}",
-                REX_LOAD_U32(0x830C2150), REX_LOAD_U32(0x830C4560),
-                REX_LOAD_U32(0x830C6970), REX_LOAD_U32(0x830B03EC));
-  }
-  ::Sleep(16);
-}
+// The MainLoop hook is REMOVED. It ran for ~3-4 hours of continuous sessions
+// disabled before deletion, across boot, menu, freeroam level load and level
+// exit, with no regression — which is the evidence, because several of the
+// things it did read as load-bearing and are not.
+//
+// What it did, and why each is gone:
+//
+//   ::Sleep(16) at the tail. This is the one with a measurable cost: it paced
+//     the guest's own main loop at 60Hz from inside the emulator. Removing it is
+//     most of why logo/intro went from 20fps to 40fps.
+//
+//   REX_STORE_U8(0x82D57994, 1) every iteration. byte_82D57994 gates MainLoop's
+//     call to RenderPipeline — at 0x82B707B0 and again at 0x82B7080C a zero
+//     jumps straight to the vt[36] tail. The comment argued that "nothing in the
+//     guest sets it, so forcing it is load-bearing". That is falsified: with the
+//     hook gone RenderPipeline still runs every frame (7,264 times in mx_1270).
+//
+//   NtSetEvent on *(0x830EC248 + 0x194) once per frame, to drive the loader.
+//     The reasoning was that hook #6 skipped the guest renderer that would
+//     satisfy LoaderTick's Wait(*(tr+0x194), -1), so the Transition thread would
+//     park forever. Levels load AND exit without it, so whatever satisfies that
+//     handshake now, it is not this.
+//
+//   ctx.r3.u32 = 1, to keep the guest's `while (MainLoop != 0)` from exiting.
+//   GuestTick(), which armed the stall watchdog in hooks_wait.cpp — itself now
+//     removed, since this was its only caller.
+//   Per-frame diagnostics: MainLoop body timing, the AssetDB load-machine state,
+//     the three per-pass entity counts, and the eng+8 / vtable dumps taken at
+//     iteration 1.
+//
+// Two disabled workarounds documented in that body are worth keeping, because
+// both are traps and neither is obvious from code that no longer exists:
+//
+//   The eng+8 SELF-REF override (`REX_STORE_U32(eng + 8, eng)`) was needed only
+//   while hooks #2/#5 skipped the engine init, leaving eng+8 as junk that had to
+//   be forced onto Bootstrap's nullsub_1. With the real init running, vt[17]
+//   populates eng+8 with the genuine AssetDB, and overwriting it sends vt[36]
+//   into garbage — an AV at guest 0x4D5854F1 inside orig_MainLoop.
+//
+//   Clearing byte_82D57994 at frame 600 was a fabricated "loading complete"
+//   signal. It closed the render window ~20s in, entirely inside the 47.4s Bink
+//   intro, so RenderPipeline was skipped every time it was reached.
+//
+// git history has the body.
 
 //=============================================================================
 // sub_82B70578 — RenderPipeline

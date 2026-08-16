@@ -109,6 +109,7 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
   // visible as the intro playing twice while both existed. Nothing here needs
   // to own the swapchain before the guest starts.
   while (m_running) {
+    bool idle = false;
     if (m_renderer) {
       // Hand any PM4 geometry the VdSwap hook translated this frame to the game
       // pipeline. GetDrawCalls moves-and-clears, so a tick with no VdSwap since
@@ -121,12 +122,25 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       // zero and collapsed every vertex to the origin.
       auto draws = native::NativeGraphics::Get().GetDrawCalls();
 
-      // This loop ticks on a fixed 16ms sleep, and the guest swaps at its own
-      // rate, so most iterations find nothing new. Such a tick must re-present
-      // the last frame we did get, not a cleared screen: GetDrawCalls
-      // moves-and-clears, so an unconditional ClearGameDraws here threw away
-      // the only geometry we had every time the two rates disagreed. Combined
-      // with the placeholder-triangle fallback that used to sit in
+      // This loop no longer ticks on a fixed sleep: an idle tick parks on the
+      // mailbox cv and wakes exactly when the guest posts a frame (bottom of
+      // the loop).
+      //
+      // Expect the two counters below to run at ROUGHLY 1:1, not with the empty
+      // side at zero — measured 7517 with draws / 6606 empty over mx_1270. That
+      // ratio is structural rather than waste: a tick that rendered loops
+      // straight back without waiting, so it always finds an empty list on the
+      // next pass, re-presents, and only THEN parks. One empty tick per
+      // productive one is the design. A count that climbs far past the
+      // productive side means the guest is posting lists nobody consumed; the
+      // millions-of-empties reading the fixed-sleep version produced is not
+      // reachable here, because there is no longer a clock to spin against.
+      //
+      // A tick that finds nothing
+      // must still re-present the last frame we did get, not a cleared screen:
+      // GetDrawCalls moves-and-clears, so an unconditional ClearGameDraws here
+      // threw away the only geometry we had every time the two rates disagreed.
+      // Combined with the placeholder-triangle fallback that used to sit in
       // RenderGameFrame, that made the post-load screen alternate between guest
       // geometry and the placeholder — invisible while the render target
       // accumulated, a visible flash once the clear was fixed. The placeholder
@@ -402,8 +416,8 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
         for (const auto& [stride, count] : s_skippedStrides)
           hist += fmt::format("{}:{} ", stride, count);
         REXLOG_INFO("RenderThread: frame #{} submitted {} draws, skipped {} "
-                    "— skipped strides (cumulative) {} — host ticks with/without "
-                    "new draws {}/{} — skipped untransformable (cumulative) {}",
+                    "— skipped strides (cumulative) {} — ticks with new draws {} "
+                    "/ empty wakeups {} — skipped untransformable (cumulative) {}",
                     s_frame, submitted, skipped, hist.empty() ? "none" : hist,
                     s_ticksWithDraws, s_ticksEmpty, s_skippedUntransformable);
       }
@@ -453,6 +467,7 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       static bool s_rendered = false;
       static uint64_t s_ticksSkippedRender = 0;
       if (draws.empty() && s_rendered) {
+        idle = true;
         // Counted and reported here rather than after the branch: the counter
         // only changes on this path, so testing it on every tick re-logs the
         // same line for as long as it rests on a multiple of 500.
@@ -465,7 +480,15 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
         s_rendered = true;
       }
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    // Replaces the fixed-tick sleep. The guest's SetDrawCalls already applies
+    // backpressure (it blocks until the list is consumed), so an idle tick
+    // parks on the mailbox cv and wakes exactly when a frame is posted — no
+    // spin, no log flood, and the core goes back to the compute-bound guest.
+    // A tick that just rendered loops straight back to consume the next
+    // frame; Shutdown() releases the wait and m_running ends the loop.
+    if (idle || !m_renderer) {
+      native::NativeGraphics::Get().WaitForDrawsOrShutdown();
+    }
   }
 }
 

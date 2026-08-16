@@ -524,7 +524,15 @@ void D3D12Renderer::EndFrame() {
   // the last validation error before the first hang is the one that caused it.
   DrainD3D12Messages();
 
-  hr = m_swapChain->Present(1, 0);
+  // ALLOW_TEARING is only legal on a swap chain created with the matching flag,
+  // and only meaningful at sync interval 0 — CreateSwapChain sets that flag from
+  // the same m_allowTearing, so the two cannot disagree. See kPresentSyncInterval
+  // for why the interval is 0 and what it does and does not buy.
+  const UINT flags =
+      (kPresentSyncInterval == 0 && m_allowTearing) ? DXGI_PRESENT_ALLOW_TEARING
+                                                    : 0u;
+
+  hr = m_swapChain->Present(kPresentSyncInterval, flags);
   if (FAILED(hr)) {
     char buf[128] = {};
     snprintf(buf, sizeof(buf), "EndFrame: Present failed HR=0x%08lX", hr);
