@@ -237,7 +237,28 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // The offscreen game depth buffer's format. Named because it has to appear in
   // three places that must agree — the resource, its clear value, and the PSO's
   // DSVFormat — and the PSO's copy was the one that got left out.
-  static constexpr DXGI_FORMAT kGameDepthFormat = DXGI_FORMAT_D32_FLOAT;
+  // D32_FLOAT_S8X24 rather than D32_FLOAT, to give the guest's stencil a plane:
+  // half of every level frame asks for stencil (141,960 of 284,794 draws, 15
+  // configurations, two-sided shadow volumes among them). The depth half is
+  // deliberately UNCHANGED — still 32-bit float — so this can be judged on
+  // "nothing moved". Xenia maps the guest's kD24FS8 the same way
+  // (d3d12_render_target_cache.cc:1858).
+  static constexpr DXGI_FORMAT kGameDepthFormat =
+      DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+  // A depth resource is planar and its views are not interchangeable: typeless
+  // so one allocation carries both a DSV and an SRV, plus an SRV of the depth
+  // plane alone. The RESOURCE format is also the depth snapshot's, because
+  // depth resolves are a CopyTextureRegion and D3D12 wants one typeless family
+  // on both ends.
+  static constexpr DXGI_FORMAT kGameDepthResourceFormat =
+      DXGI_FORMAT_R32G8X24_TYPELESS;
+  static constexpr DXGI_FORMAT kGameDepthSrvFormat =
+      DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+  // All four depth clears go through this so the stencil plane cannot be left
+  // out of one of them. Undefined stencil is invisible until the test is turned
+  // on, and then geometry vanishes rather than degrades.
+  static constexpr D3D12_CLEAR_FLAGS kGameDepthClearFlags =
+      D3D12_CLEAR_FLAGS(D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL);
   // Sampler variants, indexed by these bits. The guest's per-texture address
   // mode reaches the renderer on HleTexturePayload (clamp_x/clamp_y) and used
   // to be discarded in favour of one static WRAP sampler.

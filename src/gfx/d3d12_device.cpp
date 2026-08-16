@@ -424,7 +424,7 @@ void D3D12Renderer::BeginFrame() {
     // this, depth accumulates across frames and real geometry would
     // depth-fail against random initial values.
     m_commandList->ClearDepthStencilView(
-        dsvHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0f, 0, 0, nullptr);
+        dsvHandle, kGameDepthClearFlags, 1.0f, 0, 0, nullptr);
     m_commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
   } else {
     m_commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);

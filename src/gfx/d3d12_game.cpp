@@ -436,10 +436,18 @@ namespace {
 // only evidence was `resolve snapshot: creation FAILED for 64x64` with no code
 // and 40,000 lines of downstream noise after it.
 //
-// It matters more here than in most codebases because the D3D12 debug layer
-// and DRED are NOT available on this machine -- D3D12GetDebugInterface returns
-// E_NOINTERFACE (Graphics Tools is not installed), so there is no validation
-// message coming. The HRESULT is the only thing the runtime will tell us.
+// An earlier version of this comment claimed the debug layer and DRED were
+// unavailable here because one run logged `D3D12GetDebugInterface HR=0x80004002`.
+// That was WRONG and is corrected rather than deleted, because the wrong version
+// was used to argue that guessing was the only option. Graphics Tools IS
+// installed (d3d12SDKLayers.dll is in System32), a standalone probe gets
+// ID3D12Debug, ID3D12Debug1 and both DRED settings interfaces with S_OK, and a
+// later run logged "DRED enabled". Read the CURRENT run's DRED line before
+// concluding anything about what is available.
+//
+// The HRESULT still earns its place: the debug layer is off by default in a
+// release build (MX_D3D12_DEBUG=1, or 2 for GPU-based validation), so an
+// ordinary run has no validation message and this is all the runtime says.
 const char* HrName(HRESULT hr) {
   switch (hr) {
     case E_OUTOFMEMORY:            return "E_OUTOFMEMORY";
@@ -463,6 +471,38 @@ std::string HrText(HRESULT hr) {
   std::snprintf(buf, sizeof(buf), "0x%08lX%s%s", static_cast<unsigned long>(hr),
                 *name ? " " : "", name);
   return buf;
+}
+
+// A resource's format expressed as one a shader-resource view can use.
+//
+// Most formats view as themselves and pass straight through. TYPELESS ones
+// cannot: CreateShaderResourceView rejects them and D3D12 removes the device
+// with DXGI_ERROR_INVALID_CALL.
+//
+// That failure is worth describing because it does not look like what it is.
+// The removal is triggered by an invalid CPU-side call, so there is no faulting
+// GPU work and DRED reports "every command list completed; no faulting op" with
+// no page fault — which reads as though the device died for no reason. Every
+// later Create* call then returns DEVICE_REMOVED, so the first error in the log
+// is some unrelated innocent allocation. Only the debug layer names it
+// (MX_D3D12_DEBUG=1), and it is off by default.
+//
+// The depth entries are the ones that matter here: the game depth surface is
+// R32G8X24_TYPELESS so that one allocation can carry both a DSV and an SRV, and
+// its depth plane views as R32_FLOAT_X8X24_TYPELESS. R32_TYPELESS/R24G8 are
+// included because the same rule governs them and a future format change
+// should not have to rediscover this.
+DXGI_FORMAT SrvFormatForResource(DXGI_FORMAT resourceFormat) {
+  switch (resourceFormat) {
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+      return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    case DXGI_FORMAT_R24G8_TYPELESS:
+      return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+    case DXGI_FORMAT_R32_TYPELESS:
+      return DXGI_FORMAT_R32_FLOAT;
+    default:
+      return resourceFormat;
+  }
 }
 
 // Guest blend factor -> D3D12_BLEND.
@@ -831,7 +871,7 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
       // R32_FLOAT resource is not merely wrong -- CreateShaderResourceView
       // rejects it as a cross-family format and D3D12 removes the device
       // (DXGI_ERROR_INVALID_CALL). That was the hang.
-      slots[i].format = it->second.resource->GetDesc().Format;
+      slots[i].format = SrvFormatForResource(it->second.resource->GetDesc().Format);
       // A SNAPSHOT keeps the DEFAULT identity mapping. The guest's swizzle is
       // recorded (stageSampledSwizzles, printed by SLOT MAP) but deliberately
       // NOT applied here.
@@ -899,7 +939,7 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
       return false;
     }
     slots[i].resource = it->second.resource.Get();
-    slots[i].format = it->second.resource->GetDesc().Format;
+    slots[i].format = SrvFormatForResource(it->second.resource->GetDesc().Format);
     slots[i].swizzle = tex->swizzle;
     slots[i].useSwizzle = true;
   }
@@ -2415,8 +2455,8 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameDepthTarget(
   cv.DepthStencil.Depth = 1.0f;
   cv.DepthStencil.Stencil = 0;
   PooledSurfaceSpec spec;
-  spec.resourceFormat = DXGI_FORMAT_R32_TYPELESS;
-  spec.srvFormat = DXGI_FORMAT_R32_FLOAT;
+  spec.resourceFormat = kGameDepthResourceFormat;
+  spec.srvFormat = kGameDepthSrvFormat;
   spec.flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
   spec.initialState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
   spec.clear = &cv;
@@ -2527,6 +2567,7 @@ void D3D12Renderer::QueueLuminanceReadback(GameRenderTarget* snap,
   // so nothing legitimate is turned away by demanding a typed format.
   if (sd.Format == DXGI_FORMAT_R32_TYPELESS ||
       sd.Format == DXGI_FORMAT_R24G8_TYPELESS ||
+      sd.Format == DXGI_FORMAT_R32G8X24_TYPELESS ||
       sd.Format == DXGI_FORMAT_UNKNOWN)
     return;
   // The caller checked the RESOLVE was 1x1; this checks the RESOURCE is, since
@@ -2658,7 +2699,7 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameSnapshot(
   // family, and the shader reads the depth in .x.
   PooledSurfaceSpec snapSpec;
   snapSpec.resourceFormat = format;
-  snapSpec.srvFormat = format;
+  snapSpec.srvFormat = SrvFormatForResource(format);
   if (!CreatePooledSurface(entry, width, height, snapSpec, reuseSrvIndex)) {
     // Loudly, and without having spent a descriptor — CreatePooledSurface
     // claims the index only after the resource exists. Claiming it before
@@ -2939,7 +2980,7 @@ void D3D12Renderer::RenderGameFrame() {
         // 1.0 is the far plane: "nothing occludes". That is the correct reading
         // of a shadow map no caster was rendered into, and it is the value
         // EnsureGameDepthTarget already declares as the resource's clear value.
-        m_commandList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f,
+        m_commandList->ClearDepthStencilView(dsv, kGameDepthClearFlags, 1.0f,
                                              0, 0, nullptr);
       } else {
         ++m_bindCreatedColour;
@@ -3056,7 +3097,7 @@ void D3D12Renderer::RenderGameFrame() {
         srcWidth = srcEntry->width;
         srcHeight = srcEntry->height;
         srcState = srcEntry->state;
-        snapFormat = DXGI_FORMAT_R32_FLOAT;
+        snapFormat = kGameDepthResourceFormat;  // planar: must match the source
         ++m_depthResolves;
       }
       // ALIASED COLOUR SOURCE. The guest gives one EDRAM allocation several
@@ -3290,7 +3331,7 @@ void D3D12Renderer::RenderGameFrame() {
             }
             auto dsv = m_gameDepthDsvHeap->GetCPUDescriptorHandleForHeapStart();
             dsv.ptr += SIZE_T(made->rtvIndex) * m_gameDsvDescriptorSize;
-            m_commandList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH,
+            m_commandList->ClearDepthStencilView(dsv, kGameDepthClearFlags,
                                                  1.0f, 0, 0, nullptr);
           }
           srcEntry = made;
@@ -3298,7 +3339,7 @@ void D3D12Renderer::RenderGameFrame() {
           srcWidth = made->width;
           srcHeight = made->height;
           srcState = made->state;
-          snapFormat = DXGI_FORMAT_R32_FLOAT;
+          snapFormat = kGameDepthResourceFormat;  // planar: must match the source
           ++m_depthResolves;
           ++m_resolveCreatedSources;
         }
@@ -3731,7 +3772,7 @@ void D3D12Renderer::RenderGameFrame() {
         D3D12_CPU_DESCRIPTOR_HANDLE dsv =
             m_gameDepthDsvHeap->GetCPUDescriptorHandleForHeapStart();
         dsv.ptr += SIZE_T(depthTarget->rtvIndex) * m_gameDsvDescriptorSize;
-        m_commandList->ClearDepthStencilView(dsv, D3D12_CLEAR_FLAG_DEPTH, 1.0f,
+        m_commandList->ClearDepthStencilView(dsv, kGameDepthClearFlags, 1.0f,
                                              0, 0, nullptr);
         depthTarget->usedThisFrame = true;
         depthTarget->everDrawn = true;
