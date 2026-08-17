@@ -1406,6 +1406,12 @@ struct VideoComponentProbe {
   uint64_t render_calls = 0;
   uint32_t last_material = 0;
   uint32_t last_draw_item = 0;
+  // Who called the render prepare. Slot 15 is reached through a virtual call
+  // and static hunting for it failed: the `lwz rD, 0x3C(rA)` encodings produce
+  // 40+ candidate sites and not one of them is in the UI range, so the caller
+  // is not findable by pattern. The link register names it outright.
+  uint32_t first_caller = 0;
+  uint32_t last_caller = 0;
 };
 
 std::mutex g_videoProbeMu;
@@ -1453,9 +1459,9 @@ void ReportVideoComponents(bool force) {
     total += q.render_calls;
     rows += fmt::format(
         " [\"{}\" comp0x{:08X} renders{} material={} item0x{:08X} "
-        "texasset0x{:08X}]",
+        "texasset0x{:08X} caller0x{:08X}/0x{:08X}]",
         q.video, q.component, q.render_calls, MaterialLabel(q.last_material),
-        q.last_draw_item, q.texture_asset);
+        q.last_draw_item, q.texture_asset, q.first_caller, q.last_caller);
   }
   REXLOG_INFO("native: VIDEO COMPONENT RENDER {} components, {} renders "
               "total, {} material resolves --{}",
@@ -1558,6 +1564,9 @@ extern "C" REX_FUNC(sub_82B26778) {
 REX_IMPORT(__imp__sub_8237ABA8, orig_UIImageRenderPrepare, void());
 extern "C" REX_FUNC(sub_8237ABA8) {
   const uint32_t self = ctx.r3.u32;
+  // Read BEFORE the original: it makes calls of its own, and the callee is
+  // free to leave whatever it likes in lr by the time control comes back.
+  const uint32_t caller = uint32_t(ctx.lr);
   orig_UIImageRenderPrepare(ctx, base);
   if (!self) return;
 
@@ -1569,6 +1578,8 @@ extern "C" REX_FUNC(sub_8237ABA8) {
   ++p->render_calls;
   p->last_material = REX_LOAD_U32(self + kCompMaterialSlot);
   p->last_draw_item = REX_LOAD_U32(self + kCompDrawItem);
+  if (!p->first_caller) p->first_caller = caller;
+  p->last_caller = caller;
   ReportVideoComponents(false);
 }
 
