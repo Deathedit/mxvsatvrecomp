@@ -1666,12 +1666,27 @@ ID3D12PipelineState* D3D12Renderer::BlendedPSO(const BlendKey& key) {
 // nothing per frame; only the staging copy happens each time.
 bool D3D12Renderer::EnsureYuvPlanes(const GameDraw& draw,
                                     uint32_t& descriptorBase) {
-  if (!m_gameSrvHeap || draw.planeCount < 3) return false;
+  if (!m_gameSrvHeap) {
+    ++m_yuvRefusedNoHeap;
+    return false;
+  }
+  if (draw.planeCount < 3) {
+    ++m_yuvRefusedTooFewPlanes;
+    return false;
+  }
   const uint32_t kPlanes = kMaxDrawPlanes;
   // One block per composite draw per frame in flight. Beyond the budget the
   // draw is refused rather than aliasing an earlier draw's descriptors, which
   // is the failure this striping exists to prevent.
-  if (m_yuvDrawsThisFrame >= kMaxYuvDrawsPerFrame) return false;
+  //
+  // Counted because the refusal is otherwise invisible and drops a video draw
+  // in exactly the way a missing-video defect looks. Two concurrent streams is
+  // 2 per frame against a budget of kMaxYuvDrawsPerFrame, so this should read
+  // zero -- and if it ever does not, the budget is the bug, not the video.
+  if (m_yuvDrawsThisFrame >= kMaxYuvDrawsPerFrame) {
+    ++m_yuvRefusedBudget;
+    return false;
+  }
   descriptorBase =
       kYuvPlaneDescriptorBase +
       (m_frameIndex * kMaxYuvDrawsPerFrame + m_yuvDrawsThisFrame) * kPlanes;
@@ -1828,6 +1843,7 @@ bool D3D12Renderer::EnsureYuvPlanes(const GameDraw& draw,
                   draw.yuvHasAlpha ? 1 : 0);
     LogInfo(message);
   }
+  ++m_yuvPrepared;
   return true;
 }
 
@@ -2323,12 +2339,50 @@ bool D3D12Renderer::CreatePooledSurface(GameRenderTarget& entry, uint32_t width,
   return true;
 }
 
+// See the field notes in the header. Called on every colour-target bind, clear
+// and draw, so it must stay cheap: two small map lookups and a linear scan of
+// a per-base owner list that is expected to hold one or two entries.
+void D3D12Renderer::NoteEdramOwnership(uint32_t object, uint32_t width,
+                                       uint32_t height, uint32_t edramBase,
+                                       DXGI_FORMAT format) {
+  auto& owners = m_edramOwners[edramBase];
+  EdramOwner* self = nullptr;
+  for (auto& o : owners) {
+    if (o.object == object && o.width == width && o.height == height &&
+        o.format == format) {
+      self = &o;
+      break;
+    }
+  }
+  if (!self) {
+    owners.push_back({object, width, height, format, 0});
+    self = &owners.back();
+  }
+  ++self->binds;
+
+  // A TAKEOVER is a bind at a base whose previous owner was a different object.
+  // Counted rather than "how many objects share a base", because the thing the
+  // fix has to do is transfer contents at the moment ownership changes, and a
+  // base with two owners that never alternate needs no transfer at all.
+  const auto last = m_edramLastOwner.find(edramBase);
+  if (last != m_edramLastOwner.end() && last->second.object != object) {
+    const EdramOwner& prev = last->second;
+    ++m_edramTakeovers;
+    if (prev.width == width && prev.height == height) {
+      ++m_edramTakeoverSameExtent;
+      if (prev.format != format) ++m_edramTakeoverFormatDiff;
+    }
+  }
+  m_edramLastOwner[edramBase] = EdramOwner{object, width, height, format, 0};
+}
+
 D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameRenderTarget(
     uint32_t object, uint32_t width, uint32_t height, uint32_t edramBase,
     DXGI_FORMAT format) {
   if (!object || !width || !height || width > 8192 || height > 8192 ||
       !m_gameRtvHeap || !m_gameSrvHeap)
     return nullptr;
+  NoteEdramOwnership(object, width, height, edramBase, format);
   uint32_t reuseRtvIndex = UINT32_MAX;
   uint32_t reuseSrvIndex = UINT32_MAX;
   if (auto it = m_gameRenderTargets.find(object);
@@ -4639,6 +4693,92 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_translatedPsoCapped),
                   static_cast<unsigned long long>(m_translatedNoRootSig));
     LogInfo(message);
+    // Name the no-handle population. Sorted by count, worst first, and the
+    // DISTINCT key count printed alongside so "one shader does all 1906" and
+    // "1906 shaders do one each" are distinguishable -- they mean completely
+    // different things and the total cannot tell them apart.
+    {
+      std::vector<std::pair<uint64_t, uint64_t>> worst;  // count, key
+      worst.reserve(m_standInNoHandleBy.size());
+      for (const auto& [key, n] : m_standInNoHandleBy)
+        worst.emplace_back(n, key);
+      std::sort(worst.rbegin(), worst.rend());
+      std::string line;
+      for (size_t i = 0; i < worst.size() && i < 8; ++i) {
+        char one[80];
+        std::snprintf(one, sizeof(one), " [vs 0x%08X x%u idx=%u]",
+                      uint32_t(worst[i].second >> 32),
+                      static_cast<unsigned>(worst[i].first),
+                      uint32_t(worst[i].second & 0xFFFFFFFFu));
+        line += one;
+      }
+      std::snprintf(message, sizeof(message),
+                    "no-handle records: %llu total = %llu yuv + %llu clear + "
+                    "%llu surface-bind + %llu UNEXPLAINED; %zu distinct "
+                    "(vs, idx):%s",
+                    static_cast<unsigned long long>(m_standInNoHandle),
+                    static_cast<unsigned long long>(m_standInNoHandlePlanes),
+                    static_cast<unsigned long long>(m_standInNoHandleClear),
+                    static_cast<unsigned long long>(m_standInNoHandleBind),
+                    static_cast<unsigned long long>(
+                        m_standInNoHandle - m_standInNoHandlePlanes -
+                        m_standInNoHandleClear - m_standInNoHandleBind),
+                    m_standInNoHandleBy.size(), line.c_str());
+    }
+    LogInfo(message);
+    // The YUV plane gate, whole population and never gated on non-zero: this is
+    // the last step before a video draw becomes pixels, and every refusal in it
+    // used to be silent.
+    std::snprintf(message, sizeof(message),
+                  "yuv plane gate: %llu prepared, refused %llu no-heap / "
+                  "%llu too-few-planes / %llu OVER BUDGET (cap %u per frame)",
+                  static_cast<unsigned long long>(m_yuvPrepared),
+                  static_cast<unsigned long long>(m_yuvRefusedNoHeap),
+                  static_cast<unsigned long long>(m_yuvRefusedTooFewPlanes),
+                  static_cast<unsigned long long>(m_yuvRefusedBudget),
+                  kMaxYuvDrawsPerFrame);
+    LogInfo(message);
+    // EDRAM aliasing, whole population and never gated on non-zero. Sizes the
+    // ownership-transfer fix: `same-extent` takeovers are the ones it can
+    // repair, and `format-differs` are the subset needing a conversion rather
+    // than a plain copy.
+    {
+      size_t sharedBases = 0;
+      for (const auto& [edramBase, owners] : m_edramOwners)
+        if (owners.size() >= 2) ++sharedBases;
+      std::snprintf(message, sizeof(message),
+                    "edram aliasing: %zu bases, %zu shared by >1 object; "
+                    "%llu takeovers (%llu same-extent, %llu of those "
+                    "format-differs)",
+                    m_edramOwners.size(), sharedBases,
+                    static_cast<unsigned long long>(m_edramTakeovers),
+                    static_cast<unsigned long long>(m_edramTakeoverSameExtent),
+                    static_cast<unsigned long long>(m_edramTakeoverFormatDiff));
+      LogInfo(message);
+      // ONE LINE PER BASE. Packing every base into the single line above
+      // truncated at message[512]: base 0x0 has ~15 owners and consumed the
+      // whole buffer, so base 0x2D0 -- the one this was built to look at --
+      // never printed at all.
+      size_t emitted = 0;
+      for (const auto& [edramBase, owners] : m_edramOwners) {
+        if (owners.size() < 2 || ++emitted > 8) continue;
+        std::string named;
+        char one[96];
+        size_t shown = 0;
+        for (const auto& o : owners) {
+          if (++shown > 8) break;
+          std::snprintf(one, sizeof(one), " 0x%08X(%ux%u fmt%u x%llu)",
+                        o.object, o.width, o.height, uint32_t(o.format),
+                        static_cast<unsigned long long>(o.binds));
+          named += one;
+        }
+        std::snprintf(message, sizeof(message),
+                      "  edram base 0x%X: %zu owners%s%s", edramBase,
+                      owners.size(), named.c_str(),
+                      owners.size() > 8 ? " ..." : "");
+        LogInfo(message);
+      }
+    }
     // THIS frame, not cumulative: the question is whether the frame on screen
     // was assembled on one surface or several. "presented 1 of 1" means present
     // is showing the finished scene; "1 of 4" means it is showing one layer.
@@ -5072,7 +5212,14 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
       !pixelShaderHlsl && hasVertexStage && !colorWrite;
   d.depthOnlyStandIn = depthOnlyStandIn;
 
-  if (!d.pixelShaderHandle && !depthOnlyStandIn) ++m_standInNoHandle;
+  if (!d.pixelShaderHandle && !depthOnlyStandIn) {
+    ++m_standInNoHandle;
+    if (d.planeCount >= 3) ++m_standInNoHandlePlanes;
+    if (d.colorClear) ++m_standInNoHandleClear;
+    if (d.surfaceBind) ++m_standInNoHandleBind;
+    m_standInNoHandleBy[(uint64_t(d.vertexShaderHandle) << 32) |
+                        uint64_t(d.indexCount)]++;
+  }
   else if (!d.pixelShaderHlsl && !depthOnlyStandIn) ++m_standInNoHlsl;
   else if (!hasVertexStage && !(interpolators && interpBytes))
     ++m_standInNoVertexInputs;

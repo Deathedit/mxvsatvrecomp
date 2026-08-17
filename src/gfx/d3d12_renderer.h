@@ -832,6 +832,69 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // is charged per draw, in the order the gate tests them.
   uint64_t m_standInNoHlsl = 0;
   uint64_t m_standInNoHandle = 0;
+  // WHAT the no-handle draws are, keyed (vertexShaderHandle << 32 | indexCount).
+  //
+  // The count on its own says a population exists and nothing about it, and
+  // that population is the last unexplained one in the frame: a draw with no
+  // pixel shader that still writes colour (the legitimate depth-only case is
+  // excluded above by !colorWrite). Keyed by vertex shader AND index count
+  // because either alone merges unrelated draws -- and the vertex handle can be
+  // matched against logs/hlsldump to say what the geometry actually is.
+  //
+  // Handles are addresses and vary per run, so this is only readable WITHIN a
+  // run. Do not compare these keys across logs.
+  std::map<uint64_t, uint64_t> m_standInNoHandleBy;
+  // ...of which carry YUV planes, i.e. ARE the Bink composite and render
+  // through BindYuvPlanes rather than painting a stand-in colour. If this
+  // equals m_standInNoHandle the whole population is video and nothing in it is
+  // a lost draw. Counted rather than inferred from "they are all 4-index
+  // quads", which is a resemblance and not a measurement.
+  uint64_t m_standInNoHandlePlanes = 0;
+  // EnsureYuvPlanes' three refusals. All were bare `return false` -- a composite
+  // draw dropped here produces no video and no evidence, which is the same
+  // symptom as one never submitted. `budget` is the one that can bite silently:
+  // it is a hard per-frame cap, and exceeding it refuses a real video draw.
+  // EDRAM ALIASING. How often several guest OBJECTS name one EDRAM allocation.
+  //
+  // Measured because it is the mechanism behind the missing videos: the Bink
+  // composites draw into object 0x2175DC60 while the 1280x430 resolve reads out
+  // of 0x2123C1D8, and both are 1280x720 at base 0x2D0. We key host surfaces by
+  // object, so the resolve copies a surface the video was never drawn into.
+  //
+  // The counters exist to size the fix before writing it. The bounded repair --
+  // copy the previous owner's contents forward when a new object takes over a
+  // base -- only works for a takeover at the SAME EXTENT, and only needs a
+  // format conversion when the formats differ. So those two cases are split
+  // out rather than lumped into one "aliased" total.
+  struct EdramOwner {
+    uint32_t object = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    uint64_t binds = 0;
+  };
+  void NoteEdramOwnership(uint32_t object, uint32_t width, uint32_t height,
+                          uint32_t edramBase, DXGI_FORMAT format);
+  std::map<uint32_t, std::vector<EdramOwner>> m_edramOwners;  // base -> owners
+  // The FULL previous descriptor, not just its object. One object can own
+  // several entries at a base (the list is keyed by object AND format), so
+  // matching a takeover by object alone picks an arbitrary one of them and
+  // reports "format differs" as 0 even when it does.
+  std::map<uint32_t, EdramOwner> m_edramLastOwner;
+  uint64_t m_edramTakeovers = 0;         // bind at a base another object held
+  uint64_t m_edramTakeoverSameExtent = 0;  // ...same w/h  (bounded fix applies)
+  uint64_t m_edramTakeoverFormatDiff = 0;  // ...and format differs (needs convert)
+  uint64_t m_yuvRefusedNoHeap = 0;
+  uint64_t m_yuvRefusedTooFewPlanes = 0;
+  uint64_t m_yuvRefusedBudget = 0;
+  uint64_t m_yuvPrepared = 0;
+  // The other two record types that share this list and are NOT draws:
+  // an ordered full-surface clear, and an ordered surface bind. Both legitimately
+  // carry no shaders, so both land in the no-handle bucket and inflate it. What
+  // is left after subtracting all three is the only part that could be a lost
+  // draw -- and that residue is the number to look at, not the total.
+  uint64_t m_standInNoHandleClear = 0;
+  uint64_t m_standInNoHandleBind = 0;
   uint64_t m_standInNoVertexInputs = 0;
   uint64_t m_standInNoConstants = 0;
   uint64_t m_standInTooManySamplers = 0;
