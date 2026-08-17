@@ -1441,8 +1441,15 @@ std::vector<VideoComponentProbe> g_videoProbes;   // 6 in the whole game
 // contended lock on the UI's hot path to watch five objects. Written under the
 // mutex at registration (load time only), read without it.
 std::atomic<uint32_t> g_videoCompFast[16] = {};
+// The material name table has its OWN mutex, not the probe mutex, because two
+// unrelated collectors read it: the video report (under g_videoProbeMu) and the
+// UI inventory (under g_uiMu). Lock order is always <collector> -> g_materialMu
+// and nothing takes a collector lock while holding this one, so there is no
+// cycle. Sharing g_videoProbeMu for it would have made every UI-inventory read
+// a data race.
+std::mutex g_materialMu;
 std::map<uint32_t, std::string> g_materialNames;  // handle -> resolved name
-uint64_t g_materialResolves = 0;
+std::atomic<uint64_t> g_materialResolves{0};
 
 // Linear scan: the population is six. Caller holds the lock.
 VideoComponentProbe* FindProbe(uint32_t component) {
@@ -1453,6 +1460,7 @@ VideoComponentProbe* FindProbe(uint32_t component) {
 
 std::string MaterialLabel(uint32_t handle) {
   if (!handle) return "none";
+  std::lock_guard<std::mutex> lk(g_materialMu);
   const auto it = g_materialNames.find(handle);
   return it == g_materialNames.end()
              ? fmt::format("0x{:08X} <unnamed>", handle)
@@ -1493,11 +1501,98 @@ void ReportVideoComponents(bool force) {
   }
   REXLOG_INFO("native: VIDEO COMPONENT RENDER {} components, {} renders "
               "total, {} material resolves --{}",
-              g_videoProbes.size(), total, g_materialResolves,
+              g_videoProbes.size(), total, g_materialResolves.load(),
               rows.empty() ? " (none)" : rows);
 }
 
+// ---- The full UI inventory -------------------------------------------------
+
+struct UiComponentRow {
+  std::string name;       // read once, from +16
+  uint64_t visits = 0;
+  uint64_t visible = 0;
+  uint32_t material = 0;
+  uint32_t flags172 = 0;
+};
+
+std::mutex g_uiMu;
+std::map<uint32_t, UiComponentRow> g_uiRows;
+uint64_t g_uiVisits = 0;
+uint64_t g_uiDropped = 0;
+
+constexpr size_t kMaxUiRows = 768;
+
+// The component's own <Name>, at +16.
+//
+// The offset comes from sub_8237F320, which passes `a1 + 4` (dwords, so byte
+// 16) into the video-player factory alongside `a1 + 152` (byte 608), and 608 is
+// confirmed to be the <Video> path by the SetTextureAsset hook. It is read
+// through a printable-ASCII filter and reported as `name?` when it does not
+// look like a string, so a wrong offset shows up as visibly empty rather than
+// as plausible garbage.
+std::string ReadComponentName(uint32_t component, uint8_t* base) {
+  std::string out;
+  for (uint32_t i = 0; i < 48; ++i) {
+    const uint8_t c = REX_LOAD_U8(component + 16 + i);
+    if (!c) break;
+    if (c < 0x20 || c > 0x7E) return std::string();
+    out.push_back(char(c));
+  }
+  return out;
+}
+
 }  // namespace
+
+void NoteUiComponentVisit(uint32_t component, uint32_t flags172,
+                          uint32_t flags176, uint8_t* base) {
+  if (!component) return;
+  const uint32_t material = REX_LOAD_U32(component + kCompMaterialSlot);
+  std::lock_guard<std::mutex> lk(g_uiMu);
+  ++g_uiVisits;
+  auto it = g_uiRows.find(component);
+  if (it == g_uiRows.end()) {
+    if (g_uiRows.size() >= kMaxUiRows) { ++g_uiDropped; return; }
+    it = g_uiRows.emplace(component, UiComponentRow{}).first;
+    it->second.name = ReadComponentName(component, base);
+  }
+  UiComponentRow& r = it->second;
+  ++r.visits;
+  if ((flags172 >> 4) & 1u) ++r.visible;
+  r.material = material;
+  r.flags172 = flags172;
+
+  // Report the inventory every 5s, ordered by visits. Bounded to the top rows
+  // because a menu walks a few hundred components; the whole count and the
+  // dropped count are printed so a truncated list is never mistaken for the
+  // whole population.
+  static std::chrono::steady_clock::time_point s_last{};
+  const auto now = std::chrono::steady_clock::now();
+  if (now - s_last < std::chrono::seconds(5)) return;
+  s_last = now;
+  std::vector<const std::pair<const uint32_t, UiComponentRow>*> order;
+  order.reserve(g_uiRows.size());
+  for (const auto& kv : g_uiRows) order.push_back(&kv);
+  std::sort(order.begin(), order.end(), [](auto* a, auto* b) {
+    return a->second.visits > b->second.visits;
+  });
+  std::string rows;
+  size_t shown = 0, drawn = 0;
+  for (const auto* kv : order) {
+    if (kv->second.visible) ++drawn;
+    if (shown >= 48) continue;
+    ++shown;
+    rows += fmt::format(" [{}0x{:08X} v{}/{} mat={} f172=0x{:08X}]",
+                        kv->second.name.empty()
+                            ? std::string("name? ")
+                            : ("\"" + kv->second.name + "\" "),
+                        kv->first, kv->second.visible, kv->second.visits,
+                        MaterialLabel(kv->second.material), kv->second.flags172);
+  }
+  REXLOG_INFO("native: UI INVENTORY {} components ({} ever visible), {} visits, "
+              "{} dropped (cap {}); showing {} by visits --{}",
+              g_uiRows.size(), drawn, g_uiVisits, g_uiDropped, kMaxUiRows, shown,
+              rows.empty() ? " (none)" : rows);
+}
 
 void NoteVideoComponent(uint32_t component, const std::string& video,
                         uint32_t texture_asset, uint32_t player) {
@@ -1533,7 +1628,7 @@ extern "C" REX_FUNC(sub_82388560) {
   orig_ResolveMaterialByName(ctx, base);
   // The slot is written by the original; slot[0] is the material it chose.
   const uint32_t material = slot ? REX_LOAD_U32(slot) : 0;
-  std::lock_guard<std::mutex> lk(g_videoProbeMu);
+  std::lock_guard<std::mutex> lk(g_materialMu);
   ++g_materialResolves;
   if (!material || name.empty()) return;
   // The name table is what makes every material handle downstream readable, so
@@ -1551,7 +1646,7 @@ extern "C" REX_FUNC(sub_82388560) {
     REXLOG_INFO("native: MATERIAL RESOLVE \"{}\" -> material 0x{:08X} "
                 "(slot 0x{:08X} = component 0x{:08X}); {} resolves so far",
                 name, material, slot, slot - kCompMaterialSlot,
-                g_materialResolves);
+                g_materialResolves.load());
   }
 }
 
@@ -1567,7 +1662,7 @@ extern "C" REX_FUNC(sub_82B26778) {
   static uint64_t s_calls = 0, s_dropped = 0;
   std::string label;
   {
-    std::lock_guard<std::mutex> lk(g_videoProbeMu);
+    std::lock_guard<std::mutex> lk(g_materialMu);
     ++s_calls;
     // Only pairs involving a *VideoRenderTarget material. Everything else is
     // the rest of the UI and would bury it.
@@ -1608,13 +1703,23 @@ extern "C" REX_FUNC(sub_8236DB10) {
       if (c == self) { watched = true; break; }
     }
   }
-  if (watched) {
-    // Read BEFORE the original: it CLEARS both flag groups on the way out, so
-    // sampling afterwards would report every component as clean and the dirty
-    // counter could never fire.
+  // Read BEFORE the original: it CLEARS both flag groups on the way out, so
+  // sampling afterwards would report every component as clean and the dirty
+  // counter could never fire.
+  if (self) {
     flags172 = REX_LOAD_U32(self + 172);
     flags176 = REX_LOAD_U32(self + 176);
   }
+  // The FULL UI inventory, not just the video components.
+  //
+  // "What actually paints the menu backdrop" has now been answered wrongly four
+  // times by inference, and the direct probe is unavailable: pixel history on a
+  // plugin capture cannot work, because Xenia renders into an emulated EDRAM
+  // buffer whose target is 80x8192 rather than 1280x720. So name it from the
+  // guest instead -- every component the UI walk actually visits, with the
+  // material it carries. The guest submits the same work in both modes, so this
+  // inventory is the menu's 2D layer by name.
+  NoteUiComponentVisit(self, flags172, flags176, base);
   orig_UIComponentVisit(ctx, base);
   if (!watched) return;
   std::lock_guard<std::mutex> lk(g_videoProbeMu);
