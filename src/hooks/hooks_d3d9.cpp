@@ -5907,6 +5907,33 @@ bool PrepareBinkPlanes(mx::hle::DrawCall& dc, uint32_t device, uint8_t* base) {
     std::lock_guard<std::mutex> lk(g_binkRefusalsMu);
     ++g_binkRefusals.ok;
   }
+  // WHICH SURFACE the composite actually targets, reported once per distinct
+  // target. This is the last inference standing in the EDRAM-aliasing case: the
+  // videos were attributed to 0x2175DC60 only because that surface takes
+  // exactly 2 draws a frame, matching the 2 Bink composites. Resemblance, not
+  // evidence -- and dc.render_target_object is assigned 45 lines above this, so
+  // the binding can simply be stated instead.
+  //
+  // The comparison it settles: the 1280x430 FE_Smoke resolve names 0x2123C1D8
+  // as its source. If the composite targets a DIFFERENT object at the same
+  // EDRAM base, the resolve is copying a surface the video was never drawn into.
+  {
+    static std::mutex s_tmu;
+    static std::set<uint32_t> s_targets;
+    bool fresh = false;
+    {
+      std::lock_guard<std::mutex> lk(s_tmu);
+      fresh = s_targets.size() < 16 && s_targets.insert(dc.render_target_object).second;
+    }
+    if (fresh) {
+      REXLOG_INFO("d3d9: BINK COMPOSITE TARGET object 0x{:08X} {}x{} edram base "
+                  "0x{:X} pitch {} -- {} planes, luma {}x{}, alpha {}",
+                  dc.render_target_object, dc.render_target_width,
+                  dc.render_target_height, dc.surface_base, dc.surface_pitch,
+                  decoded, dc.planes[0]->width, dc.planes[0]->height,
+                  dc.yuv_has_alpha);
+    }
+  }
   static uint64_t s_ok = 0;
   if (++s_ok <= 4 || (s_ok % 600) == 0) {
     // Nonzero byte counts per plane. Green output from the YUV shader is what
