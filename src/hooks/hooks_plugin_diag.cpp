@@ -1513,6 +1513,16 @@ struct UiComponentRow {
   uint64_t visible = 0;
   uint32_t material = 0;
   uint32_t flags172 = 0;
+  // The class, from the vtable pointer at +0.
+  //
+  // Needed because +260 (material) and +172 (flags) belong to the IMAGE
+  // component family and are NOT valid for every UIComponent subclass. The
+  // first inventory printed rows like `mat=0x64547269 f172=0x4672655D` -- those
+  // are ASCII ("dTri", "Fre]"), i.e. some other member read through the wrong
+  // layout. The names at +16 are all sensible, so +16 is right and these two
+  // are class-specific. Logging the vtable makes the row self-describing
+  // instead of quietly inviting the same misreading the material handles did.
+  uint32_t vtable = 0;
 };
 
 std::mutex g_uiMu;
@@ -1554,6 +1564,7 @@ void NoteUiComponentVisit(uint32_t component, uint32_t flags172,
     if (g_uiRows.size() >= kMaxUiRows) { ++g_uiDropped; return; }
     it = g_uiRows.emplace(component, UiComponentRow{}).first;
     it->second.name = ReadComponentName(component, base);
+    it->second.vtable = REX_LOAD_U32(component);
   }
   UiComponentRow& r = it->second;
   ++r.visits;
@@ -1581,16 +1592,21 @@ void NoteUiComponentVisit(uint32_t component, uint32_t flags172,
     if (kv->second.visible) ++drawn;
     if (shown >= 48) continue;
     ++shown;
-    rows += fmt::format(" [{}0x{:08X} v{}/{} mat={} f172=0x{:08X}]",
+    rows += fmt::format(" [{}0x{:08X} vt0x{:08X} visits{} mat?={} f172?=0x{:08X}]",
                         kv->second.name.empty()
                             ? std::string("name? ")
                             : ("\"" + kv->second.name + "\" "),
-                        kv->first, kv->second.visible, kv->second.visits,
+                        kv->first, kv->second.vtable, kv->second.visits,
                         MaterialLabel(kv->second.material), kv->second.flags172);
   }
-  REXLOG_INFO("native: UI INVENTORY {} components ({} ever visible), {} visits, "
-              "{} dropped (cap {}); showing {} by visits --{}",
-              g_uiRows.size(), drawn, g_uiVisits, g_uiDropped, kMaxUiRows, shown,
+  // mat? and f172? carry question marks because they are only valid for the
+  // IMAGE component family; group by vt (the class vtable) before believing
+  // them. `drawn` is derived from f172 and inherits the same doubt, so it is
+  // labelled rather than presented as a count of what draws.
+  REXLOG_INFO("native: UI INVENTORY {} components, {} visits, {} dropped "
+              "(cap {}); showing {} by visits; {} rows had f172 bit4 set "
+              "(only meaningful for image-family vt) --{}",
+              g_uiRows.size(), g_uiVisits, g_uiDropped, kMaxUiRows, shown, drawn,
               rows.empty() ? " (none)" : rows);
 }
 
