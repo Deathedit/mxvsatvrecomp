@@ -224,6 +224,18 @@ struct D3D9DeviceState {
 
   uint32_t vertex_shader = 0;
   uint32_t pixel_shader  = 0;
+  // The last NON-NULL pixel shader bound on this device.
+  //
+  // A null pixel shader does not mean "no pixel shader" on this hardware. The
+  // guest's PM4 emitter (sub_82565928) simply emits no pixel IM_LOAD in that
+  // case, so the GPU keeps the previously loaded pixel program active and the
+  // draw inherits it. `pixel_shader` above is overwritten by
+  // SetPixelShader(NULL) and cannot answer "which program is actually running".
+  //
+  // Diagnostic only for now: it exists to test whether the draws that bind YUV
+  // planes with a null pixel shader are inheriting one of the two Bink
+  // composite shaders, which is what Bink detection keys on.
+  uint32_t last_nonnull_pixel_shader = 0;
   bool     vs_seen = false;
   bool     ps_seen = false;
 

@@ -844,6 +844,8 @@ extern "C" REX_FUNC(sub_825506E8) {
   st.NoteDevice(ctx.r3.u32, mx::hle::kEpSetPixelShader);
   st.pixel_shader = ctx.r4.u32;
   st.ps_seen = true;
+  // Kept across a SetPixelShader(NULL) on purpose -- see the field's note.
+  if (ctx.r4.u32) st.last_nonnull_pixel_shader = ctx.r4.u32;
   // Also record it against the DEVICE, so draws submitted on other threads can
   // find it -- see NotePixelShaderForDevice.
   NotePixelShaderForDevice(ctx.r3.u32, ctx.r4.u32);

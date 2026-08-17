@@ -1326,6 +1326,28 @@ void ProbeBinkComposite(uint32_t pixel_shader, uint32_t vertex_shader,
                         uint32_t device, uint8_t* base, uint32_t vertex_count);
 bool IsBinkCompositeDraw(uint32_t pixel_shader, uint8_t* base);
 bool PrepareBinkPlanes(mx::hle::DrawCall& dc, uint32_t device, uint8_t* base);
+
+// Why PrepareBinkPlanes refused. Every one of these used to be a bare
+// `return false` -- no counter, no log -- so a run in which the composite never
+// happened looked identical to one in which it was never asked for. Measured
+// 2026-08-17: 54,000 calls, 0 successes, and not one line to say which of the
+// five walls they hit.
+//
+// `no_fetch` is the one to read first: it is the only refusal that does not
+// come from the texture itself but from the DEVICE's live fetch registers,
+// which is a different source from the DeviceState texture bindings a draw
+// probe prints. Those two agreeing was assumed once and never checked.
+struct BinkPlaneRefusals {
+  uint64_t calls = 0;
+  uint64_t ok = 0;
+  uint64_t no_fetch = 0;    // ReadLiveTextureFetch failed at slot s
+  uint64_t describe = 0;    // fetch constant unusable
+  uint64_t copy = 0;        // guest memory unreadable
+  uint64_t decode = 0;      // bytes there, decode refused
+  uint64_t too_few = 0;     // fewer than three planes survived
+  uint32_t first_fail_slot = 0xFFFFFFFFu;  // where no_fetch first broke
+};
+BinkPlaneRefusals BinkPlaneRefusalStats();
 bool CopyTexturePhysical(const mx::hle::HleTextureSource& source, uint8_t* base,
                          std::vector<uint8_t>& out);
 
@@ -1634,12 +1656,64 @@ void NoteStencilCensus(uint32_t depth_control, uint32_t device, uint8_t* base) {
   }
 }
 
+// A draw record carrying NEITHER shader. The renderer counts these as
+// "no-handle" stand-ins and, measured 2026-08-17, they are the entire
+// unexplained remainder of that population: 3317 records, one signature,
+// 4 indices, ~2 per frame, colour write on, no YUV planes, not a clear and not
+// a surface bind. They also never reach AttachTranslatedPixelShader -- its
+// untranslated counter prints every 500 and never fires -- so nothing on the
+// shader path has ever described them.
+//
+// Logged with the guest context the renderer does not have, and specifically
+// with the bound texture objects: if one of them is a resolve destination, this
+// is the consumer the menu backdrop has been missing. Keyed so each distinct
+// shape reports once rather than 3317 times.
+void NoteShaderlessDraw(const mx::hle::DrawCall& dc) {
+  if (dc.pixel_shader_handle || dc.vertex_shader_handle) return;
+  auto& st = mx::hle::DeviceState();
+  static std::mutex s_mu;
+  static std::set<uint64_t> s_seen;
+  // The inherited shader is part of the key: if these draws inherit DIFFERENT
+  // programs the single-line report would hide it behind whichever arrived
+  // first, and that is the whole question being asked.
+  const uint64_t key = (uint64_t(uint32_t(dc.topology)) << 40) ^
+                       (uint64_t(dc.index_count) << 16) ^
+                       uint64_t(dc.render_target_object) ^
+                       (uint64_t(st.last_nonnull_pixel_shader) << 8);
+  {
+    std::lock_guard<std::mutex> lk(s_mu);
+    if (s_seen.size() >= 16 || !s_seen.insert(key).second) return;
+  }
+  std::string bound;
+  for (uint32_t gs = 0; gs < mx::hle::kMaxSamplers; ++gs) {
+    const uint32_t obj = st.texture[gs].object;
+    if (!obj) continue;
+    const bool is_resolve = g_resolvedTextureTargets.contains(obj);
+    bound += fmt::format(" s{}=0x{:08X}{}", gs, obj,
+                         is_resolve ? "(RESOLVE-DEST)" : "");
+  }
+  // Compare last-non-null against the two handles on the "Bink composite
+  // shaders created" line at startup: a match means these draws are inheriting
+  // a Bink composite shader and IsBinkCompositeDraw is refusing them only
+  // because SetPixelShader(NULL) cleared the slot it tests.
+  REXLOG_INFO("d3d9: SHADERLESS draw topology {} indices {} verts {} target "
+              "0x{:08X} {}x{} colour_mask 0x{:X}; last non-null ps 0x{:08X}; "
+              "bound textures:{}",
+              uint32_t(dc.topology), dc.index_count,
+              dc.vertex_stride ? dc.vertices.size() / dc.vertex_stride : 0,
+              dc.render_target_object, dc.render_target_width,
+              dc.render_target_height, dc.colour_mask,
+              st.last_nonnull_pixel_shader,
+              bound.empty() ? " none" : bound);
+}
+
 bool FinishHleDraw(mx::hle::DrawCall& dc) {
   mx::hle::HleSkip skip = mx::hle::HleSkip::kNone;
   if (!mx::hle::FinalizeHleTopology(dc, skip)) {
     ++mx::hle::HleSkipCounts()[uint32_t(skip)];
     return false;
   }
+  NoteShaderlessDraw(dc);
   mx::hle::HleFrameDraws().push_back(std::move(dc));
   return true;
 }
@@ -2073,6 +2147,20 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   // The Bink composite needs its whole plane set, so it takes its own path
   // rather than competing in the single-winner binding contest.
   const uint32_t bound_ps = st.ps_seen ? st.pixel_shader : 0;
+  // REVERTED 2026-08-17: do NOT widen this to the last non-null pixel shader.
+  //
+  // The theory was sound and its evidence real -- sub_82565928 emits no pixel
+  // IM_LOAD for a null shader, so the GPU keeps the previous program, and the
+  // 3317 shaderless 4-index quads a run DO inherit exactly ps_yuv /
+  // ps_yuv_alpha. But "inherits the Bink shader" is not "is a Bink composite":
+  // this title submits an enormous number of null-pixel-shader draws (the depth
+  // passes, ~96k in a menu run), and every one of them follows a composite and
+  // so inherits it too. Measured: 54,000 matches in 40 seconds, **0** of which
+  // prepared planes, and the shaderless population did not move. It also cost
+  // 54,000 futile texture decode attempts.
+  //
+  // Whatever admits those quads has to discriminate on the PLANES, not on the
+  // inherited shader.
   if (IsBinkCompositeDraw(bound_ps, base) &&
       PrepareBinkPlanes(dc, device, base)) {
     // Bink intentionally skips PrepareDrawTexture because its composite needs
@@ -4202,6 +4290,21 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
                   draw_threads.empty() ? " none" : draw_threads,
                   rows.empty() ? " (none)" : rows);
     }
+    // Bink plane preparation, whole population, NOT gated on non-zero: a run
+    // where the composite is never attempted and one where it is attempted and
+    // always refused are different diagnoses and must not print the same
+    // nothing. The parts sum to `calls`.
+    {
+      const BinkPlaneRefusals b = BinkPlaneRefusalStats();
+      REXLOG_INFO("d3d9: BINK PLANES {} calls = {} ok + {} no-fetch + {} "
+                  "describe + {} copy + {} decode + {} too-few (first "
+                  "no-fetch slot {})",
+                  b.calls, b.ok, b.no_fetch, b.describe, b.copy, b.decode,
+                  b.too_few,
+                  b.first_fail_slot == 0xFFFFFFFFu
+                      ? std::string("none")
+                      : std::to_string(b.first_fail_slot));
+    }
     // Who owns the loop. Printed beside the total so the two can be checked
     // against each other rather than trusted separately.
     std::string split;
@@ -5698,23 +5801,58 @@ void ProbeBinkComposite(uint32_t pixel_shader, uint32_t vertex_shader,
 //  - it must not touch g_hleCpuTextures. The planes are new guest memory every
 //    video frame, so caching them by payload key would grow the cache without
 //    bound; at 30 fps that is ~90 dead entries a second.
+BinkPlaneRefusals g_binkRefusals;
+std::mutex g_binkRefusalsMu;
+
+BinkPlaneRefusals BinkPlaneRefusalStats() {
+  std::lock_guard<std::mutex> lk(g_binkRefusalsMu);
+  return g_binkRefusals;
+}
+
 bool PrepareBinkPlanes(mx::hle::DrawCall& dc, uint32_t device, uint8_t* base) {
   using namespace mx::hle;
+  // Charged exactly once per call, at whichever wall it hits.
+  auto charge = [](uint64_t BinkPlaneRefusals::*field, uint32_t slot) {
+    std::lock_guard<std::mutex> lk(g_binkRefusalsMu);
+    ++(g_binkRefusals.*field);
+    if (slot != 0xFFFFFFFFu &&
+        g_binkRefusals.first_fail_slot == 0xFFFFFFFFu)
+      g_binkRefusals.first_fail_slot = slot;
+  };
+  {
+    std::lock_guard<std::mutex> lk(g_binkRefusalsMu);
+    ++g_binkRefusals.calls;
+  }
   uint32_t decoded = 0;
   for (uint32_t s = 0; s < DrawCall::kMaxPlanes && s < kMaxSamplers; ++s) {
     uint32_t fetch[6] = {};
-    if (!ReadLiveTextureFetch(device, base, s, fetch)) break;
+    if (!ReadLiveTextureFetch(device, base, s, fetch)) {
+      // NOT a refusal by itself. A three-plane video has no alpha at slot 3, so
+      // this break is how the loop terminates normally -- the first cut charged
+      // it unconditionally and reported 646 "no-fetch" against 1886 calls that
+      // all succeeded. Only a break that leaves too few planes is a failure,
+      // and `too_few` below already counts that.
+      if (decoded < 3) charge(&BinkPlaneRefusals::no_fetch, s);
+      break;
+    }
     HleTextureSource source;
     const char* why = nullptr;
     if (!DescribeHleTexture2D(fetch, source, &why)) {
       NoteRejectedTextureFormat("bink", s, source, why, fetch);
+      charge(&BinkPlaneRefusals::describe, s);
       return false;
     }
     std::vector<uint8_t> guest;
-    if (!CopyTexturePhysical(source, base, guest)) return false;
-    auto payload = std::make_shared<HleTexturePayload>();
-    if (!DecodeHleTexture2D(source, guest.data(), guest.size(), *payload, &why))
+    if (!CopyTexturePhysical(source, base, guest)) {
+      charge(&BinkPlaneRefusals::copy, s);
       return false;
+    }
+    auto payload = std::make_shared<HleTexturePayload>();
+    if (!DecodeHleTexture2D(source, guest.data(), guest.size(), *payload,
+                            &why)) {
+      charge(&BinkPlaneRefusals::decode, s);
+      return false;
+    }
     // An all-zero plane is normal for a video that has not decoded its first
     // frame yet, so unlike the immutable path this is not memoised as empty —
     // the same descriptor will carry real pixels a frame later.
@@ -5754,7 +5892,10 @@ bool PrepareBinkPlanes(mx::hle::DrawCall& dc, uint32_t device, uint8_t* base) {
   }
   // Y, Cr and Cb are always present; the fourth is the alpha plane and its
   // presence is what selects the guest's alpha-capable pixel shader.
-  if (decoded < 3) return false;
+  if (decoded < 3) {
+    charge(&BinkPlaneRefusals::too_few, 0xFFFFFFFFu);
+    return false;
+  }
   dc.plane_count = decoded;
   dc.yuv_has_alpha = decoded >= 4;
   dc.yuv_composite = true;
@@ -5762,6 +5903,10 @@ bool PrepareBinkPlanes(mx::hle::DrawCall& dc, uint32_t device, uint8_t* base) {
   // plane's; the chroma planes are half-size and the shader normalises.
   dc.sampled_texture_width = dc.planes[0]->width;
   dc.sampled_texture_height = dc.planes[0]->height;
+  {
+    std::lock_guard<std::mutex> lk(g_binkRefusalsMu);
+    ++g_binkRefusals.ok;
+  }
   static uint64_t s_ok = 0;
   if (++s_ok <= 4 || (s_ok % 600) == 0) {
     // Nonzero byte counts per plane. Green output from the YUV shader is what
