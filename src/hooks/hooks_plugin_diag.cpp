@@ -1280,6 +1280,12 @@ extern "C" REX_FUNC(sub_82AA7638) {
 }
 
 //-----------------------------------------------------------------------------
+// Defined with the render probes below; declared here because the
+// SetTextureAsset hook is what discovers the video components in the first
+// place, and it comes first in the file.
+void NoteVideoComponent(uint32_t component, const std::string& video,
+                        uint32_t texture_asset, uint32_t player);
+
 // UIVideoLayer::SetTextureAsset — sub_8236EB30
 //
 // The missing link in the menu backdrop. A UIVideoLayer with a `TextureAsset`
@@ -1347,6 +1353,197 @@ extern "C" REX_FUNC(sub_8236EB30) {
   REXLOG_INFO("native: UIVideoLayer::SetTextureAsset layer 0x{:08X} video "
               "\"{}\" asset 0x{:08X} -> TEXTURE 0x{:08X}, player 0x{:08X};{}",
               layer, name, asset, texture, player, fetch_desc);
+  NoteVideoComponent(layer, name, texture, player);
+}
+
+//-----------------------------------------------------------------------------
+// What does the FE_Smoke QUAD actually carry?
+//
+// Both video render targets are produced, bound only for the resolve idiom and
+// sampled by nothing -- measured, see VIDEO TARGET CONSUMPTION. So the question
+// is no longer which host texture we lose, but what the guest's own draw item
+// holds. UIVideoComponent, decompiled 2026-08-17:
+//
+//   this+260  { material, pack, index }   <- what the quad samples
+//   this+236  -> ImageIconProperties (this+320); +164 is the installed material
+//   this+664  <TextureAsset>              <- where the video decodes
+//
+//   sub_82388560(this+260, name)   resolves a NAME to a material. The MATERIAL
+//                                  branch always fails for these (no material
+//                                  named *VideoRenderTarget exists in any of
+//                                  the game's 130 databases), so it wraps the
+//                                  TEXTURE of that name in a synthesised one.
+//   sub_8237ABA8(this)             vtable slot 15, the render prepare:
+//                                    sub_82B26778(*(this+236), *(this+260))
+//   sub_82B26778(props, material)  installs it at props+164.
+//
+// Three probes, because each answers a different question and the previous
+// round of this investigation was lost to conflating them:
+//
+//   sub_82388560   which NAME each material handle came from. Without it every
+//                  handle below is an unnamed pointer and we are back to
+//                  identifying resources by resemblance.
+//   sub_8237ABA8   is the video component's render path running AT ALL, and
+//                  what does it hold when it runs. `0 calls` and `calls but
+//                  the wrong material` are opposite diagnoses.
+//   sub_82B26778   whether the material actually reaches the draw item. NOTE:
+//                  guarded by `props[41] != material`, so it fires ONLY on
+//                  CHANGE -- a low call count here means "stable", NOT "not
+//                  drawing". Do not read it as a per-frame counter.
+//-----------------------------------------------------------------------------
+
+namespace {
+
+constexpr uint32_t kCompMaterialSlot = 260;
+constexpr uint32_t kCompDrawItem = 236;
+constexpr uint32_t kCompTextureAsset = 664;
+
+struct VideoComponentProbe {
+  uint32_t component = 0;
+  std::string video;
+  uint32_t texture_asset = 0;
+  uint32_t player = 0;
+  uint64_t render_calls = 0;
+  uint32_t last_material = 0;
+  uint32_t last_draw_item = 0;
+};
+
+std::mutex g_videoProbeMu;
+std::vector<VideoComponentProbe> g_videoProbes;   // 6 in the whole game
+std::map<uint32_t, std::string> g_materialNames;  // handle -> resolved name
+uint64_t g_materialResolves = 0;
+
+// Linear scan: the population is six. Caller holds the lock.
+VideoComponentProbe* FindProbe(uint32_t component) {
+  for (auto& p : g_videoProbes)
+    if (p.component == component) return &p;
+  return nullptr;
+}
+
+std::string MaterialLabel(uint32_t handle) {
+  if (!handle) return "none";
+  const auto it = g_materialNames.find(handle);
+  return it == g_materialNames.end()
+             ? fmt::format("0x{:08X} <unnamed>", handle)
+             : fmt::format("0x{:08X} \"{}\"", handle, it->second);
+}
+
+}  // namespace
+
+void NoteVideoComponent(uint32_t component, const std::string& video,
+                        uint32_t texture_asset, uint32_t player) {
+  if (!component) return;
+  std::lock_guard<std::mutex> lk(g_videoProbeMu);
+  if (VideoComponentProbe* p = FindProbe(component)) {
+    p->video = video;
+    p->texture_asset = texture_asset;
+    p->player = player;
+    return;
+  }
+  if (g_videoProbes.size() >= 16) return;
+  g_videoProbes.push_back({component, video, texture_asset, player});
+}
+
+// sub_82388560(slot, name) — the material-name resolver.
+REX_IMPORT(__imp__sub_82388560, orig_ResolveMaterialByName, void());
+extern "C" REX_FUNC(sub_82388560) {
+  const uint32_t slot = ctx.r3.u32;
+  const uint32_t name_ptr = ctx.r4.u32;
+  std::string name;
+  for (uint32_t i = 0; i < 64 && name_ptr; ++i) {
+    const char c = char(REX_LOAD_U8(name_ptr + i));
+    if (!c) break;
+    name.push_back(c);
+  }
+  orig_ResolveMaterialByName(ctx, base);
+  // The slot is written by the original; slot[0] is the material it chose.
+  const uint32_t material = slot ? REX_LOAD_U32(slot) : 0;
+  std::lock_guard<std::mutex> lk(g_videoProbeMu);
+  ++g_materialResolves;
+  if (!material || name.empty()) return;
+  // Log each handle once. Names repeat across hundreds of components and the
+  // interesting ones are the three *VideoRenderTarget assets.
+  if (g_materialNames.size() < 4096 &&
+      g_materialNames.emplace(material, name).second) {
+    if (name.find("VideoRenderTarget") != std::string::npos) {
+      REXLOG_INFO("native: MATERIAL RESOLVE \"{}\" -> material 0x{:08X} "
+                  "(slot 0x{:08X}); {} resolves so far",
+                  name, material, slot, g_materialResolves);
+    }
+  }
+}
+
+// sub_82B26778(props, material) — installs the material on the draw item.
+// Fires only when it CHANGES; see the header note.
+REX_IMPORT(__imp__sub_82B26778, orig_InstallDrawItemMaterial, void());
+extern "C" REX_FUNC(sub_82B26778) {
+  const uint32_t props = ctx.r3.u32;
+  const uint32_t material = ctx.r4.u32;
+  orig_InstallDrawItemMaterial(ctx, base);
+  static std::mutex s_mu;
+  static std::set<uint64_t> s_seen;
+  static uint64_t s_calls = 0, s_dropped = 0;
+  std::string label;
+  {
+    std::lock_guard<std::mutex> lk(g_videoProbeMu);
+    ++s_calls;
+    // Only pairs involving a *VideoRenderTarget material. Everything else is
+    // the rest of the UI and would bury it.
+    const auto it = g_materialNames.find(material);
+    if (it == g_materialNames.end() ||
+        it->second.find("VideoRenderTarget") == std::string::npos)
+      return;
+    label = it->second;
+  }
+  const uint64_t key = (uint64_t(props) << 32) | material;
+  {
+    std::lock_guard<std::mutex> lk(s_mu);
+    if (s_seen.size() >= 64) { ++s_dropped; return; }
+    if (!s_seen.insert(key).second) return;
+  }
+  REXLOG_INFO("native: DRAW ITEM MATERIAL props 0x{:08X} <- material 0x{:08X} "
+              "\"{}\"; {} installs total, {} pairs dropped",
+              props, material, label, s_calls, s_dropped);
+}
+
+// sub_8237ABA8(this) — vtable slot 15, the render prepare that binds
+// *(this+260) onto the draw item. Called per render, so this is a COUNTER with
+// a periodic report rather than a line per call.
+REX_IMPORT(__imp__sub_8237ABA8, orig_UIImageRenderPrepare, void());
+extern "C" REX_FUNC(sub_8237ABA8) {
+  const uint32_t self = ctx.r3.u32;
+  orig_UIImageRenderPrepare(ctx, base);
+  if (!self) return;
+
+  // Read AFTER the original: it is what assigns the draw item's material, and
+  // the whole question is what it ended up holding.
+  std::lock_guard<std::mutex> lk(g_videoProbeMu);
+  VideoComponentProbe* p = FindProbe(self);
+  if (!p) return;  // some other image component; not this probe's population
+  ++p->render_calls;
+  p->last_material = REX_LOAD_U32(self + kCompMaterialSlot);
+  p->last_draw_item = REX_LOAD_U32(self + kCompDrawItem);
+
+  // The whole population every time, so "FE_Smoke: 0 calls" is visible rather
+  // than being an absent line. Throttled on the total, not per component --
+  // a per-component cap would let a chatty one silence the quiet one, which is
+  // exactly the case of interest.
+  static uint64_t s_reports = 0;
+  uint64_t total = 0;
+  for (const auto& q : g_videoProbes) total += q.render_calls;
+  if (total != 1 && (total % 600) != 0) return;
+  ++s_reports;
+  std::string rows;
+  for (const auto& q : g_videoProbes) {
+    rows += fmt::format(
+        " [\"{}\" comp0x{:08X} renders{} material={} item0x{:08X} "
+        "texasset0x{:08X}]",
+        q.video, q.component, q.render_calls, MaterialLabel(q.last_material),
+        q.last_draw_item, q.texture_asset);
+  }
+  REXLOG_INFO("native: VIDEO COMPONENT RENDER {} components, {} renders "
+              "total --{}",
+              g_videoProbes.size(), total, rows);
 }
 
 //-----------------------------------------------------------------------------
