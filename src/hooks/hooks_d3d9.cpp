@@ -5688,6 +5688,36 @@ bool PrepareBinkPlanes(mx::hle::DrawCall& dc, uint32_t device, uint8_t* base) {
   return true;
 }
 
+// FINDING 2026-08-17 — THIS FUNCTION'S RESULT IS SAMPLED BY NO DRAW.
+//
+// It picks the ONE texture a tex*col stand-in samples, by scoring the shader's
+// candidate fetches against each other. That mattered when untranslated shaders
+// were common. Measured over mx_1282..mx_1285, it no longer reaches anything:
+//
+//   stand-in gate: reached 314000, will_stand_in 56138, pixel_shader==0 56138
+//
+// The two are IDENTICAL, so every stand-in draw is a no-handle draw -- and for
+// those this function is never called at all: there is no shader on the draw
+// and none at device+0x3244 either, so ReadBoundPixelShader returns at
+// `if (!candidate)` before reaching it. Meanwhile `no-hlsl` is 0 in every run,
+// so a draw that HAS a shader always translates, and a translated draw carries
+// its textures in pixelTextures and binds them itself (d3d12_game.cpp:4059).
+//
+// A consumer would have to have a shader (so this runs) AND fail to translate
+// (so it samples d.texture). That set is empty.
+//
+// A grading instrument lived here briefly and confirmed the picks are often
+// junk -- a 1x1 kR16Float, a 129x129 terrain clipmap, a 1280x720 kR32Float, all
+// scored as colour sources. **Real, and inert.** Removed rather than kept,
+// because a counter that can only ever read zero is the thing this codebase
+// keeps being bitten by. Do not rebuild it without first re-checking the gate
+// numbers above.
+//
+// STILL OPEN, and the one reason to care: d.texture also selects the PSO
+// SAMPLER VARIANT (point/linear, mip mode) at d3d12_game.cpp:4390, inside an
+// `if (textured)` block that was NOT confirmed to exclude translated draws. If
+// a translated draw carries a d.texture from a bad pick here, its colour is
+// unaffected but its sampler may not be.
 bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
                                 uint8_t* base,
                                 mx::hle::PixelTextureBinding& out) {
@@ -5837,6 +5867,7 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
     found = true;
   }
   if (!found) return false;
+
   static std::map<uint32_t, bool> s_logged;
   if (s_logged.size() < 32 && s_logged.emplace(handle, true).second) {
     const auto& selected_state = DeviceState().texture[out.sampler];
@@ -7627,6 +7658,9 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
     AttachTranslatedPixelShader(dc, resolved, device, base);
   }
 
+  // AttachTranslatedPixelShader ran just above, so dc already knows whether it
+  // has a translated shader. A draw that has one renders with it and never
+  // samples this pick -- only a stand-in draw does, and only those are graded.
   if ((!pixel_shader ||
        !ResolvePixelBindingForDraw(pixel_shader, device, base, binding)) &&
       !ReadBoundPixelShader(device, base, pixel_shader, binding)) {
