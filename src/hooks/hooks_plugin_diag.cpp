@@ -1428,6 +1428,41 @@ std::string MaterialLabel(uint32_t handle) {
              : fmt::format("0x{:08X} \"{}\"", handle, it->second);
 }
 
+// The whole population, every time. Caller holds g_videoProbeMu.
+//
+// Throttled on TIME and on the population changing -- NOT on a render count.
+// The first cut fired only at `total == 1 || total % 600 == 0`, which printed
+// exactly once, at a moment when two of the six components had registered and
+// FE_Smoke had not. Its row never appeared at all, and an absent row is
+// indistinguishable from `renders 0`, which is the entire question. A counter
+// whose reporting condition can be skipped over is the same defect as one that
+// cannot fire.
+void ReportVideoComponents(bool force) {
+  static std::chrono::steady_clock::time_point s_last{};
+  static size_t s_lastCount = 0;
+  const auto now = std::chrono::steady_clock::now();
+  const bool grew = g_videoProbes.size() != s_lastCount;
+  if (!force && !grew &&
+      now - s_last < std::chrono::seconds(3))
+    return;
+  s_last = now;
+  s_lastCount = g_videoProbes.size();
+  uint64_t total = 0;
+  std::string rows;
+  for (const auto& q : g_videoProbes) {
+    total += q.render_calls;
+    rows += fmt::format(
+        " [\"{}\" comp0x{:08X} renders{} material={} item0x{:08X} "
+        "texasset0x{:08X}]",
+        q.video, q.component, q.render_calls, MaterialLabel(q.last_material),
+        q.last_draw_item, q.texture_asset);
+  }
+  REXLOG_INFO("native: VIDEO COMPONENT RENDER {} components, {} renders "
+              "total, {} material resolves --{}",
+              g_videoProbes.size(), total, g_materialResolves,
+              rows.empty() ? " (none)" : rows);
+}
+
 }  // namespace
 
 void NoteVideoComponent(uint32_t component, const std::string& video,
@@ -1442,6 +1477,10 @@ void NoteVideoComponent(uint32_t component, const std::string& video,
   }
   if (g_videoProbes.size() >= 16) return;
   g_videoProbes.push_back({component, video, texture_asset, player});
+  // Report on registration too, so a component that NEVER renders still gets a
+  // row. Without this the only reporter is the render hook, and a component
+  // that never renders is exactly the one that would never be printed.
+  ReportVideoComponents(true);
 }
 
 // sub_82388560(slot, name) — the material-name resolver.
@@ -1461,15 +1500,22 @@ extern "C" REX_FUNC(sub_82388560) {
   std::lock_guard<std::mutex> lk(g_videoProbeMu);
   ++g_materialResolves;
   if (!material || name.empty()) return;
-  // Log each handle once. Names repeat across hundreds of components and the
-  // interesting ones are the three *VideoRenderTarget assets.
-  if (g_materialNames.size() < 4096 &&
-      g_materialNames.emplace(material, name).second) {
-    if (name.find("VideoRenderTarget") != std::string::npos) {
-      REXLOG_INFO("native: MATERIAL RESOLVE \"{}\" -> material 0x{:08X} "
-                  "(slot 0x{:08X}); {} resolves so far",
-                  name, material, slot, g_materialResolves);
-    }
+  // The name table is what makes every material handle downstream readable, so
+  // it records EVERY handle regardless of logging.
+  if (g_materialNames.size() < 4096) g_materialNames.emplace(material, name);
+  if (name.find("VideoRenderTarget") == std::string::npos) return;
+  // Deduped on (SLOT, material), not on the handle. The handle is shared: the
+  // asset system caches materials by name, so both video components resolve
+  // "1280_720_VideoRenderTarget" to the same 0x21B0D720 and a handle-keyed
+  // dedupe printed one line for the whole run -- hiding WHICH components
+  // resolved it, which is the part worth knowing. The slot is component+260,
+  // so each line names a distinct component.
+  static std::set<uint64_t> s_seen;
+  if (s_seen.size() < 64 && s_seen.insert((uint64_t(slot) << 32) | material).second) {
+    REXLOG_INFO("native: MATERIAL RESOLVE \"{}\" -> material 0x{:08X} "
+                "(slot 0x{:08X} = component 0x{:08X}); {} resolves so far",
+                name, material, slot, slot - kCompMaterialSlot,
+                g_materialResolves);
   }
 }
 
@@ -1523,27 +1569,7 @@ extern "C" REX_FUNC(sub_8237ABA8) {
   ++p->render_calls;
   p->last_material = REX_LOAD_U32(self + kCompMaterialSlot);
   p->last_draw_item = REX_LOAD_U32(self + kCompDrawItem);
-
-  // The whole population every time, so "FE_Smoke: 0 calls" is visible rather
-  // than being an absent line. Throttled on the total, not per component --
-  // a per-component cap would let a chatty one silence the quiet one, which is
-  // exactly the case of interest.
-  static uint64_t s_reports = 0;
-  uint64_t total = 0;
-  for (const auto& q : g_videoProbes) total += q.render_calls;
-  if (total != 1 && (total % 600) != 0) return;
-  ++s_reports;
-  std::string rows;
-  for (const auto& q : g_videoProbes) {
-    rows += fmt::format(
-        " [\"{}\" comp0x{:08X} renders{} material={} item0x{:08X} "
-        "texasset0x{:08X}]",
-        q.video, q.component, q.render_calls, MaterialLabel(q.last_material),
-        q.last_draw_item, q.texture_asset);
-  }
-  REXLOG_INFO("native: VIDEO COMPONENT RENDER {} components, {} renders "
-              "total --{}",
-              g_videoProbes.size(), total, rows);
+  ReportVideoComponents(false);
 }
 
 //-----------------------------------------------------------------------------
