@@ -5713,11 +5713,17 @@ bool PrepareBinkPlanes(mx::hle::DrawCall& dc, uint32_t device, uint8_t* base) {
 // keeps being bitten by. Do not rebuild it without first re-checking the gate
 // numbers above.
 //
-// STILL OPEN, and the one reason to care: d.texture also selects the PSO
-// SAMPLER VARIANT (point/linear, mip mode) at d3d12_game.cpp:4390, inside an
-// `if (textured)` block that was NOT confirmed to exclude translated draws. If
-// a translated draw carries a d.texture from a bad pick here, its colour is
-// unaffected but its sampler may not be.
+// The last way it could still have mattered is CLOSED, also negative.
+// d.texture selects the PSO SAMPLER VARIANT (point/linear, mip mode) at
+// d3d12_game.cpp:4390, which looked like a path a bad pick could reach even on
+// a translated draw. It cannot: the translated branch at d3d12_game.cpp:4223
+// binds its own root signature, heaps and samplers (BindTranslatedSamplers) and
+// ends in `continue` at :4301 — everything below, `++m_standInDraws` included,
+// is stand-in only. So the variant is computed from d.texture exclusively for
+// draws that never called this function.
+//
+// Net: nothing this function returns is sampled, and nothing it returns selects
+// a sampler. It is vestigial in full.
 bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
                                 uint8_t* base,
                                 mx::hle::PixelTextureBinding& out) {
