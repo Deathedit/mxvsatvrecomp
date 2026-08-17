@@ -74,9 +74,6 @@ class XenosGpuState {
   uint32_t ReadRegister(uint32_t reg) const;
   void WriteRegister(uint32_t reg, uint32_t val);
 
-  void Snapshot();
-  std::string DumpDiff() const;
-
   const auto& Registers() const { return regs_; }
 
   // Shared register-name lookup. Single source of truth across the codebase
@@ -86,7 +83,6 @@ class XenosGpuState {
 
  private:
   std::unordered_map<uint32_t, uint32_t> regs_;
-  std::unordered_map<uint32_t, uint32_t> prev_regs_;
 };
 
 }  // namespace mx::gpu

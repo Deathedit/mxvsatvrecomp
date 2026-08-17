@@ -263,32 +263,10 @@ void XenosGpuState::ApplyPackets(const std::vector<pm4::Pm4Packet>& packets) {
   }
 }
 
-void XenosGpuState::Snapshot() {
-  prev_regs_ = regs_;
-}
-
-std::string XenosGpuState::DumpDiff() const {
-  std::string out = "--- GPU State Diff ---\n";
-
-  for (const auto& [reg, val] : regs_) {
-    auto it = prev_regs_.find(reg);
-    if (it == prev_regs_.end() || it->second != val) {
-      const char* name = RegisterName(reg);
-      char buf[128];
-      uint32_t prev = (it != prev_regs_.end()) ? it->second : 0;
-      snprintf(buf, sizeof(buf), "  [0x%04X] %-24s 0x%08X",
-               reg, name ? name : "?", val);
-      out += buf;
-      if (it != prev_regs_.end() && it->second != val) {
-        snprintf(buf, sizeof(buf), "  (was 0x%08X)", prev);
-        out += buf;
-      }
-      out += "\n";
-    }
-  }
-
-  if (out.size() <= 24) out += "  (no changes)\n";
-  return out;
-}
+// Snapshot() / DumpDiff() / prev_regs_ removed 2026-08-17. A frame-over-frame
+// register diff, with no caller since the PM4 translator was retired — the
+// register shadow is now read directly by the D3D9 HLE path, which asks for
+// specific registers rather than for what changed. RegisterName stays: it is
+// live through Pm4Parser::RegisterName.
 
 }  // namespace mx::gpu

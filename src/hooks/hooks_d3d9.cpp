@@ -2741,7 +2741,10 @@ constexpr float kCtlSpreadEpsilon = 1e-4f;
 // global percentage can express neither.
 struct ShaderScore {
   uint64_t execs = 0;
-  uint64_t space[4] = {};                 // indexed by ExportSpace
+  // `space[4]`, indexed by ExportSpace, was here and was never written or read.
+  // Removed 2026-08-17 with the ExportSpace classifier itself — see the FINDING
+  // block in hle_types.h, which keeps the one conclusion that mattered: exported
+  // positions are window coordinates, not clip space.
   uint64_t clip[kClipBucketCount] = {};
   uint64_t in_clip = 0;
   uint64_t degenerate = 0;

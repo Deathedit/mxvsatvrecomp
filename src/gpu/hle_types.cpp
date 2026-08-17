@@ -3,43 +3,9 @@
 #include "gpu/shader_hlsl.h"
 
 #include <algorithm>
-#include <cmath>
 #include <cstring>
 
 namespace mx::hle {
-
-ExportSpace ClassifyExportSpace(float x, float y, float w, float xs, float xo,
-                                float ys, float yo) {
-  (void)xo;
-  (void)yo;
-  if (w != 0.0f) { x /= w; y /= w; }
-  if (!std::isfinite(x) || !std::isfinite(y)) return ExportSpace::kNeither;
-  // Degenerate first: (0,0,0,w=0) is inside the unit cube and inside the
-  // viewport rectangle both, so it is evidence for nothing.
-  if (w == 0.0f || (std::fabs(x) < 1e-4f && std::fabs(y) < 1e-4f))
-    return ExportSpace::kDegenerate;
-  if (xs == 0.0f || ys == 0.0f) return ExportSpace::kNeither;
-
-  const float wpx = std::fabs(xs) * 2.0f, wpy = std::fabs(ys) * 2.0f;
-  const bool clip_like =
-      x >= -1.05f && x <= 1.05f && y >= -1.05f && y <= 1.05f;
-  const bool win_like =
-      x >= -1.0f && x <= wpx + 1.0f && y >= -1.0f && y <= wpy + 1.0f;
-  // Clip wins the tie: the regions overlap near the origin, and the tie must
-  // go against the hypothesis being tested rather than for it.
-  if (clip_like) return ExportSpace::kClipLike;
-  if (win_like) return ExportSpace::kWindowLike;
-  return ExportSpace::kNeither;
-}
-
-const char* ExportSpaceName(ExportSpace s) {
-  switch (s) {
-    case ExportSpace::kDegenerate: return "degenerate";
-    case ExportSpace::kClipLike:   return "clip-like";
-    case ExportSpace::kWindowLike: return "window-like";
-    default:                       return "neither";
-  }
-}
 
 HostTopology MapTopology(uint32_t prim_type) {
   switch (static_cast<PrimitiveType>(prim_type)) {

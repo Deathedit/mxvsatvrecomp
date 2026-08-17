@@ -276,7 +276,9 @@ constexpr uint32_t kHleProbeRegs = 64;
 // Layouts a candidate can be read in. A D3D-era compiler packs a matrix into
 // four constants either way round, and picking wrong transposes the transform —
 // which looks like plausible geometry in the wrong place, not like a failure.
-enum class HleMatrixLayout : uint8_t { kRowMajor = 0, kColMajor };
+// HleMatrixLayout (kRowMajor / kColMajor) was declared here and never used —
+// removed 2026-08-17. The probe below scores both layouts internally and names
+// the winner in its report; it never needed the type to be public.
 
 // Score one built draw's positions against every candidate. `consts` is
 // kHleProbeRegs*4 floats already in host order; `viewport_mvp` is the control,

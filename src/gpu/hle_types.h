@@ -185,13 +185,14 @@ struct DrawCall {
   uint32_t vertex_count = 0;
   uint32_t index_count = 0;
   uint32_t vertex_stride = 0;
-  // The fetch constant's endian swap mode for `vertices` (0 none, 1 8in16,
-  // 2 8in32). The bytes are left in guest order and the swap is applied per
-  // attribute at read time, because its correct width is the format's packed
-  // unit and one vertex mixes 16-bit positions with 32-bit colours. Swapping
-  // the whole buffer up front is what read every (x, y, z, w=1) position as
-  // (y, x, w=1, z).
-  uint32_t vertex_endian = 0;
+  // RULE — `vertices` stays in GUEST byte order and the fetch constant's endian
+  // swap is applied PER ATTRIBUTE at read time, never to the whole buffer. The
+  // correct swap width is the format's packed unit, and one vertex mixes 16-bit
+  // positions with 32-bit colours; swapping the buffer up front is what read
+  // every (x, y, z, w=1) position as (y, x, w=1, z). The `vertex_endian` field
+  // that used to sit here carried the mode but was never read by anything — it
+  // was removed 2026-08-17 and the rule kept, because the rule is the part that
+  // matters and the readers get the mode from the fetch constant directly.
   uint32_t prim_type = 0;            // xenos::PrimitiveType (raw 6-bit value)
   HostTopology topology = HostTopology::kUndefined;  // mapped from prim_type
   bool index_16bit = true;
@@ -679,7 +680,9 @@ struct DrawCall {
   uint32_t colour_control = 0;
   float alpha_ref = 0.0f;      // RB_ALPHA_REF 0x210E
   bool alpha_state_seen = false;
-  uint32_t mode_control = 0;   // RB_MODECONTROL   0x2208, bits 0-2 = edram_mode
+  // `mode_control` (RB_MODECONTROL 0x2208, bits 0-2 = edram_mode) sat here and
+  // was never written or read — removed 2026-08-17. Nothing consults edram_mode
+  // yet; add it back at the point something does, not before.
 
   // SCISSOR, in guest render-target pixels, already offset and normalised.
   //
@@ -712,20 +715,20 @@ struct DrawCall {
 };
 
 //===========================================================================
-// Which space an executed vertex shader's exported position lives in.
+// FINDING — which space an exported vertex position lives in. The classifier
+// that produced it (ExportSpace / ClassifyExportSpace / ExportSpaceName) was
+// removed 2026-08-17 as dead code; it had no caller left. The answer it gave
+// is load-bearing and is why two things in the renderer look the way they do,
+// so it is kept here.
 //
-// The PM4 path settled this for the ring's own executions: every sampled export
-// read like window coordinates — (640, 0, 1, w=1), (1280, 0, 0, w=1),
-// (639.5, -0.5, 1, w=1) in a 1280x720 window — not clip space. That is why
-// BuildViewportMvp exists and why the renderer applies the viewport inverse.
+// **Exported positions are WINDOW coordinates, not clip space.** The PM4 path
+// settled it for the ring's own executions: every sampled export read as
+// (640, 0, 1, w=1), (1280, 0, 0, w=1), (639.5, -0.5, 1, w=1) in a 1280x720
+// window. That is why BuildViewportMvp exists and why the renderer applies the
+// viewport inverse.
 //
-// A free function because two paths now ask the same question from different
-// inputs: PM4 reads the Xenos context registers, the D3D9 path reads the
-// D3D9 viewport. Only the *inputs* differ, so only the inputs should be
-// duplicated. Two copies of the classification would be free to drift, and a
-// drifted control is worse than no control.
-//
-// Three rules are baked in, and each was paid for:
+// Three rules the classifier baked in, each paid for, and worth knowing if the
+// question is ever reopened:
 //
 //   1. **Degenerate first.** (0,0,0,w=0) sits inside the unit cube *and*
 //      inside the viewport rectangle, so it would otherwise count as evidence
@@ -736,18 +739,6 @@ struct DrawCall {
 //      1280x720: xs is half the width, ys half the height (negative, y growing
 //      downward). A half-pixel margin covers D3D9's pixel-centre convention.
 //===========================================================================
-enum class ExportSpace : uint8_t {
-  kDegenerate = 0,  // no evidence either way
-  kClipLike,
-  kWindowLike,
-  kNeither,
-};
-
-// x, y, w are the raw exported position; the perspective divide is applied
-// here so callers cannot disagree about whether it was already done.
-ExportSpace ClassifyExportSpace(float x, float y, float w, float xs, float xo,
-                                float ys, float yo);
-const char* ExportSpaceName(ExportSpace s);
 
 //===========================================================================
 // Topology mapping and the two primitive expansions.
