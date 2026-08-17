@@ -1346,6 +1346,23 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     uint64_t lastFrame = 0;
   };
   std::map<uint64_t, BlankSourceInfo> m_blankSourceByExtent;
+
+  // Why a banded DEPTH resolve did not stitch. BLANK-SOURCE alone says a
+  // resolve copied an undrawn surface; it cannot say whether the stitch was
+  // unavailable, mis-shaped, or merely not drawn yet, and those are three
+  // different repairs. Keyed by reason, holding the first sighting's numbers.
+  //   1 fewer than two candidate bands
+  //   2 heights do not cover the destination exactly (observedTotal says by how
+  //     much -- an overshoot means an extra aliasing surface joined the set)
+  //   3 the cover does not start at the resolve's own EDRAM base
+  //   4 exact cover, but no band has been drawn into yet
+  struct DepthBandRefusal {
+    uint64_t count = 0;
+    uint32_t destWidth = 0, destHeight = 0;
+    uint32_t observedTotal = 0, candidates = 0;
+    uint32_t sourceBase = 0, firstBase = 0, source = 0;
+  };
+  std::map<uint32_t, DepthBandRefusal> m_depthBandRefusals;
   // Resolves served from a surface twice their size in each axis at the same
   // EDRAM base and format -- the 1x partner of a 4x-MSAA source, which is the
   // image we actually hold because we render everything at 1x.

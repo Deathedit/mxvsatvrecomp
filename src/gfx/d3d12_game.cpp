@@ -3099,11 +3099,45 @@ void D3D12Renderer::RenderGameFrame() {
         for (const GameRenderTarget* b : depthBands) total += b->height;
         // Anything that is not an exact cover of the destination, starting at
         // the resolve's own base, is not a banding of this surface.
-        if (depthBands.size() < 2 || total != d.resolveDestHeight ||
-            depthBands.front()->edramBase != d.resolveSourceBase)
-          depthBands.clear();
+        //
+        // WHICH of these three refuses, and with what numbers. Without this the
+        // only evidence is a BLANK-SOURCE count, which says a resolve copied an
+        // undrawn surface but not whether the stitch was unavailable, mis-shaped
+        // or simply not yet drawn -- three different repairs. The exact-cover
+        // test is the fragile one by construction: it sums EVERY same-width
+        // target at or above the base, so one extra aliasing surface makes the
+        // total overshoot and loses the stitch entirely, which is exactly the
+        // failure the "exclude the resolve's own object" clause above was added
+        // to dodge once already.
+        const uint32_t candidates = uint32_t(depthBands.size());
+        uint32_t refusal = 0;  // 0 = accepted
+        if (depthBands.size() < 2)
+          refusal = 1;  // fewer than two bands to stitch
+        else if (total != d.resolveDestHeight)
+          refusal = 2;  // heights do not cover the destination exactly
+        else if (depthBands.front()->edramBase != d.resolveSourceBase)
+          refusal = 3;  // cover does not start at the resolve's own base
+        if (refusal) depthBands.clear();
         for (const GameRenderTarget* b : depthBands)
           if (b->everDrawn) depthBandsDrawn = true;
+        if (!refusal && !depthBandsDrawn)
+          refusal = 4;  // exact cover, but no band has been drawn into yet
+        if (refusal) {
+          auto& r = m_depthBandRefusals[refusal];
+          if (!r.count) {
+            r.destWidth = d.resolveDestWidth;
+            r.destHeight = d.resolveDestHeight;
+            r.observedTotal = total;
+            r.candidates = candidates;
+            r.sourceBase = d.resolveSourceBase;
+            r.firstBase = candidates ? depthBands.empty()
+                                           ? 0u
+                                           : depthBands.front()->edramBase
+                                     : 0u;
+            r.source = d.resolveSource;
+          }
+          ++r.count;
+        }
       }
       if (auto it = m_gameRenderTargets.find(d.resolveSource);
           !d.resolveSourceIsDepth && it != m_gameRenderTargets.end()) {
@@ -4524,6 +4558,24 @@ void D3D12Renderer::RenderGameFrame() {
                     static_cast<unsigned long long>(b.rescueNoCandidate),
                     static_cast<unsigned long long>(b.rescueAllBlank),
                     static_cast<unsigned long long>(b.rescueNotAttempted));
+      LogInfo(message);
+    }
+    // Why banded depth resolves did not stitch. See DepthBandRefusal for the
+    // reason codes; reason 2 carries the observed total, which says whether the
+    // cover UNDERSHOOT (a band missing from the pool) or OVERSHOT (an extra
+    // aliasing surface joined the set) -- opposite repairs.
+    for (const auto& [reason, r] : m_depthBandRefusals) {
+      static const char* kWhy[] = {"accepted", "fewer than 2 bands",
+                                   "heights do not cover the destination",
+                                   "cover does not start at the source base",
+                                   "exact cover but no band drawn yet"};
+      std::snprintf(
+          message, sizeof(message),
+          "  DEPTH-BAND REFUSED (%u: %s) x%llu: dest %ux%u, %u candidates "
+          "summing %u, source 0x%08X base 0x%03X, first band base 0x%03X",
+          reason, reason < 5 ? kWhy[reason] : "?",
+          static_cast<unsigned long long>(r.count), r.destWidth, r.destHeight,
+          r.candidates, r.observedTotal, r.source, r.sourceBase, r.firstBase);
       LogInfo(message);
     }
     // DIAG: the COLOUR pool with its EDRAM bases. The
