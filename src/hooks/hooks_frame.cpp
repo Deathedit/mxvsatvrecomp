@@ -134,6 +134,48 @@ extern "C" REX_FUNC(sub_82566B58) {
     s_last = now;
   }
 
+  // FRAME DRAWS. One line per swap, in BOTH modes, from the same counter
+  // family: guest entry calls, HLE draws queued, HLE draws dropped.
+  //
+  // This is the measurement that decides where the missing menu backdrop lives.
+  // mxmenu.rdc established the backdrop is not a draw we shade wrongly -- no 2D
+  // draw touches a backdrop pixel at all -- so the question is whether the guest
+  // ever submits it:
+  //
+  //   plugin guest > native guest   our layer suppresses guest submission
+  //                                 upstream of the renderer
+  //   guest == queued (native)      the guest never submits it; guest state
+  //   guest >  queued + dropped     the draws vanish before BuildAndQueueDraw
+  //   dropped > 0                   we build and discard them
+  //
+  // Printed EVERY swap and never sampled. Every previous attempt at this number
+  // was gated or modulus-sampled and gave a wrong answer -- a native run ending
+  // at 424 swaps logged only #1..#3 while a plugin run reaching 760 logged #600,
+  // which reads as a divergence in the guest's frame lifecycle and is purely the
+  // modulus. VdSwap is the one signal that ticks once per present in both modes.
+  //
+  // The tag is `native`/`plugin`, so the two runs are told apart by the line
+  // itself rather than by remembering which log is which.
+  {
+    static uint64_t s_prev_guest = 0, s_prev_queued = 0, s_prev_dropped = 0;
+    const uint64_t guest = GuestDrawCalls();
+    const uint64_t queued = HleDrawsQueued();
+    const uint64_t dropped = HleDrawsDropped();
+    const uint64_t d_guest = guest - s_prev_guest;
+    const uint64_t d_queued = queued - s_prev_queued;
+    const uint64_t d_dropped = dropped - s_prev_dropped;
+    s_prev_guest = guest;
+    s_prev_queued = queued;
+    s_prev_dropped = dropped;
+    REXLOG_INFO("{}: FRAME DRAWS #{} guest {} queued {} dropped {} "
+                "(unbuilt {}); cumulative guest {} queued {} dropped {}",
+                mx::native::g_plugin_mode ? "plugin" : "native", swap_count,
+                d_guest, d_queued, d_dropped,
+                d_guest > d_queued + d_dropped ? d_guest - d_queued - d_dropped
+                                               : 0,
+                guest, queued, dropped);
+  }
+
   if (swap_count <= 5) REXLOG_INFO("native: VdSwap #{} ENTER", swap_count);
   uint32_t cpu_val = REX_LOAD_U32(0x82D21818);
   REX_STORE_U32(0x83144208, cpu_val);

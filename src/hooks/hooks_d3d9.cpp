@@ -9313,3 +9313,6 @@ void ReportDrawCounts(uint8_t* base) {
 uint64_t GuestDrawCalls() {
   return mx::hooks::d3d9::g_guestDrawCalls.load(std::memory_order_relaxed);
 }
+
+uint64_t HleDrawsQueued() { return mx::hooks::d3d9::g_pendingQueued; }
+uint64_t HleDrawsDropped() { return mx::hooks::d3d9::g_pendingDropped; }

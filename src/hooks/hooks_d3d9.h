@@ -22,3 +22,29 @@ void ReportHostPageQueryStats();
 // hooks_d3d9_internal.h. Exposed as a function rather than the atomic itself
 // because hooks_frame.cpp cannot include the internal header.
 uint64_t GuestDrawCalls();
+
+// HLE draws this layer QUEUED and DROPPED so far, cumulative.
+//
+// The pair exists to be compared against GuestDrawCalls() in the same run and
+// the same counter family. mxmenu.rdc showed the menu backdrop is not a draw we
+// render wrongly -- it is not in the frame at all -- and the open question is
+// whether the guest ever submitted it. Three outcomes:
+//
+//   guest == queued           the guest never submits the background, and the
+//                             defect is guest-state, not translation.
+//   guest >  queued+dropped   guest draws vanish before BuildAndQueueDraw.
+//   dropped > 0               we build them and throw them away; the reason
+//                             counters in the draw path say which.
+//
+// Do NOT compare either of these against FRAME COST. That line counts
+// shader-output ATTEMPTS and only prints on cost-gated frames; pitting it
+// against a guest-entry counter across two modes is the exact cross-counter
+// error recorded in backdrop-is-not-missing-draws. These two and
+// GuestDrawCalls() are one family: all three count whole draws, all three are
+// cumulative, and the only difference is how far down the pipe the draw got.
+//
+// Plain uint64_t behind a function, like GuestDrawCalls: written on guest draw
+// threads without a lock, so a read can lag by a draw or two. Fine for a
+// per-frame delta, and not worth an atomic on the draw path.
+uint64_t HleDrawsQueued();
+uint64_t HleDrawsDropped();
