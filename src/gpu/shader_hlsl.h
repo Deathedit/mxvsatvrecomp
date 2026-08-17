@@ -249,8 +249,15 @@ struct HlslShader {
   //       all, so this needs one plumbed from the guest first.
   //
   // Both bodies currently run unconditionally either way.
-  uint32_t pred_exec_blocks = 0;  // p0-gated
-  uint32_t bool_exec_blocks = 0;  // bool-constant-gated
+  uint32_t pred_exec_blocks = 0;  // p0-gated, seen
+  uint32_t bool_exec_blocks = 0;  // bool-constant-gated, seen
+
+  // Of pred_exec_blocks, how many were actually emitted as `if (xe_p0 == …)`
+  // rather than run unconditionally. Vertex stage only for now — see the
+  // safety note at the emit site. Reported separately so "we saw a predicate"
+  // and "we obeyed it" can never be read as the same number: when these two
+  // are equal the stage is fully honoured, and the gap is the work left.
+  uint32_t honoured_pred_exec_blocks = 0;
 
   // Count of fetch instructions skipped because their opcode is not one this
   // emitter implements — the getTextureGradients / getTextureWeights /

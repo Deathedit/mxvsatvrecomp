@@ -1453,16 +1453,18 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
       }
       if (!uc::IsControlFlowOpcodeExec(cf[j].opcode())) continue;
 
-      // Counted BEFORE the body is walked, and counted even though the body is
-      // then walked UNCONDITIONALLY — that gap is the whole point of the
-      // numbers. Split by MECHANISM, not by name: kCondExecPredClean rides the
+      // Split by MECHANISM, not by name: kCondExecPredClean rides the
       // bool-constant struct, not the predicate one, so grouping it with
       // kCondExecPred (as one counter used to) hides which fix applies. See
       // HlslShader::pred_exec_blocks.
+      bool p0_gated = false;
+      bool p0_condition = false;
       switch (cf[j].opcode()) {
         case uc::ControlFlowOpcode::kCondExecPred:
         case uc::ControlFlowOpcode::kCondExecPredEnd:
-          ++out.pred_exec_blocks;  // p0 — fixable now
+          ++out.pred_exec_blocks;
+          p0_gated = true;
+          p0_condition = cf[j].cond_exec_pred.condition();
           break;
         case uc::ControlFlowOpcode::kCondExec:
         case uc::ControlFlowOpcode::kCondExecEnd:
@@ -1472,6 +1474,37 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
           break;
         default:
           break;
+      }
+
+      // HONOUR the predicate where it is safe to, which today means the vertex
+      // stage only. Xenia emits a plain `if` on p0 for these
+      // (dxbc_shader_translator.cc, UpdateExecConditionalsAndEmitDisassembly)
+      // and gets away with it because it emits DXBC directly and its fetches
+      // carry an explicit LOD. Ours emit HLSL, and the two stages differ:
+      //
+      //   VERTEX  — ExplicitLod() is `use_register_lod() || !pixel()`, so every
+      //             vertex fetch is already SampleLevel. No implicit gradient,
+      //             so an `if` around it is legal, and a vertex stage has no
+      //             discard to be skipped either. SAFE.
+      //   PIXEL   — the body spells `.Sample()`, which needs derivatives and is
+      //             illegal in varying flow control; FXC rejects it, and a
+      //             rejected shader falls to a stand-in, which is a VISIBLE
+      //             regression (this is how the water was lost once already).
+      //             `[flatten]` is worse, not better: both of this game's
+      //             affected pixel shaders contain `discard`, and flattening
+      //             would execute it unconditionally and kill pixels the
+      //             console kept. UNSAFE until fetches inside a predicated
+      //             region are emitted gradient-free (SampleGrad with the
+      //             derivatives taken before the branch, or hoisted).
+      //
+      // Left unhonoured for the pixel stage rather than half-done: it stays
+      // counted in pred_exec_blocks, so the log keeps naming the shaders that
+      // still run their predicated bodies unconditionally.
+      const bool honour_p0 = p0_gated && stage != HlslStage::kPixel;
+      if (honour_p0) {
+        ++out.honoured_pred_exec_blocks;
+        em.Line(std::string("if (xe_p0 == ") + (p0_condition ? "true" : "false") +
+                ") {");
       }
 
       const uint32_t addr = ExecAddress(cf[j]);
@@ -1564,6 +1597,7 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
           return false;
         }
       }
+      if (honour_p0) em.Line("}");
     }
   }
 
@@ -1867,7 +1901,14 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   // reads the register before any setTexLOD has run gets level 0, which is the
   // level that stage sampled at before register LOD was honoured at all.
   if (em.uses_reg_lod) src += "  float xe_lod = 0.0;\n";
-  // Written by setp_*, read by nothing yet — see unhonoured_predicate_ops.
+  // Written by setp_*, and since 2026-08-17 READ by cond_exec_pred in the
+  // vertex stage — `if (xe_p0 == …)` around the block the console gated. Still
+  // unread in the pixel stage, where `.Sample()` inside varying flow control is
+  // illegal; see the safety note at the emit site and
+  // HlslShader::honoured_pred_exec_blocks for the seen-vs-obeyed split.
+  //
+  // Declared here, ahead of `src += em.body`, so every block the walk emitted
+  // is downstream of it.
   src += "  bool xe_p0 = false;\n";
   src += "  int xe_a0 = 0;\n";
   if (em.uses_cube) {
