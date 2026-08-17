@@ -2534,53 +2534,21 @@ constexpr uint32_t kPhysProbeDwords = 256;
 // right, because nothing else would produce that.
 //---------------------------------------------------------------------------
 //---------------------------------------------------------------------------
-// Stage D2 — where the exported positions land, as a distribution.
+// Stage D2 — REMOVED 2026-08-17 as never-wired scaffolding.
 //
-// Stage C reported one number: 35% inside the clip volume. That number cannot
-// be recorded as a result, because a single cutoff cannot tell "the transform
-// is right and this geometry is off-screen" from "the transform is wrong by a
-// factor of a thousand". Both are simply "not in clip".
+// ClipBucket / kClipBucketName / ClassifyClip bucketed exported positions by
+// how far outside the clip volume they landed, to replace Stage C's single
+// "35% inside the clip volume" with a distribution. ClassifyClip was never
+// called and ShaderScore (Stage I, also removed below) was never instantiated,
+// so **the distribution was never measured** — this was intent, not a result.
 //
-// So bucket by how far outside it lands. A pile at 1-2 says the first; a pile
-// past 100 says the second; an even spread across every bucket says it is not
-// a transform at all. The buckets are on x and y only — z has its own near
-// plane convention and folding it in would blur the one axis being read.
-//
-// The viewport inverse gets the identical treatment on the identical vertices.
-// Without a reference the buckets are just numbers: it scored 0% under the
-// Stage 3 threshold, so what it looks like as a *distribution* is what says
-// whether the shader's output is different in kind or merely in degree.
+// Kept because the design is sound if the question is ever reopened: bucket on
+// x and y only (z has its own near-plane convention and folding it in blurs the
+// axis being read), and give the viewport inverse the identical treatment on
+// the identical vertices, because without a reference the buckets are just
+// numbers. The question itself is likely moot — the space hypothesis it was
+// built to test is settled, see the FINDING block in gpu/hle_types.h.
 //---------------------------------------------------------------------------
-enum ClipBucket : uint32_t {
-  kClipIn = 0,      // <= 1: inside, on x and y
-  kClipJustOut,     // 1-2:   off-screen, but the same order of magnitude
-  kClipOut,         // 2-10
-  kClipFarOut,      // 10-100
-  kClipWild,        // > 100: the scale is wrong, not the framing
-  kClipBehind,      // w <= 0: behind the eye, no meaningful projection
-  kClipNonFinite,   // inf/nan
-  kClipBucketCount,
-};
-
-const char* const kClipBucketName[kClipBucketCount] = {
-    "<=1", "1-2", "2-10", "10-100", ">100", "w<=0", "nonfinite"};
-
-uint32_t ClassifyClip(const float p[4]) {
-  if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2]) ||
-      !std::isfinite(p[3]))
-    return kClipNonFinite;
-  if (p[3] <= 0.0f) return kClipBehind;
-  const float x = std::fabs(p[0] / p[3]);
-  const float y = std::fabs(p[1] / p[3]);
-  const float d = x > y ? x : y;
-  if (!std::isfinite(d)) return kClipNonFinite;
-  if (d <= 1.0f)   return kClipIn;
-  if (d <= 2.0f)   return kClipJustOut;
-  if (d <= 10.0f)  return kClipOut;
-  if (d <= 100.0f) return kClipFarOut;
-  return kClipWild;
-}
-
 
 //---------------------------------------------------------------------------
 // Stage G — execute the shader that was actually bound.
@@ -2722,49 +2690,25 @@ const PatchedCode* CodeFromShaderObject(uint32_t shader, uint8_t* base) {
 
 
 
-constexpr float kCtlSpreadEpsilon = 1e-4f;
-
-// Stage I — the same numbers, attributed to the shader that produced them.
+// Stage I — REMOVED 2026-08-17. `ShaderScore` and `kCtlSpreadEpsilon` were
+// declared here and the struct was NEVER INSTANTIATED, so none of it ever ran.
 //
-// Every count above is one percentage over a mixed population, and no one knows
-// what that percentage is supposed to be: real scenes cull, draw shadow maps and
-// run off-screen passes, so 100% in-clip is wrong and 36% may be right. Four
-// independent improvements moved it by nothing and a fifth appeared to move it
-// for a reason that cannot have caused it. A number with no target value cannot
-// judge a change.
+// The reasoning that motivated it is worth keeping, because it is general and
+// this project keeps rediscovering it: every count it was meant to replace was
+// one percentage over a mixed population, with no known target value. Real
+// scenes cull, draw shadow maps and run off-screen passes, so 100% in-clip is
+// wrong and 36% may be right. Four independent improvements moved that number
+// by nothing and a fifth appeared to move it for a reason that cannot have
+// caused it. **A number with no target value cannot judge a change** — ask
+// where the failure is, not how big it is. Three shaders is a bug with an
+// address; an even spread over forty means the defect is in the model.
 //
-// So stop asking how big the failure is and ask *where* it is. If the 29% that
-// land in no modelled space come from three shaders, that is a bug with an
-// address. If they are spread evenly over forty, the defect is in the model —
-// the constants, the interpreter, or the space hypothesis itself — and no amount
-// of further input precision will touch it. Both answers are useful; the single
-// global percentage can express neither.
-struct ShaderScore {
-  uint64_t execs = 0;
-  // `space[4]`, indexed by ExportSpace, was here and was never written or read.
-  // Removed 2026-08-17 with the ExportSpace classifier itself — see the FINDING
-  // block in hle_types.h, which keeps the one conclusion that mattered: exported
-  // positions are window coordinates, not clip space.
-  uint64_t clip[kClipBucketCount] = {};
-  uint64_t in_clip = 0;
-  uint64_t degenerate = 0;
-  uint64_t draws = 0;
-  uint32_t attrs = 0;                     // fetch count, from the binding table
-  uint32_t first_dword = 0;               // identity check, with attrs
-  uint64_t vp_extent = 0;                 // (w<<32)|h, last seen
-  // Range of the position attribute's four components over every execution. A
-  // component that never moves is not a coordinate — it is padding, or a
-  // homogeneous 1 the shader needs, and reading it as z is a misinterpretation
-  // no amount of decode correctness will catch.
-  float in_lo[4] = {1e30f, 1e30f, 1e30f, 1e30f};
-  float in_hi[4] = {-1e30f, -1e30f, -1e30f, -1e30f};
-  uint64_t in_seen = 0;
-  // The first execution in full, captured as it happens. Which shader is worst
-  // is not known until the report, and by then the vertex is long gone — so
-  // every shader records its first, and the report prints the one that earned
-  // it. Costs one short string per distinct shader.
-  std::string first_exec;
-};
+// Two of its per-shader fields are worth re-deriving if anything like this is
+// built again: the RANGE of each position component over every execution (a
+// component that never moves is padding or a homogeneous 1, not a coordinate,
+// and reading it as z is a misinterpretation no decode correctness will catch),
+// and the FIRST execution captured in full (which shader is worst is unknown
+// until the report, by which time the vertex is long gone).
 
 // HLE rendering must consume the shader's position export, not the raw
 // declaration POSITION that BuildHleDraw initially packs. These counters are

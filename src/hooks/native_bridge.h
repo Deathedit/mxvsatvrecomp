@@ -36,15 +36,22 @@ class NativeGraphics {
   void BeginFrame();
   void EndFrame();
 
-  bool IsInitialized() const { return m_renderer != nullptr; }
-
+  // IsInitialized / GetRenderer / ClearDrawCalls removed 2026-08-17 -- none had
+  // a caller anywhere in src/, tools/ or generated/.
+  //
+  // The guest base pair STAYS, and the reason is worth reading before touching
+  // it again. GetGuestMemory() is called by the crash reporter (app/mx_app.cpp)
+  // to decide whether a faulting address is inside guest memory. Its writer used
+  // to be the EngineInit hook; that hook was deleted 2026-08-16 and left a note
+  // claiming both were dead -- which was wrong, and silently disabled guest-fault
+  // classification, because gbase == 0 makes `in_guest` false for every address.
+  // Bootstrap now sets it (hooks_boot.cpp). If the writer is ever removed again,
+  // the reporter degrades quietly rather than failing, so check mx_app.cpp first.
   void SetGuestMemory(uint8_t* base) { m_guest_base = base; }
   uint8_t* GetGuestMemory() const { return m_guest_base; }
-  D3D12Renderer* GetRenderer() const { return m_renderer; }
 
   void SetDrawCalls(const std::vector<mx::hle::DrawCall>& calls);
   std::vector<mx::hle::DrawCall> GetDrawCalls();
-  void ClearDrawCalls();
   // Blocks until the guest posts a draw list or Shutdown() runs. The render
   // thread's idle state: the mailbox is the wakeup source, not a clock.
   void WaitForDrawsOrShutdown();

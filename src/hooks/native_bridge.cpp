@@ -94,12 +94,8 @@ std::vector<mx::hle::DrawCall> NativeGraphics::GetDrawCalls() {
   return calls;
 }
 
-void NativeGraphics::ClearDrawCalls() {
-  {
-    std::lock_guard<std::mutex> lock(m_drawMutex);
-    m_drawCalls.clear();
-  }
-  m_drawConsumed.notify_one();
-}
+// ClearDrawCalls() removed 2026-08-17 -- no caller. GetDrawCalls() already
+// hands the list out by move and notifies m_drawConsumed, so the mailbox is
+// drained by the consumer rather than by anyone clearing it out of band.
 
 }  // namespace mx::native

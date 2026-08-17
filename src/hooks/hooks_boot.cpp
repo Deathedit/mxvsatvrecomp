@@ -132,6 +132,13 @@ extern "C" REX_FUNC(sub_82B6F820) {
 
 REX_IMPORT(__imp__sub_82ABB838, orig_Bootstrap, void());
 extern "C" REX_FUNC(sub_82ABB838) {
+  // The crash reporter needs this to tell a guest address from a host pointer,
+  // so it is set in BOTH modes and before the original runs -- a fault inside
+  // orig_Bootstrap should still classify. EngineInit used to own this; that hook
+  // was deleted 2026-08-16 and took the only writer with it, which left
+  // `in_guest` false for every address until 2026-08-17. Bootstrap is the
+  // earliest hook here that runs unconditionally at boot.
+  mx::native::NativeGraphics::Get().SetGuestMemory(base);
   if (mx::native::g_plugin_mode) {
     LogEngSlot8(base, "Bootstrap ENTER");
     orig_Bootstrap(ctx, base);
@@ -197,10 +204,17 @@ extern "C" REX_FUNC(sub_82AEBF40) {
 //
 // It did three things, and the middle one is why it could not stay:
 //
-//   NativeGraphics::SetGuestMemory(base) -- and that was the ONLY caller. With
-//     the hook gone, m_guest_base is set by nobody; GetGuestMemory() was already
-//     called by nobody. The accessor pair and the member in native_bridge.h are
-//     therefore dead, and should go with the next change that touches that file.
+//   NativeGraphics::SetGuestMemory(base) -- and that was the ONLY caller.
+//
+//     CORRECTED 2026-08-17. This block used to continue "GetGuestMemory() was
+//     already called by nobody, [so] the accessor pair and the member are
+//     therefore dead". **That was wrong.** app/mx_app.cpp calls GetGuestMemory()
+//     in the crash reporter to decide whether a faulting address lies inside
+//     guest memory. Deleting this hook set m_guest_base to nobody, so gbase was
+//     0, so `in_guest` was false for EVERY address and guest faults were
+//     reported as host-side pointers for a day. The Bootstrap hook above now
+//     sets it. The claim was made by grepping src/hooks/ instead of the whole
+//     tree -- scope a deadness check to the repo, never to a directory.
 //
 //   `for (;;) ::Sleep(16);` after calling the original -- it parked the guest's
 //     init thread forever to keep the process alive. That is a bring-up scaffold
