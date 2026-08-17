@@ -265,7 +265,7 @@ extern "C" REX_FUNC(sub_82550B80) {
 
   // One line in the log too, so a run with no dump file is distinguishable
   // from a run where the hook was never reached.
-  REXLOG_INFO("d3d9: decl #{} written to d3d9_dump_decls.txt", n);
+  REXLOG_INFO("d3d9: decl #{} written to logs/decldump/decls.txt", n);
 }
 
 //=============================================================================

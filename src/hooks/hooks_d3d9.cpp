@@ -84,10 +84,15 @@ using mx::hle::DeviceState;
 // Declarations are built during load, and the rotating log (3 x 5MB) only
 // retains the last ~50 seconds of a 165s run — the first attempt at this probe
 // logged every declaration and then lost all of them. Anything created early
-// has to go somewhere that does not rotate, so this follows the pm4_dump_*.txt
-// convention and writes next to the executable.
+// has to go somewhere that does not rotate, so this writes its own file into
+// logs/decldump/, alongside the other dump directories. Opened with trunc, so
+// unlike hlsldump and pm4dump it needs no wipe — one run overwrites the last.
 std::ofstream& DeclFile() {
-  static std::ofstream f("d3d9_dump_decls.txt", std::ios::trunc);
+  static std::ofstream f = [] {
+    std::error_code ec;
+    std::filesystem::create_directories("logs/decldump", ec);
+    return std::ofstream("logs/decldump/decls.txt", std::ios::trunc);
+  }();
   return f;
 }
 

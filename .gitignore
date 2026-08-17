@@ -10,7 +10,10 @@ tools/__pycache__
 *.exe
 gamecontrollerdb.txt
 
-# Runtime dumps written next to the executable by the VdSwap hook
+# Runtime dumps. These write into logs/ as of 2026-08-17 (logs/* is already
+# ignored above); the bare patterns stay so that stragglers from an older
+# binary in the project root are still ignored rather than showing up as
+# untracked.
 pm4_dump_*.txt
 d3d9_dump_*.txt
 gpu_state_diff_*.txt

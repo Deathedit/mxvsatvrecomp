@@ -7,7 +7,7 @@
 // microcode, because a Xenos vfetch carries format and offset but not semantic.
 // The semantics live one layer up, in the arrays the game hands to
 // D3DDevice_CreateVertexDeclaration — 23 of them captured in
-// d3d9_dump_decls.txt.
+// logs/decldump/decls.txt.
 //
 // **The Type dword's bit layout is not inferred here.** It was read out of
 // D3D::PatchVertexShaderToMatchVertexDeclaration (0x82564C50), which is the

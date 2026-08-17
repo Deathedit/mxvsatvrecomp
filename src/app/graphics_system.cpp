@@ -62,7 +62,7 @@ static constexpr uint32_t kSupportedStride = mx::hle::kHostVertexStride;
 REXCVAR_DEFINE_BOOL(hle_capture, false, "Debug",
                     "Score every D3D9 draw against the state shadow and report "
                     "what fraction is fully described, plus the first few "
-                    "resolved draws to d3d9_dump_decls.txt. Capture only — it "
+                    "resolved draws to logs/decldump/decls.txt. Capture only — it "
                     "submits nothing and renders nothing");
 
 // The per-draw and per-vertex diagnostics this investigation accumulated.

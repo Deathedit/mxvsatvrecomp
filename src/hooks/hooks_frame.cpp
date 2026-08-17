@@ -21,6 +21,9 @@
 // 0x53574150 — ASCII "SWAP". A draw could not have appeared there. The frame
 // range ran ~11552 bytes per frame at boot and was never looked at.
 
+#include <filesystem>
+#include <system_error>
+
 #include "hooks/hook_common.h"
 #include "hooks/hooks_d3d9.h"
 
@@ -48,6 +51,23 @@
 //=============================================================================
 
 namespace {
+
+// logs/pm4dump, emptied once per process before the first dump of the run.
+// Mirrors EnsureHlslDumpDir in hooks_d3d9.cpp, and for the same reason: these
+// filenames are (tag, swap_count) and repeat every run, so a short run leaves
+// the high frame numbers of a longer earlier run sitting in the directory,
+// where they read as belonging to the current one. Cleared lazily at the first
+// dump so a run that dumps nothing leaves the previous run's files readable.
+void EnsurePm4DumpDir() {
+  static const bool s_cleared = [] {
+    std::error_code ec;
+    std::filesystem::remove_all("logs/pm4dump", ec);
+    return true;
+  }();
+  (void)s_cleared;
+  std::error_code ec;
+  std::filesystem::create_directories("logs/pm4dump", ec);
+}
 
 // Type3 opcode histogram for a parsed range. This is what says whether draws
 // are inline (0x22/0x34/0x35/0x36), hidden behind INDIRECT_BUFFER (0x3F/0x37),
@@ -281,10 +301,19 @@ extern "C" REX_FUNC(sub_82566B58) {
                             swap_count == 1000 ||
                             (swap_count >= 1200 && (swap_count % 500 == 0));
     if (should_dump_file) {
-      char dumpfname[64];
-      snprintf(dumpfname, sizeof(dumpfname), "pm4_dump_%s_frame_%02d.txt", tag, swap_count);
+      // Into logs/pm4dump/, with every other dump directory (hlsldump,
+      // constdump, texpng). These used to land next to the executable and had
+      // accumulated 137 files in the project root before anyone noticed —
+      // they are gitignored, so nothing ever complained. 2026-08-17.
+      //
+      // Wiped once per process, same reason as EnsureHlslDumpDir: the names
+      // repeat every run, so a short run leaves a long run's high frame
+      // numbers behind and they read as belonging to the current one.
+      EnsurePm4DumpDir();
+      char dumpfname[96];
+      snprintf(dumpfname, sizeof(dumpfname), "logs/pm4dump/%s_frame_%02d.txt", tag, swap_count);
       mx::pm4::Pm4Parser::DumpPackets(frame_packets, dumpfname);
-      snprintf(dumpfname, sizeof(dumpfname), "pm4_dump_%s_swap_%02d.txt", tag, swap_count);
+      snprintf(dumpfname, sizeof(dumpfname), "logs/pm4dump/%s_swap_%02d.txt", tag, swap_count);
       mx::pm4::Pm4Parser::DumpPackets(swap_packets, dumpfname);
       LogOpcodeHistogram(tag, "frame", swap_count, frame_packets);
       LogOpcodeHistogram(tag, "swap", swap_count, swap_packets);
