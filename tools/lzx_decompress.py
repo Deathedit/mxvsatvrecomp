@@ -36,6 +36,15 @@ _ALIGNTREE_MAX_CODEWORD = 8
 
 _LENTABLE_SAFETY = 64
 
+# LZX_FRAME_SIZE. A fixed constant in mspack -- it is NOT the window size, and
+# the two only coincide at window_bits=15. This file used the window size until
+# 2026-08-17, which silently mis-decoded every stream with a larger window: the
+# bitstream is re-aligned to a 16-bit boundary at each frame boundary, so
+# getting the frame length wrong desynchronises the reader after the first
+# 32 KB. It went unnoticed because the only caller decoded a window_bits=15
+# stream in a single call.
+_FRAME_SIZE = 32768
+
 _BLOCKTYPE_VERBATIM = 1
 _BLOCKTYPE_ALIGNED = 2
 _BLOCKTYPE_UNCOMPRESSED = 3
@@ -382,14 +391,20 @@ class LZXDecoder:
         bb = _BitBuffer(data)
         output = bytearray(output_size)
         out_pos = 0
-        frame_size = self.window_size      # 32 768 (LZX_FRAME_SIZE)
+        frame_size = _FRAME_SIZE
         window = self.window
         window_mask = self.window_size - 1
 
         # Use a LINEAR (non-wrapping) position counter for decode tracking.
         # The actual window index is always (window_posn & window_mask).
-        window_posn = self.window_pos      # starts at 0
-        frame_posn = 0
+        #
+        # frame_posn starts where the window left off, NOT at 0, so successive
+        # calls append instead of overwriting. A chunked container (see
+        # xcompress.py) calls this once per chunk against one decoder, and with
+        # frame_posn = 0 the second chunk read its output back from window
+        # offset 0 -- i.e. it re-emitted the first chunk.
+        window_posn = self.window_pos
+        frame_posn = window_posn
 
         # Read E8 translation header on first call
         if not self.header_read:
@@ -530,11 +545,19 @@ class LZXDecoder:
             # window indices are always masked with window_mask)
             frame_posn += cur_frame_size
 
-        # Store final position back
-        self.window_pos = window_posn & window_mask
+        # Store the LINEAR position back, not the masked one -- the next chunk
+        # needs to know where its frame starts, and masking throws that away
+        # as soon as the window wraps.
+        self.window_pos = window_posn
 
-        # Apply Intel E8 translation
-        if self.intel_started and output_size > 10:
+        # Apply Intel E8 translation.
+        #
+        # intel_filesize is part of the condition, as it is in mspack. Without
+        # it any stream whose main tree merely HAPPENS to use symbol 0xE8 gets
+        # E8 translation applied, because _read_block_header sets intel_started
+        # from maintree_len[0xE8] alone. That corrupts arbitrary binary data,
+        # which is most of a package: 0xE8 is a common byte.
+        if self.intel_started and self.intel_filesize and output_size > 10:
             self._e8_decode(output, output_size)
 
         self.intel_curpos += output_size

@@ -10,10 +10,19 @@ reverse-engineered.
 |--------|--------|------|
 | `.bxml` (config files) | Fully decoded → XML | `bxml_full_decoder.py` |
 | `.xenon.database` (asset manifest) | Fully decoded → XML w/ typed attrs | `bxml_full_decoder.py` |
-| `.xenon.package` (heap layout) | Layout decoded; BXML heaps decode; binary heaps dump only | `package_decoder.py` |
+| `.xenon.package` (asset bundle) | Fully decompressed to asset bytes | `package_decoder.py` + `xcompress.py` |
 
-All 130 databases in `assets/Database/` decode cleanly to a unified
-asset catalog (`out/asset_catalog.json`, 23,183 assets indexed).
+All 130 databases in `assets/Database/` decode cleanly, and every package
+decompresses with 100% heap coverage, no gaps and nothing past EOF.
+
+⚠️ `out/asset_catalog.json` and anything else generated before 2026-08-17
+is WRONG and should be regenerated. Two bugs, both of which produced
+plausible output rather than an error:
+
+- The database tree was walked by record ORDER instead of the explicit
+  first-child index, which mis-parented every file. MXUI listed 324
+  assets; it really has 1533.
+- Package heaps were never actually decompressed. See `xcompress.py`.
 
 ## Primary tools
 
@@ -24,8 +33,14 @@ python bxml_full_decoder.py path/to/Engine.bxml           # decode to stdout
 python bxml_full_decoder.py assets/                       # batch all .bxml + .xenon.database
 ```
 
-Iterative DFS tree reconstruction (no Python recursion limit — handles
-NAT_Farm.xenon.database with 5247 nodes). Verified on:
+Tree reconstruction uses each record's explicit first-child index
+(field[4]) — the record order is NOT pre-order and NOT breadth-first, and
+this decoder assumed each of those in turn before measuring. Verified by
+reachability: across all 130 `.xenon.database` files every record is
+reached exactly once, with no edge pointing backwards or past the end.
+
+Emitters are iterative, so a deep tree cannot blow the recursion limit.
+Verified on:
 
 - Engine.bxml (4 nodes, config)
 - RdbTables.bxml (6 nodes, 10 attrs, config)
@@ -47,23 +62,37 @@ for node in root.walk():                      # iterative pre-order
 lines = root.to_xml()                         # iterative XML emitter
 ```
 
-### `package_decoder.py` — .xenon.package heap extractor
+### `package_decoder.py` — .xenon.package asset extractor
 
 ```
-python package_decoder.py path/to/RiderPhysics.xenon.package
-python package_decoder.py path/to/NAT_Farm.xenon.package     # 66MB, 1049 heaps
+python package_decoder.py path/to/MXUI.xenon.package                    # manifest only (fast)
+python package_decoder.py path/to/MXUI.xenon.package --extract "*.layer"
+python package_decoder.py path/to/MXUI.xenon.package --search SmokeVideo --filter "*.layer"
 ```
 
-Cross-references sibling `.xenon.database` for heap layout, then walks
-every heap and runs the appropriate BXML decoder or dumps raw binary.
-Writes `<stem>_package_manifest.txt` into `out/`.
+Cross-references the sibling `.xenon.database` for the asset table, then
+decompresses via `xcompress.py`. Always writes
+`<stem>_package_manifest.txt` into `out/`; `--extract` also writes the
+decompressed bytes of each matching asset to `out/<stem>/`.
 
-For each heap:
-- BXML-bearing heaps (bxml/celib/surface/material/script/timeline/animset
-  containing embedded BXML at heap offset 33) → full XML tree
-- Binary heaps (soundbnk/model/texture/anim/shader/collis/etc) →
-  first 15 lines + element histogram (per-TYPE sub-blob parsers needed
-  before these decode to structured data)
+The manifest header reports coverage, gap count and past-EOF count. Those
+three numbers are the check that caught two rounds of wrong heap offsets
+— read them before trusting anything below.
+
+Decompression is pure Python and slow (a 33 MB package is minutes), so
+`--extract` and `--search` take a glob and decode only what matches.
+`--search` greps decompressed assets, decoding BXML ones to XML first; a
+plain grep of the package file finds nothing, because everything is
+compressed.
+
+### `xcompress.py` — the Xbox 360 chunk container inside a heap
+
+Not a CLI; used by `package_decoder.py`. Owns the three layers between a
+heap extent and asset bytes: the heap's stream list, the XCompress chunk
+framing (`0xFF`-prefixed, or a bare BE16 length implying a full 0x8000
+frame), and the LZX window size of **17 bits**. All three were determined
+by measurement, and the file records what each wrong guess looked like —
+in every case, silently truncated output rather than an error.
 
 ### `bxml_strings.py` — Strings-only summarizer
 
@@ -109,9 +138,10 @@ code is what made an earlier attempt report 586,594 phantom "shader blocks".
 Annotation is off by default (`ANNOTATE`), and `STRIP = True` removes only the
 comments it wrote.
 
-Note on coverage: the 2481 packaged `shader` assets are in encrypted
-`.xenon.package` heaps (see the decryption section below) and are not
-recoverable by scanning. Runtime dumps remain the reliable source.
+Note on coverage: the 2481 packaged `shader` assets live in LZX-compressed
+`.xenon.package` heaps, so scanning cannot see them. They now decompress
+(`package_decoder.py --extract`), but the per-type `shader` payload format
+is not parsed yet, so runtime dumps remain the reliable source.
 
 ## Internals / debug tools
 
@@ -263,57 +293,55 @@ build-pipeline label that's not actually consumed at runtime (or applies
 at Package Block level, not Heap level). BXML heaps decode via their
 internal zlib stream regardless of `codec`.
 
-### Heap storage modes (post-investigation)
+### Heap storage (RETRACTED: nothing here is encrypted)
 
-`.xenon.package` heaps come in two modes:
+**Every heap is LZX-compressed, and all of them now decompress.** This
+section previously claimed that most heaps were encrypted with an Xbox
+360 content key and listed key recovery as blocked work. That was wrong.
 
-**Structured (cleartext)**: 16-byte heap header has
-`H[0..3]=heap_size-4 LE`, `H[4..7]=0x00010000`, `H[8..11]=heap_size-16 LE`,
-`H[12..15]=checksum`. Payload at offset 33 is plain BXML block (with
-embedded zlib stream) OR uncompressed native binary. Decodable by us
-today. Examples: `bxml`, `celib`, `script`, `timeline`, `colorlut`, some
-`soundbnk`/`anim`/`animset`.
+The evidence for "encrypted" was that heap headers and payloads looked
+like high-entropy random bytes. They do — that is what compressed data
+looks like. Entropy cannot tell encryption from compression, and it was
+the only test applied. What actually made the heaps unreadable was three
+container layers being mis-parsed at once; see `xcompress.py`.
 
-**Encrypted**: All 16 heap-header bytes look high-entropy random. The
-per-TYPE descriptor at [16..33] is also obfuscated. The heap content
-cannot be read without the original Xbox 360 decryption key (likely
-AES-128-CBC with package-offset-derived IV, per Xbox's content security
-model). Examples: most `model`, `material`, `shader`, `collis`,
-`activity`, `tdf`, `particle`, `packdata`, `bounce`, sometimes `surface`.
+The claim was also self-refuting and it went unnoticed: the same section
+recorded that `bxml`/`script`/`celib` heaps were readable cleartext. A
+content-key scheme that leaves the script and UI assets in the clear and
+encrypts only the textures is not a scheme anyone ships.
 
-### What's extractable now (post-LZX investigation)
+Real layout, verified against all 13 packages — 100% heap coverage, no
+gaps, nothing past EOF:
 
-| Asset category | Storage | Extractable today? |
-|----------------|---------|---------------------|
-| `bxml` / `celib` / `script` / `timeline` | BXML-bearing cleartext | YES — `bxml_full_decoder.py` |
-| `surface` / `material` | mixed (some cleartext, mostly encrypted) | PARTIAL — varies per heap |
-| `soundbnk` / `sound` / `anim` / `animset` / `colorlut` | structured-cleartext binary | PARTIAL — heap header readable; payload needs per-TYPE native parser |
-| `texture` / `model` / `shader` / `collis` / `tdf` / `particle` / `packdata` / `bounce` / `activity` | encrypted | NO — requires Xbox 360 content-key decryption first |
+```
+HEAP     u32 heap_len (= heap_size - 4)
+         one or more STREAMs, filling exactly to heap_size - 4
+         u32 trailer
+STREAM   u32 0x00010000
+         u32 stream_len            -- includes the 5-byte terminator
+         XCompress chunk framing, then five zero bytes
+CHUNK    0xFF, u16 BE uncompressed, u16 BE compressed
+         or bare u16 BE compressed, uncompressed implied 0x8000
+LZX      window_bits = 17, 16-bit LE bitstream words
+```
 
-### What still needs per-type parsers (for cleartext-binary heaps)
+Decompressed bytes are homogeneous per asset type, which is the check
+that the container is right:
 
-| Priority | Type | Notes |
-|----------|------|-------|
-| Medium | `soundbnk` | FMOD/XMA audio bank format (`FSB5`/XMA2 magic expected at offset 33) |
-| Medium | `anim` | Skeletal animation keyframes (per `ShaderAsset_Unpack` analog: 4B flag + 4B count + sub-records) |
-| Medium | `animset` | Animation blend tree format |
-| Medium | `colorlut` | Color LUT (likely raw RGB/RGBA data) |
+| Type | First 4 bytes | Contents |
+|------|---------------|----------|
+| `uicmpnt` | `BXML` | UI component tree — layers, components, script + material bindings |
+| `texture` | `77 DD CC 00` | header with BE width/height at +0x2C, then pixel data |
+| `swfx` | `00 00 00 01` | Scaleform |
+| `localiz` | `00 00 00 02` | localized string tables |
+| `script` | BE u32 length | Lua **source**, not bytecode |
 
-### What's BLOCKED on Xbox 360 decryption (for encrypted heaps)
+### What still needs per-type parsers
 
-Most game-critical rendering assets are encrypted on disk:
-
-- `model` (geometry, vertex/index buffers) — 1833 assets
-- `texture` (DXT1/5 compressed) — 7611 assets
-- `shader` (Xenos microcode) — 2481 assets
-- `material` (shader parameter bindings) — 4730 assets
-- `collis` (collision meshes) — 545 assets
-
-Decryption requires:
-1. Find the game's content key in the XEX2 binary's security header (XEX2 header secret blocks)
-2. Reverse the cipher (likely AES-128-CBC with IV derived from the heap's package-offset)
-3. Decrypt heaps host-side and re-emit cleartext package files, OR
-4. Implement decryption in `package_decoder.py` for on-the-fly cleartext extraction
+The container is solved; the per-type payload formats are not. `texture`
+is partly known (dimensions confirmed against the runtime `sub_826295E8`
+hook). `model`, `shader`, `collis`, `soundbnk`, `anim`, `animset` and
+`colorlut` decompress to bytes nobody has parsed yet.
 
 ## Generated artifacts
 

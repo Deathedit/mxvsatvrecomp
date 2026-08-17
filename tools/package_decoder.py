@@ -1,49 +1,51 @@
 """Decode .xenon.package files.
 
-WHAT A PACKAGE ACTUALLY IS, measured against MXUI.xenon.package (33 MB):
+WHAT A PACKAGE IS, measured against MXUI.xenon.package (33 MB, 1533 assets):
 
-  * The sibling .xenon.database declares the layout as a flat list of heaps
-    (offset + size). MXUI declares 1470.
-  * A heap is NOT a BXML block. It carries a 12-byte little-endian header --
-    `u32 size-4`, `u32 0x00010000`, `u32 size-16` -- followed by an opaque
-    payload. Most of a UI package is texture and asset data.
-  * BXML blocks DO live in a package, but at ARBITRARY offsets rather than at
-    heap starts, and zlib-compressed after a 28-byte header. MXUI has 16.
+  * The sibling .xenon.database is a BXML tree naming every asset and giving
+    its heap extent. Offsets in <Heap> are RELATIVE to the owning <Package>'s
+    heapOffset. The heaps tile the package with no gaps and no overlap.
+  * A heap is a container: a length, then one or more LZX streams in Xbox 360
+    XCompress chunk framing. See xcompress.py, which owns that format.
+  * Decompressed asset bytes are homogeneous by type -- every uicmpnt starts
+    'BXML', every texture 0x77DDCC00, every swfx 00 00 00 01, every script a
+    big-endian length followed by Lua source.
 
-The previous version of this file assumed one BXML block per heap start. It
-therefore printed "NO BXML signature found" 1404 times out of 1470 and extracted
-nothing from any UI package -- MXUI_Streaming's manifest contained no content
-either, which is what made the breakage easy to miss: it produced a file, just
-an empty one.
+This file has been wrong in three separate ways, each of which produced output
+rather than an error, so its history is worth keeping:
 
-It also mis-walked the database, returning 71 duplicate 'MXUI' entries with
-identical offsets and decreasing heap counts (1470, 1468, 1466, ...). Only the
-first was ever used.
+  1. It assumed one BXML block per heap start, printed "NO BXML signature
+     found" 1404 times, and extracted nothing from any UI package.
+  2. It mis-walked the database, returning 71 duplicate 'MXUI' entries with
+     identical offsets. Only the first was ever used.
+  3. It walked the database tree by record ORDER (first pre-order, then
+     breadth-first) instead of the explicit first-child index. That produced a
+     plausible 324-asset table -- a fifth of the real 1533 -- with heap offsets
+     that pointed into the middle of other assets.
 
 Usage:
     python tools/package_decoder.py <file.xenon.package>
-    python tools/package_decoder.py <file.xenon.package> --search VideoRenderTarget
+    python tools/package_decoder.py <file.xenon.package> --search SmokeVideo
+    python tools/package_decoder.py <file.xenon.package> --extract "*.layer"
 
---search greps the DECODED XML of every BXML block, which is the only way to
-find a name that is stored compressed. A plain grep of the package file cannot
-see it.
+--search decompresses each asset and greps its decoded form, which is the only
+way to find a name stored compressed. A plain grep of the package cannot see
+it. Decompression is pure Python and not fast: a whole 33 MB package takes a
+few minutes, so --search and --extract take a glob to narrow the work.
 """
 
 import argparse
 import collections
+import fnmatch
 import os
 import struct
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bxml_full_decoder import decode_bxml, decode_bxml_bytes  # noqa: E402
+from xcompress import decompress_asset, split_streams  # noqa: E402
 
 BXML_MAGIC = b'BXML'
-HEAP_HEADER_BYTES = 12
-# The constant dword every heap header carries at +4. Checked rather than
-# skipped: a heap that does not have it is not the shape this parser assumes,
-# and saying so is more useful than decoding it as if it were.
-HEAP_HEADER_TAG = 0x00010000
 
 
 def attr_by_name(node, name):
@@ -56,7 +58,7 @@ def attr_by_name(node, name):
 def parse_database(db_path):
     """The asset table: every asset with its ABSOLUTE heap extent and codec.
 
-    Structure, now that bxml_full_decoder walks records breadth-first:
+    Structure:
 
         <Database>
           <Handles>  322 <Asset name type/>          -- names only, no heap
@@ -69,6 +71,11 @@ def parse_database(db_path):
     Heap offsets are relative to the owning Package's heapOffset, which is why
     they looked like they only covered the first 660 KB of a 33 MB file when
     read as absolute.
+
+    An asset NAME is not unique: the same asset is repeated verbatim in each
+    localized package, so MXUI lists 1533 assets but only 75 distinct uicmpnt.
+    Duplicates decompress byte-identically, which is a free check on the heap
+    extents being right.
 
     Returns [{'name','type','offset','size','codec'}], offset absolute.
     """
@@ -103,17 +110,6 @@ def parse_database(db_path):
     return out
 
 
-def heap_header(data, offset, size):
-    """The 12-byte header, or None when the heap does not have that shape."""
-    if offset + HEAP_HEADER_BYTES > len(data):
-        return None
-    a, tag, b = struct.unpack('<III', data[offset:offset + HEAP_HEADER_BYTES])
-    if tag != HEAP_HEADER_TAG:
-        return None
-    return {'declared_a': a, 'declared_b': b,
-            'matches_size': (a == size - 4 and b == size - 16)}
-
-
 def find_bxml_blocks(data):
     """Every BXML block in the package, wherever it sits."""
     out = []
@@ -133,12 +129,31 @@ def node_to_lines(node, out):
     out.extend(node.to_xml())
 
 
+def asset_text(raw):
+    """A searchable/printable rendering of one decompressed asset.
+
+    uicmpnt and bxml assets are BXML and get decoded to XML. Everything else is
+    handed back as latin-1, which never raises and leaves ASCII runs (Lua
+    source, resource names) greppable inside otherwise binary data.
+    """
+    if raw[:4] == BXML_MAGIC:
+        try:
+            return '\n'.join(decode_bxml_bytes(raw).to_xml())
+        except Exception as exc:
+            return '<<BXML decode failed: %s>>' % exc
+    return raw.decode('latin-1')
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('package', nargs='?',
                     default=r'C:\Users\VM\Desktop\mx\assets\Database\MXUI.xenon.package')
     ap.add_argument('--search', default='',
-                    help='case-insensitive substring to look for in decoded XML')
+                    help='case-insensitive substring to look for in decompressed assets')
+    ap.add_argument('--extract', default='',
+                    help='glob over asset names; writes each match under <out-dir>/<stem>/')
+    ap.add_argument('--filter', default='*',
+                    help='glob over asset names, limiting --search (default all)')
     ap.add_argument('--out-dir', default=r'C:\Users\VM\Desktop\mx\out')
     args = ap.parse_args()
 
@@ -162,17 +177,20 @@ def main():
         lines.append('No sibling .xenon.database')
 
     if assets:
-        by_codec = collections.Counter(a['codec'] for a in assets)
+        by_type = collections.Counter(a['type'] for a in assets)
         covered = sum(a['size'] for a in assets)
         over = [a for a in assets if a['offset'] + a['size'] > len(data)]
-        lines.append('Assets with heaps: %d  (%s)  covering %d of %d bytes '
-                     '(%.1f%%)%s'
-                     % (len(assets),
-                        ', '.join('%s=%d' % (k or 'raw', v)
-                                  for k, v in by_codec.most_common()),
-                        covered, len(data), 100.0 * covered / max(1, len(data)),
-                        '' if not over else
-                        '  -- %d run past EOF, offsets are WRONG' % len(over)))
+        gaps = sum(1 for x, y in zip(sorted(assets, key=lambda a: a['offset']),
+                                     sorted(assets, key=lambda a: a['offset'])[1:])
+                   if x['offset'] + x['size'] != y['offset'])
+        # The coverage/gap/EOF triple is the check that caught two rounds of
+        # wrong heap offsets. Keep it printed even when it is boring.
+        lines.append('Assets: %d  (%s)' % (len(assets),
+                     ', '.join('%s=%d' % kv for kv in by_type.most_common())))
+        lines.append('Heaps cover %d of %d bytes (%.1f%%), %d gaps, %d past EOF%s'
+                     % (covered, len(data), 100.0 * covered / max(1, len(data)),
+                        gaps, len(over),
+                        '  -- OFFSETS ARE WRONG' if (over or gaps) else ''))
         lines.append('')
         lines.append('%-40s %-9s %-11s %-9s %s'
                      % ('asset', 'type', 'offset', 'size', 'codec'))
@@ -182,50 +200,57 @@ def main():
                             a['codec'] or 'raw'))
         lines.append('')
 
-    # --- BXML blocks -------------------------------------------------------
-    blocks = find_bxml_blocks(data)
-    lines.append('BXML blocks found: %d' % len(blocks))
+    # --- decompress ---------------------------------------------------------
+    # Only what was asked for: LZX here is pure Python and a whole package is
+    # minutes of work.
     needle = args.search.lower()
     hits = []
-    decoded_ok = decoded_fail = 0
-    for off in blocks:
-        try:
-            root = decode_bxml_bytes(data[off:])
-        except Exception as exc:
-            decoded_fail += 1
-            lines.append('\n=== BXML @%d -- FAILED: %s' % (off, exc))
+    done = failed = 0
+    extract_dir = os.path.join(args.out_dir, stem)
+    seen_names = set()
+    for a in sorted(assets, key=lambda x: x['offset']):
+        name = a['name'] or 'unnamed_%d' % a['offset']
+        want_extract = args.extract and fnmatch.fnmatch(name, args.extract)
+        want_search = needle and fnmatch.fnmatch(name, args.filter)
+        if not (want_extract or want_search):
             continue
-        decoded_ok += 1
-        sc, ss, sf, ac, nc = struct.unpack('<IIIII', data[off + 8:off + 28])
-        body = []
-        node_to_lines(root, body)
-        body = [ln for ln in body if ln is not None]
-        lines.append('\n=== BXML @%d  root <%s>  %d strings, %d nodes, %d lines'
-                     % (off, root.name, sc, nc, len(body)))
-        lines.extend(body)
-        if needle:
-            for i, ln in enumerate(body):
+        # Assets repeat verbatim across localized packages; decode each once.
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        try:
+            raw = decompress_asset(data, a['offset'], a['size'])
+        except Exception as exc:
+            failed += 1
+            lines.append('DECOMPRESS FAILED %s: %s' % (name, exc))
+            continue
+        done += 1
+        if want_extract:
+            os.makedirs(extract_dir, exist_ok=True)
+            with open(os.path.join(extract_dir, name), 'wb') as fp:
+                fp.write(raw)
+        if want_search:
+            for i, ln in enumerate(asset_text(raw).splitlines()):
                 if needle in ln.lower():
-                    hits.append((off, i, ln.strip()))
+                    hits.append((name, i, ln.strip()))
 
-    lines.append('\nDecoded %d BXML blocks, %d failed' % (decoded_ok, decoded_fail))
+    summary = ['Decompressed %d assets, %d failed' % (done, failed)]
+    if args.extract:
+        summary.append("Extracted '%s' to %s" % (args.extract, extract_dir))
     if needle:
-        lines.append("Search '%s': %d hits" % (args.search, len(hits)))
-        for off, i, ln in hits[:40]:
-            lines.append('  @%d line %d: %s' % (off, i, ln))
+        summary.append("Search '%s': %d hits" % (args.search, len(hits)))
+        for name, i, ln in hits[:60]:
+            summary.append('  %s:%d: %s' % (name, i, ln[:160]))
+    lines.append('')
+    lines.extend(summary)
 
     os.makedirs(args.out_dir, exist_ok=True)
     out_path = os.path.join(args.out_dir, stem + '_package_manifest.txt')
     with open(out_path, 'w', encoding='utf-8') as fp:
         fp.write('\n'.join(lines))
 
-    # Summary to stdout: the counts, plus search hits if any were asked for.
-    print('\n'.join(lines[:6]))
-    print('Decoded %d/%d BXML blocks' % (decoded_ok, len(blocks)))
-    if needle:
-        print("Search '%s': %d hits" % (args.search, len(hits)))
-        for off, i, ln in hits[:20]:
-            print('  @%d line %d: %s' % (off, i, ln))
+    print('\n'.join(lines[:5]))
+    print('\n'.join(summary[:40]))
     print('Wrote %s (%d lines)' % (out_path, len(lines)))
 
 

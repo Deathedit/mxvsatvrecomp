@@ -13,13 +13,15 @@ Decompressed payload:
   field[1] = text_content_string_idx (-1 = no text)
   field[2] = reserved (always 0)
   field[3] = has_text flag (0/1)
-  field[4] = total_node_count (validation)
+  field[4] = first_child_index (record index of child 0; unused when count is 0)
   field[5] = child_count
   field[6] = attr_start_index (into Stream A triples)
   field[7] = attr_count
 
-Tree traversal: depth-first pre-order with explicit child_count.
-Reconstruction: read parent, next `child_count` nodes are its children, recurse.
+Tree traversal: children are named EXPLICITLY -- node i's children are records
+field[4] .. field[4]+field[5]-1. Nothing about the record ORDER has to be
+assumed, and nothing should be: see build_tree() for the two orderings this
+decoder wrongly assumed before.
 
 Usage:
     python bxml_decoder.py <file.bxml>           # decode to XML
@@ -197,30 +199,37 @@ def decode_bxml_bytes(raw):
         f = struct.unpack('<8I', rec)
         records.append(f)
 
-    # Reconstruct the tree. Records are in BREADTH-FIRST order, not pre-order.
+    # Reconstruct the tree from the EXPLICIT first-child index in field[4].
     #
-    # This was a DFS walk until 2026-08-17 and it mis-parented every file the
-    # tool has ever decoded. The record dump of MXUI.xenon.database shows the
-    # order plainly:
+    # This decoder guessed the parent link twice before, and both guesses were
+    # wrong in ways that produced plausible-looking XML:
     #
-    #     rec 0    Database  child_count=2
-    #     rec 1    Handles   child_count=322
-    #     rec 2    Packages  child_count=71     <- Database's SECOND child
-    #     rec 3..324   322 Assets               <- Handles' children
-    #     rec 325..395  71 Packages             <- Packages' children
+    #   1. Pre-order DFS ("the next child_count records are my children").
+    #      Wrong from the very first file. The record dump makes it obvious:
+    #        rec 0 Database f5=2, rec 1 Handles f5=322, rec 2 Packages f5=71
+    #      `Packages` sits immediately after `Handles`, BEFORE Handles' 322
+    #      children -- so a DFS walker adopts Packages into Handles and every
+    #      level below compounds it. This is what turned the asset list into
+    #      400-deep nesting with each <Asset> apparently containing the next.
     #
-    # `Packages` follows `Handles` immediately, before Handles' 322 children.
-    # A DFS builder sees Handles on the stack with 322 outstanding and adopts
-    # Packages into it, and every subsequent level compounds the error -- which
-    # is why the asset list came out as 400-deep nesting, each Asset appearing
-    # to contain the next, and why Heap/Compress nodes could not be attributed
-    # to an owner.
+    #   2. Breadth-first allocation ("hand out record indices level by level").
+    #      Fixes the case above and is still wrong. It agreed with the file for
+    #      the FIRST package and diverged after: record 325 declares its
+    #      children at 396..403, but record 326 declares 428, not 404. The
+    #      grandchildren of 325 sit in between. BFS-by-allocation produced a
+    #      Package whose direct children were bare <Heap>/<Block>/<Compress>
+    #      with the <Asset> wrappers gone.
     #
-    # child_count (field 5) was verified independently: it sums to
-    # node_count - 1 across the file, which only holds if it really is a child
-    # count and the tree is well formed. The field was right; the traversal was
-    # not.
-    def build_tree_bfs():
+    # Neither ordering has to be assumed, because field[4] names the first
+    # child outright. Verified across all 130 .xenon.database files shipped
+    # with the game: every record is reached exactly once, and no edge points
+    # backwards or past the end.
+    #
+    # (field[4] was documented as "total_node_count (validation)". It is not.
+    # It only looked constant because the four reference files used to derive
+    # the layout were shallow enough that most nodes were leaves, and a leaf's
+    # field[4] is never read.)
+    def build_tree():
         if not records:
             return BxmlNode()
         nodes = []
@@ -232,19 +241,13 @@ def decode_bxml_bytes(raw):
             node.attrs = all_attrs[f[6]:f[6] + f[7]]
             nodes.append(node)
 
-        next_free = 1
-        queue = collections.deque([0])
-        while queue:
-            parent = queue.popleft()
-            for _ in range(records[parent][5]):
-                if next_free >= len(nodes):
-                    break
-                nodes[parent].children.append(nodes[next_free])
-                queue.append(next_free)
-                next_free += 1
+        for i, f in enumerate(records):
+            first, count = f[4], f[5]
+            for c in range(first, min(first + count, len(nodes))):
+                nodes[i].children.append(nodes[c])
         return nodes[0]
 
-    return build_tree_bfs()
+    return build_tree()
 
 def main():
     if len(sys.argv) < 2:
