@@ -11,6 +11,7 @@
 #include <rex/cvar.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstdlib>
@@ -1412,10 +1413,34 @@ struct VideoComponentProbe {
   // is not findable by pattern. The link register names it outright.
   uint32_t first_caller = 0;
   uint32_t last_caller = 0;
+  // The per-frame step that decides whether the quad rebuilds and draws.
+  //
+  //   sub_8236DB10(this)   if (this[+176] & 0xC0000000) -> slot 15 rebuild
+  //   sub_8236DCA8(this)   return (this[+172] >> 4) & 1  -> then submit
+  //
+  // Two INDEPENDENT gates, so `slot 15 never ran` has three causes and these
+  // separate them:
+  //   visit_calls == 0     the component is never traversed at all -- it is
+  //                        not in the active layer, and the question moves up
+  //                        to whoever walks the tree.
+  //   dirty_seen == 0      it is traversed but never marked dirty, so the
+  //                        quad is never (re)built.
+  //   visible_seen == 0    it is traversed but bit 4 of +172 is clear, so
+  //                        nothing is ever submitted.
+  uint64_t visit_calls = 0;
+  uint64_t dirty_seen = 0;
+  uint64_t visible_seen = 0;
+  uint32_t last_flags172 = 0;
+  uint32_t last_flags176 = 0;
 };
 
 std::mutex g_videoProbeMu;
 std::vector<VideoComponentProbe> g_videoProbes;   // 6 in the whole game
+// Lock-free prefilter for the per-frame visit hook. sub_8236DB10 runs for
+// EVERY UI component every frame; taking the probe mutex there would put a
+// contended lock on the UI's hot path to watch five objects. Written under the
+// mutex at registration (load time only), read without it.
+std::atomic<uint32_t> g_videoCompFast[16] = {};
 std::map<uint32_t, std::string> g_materialNames;  // handle -> resolved name
 uint64_t g_materialResolves = 0;
 
@@ -1458,10 +1483,13 @@ void ReportVideoComponents(bool force) {
   for (const auto& q : g_videoProbes) {
     total += q.render_calls;
     rows += fmt::format(
-        " [\"{}\" comp0x{:08X} renders{} material={} item0x{:08X} "
-        "texasset0x{:08X} caller0x{:08X}/0x{:08X}]",
-        q.video, q.component, q.render_calls, MaterialLabel(q.last_material),
-        q.last_draw_item, q.texture_asset, q.first_caller, q.last_caller);
+        " [\"{}\" comp0x{:08X} renders{} visits{} dirty{} visible{} "
+        "f172=0x{:08X} f176=0x{:08X} material={} item0x{:08X} "
+        "texasset0x{:08X} caller0x{:08X}]",
+        q.video, q.component, q.render_calls, q.visit_calls, q.dirty_seen,
+        q.visible_seen, q.last_flags172, q.last_flags176,
+        MaterialLabel(q.last_material), q.last_draw_item, q.texture_asset,
+        q.last_caller);
   }
   REXLOG_INFO("native: VIDEO COMPONENT RENDER {} components, {} renders "
               "total, {} material resolves --{}",
@@ -1482,6 +1510,8 @@ void NoteVideoComponent(uint32_t component, const std::string& video,
     return;
   }
   if (g_videoProbes.size() >= 16) return;
+  g_videoCompFast[g_videoProbes.size()].store(component,
+                                              std::memory_order_release);
   g_videoProbes.push_back({component, video, texture_asset, player});
   // Report on registration too, so a component that NEVER renders still gets a
   // row. Without this the only reporter is the render hook, and a component
@@ -1556,6 +1586,46 @@ extern "C" REX_FUNC(sub_82B26778) {
   REXLOG_INFO("native: DRAW ITEM MATERIAL props 0x{:08X} <- material 0x{:08X} "
               "\"{}\"; {} installs total, {} pairs dropped",
               props, material, label, s_calls, s_dropped);
+}
+
+// sub_8236DB10(this) — the per-frame visit, called at the top of the component
+// draw step (sub_8237A6D0 / sub_8237B1D0) before anything is submitted:
+//
+//     if (this[+176] & 0xC0000000) { slot15(this); this[+176] &= 0x3FFFFFFF; }
+//     this[+176] &= 0xCFFFFFFF;
+//
+// Runs for every UI component every frame, so it is prefiltered without a lock
+// against the five registered video components.
+REX_IMPORT(__imp__sub_8236DB10, orig_UIComponentVisit, void());
+extern "C" REX_FUNC(sub_8236DB10) {
+  const uint32_t self = ctx.r3.u32;
+  uint32_t flags172 = 0, flags176 = 0;
+  bool watched = false;
+  if (self) {
+    for (auto& slot : g_videoCompFast) {
+      const uint32_t c = slot.load(std::memory_order_acquire);
+      if (!c) break;
+      if (c == self) { watched = true; break; }
+    }
+  }
+  if (watched) {
+    // Read BEFORE the original: it CLEARS both flag groups on the way out, so
+    // sampling afterwards would report every component as clean and the dirty
+    // counter could never fire.
+    flags172 = REX_LOAD_U32(self + 172);
+    flags176 = REX_LOAD_U32(self + 176);
+  }
+  orig_UIComponentVisit(ctx, base);
+  if (!watched) return;
+  std::lock_guard<std::mutex> lk(g_videoProbeMu);
+  VideoComponentProbe* p = FindProbe(self);
+  if (!p) return;
+  ++p->visit_calls;
+  if (flags176 & 0xC0000000u) ++p->dirty_seen;
+  if ((flags172 >> 4) & 1u) ++p->visible_seen;
+  p->last_flags172 = flags172;
+  p->last_flags176 = flags176;
+  ReportVideoComponents(false);
 }
 
 // sub_8237ABA8(this) — vtable slot 15, the render prepare that binds
