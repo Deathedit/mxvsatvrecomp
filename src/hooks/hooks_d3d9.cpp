@@ -64,6 +64,7 @@
 #include "gpu/hle_types.h"      // g_luminanceReadbackBits/Seq
 #include "gpu/xenos_gpu_state.h"  // mx::gpu::alu — the PM4 ALU constant file
 #include "hooks/hooks_d3d9_internal.h"  // shared with hooks_d3d9_entry.cpp
+#include "hooks/texture_dump.h"         // --texture_dump=true, logs/texdump
 
 // Defined in src/app/graphics_system.cpp with the rest of the Debug cvars.
 REXCVAR_DECLARE(bool, hle_capture);
@@ -1170,6 +1171,32 @@ bool ResolvedDestinationIsMostlyWritten(uint32_t dest_object) {
                 it->second.resolves);
   }
   return false;
+}
+
+// Which guest threads actually build draws. The companion to
+// ResolvedTargetByAddress::last_bind_thread: a bind on a thread that never
+// appears here can never be seen by a draw, because DeviceState() is
+// thread_local. Fixed array with atomics rather than a set, because this is
+// written from every record worker and a std::set insert would race.
+std::atomic<uint32_t> g_drawThreadIds[8];
+void NoteDrawThread() {
+  const uint32_t tid = GetCurrentThreadId();
+  for (auto& slot : g_drawThreadIds) {
+    uint32_t cur = slot.load(std::memory_order_relaxed);
+    if (cur == tid) return;
+    if (cur == 0 && slot.compare_exchange_strong(cur, tid)) return;
+  }
+}
+
+// The consumption record for a resolve destination, by its texture object, or
+// null when this object never resolved anywhere. find() only: this runs on
+// guest draw threads and must not insert into a map the resolve path is
+// writing.
+ResolvedTargetByAddress* ResolveEntryForObject(uint32_t dest_object) {
+  const auto po = g_resolveDestObjectPhys.find(dest_object);
+  if (po == g_resolveDestObjectPhys.end()) return nullptr;
+  const auto it = g_resolvedTargetsByAddress.find(po->second);
+  return it == g_resolvedTargetsByAddress.end() ? nullptr : &it->second;
 }
 
 // The destination texture object whose snapshot covers this described texture,
@@ -4136,6 +4163,45 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
       REXLOG_INFO("d3d9: TEXTURE REPEATS {} addresses:{}",
                   g_texDecodeSites.size(), top.empty() ? " (none)" : top);
     }
+    // RESOLVE CONSUMPTION. Every destination the guest has resolved into, and
+    // whether it ever asked for it back through SetTexture.
+    //
+    // The whole population, with the total printed first, and NOT gated on
+    // there being orphans -- "0 orphans of 14" and "no line at all" have to be
+    // distinguishable, or this is another counter that cannot report. Orphans
+    // are listed by name because the interesting one is a specific surface: the
+    // menu backdrop is a 1280x430 resolve that mx_1288 produced exactly once
+    // and nothing sampled.
+    {
+      size_t orphans = 0, asked_but_lost = 0;
+      std::string rows;
+      for (const auto& [addr, e] : g_resolvedTargetsByAddress) {
+        if (!e.set_texture_binds) ++orphans;
+        // The row that matters: the guest asked for it and no draw slot ever
+        // saw it. That is a binding WE lose, and it is invisible to every other
+        // counter here.
+        if (e.set_texture_binds && !e.slot_seen) ++asked_but_lost;
+        rows += fmt::format(
+            " [0x{:08X} {}x{} {}res bind{} seen{} snap{} part{} smp{:#x} "
+            "draws{} untrans{} declared{:#x} bt{} span{}/{}win]",
+            addr, e.width, e.height, e.resolves, e.set_texture_binds,
+            e.slot_seen, e.slot_snapshot, e.slot_partial, e.bind_sampler_mask,
+            e.draws_while_bound, e.draws_no_translation,
+            e.declared_sampler_mask, e.last_bind_thread,
+            e.guest_draws_spanned, e.bind_windows);
+      }
+      std::string draw_threads;
+      for (const auto& slot : g_drawThreadIds) {
+        if (const uint32_t tid = slot.load(std::memory_order_relaxed))
+          draw_threads += fmt::format(" {}", tid);
+      }
+      REXLOG_INFO("d3d9: RESOLVE CONSUMPTION {} destinations, {} never asked "
+                  "for, {} asked for but never reached a draw slot; draw "
+                  "threads:{} --{}",
+                  g_resolvedTargetsByAddress.size(), orphans, asked_but_lost,
+                  draw_threads.empty() ? " none" : draw_threads,
+                  rows.empty() ? " (none)" : rows);
+    }
     // Who owns the loop. Printed beside the total so the two can be checked
     // against each other rather than trusted separately.
     std::string split;
@@ -6611,9 +6677,18 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // nothing too, but only here, where a partly-written snapshot is standing by.
   uint32_t partial_snapshot_object = 0;
   const auto& texture_state = DeviceState().texture[guest_sampler];
+  ResolvedTargetByAddress* resolve_entry = nullptr;
   if (texture_state.object &&
       g_resolvedTextureTargets.contains(texture_state.object)) {
+    // Counted BEFORE the coverage gate, so "reached the draw path" and "was
+    // allowed to be a snapshot" stay separable. The SLOT MAP line below cannot
+    // answer this: it dedupes on (shader, slot), so a slot that logged once
+    // with a different texture never logs again however many other textures
+    // pass through it.
+    resolve_entry = ResolveEntryForObject(texture_state.object);
+    if (resolve_entry) ++resolve_entry->slot_seen;
     if (ResolvedDestinationIsMostlyWritten(texture_state.object)) {
+      if (resolve_entry) ++resolve_entry->slot_snapshot;
       // Logged HERE as well as at the decode below, because this path RETURNS.
       // The first cut of the SLOT MAP diagnostic sat only after this point and
       // so reported resolved=0 on every line it printed -- blind to precisely
@@ -6663,6 +6738,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
       out_swizzles[slot] = have_swz ? uint16_t(swz) : uint16_t(0);
       return true;
     }
+    if (resolve_entry) ++resolve_entry->slot_partial;
     partial_snapshot_object = texture_state.object;
   }
 
@@ -7054,6 +7130,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   payload->key = key;
   payload->content_version =
       TextureContentVersion(source, base, payload->format);
+  mx::diag::DumpDecodedTexture(source, *payload, "slot", guest_sampler);
   out_textures[slot] = payload;
   g_hleCpuTextures.emplace(key, std::move(payload));
   return true;
@@ -7358,6 +7435,30 @@ void AttachTranslatedPixelShader(mx::hle::DrawCall& dc, uint32_t handle,
                                  uint32_t device, uint8_t* base) {
   using namespace mx::hle;
   dc.pixel_shader_handle = handle;
+  // Census of resolve destinations bound at THIS draw, before any of the slot
+  // logic below can filter them out. See the fields' note in the header: this
+  // is deliberately outside the sampler loop, because the whole point is to see
+  // destinations that loop never reaches.
+  {
+    NoteDrawThread();
+    const TranslatedShader* census_t = TranslatedPixelShader(handle);
+    uint32_t declared = 0;
+    if (census_t) {
+      for (uint32_t s = 0; s < census_t->sampler_count &&
+                           s < mx::hle::DrawCall::kMaxPixelTextures; ++s)
+        declared |= 1u << (census_t->slot_guest[s] & 31u);
+    }
+    auto& st = DeviceState();
+    for (uint32_t gs = 0; gs < kMaxSamplers; ++gs) {
+      const uint32_t obj = st.texture[gs].object;
+      if (!obj || !g_resolvedTextureTargets.contains(obj)) continue;
+      if (auto* e = ResolveEntryForObject(obj)) {
+        ++e->draws_while_bound;
+        e->declared_sampler_mask |= declared;
+        if (!census_t) ++e->draws_no_translation;
+      }
+    }
+  }
   // Draws whose bound shader has no translation at all -- the other half of the
   // stand-in population, the half slot-filling cannot explain. Counted per
   // HANDLE because coverage is measured per shader and the picture is painted
@@ -7908,6 +8009,7 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
   payload->key = key;
   payload->content_version =
       TextureContentVersion(source, base, payload->format);
+  mx::diag::DumpDecodedTexture(source, *payload, "prepare", binding.sampler);
   dc.texture = payload;
   g_hleCpuTextures.emplace(key, std::move(payload));
   ++s_ready;

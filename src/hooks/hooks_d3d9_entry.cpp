@@ -1481,6 +1481,67 @@ extern "C" REX_FUNC(sub_8254E748) {
       binding.valid = (binding.fetch[0] & 3u) == 2u;
     }
     st.texture_seen_mask |= 1u << sampler;
+    // Did the guest just ask for a surface it had previously resolved into?
+    // See the note on ResolvedTargetByAddress::set_texture_binds -- this is the
+    // branch point for every "produced but never drawn" defect.
+    //
+    // How many GUEST Draw calls happen while a resolve destination sits on a
+    // sampler. D3D9DrawCounter() is bumped at the three Draw entry points
+    // before any of our filtering, so this counts what the guest asked for,
+    // not what we built -- which is the whole point:
+    //
+    //   0 draws   the guest binds it and never draws with it. Our draw path is
+    //             innocent and the real consumer is somewhere else entirely.
+    //   N draws   the guest DOES draw with it and we drop those draws before
+    //             they ever reach the texture slot loop. Ours to fix.
+    //
+    // Closed out on the next SetTexture to the same sampler, which is the only
+    // moment the window is known to have ended.
+    {
+      struct OrphanWatch {
+        uint32_t object = 0;
+        uint64_t draws_at_bind = 0;
+      };
+      static thread_local OrphanWatch t_watch[mx::hle::kMaxSamplers];
+      // ACCUMULATED, not logged. The first cut of this printed a line per
+      // window under a global cap of 24, and the whole cap was spent in the
+      // first 0.3 seconds of the run by one Bink-era object -- so the surface
+      // it was built to measure never got a line. Same trap as every other
+      // capped counter in this tree: a cap shared across a population reports
+      // on whoever is loudest, not on whoever is asked about.
+      OrphanWatch& w = t_watch[sampler];
+      if (w.object && w.object != texture) {
+        if (const auto po = g_resolveDestObjectPhys.find(w.object);
+            po != g_resolveDestObjectPhys.end()) {
+          if (const auto it = g_resolvedTargetsByAddress.find(po->second);
+              it != g_resolvedTargetsByAddress.end()) {
+            it->second.guest_draws_spanned +=
+                mx::hle::D3D9DrawCounter() - w.draws_at_bind;
+            ++it->second.bind_windows;
+          }
+        }
+        w.object = 0;
+      }
+      if (texture && g_resolveDestObjectPhys.count(texture)) {
+        w.object = texture;
+        w.draws_at_bind = mx::hle::D3D9DrawCounter();
+      }
+    }
+    // find() only, never operator[]: this runs on guest threads and the resolve
+    // maps are unguarded, so it must not insert. Bumping a counter inside an
+    // existing node cannot rehash or rebalance the map; creating one could.
+    if (texture) {
+      if (const auto po = g_resolveDestObjectPhys.find(texture);
+          po != g_resolveDestObjectPhys.end()) {
+        if (const auto it = g_resolvedTargetsByAddress.find(po->second);
+            it != g_resolvedTargetsByAddress.end()) {
+          ++it->second.set_texture_binds;
+          it->second.bind_sampler_mask |= 1u << sampler;
+          it->second.last_bind_device = device;
+          it->second.last_bind_thread = GetCurrentThreadId();
+        }
+      }
+    }
   }
   orig_SetTexture(ctx, base);
 

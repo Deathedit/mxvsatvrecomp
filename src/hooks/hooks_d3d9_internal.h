@@ -103,6 +103,82 @@ struct ResolvedTargetByAddress {
   uint32_t reached_x = 0;
   uint32_t reached_y = 0;
   uint32_t resolves = 0;
+  // How many times the guest handed this destination BACK to SetTexture.
+  //
+  // The question this exists to answer is the one the backdrop turns on: a
+  // resolve that is produced and never consumed has two completely different
+  // causes, and they need opposite fixes.
+  //
+  //   binds > 0   the guest does ask for it and OUR binding path loses it --
+  //               a fetch constant we describe wrongly, a slot we resolve to
+  //               something else, a draw we drop. Fixable here.
+  //   binds == 0  the guest never asks for it at all. Nothing in the host
+  //               renderer can make an unrequested texture appear; the missing
+  //               consumer is guest-side.
+  //
+  // Counted at SetTexture rather than at draw time on purpose: it must measure
+  // whether the GUEST asked, independently of whether our slot resolution then
+  // succeeded. A draw-time counter conflates the two and can only ever report
+  // the second question.
+  uint64_t set_texture_binds = 0;
+  // What the DRAW path then did with it. set_texture_binds says the guest
+  // asked; these three say whether we honoured the ask, and they are the only
+  // way to tell a binding we lost from one we never received.
+  //
+  //   slot_seen      reached ResolvePixelSlotTexture as a known destination
+  //   slot_snapshot  ...and was bound to the live host target (the good path)
+  //   slot_partial   ...and was sent down the memory-first path instead,
+  //                  because the GPU had written under a quarter of it
+  //
+  // seen == 0 with binds > 0 means the bind never became a draw slot at all.
+  uint64_t slot_seen = 0;
+  uint64_t slot_snapshot = 0;
+  uint64_t slot_partial = 0;
+  // WHERE the guest bound it, recorded at SetTexture. `bind==N, seen==0` has
+  // exactly two causes and these separate them:
+  //
+  //   the sampler is one no translated shader fetches from -- the draw loop
+  //     iterates the SHADER's declared samplers, so a texture bound to a
+  //     sampler nobody reads is never looked up; or
+  //   the bind landed on a different D3DDevice than the one draws are built
+  //     for, in which case DeviceState() at draw time never sees it.
+  //
+  // Compare the device here against the one the WORKING destinations report:
+  // this is self-normalising, so it needs no separate record of "the" device.
+  uint32_t bind_sampler_mask = 0;
+  uint32_t last_bind_device = 0;
+  // Draws built while this destination was still bound to a sampler, and which
+  // guest samplers those draws' shaders actually FETCH from.
+  //
+  // The slot loop cannot measure this: it walks the shader's samplers, so a
+  // destination bound to a sampler no shader reads is never looked up and
+  // produces no failure, no counter and no log line. These three close that
+  // blind spot for a `bind>0 seen0` row:
+  //
+  //   draws_while_bound == 0        the bind is transient -- something rebinds
+  //                                 the sampler before any draw is built.
+  //   draws_no_translation == most  the consumer IS drawing, as a stand-in.
+  //   declared mask lacks the bind  draws happen, translate, and simply never
+  //                                 fetch from that sampler.
+  uint64_t draws_while_bound = 0;
+  uint64_t draws_no_translation = 0;
+  uint32_t declared_sampler_mask = 0;
+  // The guest thread that last bound this destination.
+  //
+  // DeviceState() is `static thread_local` -- deliberately, because the guest's
+  // three record workers each drive their own D3D9 device on their own thread.
+  // So a SetTexture on thread A is invisible to a draw built on thread B, by
+  // design. `bind>0 draws0` is exactly what that looks like from here, and this
+  // field against the draw-thread list below is what proves or disproves it.
+  uint32_t last_bind_thread = 0;
+  // Guest Draw calls issued while this destination sat on a sampler, summed
+  // over every bind window, and how many windows that was. D3D9DrawCounter()
+  // is bumped at the guest's Draw entry points before any of our filtering, so
+  // `spanned == 0` over many windows means the GUEST never draws with it --
+  // our draw path is not losing anything. `spanned > 0` with slot_seen == 0
+  // means it does, and we drop those draws before the slot loop.
+  uint64_t guest_draws_spanned = 0;
+  uint64_t bind_windows = 0;
 };
 
 struct PendingHleDraw {
