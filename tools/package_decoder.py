@@ -54,40 +54,53 @@ def attr_by_name(node, name):
 
 
 def parse_database(db_path):
-    """Heap layout from the .xenon.database, one entry per package file.
+    """The asset table: every asset with its ABSOLUTE heap extent and codec.
 
-    The database nests Heap nodes under a package node, and the old walk
-    emitted a package entry per nesting level, so the same heap list came back
-    71 times at decreasing lengths. Collapsed by package name here, keeping the
-    LONGEST list seen -- the outermost walk is the complete one.
+    Structure, now that bxml_full_decoder walks records breadth-first:
+
+        <Database>
+          <Handles>  322 <Asset name type/>          -- names only, no heap
+          <Packages>  71 <Package name file offset blockOffset heapOffset>
+                            <Asset type name>
+                              <Compress enabled codec="LZX"/>
+                              <Heap offset size/>    -- offset is RELATIVE
+                              <Block offset size/>
+
+    Heap offsets are relative to the owning Package's heapOffset, which is why
+    they looked like they only covered the first 660 KB of a 33 MB file when
+    read as absolute.
+
+    Returns [{'name','type','offset','size','codec'}], offset absolute.
     """
     root = decode_bxml(db_path)
-    by_name = {}
-
-    def walk(node):
-        if node.name in ('Package', 'Pkg') or attr_by_name(node, 'file'):
-            name = attr_by_name(node, 'file') or attr_by_name(node, 'name')
-            if name:
-                heaps = []
-                collect_heaps(node, heaps)
-                prev = by_name.get(name)
-                if prev is None or len(heaps) > len(prev):
-                    by_name[name] = heaps
-        for c in node.children:
-            walk(c)
-
-    walk(root)
-    return [{'file': n, 'heaps': h} for n, h in by_name.items()]
-
-
-def collect_heaps(node, out):
-    for c in node.children:
-        if c.name == 'Heap':
-            off = attr_by_name(c, 'offset')
-            size = attr_by_name(c, 'size')
-            if off is not None and size is not None:
-                out.append({'offset': int(off), 'size': int(size)})
-        collect_heaps(c, out)
+    out = []
+    packages = None
+    for child in root.children:
+        if child.name == 'Packages':
+            packages = child
+            break
+    if packages is None:
+        return out
+    for pkg in packages.children:
+        if pkg.name != 'Package':
+            continue
+        base = int(attr_by_name(pkg, 'heapOffset') or 0)
+        for asset in pkg.children:
+            if asset.name != 'Asset':
+                continue
+            heap = codec = None
+            for c in asset.children:
+                if c.name == 'Heap':
+                    heap = (int(attr_by_name(c, 'offset')),
+                            int(attr_by_name(c, 'size')))
+                elif c.name == 'Compress':
+                    codec = attr_by_name(c, 'codec')
+            if heap:
+                out.append({'name': attr_by_name(asset, 'name'),
+                            'type': attr_by_name(asset, 'type'),
+                            'offset': base + heap[0], 'size': heap[1],
+                            'codec': codec})
+    return out
 
 
 def heap_header(data, offset, size):
@@ -138,35 +151,36 @@ def main():
     lines = ['# %s' % os.path.basename(pkg_path),
              'Size: %d bytes' % len(data)]
 
-    # --- heap census -------------------------------------------------------
-    heaps = []
+    # --- asset table -------------------------------------------------------
+    assets = []
     if os.path.exists(db_path):
         try:
-            for p in parse_database(db_path):
-                if p['heaps']:
-                    heaps = p['heaps']
-                    lines.append("Database declares %d heaps for '%s'"
-                                 % (len(heaps), p['file']))
-                    break
+            assets = parse_database(db_path)
         except Exception as exc:
             lines.append('Database unreadable: %s' % exc)
     else:
         lines.append('No sibling .xenon.database')
 
-    shaped = malformed = 0
-    covered = 0
-    for h in heaps:
-        covered += h['size']
-        hdr = heap_header(data, h['offset'], h['size'])
-        if hdr and hdr['matches_size']:
-            shaped += 1
-        else:
-            malformed += 1
-    if heaps:
-        lines.append('Heaps: %d with the expected 12-byte header, %d without; '
-                     'they cover %d of %d bytes (%.1f%%)'
-                     % (shaped, malformed, covered, len(data),
-                        100.0 * covered / max(1, len(data))))
+    if assets:
+        by_codec = collections.Counter(a['codec'] for a in assets)
+        covered = sum(a['size'] for a in assets)
+        over = [a for a in assets if a['offset'] + a['size'] > len(data)]
+        lines.append('Assets with heaps: %d  (%s)  covering %d of %d bytes '
+                     '(%.1f%%)%s'
+                     % (len(assets),
+                        ', '.join('%s=%d' % (k or 'raw', v)
+                                  for k, v in by_codec.most_common()),
+                        covered, len(data), 100.0 * covered / max(1, len(data)),
+                        '' if not over else
+                        '  -- %d run past EOF, offsets are WRONG' % len(over)))
+        lines.append('')
+        lines.append('%-40s %-9s %-11s %-9s %s'
+                     % ('asset', 'type', 'offset', 'size', 'codec'))
+        for a in sorted(assets, key=lambda x: x['offset']):
+            lines.append('%-40s %-9s %-11d %-9d %s'
+                         % (a['name'], a['type'], a['offset'], a['size'],
+                            a['codec'] or 'raw'))
+        lines.append('')
 
     # --- BXML blocks -------------------------------------------------------
     blocks = find_bxml_blocks(data)

@@ -26,7 +26,7 @@ Usage:
     python bxml_decoder.py <file.bxml> --raw     # dump internals
     python bxml_decoder.py <dir>                   # batch decode
 """
-import zlib, struct, sys, os
+import zlib, struct, sys, os, collections
 from pathlib import Path
 from dataclasses import dataclass, field as dc_field
 from typing import Optional, List
@@ -197,49 +197,54 @@ def decode_bxml_bytes(raw):
         f = struct.unpack('<8I', rec)
         records.append(f)
 
-    # Reconstruct tree from pre-order DFS with explicit child_count.
-    # Iterative: linear scan over records (which are in pre-order), maintaining a stack of
-    # "parents still accepting children". For each record processed, top of stack is the parent;
-    # pop frames when they run out of remaining children.
-    def build_tree_iterative():
+    # Reconstruct the tree. Records are in BREADTH-FIRST order, not pre-order.
+    #
+    # This was a DFS walk until 2026-08-17 and it mis-parented every file the
+    # tool has ever decoded. The record dump of MXUI.xenon.database shows the
+    # order plainly:
+    #
+    #     rec 0    Database  child_count=2
+    #     rec 1    Handles   child_count=322
+    #     rec 2    Packages  child_count=71     <- Database's SECOND child
+    #     rec 3..324   322 Assets               <- Handles' children
+    #     rec 325..395  71 Packages             <- Packages' children
+    #
+    # `Packages` follows `Handles` immediately, before Handles' 322 children.
+    # A DFS builder sees Handles on the stack with 322 outstanding and adopts
+    # Packages into it, and every subsequent level compounds the error -- which
+    # is why the asset list came out as 400-deep nesting, each Asset appearing
+    # to contain the next, and why Heap/Compress nodes could not be attributed
+    # to an owner.
+    #
+    # child_count (field 5) was verified independently: it sums to
+    # node_count - 1 across the file, which only holds if it really is a child
+    # count and the tree is well formed. The field was right; the traversal was
+    # not.
+    def build_tree_bfs():
         if not records:
             return BxmlNode()
-        root_node = None
-        # Stack frames: [node, remaining_children]
-        stack = []
-        for rec_idx in range(len(records)):
-            f = records[rec_idx]
+        nodes = []
+        for f in records:
             name = strings[f[0]] if 0 <= f[0] < len(strings) else f'?{f[0]}'
-            text = None
-            if f[1] != NO_TEXT and 0 <= f[1] < len(strings):
-                text = strings[f[1]]
-            has_text = f[3]
-            child_count = f[5]
-            attr_start = f[6]
-            attr_count = f[7]
-
             node = BxmlNode(name=name)
-            if has_text and text is not None:
-                node.text = text
-            node.attrs = all_attrs[attr_start:attr_start + attr_count]
+            if f[3] and f[1] != NO_TEXT and 0 <= f[1] < len(strings):
+                node.text = strings[f[1]]
+            node.attrs = all_attrs[f[6]:f[6] + f[7]]
+            nodes.append(node)
 
-            # Attach to parent (top of stack) unless it's root
-            if stack:
-                stack[-1][0].children.append(node)
-                stack[-1][1] -= 1  # parent now expects one fewer child
-            else:
-                root_node = node
+        next_free = 1
+        queue = collections.deque([0])
+        while queue:
+            parent = queue.popleft()
+            for _ in range(records[parent][5]):
+                if next_free >= len(nodes):
+                    break
+                nodes[parent].children.append(nodes[next_free])
+                queue.append(next_free)
+                next_free += 1
+        return nodes[0]
 
-            # Push our own frame if we expect children
-            if child_count > 0:
-                stack.append([node, child_count])
-
-            # Pop frames whose remaining_children == 0
-            while stack and stack[-1][1] <= 0:
-                stack.pop()
-        return root_node or BxmlNode()
-
-    return build_tree_iterative()
+    return build_tree_bfs()
 
 def main():
     if len(sys.argv) < 2:
