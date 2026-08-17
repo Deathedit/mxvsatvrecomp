@@ -17,6 +17,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -1276,4 +1277,174 @@ extern "C" REX_FUNC(sub_82AA7638) {
   }
 
   orig_ScriptDispatch(ctx, base);
+}
+
+//-----------------------------------------------------------------------------
+// UIVideoLayer::SetTextureAsset — sub_8236EB30
+//
+// The missing link in the menu backdrop. A UIVideoLayer with a `TextureAsset`
+// property does NOT draw to the screen: it renders into a named texture and
+// something else samples that texture. This function is where that texture is
+// created and attached, from the property loader at sub_823911C8:
+//
+//     layer+664  <- renderer_vtable[120](asset, 0x756B6500, 1)   the texture
+//     player+140 <- layer+664                                    render target
+//
+// Both player-creation sites in sub_8237F320 pass layer+664 into the factory,
+// so that object IS the video's output surface — the one a consumer draw would
+// bind. Our resolve tracking keys on the RESOLVE's destination object instead.
+// If the two are different objects we track one and the guest binds the other,
+// which is precisely the shape of the defect: FE_Smoke is produced every frame,
+// resolved to a 1280x430 texture, and that texture is sampled by nothing.
+//
+// Mode-neutral on purpose. A plugin-only probe here would be a one-sided
+// measurement, and this project has read the resulting silence as evidence
+// before.
+REX_IMPORT(__imp__sub_8236EB30, orig_UIVideoSetTextureAsset, void());
+extern "C" REX_FUNC(sub_8236EB30) {
+  const uint32_t layer = ctx.r3.u32;
+  const uint32_t asset = ctx.r4.u32;
+  orig_UIVideoSetTextureAsset(ctx, base);
+
+  // Read AFTER the original runs: layer+664 is assigned inside it, and the
+  // whole point is which object it ended up holding.
+  constexpr uint32_t kLayerVideoName = 608;  // the "Video" property, 48 bytes
+  constexpr uint32_t kLayerTexture = 664;    // <- the output surface
+  constexpr uint32_t kLayerPlayer = 668;
+  if (!layer) return;
+  const uint32_t texture = REX_LOAD_U32(layer + kLayerTexture);
+  const uint32_t player = REX_LOAD_U32(layer + kLayerPlayer);
+  std::string name;
+  for (uint32_t i = 0; i < 48; ++i) {
+    const char c = char(REX_LOAD_U8(layer + kLayerVideoName + i));
+    if (!c) break;
+    name.push_back(c);
+  }
+  // Is layer+664 a D3D9 TEXTURE, or an asset wrapper holding one?
+  //
+  // Settled here rather than by decompiling renderer_vtable[120]: that call is
+  // resolved at runtime through dword_830BE400+8 and the global has 40+ xrefs,
+  // so the static route would be a guess about which store feeds slot 8. A
+  // texture object carries its six hardware fetch dwords at +0x1C -- the offsets
+  // D3DDevice_SetTexture copies from -- and word 0 has type in bits [1:0]
+  // (2 = texture) with base_address in [31:12]. So the object answers for
+  // itself, and if it IS a texture its guest address can be compared directly
+  // against the 0xFBE94000 the FE_Smoke resolve lands on.
+  std::string fetch_desc = " (texture null)";
+  if (texture) {
+    uint32_t fetch[6] = {};
+    for (uint32_t i = 0; i < 6; ++i)
+      fetch[i] = REX_LOAD_U32(texture + 0x1C + i * 4);
+    const uint32_t type = fetch[0] & 3u;
+    fetch_desc = fmt::format(
+        " fetch0=0x{:08X} type={} {} addr=0x{:08X}"
+        " [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
+        fetch[0], type,
+        type == 2u ? "IS-A-TEXTURE" : "not a texture fetch",
+        fetch[0] & 0xFFFFF000u, fetch[0], fetch[1], fetch[2], fetch[3],
+        fetch[4], fetch[5]);
+  }
+  REXLOG_INFO("native: UIVideoLayer::SetTextureAsset layer 0x{:08X} video "
+              "\"{}\" asset 0x{:08X} -> TEXTURE 0x{:08X}, player 0x{:08X};{}",
+              layer, name, asset, texture, player, fetch_desc);
+}
+
+//-----------------------------------------------------------------------------
+// The engine's texture header filler — sub_826295E8
+//
+// 99.7% of this game's textures are created here, not through
+// D3DDevice_CreateTexture. It takes no name, so it cannot be filtered by
+// "_VideoRenderTarget" directly; what it does carry is the DESTINATION HEADER
+// POINTER, and that is the texture object a consumer would later bind.
+//
+// Argument layout is from three wrappers' register moves, NOT from Hex-Rays
+// (whose 42-argument prototype interleaves real stack slots with junk):
+//
+//     r3 width, r4 height, r5 depth, r6 levels, r7 usage, r8 format
+//     sp+0x74 = D3DRESOURCETYPE,  sp+0x7c = destination header pointer
+//
+// r1 on entry still points at the CALLER's frame — the outgoing parameter area
+// lives there, before the callee's stwu — so the stack args are read at entry.
+//
+// Filtered to Usage == 1, which is the render-target case: the two parallel
+// format tables at 0x82D54414 / 0x82D5448C are read with Usage = 1. That should
+// be a handful of creations rather than the ~17,000 total.
+//
+// The header's six fetch dwords at +0x1C are read AFTER the original runs, when
+// they are real: this is a texture header, unlike the UIVideoLayer asset object
+// whose +0x1C holds the ASCII name and produced a false `type=2` reading.
+// base_address is bits [31:12], so the guest address is fetch0 & 0xFFFFF000 —
+// compare it against the 0xFBE94000 that FE_Smoke's 1280x430 resolve lands on.
+REX_IMPORT(__imp__sub_826295E8, orig_EngineFillTextureHeader, void());
+extern "C" REX_FUNC(sub_826295E8) {
+  const uint32_t width = ctx.r3.u32;
+  const uint32_t height = ctx.r4.u32;
+  const uint32_t depth = ctx.r5.u32;
+  const uint32_t levels = ctx.r6.u32;
+  const uint32_t usage = ctx.r7.u32;
+  const uint32_t format = ctx.r8.u32;
+  const uint32_t sp = ctx.r1.u32;
+  const uint32_t restype = sp ? REX_LOAD_U32(sp + 0x74) : 0;
+  const uint32_t dest = sp ? REX_LOAD_U32(sp + 0x7C) : 0;
+
+  orig_EngineFillTextureHeader(ctx, base);
+
+  // COUNT FIRST, FILTER SECOND. The first cut gated on `usage == 1` and printed
+  // nothing at all, which says the same thing as "the function is never called"
+  // -- and those are completely different diagnoses. So the population is
+  // reported before any filter is applied to it.
+  {
+    static std::mutex s_cmu;
+    static uint64_t s_calls = 0, s_no_dest = 0;
+    static std::map<uint32_t, uint64_t> s_byUsage;
+    std::lock_guard<std::mutex> lk(s_cmu);
+    ++s_calls;
+    if (!dest) ++s_no_dest;
+    ++s_byUsage[usage];
+    if (s_calls <= 6 || (s_calls % 2000) == 0) {
+      std::string usages;
+      for (const auto& [u, n] : s_byUsage)
+        usages += fmt::format(" usage{}={}", u, n);
+      REXLOG_INFO("native: ENGINE TEX HEADER {} calls ({} with no dest), "
+                  "latest {}x{}x{} levels {} usage {} format {} restype {} "
+                  "dest 0x{:08X}; by usage:{}",
+                  s_calls, s_no_dest, width, height, depth, levels, usage,
+                  format, restype, dest, usages);
+    }
+  }
+
+  // NO usage filter. Two attempts to guess which usage means "render target"
+  // were both wrong:
+  //
+  //   usage == 1  -- printed nothing; this title never uses 1. The value came
+  //                 from the format TABLES being read with Usage = 1, which is
+  //                 the table lookup and not this argument.
+  //   usage != 0  -- printed the Bink video PLANES (640x216 + 320x112 for
+  //                 FE_Smoke, 1280x720 + 640x360 for Attract). usage 4 is the
+  //                 decode target, not a render target.
+  //
+  // The render targets are usage 0: the first three calls of the run are
+  // 1280x720 into 0x2123CA60 / 0x2123C238 / 0x2123C26C, and 0x2123C238 is a
+  // destination the resolve census already tracks.
+  //
+  // So: dedupe by SHAPE across everything and let the census show what exists.
+  // The size that matters is 1280x430 — FE_Smoke's resolve extent.
+  if (!dest) return;
+  // One line per distinct shape, so a render target created every frame does
+  // not drown the one created once.
+  static std::mutex s_mu;
+  static std::set<uint64_t> s_seen;
+  const uint64_t key = (uint64_t(width) << 40) ^ (uint64_t(height) << 16) ^
+                       (uint64_t(format) << 8) ^ uint64_t(levels);
+  {
+    std::lock_guard<std::mutex> lk(s_mu);
+    if (s_seen.size() >= 96 || !s_seen.insert(key).second) return;
+  }
+  uint32_t fetch[6] = {};
+  for (uint32_t i = 0; i < 6; ++i) fetch[i] = REX_LOAD_U32(dest + 0x1C + i * 4);
+  REXLOG_INFO("native: ENGINE TEX SHAPE {}x{}x{} levels {} usage {} format "
+              "0x{:08X} restype {} -> header 0x{:08X}; fetch0=0x{:08X} type={} "
+              "addr=0x{:08X}",
+              width, height, depth, levels, usage, format, restype, dest,
+              fetch[0], fetch[0] & 3u, fetch[0] & 0xFFFFF000u);
 }
