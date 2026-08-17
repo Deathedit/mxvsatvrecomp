@@ -1455,13 +1455,20 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
 
       // Counted BEFORE the body is walked, and counted even though the body is
       // then walked UNCONDITIONALLY — that gap is the whole point of the
-      // number. See HlslShader::predicated_exec_blocks.
+      // numbers. Split by MECHANISM, not by name: kCondExecPredClean rides the
+      // bool-constant struct, not the predicate one, so grouping it with
+      // kCondExecPred (as one counter used to) hides which fix applies. See
+      // HlslShader::pred_exec_blocks.
       switch (cf[j].opcode()) {
         case uc::ControlFlowOpcode::kCondExecPred:
         case uc::ControlFlowOpcode::kCondExecPredEnd:
+          ++out.pred_exec_blocks;  // p0 — fixable now
+          break;
+        case uc::ControlFlowOpcode::kCondExec:
+        case uc::ControlFlowOpcode::kCondExecEnd:
         case uc::ControlFlowOpcode::kCondExecPredClean:
         case uc::ControlFlowOpcode::kCondExecPredCleanEnd:
-          ++out.predicated_exec_blocks;
+          ++out.bool_exec_blocks;  // bool constant — needs a bank first
           break;
         default:
           break;

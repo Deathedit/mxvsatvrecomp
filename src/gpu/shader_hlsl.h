@@ -232,7 +232,25 @@ struct HlslShader {
   // never measured: if it is zero on this game, the setp_* value translation is
   // harmless and there is nothing to refuse. If it is non-zero, this names the
   // shaders to decide about, instead of refusing a working draw on suspicion.
-  uint32_t predicated_exec_blocks = 0;
+  // SPLIT 2026-08-17. These were one counter, which conflated two entirely
+  // different mechanisms and so could not say which fix a shader needs.
+  // Confirmed against C:/xenia-edge/src/xenia/gpu/ucode.h:258 (the ReXGlue SDK
+  // copy is stale; use the Xenia tree for GPU questions):
+  //
+  //   kCondExecPred / kCondExecPredEnd
+  //       -> ControlFlowCondExecPredInstruction, gated on p0.
+  //       FIXABLE NOW: xe_p0 already exists and setp_*_push writes it, so the
+  //       body just needs `if (xe_p0 == condition())` around it.
+  //
+  //   kCondExec / kCondExecEnd / kCondExecPredClean / kCondExecPredCleanEnd
+  //       -> ControlFlowCondExecInstruction, gated on a BOOL CONSTANT at
+  //       bool_address(). Despite the name, PredClean is NOT p0-gated.
+  //       NOT FIXABLE YET: there is no bool constant bank in this translator at
+  //       all, so this needs one plumbed from the guest first.
+  //
+  // Both bodies currently run unconditionally either way.
+  uint32_t pred_exec_blocks = 0;  // p0-gated
+  uint32_t bool_exec_blocks = 0;  // bool-constant-gated
 
   // Count of fetch instructions skipped because their opcode is not one this
   // emitter implements — the getTextureGradients / getTextureWeights /

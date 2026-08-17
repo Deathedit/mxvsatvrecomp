@@ -4178,10 +4178,13 @@ struct HlslCoverage {
   uint64_t compile_failed = 0;  // emitted, but FXC rejected the source
   std::map<std::string, uint64_t> failures;      // status name -> shaders
   std::map<uint32_t, uint64_t> blocking_opcode;  // opcode -> shaders
-  // Shaders (not blocks) carrying a predicated exec we run unconditionally.
-  // Counted at run level as well as per dump, because the question "does this
-  // game predicate at all" is answered by one number and was never asked.
-  uint64_t predicated = 0;
+  // Shaders (not blocks) carrying a conditional exec we run unconditionally,
+  // split by mechanism because the two need different fixes: p0 is evaluable
+  // today, a bool constant is not (no bank exists). Counted at run level as
+  // well as per dump, because the question "does this game predicate at all"
+  // is answered by one number and was never asked.
+  uint64_t predicated = 0;   // p0-gated
+  uint64_t bool_gated = 0;   // bool-constant-gated
 };
 HlslCoverage g_hlslVs, g_hlslPs;
 // map rather than set only because <map> is already included here and <set> is
@@ -4283,7 +4286,10 @@ std::string HlslCoverageSummary(const HlslCoverage& c) {
   // Deliberately NOT gated on non-zero: zero here is the finding that makes the
   // setp_* value translation safe, and a counter that vanishes when it reads
   // zero cannot report that.
-  s += fmt::format(", PREDICATED-EXEC={}", c.predicated);
+  // Both printed unconditionally, zero included: an absent line would read as
+  // "not measured" rather than "none", which is the failure this file keeps
+  // hitting. P0 is fixable now; BOOL needs a constant bank first.
+  s += fmt::format(", P0-EXEC={}, BOOL-EXEC={}", c.predicated, c.bool_gated);
   if (c.compile_failed) s += fmt::format(", FXC-REJECTED={}", c.compile_failed);
   for (const auto& [why, n] : c.failures) s += fmt::format(", {}={}", why, n);
   if (!c.blocking_opcode.empty()) {
@@ -4455,10 +4461,16 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
                  "this shader may run instructions the console skipped)";
           // The stronger of the two. Above, p0 is merely discarded; here a
           // block the console gated on p0 is executed regardless.
-          if (out.predicated_exec_blocks)
-            f << "\n; PREDICATED EXEC BLOCKS: " << out.predicated_exec_blocks
+          if (out.pred_exec_blocks)
+            f << "\n; P0-GATED EXEC BLOCKS: " << out.pred_exec_blocks
               << " (cond_exec_pred walked as a plain exec — this shader's "
-                 "body RUNS UNCONDITIONALLY where the console gated it)";
+                 "body RUNS UNCONDITIONALLY where the console gated it on p0. "
+                 "Fixable now: xe_p0 exists)";
+          if (out.bool_exec_blocks)
+            f << "\n; BOOL-GATED EXEC BLOCKS: " << out.bool_exec_blocks
+              << " (cond_exec / cond_exec_pred_clean walked as a plain exec — "
+                 "gated on a BOOL CONSTANT, and this translator has no bool "
+                 "constant bank, so the condition cannot be evaluated yet)";
           if (out.unhonoured_fetch_ops)
             f << "\n; UNHONOURED FETCH OPS: " << out.unhonoured_fetch_ops
               << " (getCompTexLOD/getGradients/getWeights/getBCF/setGradients "
@@ -4551,7 +4563,8 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
   // Counted for every shader that EMITTED, whether or not FXC then took it:
   // predication is a property of the guest microcode, not of our compile, and
   // scoping it to the compiled ones would under-report the population.
-  if (out.predicated_exec_blocks) ++cov.predicated;
+  if (out.pred_exec_blocks) ++cov.predicated;
+  if (out.bool_exec_blocks) ++cov.bool_gated;
 
   if (out.status != mx::hle::HlslStatus::kOk) {
     ++cov.failures[mx::hle::HlslStatusName(out.status)];
