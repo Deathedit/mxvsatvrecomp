@@ -77,10 +77,22 @@ class BxmlNode:
                 stack.append(child)
 
 def read_bxml(path):
-    with open(path, 'rb') as f: raw = f.read()
+    with open(path, 'rb') as f:
+        return read_bxml_bytes(f.read())
+
+
+def read_bxml_bytes(raw):
+    """Same as read_bxml but from a buffer, so a BXML block EMBEDDED in a larger
+    file (a .xenon.package carries several at arbitrary offsets) can be decoded
+    without being carved out to a temp file first.
+
+    Uses decompressobj rather than zlib.decompress because an embedded block is
+    followed by the rest of the package, and the one-shot call rejects trailing
+    data.
+    """
     if raw[:4] != b'BXML':
         raise ValueError(f'Not BXML: {raw[:4]}')
-    bin_d = zlib.decompress(raw[raw.find(b'\x78\x9C'):])
+    bin_d = zlib.decompressobj().decompress(raw[raw.find(b'\x78\x9C'):])
     string_count = struct.unpack('<I', raw[8:12])[0]
     strings_size = struct.unpack('<I', raw[12:16])[0]
     streaming_flag = struct.unpack('<I', raw[16:20])[0]
@@ -139,7 +151,13 @@ def decode_bxml(path):
     """Decode a BXML file into a BxmlNode tree.
     Handles both config .bxml (string-only attrs) and .xenon.database (typed binary attrs).
     """
-    bin_d, str_count, str_size, stream_flag, aux_count, node_count = read_bxml(path)
+    with open(path, 'rb') as f:
+        return decode_bxml_bytes(f.read())
+
+
+def decode_bxml_bytes(raw):
+    """decode_bxml over a buffer. See read_bxml_bytes for why this exists."""
+    bin_d, str_count, str_size, stream_flag, aux_count, node_count = read_bxml_bytes(raw)
     strings = parse_strings(bin_d, str_size)
 
     # Post-strings layout: [binary_data | attr_descriptors | node_records]

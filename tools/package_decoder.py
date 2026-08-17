@@ -1,13 +1,50 @@
-"""Decode .xenon.package files using bxml_full_decoder.
+"""Decode .xenon.package files.
 
-Each heap in a package = [33-byte heap header] + [standard BXML block].
+WHAT A PACKAGE ACTUALLY IS, measured against MXUI.xenon.package (33 MB):
 
-The .xenon.database sibling file declares the heap layout (offset+size per Heap node).
-Without the database, we scan for BXML blocks directly.
+  * The sibling .xenon.database declares the layout as a flat list of heaps
+    (offset + size). MXUI declares 1470.
+  * A heap is NOT a BXML block. It carries a 12-byte little-endian header --
+    `u32 size-4`, `u32 0x00010000`, `u32 size-16` -- followed by an opaque
+    payload. Most of a UI package is texture and asset data.
+  * BXML blocks DO live in a package, but at ARBITRARY offsets rather than at
+    heap starts, and zlib-compressed after a 28-byte header. MXUI has 16.
+
+The previous version of this file assumed one BXML block per heap start. It
+therefore printed "NO BXML signature found" 1404 times out of 1470 and extracted
+nothing from any UI package -- MXUI_Streaming's manifest contained no content
+either, which is what made the breakage easy to miss: it produced a file, just
+an empty one.
+
+It also mis-walked the database, returning 71 duplicate 'MXUI' entries with
+identical offsets and decreasing heap counts (1470, 1468, 1466, ...). Only the
+first was ever used.
+
+Usage:
+    python tools/package_decoder.py <file.xenon.package>
+    python tools/package_decoder.py <file.xenon.package> --search VideoRenderTarget
+
+--search greps the DECODED XML of every BXML block, which is the only way to
+find a name that is stored compressed. A plain grep of the package file cannot
+see it.
 """
-import struct, zlib, sys, os
+
+import argparse
+import collections
+import os
+import struct
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from bxml_full_decoder import decode_bxml
+from bxml_full_decoder import decode_bxml, decode_bxml_bytes  # noqa: E402
+
+BXML_MAGIC = b'BXML'
+HEAP_HEADER_BYTES = 12
+# The constant dword every heap header carries at +4. Checked rather than
+# skipped: a heap that does not have it is not the shape this parser assumes,
+# and saying so is more useful than decoding it as if it were.
+HEAP_HEADER_TAG = 0x00010000
+
 
 def attr_by_name(node, name):
     for k, v in node.attrs:
@@ -15,164 +52,168 @@ def attr_by_name(node, name):
             return v
     return None
 
-def find_pkgs_in_db(pkg_db_path):
-    """Returns a list of {'file': str, 'heaps': [(off, size)]} dicts parsed from .xenon.database."""
-    root = decode_bxml(pkg_db_path)
-    pkgs = []
-    for node in root.walk():
-        if node.name == 'Package':
-            file_attr = attr_by_name(node, 'file') or attr_by_name(node, 'name')
-            heaps = []
-            # Walk ONLY this node's descendants for Heap elements
-            for child in node.walk():
-                if child.name == 'Heap':
-                    off_s = attr_by_name(child, 'offset')
-                    sz_s = attr_by_name(child, 'size')
-                    block_off_s = attr_by_name(child, 'blockOffset')
-                    heap_off_s = attr_by_name(child, 'heapOffset')
-                    if off_s is not None and sz_s is not None:
-                        try:
-                            off = int(off_s)
-                            sz = int(sz_s)
-                            heaps.append({'offset': off, 'size': sz,
-                                          'blockOffset': int(block_off_s) if block_off_s else 0,
-                                          'heapOffset': int(heap_off_s) if heap_off_s else 0})
-                        except ValueError:
-                            pass
-            pkgs.append({'file': file_attr or '(unnamed)', 'heaps': heaps})
-    return pkgs
 
-def decode_heap(heap_data, label, out_lines, verbose=False):
-    out_lines.append(f"\n=== Heap '{label}' ({len(heap_data)} bytes) ===")
-    if len(heap_data) < 33:
-        out_lines.append("  too small")
-        return False
+def parse_database(db_path):
+    """Heap layout from the .xenon.database, one entry per package file.
 
-    hdr = heap_data[:33]
-    bxml_idx = heap_data.find(b'BXML')
-    if bxml_idx < 0:
-        out_lines.append("  NO BXML signature found")
-        return False
+    The database nests Heap nodes under a package node, and the old walk
+    emitted a package entry per nesting level, so the same heap list came back
+    71 times at decreasing lengths. Collapsed by package name here, keeping the
+    LONGEST list seen -- the outermost walk is the complete one.
+    """
+    root = decode_bxml(db_path)
+    by_name = {}
 
-    bxml_data = heap_data[bxml_idx:]
+    def walk(node):
+        if node.name in ('Package', 'Pkg') or attr_by_name(node, 'file'):
+            name = attr_by_name(node, 'file') or attr_by_name(node, 'name')
+            if name:
+                heaps = []
+                collect_heaps(node, heaps)
+                prev = by_name.get(name)
+                if prev is None or len(heaps) > len(prev):
+                    by_name[name] = heaps
+        for c in node.children:
+            walk(c)
 
-    import tempfile
-    tmp = os.path.join(tempfile.gettempdir(), 'pkg_heap.bxml')
-    with open(tmp, 'wb') as f:
-        f.write(bxml_data)
+    walk(root)
+    return [{'file': n, 'heaps': h} for n, h in by_name.items()]
 
-    try:
-        root = decode_bxml(tmp)
-        xml_lines = root.to_xml()
-        out_lines.append(f"  BXML@{bxml_idx}: decoded {len(xml_lines)} lines")
-        # Output first 15 + summary
-        for line in xml_lines[:15]:
-            out_lines.append(f"    {line}")
-        if len(xml_lines) > 15:
-            out_lines.append(f"    ... ({len(xml_lines)-15} more lines)")
-            # Count distinct element names
-            counts = {}
-            for node in root.walk():
-                counts[node.name] = counts.get(node.name, 0) + 1
-            top = sorted(counts.items(), key=lambda x: -x[1])[:15]
-            out_lines.append(f"  Element-type histogram: " + ", ".join(f"{n}:{c}" for n, c in top))
-        return True
-    except Exception as e:
-        out_lines.append(f"  DECODE FAILED at BXML@{bxml_idx}: {e}")
-        return False
 
-def direct_scan_heaps(pkg_path):
-    """Scan for BXML-magic blocks. Returns list of (heap_start, bxml_idx, comp_size)."""
-    with open(pkg_path, 'rb') as f: data = f.read()
-    heaps = []
-    pos = 0
-    while True:
-        idx = data.find(b'BXML', pos)
-        if idx < 0: break
-        heap_start = idx - 33
-        if heap_start < 0:
-            pos = idx + 4
-            continue
-        bxml_hdr = data[idx:idx+36]
-        if len(bxml_hdr) < 36:
-            break
-        comp_size = struct.unpack('<I', bxml_hdr[32:36])[0]
-        heaps.append({'heap_start': heap_start, 'bxml_idx': idx, 'comp_size': comp_size})
-        pos = idx + 36 + comp_size
-        if pos >= len(data):
-            break
-    return heaps
+def collect_heaps(node, out):
+    for c in node.children:
+        if c.name == 'Heap':
+            off = attr_by_name(c, 'offset')
+            size = attr_by_name(c, 'size')
+            if off is not None and size is not None:
+                out.append({'offset': int(off), 'size': int(size)})
+        collect_heaps(c, out)
+
+
+def heap_header(data, offset, size):
+    """The 12-byte header, or None when the heap does not have that shape."""
+    if offset + HEAP_HEADER_BYTES > len(data):
+        return None
+    a, tag, b = struct.unpack('<III', data[offset:offset + HEAP_HEADER_BYTES])
+    if tag != HEAP_HEADER_TAG:
+        return None
+    return {'declared_a': a, 'declared_b': b,
+            'matches_size': (a == size - 4 and b == size - 16)}
+
+
+def find_bxml_blocks(data):
+    """Every BXML block in the package, wherever it sits."""
+    out = []
+    i = data.find(BXML_MAGIC)
+    while i != -1:
+        out.append(i)
+        i = data.find(BXML_MAGIC, i + 1)
+    return out
+
+
+def node_to_lines(node, out):
+    """BxmlNode.to_xml() already emits attributes AND node text, iteratively so
+    deep trees do not blow the recursion limit. The first cut of this file
+    hand-rolled a walker that dropped `text` -- which is exactly where an asset
+    NAME sits, so a --search for one found nothing while appearing to work.
+    """
+    out.extend(node.to_xml())
+
 
 def main():
-    if len(sys.argv) < 2:
-        pkg_path = r'C:\Users\VM\Desktop\mx\assets\Database\NAT_Farm.xenon.package'
-    else:
-        pkg_path = sys.argv[1]
-    stem = os.path.basename(pkg_path).replace('.xenon.package', '').replace('.package', '')
-    pkg_db = os.path.join(os.path.dirname(pkg_path), stem + '.xenon.database')
-    print(f"Package: {os.path.basename(pkg_path)} ({os.path.getsize(pkg_path)} bytes)")
-    if os.path.exists(pkg_db):
-        print(f"Database: {os.path.basename(pkg_db)}")
+    ap = argparse.ArgumentParser()
+    ap.add_argument('package', nargs='?',
+                    default=r'C:\Users\VM\Desktop\mx\assets\Database\MXUI.xenon.package')
+    ap.add_argument('--search', default='',
+                    help='case-insensitive substring to look for in decoded XML')
+    ap.add_argument('--out-dir', default=r'C:\Users\VM\Desktop\mx\out')
+    args = ap.parse_args()
 
-    # Get heap layout from database
-    pkgs = []
-    if os.path.exists(pkg_db):
+    pkg_path = args.package
+    stem = os.path.basename(pkg_path).replace('.xenon.package', '')
+    db_path = pkg_path.replace('.xenon.package', '.xenon.database')
+    with open(pkg_path, 'rb') as f:
+        data = f.read()
+
+    lines = ['# %s' % os.path.basename(pkg_path),
+             'Size: %d bytes' % len(data)]
+
+    # --- heap census -------------------------------------------------------
+    heaps = []
+    if os.path.exists(db_path):
         try:
-            pkgs = find_pkgs_in_db(pkg_db)
-            heap_count = sum(len(p['heaps']) for p in pkgs)
-            print(f"DB declares {len(pkgs)} packages, {heap_count} heaps total")
-        except Exception as e:
-            print(f"DB layout extract failed: {e}")
-            import traceback
-            traceback.print_exc()
-
-    # For ALL packages reference the SAME physical .package file (multi-Package DB), OR
-    # this .package file matches exactly one Package entry. Try both.
-    target_pkg = None
-    if pkgs:
-        # Prefer one whose 'file' attribute matches the package stem
-        for p in pkgs:
-            if p['file'].lower() == stem.lower():
-                target_pkg = p
-                break
-        if target_pkg is None:
-            target_pkg = pkgs[0]
-            print(f"No exact pkg match; using first entry '{target_pkg['file']}'")
-
-    out_lines = [f"# {os.path.basename(pkg_path)}"]
-    out_lines.append(f"Size: {os.path.getsize(pkg_path)} bytes")
-
-    with open(pkg_path, 'rb') as f: pkg = f.read()
-
-    if target_pkg and target_pkg['heaps']:
-        out_lines.append(f"\nPackage '{target_pkg['file']}' has {len(target_pkg['heaps'])} heaps from DB")
-        for i, h in enumerate(target_pkg['heaps']):
-            off, sz = h['offset'], h['size']
-            if off + sz > len(pkg):
-                sz = len(pkg) - off
-            out_lines.append(f"\n--- Heap {i+1}/{len(target_pkg['heaps'])} (off={off}, size={sz}, blockOffset={h['blockOffset']}, heapOffset={h['heapOffset']}) ---")
-            decode_heap(pkg[off:off+sz], f"Heap{i+1}", out_lines)
+            for p in parse_database(db_path):
+                if p['heaps']:
+                    heaps = p['heaps']
+                    lines.append("Database declares %d heaps for '%s'"
+                                 % (len(heaps), p['file']))
+                    break
+        except Exception as exc:
+            lines.append('Database unreadable: %s' % exc)
     else:
-        # Direct-scan fallback
-        heaps = direct_scan_heaps(pkg_path)
-        out_lines.append(f"\nDirect-scan found {len(heaps)} BXML blocks")
-        for i, h in enumerate(heaps):
-            # Read comp_size bytes after BXML header end as heap end
-            end = h['bxml_idx'] + 36 + h['comp_size']
-            if end > len(pkg): end = len(pkg)
-            heap_start = h['heap_start']
-            decode_heap(pkg[heap_start:end], f"ScanHeap{i+1}@{heap_start}", out_lines)
+        lines.append('No sibling .xenon.database')
 
-    # Write manifest to file
-    out_dir = r'C:\Users\VM\Desktop\mx\out'
-    os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, stem + '_package_manifest.txt')
+    shaped = malformed = 0
+    covered = 0
+    for h in heaps:
+        covered += h['size']
+        hdr = heap_header(data, h['offset'], h['size'])
+        if hdr and hdr['matches_size']:
+            shaped += 1
+        else:
+            malformed += 1
+    if heaps:
+        lines.append('Heaps: %d with the expected 12-byte header, %d without; '
+                     'they cover %d of %d bytes (%.1f%%)'
+                     % (shaped, malformed, covered, len(data),
+                        100.0 * covered / max(1, len(data))))
+
+    # --- BXML blocks -------------------------------------------------------
+    blocks = find_bxml_blocks(data)
+    lines.append('BXML blocks found: %d' % len(blocks))
+    needle = args.search.lower()
+    hits = []
+    decoded_ok = decoded_fail = 0
+    for off in blocks:
+        try:
+            root = decode_bxml_bytes(data[off:])
+        except Exception as exc:
+            decoded_fail += 1
+            lines.append('\n=== BXML @%d -- FAILED: %s' % (off, exc))
+            continue
+        decoded_ok += 1
+        sc, ss, sf, ac, nc = struct.unpack('<IIIII', data[off + 8:off + 28])
+        body = []
+        node_to_lines(root, body)
+        body = [ln for ln in body if ln is not None]
+        lines.append('\n=== BXML @%d  root <%s>  %d strings, %d nodes, %d lines'
+                     % (off, root.name, sc, nc, len(body)))
+        lines.extend(body)
+        if needle:
+            for i, ln in enumerate(body):
+                if needle in ln.lower():
+                    hits.append((off, i, ln.strip()))
+
+    lines.append('\nDecoded %d BXML blocks, %d failed' % (decoded_ok, decoded_fail))
+    if needle:
+        lines.append("Search '%s': %d hits" % (args.search, len(hits)))
+        for off, i, ln in hits[:40]:
+            lines.append('  @%d line %d: %s' % (off, i, ln))
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    out_path = os.path.join(args.out_dir, stem + '_package_manifest.txt')
     with open(out_path, 'w', encoding='utf-8') as fp:
-        fp.write('\n'.join(out_lines))
-    print(f"\nWrote manifest ({len(out_lines)} lines) to {out_path}")
+        fp.write('\n'.join(lines))
 
-    # Print a summary of the last 40 lines on screen
-    print('\n'.join(out_lines[:70]))
+    # Summary to stdout: the counts, plus search hits if any were asked for.
+    print('\n'.join(lines[:6]))
+    print('Decoded %d/%d BXML blocks' % (decoded_ok, len(blocks)))
+    if needle:
+        print("Search '%s': %d hits" % (args.search, len(hits)))
+        for off, i, ln in hits[:20]:
+            print('  @%d line %d: %s' % (off, i, ln))
+    print('Wrote %s (%d lines)' % (out_path, len(lines)))
+
 
 if __name__ == '__main__':
     main()
