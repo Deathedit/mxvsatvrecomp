@@ -262,6 +262,36 @@ extern std::map<uint32_t, uint32_t> g_luminanceDestAddrs;
 extern uint32_t g_luminanceWroteSeq;
 extern uint64_t g_luminanceFloored;
 
+// ---- Video render-target consumption --------------------------------------
+
+// Is the `_VideoRenderTarget` texture the FE_Smoke quad's MATERIAL names ever
+// sampled by a draw?
+//
+// UIVideoComponent keeps the sampled texture and the video's decode target in
+// two unrelated fields, decompiled 2026-08-17:
+//
+//   <VisibleMaterial> -> sub_82388560 -> this+260 -> render slot 15 binds it
+//                        onto ImageIconProperties+164.   THE QUAD SAMPLES THIS.
+//   <TextureAsset>    -> sub_8236EB30 -> this+664 -> the video PLAYER's
+//                        render destination.            THE VIDEO WRITES THIS.
+//
+// Nothing copies between them. Five of the six video components in MXUI name
+// the same asset in both fields; FE_Smoke names `1280_720_VideoRenderTarget`
+// (1280x720) as its material and `Smoke_VideoRenderTarget` (1280x430) as its
+// target. The existing RESOLVE CONSUMPTION census cannot answer this, because
+// it is keyed on resolve DESTINATIONS and the material's texture need never be
+// one -- a different population, which is the trap this file has fallen into
+// twice.
+//
+// So this is keyed by the texture's BASE ADDRESS and reports every row. 1280x720
+// is also the scene render-target shape, so a row at that shape is NOT
+// self-evidently the video asset; the address is what distinguishes them, and
+// printing the whole population is what makes that possible. FE_Smoke's 1280x430
+// resolve lands at phys 0x1BE95000.
+void NoteVideoShapeBind(uint32_t sampler, uint32_t object, const uint32_t* fetch,
+                        bool fetch_valid, uint32_t device);
+void NoteVideoShapeSlot(const uint32_t* fetch, bool fetch_valid);
+
 // ---- Counters the entry points maintain -----------------------------------
 
 extern uint64_t g_indexed_draws;

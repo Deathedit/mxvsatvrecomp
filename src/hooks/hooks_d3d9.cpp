@@ -1199,6 +1199,131 @@ ResolvedTargetByAddress* ResolveEntryForObject(uint32_t dest_object) {
   return it == g_resolvedTargetsByAddress.end() ? nullptr : &it->second;
 }
 
+// ---- Video render-target consumption --------------------------------------
+//
+// See the block comment in hooks_d3d9_internal.h for what this measures and
+// why the RESOLVE CONSUMPTION census cannot answer it.
+
+struct VideoShapeRow {
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t last_object = 0;
+  uint64_t binds = 0;
+  uint32_t sampler_mask = 0;
+  uint32_t last_device = 0;
+  uint32_t last_thread = 0;
+  // Guest Draw calls issued while it sat on a sampler, and how many windows.
+  // set_texture_binds alone conflates sampling with the resolve idiom -- bind,
+  // resolve, unbind, no draw between -- and reading it as "the guest asked to
+  // sample it" cost five rounds of instrumenting the draw path. Never report
+  // binds without this beside it.
+  uint64_t guest_draws_spanned = 0;
+  uint64_t bind_windows = 0;
+  // Reached the draw path's slot loop as a shader-declared sampler. binds > 0
+  // with slot_seen == 0 means the bind never became a draw slot.
+  uint64_t slot_seen = 0;
+};
+
+std::mutex g_videoShapeMu;
+std::map<uint32_t, VideoShapeRow> g_videoShapeRows;  // keyed by base address
+uint64_t g_videoShapeBinds = 0;      // binds at a video shape, before dedupe
+uint64_t g_videoShapeDropped = 0;    // rows refused because the map was full
+
+constexpr size_t kMaxVideoShapeRows = 64;
+
+// The three _VideoRenderTarget assets declared in MXUI.xenon.database, by
+// extent. Taken from the shipped data, not guessed: 1280x430 is FE_Smoke's,
+// and matches the 1280x430 the engine's own texture-header hook reports.
+bool IsVideoTargetShape(uint32_t w, uint32_t h) {
+  return (w == 1280 && h == 720) ||    // 1280_720_VideoRenderTarget
+         (w == 1024 && h == 512) ||    // 1024_512_VideoRenderTarget
+         (w == 1280 && h == 430);      // Smoke_VideoRenderTarget
+}
+
+// Extent and base address straight off the bound fetch constants. Deliberately
+// NOT DescribeHleTexture2D: this must observe what the guest bound even when
+// the describe path would refuse it, or it inherits that path's blind spots.
+bool DecodeVideoShape(const uint32_t* fetch, bool fetch_valid, uint32_t* w,
+                      uint32_t* h, uint32_t* base) {
+  if (!fetch || !fetch_valid) return false;
+  namespace xe = rex::graphics::xenos;
+  xe::xe_gpu_texture_fetch_t f{};
+  std::memcpy(&f, fetch, sizeof(uint32_t) * 6);
+  if (f.dimension != xe::DataDimension::k2DOrStacked) return false;
+  *w = f.size_2d.width + 1;
+  *h = f.size_2d.height + 1;
+  *base = f.base_address << 12;
+  return true;
+}
+
+void NoteVideoShapeBind(uint32_t sampler, uint32_t object, const uint32_t* fetch,
+                        bool fetch_valid, uint32_t device) {
+  if (sampler >= mx::hle::kMaxSamplers) return;
+  // The window this sampler was already holding, closed here because this is
+  // the only moment it is known to have ended.
+  struct Watch {
+    uint32_t base = 0;
+    uint64_t draws_at_bind = 0;
+  };
+  static thread_local Watch t_watch[mx::hle::kMaxSamplers];
+  Watch& w = t_watch[sampler];
+
+  uint32_t width = 0, height = 0, base_addr = 0;
+  const bool matched =
+      object && DecodeVideoShape(fetch, fetch_valid, &width, &height, &base_addr) &&
+      IsVideoTargetShape(width, height);
+
+  if (w.base && (!matched || w.base != base_addr)) {
+    const uint64_t spanned = mx::hle::D3D9DrawCounter() - w.draws_at_bind;
+    std::lock_guard<std::mutex> lk(g_videoShapeMu);
+    if (const auto it = g_videoShapeRows.find(w.base);
+        it != g_videoShapeRows.end()) {
+      it->second.guest_draws_spanned += spanned;
+      ++it->second.bind_windows;
+    }
+    w.base = 0;
+  }
+  if (!matched) return;
+
+  {
+    std::lock_guard<std::mutex> lk(g_videoShapeMu);
+    ++g_videoShapeBinds;
+    auto it = g_videoShapeRows.find(base_addr);
+    if (it == g_videoShapeRows.end()) {
+      if (g_videoShapeRows.size() >= kMaxVideoShapeRows) {
+        ++g_videoShapeDropped;
+        return;
+      }
+      it = g_videoShapeRows.emplace(base_addr, VideoShapeRow{}).first;
+    }
+    VideoShapeRow& row = it->second;
+    row.width = width;
+    row.height = height;
+    row.last_object = object;
+    ++row.binds;
+    row.sampler_mask |= 1u << sampler;
+    row.last_device = device;
+    row.last_thread = GetCurrentThreadId();
+  }
+  if (!w.base) {
+    w.base = base_addr;
+    w.draws_at_bind = mx::hle::D3D9DrawCounter();
+  }
+}
+
+void NoteVideoShapeSlot(const uint32_t* fetch, bool fetch_valid) {
+  uint32_t width = 0, height = 0, base_addr = 0;
+  if (!DecodeVideoShape(fetch, fetch_valid, &width, &height, &base_addr)) return;
+  if (!IsVideoTargetShape(width, height)) return;
+  std::lock_guard<std::mutex> lk(g_videoShapeMu);
+  // find() only -- a slot must not create a row. A row that exists only because
+  // the draw path saw it, with binds == 0, would be a contradiction that reads
+  // like data.
+  if (const auto it = g_videoShapeRows.find(base_addr);
+      it != g_videoShapeRows.end())
+    ++it->second.slot_seen;
+}
+
 // The destination texture object whose snapshot covers this described texture,
 // or 0. Matches on the guest memory address the two fetch constants agree on,
 // and refuses when the extents disagree -- an address the guest allocator has
@@ -4283,6 +4408,37 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
         if (const uint32_t tid = slot.load(std::memory_order_relaxed))
           draw_threads += fmt::format(" {}", tid);
       }
+      // VIDEO TARGET CONSUMPTION. Every texture bound at one of the three
+      // _VideoRenderTarget extents, by base address.
+      //
+      // The whole population, printed unconditionally. "0 rows" means the guest
+      // never binds a texture at any of those extents at all -- a completely
+      // different finding from "rows exist and none of them draw", and the two
+      // must not collapse into the same silence.
+      //
+      // 1280x720 is also the scene render-target extent, so a row at that shape
+      // is not on its own the video asset. Read the ADDRESSES: FE_Smoke's
+      // 1280x430 resolve lands at phys 0x1BE95000.
+      {
+        std::string vrows;
+        size_t bound_never_drawn = 0;
+        std::lock_guard<std::mutex> lk(g_videoShapeMu);
+        for (const auto& [addr, r] : g_videoShapeRows) {
+          if (r.binds && !r.guest_draws_spanned) ++bound_never_drawn;
+          vrows += fmt::format(
+              " [0x{:08X} {}x{} obj0x{:08X} bind{} smp{:#x} seen{} span{}/{}win "
+              "dev0x{:08X} bt{}]",
+              addr, r.width, r.height, r.last_object, r.binds, r.sampler_mask,
+              r.slot_seen, r.guest_draws_spanned, r.bind_windows, r.last_device,
+              r.last_thread);
+        }
+        REXLOG_INFO("d3d9: VIDEO TARGET CONSUMPTION {} addresses at a "
+                    "_VideoRenderTarget extent, {} binds total, {} bound but "
+                    "never drawn with, {} rows dropped (map full) --{}",
+                    g_videoShapeRows.size(), g_videoShapeBinds,
+                    bound_never_drawn, g_videoShapeDropped,
+                    vrows.empty() ? " (none)" : vrows);
+      }
       REXLOG_INFO("d3d9: RESOLVE CONSUMPTION {} destinations, {} never asked "
                   "for, {} asked for but never reached a draw slot; draw "
                   "threads:{} --{}",
@@ -6849,6 +7005,11 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // nothing too, but only here, where a partly-written snapshot is standing by.
   uint32_t partial_snapshot_object = 0;
   const auto& texture_state = DeviceState().texture[guest_sampler];
+  // Unconditional, and BEFORE the resolve-destination branch. The material's
+  // texture need never have been resolved into, so gating this the way
+  // slot_seen is gated would make it a counter that cannot fire for exactly
+  // the case it exists to measure.
+  NoteVideoShapeSlot(texture_state.fetch, texture_state.valid);
   ResolvedTargetByAddress* resolve_entry = nullptr;
   if (texture_state.object &&
       g_resolvedTextureTargets.contains(texture_state.object)) {

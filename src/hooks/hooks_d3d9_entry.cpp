@@ -1577,6 +1577,20 @@ extern "C" REX_FUNC(sub_8254E748) {
       }
     }
   }
+
+  // Is the texture the FE_Smoke quad's MATERIAL names ever sampled? Keyed by
+  // base address and NOT restricted to resolve destinations -- see the block
+  // comment on NoteVideoShapeBind. Takes a lock, but only past a shape test
+  // that rejects every bind in the game bar a handful.
+  //
+  // Deliberately AFTER the device-fetch-file cross-check above, so it reads the
+  // corrected constants. Placed before it, this would silently miss every bind
+  // that took the s_device_fallback path -- and it would miss them by reading
+  // `valid == false`, which is indistinguishable here from "not a texture".
+  if (sampler < mx::hle::kMaxSamplers) {
+    const auto& binding = DeviceState().texture[sampler];
+    NoteVideoShapeBind(sampler, texture, binding.fetch, binding.valid, device);
+  }
 }
 
 //-----------------------------------------------------------------------------
