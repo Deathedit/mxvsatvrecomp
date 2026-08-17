@@ -48,6 +48,7 @@ set(MX_SOURCES
     src/hooks/hooks_plugin_diag.cpp
     src/hooks/hooks_d3d9.cpp
     src/hooks/hooks_d3d9_entry.cpp
+    src/hooks/texture_dump.cpp
 )
 
 if(WIN32)
@@ -61,7 +62,9 @@ rexglue_setup_target(mx)
 # Export mid-ASM hook functions so generated code (with dllimport) can find them
 target_link_options(mx PRIVATE "LINKER:/EXPORT:NativeGameTickSkip" "LINKER:/EXPORT:NativeSetupDeviceSkip" "LINKER:/EXPORT:NativeSkipVtable8" "LINKER:/EXPORT:NativeSkipVtable17" "LINKER:/EXPORT:NativeSkipRendererInit" "LINKER:/EXPORT:NativeSkipLoaderRenderer" "LINKER:/EXPORT:NativeSkipLoaderEarly" "LINKER:/EXPORT:NativeSkipLoaderAll" "LINKER:/EXPORT:NativeSkipRendererDispatch" "LINKER:/EXPORT:NativePreDispatchLog" "LINKER:/EXPORT:NativePostLazyInitLog")
 
-target_link_libraries(mx PRIVATE d3d12 dxgi dxguid d3dcompiler winmm)
+# windowscodecs: WIC, for the PNG encoder in src/hooks/texture_dump.cpp. Ships
+# with Windows, so this adds no dependency to fetch or vendor.
+target_link_libraries(mx PRIVATE d3d12 dxgi dxguid d3dcompiler winmm windowscodecs)
 
 # src/ on the include path so cross-layer includes name their layer:
 #   #include "gpu/pm4_parser.h", #include "gfx/d3d12_renderer.h"

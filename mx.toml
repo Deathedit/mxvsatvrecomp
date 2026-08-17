@@ -45,3 +45,14 @@
 # (2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 11 -> 2) instead of parking at 6. Pair it
 # with force_load. Diagnostic only. See AGENTS.md "the registry chokepoint".
 # registry_override = "ReadyToLaunch=1"
+# Write every decoded guest texture to logs/texdump as a PNG, one per distinct
+# fetch constant (and per rewrite, for atlases the guest repacks in place), plus
+# an index.txt naming each file's format, address, sampler and size. The colour
+# image is forced opaque and a `_alpha.png` is written beside it when the alpha
+# channel varies, so a UI atlas whose shape lives entirely in alpha is readable.
+#
+# Only textures that are BOUND TO A SAMPLER appear. A resolve destination the
+# guest renders and never samples produces no file. Bink planes are excluded.
+# Encodes on the draw thread; expect a hitch per new texture. Diagnostic only.
+# Also available as --texture_dump=true.
+# texture_dump = true

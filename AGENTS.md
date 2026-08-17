@@ -674,7 +674,12 @@ PM4 and vertex-declaration dumps wrote next to the executable instead, where
 | `logs/hlsldump/` | per-shader HLSL, guest microcode, DXBC disassembly | wiped once per process |
 | `logs/decldump/decls.txt` | vertex declarations captured during load | truncated per run |
 | `logs/constdump/` | ALU constant files, per shader | accumulates |
-| `logs/texpng/` | decoded guest textures | accumulates |
+| `logs/texdump/` | decoded guest textures as PNG, plus `index.txt` | wiped once per process |
+
+`logs/texpng/` was listed here until 2026-08-17 and **nothing has ever written
+it** — the row survived from a dump that was removed. The real texture dump is
+`logs/texdump/`, off unless `texture_dump = true`; see `src/hooks/texture_dump.h`
+for what it can and cannot see (only textures that reach a sampler).
 
 The two "wiped once per process" directories are wiped **lazily, at the first
 dump of a run** — so a run that dumps nothing leaves the previous run's files
