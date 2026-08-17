@@ -11,10 +11,17 @@ with a host D3D12 renderer replacing the Xenos GPU. The `rexgpu-xenos` plugin is
 > path absent entirely. That narrative now lives in
 > [docs/renderer_history.md](docs/renderer_history.md); this file is the map.
 >
-> **This drift is the failure mode to watch.** Twice now the file has been
+> **Reconciled again 2026-08-17**, against the 54 commits since 08-12. Four
+> claims in "Current state" had become false — the stand-in rate, the ~30 fps
+> Present cap, an unverified `vs[226]` probe, and a "what is in front now" that
+> described a frame no longer being drawn. The architecture table still listed
+> two hooks that had been deleted.
+>
+> **This drift is the failure mode to watch.** Three times now the file has been
 > read as current while describing a renderer that no longer existed. When you
 > land a change that contradicts something here, fix it here in the same
-> commit.
+> commit — and see "Write comments that cannot go stale" under Method for the
+> phrasing that avoids the problem instead of paying it down later.
 
 **This file holds:** how to build and run, the architecture, the cvars and their
 defaults, and the method. Two companions hold the rest:
@@ -29,41 +36,80 @@ defaults, and the method. Two companions hold the rest:
 
 ---
 
-## Current state — 2026-08-12
+## Current state — 2026-08-17
 
-**The renderer now runs the game's own shaders.** `shader_hlsl.cpp` translates
-Xenos microcode to HLSL; ~73% of freeroam draws run guest pixel shaders. The
-stand-in path is the fallback, not the norm.
+**The renderer runs the game's own shaders, and the translator is no longer the
+bottleneck.** `shader_hlsl.cpp` turns Xenos microcode into HLSL; the stand-in
+path is the exception. Where a defect used to be "this shader did not
+translate", it is now almost always "this shader translated and was handed the
+wrong resource".
 
-Solved since this file was last accurate, each verified rather than inferred:
+Solved since 2026-08-12, each verified by pixels or by a reference, not inferred:
 
 | | cause | commit |
 |---|---|---|
-| Black main menu | D3D9 legacy multiply — `0 * INF` is `+0` on Xenos, NaN on host | `28d4853` |
-| White rider gear | `k_16_16(_16_16)` render targets are signed -32..32, not UNORM | `c3240a1` |
-| Collapsed exposure | guest reads the 1x1 resolve out of guest RAM, so it needs writing back | `cd7b293` |
-| Small textures wrong | 16px-and-under textures keep their base level in a packed mip tail | `4e03dd2` |
-| Worker draws unshaded | `DeviceState` was thread-local; three record workers saw no bound shader | `2706801` |
-| Heap corruption | three guest record workers, hooks now serialised, each with its own list | `7ff0ccf`, `71a6f01` |
+| Rider colour missing | a scalar ALU result was dropped when the write mask was clear | `0304a48` |
+| No mipmaps | only the base level was uploaded; the guest's chain is at `fetch.mip_address` | `c7740b4` |
+| Red screen / unlit scene | `tfetch3D` untranslated, and only 16 of 32 fetch constants were read | `5e176bd`, `fde31ea` |
+| Bike drawn behind the UI | `RB_DEPTHCONTROL` was never read; `z_write` was fabricated from `z_enable` | `93c0119` |
+| Filled quads / brake rotor | the alpha test was not honoured | `93c0119` |
+| Water surface flat | `setp_*_push` (opcodes 20–23) refused the whole shader | `dcd5a62` |
+| UI atlas 200ms/frame | an unreachable skip guard in the coverage path | `e9573a5` |
+| Ground missing 16% of frame | `0xFFFF` read as vertex 65535 instead of a strip cut | primitive restart |
 
-**Performance, measured 2026-08-12 in the main menu.** The render tick was
-1815 ms, of which 1031 ms was `AddGameDraw` and 743 ms was retirement — 97.7%
-allocator, GPU idle. `AddGameDraw` was creating up to 9 committed UPLOAD-heap
-resources per draw at ~683 µs each. Suballocating from a persistently-mapped ring
-(`db4fea9`) took the tick to **57–82 ms** and `CreateCommittedResource` to zero.
+**Performance, measured 2026-08-12 in the main menu — still the last full
+profile.** The render tick was 1815 ms, of which 1031 ms was `AddGameDraw` and
+743 ms was retirement — 97.7% allocator, GPU idle. `AddGameDraw` was creating up
+to 9 committed UPLOAD-heap resources per draw at ~683 µs each. Suballocating from
+a persistently-mapped ring (`db4fea9`) took the tick to **57–82 ms** and
+`CreateCommittedResource` to zero.
 
-**What is in front now.** A ~200 ms frame, of which `LOOP BY REASON` attributes
-121 ms to 133 draws with no pixel shader — 144,097 vertices on the CPU
-interpreter. Those draws have no pixel shader *bound at all*, which is legal:
-the guest's PM4 emitter carries the pixel microcode inside the **vertex** shader
-object at `vs + vs[226] + 872`, gated on `vs[218] & 0x20`. Not yet verified that
-`[226]` is pixel rather than alternate-vertex microcode — probe it before wiring
-it up.
+**Present no longer paces the guest.** `kPresentSyncInterval` is 0 and the fixed
+16 ms sleep is gone (`2e7f74b`); the earlier "~30 fps cap" in this file described
+`Present(1,0)` plus that sleep and is obsolete. A tick with no new guest draws is
+still skipped (`8bcb09a`) — the swapchain is flip-discard, so the last frame
+stays on screen. **Frame rate must be read from log timestamps, not from `FRAME
+COST` buckets**, and a renderer that has died reports as a plausible-looking low
+frame rate rather than as an error.
 
-**Present is capped at ~30 fps** by `Present(1,0)` plus a fixed 16 ms sleep, and a
-tick with no new guest draws is skipped entirely (`8bcb09a`) — the swapchain is
-flip-discard, so the last frame stays on screen. Frame rate must be read from log
-timestamps, not from `FRAME COST` buckets.
+**What is in front now — the open defects are all one shape.** Content is
+produced correctly and then not consumed correctly:
+
+- the **grey intro**: the Bink video decodes and draws real colour, the guest's
+  own clear to `0xFF808080` is correct, and then a final fullscreen composite
+  samples something degenerate and returns *bit-identical output at three
+  widely separated UVs*
+- the **menu backdrop**: `FE_Smoke` draws, resolves to a 1280x430 texture, and
+  is never sampled
+- **banded depth resolves**: both bands drawn, but the resolve names a third
+  surface object no draw ever bound
+
+None of these are translation failures. They are resource identity — we bind by
+D3D9 object handle and then repair the mapping with heuristics (`aliasedSource`,
+`msaaPartner`, `contains`, `blank_exact`, `addr_match`, the binding scoring
+switch, `SLOT MAP`). Each heuristic works until it doesn't.
+
+**A replacement for that layer is being evaluated — see "The Xenia Edge shader
+bridge" below.** Read it before starting new work on the translator or on the
+binding heuristics; both are candidates for deletion.
+
+**Three shaders currently translate WRONG rather than not at all**, which is
+worse than a refusal because they render confidently: `ps_267BFA20`,
+`ps_267D2620` and `vs_27084F60` walk `kCondExecPred` blocks as plain execs, so
+bodies the console gated on `p0` run unconditionally.
+
+**The alpha-test stand-in count is not a regression — resolved 2026-08-17 from
+`mx_1279` without a new run.** It reads `STAND-IN 0` after `93c0119` and
+`STAND-IN 125` later, and both are from the *same run*: the counter held at 0
+for four and a half minutes across 296,529 honoured draws, then went 0 -> 14 ->
+125 in three seconds and stayed flat. The ALU constant file crosses
+`483 -> 494 distinct constants` in the same window, so a new shader set entered
+the frame and brought 125 draws (0.03%) the alpha test cannot honour.
+
+Worth keeping as a worked example: **two readings of one counter, four minutes
+apart in one run, look exactly like a regression across two runs.** Trace a
+counter's whole timeline before comparing endpoints, and see
+[[measure-the-right-population]].
 
 ---
 
@@ -261,9 +307,10 @@ name their layer: `#include "gpu/pm4_parser.h"`.
 | `src/gpu/shader_alu.*` | Vertex shader ALU interpreter (the CPU fallback for untranslated draws) |
 | `src/hooks/hooks_d3d9.cpp` | The D3D9 HLE layer — the largest file in the project |
 | `src/hooks/hooks_frame.cpp` | VdSwap, XenosWait, Begin/EndFrame, GpuState |
-| `src/hooks/hooks_boot.cpp` | Bootstrap, GraphicsInit, EngineInit, TexManager, GpuAlloc |
+| `src/hooks/hooks_boot.cpp` | Bootstrap, GraphicsInit, TexManager, GpuAlloc |
 | `src/hooks/hooks_loading.cpp` | SetupRenderer, Transition, LoaderTick |
-| `src/hooks/hooks_gameloop.cpp` | MainLoop, RenderPipeline |
+| `src/hooks/hooks_gameloop.cpp` | RenderPipeline |
+| `src/hooks/hooks_wait.cpp` | Two guest-wait passthroughs, nothing else |
 | `src/hooks/hooks_plugin_diag.cpp` | Registry hooks, load-state-machine probes, script-VM probes |
 | `src/hooks/midasm_stubs.cpp` | Exported mid-ASM hook targets (must stay at global namespace) |
 | `src/hooks/native_bridge.*` | `NativeGraphics` singleton, `g_plugin_mode` |
@@ -292,6 +339,65 @@ attributed to vertex work rather than to the shader.
 
 `LOOP BY REASON` in the log is the breakdown of why draws fell back, with the
 vertex count and milliseconds each reason cost.
+
+### The Xenia Edge shader bridge — evaluated 2026-08-17, not yet adopted
+
+**Before starting work on `shader_hlsl.cpp`, `shader_alu.cpp`, `shader_ucode.cpp`
+or the binding heuristics, read this. All of them are deletion candidates.**
+
+The sibling project at `C:\Users\VM\Desktop\sr` links **Xenia's real
+`DxbcShaderTranslator`** rather than hand-writing one.
+`tools/xenia_edge_bridge/xenia_edge_shader_bridge.cpp` is 266 lines of C ABI over
+`DxbcShader` + `DxbcShaderTranslator`, built as `shaders.dll` from 13 Xenia
+source files (tree at `C:/xenia-edge`) plus ~60 lines of stubs. It emits SM 5.1
+DXBC directly, so FXC never runs.
+
+Measured 2026-08-17 against **our** corpus,
+`C:\Users\VM\Desktop\xenia_dump\shaders_dump_mx` — 226 pixel + 75 vertex.
+(`shaders_dump` beside it is Saints Row's, not ours.)
+
+    translated 301/301   REJECTED 0   valid DXBC on all 301
+    62ms total — median 0.14ms, p95 0.59ms, max 1.40ms
+
+Confirmed against a second, independent corpus — **our own** `logs/hlsldump`,
+which is what the runtime actually encountered rather than what Xenia happened
+to trace. 302 of its 420 files carry a `=== GUEST MICROCODE ===` section:
+
+    translated 302/302   (pixel 184/184, vertex 118/118)   REJECTED 0
+
+Different population from the Xenia dump (226/75 there, 184/118 here), same
+result. Against FXC's 18–145 ms per shader, either corpus translates end to end
+in less time than a single FXC compile — which would retire the persistent DXBC
+cache along with the translator.
+
+The harness is `scratchpad/bridge_corpus.py`: ctypes over `shaders.dll`, no
+compiler needed, and it reads both corpus layouts. It is falsifiable —
+byte-swapping the microcode takes it red at once.
+
+**The translator is not the real prize.** `sr` had Bink and most of its UI
+running in 1–2 hours, because of `d3d12_renderer.cpp:1499`: the *shader* declares
+which fetch constant it reads, the *fetch constant* names the guest address and
+format, and the texture is decoded from there. Nothing is guessed. That removes
+the *need* for our binding heuristics rather than improving them.
+
+Carry these into any adoption:
+
+- **The bridge access-violates on malformed microcode** — it does not return an
+  error. Its `try/catch` catches C++ exceptions; an AV is SEH and goes past it.
+  Harmless in `sr` (microcode from files), not here (live guest memory).
+- `sr` fills `std::array<uint32_t,148> system_constants` **by raw index**, rest
+  zero, with no compile-time check. Add `static_assert`s against Xenia's struct.
+- **Byte-exactness against Xenia is NOT established and must not be claimed.**
+  The bridge is deliberately bindful; Xenia's dump is bindless, so `RDEF` and
+  `SHEX` differ by construction. `ISGN`/`OSGN`/`SFI0` *are* byte-identical, so
+  the interface matches and only binding strategy diverges.
+- Step 0 proves **no coverage gap**. It does not prove the output renders
+  correctly — that lives in the binding contract.
+
+Order if adopted: (1) bridge + guest root signature, (2) texture binding by fetch
+constant — where the deletions land, (3) shared-memory SRV/UAV, separable and
+last. Expect (1)–(2) to take out two-thirds of the renderer with nothing on
+screen for a stretch.
 
 ---
 
@@ -519,6 +625,19 @@ comfortably and will report healthy no matter how wrong the cap is.
 Note the D3D9 hook logs ~53 distinct render-target *objects* — only some become
 routable targets, so that number is not the one to compare against the cap.
 
+**The translated-PSO cache has the same shape and the same silent failure.**
+`kMaxTranslatedPSOs` was 256 and is **4096** since `b38e350`; when it fills,
+every new shader/state combination from that point renders as a stand-in. It now
+says so once, loudly, instead of failing quietly. `mx_1264` was the evidence:
+331,785 of 1,312,382 draws — 25% — were lost to the old cap. Runs since have
+plateaued around 205, so the raised cap is untested by anything but the number
+that justified it.
+
+Both caps share a lesson worth stating once: **a resource cap that falls back to
+something that still paints is invisible in the picture.** It shows up as the
+wrong thing being drawn, never as an error, and only a counter that names the
+refusal will find it.
+
 ## Guest architecture
 
 Base address, engine state pointers, the asset load state machine that
@@ -542,12 +661,44 @@ package heaps only dump) and the IDA scripts (listed in
 `out/asset_catalog.json`, 23,183 assets indexed — that catalog is how the 57-asset
 MXUI script list above was obtained.
 
-**RenderDoc integration was removed on 2026-08-12 (`9e76958`).** The
+### Where runtime dumps land
+
+**Everything goes under `logs/`, one directory per kind.** Until 2026-08-17 the
+PM4 and vertex-declaration dumps wrote next to the executable instead, where
+137 files (14 MB) had accumulated in the project root — invisible because
+`.gitignore` covered them.
+
+| directory | what | lifetime |
+|---|---|---|
+| `logs/pm4dump/` | `<tag>_frame_NN.txt`, `<tag>_swap_NN.txt` — parsed PM4 for spot-check swaps | wiped once per process |
+| `logs/hlsldump/` | per-shader HLSL, guest microcode, DXBC disassembly | wiped once per process |
+| `logs/decldump/decls.txt` | vertex declarations captured during load | truncated per run |
+| `logs/constdump/` | ALU constant files, per shader | accumulates |
+| `logs/texpng/` | decoded guest textures | accumulates |
+
+The two "wiped once per process" directories are wiped **lazily, at the first
+dump of a run** — so a run that dumps nothing leaves the previous run's files
+intact to be read. Both are named in ways that repeat or collide across runs,
+which is what makes the wipe necessary; a stale file from an earlier binary
+being read as evidence about the current one has cost real time before.
+
+**PM4 dumps are written on swaps 1–20, 300, 600, 1000, then every 500** —
+not every frame.
+
+**In-tree RenderDoc integration was removed on 2026-08-12 (`9e76958`).** The
 `--rdoc_capture_frame=N` cvar and the in-application capture trigger are gone.
-Several findings below were made with it and are still valid as findings; the
-method is simply no longer available in-tree. Nothing in this file's run lines
-should carry that flag — unknown cvars are tolerated, so it would run and
-silently do nothing.
+Nothing in this file's run lines should carry that flag — unknown cvars are
+tolerated, so it would run and silently do nothing.
+
+**RenderDoc itself is very much still the tool of choice**, via the external UI
+and the RenderDoc MCP: `.rdc` files open and replay, and `pixel_history`,
+`debug_pixel`, `pick_pixel` and `export_render_target` all work against them.
+Ask for a capture instead of adding instrumentation — several of 08-15..08-17's
+findings came straight out of one. Two traps worth carrying:
+`pick_pixel(eventId)` shows state *after* that event, so use `pixel_history`
+when the question is "which event wrote this pixel"; and an exported PNG shows
+alpha-0 pixels as white, so confirm colours with `pick_pixel`, never from an
+image.
 
 ### Headless IDA
 
@@ -578,3 +729,39 @@ Two corollaries:
   sat unexplained for rounds; building the probe that said *which* draw failed
   resolved it immediately. The same move found the c255 constant and the script
   VM.
+
+### Write comments that cannot go stale
+
+This project moves fast enough that any comment describing how things *are* is
+wrong within days, and a confidently wrong comment costs more than no comment.
+The fix is not to write fewer of them — it is to write the kind that stays true.
+
+**Never write a bare present-tense claim about behaviour. Date it, and say what
+was measured.**
+
+    BAD   // ~73% of freeroam draws run guest pixel shaders.
+    GOOD  // Measured 2026-08-12 (mx_1043, menu): 73% of draws ran guest
+          // pixel shaders; the rest fell to the stand-in.
+
+The second never becomes false — it is a record of an observation, and a reader
+five days later can see its age and decide whether to re-measure. The first
+silently rots into a lie. Every comment in this codebase that has had to be
+retracted was of the first kind; the dated measurements have all held up.
+
+The same rule is why this file's "Current state" section carries a date in its
+heading, and why that date is the first thing to distrust. **This file has now
+been read as current while describing a renderer that no longer existed three
+times** — 08-05, 08-12, and again on 08-17, when it still claimed a ~30 fps
+Present cap that had been removed and a `vs[226]` probe that had since been done.
+When you land a change that contradicts something here, fix it here in the same
+commit.
+
+Two things that follow:
+
+- **Explain *why*, not *what*.** The what is in the code and changes with it;
+  the why is a fact about the guest or the hardware and usually does not. A
+  comment recording that Xbox `D3DBLEND` is not the PC enum, or that
+  `D3DCLEAR_ZBUFFER` is `0x10`, will be true forever.
+- **A comment that records a dead end is worth as much as one that records a
+  fix**, and it does not rot either. Several sections here exist only to stop
+  the same wrong turn being taken a third time.
