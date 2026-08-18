@@ -342,7 +342,7 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                 1, std::memory_order_relaxed);
             const uint64_t n =
                 s_maskDraws.fetch_add(1, std::memory_order_relaxed) + 1;
-            if ((n % 1000) == 0) {
+            if ((n % 20000) == 0) {
               std::string hist;
               uint64_t partial = 0;
               for (uint32_t m = 0; m < 16; ++m) {
