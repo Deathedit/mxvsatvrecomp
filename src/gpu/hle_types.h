@@ -642,6 +642,23 @@ struct DrawCall {
   // colour. They are fullscreen compositor passes, not pre-passes — 4.3 verts,
   // raw extent 2.01 ndc, 91.5% sampling a render target (51f3c80).
   //
+  // That census asked a BINARY question (zero vs non-zero) and so could not see
+  // partial masks at all — bits 0-3 are per-channel RGBA, and every consumer
+  // collapses them: graphics_system passes `(colour_mask & 0xF) != 0` and the
+  // renderer sets RenderTargetWriteMask to ALL or 0, so a guest mask of 0x1
+  // makes us write four channels. A raw 16-bucket histogram (mx_1329, 199,000
+  // draws) finally measured it:
+  //
+  //     0x0 = 66518   colour writes off (the depth-only passes)
+  //     0x7 = 1       RGB, alpha masked -- the ONLY partial mask in the run
+  //     0xF = 132481  all channels
+  //
+  // So the widening is real and fires exactly once in 199,000 draws. Do not
+  // spend time on it, and do not suspect it for anything that happens per
+  // frame: it was checked while hunting the black menu backdrop and cleanly
+  // exonerated. Keep the histogram in mind before re-asking a yes/no question
+  // of a field that has four bits.
+  //
   // Raw dwords, not decoded fields: the decode belongs next to the counters
   // that report it, and storing raw keeps a misread visible.
   uint32_t colour_mask = 0;    // RB_COLOR_MASK    0x2104, bits 0-3 = RGBA of RT0
