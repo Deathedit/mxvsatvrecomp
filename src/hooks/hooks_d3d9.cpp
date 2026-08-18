@@ -5895,8 +5895,26 @@ uint32_t ReadGuestGlobalPtr(uint8_t* base, uint32_t addr) {
 
 // Exact identity: the guest's own two Bink composite pixel shaders, read from
 // its globals. Not a heuristic on texture count or draw shape.
+REXCVAR_DEFINE_BOOL(d3d9_bink_disable, false, "Debug",
+                    "Disconnect the Bink decode path. The guest's video "
+                    "composite draws are then built like any other draw, with "
+                    "no YUV planes prepared, so videos render as whatever "
+                    "their bound textures happen to be. Diagnostic A/B only");
+
+// The single gate for the whole Bink path: both routing sites (the draw
+// builder and the deferred rebuild) call this before touching planes, so
+// returning false here disconnects decode, upload and the plane budget in one
+// place rather than stubbing three.
+//
+// Disconnecting is a DIAGNOSTIC, not a fix. The path is measured healthy --
+// `BINK PLANES 1886 calls = 1886 ok` and `yuv plane gate: 1876 prepared, 0
+// refused` -- so anything that changes when it is off is a change in what the
+// video draws do to the frame, not a repair of the decoder. With the cvar set,
+// the BINK PLANES line reports 0 calls, which is how the log shows the switch
+// actually took effect rather than the path merely being quiet.
 bool IsBinkCompositeDraw(uint32_t pixel_shader, uint8_t* base) {
   if (!pixel_shader) return false;
+  if (REXCVAR_GET(d3d9_bink_disable)) return false;
   return pixel_shader == ReadGuestGlobalPtr(base, kBinkPixelShaderYuv) ||
          pixel_shader == ReadGuestGlobalPtr(base, kBinkPixelShaderYuvAlpha);
 }
