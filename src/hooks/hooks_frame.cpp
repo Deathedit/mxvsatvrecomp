@@ -135,7 +135,8 @@ extern "C" REX_FUNC(sub_82566B58) {
   }
 
   // FRAME DRAWS. One line per swap, in BOTH modes, from the same counter
-  // family: guest entry calls, HLE draws queued, HLE draws dropped.
+  // family: guest entry calls, HLE draws ACCEPTED into the frame list, and HLE
+  // draws REFUSED.
   //
   // This is the measurement that decides where the missing menu backdrop lives.
   // mxmenu.rdc established the backdrop is not a draw we shade wrongly -- no 2D
@@ -144,9 +145,15 @@ extern "C" REX_FUNC(sub_82566B58) {
   //
   //   plugin guest > native guest   our layer suppresses guest submission
   //                                 upstream of the renderer
-  //   guest == queued (native)      the guest never submits it; guest state
-  //   guest >  queued + dropped     the draws vanish before BuildAndQueueDraw
-  //   dropped > 0                   we build and discard them
+  //   guest == accepted (native)    the guest never submits it; guest state
+  //   guest >  accepted + refused   draws vanish before BuildAndQueueDraw
+  //   refused > 0                   we build and discard them
+  //
+  // `accepted` is counted in FinishHleDraw, the point a built draw joins the
+  // frame's draw list. The first cut used the DEFERRED queue instead and
+  // reported `queued 0` on a native run whose capture holds 340 host draws --
+  // that queue only carries draws with no shader code yet, waiting on this
+  // frame's PM4 packets, and is legitimately zero on a normal frame.
   //
   // Printed EVERY swap and never sampled. Every previous attempt at this number
   // was gated or modulus-sampled and gave a wrong answer -- a native run ending
@@ -157,23 +164,24 @@ extern "C" REX_FUNC(sub_82566B58) {
   // The tag is `native`/`plugin`, so the two runs are told apart by the line
   // itself rather than by remembering which log is which.
   {
-    static uint64_t s_prev_guest = 0, s_prev_queued = 0, s_prev_dropped = 0;
+    static uint64_t s_prev_guest = 0, s_prev_accepted = 0, s_prev_refused = 0;
     const uint64_t guest = GuestDrawCalls();
-    const uint64_t queued = HleDrawsQueued();
-    const uint64_t dropped = HleDrawsDropped();
+    const uint64_t accepted = HleDrawsAccepted();
+    const uint64_t refused = HleDrawsRefused();
     const uint64_t d_guest = guest - s_prev_guest;
-    const uint64_t d_queued = queued - s_prev_queued;
-    const uint64_t d_dropped = dropped - s_prev_dropped;
+    const uint64_t d_accepted = accepted - s_prev_accepted;
+    const uint64_t d_refused = refused - s_prev_refused;
     s_prev_guest = guest;
-    s_prev_queued = queued;
-    s_prev_dropped = dropped;
-    REXLOG_INFO("{}: FRAME DRAWS #{} guest {} queued {} dropped {} "
-                "(unbuilt {}); cumulative guest {} queued {} dropped {}",
+    s_prev_accepted = accepted;
+    s_prev_refused = refused;
+    REXLOG_INFO("{}: FRAME DRAWS #{} guest {} accepted {} refused {} "
+                "(unbuilt {}); cumulative guest {} accepted {} refused {}",
                 mx::native::g_plugin_mode ? "plugin" : "native", swap_count,
-                d_guest, d_queued, d_dropped,
-                d_guest > d_queued + d_dropped ? d_guest - d_queued - d_dropped
-                                               : 0,
-                guest, queued, dropped);
+                d_guest, d_accepted, d_refused,
+                d_guest > d_accepted + d_refused
+                    ? d_guest - d_accepted - d_refused
+                    : 0,
+                guest, accepted, refused);
   }
 
   if (swap_count <= 5) REXLOG_INFO("native: VdSwap #{} ENTER", swap_count);

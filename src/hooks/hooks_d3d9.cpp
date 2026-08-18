@@ -1482,6 +1482,18 @@ std::vector<PendingHleDraw> g_pendingHleDraws;
 void NoteQueueThread(uint32_t thread, bool is_resolve);
 void NoteResolvePosition(uint32_t dest, size_t index);
 uint64_t g_pendingQueued = 0, g_pendingApplied = 0, g_pendingDropped = 0;
+
+// Draws that actually reached the frame's draw list, and draws refused at the
+// last gate. Counted in FinishHleDraw, which is where a built draw becomes a
+// draw the renderer will issue.
+//
+// The FIRST version of the FRAME DRAWS line used g_pendingQueued for this and
+// reported `queued 0` on a native run whose capture plainly contains 340 host
+// draws. g_pendingQueued counts only the DEFERRED path -- draws with no shader
+// code yet, waiting on this frame's PM4 packets -- and on a normal frame that
+// is legitimately zero. It looked like the queue point because it sits at a
+// push_back; it is the wrong population.
+uint64_t g_hleDrawsAccepted = 0, g_hleDrawsRefused = 0;
 constexpr size_t kMaxPendingHleDraws = 2048;
 
 // Vertex shader object layout, read out of sub_82565928's VS branch at
@@ -1836,10 +1848,12 @@ bool FinishHleDraw(mx::hle::DrawCall& dc) {
   mx::hle::HleSkip skip = mx::hle::HleSkip::kNone;
   if (!mx::hle::FinalizeHleTopology(dc, skip)) {
     ++mx::hle::HleSkipCounts()[uint32_t(skip)];
+    ++g_hleDrawsRefused;
     return false;
   }
   NoteShaderlessDraw(dc);
   mx::hle::HleFrameDraws().push_back(std::move(dc));
+  ++g_hleDrawsAccepted;
   return true;
 }
 
@@ -9314,5 +9328,10 @@ uint64_t GuestDrawCalls() {
   return mx::hooks::d3d9::g_guestDrawCalls.load(std::memory_order_relaxed);
 }
 
-uint64_t HleDrawsQueued() { return mx::hooks::d3d9::g_pendingQueued; }
-uint64_t HleDrawsDropped() { return mx::hooks::d3d9::g_pendingDropped; }
+uint64_t HleDrawsAccepted() { return mx::hooks::d3d9::g_hleDrawsAccepted; }
+uint64_t HleDrawsRefused() {
+  // Both last-gate refusals and the deferred path's own discards, because a
+  // draw lost either way is a draw the renderer never issues and the caller is
+  // asking "did we lose it", not "where".
+  return mx::hooks::d3d9::g_hleDrawsRefused + mx::hooks::d3d9::g_pendingDropped;
+}
