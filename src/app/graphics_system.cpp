@@ -9,6 +9,7 @@
 #include <chrono>
 #include <iterator>
 #include <map>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -319,6 +320,44 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
           ++addDrawCalls;
           const int32_t scissor[4] = {d->scissor_left, d->scissor_top,
                                       d->scissor_right, d->scissor_bottom};
+          // COLOUR MASK census. RB_COLOR_MASK bits 0-3 are per-channel RGBA,
+          // but every consumer of it collapses to a boolean -- the argument
+          // below is `(colour_mask & 0xF) != 0`, and the renderer then sets
+          // RenderTargetWriteMask to ALL or 0. A guest mask of, say, 0x1
+          // (red only) makes us write all four channels.
+          //
+          // Whether that ever HAPPENS has never been measured, and could not
+          // be read off any existing log: the one census on record split draws
+          // into "colour_mask 0" (175) and "want colour" (4024), which is the
+          // same collapse -- a partial mask counts as "want colour" and is
+          // invisible. So this histograms the raw 4-bit value, all sixteen
+          // buckets, rather than asking the yes/no question again.
+          //
+          // Reported unconditionally, including the all-zero case, so "no
+          // partial masks exist" and "the census never ran" stay distinct.
+          {
+            static std::atomic<uint64_t> s_maskHist[16]{};
+            static std::atomic<uint64_t> s_maskDraws{0};
+            s_maskHist[d->colour_mask & 0xFu].fetch_add(
+                1, std::memory_order_relaxed);
+            const uint64_t n =
+                s_maskDraws.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((n % 20000) == 0) {
+              std::string hist;
+              uint64_t partial = 0;
+              for (uint32_t m = 0; m < 16; ++m) {
+                const uint64_t c =
+                    s_maskHist[m].load(std::memory_order_relaxed);
+                if (!c) continue;
+                hist += fmt::format(" 0x{:X}={}", m, c);
+                if (m != 0u && m != 0xFu) partial += c;
+              }
+              REXLOG_INFO("gfx: COLOUR MASK census {} draws, {} PARTIAL "
+                          "(neither 0 nor 0xF -- these are the ones we widen "
+                          "to RGBA) --{}",
+                          n, partial, hist.empty() ? " (none)" : hist);
+            }
+          }
           m_renderer->AddGameDraw(d->vertices.data(),
                                   static_cast<uint32_t>(d->vertices.size()),
                                   d->vertex_stride, d->indices.data(),
