@@ -361,6 +361,36 @@ across `0x8246Axxx`, `0x829Exxxx`, `0x82ACxxxx`-`0x82AFxxxx`, `0x82B0xxxx` and
 `0x82B1xxxx` — UI and particles as well as video. Any host layer that hooks only
 the two named draws is blind to all of it.
 
+### `BeginVertices` / `EndVertices` — a FOURTH draw path, still unhooked
+
+`sub_825556C8` above is not merely a ring-space reservation: **it emits the PM4
+draw packet itself**, `v25[5] = primType & 0x3F | (count << 16) | 0x80`, and
+returns a guest pointer for the caller to write inline vertices into.
+`sub_825556B8` closes it. So a caller that uses the pair DIRECTLY never enters
+`DrawVerticesUP` either, and is invisible to a layer hooking the three named
+draws.
+
+The engine's UI does exactly that, via `sub_82B27390` (reached from
+`sub_82B296B0`, which sets the D3D9 state):
+
+```
+sub_82B27390(geom)
+  n = geom[1]
+  p = sub_825556C8(dev, geom[2], n, 12)   // BeginVertices -> write pointer
+  memcpy(p, geom[3], 12 * n)
+  sub_825556B8(dev)                       // EndVertices
+```
+
+Measured consequence: every stage of the UI submit passes and
+`GuestDrawCalls()` never moves — 0 of 2816 render entries moved it.
+
+**A hook for this exists but is NOT on the main branch.** It is parked on
+`begin-vertices-hook` (commit `de8bf3b`), gated behind `--d3d9_begin_vertices`,
+default off. It fires correctly (16 draws logged to `decls.txt`, prim 13,
+4 verts, stride 12) but does not yet make the intro logo appear, and it exposed
+an intermittent crash in `sub_8234CE20`. Reapply with `git cherry-pick`. Full
+write-up in the memory note `ui-draws-bypass-hooked-entry-points`.
+
 Open flags, read statically out of `sub_8234E0A8`: `a4=1` gives `0x00102400`
 (`0x2000|0x100400`); `a4=0` gives `0x01100400`, the branch that first calls
 `sub_82CEB3F0(10485760)`.
