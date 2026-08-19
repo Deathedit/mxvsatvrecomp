@@ -51,6 +51,7 @@ set(MX_SOURCES
     src/hooks/hooks_plugin_diag.cpp
     src/hooks/hooks_ui_probe.cpp
     src/hooks/hooks_d3d9.cpp
+    src/hooks/hooks_d3d9_texture.cpp
     src/hooks/hooks_d3d9_entry.cpp
     src/hooks/texture_dump.cpp
 )
