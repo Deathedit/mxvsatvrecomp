@@ -1121,9 +1121,13 @@ uint32_t GpuPhysicalAddress(uint32_t address) {
 // extent. This was silent, and a resolve lost here is indistinguishable
 // downstream from a texture the guest never filled.
 uint64_t g_resolveDroppedNoSource = 0;
-uint64_t g_resolveAddressMatches = 0;   // blanks rescued by the address match
-uint64_t g_resolveAddressExtentMiss = 0;  // same address, different extent
-uint64_t g_resolveAddressPartial = 0;  // matched, but barely written by the GPU
+// One object rather than three loose counters, so a split publishes one symbol.
+struct ResolveAddressCensus {
+  uint64_t matches = 0;      // blanks rescued by the address match
+  uint64_t extentMiss = 0;   // same address, different extent
+  uint64_t partial = 0;      // matched, but barely written by the GPU
+};
+ResolveAddressCensus g_resolveAddr;
 
 // Whether a resolve destination is worth sampling as a snapshot at all.
 //
@@ -1161,7 +1165,7 @@ bool ResolvedDestinationIsMostlyWritten(uint32_t dest_object) {
       uint64_t(it->second.reached_x) * it->second.reached_y;
   const uint64_t full = uint64_t(it->second.width) * it->second.height;
   if (!full || reached * 4 >= full) return true;
-  ++g_resolveAddressPartial;
+  ++g_resolveAddr.partial;
   static std::set<uint32_t> s_logged;
   if (s_logged.insert(dest_object).second && s_logged.size() <= 8) {
     REXLOG_INFO("d3d9: resolve dest 0x{:08X} phys 0x{:08X} {}x{} reached only "
@@ -1355,7 +1359,7 @@ const ResolvedTargetByAddress* ResolvedTargetForAddress(
   }
   if (it->second.width != described.width ||
       it->second.height != described.height) {
-    ++g_resolveAddressExtentMiss;
+    ++g_resolveAddr.extentMiss;
     static uint64_t s_logged = 0;
     if (++s_logged <= 8) {
       REXLOG_INFO("d3d9: resolve phys 0x{:08X} matched but extent differs: "
@@ -2749,13 +2753,12 @@ void ScoreDraw(bool indexed, uint32_t first, uint32_t count,
 // against the search's 0%. The vertex blob at +0x368 is no longer collected at
 // all; only the pixel-shader blob below is still read.
 //
-// If a future change needs the offset again, use `g_patchedCode`, not a
+// If a future change needs the offset again, use `g_patch.patched`, not a
 // content search. The search was only ever a way to work around not having
 // the code.
 //---------------------------------------------------------------------------
 constexpr uint32_t kMaxBlobDwords = 4096;   // 16 KB ceiling on one blob
 
-std::map<uint32_t, std::vector<uint32_t>> g_psBlobs;
 
 
 
@@ -2833,9 +2836,14 @@ constexpr uint32_t kPhysProbeDwords = 256;
 // shader handle and reused, because the offset is a property of the layout.
 constexpr uint32_t kPatchWindowBack = 128;   // dwords captured before dest
 
-uint64_t g_vsWindowAgree = 0, g_vsWindowDisagree = 0, g_vsWindowNoField = 0;
-uint64_t g_vsWindowAtDest = 0, g_vsWindowEarly = 0, g_vsWindowLate = 0;
-uint64_t g_vsWindowLenRejected = 0;
+// One object rather than seven loose counters, so a split publishes one symbol.
+// Values and meanings unchanged.
+struct VsWindowCensus {
+  uint64_t agree = 0, disagree = 0, noField = 0;
+  uint64_t atDest = 0, early = 0, late = 0;
+  uint64_t lenRejected = 0;
+};
+VsWindowCensus g_vsWindow;
 
 struct PatchedCode {
   std::vector<uint32_t> code;   // host-endian, from dest - kPatchWindowBack*4
@@ -2848,8 +2856,15 @@ struct PatchedCode {
 
 // Winning start, as a signed dword distance from dest. The histogram is the
 // finding: one value across every shader means a fixed layout.
-std::map<int32_t, uint64_t> g_patchCodeOffsets;
-std::map<uint32_t, PatchedCode> g_patchedCode;   // shader handle -> latest
+// One object rather than three containers. g_patch.psBlobs moved down here from its
+// original site ~100 lines earlier so that all three live together and the
+// struct can be declared after PatchedCode.
+struct ShaderPatchState {
+  std::map<uint32_t, std::vector<uint32_t>> psBlobs;
+  std::map<int32_t, uint64_t> codeOffsets;
+  std::map<uint32_t, PatchedCode> patched;   // shader handle -> latest
+};
+ShaderPatchState g_patch;
 
 uint32_t ReadPatchFetchCount(uint32_t self, uint32_t variant, uint8_t* base);
 
@@ -3032,7 +3047,8 @@ uint64_t g_hleShaderBadAttribute = 0;
 // having only once one bucket is known to dominate.
 uint64_t g_phaseVertexUs = 0;   // ApplyShaderOutputs, all of it
 uint64_t g_phaseInterpUs = 0;   // the software vertex shader inside it
-uint64_t g_phaseTextureUs = 0;  // describe + copy + decode, per draw
+// The texture bucket of this breakdown is g_tex.phaseUs, defined with the
+// rest of the texture counters below.
 uint64_t g_phaseDrawCount = 0;
 uint64_t g_phaseVertexLoopUs = 0;  // the per-vertex loop alone
 
@@ -3076,10 +3092,22 @@ struct PhaseTimer {
 // (HleTextureHasNonzeroData, then HleTextureIsConstant). Counted separately
 // from the decode because they are OURS, not the guest's, and a 2048x2048 BC1
 // gets walked twice by them on top of being untiled.
-uint64_t g_texDescribeUs = 0, g_texStaleUs = 0, g_texCopyUs = 0;
-uint64_t g_texDecodeUs = 0, g_texScanUs = 0;
-uint64_t g_texSlotCalls = 0, g_texCacheHits = 0, g_texStaleEvicts = 0;
-uint64_t g_texDecodes = 0, g_texDecodedBytes = 0;
+// Grouped into one object rather than eleven loose globals, so that splitting
+// this file publishes ONE symbol instead of eleven. Nothing else changes: the
+// fields keep their meanings and their values, only the spelling of a reference
+// moves from `g_tex.decodeUs` to `g_tex.decodeUs`.
+//
+// g_tex.phaseUs joined as `phaseUs`. It is the texture bucket of the frame
+// cost and the only phase timer the texture code touches, so leaving it behind
+// would have meant publishing a second symbol for one counter.
+struct TextureStats {
+  uint64_t describeUs = 0, staleUs = 0, copyUs = 0;
+  uint64_t decodeUs = 0, scanUs = 0;
+  uint64_t slotCalls = 0, cacheHits = 0, staleEvicts = 0;
+  uint64_t decodes = 0, decodedBytes = 0;
+  uint64_t phaseUs = 0;  // was g_tex.phaseUs
+};
+TextureStats g_tex;
 
 // WHICH textures re-decode, and WHY the cache did not hold them.
 //
@@ -3106,8 +3134,12 @@ struct TexDecodeSite {
 };
 // Cumulative, NOT per frame: the question is whether the same texture repeats
 // across frames, which a per-frame counter cannot show.
-std::map<uint32_t, TexDecodeSite> g_texDecodeSites;
-std::set<std::pair<uint32_t, uint64_t>> g_texDecodeKeys;
+// One object rather than two containers, for the same reason as the counters.
+struct TexDecodeIndex {
+  std::map<uint32_t, TexDecodeSite> sites;
+  std::set<std::pair<uint32_t, uint64_t>> keys;
+};
+TexDecodeIndex g_texIndex;
 
 uint64_t g_liveVertexResolved = 0, g_liveVertexAmbiguous = 0;
 uint64_t g_liveVertexUnreadable = 0, g_liveVertexNoMatch = 0;
@@ -3201,9 +3233,9 @@ ShaderApplyResult ApplyShaderOutputs(
   // Shaders resident before that hook first fires may use the independently
   // validated live allocation fallback above.  The >=90% PM4 content match
   // remains diagnostic-only and is never a source for pixels.
-  auto pi = g_patchedCode.find(handle);
+  auto pi = g_patch.patched.find(handle);
   const PatchedCode* patchp =
-      pi != g_patchedCode.end() && pi->second.resolved ? &pi->second : nullptr;
+      pi != g_patch.patched.end() && pi->second.resolved ? &pi->second : nullptr;
   if (!patchp) patchp = CodeFromShaderObject(handle, base);
   if (!patchp) {
     ++g_hleShaderNoCode;
@@ -4340,7 +4372,7 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
   // busy frames -- the ones the whole change is about -- never appear at all.
   // That made an A/B look like a 30% win when the two runs had simply reached
   // different scenes.
-  if (finalize_us >= 20000 || g_phaseTextureUs >= 20000 ||
+  if (finalize_us >= 20000 || g_tex.phaseUs >= 20000 ||
       mx::hle::g_transcodeUs >= 20000 || g_phaseVertexUs >= 20000 ||
       g_phaseVertexCount >= 50000) {
     REXLOG_INFO("d3d9: FRAME COST {} draws {} verts | vertex {}ms = per-vertex "
@@ -4354,7 +4386,7 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
                      : 0),
                 mx::hle::g_transcodeUs / 1000, mx::hle::g_transcodeVerts,
                 g_transcodeDeferred, g_transcodeLate, g_transcodeLost,
-                g_phaseTextureUs / 1000, finalize_us / 1000);
+                g_tex.phaseUs / 1000, finalize_us / 1000);
     // Inside the texture bucket. Printed beside it for the same reason as
     // LOOP BY REASON below: the parts must be checkable against the total
     // rather than trusted on their own. describe + stale + copy + decode +
@@ -4364,16 +4396,16 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
         "d3d9: TEXTURE COST {} slot calls -- describe {}ms, stale-check {}ms, "
         "copy {}ms, decode {}ms, scan {}ms | {} cache hits, {} stale evictions,"
         " {} decodes over {} KB",
-        g_texSlotCalls, g_texDescribeUs / 1000, g_texStaleUs / 1000,
-        g_texCopyUs / 1000, g_texDecodeUs / 1000, g_texScanUs / 1000,
-        g_texCacheHits, g_texStaleEvicts, g_texDecodes,
-        g_texDecodedBytes / 1024);
+        g_tex.slotCalls, g_tex.describeUs / 1000, g_tex.staleUs / 1000,
+        g_tex.copyUs / 1000, g_tex.decodeUs / 1000, g_tex.scanUs / 1000,
+        g_tex.cacheHits, g_tex.staleEvicts, g_tex.decodes,
+        g_tex.decodedBytes / 1024);
     // The repeat offenders, cumulative, worst first. Three textures own this
     // whole bucket; this names them and says why each one misses.
     {
       std::vector<std::pair<uint32_t, const TexDecodeSite*>> worst;
-      worst.reserve(g_texDecodeSites.size());
-      for (const auto& [addr, s] : g_texDecodeSites) worst.emplace_back(addr, &s);
+      worst.reserve(g_texIndex.sites.size());
+      for (const auto& [addr, s] : g_texIndex.sites) worst.emplace_back(addr, &s);
       std::sort(worst.begin(), worst.end(), [](const auto& a, const auto& b) {
         return a.second->bytes > b.second->bytes;
       });
@@ -4388,7 +4420,7 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
             s.by_reason[1], s.by_reason[2]);
       }
       REXLOG_INFO("d3d9: TEXTURE REPEATS {} addresses:{}",
-                  g_texDecodeSites.size(), top.empty() ? " (none)" : top);
+                  g_texIndex.sites.size(), top.empty() ? " (none)" : top);
     }
     // RESOLVE CONSUMPTION. Every destination the guest has resolved into, and
     // whether it ever asked for it back through SetTexture.
@@ -4488,14 +4520,14 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
     g_loopUs[r] = g_loopVerts[r] = g_loopDraws[r] = 0;
   mx::hle::g_transcodeUs = mx::hle::g_transcodeVerts = 0;
   g_transcodeDeferred = g_transcodeLate = g_transcodeLost = 0;
-  g_phaseVertexUs = g_phaseInterpUs = g_phaseTextureUs = 0;
+  g_phaseVertexUs = g_phaseInterpUs = g_tex.phaseUs = 0;
   g_phaseVertexLoopUs = g_phaseVertexCount = 0;
   // Per frame, like every other bucket here -- these are a frame's cost, not a
   // run's, and the report above has already consumed them.
-  g_texDescribeUs = g_texStaleUs = g_texCopyUs = 0;
-  g_texDecodeUs = g_texScanUs = 0;
-  g_texSlotCalls = g_texCacheHits = g_texStaleEvicts = 0;
-  g_texDecodes = g_texDecodedBytes = 0;
+  g_tex.describeUs = g_tex.staleUs = g_tex.copyUs = 0;
+  g_tex.decodeUs = g_tex.scanUs = 0;
+  g_tex.slotCalls = g_tex.cacheHits = g_tex.staleEvicts = 0;
+  g_tex.decodes = g_tex.decodedBytes = 0;
   g_phaseDrawCount = 0;
 }
 
@@ -5106,7 +5138,7 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
 
 void CollectPixelShaderBlob(uint32_t handle, uint8_t* base) {
   (void)base;
-  if (!handle || g_psBlobs.count(handle)) return;
+  if (!handle || g_patch.psBlobs.count(handle)) return;
   // D3DDevice_CreatePixelShader (0x82552148) copies the source header to
   // object+0x28, allocates pFunction[2] code bytes separately, and
   // sub_825506B0 stores that allocation at object+0x18. Pixel shader objects
@@ -5182,7 +5214,7 @@ void CollectPixelShaderBlob(uint32_t handle, uint8_t* base) {
                   blob.size() > 1 ? blob[1] : 0,
                   blob.size() > 2 ? blob[2] : 0);
     }
-    g_psBlobs.emplace(handle, std::move(blob));
+    g_patch.psBlobs.emplace(handle, std::move(blob));
   }
 }
 
@@ -5598,8 +5630,8 @@ const ResolvedPixelBinding* ResolvePixelProfile(uint32_t handle) {
   // left to find and the resolve is final on the first try.
   auto known = g_resolvedPixelBindings.find(handle);
   if (known != g_resolvedPixelBindings.end()) return &known->second;
-  auto bi = g_psBlobs.find(handle);
-  if (bi == g_psBlobs.end()) return nullptr;
+  auto bi = g_patch.psBlobs.find(handle);
+  if (bi == g_patch.psBlobs.end()) return nullptr;
 
   ResolvedPixelBinding resolved;
   const uint32_t* code = bi->second.data();
@@ -6635,8 +6667,8 @@ void ReportBoundZero() {
               "shader-published fetch: {} shaders, {} slots served",
               total, g_slotBoundZero, g_slotBoundUnbound,
               g_blankTextures.size(), outstanding,
-              by.empty() ? " none" : by, g_resolveAddressMatches,
-              g_resolveAddressExtentMiss, g_resolveDroppedNoSource,
+              by.empty() ? " none" : by, g_resolveAddr.matches,
+              g_resolveAddr.extentMiss, g_resolveDroppedNoSource,
               g_shaderFetchPublished.load(std::memory_order_relaxed),
               g_shaderFetchServed.load(std::memory_order_relaxed));
 }
@@ -7138,10 +7170,10 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   }
   HleTextureSource source;
   const char* why = nullptr;
-  ++g_texSlotCalls;
+  ++g_tex.slotCalls;
   bool described = false;
   {
-    PhaseTimer t(g_texDescribeUs);
+    PhaseTimer t(g_tex.describeUs);
     described = DescribeHleTexture2D(fetch, source, &why);
   }
   if (!described) {
@@ -7283,7 +7315,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // contradicts.
   if (addr_match) {
     out_objects[slot] = addr_match->dest_object;
-    ++g_resolveAddressMatches;
+    ++g_resolveAddr.matches;
     return true;
   }
 
@@ -7308,18 +7340,18 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     // through to a fresh decode; everything else is served from the cache.
     bool stale = false;
     {
-      PhaseTimer t(g_texStaleUs);
+      PhaseTimer t(g_tex.staleUs);
       stale = TextureContentStale(source, base, *cached->second);
     }
     if (!stale) {
-      ++g_texCacheHits;
+      ++g_tex.cacheHits;
       out_textures[slot] = cached->second;
       return true;
     }
     // Counted apart from a plain miss. A key that is present but keeps testing
     // stale is a re-decode every bind, which costs the same as having no cache
     // at all while looking like a working one from the outside.
-    ++g_texStaleEvicts;
+    ++g_tex.staleEvicts;
     miss_reason = TexMissReason::kStaleEvicted;
     g_hleCpuTextures.erase(cached);
   } else if (g_hleEmptyTextures.count(key)) {
@@ -7360,7 +7392,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   std::vector<uint8_t> guest;
   bool copied = false;
   {
-    PhaseTimer t(g_texCopyUs);
+    PhaseTimer t(g_tex.copyUs);
     copied = CopyTexturePhysical(source, base, guest);
   }
   if (!copied) {
@@ -7371,14 +7403,14 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   auto payload = std::make_shared<HleTexturePayload>();
   bool decoded_ok = false;
   {
-    PhaseTimer t(g_texDecodeUs);
+    PhaseTimer t(g_tex.decodeUs);
     decoded_ok =
         DecodeHleTexture2D(source, guest.data(), guest.size(), *payload, &why);
   }
-  ++g_texDecodes;
-  g_texDecodedBytes += guest.size();
+  ++g_tex.decodes;
+  g_tex.decodedBytes += guest.size();
   {
-    TexDecodeSite& site = g_texDecodeSites[source.address];
+    TexDecodeSite& site = g_texIndex.sites[source.address];
     ++site.decodes;
     site.bytes += guest.size();
     site.width = source.width;
@@ -7389,7 +7421,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     // than one means the same bytes are being decoded under several keys --
     // the fetch-constant hash splitting on sampler state -- which is a
     // different fix from a texture whose content genuinely changes.
-    if (g_texDecodeKeys.emplace(source.address, key).second)
+    if (g_texIndex.keys.emplace(source.address, key).second)
       ++site.distinct_keys;
   }
   if (!decoded_ok) {
@@ -7421,7 +7453,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // behind it is legal and is left alone; that restraint is what keeps this from
   // becoming the blanket substitution the notes above record as a regression.
   const bool decode_is_blank = [&] {
-    PhaseTimer t(g_texScanUs);
+    PhaseTimer t(g_tex.scanUs);
     return !HleTextureHasNonzeroData(*payload);
   }();
   uint8_t uniform_value = 0;
@@ -7434,7 +7466,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // Exactly the shape of [[counter-that-cannot-fire]], committed twice in one
   // session. Measure first, gate second.
   const bool decode_is_uniform = !decode_is_blank && [&] {
-    PhaseTimer t(g_texScanUs);
+    PhaseTimer t(g_tex.scanUs);
     return HleTextureIsConstant(*payload, &uniform_value);
   }();
   if (decode_is_uniform) {
@@ -7945,8 +7977,8 @@ void AttachTranslatedPixelShader(mx::hle::DrawCall& dc, uint32_t handle,
                     "resolve address matches {} (extent mismatches {}, "
                     "partial-coverage refusals {}), "
                     "blank textures {} still blank of {}",
-                    s_slotOk, s_slotShort, g_resolveAddressMatches,
-                    g_resolveAddressExtentMiss, g_resolveAddressPartial,
+                    s_slotOk, s_slotShort, g_resolveAddr.matches,
+                    g_resolveAddr.extentMiss, g_resolveAddr.partial,
                     blank_outstanding, g_blankTextures.size());
       }
     } else {
@@ -7966,7 +7998,7 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
                         uint32_t device, uint8_t* base,
                         mx::hle::PixelTextureBinding& binding) {
   using namespace mx::hle;
-  PhaseTimer phase_timer(g_phaseTextureUs);
+  PhaseTimer phase_timer(g_tex.phaseUs);
   static uint64_t s_attempts = 0, s_ready = 0, s_no_shader = 0;
   static uint64_t s_no_binding = 0, s_bad_desc = 0, s_unreadable = 0;
   static uint64_t s_mapped = 0, s_empty = 0, s_semantic_reject = 0;
@@ -8280,7 +8312,7 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
   if (const ResolvedTargetByAddress* resolved =
           ResolvedTargetForAddress(source)) {
     ++s_mapped;
-    ++g_resolveAddressMatches;
+    ++g_resolveAddr.matches;
     dc.sampled_texture_object = resolved->dest_object;
     dc.sampled_render_target_object = resolved->source_object;
     // The renderer samples the snapshot; uploading the empty guest storage
@@ -8744,8 +8776,8 @@ void CapturePatchedCode(uint32_t self, uint32_t dest, uint32_t variant,
   if (!self || !dest || dest < kPatchWindowBack * 4) return;
   const uint32_t start = dest - kPatchWindowBack * 4;
 
-  auto it = g_patchedCode.find(self);
-  const bool known = it != g_patchedCode.end() && it->second.resolved;
+  auto it = g_patch.patched.find(self);
+  const bool known = it != g_patch.patched.end() && it->second.resolved;
   const uint32_t known_off = known ? it->second.code_off : 0;
 
   PatchedCode pc;
@@ -8797,7 +8829,7 @@ void CapturePatchedCode(uint32_t self, uint32_t dest, uint32_t variant,
       if (!decodes_at(s)) continue;
       pc.code_off = s;
       pc.resolved = true;
-      ++g_patchCodeOffsets[int32_t(s) - int32_t(kPatchWindowBack)];
+      ++g_patch.codeOffsets[int32_t(s) - int32_t(kPatchWindowBack)];
       break;
     }
   }
@@ -8849,7 +8881,7 @@ void CapturePatchedCode(uint32_t self, uint32_t dest, uint32_t variant,
       pc.code.resize(want);
       pc.code_len_dwords = field_len / 4;
     } else {
-      ++g_vsWindowLenRejected;
+      ++g_vsWindow.lenRejected;
     }
   }
 
@@ -8859,12 +8891,12 @@ void CapturePatchedCode(uint32_t self, uint32_t dest, uint32_t variant,
     // answers. Where the CF starts: dest, in 24 of 24 measured. Whether the
     // shader object's own allocation is the buffer that was patched: only
     // sometimes — 16 of 24 — so the field is NOT a drop-in source of code.
-    if (search_abs == dest) ++g_vsWindowAtDest;
-    else if (search_abs < dest) ++g_vsWindowEarly;
-    else ++g_vsWindowLate;
-    if (!field_abs) ++g_vsWindowNoField;
-    else if (field_abs == dest) ++g_vsWindowAgree;
-    else ++g_vsWindowDisagree;
+    if (search_abs == dest) ++g_vsWindow.atDest;
+    else if (search_abs < dest) ++g_vsWindow.early;
+    else ++g_vsWindow.late;
+    if (!field_abs) ++g_vsWindow.noField;
+    else if (field_abs == dest) ++g_vsWindow.agree;
+    else ++g_vsWindow.disagree;
     static std::map<uint64_t, bool> s_logged;
     const uint64_t key = (uint64_t(self) << 32) | variant;
     if (field_abs && s_logged.size() < 24 && s_logged.emplace(key, true).second) {
@@ -8877,14 +8909,14 @@ void CapturePatchedCode(uint32_t self, uint32_t dest, uint32_t variant,
                                                   : "at-dest, other buffer")
                              : "SEARCH OFF DEST");
     }
-    const uint64_t seen = g_vsWindowAtDest + g_vsWindowEarly + g_vsWindowLate;
+    const uint64_t seen = g_vsWindow.atDest + g_vsWindow.early + g_vsWindow.late;
     if ((seen % 512) == 1) {
       REXLOG_INFO(
           "d3d9: vs code window: CF at dest {} early {} late {}; shader alloc "
           "is the patched buffer {} of {} (other buffer {}, unreadable {}); "
           "length rejected {}",
-          g_vsWindowAtDest, g_vsWindowEarly, g_vsWindowLate, g_vsWindowAgree,
-          seen, g_vsWindowDisagree, g_vsWindowNoField, g_vsWindowLenRejected);
+          g_vsWindow.atDest, g_vsWindow.early, g_vsWindow.late, g_vsWindow.agree,
+          seen, g_vsWindow.disagree, g_vsWindow.noField, g_vsWindow.lenRejected);
     }
   }
   // A ring-window read is inherently transient: the destination may wrap or
@@ -8900,10 +8932,10 @@ void CapturePatchedCode(uint32_t self, uint32_t dest, uint32_t variant,
   ++s_capture_attempts;
   const bool capture_resolved = pc.resolved;
   if (capture_resolved) {
-    g_patchedCode[self] = std::move(pc);
+    g_patch.patched[self] = std::move(pc);
     // Only ever against a capture the decode already proved, so a match here
     // is evidence about the LAYOUT rather than about this one shader.
-    ProbeShaderObjectCode(self, variant, g_patchedCode[self], base);
+    ProbeShaderObjectCode(self, variant, g_patch.patched[self], base);
     ++s_capture_resolved;
   } else if (same_variant_as_known) {
     ++s_capture_preserved;
@@ -8911,7 +8943,7 @@ void CapturePatchedCode(uint32_t self, uint32_t dest, uint32_t variant,
     // A different variant is a different program. Refuse to use stale exact
     // code if the replacement could not itself be captured.
     if (known) {
-      g_patchedCode.erase(it);
+      g_patch.patched.erase(it);
       ++s_capture_invalidated;
     }
   }
