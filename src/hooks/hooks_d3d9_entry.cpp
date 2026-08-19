@@ -436,6 +436,195 @@ extern "C" REX_FUNC(sub_825561B0) {
   ReportDrawCounts(base);
 }
 
+// Build draws from the BeginVertices/EndVertices path.
+//
+// OFF BY DEFAULT, and the reason is a regression, not caution. The hook works:
+// with it on, decls.txt gets BeginEndVertices entries (prim 13, 4 verts, stride
+// 12, from the command ring) and UI RENDER DRAW goes from 0 of 2816 READY
+// entries moving the draw counter to 1020 of 1020. But the same run took an
+// access violation the previous eleven runs did not:
+//
+//     write to guest 0x58 in sub_8234CE20 +0x10B
+//     sub_8234CE20:  if (!this[105]) { v2 = this[37]; *(v2 + 88) = 1; ... }
+//
+// 0x58 is 88 decimal, so `this[37]` (+148) was null: a one-shot init running
+// against a half-constructed object. This hook does not alter guest control
+// flow -- it reads args, calls the original, and does host-side bookkeeping --
+// so the most likely story is a pre-existing construction race that the extra
+// work on the draw path shifted timing enough to expose. That is a hypothesis,
+// not a measurement, which is exactly why the default is off rather than
+// "probably fine".
+//
+// Turn on with --d3d9_begin_vertices to keep working on it. Leaving the default
+// on would trade a known-good menu for an unproven intro.
+REXCVAR_DEFINE_BOOL(d3d9_begin_vertices, false, "Debug",
+                    "Build DrawCalls from D3DDevice_BeginVertices/EndVertices "
+                    "(the UI draw path). Off: known to expose a crash in the "
+                    "guest one-shot init sub_8234CE20.");
+
+namespace {
+
+// Set while D3DDevice_DrawVerticesUP's original is running. See the
+// BeginVertices hook below for why.
+thread_local uint32_t t_inDrawVerticesUP = 0;
+struct UpDepthGuard {
+  UpDepthGuard() { ++t_inDrawVerticesUP; }
+  ~UpDepthGuard() { --t_inDrawVerticesUP; }
+};
+
+// What BeginVertices reserved, carried to the matching EndVertices.
+//
+// Thread-local because this title submits draws from several threads
+// (device-state-is-thread-local), and the pair is strictly nested within one
+// call chain on one thread.
+struct PendingVertices {
+  uint32_t device = 0;
+  uint32_t prim_type = 0;
+  uint32_t count = 0;
+  uint32_t stride = 0;
+  uint32_t data = 0;  // the guest write pointer BeginVertices returned
+  bool active = false;
+};
+thread_local PendingVertices t_pendingVertices;
+
+std::atomic<uint64_t> g_bv_draws{0};
+std::atomic<uint64_t> g_bv_suppressed{0};   // nested inside DrawVerticesUP
+std::atomic<uint64_t> g_bv_unpaired{0};     // End with no live Begin
+std::atomic<uint64_t> g_bv_reserve_failed{0};  // Begin returned 0
+std::atomic<uint64_t> g_bv_unreadable{0};
+
+}  // namespace
+
+//-----------------------------------------------------------------------------
+// 0x825556C8 / 0x825556B8 — D3DDevice_BeginVertices / D3DDevice_EndVertices
+//
+// The FOURTH draw path, and the one that made the intro logo invisible.
+//
+// BeginVertices reserves command-ring space, EMITS THE PM4 DRAW PACKET ITSELF,
+// and returns a guest pointer for the caller to write inline vertices into;
+// EndVertices closes the reservation. The draw packet is plain in the
+// decompilation of sub_825556C8:
+//
+//     v25[5] = primType & 0x3F | (vertexCount << 16) | 0x80;
+//
+// so nothing on this path passes through DrawIndexedVertices, DrawVertices or
+// DrawVerticesUP — the three entry points this file hooks. The engine's UI
+// draws exclusively this way: sub_82B296B0 sets the state and calls
+// sub_82B27390, which is BeginVertices + memcpy + EndVertices.
+//
+// That is why every stage of the UI submit measured as PASSING while
+// GuestDrawCalls never moved (UI RENDER DRAW: 0 of 2816 READY entries moved
+// it). The counter can only see hooked entry points, and this path uses none.
+//
+// TWO THINGS THIS MUST NOT DO:
+//
+//   * Double count. DrawVerticesUP reserves through this same function, so a
+//     naive hook builds a second DrawCall for every UP draw. t_inDrawVerticesUP
+//     suppresses those, and they are COUNTED as suppressed rather than dropped
+//     silently — if that number is ever zero on a run with UP draws, the guard
+//     is not doing what this comment claims.
+//   * Read the vertices too early. BeginVertices returns a pointer to UNWRITTEN
+//     ring space; the caller memcpys into it afterwards. The bytes are read at
+//     EndVertices, which is the first moment they exist.
+//-----------------------------------------------------------------------------
+REX_IMPORT(__imp__sub_825556C8, orig_BeginVertices, void());
+extern "C" REX_FUNC(sub_825556C8) {
+  // Before ANY counting: with the cvar off this must be indistinguishable
+  // from not hooking the function at all, including in FRAME DRAWS, or the
+  // counters stop comparing against every log recorded so far.
+  if (!REXCVAR_GET(d3d9_begin_vertices)) {
+    orig_BeginVertices(ctx, base);
+    return;
+  }
+  const bool nested = t_inDrawVerticesUP != 0;
+  // Only the outermost reservation is a draw of its own; the UP wrapper counts
+  // its own.
+  if (!nested) g_guestDrawCalls.fetch_add(1, std::memory_order_relaxed);
+  MX_D3D9_PLUGIN_PASSTHROUGH(orig_BeginVertices);
+
+  const uint32_t device = ctx.r3.u32;
+  const uint32_t prim_type = ctx.r4.u32;
+  const uint32_t count = ctx.r5.u32;
+  const uint32_t stride = ctx.r6.u32;
+
+  if (!nested) {
+    ++mx::hle::D3D9DrawCounter();
+    NoteDrawDeclaration(device, base);
+    if (REXCVAR_GET(hle_capture)) {
+      DeviceState().NoteDevice(device, mx::hle::kEpDraw);
+      SampleFetchConstantFile(device, base);
+    }
+  }
+
+  orig_BeginVertices(ctx, base);
+
+  if (nested) {
+    g_bv_suppressed.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  // r3 on return is the write pointer, or 0 when the reservation failed (the
+  // guest takes an explicit `return 0` path when it cannot get ring space).
+  const uint32_t data = ctx.r3.u32;
+  if (!data) {
+    g_bv_reserve_failed.fetch_add(1, std::memory_order_relaxed);
+    t_pendingVertices = PendingVertices{};
+    return;
+  }
+  t_pendingVertices =
+      PendingVertices{device, prim_type, count, stride, data, true};
+}
+
+REX_IMPORT(__imp__sub_825556B8, orig_EndVertices, void());
+extern "C" REX_FUNC(sub_825556B8) {
+  if (!REXCVAR_GET(d3d9_begin_vertices)) {
+    orig_EndVertices(ctx, base);
+    return;
+  }
+  MX_D3D9_PLUGIN_PASSTHROUGH(orig_EndVertices);
+  // Consume unconditionally: a reservation must never outlive its End, or the
+  // next unrelated End on this thread would build a draw from stale bounds.
+  const PendingVertices pv = t_pendingVertices;
+  t_pendingVertices = PendingVertices{};
+
+  orig_EndVertices(ctx, base);
+
+  if (t_inDrawVerticesUP) return;
+  if (!pv.active) {
+    g_bv_unpaired.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+
+  // Built AFTER the original, like the other three: the guest's own call
+  // performs D3D9's lazy vertex-shader patching, so a shader's first draw can
+  // use the code captured during it.
+  const uint64_t bytes = uint64_t(pv.count) * pv.stride;
+  if (pv.stride && pv.count && bytes <= 16u * 1024u * 1024u &&
+      HostPageReadable(REX_RAW_ADDR(pv.data)) &&
+      HostPageReadable(REX_RAW_ADDR(pv.data + bytes - 1))) {
+    const uint64_t n = g_bv_draws.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= kMaxDrawsLogged) {
+      auto& f = DeclFile();
+      f << "BeginEndVertices #" << n << " dev=0x" << std::hex << pv.device
+        << std::dec << " prim=" << pv.prim_type
+        << " vertex_count=" << pv.count << " data=0x" << std::hex << pv.data
+        << std::dec << " stride=" << pv.stride << "\n";
+      f.flush();
+    }
+    UpVertexData up{pv.data, pv.stride, uint32_t(bytes)};
+    BuildAndQueueDraw(/*indexed=*/false, pv.prim_type, /*first=*/0, pv.count,
+                      0, pv.device, base, &up);
+  } else {
+    const uint64_t bad =
+        g_bv_unreadable.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (bad <= 8) {
+      REXLOG_INFO("d3d9: BeginEndVertices skipped - data=0x{:08X} count={} "
+                  "stride={} not readable",
+                  pv.data, pv.count, pv.stride);
+    }
+  }
+  ReportDrawCounts(base);
+}
+
 //-----------------------------------------------------------------------------
 // 0x82555B88 — D3DDevice_DrawVerticesUP(D3DDevice*, D3DPRIMITIVETYPE,
 //                  UINT VertexCount, const void* pVertexStreamZeroData,
@@ -458,6 +647,10 @@ extern "C" REX_FUNC(sub_825561B0) {
 //-----------------------------------------------------------------------------
 REX_IMPORT(__imp__sub_82555B88, orig_DrawVerticesUP, void());
 extern "C" REX_FUNC(sub_82555B88) {
+  // DrawVerticesUP reserves its ring space THROUGH BeginVertices, so the
+  // hook below would build a second DrawCall for every UP draw. RAII, not a
+  // plain ++/--, because the plugin passthrough returns early.
+  const UpDepthGuard up_depth_guard;
   g_guestDrawCalls.fetch_add(1, std::memory_order_relaxed);
   MX_D3D9_PLUGIN_PASSTHROUGH(orig_DrawVerticesUP);
   const uint32_t device = ctx.r3.u32;
