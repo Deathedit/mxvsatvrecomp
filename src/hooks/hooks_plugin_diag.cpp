@@ -7,6 +7,7 @@
 // means its call site is jumped, not that the mode is wrong.
 
 #include "hooks/hook_common.h"
+#include "hooks/hooks_d3d9.h"  // GuestDrawCalls
 
 #include <rex/cvar.h>
 
@@ -2162,6 +2163,161 @@ struct DrainValueRow {
   bool video = false;
 };
 
+// ---- the EMIT, sub_82B268A8 -------------------------------------------
+//
+// The last step before a UI item becomes a draw:
+//
+//     v4 = *(submitter + 104);                  // the installed item
+//     if ((*(v4 + 212) & 0xFF000000) != 0) {    // the gate
+//         sub_82B26860(*(short*)(v4 + 248), ..) // sort key
+//         dword_830BC7E8++                      // append to the pool
+//         sub_82AF1990(ctx + 120)               // insert into the queue
+//     }
+//
+// The question this answers: does EMITTED imply DRAWN? The menu's UI pass
+// contains ~70 draws (rdc/mmmmmm.rdc, events 9168..10093). If the emit
+// fires ~70 times per frame there, then everything emitted becomes a draw
+// and the video's emit -- which is proven to happen, with every gate passing
+// -- should too, so the contradiction lies further down. If the emit fires
+// MORE than the draw count, the renderer is dropping emitted items and the
+// difference between kept and dropped is the defect.
+//
+// This deliberately does not depend on the image-family population being
+// large enough to reason about: it compares two counts on the SAME frames.
+// ---- the per-entry RENDER ACTION, sub_82B2B120 -------------------------
+//
+// Slot 1 of the queued entry's own vtable (off_8213E258, pre-installed into all
+// 500 pool slots by the initialiser sub_82CE4B50). This is where a queued UI
+// record either becomes a draw or silently does not:
+//
+//     // entry+4 = submitter, entry+8 = item, as stored by the emit
+//     (*(submitter->vtbl + 12))(submitter, item, 0);   // re-install
+//     sub_82B28AA0(submitter);
+//     if (!*(item + 236)) sub_82B267C0();              // fallback
+//     if ( *(item + 236)) {                            // THE DRAW GATE
+//         v4 = *(submitter + 96);
+//         if (!v4 || *(int*)(v4 + 4) > 0)
+//             sub_82B2AF40(submitter + 16, submitter, v4, 0);   // the draw
+//     }
+//
+// UI EMIT already proved 1710 items are queued with every earlier gate passing,
+// while the intro frame contains zero UI draws. This closes the last span:
+// entries in vs draws out, on the same frames, with the reason separated rather
+// than inferred.
+//
+// NOTE the offset collision: 236 is kCompDrawItem on a COMPONENT, and this is
+// +236 on the ITEM. Different objects, same number, unrelated -- hence its own
+// constant rather than reusing kCompDrawItem.
+constexpr uint32_t kEntrySubmitter = 4;
+constexpr uint32_t kEntryItem = 8;
+constexpr uint32_t kItemDrawGate = 236;
+constexpr uint32_t kSubmitterGeom = 96;
+constexpr uint32_t kItemMaterial = 164;
+constexpr uint32_t kMaterialSub = 16;
+constexpr uint32_t kMaterialEntryCount = 20;
+constexpr uint32_t kMaterialEntryArray = 24;
+constexpr uint32_t kMaterialEntryResource = 16;
+constexpr uint32_t kMaxMaterialEntries = 64;
+// The outermost gate in sub_82B296B0, which is the function that actually sets
+// D3D9 state and draws:
+//
+//     v12 = *(submitter + 104);          // the item
+//     v13 = *(v12 + 164);                // material
+//     v14 = *(v12 + 168);
+//     if ((a3 || v14) && v13) { ...every SetTexture, every draw... }
+//
+// with a3 = *(submitter + 96), which sub_82B2B120 explicitly allows to be null.
+// So both a3 AND +168 null means the whole body is skipped in silence -- no
+// state, no draw, no return value to notice.
+//
+// v13 is NOT a candidate: sub_82B267C0 only sets item+236 when *(item+164) is
+// non-null, and 906/906 came back READY, so the material is definitely there.
+// That leaves (a3 || v14) as the only way this can fail, which is the
+// prediction being tested.
+constexpr uint32_t kItemAltGeom = 168;
+
+std::mutex g_entryMu;
+uint64_t g_entryCalls = 0;      // queued entries that reached the action
+uint64_t g_entryDrawn = 0;      // item+236 non-null -> the draw ran
+uint64_t g_entryNoGate = 0;     // item+236 NULL -> silently no draw
+uint64_t g_entryBadItem = 0;    // entry carried no usable item pointer
+uint64_t g_entryGeomEmpty = 0;  // gate passed but submitter+96 count <= 0
+uint32_t g_entryLastItem = 0;
+uint32_t g_entryLastGate = 0;
+
+// READ AFTER THE ORIGINAL. The first cut of this probe sampled item+236 on
+// ENTRY and reported "881 no-gate", which is not a defect at all: the item is
+// bump-allocated fresh every frame, so +236 is null on entry in a WORKING frame
+// too. sub_82B2B120 calls the builder sub_82B267C0 first and only then tests
+// the field. Sampling before the call measured a value that is null by
+// construction -- a probe that always fires. The post value is the answer.
+uint64_t g_entryReady = 0;     // +236 non-null AFTER the builder ran -> drew
+uint64_t g_entryNotReady = 0;  // still null after the builder -> no draw
+
+// Why the builder leaves it null, read straight out of sub_82B267C0:
+//
+//     mat = *(item + 164);  sub = *(mat + 16);
+//     *(item + 236) = 1;                       // optimistic
+//     n = *(sub + 20);  arr = *(sub + 24);
+//     for (i = 0; *(*(arr + i) + 16); i += 4)  // EVERY entry needs +16
+//         if (++k >= n) return;                // all present -> stays 1
+//     *(item + 236) = 0;                       // one was null -> not ready
+//
+// So it is a material-RESIDENCY test: each of the material's n entries must
+// carry a non-null +16. On the video component the material is
+// "1280_720_VideoRenderTarget", and +16 on a render-target asset is the texture
+// object itself (sub_8253E1B0 reads it that way). Walking the same array here
+// names WHICH entry is missing instead of leaving it to inference.
+uint32_t g_entryLastMat = 0;
+uint32_t g_entryLastMatCount = 0;
+uint32_t g_entryFirstBadIdx = 0xFFFFFFFFu;
+uint32_t g_entryLastBadEntry = 0;
+uint64_t g_entryWalkAborted = 0;  // array looked implausible; nothing inferred
+
+// Does the guest's UI draw actually reach D3D9?
+//
+// Every stage from the component down to sub_82B2AF40 now measures as passing,
+// and FRAME DRAWS reports guest == accepted, so the only span left is whether
+// sub_82B296B0 (below the draw call) ever enters a D3D9 entry point.
+// GuestDrawCalls() counts guest D3D9 draws in BOTH modes, so bracketing the
+// original answers it directly.
+//
+// HOW FAR TO TRUST THE DELTA. It is a process-wide counter and this title
+// submits draws from several threads (see device-state-is-thread-local), so a
+// non-zero delta MAY include another thread's draws and is only suggestive.
+// A delta of ZERO is the strong direction: it means no guest draw at all
+// occurred anywhere while this entry ran, which no concurrent thread can fake.
+// The two are counted separately rather than averaged, and the sum is kept so a
+// handful of large deltas cannot masquerade as one-per-entry.
+uint64_t g_entryDrawDelta = 0;    // summed
+uint64_t g_entryWithDraw = 0;     // READY entries where the counter moved
+uint64_t g_entryZeroDraw = 0;     // READY entries where it did NOT move
+uint64_t g_entryMaxDelta = 0;
+
+// The sub_82B296B0 entry gate, split so the answer is not inferred from a
+// single combined counter: which of the two operands is null matters for the
+// fix, and "both null" is the only combination that kills the draw.
+uint64_t g_gateGeomNull = 0;   // *(submitter + 96) == 0
+uint64_t g_gateAltNull = 0;    // *(item + 168)     == 0
+uint64_t g_gateBothNull = 0;   // -> body skipped entirely
+uint64_t g_gateMatNull = 0;    // *(item + 164) == 0; expected to stay 0
+uint32_t g_gateLastAlt = 0;
+uint32_t g_gateLastMat2 = 0;
+
+constexpr uint32_t kSubmitterCurrentItem = 104;
+constexpr uint32_t kItemEmitGate = 212;
+
+std::mutex g_emitMu;
+uint64_t g_emitCalls = 0;      // every call, gate or no gate
+uint64_t g_emitPassed = 0;     // gate passed -> queued
+uint64_t g_emitNoItem = 0;     // submitter had no installed item
+uint64_t g_emitThisFrame = 0;  // reset when the drain restarts at index 0
+uint64_t g_emitLastFrame = 0;
+uint64_t g_emitMaxFrame = 0;
+uint64_t g_drainPasses = 0;    // times the drain started at index 0
+uint32_t g_emitLastItem = 0;
+uint32_t g_emitLastGate = 0;
+
 std::mutex g_drainMu;
 std::vector<DrainCallerRow> g_drainCallers;  // who consumes the list
 std::vector<DrainValueRow> g_drainValues;    // which components it reads
@@ -2188,6 +2344,42 @@ void ReportUiDrain(bool force) {
   for (const auto& v : g_drainValues)
     values += fmt::format(" [0x{:08X}{} reads{}]", v.value,
                           v.video ? " VIDEO" : "", v.reads);
+  {
+    std::lock_guard<std::mutex> nlk(g_entryMu);
+    REXLOG_INFO("native: UI RENDER ENTRY {} entries = {} READY(drew) + {} "
+                "NOT-READY + {} bad-item + {} geom-empty ({} null on entry, "
+                "which is normal); last item 0x{:08X} mat 0x{:08X} "
+                "entries {} first-missing {} bad-entry 0x{:08X} aborted {}",
+                g_entryCalls, g_entryReady, g_entryNotReady,
+                g_entryBadItem, g_entryGeomEmpty, g_entryNoGate,
+                g_entryLastItem, g_entryLastMat, g_entryLastMatCount,
+                g_entryFirstBadIdx == 0xFFFFFFFFu
+                    ? std::string("none")
+                    : std::to_string(g_entryFirstBadIdx),
+                g_entryLastBadEntry, g_entryWalkAborted);
+    REXLOG_INFO("native: UI RENDER DRAW of {} READY entries: {} moved the guest "
+                "D3D9 draw counter, {} did NOT; total delta {}, max {} "
+                "(delta is process-wide and this title draws on several "
+                "threads, so >0 is suggestive; ==0 is the strong signal)",
+                g_entryReady, g_entryWithDraw, g_entryZeroDraw,
+                g_entryDrawDelta, g_entryMaxDelta);
+    REXLOG_INFO("native: UI DRAW GATE (sub_82B296B0 needs (geom96 || alt168) && "
+                "mat164) over {} READY: geom96 null {}, alt168 null {}, BOTH "
+                "null {} <- body skipped, mat164 null {}; last alt168 0x{:08X} "
+                "mat164 0x{:08X}",
+                g_entryReady, g_gateGeomNull, g_gateAltNull, g_gateBothNull,
+                g_gateMatNull, g_gateLastAlt, g_gateLastMat2);
+  }
+  {
+    std::lock_guard<std::mutex> elk(g_emitMu);
+    REXLOG_INFO("native: UI EMIT {} calls = {} queued + {} gate-failed + {} "
+                "no-item; per frame last {} max {} over {} drain passes; "
+                "last item 0x{:08X} gate 0x{:08X}",
+                g_emitCalls, g_emitPassed,
+                g_emitCalls - g_emitPassed - g_emitNoItem, g_emitNoItem,
+                g_emitLastFrame, g_emitMaxFrame, g_drainPasses,
+                g_emitLastItem, g_emitLastGate);
+  }
   REXLOG_INFO("native: UI DRAIN list 0x{:08X}; {} reads of it of {} accessor "
               "calls total, max index {}; {} callers --{}; {} values ({} "
               "dropped) --{}",
@@ -2199,6 +2391,138 @@ void ReportUiDrain(bool force) {
 }
 
 }  // namespace
+
+REX_IMPORT(__imp__sub_82B2B120, orig_UiRenderEntry, void());
+extern "C" REX_FUNC(sub_82B2B120) {
+  const uint32_t entry = ctx.r3.u32;
+  uint32_t submitter = 0, item = 0, gate = 0, geom = 0;
+  bool have_item = false;
+  if (PlausibleGuestPtr(entry)) {
+    submitter = REX_LOAD_U32(entry + kEntrySubmitter);
+    item = REX_LOAD_U32(entry + kEntryItem);
+    have_item = PlausibleGuestPtr(item);
+    if (have_item) gate = REX_LOAD_U32(item + kItemDrawGate);
+    if (PlausibleGuestPtr(submitter))
+      geom = REX_LOAD_U32(submitter + kSubmitterGeom);
+  }
+
+  const uint64_t draws_before = GuestDrawCalls();
+  orig_UiRenderEntry(ctx, base);
+  const uint64_t draws_after = GuestDrawCalls();
+  const uint64_t draw_delta =
+      draws_after > draws_before ? draws_after - draws_before : 0;
+
+  // AFTER: sub_82B2B120 runs the builder before testing the field, so this
+  // is the value the draw decision actually used.
+  const uint32_t gate_post =
+      have_item ? REX_LOAD_U32(item + kItemDrawGate) : 0;
+
+  std::lock_guard<std::mutex> lk(g_entryMu);
+  ++g_entryCalls;
+  if (!have_item) {
+    ++g_entryBadItem;
+    return;
+  }
+  g_entryLastItem = item;
+  g_entryLastGate = gate;
+  if (!gate) ++g_entryNoGate;  // pre-state only: null here is normal
+
+  if (!gate_post) {
+    ++g_entryNotReady;
+    // The builder gave up. Walk the same array it walks and record the first
+    // entry whose +16 is null -- that is the resource the material is waiting
+    // on. Bounded, and an implausible array is COUNTED as aborted rather than
+    // guessed at, so a walk that could not run never looks like a clean result.
+    const uint32_t mat = PlausibleGuestPtr(item)
+                             ? REX_LOAD_U32(item + kItemMaterial)
+                             : 0;
+    g_entryLastMat = mat;
+    const uint32_t sub = PlausibleGuestPtr(mat)
+                             ? REX_LOAD_U32(mat + kMaterialSub)
+                             : 0;
+    if (!PlausibleGuestPtr(sub)) {
+      ++g_entryWalkAborted;
+      return;
+    }
+    const uint32_t n = REX_LOAD_U32(sub + kMaterialEntryCount);
+    const uint32_t arr = REX_LOAD_U32(sub + kMaterialEntryArray);
+    g_entryLastMatCount = n;
+    if (n > kMaxMaterialEntries || !PlausibleGuestPtr(arr)) {
+      ++g_entryWalkAborted;
+      return;
+    }
+    for (uint32_t k = 0; k < n; ++k) {
+      const uint32_t e = REX_LOAD_U32(arr + k * 4);
+      if (!PlausibleGuestPtr(e)) {
+        ++g_entryWalkAborted;
+        return;
+      }
+      if (!REX_LOAD_U32(e + kMaterialEntryResource)) {
+        g_entryFirstBadIdx = k;
+        g_entryLastBadEntry = e;
+        return;
+      }
+    }
+    return;
+  }
+
+  // Ready. The guest reached the draw call, but still skips when the geometry
+  // object exists and reports a count <= 0, so that is split out rather than
+  // folded into the drawn count.
+  if (geom && PlausibleGuestPtr(geom) &&
+      static_cast<int32_t>(REX_LOAD_U32(geom + 4)) <= 0) {
+    ++g_entryGeomEmpty;
+    return;
+  }
+  ++g_entryReady;
+  // The sub_82B296B0 gate, evaluated on the same operands the guest uses.
+  {
+    const uint32_t alt = REX_LOAD_U32(item + kItemAltGeom);
+    const uint32_t mat2 = REX_LOAD_U32(item + kItemMaterial);
+    g_gateLastAlt = alt;
+    g_gateLastMat2 = mat2;
+    if (!geom) ++g_gateGeomNull;
+    if (!alt) ++g_gateAltNull;
+    if (!geom && !alt) ++g_gateBothNull;
+    if (!mat2) ++g_gateMatNull;
+  }
+  // Only counted on the READY path: a skipped entry is not expected to draw, so
+  // folding those in would dilute the very ratio being measured.
+  g_entryDrawDelta += draw_delta;
+  if (draw_delta > g_entryMaxDelta) g_entryMaxDelta = draw_delta;
+  if (draw_delta)
+    ++g_entryWithDraw;
+  else
+    ++g_entryZeroDraw;
+}
+
+REX_IMPORT(__imp__sub_82B268A8, orig_UiEmit, void());
+extern "C" REX_FUNC(sub_82B268A8) {
+  const uint32_t submitter = ctx.r3.u32;
+  // Read BEFORE the original: it is what consumes the installed item, and
+  // the gate word is the thing being measured.
+  uint32_t item = 0, gate = 0;
+  if (PlausibleGuestPtr(submitter))
+    item = REX_LOAD_U32(submitter + kSubmitterCurrentItem);
+  const bool have_item = PlausibleGuestPtr(item);
+  if (have_item) gate = REX_LOAD_U32(item + kItemEmitGate);
+
+  orig_UiEmit(ctx, base);
+
+  std::lock_guard<std::mutex> lk(g_emitMu);
+  ++g_emitCalls;
+  if (!have_item) {
+    ++g_emitNoItem;
+    return;
+  }
+  g_emitLastItem = item;
+  g_emitLastGate = gate;
+  // Same predicate the guest uses, evaluated on the same word.
+  if (gate & 0xFF000000u) {
+    ++g_emitPassed;
+    ++g_emitThisFrame;
+  }
+}
 
 REX_IMPORT(__imp__sub_822F9800, orig_VectorAt, void());
 extern "C" REX_FUNC(sub_822F9800) {
@@ -2221,6 +2545,17 @@ extern "C" REX_FUNC(sub_822F9800) {
   // register so this does not depend on how the recompiler surfaces r3.
   const uint32_t data = REX_LOAD_U32(vec);
   const uint32_t value = data ? REX_LOAD_U32(data + index * 4) : 0;
+
+  // Frame roll. The drain walks 0..count-1 once per UIManager::Render, so a
+  // read at index 0 is the start of a frame's drain -- the only per-frame
+  // boundary available in this file without reaching into the swap hook.
+  if (index == 0) {
+    std::lock_guard<std::mutex> elk(g_emitMu);
+    ++g_drainPasses;
+    g_emitLastFrame = g_emitThisFrame;
+    if (g_emitThisFrame > g_emitMaxFrame) g_emitMaxFrame = g_emitThisFrame;
+    g_emitThisFrame = 0;
+  }
 
   std::lock_guard<std::mutex> lk(g_drainMu);
   ++g_drainListReads;
