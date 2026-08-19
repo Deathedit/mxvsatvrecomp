@@ -1328,7 +1328,18 @@ extern "C" REX_FUNC(sub_8236EB30) {
   constexpr uint32_t kLayerVideoName = 608;  // the "Video" property, 48 bytes
   constexpr uint32_t kLayerTexture = 664;    // <- the output surface
   constexpr uint32_t kLayerPlayer = 668;
-  if (!layer) return;
+  // GUARDED, after an access violation here on 2026-08-19: reading at guest
+  // 0x3E4F96FC, which is exactly the `texture + 0x1C` below for a texture of
+  // 0x3E4F96E0. That run reached further into the menu than any before it
+  // (FE_RiderSelect, FE_SplitscreenSetup, POP_ProfileSelection) and found a
+  // UIVideoLayer whose +664 is not a live object. `layer` is a guest `this` and
+  // has always been sound; +664 is whatever the property loader left there, and
+  // this probe reads six dwords off it, so it needs checking before the read.
+  //
+  // Refusals are COUNTED, not silently skipped: a probe that quietly reads
+  // nothing looks exactly like a probe whose subject never appears, and that
+  // confusion has cost this project real time.
+  if (!PlausibleGuestPtr(layer)) return;
   const uint32_t texture = REX_LOAD_U32(layer + kLayerTexture);
   const uint32_t player = REX_LOAD_U32(layer + kLayerPlayer);
   std::string name;
@@ -1348,7 +1359,13 @@ extern "C" REX_FUNC(sub_8236EB30) {
   // itself, and if it IS a texture its guest address can be compared directly
   // against the 0xFBE94000 the FE_Smoke resolve lands on.
   std::string fetch_desc = " (texture null)";
-  if (texture) {
+  if (texture && !PlausibleGuestPtr(texture)) {
+    static std::atomic<uint64_t> s_badTexture{0};
+    fetch_desc = fmt::format(" (texture 0x{:08X} NOT a plausible guest pointer, "
+                             "not dereferenced; {} so far)",
+                             texture,
+                             s_badTexture.fetch_add(1, std::memory_order_relaxed) + 1);
+  } else if (texture) {
     uint32_t fetch[6] = {};
     for (uint32_t i = 0; i < 6; ++i)
       fetch[i] = REX_LOAD_U32(texture + 0x1C + i * 4);
