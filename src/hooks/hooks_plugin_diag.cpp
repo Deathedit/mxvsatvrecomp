@@ -1398,6 +1398,40 @@ namespace {
 constexpr uint32_t kCompMaterialSlot = 260;
 constexpr uint32_t kCompDrawItem = 236;
 constexpr uint32_t kCompTextureAsset = 664;
+// The three fields slot 13 (sub_8236EBB0) actually branches on:
+//
+//     v2 = this[167];                      // +668 the video player object
+//     if (v2) (*(v2->vtbl + 24))(v2);      // begin
+//     v3 = this[48];                       // +192 THE SUBMITTER
+//     if (v3) {
+//         (*(v3->vtbl + 12))(v3, this[60], 0);   // submit the item at +240
+//         this[60] = 0;                          // consumed
+//     }
+//
+// So a null +192 means the draw is never submitted no matter how healthy
+// everything upstream is -- and upstream is now proven healthy: the
+// component is visited, visible, enqueued and drained 1:1 (UI ENQUEUE /
+// UI DRAIN). +240 is refilled EVERY frame by sub_8237AB78 (a bump
+// allocation from the pool dword_82DD8084), so a zero there would mean the
+// allocation step never ran, not that it was consumed once.
+// The sort key the emit computes for every UI draw:
+//
+//     sub_82B26860(*(short*)(item + 248), ...):
+//         key = table[idx] * 10000.0 - seq++
+//
+// where `table` is the float array at 0x830C0000. A layer index that sorts
+// the intro's items outside whatever range actually gets drawn would produce
+// exactly the observed symptom: every gate passes, the item is queued, and
+// no draw comes out.
+constexpr uint32_t kItemLayerIndex = 248;
+constexpr uint32_t kLayerPriorityTable = 0x830C0000;
+// A layer index is a small enum. Anything larger is a misread, and reading
+// the table at a wild offset would be a wild guest load - so it is bounded
+// and the out-of-range case is COUNTED rather than silently clamped.
+constexpr uint32_t kMaxSaneLayerIndex = 256;
+constexpr uint32_t kCompSubmitter = 192;
+constexpr uint32_t kCompPendingItem = 240;
+constexpr uint32_t kCompPlayerObj = 668;
 
 struct VideoComponentProbe {
   uint32_t component = 0;
@@ -1432,6 +1466,50 @@ struct VideoComponentProbe {
   uint64_t visible_seen = 0;
   uint32_t last_flags172 = 0;
   uint32_t last_flags176 = 0;
+  // Sampled in the per-frame visit. That hook runs at the TOP of the draw
+  // step (sub_8237A6D0 / sub_8237B1D0), which sub_8237AB78 tail-calls right
+  // after allocating the frame's draw item into +240 -- so at this point
+  // +240 is freshly allocated and slot 13 has not yet consumed it. Both
+  // ends of its lifetime are therefore visible here.
+  //
+  // Each carries a non-null COUNT, not just the last value: a single
+  // last-seen pointer cannot distinguish "always null" from "null on the
+  // frame we happened to sample", and that distinction is the whole point.
+  uint32_t last_submitter = 0;     // +192
+  uint32_t last_pending_item = 0;  // +240
+  uint32_t last_player_obj = 0;    // +668
+  uint64_t submitter_nonnull = 0;
+  uint64_t pending_nonnull = 0;
+  uint64_t player_nonnull = 0;
+  uint64_t draw_item_nonnull = 0;  // +236, set by slot 15
+  // The submit in slot 13 is a VIRTUAL call on the object at +192:
+  //
+  //     (*(v3->vtbl + 12))(v3, this[240], 0);   // slot 3 -- the submit
+  //     (*(v3->vtbl +  4))(v3, *(UIManager+560));// slot 1 -- the context
+  //
+  // Its target cannot be read off the vtable statically because the object
+  // is chosen at run time, but it is two guest loads once the pointer is in
+  // hand. Resolving it here is the same move that named the drain from the
+  // link register after a static hunt failed -- let it name itself.
+  uint32_t last_submitter_vtbl = 0;
+  uint32_t last_submit_fn = 0;   // vtbl + 12
+  uint32_t last_slot1_fn = 0;    // vtbl + 4
+  // THE LAST GATE. Slot 1 (sub_82B268A8) emits a draw only for an item whose
+  // +212 has a non-zero TOP BYTE:
+  //
+  //     v4 = *(this + 104);                      // the installed item
+  //     if ((*(v4 + 212) & 0xFF000000) != 0) { ... emit ... }
+  //     return;                                  // otherwise silently nothing
+  //
+  // Read off the PERSISTENT item at +236, not the per-frame one at +240: the
+  // image draw step (sub_8237A6D0) copies +236 into +240 via the item's own
+  // vtable slot 2, and that copy happens AFTER this hook runs. +236 is the
+  // stable source and is already populated by slot 15.
+  uint32_t last_item212 = 0;
+  uint64_t item212_top_nonzero = 0;
+  uint32_t last_layer248 = 0;       // *(uint16*)(item236 + 248)
+  uint32_t last_layer_prio = 0;     // raw bits of table[last_layer248]
+  uint64_t layer_out_of_range = 0;
 };
 
 std::mutex g_videoProbeMu;
@@ -1450,6 +1528,25 @@ std::atomic<uint32_t> g_videoCompFast[16] = {};
 std::mutex g_materialMu;
 std::map<uint32_t, std::string> g_materialNames;  // handle -> resolved name
 std::atomic<uint64_t> g_materialResolves{0};
+
+// A guest pointer worth dereferencing.
+//
+// THIS HAD AN UPPER BOUND OF 0x80000000 AND IT MANUFACTURED A ZERO. Heap
+// objects sit at 0x2xxx_xxxx (0x21855..., 0x239..., 0x25E...), so the bound
+// looked right -- but VTABLES live in the module image at 0x82xx_xxxx
+// (imagebase 0x82000000). The submitter's vtable resolved to 0x8213E2B8,
+// the guard rejected it, and the log reported `submitFn=0x00000000`, which
+// reads exactly like "the game has no submit function" rather than "the
+// probe refused to look". Only the raw vtable value being printed alongside
+// it gave the lie away.
+//
+// A validity guard that fails closed must never be able to fabricate the
+// same value the measurement is looking for. Keep the low bound (it rejects
+// null and small garbage) and drop the high one -- the guest address space
+// is 32-bit and the image is legitimately at the top of it.
+bool PlausibleGuestPtr(uint32_t p) {
+  return p >= 0x10000000u && (p & 3u) == 0u;
+}
 
 // Linear scan: the population is six. Caller holds the lock.
 VideoComponentProbe* FindProbe(uint32_t component) {
@@ -1493,11 +1590,19 @@ void ReportVideoComponents(bool force) {
     rows += fmt::format(
         " [\"{}\" comp0x{:08X} renders{} visits{} dirty{} visible{} "
         "f172=0x{:08X} f176=0x{:08X} material={} item0x{:08X} "
-        "texasset0x{:08X} caller0x{:08X}]",
+        "texasset0x{:08X} caller0x{:08X} submitter192=0x{:08X}(n{}) "
+        "pend240=0x{:08X}(n{}) player668=0x{:08X}(n{}) item236n{} "
+        "subvt=0x{:08X} submitFn=0x{:08X} slot1Fn=0x{:08X} "
+        "item212=0x{:08X}(topNZ n{}) layer248={} prio=0x{:08X}({:g}) oor{}]",
         q.video, q.component, q.render_calls, q.visit_calls, q.dirty_seen,
         q.visible_seen, q.last_flags172, q.last_flags176,
         MaterialLabel(q.last_material), q.last_draw_item, q.texture_asset,
-        q.last_caller);
+        q.last_caller, q.last_submitter, q.submitter_nonnull,
+        q.last_pending_item, q.pending_nonnull, q.last_player_obj,
+        q.player_nonnull, q.draw_item_nonnull, q.last_submitter_vtbl,
+        q.last_submit_fn, q.last_slot1_fn, q.last_item212,
+        q.item212_top_nonzero, q.last_layer248, q.last_layer_prio,
+        std::bit_cast<float>(q.last_layer_prio), q.layer_out_of_range);
   }
   REXLOG_INFO("native: VIDEO COMPONENT RENDER {} components, {} renders "
               "total, {} material resolves --{}",
@@ -1523,6 +1628,13 @@ struct UiComponentRow {
   // are class-specific. Logging the vtable makes the row self-describing
   // instead of quietly inviting the same misreading the material handles did.
   uint32_t vtable = 0;
+  // The draw item's layer index, for components that have a draw item at
+  // +236 at all. Recorded here as well as on the video rows because a bare
+  // layer number is uninterpretable: the question is whether the intro's
+  // components sort differently from the MENU's, which do produce draws.
+  uint32_t item = 0;
+  uint32_t layer248 = 0;
+  bool has_layer = false;
 };
 
 std::mutex g_uiMu;
@@ -1571,6 +1683,20 @@ void NoteUiComponentVisit(uint32_t component, uint32_t flags172,
   if ((flags172 >> 4) & 1u) ++r.visible;
   r.material = material;
   r.flags172 = flags172;
+  // The draw item and its layer index, for whatever carries one. This is
+  // the comparison population for the video component's own layer248: a
+  // bare layer number says nothing, but the MENU's components DO produce
+  // draws, so their values are the reference.
+  //
+  // Guarded, not assumed: +236 is an IMAGE-family field like +260 and +172,
+  // and reading it on a class that has no draw item is exactly the misread
+  // that produced the ASCII "dTri"/"Fre]" material handles. has_layer says
+  // whether the row's value is worth anything at all.
+  r.item = REX_LOAD_U32(component + kCompDrawItem);
+  if (PlausibleGuestPtr(r.item)) {
+    r.layer248 = REX_LOAD_U16(r.item + kItemLayerIndex);
+    r.has_layer = true;
+  }
 
   // Report the inventory every 5s, ordered by visits. Bounded to the top rows
   // because a menu walks a few hundred components; the whole count and the
@@ -1592,12 +1718,17 @@ void NoteUiComponentVisit(uint32_t component, uint32_t flags172,
     if (kv->second.visible) ++drawn;
     if (shown >= 48) continue;
     ++shown;
-    rows += fmt::format(" [{}0x{:08X} vt0x{:08X} visits{} mat?={} f172?=0x{:08X}]",
+    rows += fmt::format(" [{}0x{:08X} vt0x{:08X} visits{} mat?={} f172?=0x{:08X}"
+                        " item0x{:08X} layer{}]",
                         kv->second.name.empty()
                             ? std::string("name? ")
                             : ("\"" + kv->second.name + "\" "),
                         kv->first, kv->second.vtable, kv->second.visits,
-                        MaterialLabel(kv->second.material), kv->second.flags172);
+                        MaterialLabel(kv->second.material), kv->second.flags172,
+                        kv->second.item,
+                        kv->second.has_layer
+                            ? std::to_string(kv->second.layer248)
+                            : std::string("?"));
   }
   // mat? and f172? carry question marks because they are only valid for the
   // IMAGE component family; group by vt (the class vtable) before believing
@@ -1707,6 +1838,15 @@ extern "C" REX_FUNC(sub_82B26778) {
 //
 // Runs for every UI component every frame, so it is prefiltered without a lock
 // against the five registered video components.
+// Defined with the UI ENQUEUE probe further down. Declared here because the
+// per-frame visit hook below is what drives that report, and it has to run
+// even when the render list never receives a push - which is precisely the
+// outcome the probe was added to detect.
+namespace {
+void ReportUiEnqueue(bool force);
+void ReportUiDrain(bool force);
+}  // namespace
+
 REX_IMPORT(__imp__sub_8236DB10, orig_UIComponentVisit, void());
 extern "C" REX_FUNC(sub_8236DB10) {
   const uint32_t self = ctx.r3.u32;
@@ -1737,6 +1877,12 @@ extern "C" REX_FUNC(sub_8236DB10) {
   // inventory is the menu's 2D layer by name.
   NoteUiComponentVisit(self, flags172, flags176, base);
   orig_UIComponentVisit(ctx, base);
+  // Before the `watched` early-out and while holding no other lock: the UI
+  // ENQUEUE line has to appear even when zero video components are registered
+  // and even when the render list never receives a push, because "no pushes"
+  // is the answer this probe exists to report.
+  ReportUiEnqueue(false);
+  ReportUiDrain(false);
   if (!watched) return;
   std::lock_guard<std::mutex> lk(g_videoProbeMu);
   VideoComponentProbe* p = FindProbe(self);
@@ -1746,6 +1892,36 @@ extern "C" REX_FUNC(sub_8236DB10) {
   if ((flags172 >> 4) & 1u) ++p->visible_seen;
   p->last_flags172 = flags172;
   p->last_flags176 = flags176;
+  // The slot-13 branch fields. Read after the original: it only touches the
+  // +176 flag group and the slot-15 rebuild, neither of which owns these.
+  p->last_submitter = REX_LOAD_U32(self + kCompSubmitter);
+  p->last_pending_item = REX_LOAD_U32(self + kCompPendingItem);
+  p->last_player_obj = REX_LOAD_U32(self + kCompPlayerObj);
+  const uint32_t item236 = REX_LOAD_U32(self + kCompDrawItem);
+  if (p->last_submitter) ++p->submitter_nonnull;
+  // Resolve the submit target. Two indirections, both guarded, and only for
+  // the handful of watched video components -- not on the UI hot path.
+  if (PlausibleGuestPtr(p->last_submitter)) {
+    const uint32_t vtbl = REX_LOAD_U32(p->last_submitter);
+    p->last_submitter_vtbl = vtbl;
+    if (PlausibleGuestPtr(vtbl)) {
+      p->last_submit_fn = REX_LOAD_U32(vtbl + 12);
+      p->last_slot1_fn = REX_LOAD_U32(vtbl + 4);
+    }
+  }
+  if (p->last_pending_item) ++p->pending_nonnull;
+  if (p->last_player_obj) ++p->player_nonnull;
+  if (item236) ++p->draw_item_nonnull;
+  if (PlausibleGuestPtr(item236)) {
+    p->last_item212 = REX_LOAD_U32(item236 + 212);
+    if (p->last_item212 & 0xFF000000u) ++p->item212_top_nonzero;
+    p->last_layer248 = REX_LOAD_U16(item236 + kItemLayerIndex);
+    if (p->last_layer248 < kMaxSaneLayerIndex)
+      p->last_layer_prio =
+          REX_LOAD_U32(kLayerPriorityTable + p->last_layer248 * 4);
+    else
+      ++p->layer_out_of_range;
+  }
   ReportVideoComponents(false);
 }
 
@@ -1772,6 +1948,304 @@ extern "C" REX_FUNC(sub_8237ABA8) {
   if (!p->first_caller) p->first_caller = caller;
   p->last_caller = caller;
   ReportVideoComponents(false);
+}
+
+//-----------------------------------------------------------------------------
+// The UI render-list ENQUEUE - sub_8229BAF8
+//
+// The engine's generic vector push:
+//
+//     sub_8229BAF8(vec, valuePtr)
+//         if (vec[1] >= vec[2]) grow();
+//         ((uint32_t*)vec[0])[vec[1]++] = *valuePtr;
+//
+//     vec[0] data pointer, vec[1] count, vec[2] capacity.
+//
+// It is the LAST step of a UI component's draw, after both gates:
+//
+//     sub_8236DB10(this);                     dirty check -> slot 15 rebuild
+//     if (sub_8236DB70(this, 4))              the visibility gate: bit 1<<4 of
+//                                             +172 on this AND every ancestor
+//         sub_8229BAF8(uiRenderList, &this);  ENQUEUE
+//
+// so an entry here is the closest thing the guest has to "this component will
+// draw". The intro logo's consumer - component 0x21A25860, material
+// "1280_720_VideoRenderTarget" - passes both gates and still yields no draw
+// (FRAME DRAWS reports guest == accepted, so nothing is lost on our side), and
+// this probe splits the two remaining causes:
+//
+//   it never appears here      its draw slot is not being called at all, and
+//                              the question moves to whoever walks the tree.
+//   it appears but no draw     the DRAIN of this list, or the draw-item -> PM4
+//                              path below it, is dropping the entry.
+//
+// THE LIST ADDRESS IS RESOLVED AT RUN TIME, and that is not a detail. The guest
+// LOADS the global and adds the offset:
+//
+//     lis  r11, dword_82DD7E6C@ha
+//     lwz  r11, dword_82DD7E6C@l(r11)     r11 = *(uint32_t*)0x82DD7E6C
+//     addi r3, r11, 0x19C                 list = THAT VALUE + 412
+//
+// Hex-Rays renders the call as `sub_8229BAF8(dword_82DD7E6C + 412, ...)`, which
+// reads like an address-of. Comparing r3 against the literal 0x82DD8008 would
+// match nothing, on every frame, forever - a counter that cannot fire, which is
+// a failure mode this project has already lost a session to. The global is
+// re-read on each call rather than cached, so a root object that moves cannot
+// leave a stale address silently matching nothing.
+//
+// sub_8229BAF8 is called from 60+ sites for many unrelated vectors and is HOT,
+// so the fast path is one guest load and one compare, with no lock. The total
+// push count is an atomic and is reported alongside the filtered count, because
+// "the UI list got 0 pushes" and "this function is never called" are completely
+// different diagnoses - the same rule as the ENGINE TEX HEADER probe below.
+namespace {
+
+constexpr uint32_t kUiRootGlobal = 0x82DD7E6C;
+constexpr uint32_t kUiRenderListOff = 0x19C;  // 412
+
+std::atomic<uint32_t> g_uiRenderList{0};  // last resolved address, for the report
+std::atomic<uint64_t> g_enqAllPushes{0};  // pushes into ANY vector
+
+struct EnqueueRow {
+  uint32_t value = 0;  // the component pointer pushed
+  uint64_t pushes = 0;
+  uint32_t last_caller = 0;
+  uint32_t last_index = 0;
+  bool video = false;  // matches a registered video component
+};
+
+std::mutex g_enqMu;
+std::vector<EnqueueRow> g_enqRows;
+uint64_t g_enqUiPushes = 0;
+uint64_t g_enqDroppedRows = 0;
+uint64_t g_enqRestarts = 0;  // pushes landing at index 0 = the list was drained
+uint32_t g_enqHighWater = 0;
+
+// Entries are recorded as RAW POINTERS, not names. Naming them here would mean
+// reading the material table or the UI inventory from this hot hook, adding a
+// lock-order edge into two other collectors for no diagnostic gain: UI
+// INVENTORY already prints name <-> address for every component, so
+// cross-referencing is a text search. The one exception is the `video` flag,
+// which comes from g_videoCompFast - an array built for exactly this kind of
+// lock-free prefilter.
+bool IsWatchedVideoComponent(uint32_t component) {
+  if (!component) return false;
+  for (auto& slot : g_videoCompFast) {
+    const uint32_t c = slot.load(std::memory_order_acquire);
+    if (!c) break;
+    if (c == component) return true;
+  }
+  return false;
+}
+
+// Takes g_enqMu and nothing else. Called from the per-frame UI visit hook while
+// that hook holds NO other lock, so this introduces no lock-order edge.
+void ReportUiEnqueue(bool force) {
+  static std::chrono::steady_clock::time_point s_last{};
+  static size_t s_lastRows = 0;
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lk(g_enqMu);
+  const bool grew = g_enqRows.size() != s_lastRows;
+  if (!force && !grew && now - s_last < std::chrono::seconds(3)) return;
+  s_last = now;
+  s_lastRows = g_enqRows.size();
+  std::string rows;
+  for (const auto& r : g_enqRows)
+    rows += fmt::format(" [0x{:08X}{} pushes{} lastIdx{} caller0x{:08X}]",
+                        r.value, r.video ? " VIDEO" : "", r.pushes,
+                        r.last_index, r.last_caller);
+  REXLOG_INFO("native: UI ENQUEUE list 0x{:08X}; {} pushes into it of {} vector "
+              "pushes total; {} distinct entries ({} dropped), {} list "
+              "restarts, high water {} --{}",
+              g_uiRenderList.load(std::memory_order_relaxed), g_enqUiPushes,
+              g_enqAllPushes.load(std::memory_order_relaxed), g_enqRows.size(),
+              g_enqDroppedRows, g_enqRestarts, g_enqHighWater,
+              rows.empty() ? " (none)" : rows);
+}
+
+}  // namespace
+
+REX_IMPORT(__imp__sub_8229BAF8, orig_VectorPush, void());
+extern "C" REX_FUNC(sub_8229BAF8) {
+  const uint32_t vec = ctx.r3.u32;
+  const uint32_t valuePtr = ctx.r4.u32;
+  const uint32_t caller = uint32_t(ctx.lr);
+
+  // Read BEFORE the original: the count is what says where this entry landed,
+  // and the original increments it. Index 0 is how a drained list announces
+  // itself, which is the only view of the DRAIN this probe gets for free.
+  const uint32_t index = vec ? REX_LOAD_U32(vec + 4) : 0;
+  const uint32_t value = valuePtr ? REX_LOAD_U32(valuePtr) : 0;
+
+  orig_VectorPush(ctx, base);
+
+  // COUNT FIRST, FILTER SECOND - lock-free, so the population is known even
+  // when the filter never matches.
+  g_enqAllPushes.fetch_add(1, std::memory_order_relaxed);
+
+  const uint32_t root = REX_LOAD_U32(kUiRootGlobal);
+  if (!root) return;
+  const uint32_t list = root + kUiRenderListOff;
+  g_uiRenderList.store(list, std::memory_order_relaxed);
+  if (vec != list) return;  // fast reject: some other vector
+
+  std::lock_guard<std::mutex> lk(g_enqMu);
+  ++g_enqUiPushes;
+  if (index == 0) ++g_enqRestarts;
+  if (index + 1 > g_enqHighWater) g_enqHighWater = index + 1;
+  for (auto& r : g_enqRows) {
+    if (r.value != value) continue;
+    ++r.pushes;
+    r.last_caller = caller;
+    r.last_index = index;
+    return;
+  }
+  if (g_enqRows.size() >= 64) {
+    ++g_enqDroppedRows;
+    return;
+  }
+  g_enqRows.push_back({value, 1, caller, index, IsWatchedVideoComponent(value)});
+}
+
+//-----------------------------------------------------------------------------
+// The UI render-list DRAIN - sub_822F9800
+//
+// The matching element accessor for the push:
+//
+//     sub_822F9800(vec, i)  { return ((uint32_t*)vec[0])[i]; }
+//     sub_8229BAF8(vec, v)  { ((uint32_t*)vec[0])[vec[1]++] = *v; }
+//
+// so whatever consumes the UI render list has to come through here with
+// `vec == UIManager + 0x19C`. That matters because the drain could NOT be
+// pinned statically:
+//
+//   - `dword_82DD7E6C` is the **UIManager** singleton (named from its dtor
+//     sub_82390A10, which does `sub_8251C428(a1 + 412)` - the vector destructor
+//     for this very list - and then clears the global).
+//   - The four sites that form `root + 0x19C` are all ENQUEUES
+//     (sub_8237A6D0, sub_8237B1D0, sub_8237B408, sub_82395068). Nothing else
+//     forms the address, so the consumer reaches the vector through `this`
+//     rather than through the global, and an address-formation search cannot
+//     find it.
+//   - Searching for the count field `0x1A0(rX)` across the UI range returned
+//     five sites, none of them a drain, and both UIManager vtables have a
+//     destructor in slot 0.
+//
+// So instead of guessing, this probe makes the CALLER NAME ITSELF: the link
+// register on a filtered call is the drain, recorded per distinct caller. The
+// same trick already worked for slot 15 in the VIDEO COMPONENT RENDER probe,
+// where static hunting for the virtual call site produced 40+ candidates and
+// not one was right.
+//
+// Same runtime-resolution rule as the enqueue probe: the list is
+// `*(uint32_t*)0x82DD7E6C + 0x19C`, re-read per call, never the literal
+// `0x82DD7E6C + 412`.
+//
+// Read it against UI ENQUEUE, which shares the population:
+//
+//   a component enqueued but never read here   the drain skips it - the defect
+//                                              is the drain's own filter
+//   read here but still no draw                the consumer runs and what it
+//                                              does per entry is the next step,
+//                                              and `caller` names it
+//   zero reads, callers empty                  nothing drains this list at all
+namespace {
+
+struct DrainCallerRow {
+  uint32_t caller = 0;
+  uint64_t reads = 0;
+};
+
+struct DrainValueRow {
+  uint32_t value = 0;
+  uint64_t reads = 0;
+  bool video = false;
+};
+
+std::mutex g_drainMu;
+std::vector<DrainCallerRow> g_drainCallers;  // who consumes the list
+std::vector<DrainValueRow> g_drainValues;    // which components it reads
+std::atomic<uint64_t> g_drainAllReads{0};    // accessor calls on ANY vector
+uint64_t g_drainListReads = 0;               // accessor calls on OUR list
+uint64_t g_drainDroppedValues = 0;
+uint32_t g_drainMaxIndex = 0;
+
+// Takes g_drainMu and nothing else, like ReportUiEnqueue. Called from the
+// per-frame UI visit hook while that hook holds no other lock.
+void ReportUiDrain(bool force) {
+  static std::chrono::steady_clock::time_point s_last{};
+  static size_t s_lastCallers = 0;
+  const auto now = std::chrono::steady_clock::now();
+  std::lock_guard<std::mutex> lk(g_drainMu);
+  const bool grew = g_drainCallers.size() != s_lastCallers;
+  if (!force && !grew && now - s_last < std::chrono::seconds(3)) return;
+  s_last = now;
+  s_lastCallers = g_drainCallers.size();
+  std::string callers;
+  for (const auto& c : g_drainCallers)
+    callers += fmt::format(" [caller0x{:08X} reads{}]", c.caller, c.reads);
+  std::string values;
+  for (const auto& v : g_drainValues)
+    values += fmt::format(" [0x{:08X}{} reads{}]", v.value,
+                          v.video ? " VIDEO" : "", v.reads);
+  REXLOG_INFO("native: UI DRAIN list 0x{:08X}; {} reads of it of {} accessor "
+              "calls total, max index {}; {} callers --{}; {} values ({} "
+              "dropped) --{}",
+              g_uiRenderList.load(std::memory_order_relaxed), g_drainListReads,
+              g_drainAllReads.load(std::memory_order_relaxed), g_drainMaxIndex,
+              g_drainCallers.size(), callers.empty() ? " (none)" : callers,
+              g_drainValues.size(), g_drainDroppedValues,
+              values.empty() ? " (none)" : values);
+}
+
+}  // namespace
+
+REX_IMPORT(__imp__sub_822F9800, orig_VectorAt, void());
+extern "C" REX_FUNC(sub_822F9800) {
+  const uint32_t vec = ctx.r3.u32;
+  const uint32_t index = ctx.r4.u32;
+  const uint32_t caller = uint32_t(ctx.lr);
+
+  orig_VectorAt(ctx, base);
+
+  // COUNT FIRST, FILTER SECOND - lock-free, so "the list is never read" is
+  // distinguishable from "this accessor is never called".
+  g_drainAllReads.fetch_add(1, std::memory_order_relaxed);
+
+  const uint32_t root = REX_LOAD_U32(kUiRootGlobal);
+  if (!root) return;
+  const uint32_t list = root + kUiRenderListOff;
+  if (vec != list) return;  // fast reject: some other vector
+
+  // The value read out. Taken from guest memory rather than the return
+  // register so this does not depend on how the recompiler surfaces r3.
+  const uint32_t data = REX_LOAD_U32(vec);
+  const uint32_t value = data ? REX_LOAD_U32(data + index * 4) : 0;
+
+  std::lock_guard<std::mutex> lk(g_drainMu);
+  ++g_drainListReads;
+  if (index > g_drainMaxIndex) g_drainMaxIndex = index;
+
+  bool seen = false;
+  for (auto& c : g_drainCallers) {
+    if (c.caller != caller) continue;
+    ++c.reads;
+    seen = true;
+    break;
+  }
+  if (!seen && g_drainCallers.size() < 16)
+    g_drainCallers.push_back({caller, 1});
+
+  for (auto& v : g_drainValues) {
+    if (v.value != value) continue;
+    ++v.reads;
+    return;
+  }
+  if (g_drainValues.size() >= 64) {
+    ++g_drainDroppedValues;
+    return;
+  }
+  g_drainValues.push_back({value, 1, IsWatchedVideoComponent(value)});
 }
 
 //-----------------------------------------------------------------------------
