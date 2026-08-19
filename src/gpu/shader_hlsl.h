@@ -211,13 +211,40 @@ struct HlslShader {
   uint32_t max_const_index = 0;
   bool reads_constants = false;
 
-  // Count of setp_* instructions translated for their VALUE only. Their p0
-  // result is discarded because predicated issue (the `pred` instruction prefix
-  // and cond_exec_pred) is not implemented, so a shader reporting a non-zero
-  // count may execute instructions the console would have skipped. Emitting
-  // them beats refusing the shader — a refusal costs the whole draw — but the
-  // gap is real and this is how it stays visible.
+  // Count of setp_* instructions — the ops that WRITE p0.
+  //
+  // The name is now historical. It was accurate while nothing read xe_p0 at
+  // all; since per-instruction predication landed, p0 written here is obeyed by
+  // any `(p0)` ALU instruction that follows, and in the vertex stage by
+  // cond_exec_pred as well. What is still unobeyed is narrower and has its own
+  // counters below: predicated fetches, and p0-gated exec blocks in the pixel
+  // stage. Kept under the old name so a dump from before the change and one
+  // from after still line up on the same field.
   uint32_t unhonoured_predicate_ops = 0;
+
+  // Count of ALU instructions carrying their own predicate bits, emitted as
+  // `if (xe_p0 == condition) { ... }`. Seen and obeyed are one number: unlike
+  // the exec-level blocks there is no stage where this is skipped, because an
+  // ALU instruction never samples and so its body is always legal flow control.
+  //
+  // This was the intro logo. Its pixel shader ends
+  //
+  //     (p0) sgts r2.w, -|r0|.x        <- `-|x| > 0`, constant false
+  //     (p0) mul  r2.w, r2.wwww, r0.x
+  //          max  export0, r2, r2
+  //
+  // and run unpredicated it forces alpha to a compile-time 0 — FXC even
+  // dead-strips the tfetch feeding it, which is how a one-texture DXBC came out
+  // of a two-texture shader. The quad rasterised, output white, and blended to
+  // nothing.
+  uint32_t predicated_alu_ops = 0;
+
+  // Count of FETCH instructions carrying predicate bits. NOT honoured: the
+  // fetch body spells .Sample(), which needs derivatives and is illegal in
+  // varying flow control — the same reason the pixel stage refuses p0-gated
+  // exec blocks. Zero on this title so far; a non-zero count names the shader
+  // that needs SampleGrad with hoisted derivatives before this can be closed.
+  uint32_t unhonoured_predicated_fetches = 0;
 
   // Count of PREDICATED EXEC blocks — kCondExecPred / kCondExecPredClean and
   // their *End forms. These are the other half of the same gap, and the more

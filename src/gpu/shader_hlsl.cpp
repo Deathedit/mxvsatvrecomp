@@ -160,6 +160,14 @@ class Emitter {
   // nothing acts on, because predicated issue is not implemented. Non-zero means
   // this shader may take a branch or an instruction it should have skipped.
   uint32_t unhonoured_predicate_ops = 0;
+  // ALU instructions carrying their own predicate bits, now emitted inside
+  // `if (xe_p0 == ...)`. Seen and obeyed are the same number here -- unlike the
+  // exec-level blocks, there is no stage this is refused for.
+  uint32_t predicated_alu_ops = 0;
+  // Fetch instructions carrying predicate bits. NOT honoured: a fetch is where
+  // .Sample() lives, and that is illegal in varying flow control. Counted so a
+  // shader that needs it is named rather than silently mistranslated.
+  uint32_t unhonoured_predicated_fetches = 0;
   // Fetch opcodes at 16 and above that this emitter skips. See
   // HlslShader::unhonoured_fetch_ops for why they are skipped and not refused.
   uint32_t unhonoured_fetch_ops = 0;
@@ -729,7 +737,55 @@ class Emitter {
     return r;
   }
 
+  // Opens `if (xe_p0 == ...) {` and closes it however EmitAlu returns -- and it
+  // returns from a dozen places, several of them error paths. A brace left
+  // unclosed produces HLSL that fails to compile and drops the draw to a
+  // stand-in, so this is scoped rather than closed by hand at each exit.
+  struct PredicateBlock {
+    Emitter* em = nullptr;
+    PredicateBlock(Emitter* e, bool predicated, bool condition) {
+      if (!predicated) return;
+      em = e;
+      ++em->predicated_alu_ops;
+      em->Line(std::string("if (xe_p0 == ") + (condition ? "true" : "false") +
+               ") {");
+    }
+    ~PredicateBlock() {
+      if (em) em->Line("}");
+    }
+    PredicateBlock(const PredicateBlock&) = delete;
+    PredicateBlock& operator=(const PredicateBlock&) = delete;
+  };
+
   void EmitAlu(const uc::AluInstruction& alu) {
+    // PER-INSTRUCTION PREDICATION. Separate from the exec-level cond_exec_pred
+    // handled in the CF walk: every ALU instruction carries its own
+    // is_predicated/pred_condition pair, so
+    //
+    //     17  setp_ne_push r0.x, r0.xxxx, r0.yyyy
+    //     18  (p0) sgts r2.w, -|r0|.x
+    //     21  (p0) mul  r2.w, r2.wwww, r0.xxxx
+    //
+    // runs 18 and 21 only where p0 holds, and elsewhere r2.w keeps the alpha
+    // instruction 10 put there. Running them regardless makes alpha the
+    // constant 0 -- `-|x| > 0` is never true -- which is exactly what happened:
+    // the intro logo's quad rasterised correctly, output white, and blended to
+    // nothing because its alpha had been forced to zero.
+    //
+    // Emitted as real flow control, which the exec-level path deliberately
+    // refuses to do in the pixel stage. That refusal does not apply here: an
+    // ALU instruction never samples. `.Sample()` needs derivatives and is
+    // illegal in varying flow control, but fetches are a separate instruction
+    // type emitted by EmitTextureFetch, so nothing inside this block can want a
+    // gradient. Predicated FETCHES are a different question and are counted,
+    // not honoured -- see EmitTextureFetch.
+    //
+    // Skipping the whole instruction, rather than selecting over its result, is
+    // also what gets the side effects right: a0, p0, ps and the kill discard
+    // are suppressed exactly where the console suppressed them. A select on the
+    // destination alone would still have written all four.
+    PredicateBlock pred(this, alu.is_predicated(), alu.predicate_condition());
+
     // The raw vector/scalar mask fields overlap with the export constant 0/1
     // encoding, so the canonical decoded masks are used for both temp and
     // export writes. Treating the raw bits as ordinary masks preserved position
@@ -911,6 +967,11 @@ class Emitter {
   }
 
   void EmitTextureFetch(const uc::TextureFetchInstruction& tf) {
+    // Not honoured, deliberately: the body of this function spells .Sample(),
+    // which needs derivatives and is illegal inside varying flow control. The
+    // ALU path above can take an `if` precisely because it never samples.
+    // Counted so that a shader needing this is named, not guessed at.
+    if (tf.is_predicated()) ++unhonoured_predicated_fetches;
     if (tf.is_src_relative() || tf.is_dest_relative()) {
       status = HlslStatus::kFetchRelative;
       blocking_opcode = uint32_t(tf.opcode());
@@ -2042,6 +2103,8 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   out.max_const_index = em.max_const_index;
   out.reads_constants = em.reads_constants;
   out.unhonoured_predicate_ops = em.unhonoured_predicate_ops;
+  out.predicated_alu_ops = em.predicated_alu_ops;
+  out.unhonoured_predicated_fetches = em.unhonoured_predicated_fetches;
   out.unhonoured_fetch_ops = em.unhonoured_fetch_ops;
   out.vertex_fetch_count = em.vertex_fetch_count;
   for (uint32_t i = 0; i < em.vertex_fetch_count; ++i)

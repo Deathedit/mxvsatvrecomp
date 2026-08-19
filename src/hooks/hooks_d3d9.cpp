@@ -4674,10 +4674,17 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
             << " writes_position " << (out.writes_position ? 1 : 0);
           // Only when non-zero, so its presence in a dump means something.
           if (out.unhonoured_predicate_ops)
-            f << "\n; UNHONOURED PREDICATE OPS: "
-              << out.unhonoured_predicate_ops
-              << " (setp_* translated for its value; p0 is not acted on, so "
-                 "this shader may run instructions the console skipped)";
+            f << "\n; SETP OPS WRITING p0: " << out.unhonoured_predicate_ops;
+          // The half that used to be missing entirely. Non-zero means p0 is not
+          // merely computed but ACTED ON, per instruction.
+          if (out.predicated_alu_ops)
+            f << "\n; PREDICATED ALU INSTRUCTIONS: " << out.predicated_alu_ops
+              << " (all HONOURED as `if (xe_p0 == ...)`)";
+          if (out.unhonoured_predicated_fetches)
+            f << "\n; UNHONOURED PREDICATED FETCHES: "
+              << out.unhonoured_predicated_fetches
+              << " (RUN UNCONDITIONALLY where the console gated them on p0 -- "
+                 ".Sample() is illegal in varying flow control)";
           // The stronger of the two. Above, p0 is merely discarded; here a
           // block the console gated on p0 is executed regardless.
           if (out.pred_exec_blocks)
