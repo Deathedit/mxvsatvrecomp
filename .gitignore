@@ -5,9 +5,11 @@ logs/*
 userdata/*
 old_logs/*
 backup/*
+rdc/*
 tools/__pycache__
 *.dll
 *.exe
+*.bat
 gamecontrollerdb.txt
 
 # Runtime dumps. These write into logs/ as of 2026-08-17 (logs/* is already
