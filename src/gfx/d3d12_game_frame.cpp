@@ -1624,14 +1624,20 @@ void D3D12Renderer::RenderGameFrame() {
                   "guest shaders: %llu draws TRANSLATED (%llu of them running "
                   "the guest VERTEX shader too, %llu of those fetching their "
                   "own vertices, %llu dropped for want of one), "
-                  "%llu stand-in; %llu pipelines built, %llu failed; "
-                  "vertex-sampled %llu (bind failed %llu); scissor clipped "
-                  "%llu, unreadable %llu",
+                  "%llu stand-in (%.2f/frame); %llu pipelines built, %llu "
+                  "failed; vertex-sampled %llu (bind failed %llu); scissor "
+                  "clipped %llu, unreadable %llu",
                   static_cast<unsigned long long>(m_translatedDraws),
                   static_cast<unsigned long long>(m_gpuVertexDraws),
                   static_cast<unsigned long long>(m_gpuVertexFetchDraws),
                   static_cast<unsigned long long>(m_gpuVertexDropped),
                   static_cast<unsigned long long>(m_standInDraws),
+                  // The stand-in count is the one figure on this line a reader
+                  // acts on, and cumulative it is unreadable: 2643 over a
+                  // 2800-frame run is one draw a frame, not a defect. Carry the
+                  // rate next to it so the total cannot be read alone.
+                  m_gameFrame ? double(m_standInDraws) / double(m_gameFrame)
+                              : 0.0,
                   static_cast<unsigned long long>(m_translatedOk),
                   static_cast<unsigned long long>(m_translatedFailed),
                   static_cast<unsigned long long>(m_vertexSampledDraws),
@@ -1841,11 +1847,32 @@ void D3D12Renderer::RenderGameFrame() {
                       uint32_t(worst[i].second & 0xFFFFFFFFu));
         line += one;
       }
+      // PER FRAME, beside the cumulative total, and that is the point of this
+      // line rather than a decoration.
+      //
+      // These counters are cumulative over a whole run, so on a 2800-frame run
+      // this printed "2744" and read as a 2744-draw defect. It is ONE DRAW PER
+      // FRAME. That number was carried as an open item for most of a session on
+      // the strength of the total alone; "2643 draws" and "1 draw/frame across
+      // 2643 frames" are the same measurement and completely different
+      // findings. Print the denominator with the numerator, always.
+      //
+      // What the residual actually is on this title, measured in a capture
+      // rather than assumed: the frame's FIRST draw, a screen-space quad over
+      // roughly the top-left 40% x 35%, issued before the guest has bound any
+      // shader (vs handle 0, 4 indices, triangle strip) and CLEARED five events
+      // later by the frame's own clear. Traced at two pixels in flashing.rdc;
+      // it never reaches the screen, so being a stand-in costs nothing but the
+      // draw itself. Left uncounted-as-a-category on purpose -- that is an
+      // observation about this game, not a classification we can test for here.
+      const double perFrame =
+          m_gameFrame ? double(m_standInNoHandle) / double(m_gameFrame) : 0.0;
       std::snprintf(message, sizeof(message),
-                    "no-handle records: %llu total = %llu yuv + %llu clear + "
-                    "%llu surface-bind + %llu UNEXPLAINED; %zu distinct "
-                    "(vs, idx):%s",
+                    "no-handle records: %llu total over %llu frames = %.2f per "
+                    "frame; = %llu yuv + %llu clear + %llu surface-bind + %llu "
+                    "other; %zu distinct (vs, idx):%s",
                     static_cast<unsigned long long>(m_standInNoHandle),
+                    static_cast<unsigned long long>(m_gameFrame), perFrame,
                     static_cast<unsigned long long>(m_standInNoHandlePlanes),
                     static_cast<unsigned long long>(m_standInNoHandleClear),
                     static_cast<unsigned long long>(m_standInNoHandleBind),
