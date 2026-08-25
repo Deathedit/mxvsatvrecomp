@@ -165,9 +165,16 @@ extern "C" REX_FUNC(sub_8293C778) {
     NoteGlyphCacheGeometry(atlas_w, atlas_h);
   }
 
+  // Counted BEFORE the pending test, and before the original, so that a run
+  // which never reaches the upload is distinguishable from one whose atlas is
+  // simply already warm. Both look like "no flush lines" without this.
+  ++g_glyphFlushCalls;
+  if (!pending) ++g_glyphFlushEmpty;
+
   orig_GlyphCacheFlush(ctx, base);
 
   if (!pending) return;
+  g_glyphFlushRects += pending;
   ++g_glyphCacheGeneration;
   ++g_glyphCacheFlushes;
   if (g_glyphCacheFlushes <= 8 || (g_glyphCacheFlushes % 250) == 0) {
@@ -179,6 +186,43 @@ extern "C" REX_FUNC(sub_8293C778) {
                 "atlas generation {}; atlas extent {}x{}",
                 g_glyphCacheFlushes, pending, g_glyphCacheGeneration, atlas_w,
                 atlas_h);
+  }
+}
+
+//=============================================================================
+// 0x8293A888 — Scaleform GFx: GetTexture(cache, renderer, slot).
+//
+// Returns the atlas texture for a slot, creating it through OUR renderer's
+// vtable on first use:
+//
+//     v4 = &cache[5 * slot + 14];          // slots at cache+56, stride 20
+//     if (*v4) return 1;                   // already have one
+//     *v4 = renderer->vtable[2](renderer); // CreateTexture -- OURS
+//     if (!*v4) return 0;
+//     ...
+//     return texture->vtable[2](tex, cache[0], cache[1], 9, 0, 16) != 0;
+//
+// This is the only refusal point in the glyph chain that runs through our code
+// rather than the guest's, and a failure here is NOT retried: sub_8293C778
+// clears the slot's dirty flag outside the success test, so the rects that were
+// waiting for this texture are discarded for the life of the cache. Hooked to
+// count, not to change anything -- if `FAILED` is ever non-zero, that is a
+// missing-glyph cause and not a theory.
+//
+// Called from both the rasteriser (sub_8293E720) and the flush; both are
+// counted, because a failure on either path loses the same glyph.
+//=============================================================================
+REX_IMPORT(__imp__sub_8293A888, orig_GlyphGetTexture, void());
+extern "C" REX_FUNC(sub_8293A888) {
+  orig_GlyphGetTexture(ctx, base);
+
+  ++g_glyphGetTextureCalls;
+  if (ctx.r3.u32 & 0xFF) return;
+  const uint64_t n = ++g_glyphGetTextureFailed;
+  if (n <= 8) {
+    REXLOG_INFO("d3d9: GLYPH GetTexture FAILED (#{}) -- this slot's pending "
+                "rects are now discarded and will not be retried",
+                n);
   }
 }
 

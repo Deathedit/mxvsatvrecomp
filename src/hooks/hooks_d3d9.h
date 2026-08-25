@@ -58,3 +58,16 @@ uint64_t GuestDrawCalls();
 // per-frame delta, and not worth an atomic on the draw path.
 uint64_t HleDrawsAccepted();
 uint64_t HleDrawsRefused();
+
+// One line of glyph-cache state: how often the Scaleform flush was CALLED, how
+// many of those carried rects, and how many GetTexture calls failed.
+//
+// Declared here rather than in hooks_d3d9_internal.h because the caller is the
+// frame hook, which does not include the internal header -- and must not start
+// to, given that header's include-order requirement.
+//
+// The reason it is a separate reporter and not another line inside the flush
+// hook: the thing being diagnosed is a run with ZERO flushes, and a line that
+// prints only when a flush happens renders that case as silence. Call it on a
+// swap cadence so every one of these being zero is itself a readable result.
+void ReportGlyphCache();

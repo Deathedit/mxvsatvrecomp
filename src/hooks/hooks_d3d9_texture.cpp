@@ -160,6 +160,31 @@ std::atomic<uint64_t> g_guestDrawCalls{0};
 uint32_t g_glyphCacheGeneration = 1;
 uint64_t g_glyphCacheFlushes = 0;
 
+// g_glyphCacheFlushes only moves when the flush carried rects, so on its own it
+// cannot tell "the flush never ran" from "it ran with nothing pending". Those
+// are completely different findings -- the first says the guest never reaches
+// the upload at all, the second says the atlas is simply already warm -- and a
+// freeroam run showing zero flushes is unreadable without this pair.
+// See [[counter-that-cannot-fire]]: a counter you cannot distinguish a zero in
+// is not a measurement.
+uint64_t g_glyphFlushCalls = 0;   // EVERY call, before the pending test
+uint64_t g_glyphFlushEmpty = 0;   // of those, the ones with 0 rects pending
+uint64_t g_glyphFlushRects = 0;   // total rects uploaded
+
+// sub_8293A888 is GetTexture: it hands back the atlas texture for a slot,
+// creating it through OUR renderer's vtable on first use. It is the one refusal
+// point in the glyph chain that runs through our code rather than the guest's.
+//
+// A failure there is not recoverable and not retried. sub_8293C778 clears the
+// slot's dirty flag OUTSIDE the success test:
+//
+//     if (v5[4]) { if (sub_8293A888(...)) { ...Update... } v5[4] = 0; }
+//
+// so a failed create silently DISCARDS that slot's pending rects for the life
+// of the cache. That is the exact shape of "some letters never appear".
+uint64_t g_glyphGetTextureCalls = 0;
+uint64_t g_glyphGetTextureFailed = 0;
+
 // Tiny -- one entry per distinct atlas geometry, which is one or two. The
 // atomic is the fast path: the flush hook runs once per guest DrawText, and the
 // geometry is the same on essentially every call, so the lock is taken only

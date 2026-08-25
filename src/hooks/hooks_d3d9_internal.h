@@ -301,6 +301,17 @@ extern uint64_t g_decls;
 extern uint64_t g_patchCalls;
 extern uint32_t g_glyphCacheGeneration;
 extern uint64_t g_glyphCacheFlushes;
+// The denominators for g_glyphCacheFlushes. It counts only flushes that carried
+// rects, so without these a zero cannot be read: "never called" and "called,
+// nothing pending" are the same number. Reported unconditionally, on a cadence
+// that fires even when every one of them is zero.
+extern uint64_t g_glyphFlushCalls;
+extern uint64_t g_glyphFlushEmpty;
+extern uint64_t g_glyphFlushRects;
+// GetTexture, the glyph chain's only refusal point inside our renderer. A
+// failure there makes sub_8293C778 drop that slot's pending rects permanently.
+extern uint64_t g_glyphGetTextureCalls;
+extern uint64_t g_glyphGetTextureFailed;
 
 // The extent of a Scaleform glyph atlas, read off the cache object by the flush
 // hook. This is what makes the flush invalidation name the atlases instead of

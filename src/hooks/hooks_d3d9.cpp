@@ -5525,6 +5525,25 @@ uint64_t GuestDrawCalls() {
   return mx::hooks::d3d9::g_guestDrawCalls.load(std::memory_order_relaxed);
 }
 
+// Same shape and the same reason: hooks_frame.cpp calls this and cannot include
+// the internal header where the counters are declared.
+//
+// Printed on a swap cadence rather than from inside the flush hook, because the
+// case being diagnosed is a run with ZERO flushes -- a line that prints only
+// when a flush happens reports exactly that case as silence. Every field being
+// zero has to be a readable result, not an absent one.
+void ReportGlyphCache() {
+  namespace d = mx::hooks::d3d9;
+  REXLOG_INFO(
+      "d3d9: GLYPH CACHE flush called {} times ({} with nothing pending, {} "
+      "carried rects, {} rects total) | GetTexture {} calls, {} FAILED "
+      "(a failure DISCARDS that slot's pending rects permanently, and is the "
+      "one refusal point in the glyph chain that is OURS) | generation {}",
+      d::g_glyphFlushCalls, d::g_glyphFlushEmpty, d::g_glyphCacheFlushes,
+      d::g_glyphFlushRects, d::g_glyphGetTextureCalls,
+      d::g_glyphGetTextureFailed, d::g_glyphCacheGeneration);
+}
+
 uint64_t HleDrawsAccepted() { return mx::hooks::d3d9::g_hleDrawsAccepted; }
 uint64_t HleDrawsRefused() {
   // Both last-gate refusals and the deferred path's own discards, because a
