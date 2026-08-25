@@ -542,7 +542,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // textures, and one block that size per draw exhausts the heap within a
   // frame.
   // The descriptor table width. Every block costs this many descriptors, so it
-  // multiplies against kMaxTranslatedBlocks into the heap size — see there.
+  // multiplies against m_maxTranslatedBlocks into the heap size — see there.
   static constexpr uint32_t kTranslatedSamplerSlots = 16;
   static_assert(kTranslatedSamplerSlots == kSamplerBlockSlots,
                 "one sampler per texture slot, in one contiguous table");
@@ -684,7 +684,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // block above was moved off a shared block for exactly this reason, and it
   // read as zero on this hardware rather than failing.
   // Per-draw descriptor blocks, PARTITIONED BY FRAME IN FLIGHT: frame f owns
-  // [f*kTranslatedBlocksPerFrame, (f+1)*kTranslatedBlocksPerFrame). The ring
+  // [f*m_translatedBlocksPerFrame, (f+1)*m_translatedBlocksPerFrame). The ring
   // used to be one shared range reset in ClearGameDraws, which runs only when
   // the guest hands off a new draw list — while blocks are consumed by
   // RenderGameFrame, which runs every HOST frame and replays the previous list
@@ -697,17 +697,54 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // rewriting blocks the GPU finished with kFrameCount frames ago, which is
   // what putting the reset in ClearGameDraws was protecting.
   // 3072 rather than 4096 because the slot count doubled to 16: the heap is
-  // kMaxTranslatedBlocks * kTranslatedSamplerSlots descriptors, and 4096 * 16
+  // m_maxTranslatedBlocks * kTranslatedSamplerSlots descriptors, and 4096 * 16
   // would be 65536 — exactly the Resource Binding Tier 1 cap for a
   // shader-visible CBV/SRV/UAV heap, with no margin. 3072 * 16 = 49152 keeps
   // headroom, and 1024 blocks per frame in flight is still eight times the
   // measured per-frame demand of ~125.
-  static constexpr uint32_t kMaxTranslatedBlocks = 3072;
-  static constexpr uint32_t kTranslatedBlocksPerFrame =
-      kMaxTranslatedBlocks / kFrameCount;
+  // SIZED AT RUNTIME FROM THE DEVICE'S RESOURCE BINDING TIER, because 3072 was
+  // not enough and the reason it looked like enough is instructive.
+  //
+  // The figure it was justified against -- "eight times the measured per-frame
+  // demand of ~125" -- was measured on a menu-scale frame. Freeroam submits
+  // 699-839 guest draws a frame, and the vertex and pixel stages claim a block
+  // EACH, so demand is the same order as the 1024-per-frame slice rather than
+  // an eighth of it. The ring then survives some frames and not others, and
+  // every draw after it runs dry falls to the tex*col stand-in. The UI is drawn
+  // last, so the UI is what strobes: 17016 of 19099 stand-in draws in mx_1357
+  // were this. Same shape as measure-with-a-level-loaded -- a cap validated
+  // against the menu and exceeded once a level is up.
+  //
+  // The 3072 was pinned by assuming Resource Binding Tier 1, whose
+  // shader-visible CBV/SRV/UAV heap caps at 65536 descriptors: at 16 slots a
+  // block that is 4096 blocks, and 3072 left margin under it. That assumption
+  // is what actually costs us -- Tier 2 and Tier 3 raise the cap to about a
+  // million, and Tier 1 hardware predates anything this port targets. So ask
+  // the device instead of assuming the floor.
+  //
+  // kMaxTranslatedBlocksTier1 is retained as the floor for a device that really
+  // does report Tier 1: it is worse than before only in that it is honest about
+  // the limit rather than pretending the limit is the requirement.
+  static constexpr uint32_t kMaxTranslatedBlocksTier1 = 3072;
+  // What Tier 2+ gets. 24576 * 16 = 393216 descriptors, comfortably inside the
+  // ~1,000,000 those tiers allow, and 8192 blocks per frame in flight against a
+  // measured freeroam demand under 1700 -- the margin the old constant claimed
+  // to have. Descriptors in a shader-visible heap cost 32 bytes each here, so
+  // this is ~12 MB of descriptor heap, which is not a meaningful budget item
+  // next to the render targets.
+  static constexpr uint32_t kMaxTranslatedBlocksTier2 = 24576;
+  // Resolved in CreateTranslatedRootSignature, before the heap is created.
+  uint32_t m_maxTranslatedBlocks = kMaxTranslatedBlocksTier1;
+  uint32_t m_translatedBlocksPerFrame =
+      kMaxTranslatedBlocksTier1 / kFrameCount;
+  // High-water mark of blocks claimed in a single frame, and the frame that set
+  // it. The old constant was justified by a number nobody could re-check from a
+  // log; this makes the headroom a measurement. Reported beside the exhaustion
+  // count so "how close are we" is answerable without another session.
+  uint32_t m_translatedBlockHighWater = 0;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_translatedSrvHeap;
   uint32_t m_translatedBlockNext = 0;
-  uint32_t m_translatedBlockLimit = kTranslatedBlocksPerFrame;
+  uint32_t m_translatedBlockLimit = kMaxTranslatedBlocksTier1 / kFrameCount;
   uint64_t m_translatedBlockExhausted = 0;
   // Why a draw with a translated shader fell back to the stand-in anyway. All
   // four used to be a silent `return false`, which made "translated 17243,

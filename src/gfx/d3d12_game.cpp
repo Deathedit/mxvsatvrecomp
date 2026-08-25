@@ -721,9 +721,41 @@ bool D3D12Renderer::CreateTranslatedRootSignature() {
     return false;
   }
   {
+    // Ask the device what it can actually hold. The previous size assumed
+    // Resource Binding Tier 1's 65536-descriptor cap and sized to stay under
+    // it; that assumption, not the hardware, is what limited the ring to 1024
+    // blocks per frame in flight and sent freeroam's UI to the stand-in. See
+    // the note by kMaxTranslatedBlocksTier1.
+    D3D12_FEATURE_DATA_D3D12_OPTIONS options = {};
+    HRESULT hrOptions = m_device->CheckFeatureSupport(
+        D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options));
+    // A failed query is treated as Tier 1. It is the conservative direction:
+    // too small only costs stand-in draws, while too large fails heap creation
+    // outright and takes the whole translated path with it.
+    const bool tier1 =
+        FAILED(hrOptions) ||
+        options.ResourceBindingTier == D3D12_RESOURCE_BINDING_TIER_1;
+    m_maxTranslatedBlocks =
+        tier1 ? kMaxTranslatedBlocksTier1 : kMaxTranslatedBlocksTier2;
+    m_translatedBlocksPerFrame = m_maxTranslatedBlocks / kFrameCount;
+    m_translatedBlockLimit = m_translatedBlocksPerFrame;
+    {
+      char msg[256];
+      std::snprintf(msg, sizeof(msg),
+                    "CreateTranslatedRootSignature: resource binding tier %u%s "
+                    "-> %u descriptor blocks (%u per frame in flight, %u "
+                    "descriptors)",
+                    FAILED(hrOptions) ? 0u
+                                      : uint32_t(options.ResourceBindingTier),
+                    FAILED(hrOptions) ? " (query FAILED, assuming tier 1)" : "",
+                    m_maxTranslatedBlocks, m_translatedBlocksPerFrame,
+                    m_maxTranslatedBlocks * kTranslatedSamplerSlots);
+      LogInfo(msg);
+    }
+
     D3D12_DESCRIPTOR_HEAP_DESC hd = {};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-    hd.NumDescriptors = kMaxTranslatedBlocks * kTranslatedSamplerSlots;
+    hd.NumDescriptors = m_maxTranslatedBlocks * kTranslatedSamplerSlots;
     hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     if (FAILED(m_device->CreateDescriptorHeap(&hd,
                                               IID_PPV_ARGS(&m_translatedSrvHeap)))) {

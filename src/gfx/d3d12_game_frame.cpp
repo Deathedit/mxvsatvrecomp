@@ -43,9 +43,32 @@ void D3D12Renderer::RenderGameFrame() {
   DrainLuminanceReadback();
   // This frame in flight takes its own slice of the descriptor blocks, so the
   // window resets every host frame rather than only when the guest hands off a
-  // new draw list. See kTranslatedBlocksPerFrame.
-  m_translatedBlockNext = m_frameIndex * kTranslatedBlocksPerFrame;
-  m_translatedBlockLimit = m_translatedBlockNext + kTranslatedBlocksPerFrame;
+  // new draw list. See m_translatedBlocksPerFrame.
+  // High-water BEFORE the reset, so it measures the frame that just ended.
+  // Without it the ring's headroom is unfalsifiable from a log -- which is how
+  // "eight times the measured demand of ~125" survived into a scene submitting
+  // seven times that.
+  //
+  // The base comes from m_translatedBlockLimit, NOT from m_frameIndex: at this
+  // point m_frameIndex has already advanced to the frame about to be recorded,
+  // while m_translatedBlockNext still points into the slice of the frame that
+  // just ended. Deriving the base from the new index reads across the wrap and
+  // reports nonsense -- the first run of this printed "16726 of 8192 per frame
+  // at peak", i.e. 2 * 8192 + 342, when the true figure was 342. A high-water
+  // mark that can exceed its own limit is how that got caught; keep the
+  // impossible value impossible.
+  {
+    const uint32_t prevBase = m_translatedBlockLimit >= m_translatedBlocksPerFrame
+                                  ? m_translatedBlockLimit -
+                                        m_translatedBlocksPerFrame
+                                  : 0;
+    if (m_translatedBlockNext > prevBase) {
+      const uint32_t used = m_translatedBlockNext - prevBase;
+      if (used > m_translatedBlockHighWater) m_translatedBlockHighWater = used;
+    }
+  }
+  m_translatedBlockNext = m_frameIndex * m_translatedBlocksPerFrame;
+  m_translatedBlockLimit = m_translatedBlockNext + m_translatedBlocksPerFrame;
   for (auto& [object, target] : m_gameRenderTargets)
     target.usedThisFrame = false;
   for (auto& [object, target] : m_gameDepthTargets)
@@ -1628,7 +1651,8 @@ void D3D12Renderer::RenderGameFrame() {
                   "upload-failed %llu, array-slot-flat %llu; "
                   "surfaces created on bind %llu depth + %llu colour, "
                   "on resolve %llu; "
-                  "sampler blocks %zu of %u, exhausted %llu",
+                  "sampler blocks %zu of %u, exhausted %llu; "
+                  "descriptor blocks %u of %u per frame at peak",
                   static_cast<unsigned long long>(m_translatedBlockExhausted),
                   static_cast<unsigned long long>(m_translatedNoSnapshot),
                   static_cast<unsigned long long>(m_noSnapshotDepth),
@@ -1642,7 +1666,8 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_bindCreatedColour),
                   static_cast<unsigned long long>(m_resolveCreatedSources),
                   m_samplerBlocks.size(), kSamplerBlockCount,
-                  static_cast<unsigned long long>(m_samplerBlockExhausted));
+                  static_cast<unsigned long long>(m_samplerBlockExhausted),
+                  m_translatedBlockHighWater, m_translatedBlocksPerFrame);
     LogInfo(message);
     // Separate line rather than a longer format: the snapshot numbers answer a
     // different question (which resolve result a draw sampled) from the routing
