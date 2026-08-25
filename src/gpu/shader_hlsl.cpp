@@ -164,10 +164,10 @@ class Emitter {
   // `if (xe_p0 == ...)`. Seen and obeyed are the same number here -- unlike the
   // exec-level blocks, there is no stage this is refused for.
   uint32_t predicated_alu_ops = 0;
-  // Fetch instructions carrying predicate bits. NOT honoured: a fetch is where
-  // .Sample() lives, and that is illegal in varying flow control. Counted so a
-  // shader that needs it is named rather than silently mistranslated.
-  uint32_t unhonoured_predicated_fetches = 0;
+  // Texture fetches carrying predicate bits, HONOURED as of 2026-08-26 by
+  // gating the destination write rather than the sample. See the long note at
+  // EmitFetchDestination for why that is legal here and not for exec blocks.
+  uint32_t predicated_fetches = 0;
   // Fetch opcodes at 16 and above that this emitter skips. See
   // HlslShader::unhonoured_fetch_ops for why they are skipped and not refused.
   uint32_t unhonoured_fetch_ops = 0;
@@ -743,10 +743,11 @@ class Emitter {
   // stand-in, so this is scoped rather than closed by hand at each exit.
   struct PredicateBlock {
     Emitter* em = nullptr;
-    PredicateBlock(Emitter* e, bool predicated, bool condition) {
+    PredicateBlock(Emitter* e, bool predicated, bool condition,
+                   uint32_t* counter) {
       if (!predicated) return;
       em = e;
-      ++em->predicated_alu_ops;
+      ++*counter;
       em->Line(std::string("if (xe_p0 == ") + (condition ? "true" : "false") +
                ") {");
     }
@@ -784,7 +785,8 @@ class Emitter {
     // also what gets the side effects right: a0, p0, ps and the kill discard
     // are suppressed exactly where the console suppressed them. A select on the
     // destination alone would still have written all four.
-    PredicateBlock pred(this, alu.is_predicated(), alu.predicate_condition());
+    PredicateBlock pred(this, alu.is_predicated(),
+                        alu.predicate_condition(), &predicated_alu_ops);
 
     // The raw vector/scalar mask fields overlap with the export constant 0/1
     // encoding, so the canonical decoded masks are used for both temp and
@@ -967,11 +969,6 @@ class Emitter {
   }
 
   void EmitTextureFetch(const uc::TextureFetchInstruction& tf) {
-    // Not honoured, deliberately: the body of this function spells .Sample(),
-    // which needs derivatives and is illegal inside varying flow control. The
-    // ALU path above can take an `if` precisely because it never samples.
-    // Counted so that a shader needing this is named, not guessed at.
-    if (tf.is_predicated()) ++unhonoured_predicated_fetches;
     if (tf.is_src_relative() || tf.is_dest_relative()) {
       status = HlslStatus::kFetchRelative;
       blocking_opcode = uint32_t(tf.opcode());
@@ -1413,7 +1410,41 @@ class Emitter {
     }
   }
 
+  // A predicated TEXTURE fetch. The `if` goes around the destination write
+  // ONLY -- the .Sample() above has already been emitted, outside it.
+  //
+  // That is what makes this legal where the exec-block form is not. .Sample()
+  // needs implicit derivatives and cannot appear in varying flow control, but a
+  // fetch's only effect is writing its destination register, so sampling
+  // unconditionally and gating the WRITE is observationally identical: where p0
+  // is clear the destination keeps its previous value, which is exactly what
+  // not fetching achieves.
+  //
+  // Nothing is reordered. Both statements sit at the same point in the
+  // instruction stream -- the sample was simply never inside the `if` -- so
+  // there is no hoist, and no question about what the coordinate register held
+  // in between.
+  //
+  // The guest agrees, in the encoding: every predicated fetch in this title
+  // that carries the attribute sets FetchValidOnly=false, which ucode.h defines
+  // as "whether the data should be fetched only for pixels inside the current
+  // primitive in a 2x2 quad (must be set to false if the result itself is used
+  // to calculate gradients)". The guest is telling the hardware NOT to make
+  // these fetches lane-conditional, so sampling across the whole quad is the
+  // faithful translation rather than a shortcut around one.
+  //
+  // Xenia instead wraps the fetch itself and pays for it with explicit
+  // gradients everywhere (dxbc_shader_translator_fetch.cc has no implicit
+  // OpSample at all, only OpSampleD). It needs that because it wraps whole exec
+  // blocks, where a skipped fetch has to interact with memexport and kill. For
+  // a standalone predicated fetch this is equivalent and far less machinery.
+  //
+  // EXEC-BLOCK predication is NOT solved by this and must not be assumed to be:
+  // a fetch inside a p0-gated block would need its coordinate computed outside
+  // the block, which nothing guarantees. That case still wants Xenia's approach.
   void EmitFetchDestination(const uc::TextureFetchInstruction& tf) {
+    PredicateBlock pred(this, tf.is_predicated(), tf.predicate_condition(),
+                        &predicated_fetches);
     EmitFetchDestination(tf.dest(), tf.dest_swizzle());
   }
 
@@ -2104,7 +2135,7 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   out.reads_constants = em.reads_constants;
   out.unhonoured_predicate_ops = em.unhonoured_predicate_ops;
   out.predicated_alu_ops = em.predicated_alu_ops;
-  out.unhonoured_predicated_fetches = em.unhonoured_predicated_fetches;
+  out.predicated_fetches = em.predicated_fetches;
   out.unhonoured_fetch_ops = em.unhonoured_fetch_ops;
   out.vertex_fetch_count = em.vertex_fetch_count;
   for (uint32_t i = 0; i < em.vertex_fetch_count; ++i)

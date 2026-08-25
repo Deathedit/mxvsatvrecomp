@@ -4680,11 +4680,10 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
           if (out.predicated_alu_ops)
             f << "\n; PREDICATED ALU INSTRUCTIONS: " << out.predicated_alu_ops
               << " (all HONOURED as `if (xe_p0 == ...)`)";
-          if (out.unhonoured_predicated_fetches)
-            f << "\n; UNHONOURED PREDICATED FETCHES: "
-              << out.unhonoured_predicated_fetches
-              << " (RUN UNCONDITIONALLY where the console gated them on p0 -- "
-                 ".Sample() is illegal in varying flow control)";
+          if (out.predicated_fetches)
+            f << "\n; PREDICATED TEXTURE FETCHES: " << out.predicated_fetches
+              << " (all HONOURED -- sample unconditionally, gate the "
+                 "destination write)";
           // The stronger of the two. Above, p0 is merely discarded; here a
           // block the console gated on p0 is executed regardless.
           if (out.pred_exec_blocks)

@@ -239,12 +239,24 @@ struct HlslShader {
   // nothing.
   uint32_t predicated_alu_ops = 0;
 
-  // Count of FETCH instructions carrying predicate bits. NOT honoured: the
-  // fetch body spells .Sample(), which needs derivatives and is illegal in
-  // varying flow control — the same reason the pixel stage refuses p0-gated
-  // exec blocks. Zero on this title so far; a non-zero count names the shader
-  // that needs SampleGrad with hoisted derivatives before this can be closed.
-  uint32_t unhonoured_predicated_fetches = 0;
+  // Count of TEXTURE FETCH instructions carrying predicate bits, all HONOURED
+  // as of 2026-08-26 by gating the destination WRITE rather than the sample.
+  //
+  // Previously counted and refused, on the grounds that .Sample() needs
+  // derivatives and is illegal in varying flow control. That objection is real
+  // but applies only to putting the SAMPLE inside the branch: a fetch's only
+  // effect is writing its destination register, so sampling unconditionally and
+  // predicating the write is observationally identical -- where p0 is clear the
+  // destination keeps its previous value, which is what not fetching achieves.
+  //
+  // Found in Xenia's dump of this title: 53 predicated fetches across 4
+  // shaders, every one carrying FetchValidOnly=false -- the guest telling the
+  // hardware NOT to make them lane-conditional.
+  //
+  // Does NOT cover p0-gated exec blocks, which remain unhonoured in the pixel
+  // stage; see honoured_pred_exec_blocks. A fetch inside such a block would
+  // need its coordinate computed outside the block, which nothing guarantees.
+  uint32_t predicated_fetches = 0;
 
   // Count of PREDICATED EXEC blocks — kCondExecPred / kCondExecPredClean and
   // their *End forms. These are the other half of the same gap, and the more
