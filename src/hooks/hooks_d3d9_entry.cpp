@@ -482,30 +482,29 @@ extern "C" REX_FUNC(sub_825561B0) {
 
 // Build draws from the BeginVertices/EndVertices path.
 //
-// OFF BY DEFAULT, and the reason is a regression, not caution. The hook works:
-// with it on, decls.txt gets BeginEndVertices entries (prim 13, 4 verts, stride
-// 12, from the command ring) and UI RENDER DRAW goes from 0 of 2816 READY
-// entries moving the draw counter to 1020 of 1020. But the same run took an
-// access violation the previous eleven runs did not:
+// ALWAYS ON as of 2026-08-26. It was behind --d3d9_begin_vertices, default off,
+// because the run that first proved the hook works also took an access
+// violation the previous eleven runs had not:
 //
 //     write to guest 0x58 in sub_8234CE20 +0x10B
 //     sub_8234CE20:  if (!this[105]) { v2 = this[37]; *(v2 + 88) = 1; ... }
 //
-// 0x58 is 88 decimal, so `this[37]` (+148) was null: a one-shot init running
-// against a half-constructed object. This hook does not alter guest control
-// flow -- it reads args, calls the original, and does host-side bookkeeping --
-// so the most likely story is a pre-existing construction race that the extra
-// work on the draw path shifted timing enough to expose. That is a hypothesis,
-// not a measurement, which is exactly why the default is off rather than
-// "probably fine".
+// 0x58 is 88 decimal, so `this[37]` (+148) was null: a one-shot init against a
+// half-constructed object, and the guard at the top is not atomic with the
+// `this[105] = 1` at the bottom. It reached 2 crashes in 5 hook-on runs and
+// then stopped reproducing.
 //
-// Turn on with --d3d9_begin_vertices to keep working on it. Leaving the default
-// on would trade a known-good menu for an unproven intro.
-REXCVAR_DEFINE_BOOL(d3d9_begin_vertices, false, "Debug",
-                    "Build DrawCalls from D3DDevice_BeginVertices/EndVertices "
-                    "(the UI draw path). Off: known to expose a crash in the "
-                    "guest one-shot init sub_8234CE20.");
-
+// The cvar is gone because this path is not optional: it is the ONLY way the
+// engine's UI draws reach us, and without it the intro logo is never submitted
+// at all. A flag defaulted off is a flag that is never exercised, and the
+// counters it was protecting -- FRAME DRAWS comparing against historical logs
+// -- stopped being the live question once the draws became load-bearing.
+//
+// What that crash was never explained. If guest-side faults reappear around
+// front-end construction, this is the first thing to suspect and
+// ui-draws-bypass-hooked-entry-points carries the register dump and the
+// decompilation. Reverting is a two-line change: restore the early-out at the
+// top of each hook.
 namespace {
 
 // Set while D3DDevice_DrawVerticesUP's original is running. See the
@@ -573,13 +572,6 @@ std::atomic<uint64_t> g_bv_unreadable{0};
 //-----------------------------------------------------------------------------
 REX_IMPORT(__imp__sub_825556C8, orig_BeginVertices, void());
 extern "C" REX_FUNC(sub_825556C8) {
-  // Before ANY counting: with the cvar off this must be indistinguishable
-  // from not hooking the function at all, including in FRAME DRAWS, or the
-  // counters stop comparing against every log recorded so far.
-  if (!REXCVAR_GET(d3d9_begin_vertices)) {
-    orig_BeginVertices(ctx, base);
-    return;
-  }
   const bool nested = t_inDrawVerticesUP != 0;
   // Only the outermost reservation is a draw of its own; the UP wrapper counts
   // its own.
@@ -620,10 +612,6 @@ extern "C" REX_FUNC(sub_825556C8) {
 
 REX_IMPORT(__imp__sub_825556B8, orig_EndVertices, void());
 extern "C" REX_FUNC(sub_825556B8) {
-  if (!REXCVAR_GET(d3d9_begin_vertices)) {
-    orig_EndVertices(ctx, base);
-    return;
-  }
   MX_D3D9_PLUGIN_PASSTHROUGH(orig_EndVertices);
   // Consume unconditionally: a reservation must never outlive its End, or the
   // next unrelated End on this thread would build a draw from stale bounds.

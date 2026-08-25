@@ -384,12 +384,21 @@ sub_82B27390(geom)
 Measured consequence: every stage of the UI submit passes and
 `GuestDrawCalls()` never moves — 0 of 2816 render entries moved it.
 
-**A hook for this exists but is NOT on the main branch.** It is parked on
-`begin-vertices-hook` (commit `de8bf3b`), gated behind `--d3d9_begin_vertices`,
-default off. It fires correctly (16 draws logged to `decls.txt`, prim 13,
-4 verts, stride 12) but does not yet make the intro logo appear, and it exposed
-an intermittent crash in `sub_8234CE20`. Reapply with `git cherry-pick`. Full
-write-up in the memory note `ui-draws-bypass-hooked-entry-points`.
+**HOOKED, unconditionally, since 2026-08-26.** `hooks_d3d9_entry.cpp` hooks
+both entry points and builds a `DrawCall` at `EndVertices`, when the guest's
+inline vertices actually exist. It was briefly parked on `begin-vertices-hook`
+(`de8bf3b`) and then behind `--d3d9_begin_vertices`; both are gone.
+
+**The intro logo needed this AND a shader fix**, and neither half shows anything
+alone. With the hook off the draw is never submitted; with it on but
+per-instruction ALU predication missing, the draw is submitted and blends to
+nothing because its alpha translates to a compile-time 0. See the memory notes
+`ui-draws-bypass-hooked-entry-points` and `instruction-level-predication`.
+
+One caveat carried forward: enabling this coincided with an intermittent guest
+fault at `sub_8234CE20` (2 in 5 runs) that then stopped reproducing and was
+never explained. If guest-side faults reappear around front-end construction,
+suspect this first.
 
 Open flags, read statically out of `sub_8234E0A8`: `a4=1` gives `0x00102400`
 (`0x2000|0x100400`); `a4=0` gives `0x01100400`, the branch that first calls
