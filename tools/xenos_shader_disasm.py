@@ -687,6 +687,10 @@ class FetchInstruction(object):
     tf_use_comp_lod = property(lambda s: bool(bits(s.w1, 28, 1)))
     tf_use_reg_lod = property(lambda s: bool(bits(s.w1, 29, 1)))
     tf_is_predicated = property(lambda s: bool(bits(s.w1, 31, 1)))
+    # Xenia ucode.h, TextureFetchInstruction word 2: use_reg_gradients(1) +
+    # sample_location(1) + lod_bias(7) + unused(5) + dimension(2) +
+    # offset_x/y/z(5+5+5) = 31, so pred_condition is the top bit.
+    tf_pred_condition = property(lambda s: bool(bits(s.w2, 31, 1)))
 
     tf_dimension = property(lambda s: bits(s.w2, 14, 2))
 
@@ -712,7 +716,23 @@ def fetch_dst_swizzle_str(swizzle, components=4):
 
 
 def format_fetch(fetch):
-    """One fetch instruction as text."""
+    """One fetch instruction as text.
+
+    The `(p0)` / `(!p0)` prefix is printed here for the same reason format_alu
+    prints it. It was NOT, for a long time: tf_is_predicated and
+    vf_is_predicated were decoded and then never used, so every fetch listed as
+    unpredicated no matter what the bit said. That reads as a fact about the
+    shader and is a fact about this tool -- it cost an analysis that concluded
+    "ALU instructions inside a cond_exec_pred are predicated but fetches are
+    not", which is false; all of them are. If a field is worth decoding it is
+    worth printing.
+    """
+    pred = ""
+    if fetch.is_vertex_fetch and fetch.vf_is_predicated:
+        pred = "(%sp0) " % ("" if fetch.vf_pred_condition else "!")
+    elif fetch.is_texture_fetch and fetch.tf_is_predicated:
+        pred = "(%sp0) " % ("" if fetch.tf_pred_condition else "!")
+
     if fetch.is_vertex_fetch:
         fmt = VERTEX_FORMATS.get(fetch.vf_format, "fmt%d" % fetch.vf_format)
         text = "vfetch%s r%d%s, r%d.%s, vf%d" % (
@@ -734,7 +754,7 @@ def format_fetch(fetch):
         if fetch.vf_is_index_rounded:
             text += " rounded"
         text += "]"
-        return text
+        return pred + text
 
     if fetch.is_texture_fetch:
         dim = ("1D", "2D", "3D", "cube")[fetch.tf_dimension]
@@ -750,9 +770,9 @@ def format_fetch(fetch):
             flags.append("no_comp_lod")
         if flags:
             text += " [%s]" % " ".join(flags)
-        return text
+        return pred + text
 
-    return "%s r%d, r%d, const%d" % (
+    return pred + "%s r%d, r%d, const%d" % (
         fetch.opcode_name, fetch.dst_reg, fetch.src_reg, fetch.tf_const_index)
 
 

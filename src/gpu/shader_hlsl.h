@@ -291,11 +291,17 @@ struct HlslShader {
   uint32_t pred_exec_blocks = 0;  // p0-gated, seen
   uint32_t bool_exec_blocks = 0;  // bool-constant-gated, seen
 
-  // Of pred_exec_blocks, how many were actually emitted as `if (xe_p0 == …)`
-  // rather than run unconditionally. Vertex stage only for now — see the
-  // safety note at the emit site. Reported separately so "we saw a predicate"
-  // and "we obeyed it" can never be read as the same number: when these two
-  // are equal the stage is fully honoured, and the gap is the work left.
+  // Of pred_exec_blocks, how many were emitted as `if (xe_p0 == …)`. Vertex
+  // stage only.
+  //
+  // A GAP HERE IS NOT A CORRECTNESS GAP — corrected 2026-08-26, having been
+  // described as one here for over a week. The exec-level predicate is a
+  // WAVEFRONT branch: "if any of the invocations passes the predicate check,
+  // all of them will enter the exec". It never gated a lane. Per-lane
+  // correctness is the INSTRUCTION predicates, honoured since 741d243 (ALU) and
+  // 48dfe30 (fetch); measured at 194 ALU + 46 fetch inside cond_exec_pred
+  // blocks in this title, all 240 individually predicated. This number is
+  // therefore a speed figure, not a correctness one.
   uint32_t honoured_pred_exec_blocks = 0;
 
   // Count of fetch instructions skipped because their opcode is not one this

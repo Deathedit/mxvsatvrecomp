@@ -4684,17 +4684,26 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
             f << "\n; PREDICATED TEXTURE FETCHES: " << out.predicated_fetches
               << " (all HONOURED -- sample unconditionally, gate the "
                  "destination write)";
-          // The stronger of the two. Above, p0 is merely discarded; here a
-          // block the console gated on p0 is executed regardless.
+          // NOT a correctness gap, and it used to be described as one here.
+          // The exec-level predicate is a WAVEFRONT branch: ucode.h says "if
+          // any of the invocations passes the predicate check, all of them will
+          // enter the exec". Lanes whose p0 is clear enter the block anyway, so
+          // the block gate never provided per-lane correctness -- which is why
+          // the compiler also predicates the instructions inside it, and why
+          // the validator reports a mismatch when they disagree.
+          //
+          // Measured over this title's three heavily predicated pixel shaders:
+          // 194 ALU and 46 fetch instructions inside cond_exec_pred blocks,
+          // and ALL 240 carry their own (p0). Since 741d243 and 48dfe30 we
+          // honour both, so the per-lane semantics are already right. An
+          // `if` here would be a wavefront-level SKIP -- a performance
+          // optimisation -- and in the pixel stage an illegal one.
           if (out.pred_exec_blocks)
             f << "\n; P0-GATED EXEC BLOCKS: " << out.pred_exec_blocks
-              << ", HONOURED as `if (xe_p0 == ...)`: "
+              << ", skipped as `if (xe_p0 == ...)`: "
               << out.honoured_pred_exec_blocks
-              << (out.honoured_pred_exec_blocks == out.pred_exec_blocks
-                      ? " (all obeyed)"
-                      : " (the remainder RUN UNCONDITIONALLY where the console "
-                        "gated them on p0 — pixel stage, where .Sample() is "
-                        "illegal in varying flow control)");
+              << " (the rest are ENTERED and their instructions gated"
+                 " individually, which is what the console does per lane)";
           if (out.bool_exec_blocks)
             f << "\n; BOOL-GATED EXEC BLOCKS: " << out.bool_exec_blocks
               << " (cond_exec / cond_exec_pred_clean walked as a plain exec — "

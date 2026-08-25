@@ -1589,9 +1589,21 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
       //             region are emitted gradient-free (SampleGrad with the
       //             derivatives taken before the branch, or hoisted).
       //
-      // Left unhonoured for the pixel stage rather than half-done: it stays
-      // counted in pred_exec_blocks, so the log keeps naming the shaders that
-      // still run their predicated bodies unconditionally.
+      // NOT half-done, and NOT a correctness gap -- corrected 2026-08-26.
+      //
+      // This `if` is a WAVEFRONT SKIP, not per-lane correctness. ucode.h on
+      // kCondExecPred: "if any of the invocations passes the predicate check,
+      // all of them will enter the exec". Lanes whose p0 is clear enter the
+      // block regardless, so the block gate never gated a lane. Per-lane
+      // correctness comes from the instruction predicates, which is exactly why
+      // "the compiler makes the ALU and fetch instructions themselves inside a
+      // predicated exec predicated as well".
+      //
+      // Measured over this title's three heavily predicated pixel shaders: 194
+      // ALU and 46 fetch instructions sit inside cond_exec_pred blocks and ALL
+      // 240 carry their own (p0). Those are honoured, so skipping the block
+      // buys speed and nothing else -- and in the pixel stage it is not even
+      // available. Left counted so the population stays visible.
       const bool honour_p0 = p0_gated && stage != HlslStage::kPixel;
       if (honour_p0) {
         ++out.honoured_pred_exec_blocks;
