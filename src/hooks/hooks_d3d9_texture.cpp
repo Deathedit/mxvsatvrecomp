@@ -1027,6 +1027,7 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
         break;
       case mx::hle::HostTextureFormat::kR8:
       case mx::hle::HostTextureFormat::kR16:
+      case mx::hle::HostTextureFormat::kR16Snorm:
       case mx::hle::HostTextureFormat::kR32Float:
         // Single-channel; decodable, but not base colour. Same rationale as
         // the semantic gate in PrepareDrawTexture.
@@ -2011,8 +2012,14 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // Only kUnsignedBiased rides this. kSigned would need the texture's bits
   // reinterpreted into a signed host format, and kGamma is a curve rather than
   // a scale; both are counted by NoteUnhandledSign and left alone rather than
-  // approximated, since the census over a full menu run finds no kGamma at all
-  // and kSigned on one FMT_4_4_4_4 texture.
+  // approximated.
+  //
+  // "the census over a full menu run finds no kGamma at all and kSigned on one
+  // FMT_4_4_4_4 texture" used to stand here, and it is wrong the way
+  // measure-with-a-level-loaded is always wrong: with a LEVEL up the counter
+  // reads `guest format 24 mode signed x20000`, and guest format 24 is k_16 --
+  // the terrain heightmap. k_16 now picks an SNORM host view the way k_16_16
+  // already did, so it no longer arrives here.
   {
     const uint8_t swizzled =
         mx::hle::SwizzleTextureSigns(source.signs, source.swizzle);

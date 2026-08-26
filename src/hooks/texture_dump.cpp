@@ -257,6 +257,7 @@ bool ExpandLevelToRgba8(const mx::hle::HleTexturePayload& p,
       break;
     case F::kRg8:
     case F::kR16:
+    case F::kR16Snorm:
     case F::kR16Float:
     case F::kBgra4:
       bpp = 2;
@@ -314,6 +315,9 @@ bool ExpandLevelToRgba8(const mx::hle::HleTexturePayload& p,
           break;
         case F::kR16:
           r = uint8_t(u16(q) >> 8);
+          break;
+        case F::kR16Snorm:
+          r = FloatToUnorm(snorm16(u16(q)));
           break;
         case F::kR16Float:
           r = FloatToUnorm(HalfToFloat(u16(q)));
@@ -472,6 +476,7 @@ const char* HostFormatName(mx::hle::HostTextureFormat f) {
     case F::kBgra4: return "BGRA4";
     case F::kR8: return "R8";
     case F::kR16: return "R16";
+    case F::kR16Snorm: return "R16S";
     case F::kR32Float: return "R32F";
     case F::kRg8: return "RG8";
     case F::kRg16Float: return "RG16F";

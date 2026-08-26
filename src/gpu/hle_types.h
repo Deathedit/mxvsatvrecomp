@@ -61,6 +61,13 @@ enum class HostTextureFormat : uint8_t {
   // about it beyond the DXGI format. Appended rather than inserted: the enum
   // is compared by value across the hooks/renderer boundary.
   kRgb10A2Unorm,
+  // k_16 signed, the single-channel sibling of kRg16Snorm. Left out when the
+  // two- and four-channel signed views were added, which mattered more than it
+  // looks: k_16 is the TERRAIN HEIGHTMAP. Read as UNORM its small negative
+  // heights come back near 1.0 -- measured on the 64x64 coarse map, whose
+  // probe texels decode as -0.135..+0.066 signed and 0.02..0.99 unsigned, and
+  // whose sample the terrain VS trace shows arriving as exactly 1.0.
+  kR16Snorm,
 };
 
 // xenos::TextureFilter::kBaseMap -- "sample level 0 and never minify past it".

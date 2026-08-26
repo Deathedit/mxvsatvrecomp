@@ -632,8 +632,11 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
     case xenos::TextureFormat::k_8_8:
       out.host_format = HostTextureFormat::kRg8;
       break;
+    // UNORM or SNORM by the fetch's own sign bits, the same choice k_16_16 and
+    // k_16_16_16_16 make below. This one was missed when those were added.
     case xenos::TextureFormat::k_16:
-      out.host_format = HostTextureFormat::kR16;
+      out.host_format = any_component_signed ? HostTextureFormat::kR16Snorm
+                                             : HostTextureFormat::kR16;
       break;
     case xenos::TextureFormat::k_32_FLOAT:
       out.host_format = HostTextureFormat::kR32Float;

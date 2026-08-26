@@ -438,6 +438,9 @@ bool D3D12Renderer::EnsureGameTexture(
     case mx::hle::HostTextureFormat::kRg16Snorm:
       format = DXGI_FORMAT_R16G16_SNORM;
       break;
+    case mx::hle::HostTextureFormat::kR16Snorm:
+      format = DXGI_FORMAT_R16_SNORM;
+      break;
     case mx::hle::HostTextureFormat::kRgba16Unorm:
       format = DXGI_FORMAT_R16G16B16A16_UNORM;
       break;
