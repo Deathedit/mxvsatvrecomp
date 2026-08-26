@@ -230,7 +230,8 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  // means unreadable. Compared against the target extent the
                  // renderer actually uses -- see m_vpMatch.
                  uint32_t guestVpWidth = 0, uint32_t guestVpHeight = 0,
-                 bool useGuestVp = false, bool edramCopy = false);
+                 bool useGuestVp = false, bool edramCopy = false,
+                 bool persistTargets = false);
 
 // Append a resolve to this frame's list, in order with the draws around it.
 //
@@ -1010,6 +1011,10 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // clear that would otherwise wipe exactly the contents being inherited.
   std::map<uint32_t, uint32_t> m_edramPendingSource;
   uint64_t m_edramTransfers = 0;
+  // First-use clears that discarded content the target carried out of an
+  // earlier frame, and how many of those the persist cvar spared.
+  uint64_t m_targetCarriedContent = 0;
+  uint64_t m_targetPersisted = 0;
   uint64_t m_edramTransferNoSource = 0;
   uint64_t m_edramTransferNotDrawn = 0;
   uint64_t m_edramTakeovers = 0;         // bind at a base another object held
@@ -1181,6 +1186,9 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // Whether same-extent EDRAM takeovers should inherit the previous owner's
     // contents. Carried per draw so the cvar stays in one place.
     bool edramCopy = false;
+    // Skip the per-frame first-use clear for a target that already holds
+    // content from an earlier frame, so an ACCUMULATION buffer survives.
+    bool persistTargets = false;
     // The guest's D3DRS_* blend state, translated in BlendedPSO.
     bool blendEnable = false;
     uint32_t srcBlend = 0;

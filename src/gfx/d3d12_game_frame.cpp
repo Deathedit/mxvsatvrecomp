@@ -1095,6 +1095,35 @@ void D3D12Renderer::RenderGameFrame() {
             }
           }
         }
+        // ACROSS FRAMES, not just across owners. `everDrawn` already true on
+        // the first draw of a frame means this target carried content out of an
+        // earlier frame, and the clear below is about to discard it. That is
+        // correct for a target the guest refills every frame and WRONG for an
+        // accumulation buffer -- the terrain deformation ping-pong writes a
+        // Laplacian DELTA (`mask * (blur(self) - self)`, Xenia's
+        // shader_D1A0A3F6AE7AD8B5), which only integrates if the previous
+        // contents survive to be blended onto. Cleared every frame it stays at
+        // zero for ever, which is what sand.rdc measures: min = max = 0 on the
+        // 512x512 that every terrain draw samples.
+        //
+        // Counted unconditionally so the size of the population is known even
+        // with the cvar off -- a guest clear routes through AddGameClear and
+        // sets usedThisFrame, so anything reaching here was cleared by US.
+        if (!inherited && drawTarget->everDrawn) {
+          ++m_targetCarriedContent;
+          static std::unordered_set<uint32_t> s_carried;
+          if (s_carried.size() < 32 && s_carried.insert(targetObject).second) {
+            REXLOG_INFO(
+                "d3d12: first-use clear discards previous-frame content: "
+                "target 0x{:08X} {}x{}{}",
+                targetObject, drawTarget->width, drawTarget->height,
+                d.persistTargets ? " -- PRESERVED (cvar on)" : "");
+          }
+          if (d.persistTargets) {
+            ++m_targetPersisted;
+            inherited = true;
+          }
+        }
         if (!inherited) {
           auto rtv = m_gameRtvHeap->GetCPUDescriptorHandleForHeapStart();
           rtv.ptr += SIZE_T(drawTarget->rtvIndex) * m_gameRtvDescriptorSize;
@@ -1887,7 +1916,8 @@ void D3D12Renderer::RenderGameFrame() {
                   "half-pixel offset applied %llu, skipped %llu; "
                   "guest viewport vs host target: match %llu, MISMATCH %llu, "
                   "unreadable %llu, taken-from-guest %llu; edram takeover "
-                  "transfers %llu (no-source %llu, source-never-drawn %llu)",
+                  "transfers %llu (no-source %llu, source-never-drawn %llu); "
+                  "first-use clears over carried content %llu (preserved %llu)",
                   static_cast<unsigned long long>(m_alphaTestHonoured),
                   static_cast<unsigned long long>(m_alphaTestStandIn),
                   static_cast<unsigned long long>(m_fixed16Scaled),
@@ -1900,7 +1930,9 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_vpTakenFromGuest),
                   static_cast<unsigned long long>(m_edramTransfers),
                   static_cast<unsigned long long>(m_edramTransferNoSource),
-                  static_cast<unsigned long long>(m_edramTransferNotDrawn));
+                  static_cast<unsigned long long>(m_edramTransferNotDrawn),
+                  static_cast<unsigned long long>(m_targetCarriedContent),
+                  static_cast<unsigned long long>(m_targetPersisted));
     LogInfo(message);
     // DIAG: what the WHITE-SKIPPED draws were aimed at.
     for (const auto& [extent, e] : m_skipByTarget) {
@@ -2328,7 +2360,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t cullMode, uint32_t vtxCntl,
                                  uint32_t guestVpWidth,
                                  uint32_t guestVpHeight, bool useGuestVp,
-                                 bool edramCopy) {
+                                 bool edramCopy, bool persistTargets) {
   // PERF(per-frame-allocs): DONE. This used to create an ID3D12Resource on the
   // UPLOAD heap for each of the buffers below — up to nine per call, once per
   // submitted draw — and the note here called for "a ring of upload buffers
@@ -2925,6 +2957,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.guestVpHeight = guestVpHeight;
   d.useGuestVp = useGuestVp;
   d.edramCopy = edramCopy;
+  d.persistTargets = persistTargets;
   d.halfPixel = (vtxCntl != 0xFFFFFFFFu && (vtxCntl & 1u) == 0) ? 0.5f : 0.0f;
   if (d.halfPixel != 0.0f) ++m_halfPixelDraws; else ++m_halfPixelSkipped;
   if (scissor) {

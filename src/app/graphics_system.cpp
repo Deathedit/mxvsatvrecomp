@@ -90,6 +90,22 @@ REXCVAR_DEFINE_BOOL(hle_capture, false, "Debug",
 // Default off. Two changes this session that were "obviously more correct"
 // made things worse when measured (a blanket half-pixel shift broke the
 // luminance chain), so this gets A/B'd like the others before it is trusted.
+// Keep a render target's contents across FRAMES when nothing cleared it.
+//
+// We clear every game target to transparent black at its first use in a frame.
+// A guest clear routes through AddGameClear and marks the target used, so that
+// first-use clear only ever fires on targets the GUEST did not clear -- and for
+// an accumulation buffer that is destructive. The terrain deformation buffer is
+// one: its shader writes a Laplacian DELTA that only integrates if the previous
+// frame's contents are still there. Measured in sand.rdc as min = max = 0 on
+// the 512x512 that every terrain draw samples.
+//
+// Default off, and A/B'd like the rest of this session's "obviously more
+// correct" changes -- three of those measured as exactly no visual difference.
+REXCVAR_DEFINE_BOOL(d3d12_persist_targets, false, "Graphics",
+                    "Do not clear a render target at its first use in a frame "
+                    "if it already holds content from an earlier frame.");
+
 REXCVAR_DEFINE_BOOL(d3d12_edram_takeover_copy, false, "Graphics",
                     "On a same-extent EDRAM takeover, copy the previous "
                     "owner's contents into the new owner instead of clearing.");
@@ -518,7 +534,8 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                                                       : 1u,
                                   d->guest_vp_width, d->guest_vp_height,
                                   REXCVAR_GET(d3d9_guest_viewport),
-                                  REXCVAR_GET(d3d12_edram_takeover_copy));
+                                  REXCVAR_GET(d3d12_edram_takeover_copy),
+                                  REXCVAR_GET(d3d12_persist_targets));
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;
