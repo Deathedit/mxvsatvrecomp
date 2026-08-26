@@ -2492,6 +2492,47 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.depthBase = depthBase;
   d.targetBase = targetBase;
   d.targetColorFormat = targetColorFormat;
+  // DIAG: every draw aimed at a SQUARE POWER-OF-TWO offscreen target, grouped
+  // by the frame it landed in.
+  //
+  // The question it exists to answer: the terrain's ground meshes take their
+  // whole world Y from three texture samples -- their vertex buffer carries
+  // only grid X and Z -- and the dominant term is the 512x512 at 0x132E2000,
+  // which reads min = max = 0. The guest's own `ps_hft_deform_copy` copies the
+  // heightfield into that buffer, but sub_82AD49A0 only runs it for tiles a
+  // track segment has reached, so on an untouched map the buffer has to be
+  // filled somewhere else -- at level load. Either those draws never reach us,
+  // or they do and the per-frame first-use clear eats them.
+  //
+  // ONE LINE PER FRAME THAT HAS ANY, not per draw: a level load is thousands
+  // of frames and the interesting ones are the handful that draw here at all.
+  // The cap is on LINES, so a long run cannot flood, and the running total
+  // keeps counting after the cap so the last line still states the truth.
+  if (targetWidth == targetHeight && targetWidth >= 128 &&
+      (targetWidth & (targetWidth - 1)) == 0) {
+    static std::mutex s_mu;
+    static uint64_t s_total = 0;
+    static uint32_t s_lines = 0;
+    static uint32_t s_lastFrame = 0xFFFFFFFFu;
+    static uint32_t s_inFrame = 0;
+    static uint32_t s_lastObject = 0;
+    std::lock_guard<std::mutex> lk(s_mu);
+    ++s_total;
+    if (m_gameFrame != s_lastFrame) {
+      if (s_inFrame && s_lines < 200) {
+        ++s_lines;
+        REXLOG_INFO(
+            "d3d12: SQUARE TARGET frame {}: {} draws, last object 0x{:08X} "
+            "{}x{} guest colour format {} (total {})",
+            s_lastFrame, s_inFrame, s_lastObject, targetWidth, targetHeight,
+            targetColorFormat, static_cast<unsigned long long>(s_total));
+      }
+      s_lastFrame = m_gameFrame;
+      s_inFrame = 0;
+    }
+    ++s_inFrame;
+    s_lastObject = targetObject;
+  }
   if (pixelTextures && pixelSampledObjects) {
     for (uint32_t i = 0; i < kTranslatedSamplerSlots; ++i) {
       d.pixelTextures[i] = pixelTextures[i];
