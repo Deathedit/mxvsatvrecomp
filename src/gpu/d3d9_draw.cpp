@@ -1,5 +1,7 @@
 #include "gpu/d3d9_draw.h"
 
+#include "gpu/guard_census.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -84,6 +86,10 @@ bool CopyVertex(const HleStream& s, uint32_t index, uint8_t* dst,
   const uint64_t avail =
       s.size_bytes > byte_off ? uint64_t(s.size_bytes) - byte_off : 0;
   const uint32_t copy = avail < n ? uint32_t(avail) : n;
+  // Population is EVERY vertex copy, fires only the short ones. Noted before
+  // the branch so the denominator cannot drift from the numerator -- 58,138
+  // zero-fills is unreadable until you know it is out of how many.
+  mx::gpu::guard::Note(mx::gpu::guard::Guard::kVertexZeroFill, copy < n);
   if (copy < n) {
     std::memset(dst, 0, n);
     ++HleVertexZeroFillCount();

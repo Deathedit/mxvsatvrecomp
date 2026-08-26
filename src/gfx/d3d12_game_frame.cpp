@@ -10,6 +10,7 @@
 #include "gfx/d3d12_game_internal.h"
 #include "gfx/d3d12_internal.h"
 #include "gfx/d3d12_shaders.h"
+#include "gpu/guard_census.h"
 #include "gpu/d3d9_layout.h"
 #include "gpu/hle_types.h"
 #include "gpu/shader_hlsl.h"
@@ -1168,6 +1169,10 @@ void D3D12Renderer::RenderGameFrame() {
             inherited = true;
           }
         }
+        // Population is every first use of a target this frame; fires are the
+        // ones we clear without the guest asking. `inherited` means we left the
+        // previous frame's contents alone, which is the guard NOT firing.
+        mx::gpu::guard::Note(mx::gpu::guard::Guard::kFirstUseClear, !inherited);
         if (!inherited) {
           auto rtv = m_gameRtvHeap->GetCPUDescriptorHandleForHeapStart();
           rtv.ptr += SIZE_T(drawTarget->rtvIndex) * m_gameRtvDescriptorSize;
@@ -1716,8 +1721,13 @@ void D3D12Renderer::RenderGameFrame() {
                                        m_samplerHeap.Get()};
       m_commandList->SetDescriptorHeaps(2, heaps);
       m_commandList->SetGraphicsRootSignature(m_gameRootSig.Get());
+      // A translated draw: the guard did NOT fire, but this is an opportunity
+      // and must be counted, or the stand-in rate has no denominator. This is
+      // the exact counter that was read as "80% of draws lost" earlier today.
+      mx::gpu::guard::Note(mx::gpu::guard::Guard::kStandInDraw, false);
       continue;
     }
+    mx::gpu::guard::Note(mx::gpu::guard::Guard::kStandInDraw, true);
     ++m_standInDraws;
 
     // WHICH stand-in draws actually PAINT, named by target and shader.
@@ -1977,6 +1987,13 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_edramTransferNotDrawn),
                   static_cast<unsigned long long>(m_targetCarriedContent),
                   static_cast<unsigned long long>(m_targetPersisted));
+    LogInfo(message);
+    // GUARD CENSUS -- phase 1 of docs/strict_mode.md. One line, every class-B
+    // guard, fires beside the population they are a fraction of. A guard
+    // reading 0/N with N large is reached constantly and never needed: that is
+    // a guard that can be deleted, and it is the cheapest win here.
+    std::snprintf(message, sizeof(message), "  GUARD CENSUS --%s",
+                  mx::gpu::guard::Report().c_str());
     LogInfo(message);
     // Guest depth clears. Printed unconditionally, zero included: "the guest
     // never asked" and "it asked and we could not place it" are the two

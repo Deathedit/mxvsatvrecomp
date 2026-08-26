@@ -10,6 +10,8 @@
 
 #include <rex/logging.h>
 
+#include "gpu/guard_census.h"
+
 namespace mx::gpu {
 
 namespace {
@@ -144,6 +146,18 @@ uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
   std::lock_guard<std::mutex> lk(g_mu);
   for (uint32_t i = 0; i < regs * 4; ++i) {
     const uint32_t cur = bank[i];
+    // Noted BEFORE the non-finite filter. Placed after it, the population was
+    // "non-finite components examined" and the rate came out 90.8% -- which
+    // sounds catastrophic and is unreadable, because it is a fraction of the
+    // NaNs rather than of the bank. The question is what share of the CONSTANTS
+    // we overwrite, so every component examined is an opportunity.
+    {
+      const uint32_t dd = first_reg * 4 + i;
+      const bool pub = (g_have[dd >> 5] & (1u << (dd & 31))) != 0;
+      mx::gpu::guard::Note(
+          mx::gpu::guard::Guard::kConstantNanToZero,
+          NonFinite(cur) && !pub && (cur & 0x007FFFFFu) != 0);
+    }
     if (!NonFinite(cur)) continue;
     const uint32_t d = first_reg * 4 + i;
     const bool published = (g_have[d >> 5] & (1u << (d & 31))) != 0;
@@ -171,6 +185,10 @@ uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
     // `hle_sanitize_constants`, which was retired for zeroing every non-finite
     // constant on every draw forever. A guest can legitimately compute +Inf and
     // mean it (see the divide-by-zero exposure path); no guest ever means NaN.
+    // Population is every non-finite component examined; fires are the ones we
+    // overwrite. The bank-wide total is not the denominator -- a NaN we leave
+    // alone is not a guard firing, and counting it as one would make this look
+    // vanishingly rare.
     if (!published && (cur & 0x007FFFFFu) != 0) {
       bank[i] = 0;
       ++g_zeroed;
@@ -316,9 +334,28 @@ uint32_t FillMaterialGate(uint32_t* bank, uint32_t bank_regs,
   // consistent with that. One line, once, so the assumption is either confirmed
   // or killed instead of being reasoned about again.
   {
-    static bool s_reported = false;
-    if (!s_reported) {
-      s_reported = true;
+    // SAMPLED LATE, NOT ONCE. The first cut fired on the first call to this
+    // function and reported the whole window `unpub:0` -- which is true at
+    // startup and says nothing, because PM4 has not published anything yet.
+    // The guard census showed 209,629 fills out of 2,663,216 window dwords in
+    // the same run, so the window IS published later and the snapshot was
+    // simply taken before it. A one-shot probe on a value that arrives over
+    // time reports the arrival order, not the value.
+    //
+    // Now: report the first time anything in the window is actually published,
+    // and again every 200k calls so a later change is visible too.
+    static uint64_t s_calls = 0;
+    static bool s_sawPublished = false;
+    bool any_published = false;
+    for (uint32_t c = kMaterialGateFirstConst;
+         c < kMaterialGateEndConst && !any_published; ++c)
+      for (uint32_t comp = 0; comp < 4; ++comp) {
+        const uint32_t d = c * 4 + comp;
+        if (g_have[d >> 5] & (1u << (d & 31))) { any_published = true; break; }
+      }
+    const bool first_publish = any_published && !s_sawPublished;
+    if (first_publish) s_sawPublished = true;
+    if (first_publish || (++s_calls % 200000) == 0) {
       std::string w;
       for (uint32_t c = kMaterialGateFirstConst; c < kMaterialGateEndConst; ++c) {
         w += fmt::format(" ps c{}=[", c - kPixelBankFirstReg);
@@ -339,13 +376,41 @@ uint32_t FillMaterialGate(uint32_t* bank, uint32_t bank_regs,
     if (reg >= bank_regs) continue;
     for (uint32_t comp = 0; comp < 4; ++comp) {
       const uint32_t b = reg * 4 + comp;
-      if (load_written[b]) continue;
-      if (bank[b] != 0) continue;
       const uint32_t d = c * 4 + comp;  // g_file is indexed by guest dword
-      if (!(g_have[d >> 5] & (1u << (d & 31)))) continue;
-      const uint32_t v = g_file[d];
-      if (v == 0 || NonFinite(v)) continue;
-      bank[b] = v;
+      const bool eligible =
+          !load_written[b] && bank[b] == 0 &&
+          (g_have[d >> 5] & (1u << (d & 31))) != 0 && g_file[d] != 0 &&
+          !NonFinite(g_file[d]);
+      // Every dword in the window is an opportunity, so the census can say
+      // whether this fills 4 of 16 or 16 of 16 -- and 0 of 16 would mean PM4
+      // never publishes here, which kills the theory outright.
+      mx::gpu::guard::Note(mx::gpu::guard::Guard::kMaterialGateFill, eligible);
+      // SUBSTITUTION REMOVED 2026-08-26. Not because it "did not work" -- the
+      // measurement retired the SOURCE. Run 1451, sampled at first publication
+      // rather than at startup:
+      //
+      //   ps c85 = [ unpub:0   2.074e-42   unpub:0   unpub:0 ]
+      //
+      // c85.w -- the component the terrain shader gates on -- is UNPUBLISHED.
+      // PM4 never carries it, at any point in the frame, so no amount of
+      // reordering against the shader load table could ever have supplied it.
+      // Three changes to delivery were all downstream of a source that does not
+      // hold the value.
+      //
+      // Worse, the ONE dword PM4 does publish in this window is a denormal
+      // whose bit pattern is ~1481 -- an INTEGER read as a float. That is not a
+      // shader constant; the Type-0 capture is recording a register that is not
+      // an ALU constant. With the substitution live it injected that denormal
+      // into c85.y on ~94,000 draws a run (94265/2197648 in the guard census).
+      // An inventing guard firing 94k times with junk is the exact shape
+      // docs/strict_mode.md was written about, committed two hours after
+      // writing it.
+      //
+      // The Note() above STAYS: the window keeps reporting, so if PM4 ever does
+      // publish here the census says so without anyone re-deriving this. Do not
+      // restore the assignment without first showing c85.w published with a
+      // plausible value.
+      if (!eligible) continue;
       ++filled;
       ++g_materialGateFilled;
     }
