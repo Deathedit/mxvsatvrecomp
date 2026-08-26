@@ -51,6 +51,21 @@ enum class Guard : uint32_t {
   // hooks_d3d9.cpp. Dominated by scratch registers that input_mask flags as
   // inputs. A new pair appearing is worth seeing; the absolute level is not.
   kInterpolatorZeroFill,    // mov oN, 0 for exports the guest VS never wrote
+  // A SUBSET of kConstantNanToZero, counted separately: guest c392..c395, which
+  // land in the pixel bank as xe_c[136..139]. OverlayNonFinite's own comment
+  // claims that block is what the whole NaN repair exists for -- "the legal,
+  // loading and start screens all live in that prefix, which is why they have
+  // no background: a NaN interpolator saturates the backdrop draw to white".
+  //
+  // Worth its own row because strict=8 suppressed 1.76M substitutions with no
+  // visible change in a level, which says nothing about the boot screens. This
+  // asks whether the documented mechanism is still live AT ALL, rather than
+  // inferring it from an aggregate over 346 million components.
+  //
+  // APPENDED, not inserted. hle_strict is keyed on enum position and inserting
+  // here would shift every bit below -- exactly the drift that sent run 1461 at
+  // an inert guard. New entries go on the end, always.
+  kConstantNanBackdrop,
   kCount
 };
 

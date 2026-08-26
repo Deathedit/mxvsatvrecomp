@@ -158,11 +158,19 @@ uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
       // guard rather than the opportunity -- with strict on it should fall to
       // zero, and a non-zero reading would mean the switch is not reaching
       // here.
-      mx::gpu::guard::Note(
-          mx::gpu::guard::Guard::kConstantNanToZero,
+      const bool would_repair =
           NonFinite(cur) && !pub && (cur & 0x007FFFFFu) != 0 &&
-              !mx::gpu::guard::Strict(
-                  mx::gpu::guard::Guard::kConstantNanToZero));
+          !mx::gpu::guard::Strict(mx::gpu::guard::Guard::kConstantNanToZero);
+      mx::gpu::guard::Note(mx::gpu::guard::Guard::kConstantNanToZero,
+                           would_repair);
+      // The backdrop block on its own: guest c392..c395 = xe_c[136..139].
+      // Population is every component of those four constants examined, so the
+      // row reads "of the backdrop constants we looked at, how many were NaN we
+      // repaired" -- not diluted by the other 252 registers.
+      const uint32_t guest_const = dd >> 2;
+      if (guest_const >= 392 && guest_const < 396)
+        mx::gpu::guard::Note(mx::gpu::guard::Guard::kConstantNanBackdrop,
+                             would_repair);
     }
     if (!NonFinite(cur)) continue;
     const uint32_t d = first_reg * 4 + i;
