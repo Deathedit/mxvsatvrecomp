@@ -79,14 +79,28 @@ REXCVAR_DEFINE_BOOL(hle_capture, false, "Debug",
 // unreadable 0, and every mismatch is one shape -- guest 640x360 rendered
 // through a 640x720 target, so that geometry is stretched 2x vertically.
 //
-// The target is probably oversized by our own doing: EnsureGameRenderTarget
-// grows a pooled surface to the UNION of the extents asked of it ("so a later
-// band cannot shrink away an earlier one"), so a surface grown for one draw
-// hands the next an extent the guest never asked for. Using the guest's
-// viewport is right either way -- it is what the hardware transforms into.
+// CORRECTION to the commit that added this (3c9b2fb): the target is NOT
+// oversized by our doing, and EnsureGameRenderTarget does not grow to a union
+// -- it REPLACES on any extent or format change. The union growth is the
+// SNAPSHOT path, a different function, and attributing it here was wrong.
 //
-// A/B rather than applied outright: the surface is still oversized, so whatever
-// samples it afterwards may expect the content laid out the way it is now.
+// The extent is the guest's own D3D9 surface size, straight from RB_COLOR_INFO,
+// and a 640x360 viewport on a 640x720 surface is legitimate: those are two of
+// ELEVEN surface objects aliasing one EDRAM base.
+//
+//   edram base 0x2D0: 11 owners
+//     0x2123C1D8 1280x720 fmt28   0x2123C9BC 640x720 fmt28
+//     0x2123CA94 1280x640 fmt10   0x2123CAC4 1280x80 fmt10
+//     0x21768560 1280x720 fmt10   0x2653D320 640x360 fmt10  ...
+//
+// EDRAM is a fixed 10MB scratch and the guest makes many surface views onto it,
+// binding whichever it needs. So there is nothing to fix in the extent, and
+// nothing wrong with the mismatch. Using the guest's viewport is still the more
+// faithful thing to do -- it is what the hardware transforms into -- which is
+// why this stays available.
+//
+// Default off because it demonstrably changes nothing: A/B'd, taken-from-guest
+// matched MISMATCH exactly, and there was no visual difference.
 REXCVAR_DEFINE_BOOL(d3d9_guest_viewport, false, "Graphics",
                     "Set the host viewport from the guest's PA_CL_VPORT "
                     "registers rather than the render target extent, when they "

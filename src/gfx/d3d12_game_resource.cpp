@@ -739,6 +739,25 @@ void D3D12Renderer::NoteEdramOwnership(uint32_t object, uint32_t width,
   // Counted rather than "how many objects share a base", because the thing the
   // fix has to do is transfer contents at the moment ownership changes, and a
   // base with two owners that never alternate needs no transfer at all.
+  //
+  // SIZED, 2026-08-26, one freeroam session:
+  //
+  //   edram aliasing: 3 bases, 3 shared by >1 object;
+  //                   64194 takeovers (17029 same-extent, 0 format-differs)
+  //
+  // Every base in the run is shared. On the console all those objects ARE the
+  // same physical memory, so a surface binding a base sees what the previous
+  // owner left there; here each object owns a separate D3D12 texture and sees
+  // nothing. 64194 times a run, that inheritance is silently dropped.
+  //
+  // The 17029 SAME-EXTENT takeovers are the tractable subset: identical size,
+  // and 0 of them differ in format, so a straight CopyResource at the moment of
+  // takeover would carry the contents across with no reinterpretation. The
+  // remainder change extent and would need a real EDRAM model.
+  //
+  // This is the actual shape of what "the render target extent is wrong" turned
+  // out to be -- see the correction in graphics_system.cpp. The extent is the
+  // guest's own surface size and is not wrong; the ALIASING is unmodelled.
   const auto last = m_edramLastOwner.find(edramBase);
   if (last != m_edramLastOwner.end() && last->second.object != object) {
     const EdramOwner& prev = last->second;
