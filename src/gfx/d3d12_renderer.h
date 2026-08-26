@@ -1034,6 +1034,10 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // is left after subtracting all three is the only part that could be a lost
   // draw -- and that residue is the number to look at, not the total.
   uint64_t m_standInNoHandleClear = 0;
+  // Draws removed by hle_strict bit 0 rather than painted with a tex*col
+  // stand-in. Separate from the census because both the translated path and the
+  // strict path report "the guard did not fire".
+  uint64_t m_standInStrictSkipped = 0;
   // Guest depth clears honoured, and those whose depth surface we could not
   // resolve to a host target. Counted separately because "the guest never
   // clears depth" and "it clears depth into a surface we do not have" are

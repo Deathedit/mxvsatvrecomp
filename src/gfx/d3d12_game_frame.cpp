@@ -1738,6 +1738,13 @@ void D3D12Renderer::RenderGameFrame() {
     // The geometry disappearing is a diagnostic; a plausible colour is not.
     if (mx::gpu::guard::Strict(mx::gpu::guard::Guard::kStandInDraw)) {
       mx::gpu::guard::Note(mx::gpu::guard::Guard::kStandInDraw, false);
+      // COUNTED SEPARATELY, because the census cannot answer this. Both the
+      // translated path and this one record "guard did not fire", so a census
+      // reading of 0 is ambiguous between "no stand-ins existed" and "N were
+      // suppressed" -- and knowing WHAT was removed is the entire point of
+      // strict mode. Without this the experiment reports its own success and
+      // nothing else.
+      ++m_standInStrictSkipped;
       continue;
     }
     mx::gpu::guard::Note(mx::gpu::guard::Guard::kStandInDraw, true);
@@ -1985,7 +1992,8 @@ void D3D12Renderer::RenderGameFrame() {
                   "unreadable %llu, taken-from-guest %llu; edram takeover "
                   "transfers %llu (no-source %llu, source-never-drawn %llu); "
                   "targets carrying previous-frame content %llu (all PRESERVED -- the "
-                  "first-use clear was deleted 2026-08-26)",
+                  "first-use clear was deleted 2026-08-26); STRICT skipped %llu "
+                  "stand-in draws",
                   static_cast<unsigned long long>(m_alphaTestHonoured),
                   static_cast<unsigned long long>(m_alphaTestStandIn),
                   static_cast<unsigned long long>(m_fixed16Scaled),
@@ -1999,7 +2007,8 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_edramTransfers),
                   static_cast<unsigned long long>(m_edramTransferNoSource),
                   static_cast<unsigned long long>(m_edramTransferNotDrawn),
-                  static_cast<unsigned long long>(m_targetCarriedContent));
+                  static_cast<unsigned long long>(m_targetCarriedContent),
+                  static_cast<unsigned long long>(m_standInStrictSkipped));
     LogInfo(message);
     // GUARD CENSUS -- phase 1 of docs/strict_mode.md. One line, every class-B
     // guard, fires beside the population they are a fraction of. A guard
