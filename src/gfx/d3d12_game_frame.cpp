@@ -1778,7 +1778,7 @@ void D3D12Renderer::RenderGameFrame() {
     // still painting the pixels the guest masks away.
     std::snprintf(message, sizeof(message),
                   "alpha test: honoured %llu, STAND-IN %llu; "
-                  "fixed16 -32..32 remapped %llu draws; 7e3 clamped %llu",
+                  "fixed16 -32..32 targets %llu draws (scale identity); 7e3 clamped %llu",
                   static_cast<unsigned long long>(m_alphaTestHonoured),
                   static_cast<unsigned long long>(m_alphaTestStandIn),
                   static_cast<unsigned long long>(m_fixed16Scaled),
@@ -2619,6 +2619,35 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
         // would divide a correct HDR buffer by 32. The guest nibble is the only
         // thing that separates them, which is exactly why it is carried per
         // draw instead of being inferred from the host format.
+        // Guest formats 4 (k_16_16) and 5 (k_16_16_16_16) are signed fixed
+        // point -32...32. This USED to write 1/32 here, which was half of
+        // Xenia's hack -- and the half that does not apply to us.
+        //
+        // Xenia biases the write down by 5 exponents
+        // (d3d12_command_processor.cc:4329, "Remap from -32...32 to -1...1")
+        // because ITS host render target is SNORM and physically cannot hold
+        // -32...32. It pairs that with the exact inverse at resolve
+        // (draw_util.cc:1345, `exp_bias + 5`, commented "the texture expects
+        // 0x8001 = -32, 0x7FFF = 32 ... revert").
+        //
+        // We map both formats to a HALF FLOAT host target, which holds the
+        // whole range. HostColorFormat already says so in as many words: "A
+        // half-float host target holds the whole -32...32 range ... and needs
+        // no shader-side scale." So the divide here had no counterpart and
+        // nothing ever undid it -- every consumer of a fixed-point target read
+        // values 32x too small. On console the round trip is identity: the
+        // guest writes v in -32...32 and the texture reads back v in
+        // -32...32.
+        //
+        // Measured in menu3.rdc. The deferred light accumulation buffer is
+        // guest format 5 ("RB_COLOR_INFO object 0x2123CA94 1280x640 raw
+        // 0x000502D0 format 5"), and the bike at (800,450) accumulated 0.0016
+        // of light against an ambient of 0.00065. The whole deferred chain --
+        // lights, material pass, composite -- ran a factor of 32 down.
+        //
+        // Kept as a named flag and still counted, because the population is
+        // not marginal (262,970 draws in a menu run) and a regression here
+        // needs to be attributable.
         const bool fixed16 =
             d.targetColorFormat == 4u || d.targetColorFormat == 5u;
         // .y and .z carry the range the GUEST format can represent, and are 0
@@ -2634,11 +2663,11 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
         // Every other format is already handled: 0/1 and 2/10 map to UNORM
         // host formats that clamp on write, and 7 (k_16_16_16_16_FLOAT) is a
         // genuine signed half float that must NOT be clamped. Formats 4 and 5
-        // are the fixed-point -32..32 pair scaled above; they are signed, so
-        // they get no clamp either.
+        // are the fixed-point -32..32 pair, signed, and their half-float host
+        // target holds that range directly -- so no clamp and no scale.
         const bool float7e3 =
             d.targetColorFormat == 3u || d.targetColorFormat == 12u;
-        const float cs[4] = {fixed16 ? (1.0f / 32.0f) : 1.0f,
+        const float cs[4] = {1.0f,
                              float7e3 ? 31.875f : 0.0f,
                              float7e3 ? 1.0f : 0.0f, 0.0f};
         if (float7e3) ++m_float7e3Clamped;
