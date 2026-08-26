@@ -1471,6 +1471,12 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // point into -1...1. Zero here would mean the scale never fired and any
   // improvement came from something else.
   uint64_t m_fixed16Scaled = 0;
+  // Draws whose guest colour format is 7e3 (3 or 12) and so had their pixel
+  // output clamped to [0, 31.875] RGB / [0, 1] alpha, the range the console's
+  // ROP enforces on the write. Counted because the defect it fixes is
+  // invisible from outside: a negative in an R16G16B16A16_FLOAT target looks
+  // like ordinary data until it reaches the luminance reduction.
+  uint64_t m_float7e3Clamped = 0;
   // DIAG: WHITE-SKIPPED draws grouped by target extent.
   struct SkipTargetInfo {
     uint64_t count = 0;

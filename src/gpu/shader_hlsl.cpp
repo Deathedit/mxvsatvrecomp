@@ -2143,6 +2143,45 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
       const std::string n = std::to_string(t);
       src += "  xe_color" + n + " *= xe_colorscale.x;\n";
     }
+    // Clamp to the range the GUEST colour format can actually represent.
+    //
+    // Guest format 3 (k_2_10_10_10_FLOAT) is 7e3, and the reference states its
+    // range outright: "7e3 [0, 32) RGB, unorm alpha" (xenos.h:301). It is
+    // UNSIGNED. We map it to R16G16B16A16_FLOAT, which is signed, so a shader
+    // returning a negative has that negative STORED where the console ROP
+    // would have clamped it to 0 on the write.
+    //
+    // Xenia performs exactly this clamp before packing
+    // (dxbc_shader_translator_om.cc:3516, UnclampedFloat32To7e3):
+    //     max(x, 0.0)  then  min(x, 31.875)
+    // The max/min ORDER matters for NaN: D3D min/max return the non-NaN
+    // operand, so NaN becomes 0 instead of propagating. That is hardware
+    // behaviour, not convenience -- which is why this is min(max(..)) and not
+    // clamp(), since clamp(NaN, lo, hi) would yield lo.
+    //
+    // Measured, not assumed: menu2.rdc holds (0.236, 0.159, -0.071) in the
+    // scene target at (900,400), written by the pixel shader of event 8338, and
+    // that negative propagates into the 320x180 luminance target RT 619 as
+    // (0.217, 0.142, -0.081). RT 619 drives auto-exposure, so a value the
+    // console cannot represent is feeding the gain for the entire frame.
+    //
+    // Gated on xe_colorscale.y, which the renderer sets to the RGB maximum for
+    // the clamped formats and leaves 0 for every other one. A uniform branch,
+    // so draws on any other format stay byte-identical -- deliberately NOT an
+    // unconditional clamp against +-FLT_MAX, which reads like a no-op but
+    // would turn NaN into -FLT_MAX on every draw in the game.
+    if (em.color_mask) {
+      src += "  if (xe_colorscale.y > 0.0) {\n";
+      for (uint32_t t = 0; t < kMaxColorTargets; ++t) {
+        if (!(em.color_mask & (1u << t))) continue;
+        const std::string n = std::to_string(t);
+        src += "    xe_color" + n + ".rgb = min(max(xe_color" + n +
+               ".rgb, 0.0), xe_colorscale.y);\n";
+        src += "    xe_color" + n + ".a = min(max(xe_color" + n +
+               ".a, 0.0), xe_colorscale.z);\n";
+      }
+      src += "  }\n";
+    }
     src += "  XePsOut xe_out;\n";
     for (uint32_t t = 0; t < kMaxColorTargets; ++t) {
       if (!(em.color_mask & (1u << t))) continue;

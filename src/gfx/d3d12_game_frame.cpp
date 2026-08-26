@@ -1778,10 +1778,11 @@ void D3D12Renderer::RenderGameFrame() {
     // still painting the pixels the guest masks away.
     std::snprintf(message, sizeof(message),
                   "alpha test: honoured %llu, STAND-IN %llu; "
-                  "fixed16 -32..32 remapped %llu draws",
+                  "fixed16 -32..32 remapped %llu draws; 7e3 clamped %llu",
                   static_cast<unsigned long long>(m_alphaTestHonoured),
                   static_cast<unsigned long long>(m_alphaTestStandIn),
-                  static_cast<unsigned long long>(m_fixed16Scaled));
+                  static_cast<unsigned long long>(m_fixed16Scaled),
+                  static_cast<unsigned long long>(m_float7e3Clamped));
     LogInfo(message);
     // DIAG: what the WHITE-SKIPPED draws were aimed at.
     for (const auto& [extent, e] : m_skipByTarget) {
@@ -2620,7 +2621,27 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
         // draw instead of being inferred from the host format.
         const bool fixed16 =
             d.targetColorFormat == 4u || d.targetColorFormat == 5u;
-        const float cs[4] = {fixed16 ? (1.0f / 32.0f) : 1.0f, 0.0f, 0.0f, 0.0f};
+        // .y and .z carry the range the GUEST format can represent, and are 0
+        // for formats that need no clamp -- the shader branches on .y > 0.
+        //
+        // Guest format 3 (k_2_10_10_10_FLOAT) and 12
+        // (k_2_10_10_10_FLOAT_AS_16_16_16_16) are 7e3: "[0, 32) RGB, unorm
+        // alpha" (xenos.h:301). Both map to R16G16B16A16_FLOAT here, which is
+        // SIGNED, so without this a shader's negative output is stored where
+        // the console ROP would have clamped it to 0. 31.875 is the largest
+        // representable 7e3 value and is the same bound Xenia clamps to.
+        //
+        // Every other format is already handled: 0/1 and 2/10 map to UNORM
+        // host formats that clamp on write, and 7 (k_16_16_16_16_FLOAT) is a
+        // genuine signed half float that must NOT be clamped. Formats 4 and 5
+        // are the fixed-point -32..32 pair scaled above; they are signed, so
+        // they get no clamp either.
+        const bool float7e3 =
+            d.targetColorFormat == 3u || d.targetColorFormat == 12u;
+        const float cs[4] = {fixed16 ? (1.0f / 32.0f) : 1.0f,
+                             float7e3 ? 31.875f : 0.0f,
+                             float7e3 ? 1.0f : 0.0f, 0.0f};
+        if (float7e3) ++m_float7e3Clamped;
         std::memcpy(static_cast<uint8_t*>(p) + bankBytes + texInvBytes +
                         texSignBytes + paramGenBytes + alphaTestBytes,
                     cs, sizeof(cs));
