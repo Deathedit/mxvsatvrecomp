@@ -1919,6 +1919,159 @@ extern "C" REX_FUNC(sub_8236DB10) {
   ReportVideoComponents(false);
 }
 
+//-----------------------------------------------------------------------------
+// sub_8234D630 -- BinkPlayer::DecodeAndBlitFrame, vtable slot 8. THE GATE.
+//
+// FE_Smoke.bik decodes, composites and resolves every frame into a texture that
+// nothing ever samples. Measured, not inferred: 646 VIDEO COMPONENT RENDER rows
+// across 101 logs, every one `renders0 visits0`, in native AND plugin mode. The
+// counter is not broken -- the same probe reports THQ_Logo_wSound `visits336`
+// and Attract `visits10` -- and the front end really was on screen, because
+// FE_Background.layer was visited up to 2250 times in 83 of those runs.
+//
+// The cause is guest architecture: BinkVideoComponent's constructor calls
+// AcquirePlayer and BinkPlayer_Start without ever consulting visibility, so from
+// front-end init onward the player runs forever regardless of whether anything
+// draws it.
+//
+// GATED ON TRAVERSAL, NOT ON THE MOVIE NAME. A name test would be a lie about
+// what we know: the measurement is "this component is never visited", so that is
+// what the gate tests. If the game ever does display FE_Smoke, the gate lifts on
+// its own.
+//
+// WHY THIS SKIPS THE DECODE TOO, with only the blit hooked. The decode thread
+// (sub_8234D908) does its work only under `*(player+184) == 1`, and +184 is set
+// to 1 in exactly one place: the tail of THIS function. The thread clears it
+// itself once it has decoded. So the first gated frame lets at most one more
+// decode finish, the thread clears +184, and from then on it parks on its 1ms
+// sleep having found nothing to do. One hook stops the whole chain.
+//
+// RECOVERY IS AUTOMATIC AND COSTS ONE FRAME. Nothing here latches: the predicate
+// is re-evaluated on every call. The moment the component is visited we stop
+// gating, the blit runs against whatever frame the planes still hold, sets
+// +184 = 1, and the decode thread picks straight back up.
+//
+// HOW THE SKIP IS PERFORMED -- read this before changing it. We do NOT return
+// early and we do NOT write the state word ourselves. The guest already has an
+// idle path (its `playing && !paused && handle && !frameReady` test), and it
+// does three things on the way out that are not ours to imitate: it takes and
+// releases the player's critical section, it normalises +136, and it returns
+// that value to a caller we cannot see -- sub_8234D630 has exactly ONE xref in
+// the binary, a vtable slot at 0x82198B18, so the caller is not findable
+// statically and we do not know what it does with the result. So instead of
+// reproducing that path we make the guest take it: set the player's own pause
+// flag, call the original, restore it. The guest's code decides everything; the
+// only thing we contribute is the answer to `is it paused`.
+//
+// +4 is safe to toggle here. sub_8234D908 never reads it -- it reads +144, +184,
+// +124, +132, +108, +112 and nothing else -- so the decode thread cannot observe
+// the flicker, and the original holds the critical section for the whole window.
+//
+// Player field offsets, all from the decompilation of this function:
+//   +4 paused   +124 playing   +136 state   +140 TextureAsset
+//   +144 handle   +156 CRITICAL_SECTION   +184 frameReady   +192 BinkFrame
+//-----------------------------------------------------------------------------
+namespace {
+
+constexpr uint32_t kPlayerPaused = 4;
+constexpr uint32_t kPlayerTexAsset = 140;
+
+// A player is only gated after it has been asking to blit for this long without
+// its component ever being traversed. Components are constructed before the
+// screen that shows them, so an instant verdict would gate a video during the
+// window between its construction and its first visit. The cost of being wrong
+// in this direction is a few stale frames at the start of a video; the cost of
+// being wrong in the other is a video that never plays.
+constexpr auto kGateGrace = std::chrono::seconds(5);
+
+struct GatedPlayer {
+  uint32_t player = 0;
+  std::chrono::steady_clock::time_point first_blit{};
+  uint64_t skipped = 0;
+  bool announced = false;
+};
+
+// Guarded by g_videoProbeMu, not a lock of its own: every read of this table is
+// already inside the probe lock to look at visit_calls, and one lock cannot be
+// mis-ordered against itself.
+std::vector<GatedPlayer> g_gatedPlayers;
+
+// Caller holds g_videoProbeMu. The reference dies before the lock does.
+GatedPlayer& GateEntryFor(uint32_t player) {
+  for (auto& e : g_gatedPlayers)
+    if (e.player == player) return e;
+  g_gatedPlayers.push_back({player, std::chrono::steady_clock::now(), 0, false});
+  return g_gatedPlayers.back();
+}
+
+}  // namespace
+
+REX_IMPORT(__imp__sub_8234D630, orig_BinkDecodeAndBlit, int());
+extern "C" REX_FUNC(sub_8234D630) {
+  const uint32_t player = ctx.r3.u32;
+  if (!PlausibleGuestPtr(player)) {
+    orig_BinkDecodeAndBlit(ctx, base);
+    return;
+  }
+  // The player names its own TextureAsset at +140, and that is the SAME object
+  // the property loader put at component+664 -- which is what the probe records
+  // as texture_asset. So the asset is the join between a player and the
+  // component(s) that own it, and it is available without the component ever
+  // having been visited. component+668 would look like the more direct route and
+  // is not: every last_* field on the probe is sampled inside the visit hook, so
+  // on a component with visits0 -- precisely the population this gate is about
+  // -- they are all still at their initialised zero. An unsampled field is not a
+  // measurement.
+  const uint32_t asset = REX_LOAD_U32(player + kPlayerTexAsset);
+  bool gate = false;
+  if (asset) {
+    std::lock_guard<std::mutex> lk(g_videoProbeMu);
+    bool attributed = false;
+    bool visited = false;
+    std::string name;
+    // OR over every probe sharing the asset, because sharing is real: the
+    // Videos\Attract components all share THQ_Logo's 0x21896260. If ANY sharer
+    // is being traversed the target is live and nothing may be skipped.
+    // (FE_Smoke's 0x21896920 is private to it, so this costs it nothing.)
+    for (const auto& p : g_videoProbes) {
+      if (p.texture_asset != asset) continue;
+      if (!attributed) name = p.video;
+      attributed = true;
+      if (p.visit_calls) visited = true;
+    }
+    // Unattributed means we have no evidence either way -- a player whose
+    // component never reached NoteVideoComponent. Never skip what we cannot
+    // account for.
+    if (attributed && !visited) {
+      GatedPlayer& e = GateEntryFor(player);
+      if (std::chrono::steady_clock::now() - e.first_blit >= kGateGrace) {
+        gate = true;
+        ++e.skipped;
+        if (!e.announced) {
+          e.announced = true;
+          REXLOG_INFO(
+              "native: BINK GATE \"{}\" player 0x{:08X} asset 0x{:08X} -- no "
+              "component using this asset has EVER been visited; skipping "
+              "decode + composite + resolve until one is",
+              name, player, asset);
+        } else if ((e.skipped % 1800) == 0) {
+          REXLOG_INFO("native: BINK GATE \"{}\" player 0x{:08X}: {} frames "
+                      "skipped so far",
+                      name, player, e.skipped);
+        }
+      }
+    }
+  }
+  if (!gate) {
+    orig_BinkDecodeAndBlit(ctx, base);
+    return;
+  }
+  const uint32_t paused = REX_LOAD_U32(player + kPlayerPaused);
+  REX_STORE_U32(player + kPlayerPaused, 1);
+  orig_BinkDecodeAndBlit(ctx, base);
+  REX_STORE_U32(player + kPlayerPaused, paused);
+}
+
 // sub_8237ABA8(this) — vtable slot 15, the render prepare that binds
 // *(this+260) onto the draw item. Called per render, so this is a COUNTER with
 // a periodic report rather than a line per call.
