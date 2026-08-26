@@ -1015,9 +1015,40 @@ DXGI_FORMAT D3D12Renderer::HostColorFormat(uint32_t guestColorFormat) {
       return DXGI_FORMAT_R16G16B16A16_FLOAT;
     case 6:   // k_16_16_FLOAT
       return DXGI_FORMAT_R16G16_FLOAT;
-    case 15:  // k_32_FLOAT
+    // 14 and 15, NOT 15 and 16. These were off by one against
+    // ColorRenderTargetFormat (xenia-edge xenos.h:315,
+    // `k_32_FLOAT = 14, k_32_32_FLOAT = 15`), so guest 14 fell through to the
+    // RGBA8 default and 15 took the single-channel format. There is no guest
+    // format 16; that arm was dead.
+    //
+    // What the old values cost: the terrain clipmap renders its heightmap
+    // tiles into 129x129 targets declared k_32_FLOAT, and world height is
+    // metres, not a fraction. Caught with pixel_history at event 17410 -- the
+    // tile shader writes 611.71 and the RGBA8 target stores 1.0. That is the
+    // constant world Y in terrain-is-depth-rejected ("every one of 4225
+    // vertices solves back to world Y = 1.000 against a camera at Y = 616"),
+    // measured across four sessions and never explained. It was a UNORM8
+    // clamp. 15 of a run's targets carry format 14, so this is the terrain,
+    // not a decorative surface.
+    //
+    // KNOWN OPEN CONSEQUENCE, and the reason this looks like a regression on
+    // screen: with real heights the clipmap writes correct near depth (0.876),
+    // and the irregular meshes that actually PAINT the ground are then behind
+    // it -- every one depthTestFailed, so the ground renders as the ambient
+    // term only. Those meshes take their whole world Y from three texture
+    // samples (their vertex buffer carries only grid X and Z) and their
+    // dominant term is a 512x512 that reads min = max = 0.
+    //
+    // Kept anyway: this table states what Xenos does, and the old values were
+    // only ever cancelling that second bug by putting the terrain 600 units
+    // underground. Ruled out for the second half, in order: a missing seed,
+    // resolve writeback, a disabled feature (dword_82D55078 = 1), an unhooked
+    // draw entry (sub_82555B88 IS hooked), the wrong depth target, and the
+    // tiled resolve (destpoint is honoured). Unchased lead: vs 0x26E72FE0
+    // slot 0 samples a 2048x2048 at 0x11647000 that none of those three are.
+    case 14:  // k_32_FLOAT
       return DXGI_FORMAT_R32_FLOAT;
-    case 16:  // k_32_32_FLOAT
+    case 15:  // k_32_32_FLOAT
       return DXGI_FORMAT_R32G32_FLOAT;
     default:
       return DXGI_FORMAT_R8G8B8A8_UNORM;
