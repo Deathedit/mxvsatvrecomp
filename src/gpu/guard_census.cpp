@@ -78,9 +78,19 @@ std::string Report() {
     // this census exists to prevent, committed inside the census itself. A site
     // that has never called Note() at all cannot be told from one that is
     // called constantly and declines, so say which.
-    out += fmt::format(" [{} {}/{}{}]", kNames[i], f, p,
+    // THE BIT NUMBER IS PRINTED, and that is not decoration. hle_strict is
+    // keyed on enum POSITION, and three guards were deleted from this enum on
+    // 2026-08-26/27 -- every deletion shifts every bit below it. The cvar's own
+    // comment carried the pre-deletion numbers and sent a run at bit 4 (inert
+    // material-gate) when constant-nan-to-zero had moved to bit 3. A whole run
+    // spent on a stale mapping in a comment that read authoritative.
+    //
+    // Now the log is the authority: whatever it says is the bit, because it is
+    // computed from the same enum the switch is.
+    out += fmt::format(" [{} bit{} {}/{}{}{}]", kNames[i], i, f, p,
                        p ? fmt::format(" {:.1f}%", double(f) * 100.0 / double(p))
-                         : " NOT WIRED");
+                         : " NOT WIRED",
+                       (Strict(Guard(i)) ? " STRICT" : ""));
   }
   return out;
 }

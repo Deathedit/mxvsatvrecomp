@@ -71,9 +71,15 @@ REXCVAR_DEFINE_BOOL(hle_capture, false, "Debug",
 // instead of being papered over with a plausible value. See docs/strict_mode.md
 // and guard_census.h. 0 is the shipping behaviour.
 //
-// Bit N is Guard(N). Only bits 0 (stand-in draw), 3 (blank texture) and 4
-// (constant NaN->0) have any effect; the rest are structurally unswitchable and
-// Strict() refuses them regardless.
+// Bit N is Guard(N) -- and DO NOT TRUST THIS COMMENT for which N. Deleting a
+// guard shifts every bit below it, and that has already cost one run: this said
+// "bit 4 = constant NaN" from the pre-deletion enum when it had moved to bit 3,
+// so --hle_strict=16 quietly toggled an inert guard instead. The GUARD CENSUS
+// log line prints each guard's bit, computed from the same enum the switch is.
+// Read it there.
+//
+// Only three are switchable at all; the rest are structurally unswitchable and
+// Strict() refuses them regardless of the bit. See guard_census.h.
 REXCVAR_DEFINE_INT32(hle_strict, 0, "Debug",
                      "Bitmask of inventing guards to disable, so the defect "
                      "underneath shows instead of a plausible substitute.");
@@ -239,11 +245,11 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       // Pushed once per frame so the draw path reads an atomic rather than a
       // cvar, and so src/gpu keeps no cvar dependency.
       //
-      // Only three bits do anything -- see guard_census.h for why the other
-      // four are structurally unswitchable rather than merely risky:
-      //   bit 0  stand-in draws        the draw is skipped
-      //   bit 3  blank texture payload the blank is not recorded, decode retried
-      //   bit 4  constant NaN -> 0     the NaN reaches the shader
+      // Only three are switchable -- see guard_census.h for why the other four
+      // are structurally unswitchable rather than merely risky. The GUARD
+      // CENSUS line prints every guard's bit number and marks the ones strict
+      // mode is currently suppressing, so the mapping cannot go stale in a
+      // comment the way it already did once.
       mx::gpu::guard::SetStrictMask(
           static_cast<uint32_t>(REXCVAR_GET(hle_strict)));
       std::vector<const mx::hle::DrawCall*> submittable;
