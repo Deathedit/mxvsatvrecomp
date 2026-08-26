@@ -66,46 +66,6 @@ REXCVAR_DEFINE_BOOL(hle_capture, false, "Debug",
                     "resolved draws to logs/decldump/decls.txt. Capture only — it "
                     "submits nothing and renders nothing");
 
-// The per-draw and per-vertex diagnostics this investigation accumulated.
-//
-// Default OFF. They are not free — the Stage-3 transform probe alone reads 256
-// guest dwords and scores every vertex of every draw to log a ranking nothing
-// acts on — and a run is now expected to be a measurement of the emulator, not
-// of its instrumentation. Per-FRAME reporting is unaffected and stays on.
-// Inherit the previous owner's contents when a surface takes over an EDRAM
-// base at the same extent and format.
-//
-// EDRAM is a fixed 10MB scratch. The guest makes many D3D9 surface views onto
-// it -- 11 objects on base 0x2D0 alone -- and binding a base on the console
-// shows whatever the previous owner left there, because they ARE the same
-// memory. Here each object owns its own D3D12 texture and inherits nothing.
-// Measured: 64194 takeovers a run, of which 17029 are same-extent and 0 of
-// those differ in format, so a straight CopyResource carries the contents with
-// no reinterpretation. The other ~47k change extent and need a real EDRAM
-// model; this does not attempt them.
-//
-// The copy REPLACES the per-frame first-use clear rather than preceding it --
-// that clear is precisely what would destroy the contents being inherited.
-//
-// Default off. Two changes this session that were "obviously more correct"
-// made things worse when measured (a blanket half-pixel shift broke the
-// luminance chain), so this gets A/B'd like the others before it is trusted.
-// Keep a render target's contents across FRAMES when nothing cleared it.
-//
-// We clear every game target to transparent black at its first use in a frame.
-// A guest clear routes through AddGameClear and marks the target used, so that
-// first-use clear only ever fires on targets the GUEST did not clear -- and for
-// an accumulation buffer that is destructive. The terrain deformation buffer is
-// one: its shader writes a Laplacian DELTA that only integrates if the previous
-// frame's contents are still there. Measured in sand.rdc as min = max = 0 on
-// the 512x512 that every terrain draw samples.
-//
-// Default off, and A/B'd like the rest of this session's "obviously more
-// correct" changes -- three of those measured as exactly no visual difference.
-REXCVAR_DEFINE_BOOL(d3d12_persist_targets, false, "Graphics",
-                    "Do not clear a render target at its first use in a frame "
-                    "if it already holds content from an earlier frame.");
-
 REXCVAR_DEFINE_BOOL(d3d12_edram_takeover_copy, false, "Graphics",
                     "On a same-extent EDRAM takeover, copy the previous "
                     "owner's contents into the new owner instead of clearing.");
@@ -541,8 +501,7 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                                                       : 1u,
                                   d->guest_vp_width, d->guest_vp_height,
                                   REXCVAR_GET(d3d9_guest_viewport),
-                                  REXCVAR_GET(d3d12_edram_takeover_copy),
-                                  REXCVAR_GET(d3d12_persist_targets));
+                                  REXCVAR_GET(d3d12_edram_takeover_copy));
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;

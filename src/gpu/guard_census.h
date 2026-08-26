@@ -32,11 +32,18 @@ namespace mx::gpu::guard {
 // Class B sites from docs/strict_mode.md: machinery that INVENTS output.
 // Class A (HostPageReadable, PlausibleGuestPtr — refusing to act on untrusted
 // input) is deliberately absent. It models reality and is not the subject.
+// kFirstUseClear was here and is GONE, 2026-08-26 -- the first guard actually
+// REMOVED under docs/strict_mode.md rather than measured. Run 1453 gave it
+// 27,316 opportunities with the preserve path forced on and it needed none of
+// them (0/27316) while the frame rendered clean and the terrain deformation
+// buffer finally accumulated. A guard reading 0/N with N that large has no
+// fallback role left, so it was deleted along with its cvar rather than
+// default-off, which would only have preserved the option of reintroducing a
+// known defect.
 enum class Guard : uint32_t {
   kStandInDraw,             // a tex*col colour when no shader resolved
   kScratchColourTarget,     // a colour attachment for a depth-only draw
   kCrossThreadPixelShader,  // *a* pixel shader when the draw carries none
-  kFirstUseClear,           // a clear the guest never issued
   kBlankTexturePayload,     // a blank decode for a texture that read empty
   kConstantNanToZero,       // OverlayNonFinite NaN -> 0
   kMaterialGateFill,        // FillMaterialGate PM4 substitution

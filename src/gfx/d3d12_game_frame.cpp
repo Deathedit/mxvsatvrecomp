@@ -1140,44 +1140,47 @@ void D3D12Renderer::RenderGameFrame() {
             }
           }
         }
-        // ACROSS FRAMES, not just across owners. `everDrawn` already true on
-        // the first draw of a frame means this target carried content out of an
-        // earlier frame, and the clear below is about to discard it. That is
-        // correct for a target the guest refills every frame and WRONG for an
-        // accumulation buffer -- the terrain deformation ping-pong writes a
-        // Laplacian DELTA (`mask * (blur(self) - self)`, Xenia's
-        // shader_D1A0A3F6AE7AD8B5), which only integrates if the previous
-        // contents survive to be blended onto. Cleared every frame it stays at
-        // zero for ever, which is what sand.rdc measures: min = max = 0 on the
-        // 512x512 that every terrain draw samples.
+        // THE FIRST-USE CLEAR IS GONE. Deleted 2026-08-26, not gated -- this is
+        // the first guard removed under docs/strict_mode.md rather than merely
+        // measured.
         //
-        // Counted unconditionally so the size of the population is known even
-        // with the cvar off -- a guest clear routes through AddGameClear and
-        // sets usedThisFrame, so anything reaching here was cleared by US.
-        if (!inherited && drawTarget->everDrawn) {
+        // What it used to do: on the first use of a target in a frame, clear it
+        // to kOffscreenClear unless something had already claimed the contents.
+        // Nothing in the guest asked for that. It is correct for a target the
+        // guest refills every frame and WRONG for an accumulation buffer -- the
+        // terrain deformation ping-pong writes a Laplacian DELTA (`mask *
+        // (blur(self) - self)`, Xenia's shader_D1A0A3F6AE7AD8B5) which only
+        // integrates if the previous contents survive to be blended onto.
+        // Cleared every frame it stayed at zero forever: min = max = 0 on the
+        // 512x512 every terrain draw samples, which is what sand.rdc measured.
+        //
+        // WHY IT IS SAFE TO DELETE RATHER THAN DEFAULT-OFF. Run 1453, with the
+        // preserve path forced on: the guard was given 27,316 opportunities and
+        // needed NONE of them -- 0/27316 in the guard census -- while the frame
+        // still rendered 1720 frames at 797 guest draws accepted, 0 refused, no
+        // crash, and the 512x512 went from blank to `52 stale`, content
+        // surviving across frames as the ping-pong requires. Riding and looking
+        // back showed the tracks. A guard reading 0/N with N that large has no
+        // fallback role left; keeping it behind a cvar would only preserve the
+        // option of reintroducing a known defect.
+        //
+        // The guest issues its own clears. Colour routes through AddGameClear
+        // and, since the depth-clear commit, so does depth -- so there is no
+        // longer a gap for this to cover.
+        //
+        // `m_targetCarriedContent` is KEPT and now counts what it always
+        // measured: targets whose previous-frame content survives into this
+        // frame. That is a fact about the workload, not about a guard, and it
+        // is how a reintroduced clear would be spotted.
+        if (drawTarget->everDrawn) {
           ++m_targetCarriedContent;
           static std::unordered_set<uint32_t> s_carried;
           if (s_carried.size() < 32 && s_carried.insert(targetObject).second) {
             REXLOG_INFO(
-                "d3d12: first-use clear discards previous-frame content: "
-                "target 0x{:08X} {}x{}{}",
-                targetObject, drawTarget->width, drawTarget->height,
-                d.persistTargets ? " -- PRESERVED (cvar on)" : "");
+                "d3d12: target carries previous-frame content: "
+                "target 0x{:08X} {}x{} -- PRESERVED",
+                targetObject, drawTarget->width, drawTarget->height);
           }
-          if (d.persistTargets) {
-            ++m_targetPersisted;
-            inherited = true;
-          }
-        }
-        // Population is every first use of a target this frame; fires are the
-        // ones we clear without the guest asking. `inherited` means we left the
-        // previous frame's contents alone, which is the guard NOT firing.
-        mx::gpu::guard::Note(mx::gpu::guard::Guard::kFirstUseClear, !inherited);
-        if (!inherited) {
-          auto rtv = m_gameRtvHeap->GetCPUDescriptorHandleForHeapStart();
-          rtv.ptr += SIZE_T(drawTarget->rtvIndex) * m_gameRtvDescriptorSize;
-          m_commandList->ClearRenderTargetView(rtv, kOffscreenClear, 0,
-                                               nullptr);
         }
         drawTarget->usedThisFrame = true;
         drawTarget->everDrawn = true;
@@ -1971,7 +1974,8 @@ void D3D12Renderer::RenderGameFrame() {
                   "guest viewport vs host target: match %llu, MISMATCH %llu, "
                   "unreadable %llu, taken-from-guest %llu; edram takeover "
                   "transfers %llu (no-source %llu, source-never-drawn %llu); "
-                  "first-use clears over carried content %llu (preserved %llu)",
+                  "targets carrying previous-frame content %llu (all PRESERVED -- the "
+                  "first-use clear was deleted 2026-08-26)",
                   static_cast<unsigned long long>(m_alphaTestHonoured),
                   static_cast<unsigned long long>(m_alphaTestStandIn),
                   static_cast<unsigned long long>(m_fixed16Scaled),
@@ -1985,8 +1989,7 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_edramTransfers),
                   static_cast<unsigned long long>(m_edramTransferNoSource),
                   static_cast<unsigned long long>(m_edramTransferNotDrawn),
-                  static_cast<unsigned long long>(m_targetCarriedContent),
-                  static_cast<unsigned long long>(m_targetPersisted));
+                  static_cast<unsigned long long>(m_targetCarriedContent));
     LogInfo(message);
     // GUARD CENSUS -- phase 1 of docs/strict_mode.md. One line, every class-B
     // guard, fires beside the population they are a fraction of. A guard
@@ -2431,7 +2434,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t cullMode, uint32_t vtxCntl,
                                  uint32_t guestVpWidth,
                                  uint32_t guestVpHeight, bool useGuestVp,
-                                 bool edramCopy, bool persistTargets) {
+                                 bool edramCopy) {
   // PERF(per-frame-allocs): DONE. This used to create an ID3D12Resource on the
   // UPLOAD heap for each of the buffers below — up to nine per call, once per
   // submitted draw — and the note here called for "a ring of upload buffers
@@ -3069,7 +3072,6 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.guestVpHeight = guestVpHeight;
   d.useGuestVp = useGuestVp;
   d.edramCopy = edramCopy;
-  d.persistTargets = persistTargets;
   d.halfPixel = (vtxCntl != 0xFFFFFFFFu && (vtxCntl & 1u) == 0) ? 0.5f : 0.0f;
   if (d.halfPixel != 0.0f) ++m_halfPixelDraws; else ++m_halfPixelSkipped;
   if (scissor) {
