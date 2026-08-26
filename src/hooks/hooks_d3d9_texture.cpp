@@ -1831,7 +1831,10 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
         // is tens of shaders times a handful of slots. A tighter cap filled up
         // on early menu shaders and cut off before the material under
         // investigation ever bound.
-        fresh = s_seen.size() < 1024 && s_seen.insert(key).second;
+        // Raised with the renderer's census cap, and for the same
+        // reason: 632 of these 1024 were spent in the menu, so a level's
+        // bindings arrive against a nearly full budget.
+        fresh = s_seen.size() < 4096 && s_seen.insert(key).second;
       }
       // Read regardless of whether this line is fresh: the swizzle is no
       // longer only a diagnostic, it is what the renderer binds the snapshot
@@ -1983,7 +1986,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     bool fresh = false;
     {
       std::lock_guard<std::mutex> lk(s_mu);
-      fresh = s_lines < 1024 && s_seen.insert(key).second;
+      fresh = s_lines < 4096 && s_seen.insert(key).second;
       if (fresh) ++s_lines;
     }
     if (fresh) {

@@ -266,7 +266,13 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
   if (censusHandle) {
     static std::unordered_set<uint32_t> s_censusedPs, s_censusedVs;
     auto& censused = vertex ? s_censusedVs : s_censusedPs;
-    if (censused.size() < 64 && censused.insert(censusHandle).second) {
+    // 64 was a menu-sized cap and it SATURATED before a level's shaders
+    // ever bound: mx_1420 printed 68 census lines, all of them menu, and
+    // the terrain material -- the one under investigation -- was censused
+    // zero times. Same shape as measure-with-a-level-loaded. A run
+    // translates ~300 shaders, so 512 covers a level with headroom and
+    // still cannot run away.
+    if (censused.size() < 512 && censused.insert(censusHandle).second) {
       std::string slotDesc;
       for (uint32_t i = 0; i < stageSamplerCount && i < kTranslatedSamplerSlots;
            ++i) {
@@ -275,11 +281,19 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
           continue;
         }
         const D3D12_RESOURCE_DESC rd = slots[i].resource->GetDesc();
+        // A snapshot slot used to print a HOST pointer and nothing else,
+        // which names the resource only within one process. The guest object
+        // is what the resolve log, SLOT MAP and get_resource_usage sweeps are
+        // all keyed on, so printing it here is what lets a census line be
+        // joined to the rest without brute-forcing a capture's resource list.
         slotDesc += fmt::format(
-            " [{}]={} {}x{} fmt{} res={}{}", i,
+            " [{}]={} {}x{} fmt{} res={}{}{}", i,
             slots[i].useSwizzle ? "tex" : "snap", uint32_t(rd.Width), rd.Height,
             uint32_t(slots[i].format),
             static_cast<const void*>(slots[i].resource),
+            (!slots[i].useSwizzle && i < stageSampledObjects.size())
+                ? fmt::format(" object 0x{:08X}", stageSampledObjects[i])
+                : std::string(),
             slots[i].useSwizzle ? "" : " (no swizzle)");
         // PROBE: the decoded bytes this slot will actually sample, read from the
         // payload rather than matched up in a capture afterwards.
