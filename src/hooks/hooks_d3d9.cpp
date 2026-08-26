@@ -4479,65 +4479,128 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
     // menu backdrop is a 1280x430 resolve that mx_1288 produced exactly once
     // and nothing sampled.
     {
-      size_t orphans = 0, asked_but_lost = 0;
-      std::string rows;
-      for (const auto& [addr, e] : g_resolvedTargetsByAddress) {
-        if (!e.set_texture_binds) ++orphans;
-        // The row that matters: the guest asked for it and no draw slot ever
-        // saw it. That is a binding WE lose, and it is invisible to every other
-        // counter here.
-        if (e.set_texture_binds && !e.slot_seen) ++asked_but_lost;
-        rows += fmt::format(
-            " [0x{:08X} {}x{} {}res bind{} seen{} snap{} part{} smp{:#x} "
-            "draws{} untrans{} declared{:#x} bt{} span{}/{}win]",
-            addr, e.width, e.height, e.resolves, e.set_texture_binds,
-            e.slot_seen, e.slot_snapshot, e.slot_partial, e.bind_sampler_mask,
-            e.draws_while_bound, e.draws_no_translation,
-            e.declared_sampler_mask, e.last_bind_thread,
-            e.guest_draws_spanned, e.bind_windows);
-      }
-      std::string draw_threads;
-      for (const auto& slot : g_drawThreadIds) {
-        if (const uint32_t tid = slot.load(std::memory_order_relaxed))
-          draw_threads += fmt::format(" {}", tid);
-      }
+      // THROTTLED 2026-08-26, and the reason is worth keeping. These two are
+      // the widest lines in the log: RESOLVE CONSUMPTION is 6181 bytes per
+      // line, and at 422 fires over 2067 frames the pair accounted for 3.6MB
+      // of run 1434's 10.8MB. That is what rotates the log away every ~30
+      // seconds, which is how three empty greps nearly became a false
+      // conclusion about the FE_Smoke gate never firing.
+      //
+      // They inherit the enclosing cost trigger, which is right for FRAME COST
+      // -- that line is ABOUT the slow frame it fires on. These two are not.
+      // They are cumulative whole-population snapshots, identical on
+      // consecutive slow frames apart from monotonic counter drift.
+      //
+      // So the fire condition becomes the one ReportVideoComponents already
+      // uses: print when the POPULATION or the FINDING changes, plus a
+      // heartbeat. Every property the original comments defend survives --
+      //   - the first report always prints, so "0 orphans of 14" and "no line
+      //     at all" stay distinguishable;
+      //   - a new destination or video row appearing prints immediately;
+      //   - an orphan / asked-but-lost / bound-never-drawn count changing
+      //     prints immediately, and that is the diagnostic payload;
+      //   - drift alone waits for the heartbeat.
+      //
+      // The signature is computed BEFORE the row strings are built, and the
+      // strings are built ONLY when printing. That is most of the saving: this
+      // runs on the render thread and formatted ~9KB per slow frame whether or
+      // not anything had changed.
+      constexpr auto kCensusHeartbeat = std::chrono::seconds(10);
+
       // VIDEO TARGET CONSUMPTION. Every texture bound at one of the three
       // _VideoRenderTarget extents, by base address.
       //
-      // The whole population, printed unconditionally. "0 rows" means the guest
-      // never binds a texture at any of those extents at all -- a completely
-      // different finding from "rows exist and none of them draw", and the two
-      // must not collapse into the same silence.
+      // The whole population. "0 rows" means the guest never binds a texture at
+      // any of those extents at all -- a completely different finding from
+      // "rows exist and none of them draw", and the two must not collapse into
+      // the same silence.
       //
       // 1280x720 is also the scene render-target extent, so a row at that shape
       // is not on its own the video asset. Read the ADDRESSES: FE_Smoke's
       // 1280x430 resolve lands at phys 0x1BE95000.
       {
-        std::string vrows;
-        size_t bound_never_drawn = 0;
         std::lock_guard<std::mutex> lk(g_videoShapeMu);
-        for (const auto& [addr, r] : g_videoShapeRows) {
+        size_t bound_never_drawn = 0;
+        for (const auto& kv : g_videoShapeRows) {
+          const auto& r = kv.second;
           if (r.binds && !r.guest_draws_spanned) ++bound_never_drawn;
-          vrows += fmt::format(
-              " [0x{:08X} {}x{} obj0x{:08X} bind{} smp{:#x} seen{} span{}/{}win "
-              "dev0x{:08X} bt{}]",
-              addr, r.width, r.height, r.last_object, r.binds, r.sampler_mask,
-              r.slot_seen, r.guest_draws_spanned, r.bind_windows, r.last_device,
-              r.last_thread);
         }
-        REXLOG_INFO("d3d9: VIDEO TARGET CONSUMPTION {} addresses at a "
-                    "_VideoRenderTarget extent, {} binds total, {} bound but "
-                    "never drawn with, {} rows dropped (map full) --{}",
-                    g_videoShapeRows.size(), g_videoShapeBinds,
-                    bound_never_drawn, g_videoShapeDropped,
-                    vrows.empty() ? " (none)" : vrows);
+        static uint64_t s_sig = ~0ull;
+        static std::chrono::steady_clock::time_point s_last{};
+        const auto now = std::chrono::steady_clock::now();
+        const uint64_t sig = (uint64_t(g_videoShapeRows.size()) << 40) ^
+                             (uint64_t(bound_never_drawn) << 20) ^
+                             uint64_t(g_videoShapeDropped);
+        if (sig != s_sig || now - s_last >= kCensusHeartbeat) {
+          s_sig = sig;
+          s_last = now;
+          std::string vrows;
+          for (const auto& [addr, r] : g_videoShapeRows) {
+            vrows += fmt::format(
+                " [0x{:08X} {}x{} obj0x{:08X} bind{} smp{:#x} seen{} span{}/{}win "
+                "dev0x{:08X} bt{}]",
+                addr, r.width, r.height, r.last_object, r.binds, r.sampler_mask,
+                r.slot_seen, r.guest_draws_spanned, r.bind_windows, r.last_device,
+                r.last_thread);
+          }
+          REXLOG_INFO("d3d9: VIDEO TARGET CONSUMPTION {} addresses at a "
+                      "_VideoRenderTarget extent, {} binds total, {} bound but "
+                      "never drawn with, {} rows dropped (map full) --{}",
+                      g_videoShapeRows.size(), g_videoShapeBinds,
+                      bound_never_drawn, g_videoShapeDropped,
+                      vrows.empty() ? " (none)" : vrows);
+        }
       }
-      REXLOG_INFO("d3d9: RESOLVE CONSUMPTION {} destinations, {} never asked "
-                  "for, {} asked for but never reached a draw slot; draw "
-                  "threads:{} --{}",
-                  g_resolvedTargetsByAddress.size(), orphans, asked_but_lost,
-                  draw_threads.empty() ? " none" : draw_threads,
-                  rows.empty() ? " (none)" : rows);
+
+      // RESOLVE CONSUMPTION. Every destination the guest has resolved into, and
+      // whether it ever asked for it back through SetTexture. Orphans are
+      // listed by name because the interesting one is a specific surface: the
+      // menu backdrop is a 1280x430 resolve that mx_1288 produced exactly once
+      // and nothing sampled.
+      size_t orphans = 0, asked_but_lost = 0;
+      for (const auto& kv : g_resolvedTargetsByAddress) {
+        const auto& e = kv.second;
+        if (!e.set_texture_binds) ++orphans;
+        // The row that matters: the guest asked for it and no draw slot ever
+        // saw it. That is a binding WE lose, and it is invisible to every other
+        // counter here.
+        if (e.set_texture_binds && !e.slot_seen) ++asked_but_lost;
+      }
+      {
+        static uint64_t s_sig = ~0ull;
+        static std::chrono::steady_clock::time_point s_last{};
+        const auto now = std::chrono::steady_clock::now();
+        const uint64_t sig =
+            (uint64_t(g_resolvedTargetsByAddress.size()) << 40) ^
+            (uint64_t(orphans) << 20) ^ uint64_t(asked_but_lost);
+        if (sig != s_sig || now - s_last >= kCensusHeartbeat) {
+          s_sig = sig;
+          s_last = now;
+          std::string rows;
+          for (const auto& [addr, e] : g_resolvedTargetsByAddress) {
+            rows += fmt::format(
+                " [0x{:08X} {}x{} {}res bind{} seen{} snap{} part{} smp{:#x} "
+                "draws{} untrans{} declared{:#x} bt{} span{}/{}win]",
+                addr, e.width, e.height, e.resolves, e.set_texture_binds,
+                e.slot_seen, e.slot_snapshot, e.slot_partial,
+                e.bind_sampler_mask, e.draws_while_bound,
+                e.draws_no_translation, e.declared_sampler_mask,
+                e.last_bind_thread, e.guest_draws_spanned, e.bind_windows);
+          }
+          std::string draw_threads;
+          for (const auto& slot : g_drawThreadIds) {
+            if (const uint32_t tid = slot.load(std::memory_order_relaxed))
+              draw_threads += fmt::format(" {}", tid);
+          }
+          REXLOG_INFO("d3d9: RESOLVE CONSUMPTION {} destinations, {} never "
+                      "asked for, {} asked for but never reached a draw slot; "
+                      "draw threads:{} --{}",
+                      g_resolvedTargetsByAddress.size(), orphans,
+                      asked_but_lost,
+                      draw_threads.empty() ? " none" : draw_threads,
+                      rows.empty() ? " (none)" : rows);
+        }
+      }
     }
     // Bink plane preparation, whole population, NOT gated on non-zero: a run
     // where the composite is never attempted and one where it is attempted and
