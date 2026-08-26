@@ -997,6 +997,11 @@ void D3D12Renderer::RenderGameFrame() {
                                           depthTarget ? &dsv : nullptr);
         boundDepthObject = wantDepthObject;
         D3D12_VIEWPORT viewport = {};
+        // See GameDraw::halfPixel. TopLeftX/Y are floats and a sub-pixel origin
+        // is exactly the screen-space translation the reference performs on the
+        // vertex, without a shader constant.
+        viewport.TopLeftX = d.halfPixel;
+        viewport.TopLeftY = d.halfPixel;
         viewport.Width = float(drawTarget->width);
         viewport.Height = float(drawTarget->height);
         viewport.MinDepth = 0.0f;
@@ -1031,7 +1036,12 @@ void D3D12Renderer::RenderGameFrame() {
       auto dsv = m_gameDsvHeap->GetCPUDescriptorHandleForHeapStart();
       m_commandList->OMSetRenderTargets(1, &rtv, FALSE,
                                         m_gameDepth ? &dsv : nullptr);
-      m_commandList->RSSetViewports(1, &m_viewport);
+      // A local copy: m_viewport is also used by the present blit, which draws
+      // our own quad and must not be shifted.
+      D3D12_VIEWPORT mainViewport = m_viewport;
+      mainViewport.TopLeftX += d.halfPixel;
+      mainViewport.TopLeftY += d.halfPixel;
+      m_commandList->RSSetViewports(1, &mainViewport);
       boundTargetObject = 0;
       // The main target binds m_gameDepth, which is not one of the per-object
       // depth surfaces, so the offscreen path must treat this as "not mine".
@@ -1788,11 +1798,14 @@ void D3D12Renderer::RenderGameFrame() {
     // still painting the pixels the guest masks away.
     std::snprintf(message, sizeof(message),
                   "alpha test: honoured %llu, STAND-IN %llu; "
-                  "fixed16 -32..32 targets %llu draws (scale identity); 7e3 clamped %llu",
+                  "fixed16 -32..32 targets %llu draws (scale identity); 7e3 clamped %llu; "
+                  "half-pixel offset applied %llu, skipped %llu",
                   static_cast<unsigned long long>(m_alphaTestHonoured),
                   static_cast<unsigned long long>(m_alphaTestStandIn),
                   static_cast<unsigned long long>(m_fixed16Scaled),
-                  static_cast<unsigned long long>(m_float7e3Clamped));
+                  static_cast<unsigned long long>(m_float7e3Clamped),
+                  static_cast<unsigned long long>(m_halfPixelDraws),
+                  static_cast<unsigned long long>(m_halfPixelSkipped));
     LogInfo(message);
     // DIAG: what the WHITE-SKIPPED draws were aimed at.
     for (const auto& [extent, e] : m_skipByTarget) {
@@ -2217,7 +2230,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t targetColorFormat,
                                  const int32_t* scissor,
                                  uint32_t alphaControl, float alphaRef,
-                                 uint32_t cullMode) {
+                                 uint32_t cullMode, uint32_t vtxCntl) {
   // PERF(per-frame-allocs): DONE. This used to create an ID3D12Resource on the
   // UPLOAD heap for each of the buffers below — up to nine per call, once per
   // submitted draw — and the note here called for "a ring of upload buffers
@@ -2805,6 +2818,13 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.destBlend = destBlend;
   d.blendOp = blendOp;
   d.cullMode = cullMode;
+  // Bit 0 has PA_SU_VTX_CNTL::PIX_CENTER's meaning -- 0 is Direct3D 9 centres
+  // at .0 and needs the offset, 1 is the host's own .5 and does not -- but the
+  // value currently comes from the d3d9_half_pixel_offset cvar rather than from
+  // the register, which is not locatable in the device shadow. Keeping the
+  // decode identical means the register drops straight in when it is found.
+  d.halfPixel = (vtxCntl != 0xFFFFFFFFu && (vtxCntl & 1u) == 0) ? 0.5f : 0.0f;
+  if (d.halfPixel != 0.0f) ++m_halfPixelDraws; else ++m_halfPixelSkipped;
   if (scissor) {
     d.scissorSeen = true;
     d.scissorLeft = scissor[0];

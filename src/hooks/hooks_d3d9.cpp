@@ -2521,6 +2521,32 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
       pa_su_sc = REX_LOAD_U32(device + kPaSuScModeCntl);
       pa_su_sc_seen = true;
       dc.pa_su_sc_mode_cntl = pa_su_sc;
+      // PA_SU_VTX_CNTL is NOT here, and is not read at all. Recorded so the
+      // next person does not spend the afternoon this cost.
+      //
+      // The register is 0x2302 (register_table.inc:1337). 0x2206, the "next
+      // one along" from PA_SU_SC_MODE_CNTL, is PA_CL_VTE_CNTL -- which this
+      // file already reads elsewhere for VportScaleEnabled. Reading it here by
+      // mistake decoded VPORT_X_SCALE_ENA as PIX_CENTER, and 0x0000043F (all
+      // six VTE enables plus VTX_W0_FMT) is a perfectly sensible VTE_CNTL and
+      // obvious nonsense as a vertex control: PA_SU_VTX_CNTL is pix_center:1,
+      // round_mode:2, quant_mode:3 and then 26 bits of PADDING, so any value
+      // with bits 6+ set is not this register.
+      //
+      // The second guess was worse, because it looked right. The offset rule
+      // 0x2934 + (reg - 0x2200) * 4 holds WITHIN a block and does not span
+      // them -- 0x2100 sits at +0x28CC and 0x2200 at +0x2934, 256 registers
+      // apart but only 0x68 bytes -- so extrapolating to 0x2302 gave +0x2D3C,
+      // which read 0x00000000 and decoded as a plausible D3D9 pixel centre.
+      // Dumping the neighbourhood killed it: +0x2D00..+0x2D7C holds guest heap
+      // pointers (212408C4), an XEX text address (82567668) and the ASCII tag
+      // "REX" (52455800). An object with a vtable, not shadowed registers. The
+      // zero was a struct field, and a single-address read could never have
+      // told that apart from a real register a D3D9 title legitimately sets to
+      // zero.
+      //
+      // Finding it needs IDA -- where the guest writes register 0x2302 -- not a
+      // third extrapolation.
       static std::mutex s_mu;
       static std::map<uint32_t, uint64_t> s_modes;
       bool fresh = false;

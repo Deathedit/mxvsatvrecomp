@@ -72,6 +72,26 @@ REXCVAR_DEFINE_BOOL(hle_capture, false, "Debug",
 // guest dwords and scores every vertex of every draw to log a ranking nothing
 // acts on — and a run is now expected to be a measurement of the emulator, not
 // of its instrumentation. Per-FRAME reporting is unaffected and stays on.
+// The Direct3D 9 half-pixel offset, as an A/B switch.
+//
+// The reference applies +0.5 pixels to every vertex whenever
+// PA_SU_VTX_CNTL::PIX_CENTER is kD3DZero -- Direct3D 9 pixel centres at .0
+// against a host that rasterises at .5 -- and its own documentation says
+// omitting it "may significantly break post-processing in some games".
+//
+// We cannot read that register: 0x2302 is not at the offset the 0x22xx block
+// rule extrapolates to (that address holds an object with a vtable and a "REX"
+// tag, not registers), and two guesses at it were both wrong.
+//
+// So this is settled by experiment instead, which is self-validating. If the
+// guest wants .0 centres, turning this on corrects a half-pixel error. If it
+// already wants .5, turning it on puts everything a FULL pixel out, which is
+// unmistakable. Default off: the burden is on the change to show it helps.
+REXCVAR_DEFINE_BOOL(d3d9_half_pixel_offset, false, "Graphics",
+                    "Shift the viewport half a pixel to convert Direct3D 9 "
+                    "pixel centres (.0) to the host's (.5). A/B switch -- see "
+                    "the note at the definition.");
+
 REXCVAR_DEFINE_BOOL(hle_diag, false, "Debug",
                     "Per-draw and per-vertex HLE diagnostics: the transform "
                     "probe, the prim-type and vfetch censuses, and the vertex "
@@ -437,7 +457,9 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   // state they had before cull was plumbed.
                                   mx::hle::IsPrimitivePolygonal(d->prim_type)
                                       ? d->pa_su_sc_mode_cntl
-                                      : 0u);
+                                      : 0u,
+                                  REXCVAR_GET(d3d9_half_pixel_offset) ? 0u
+                                                                      : 1u);
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;

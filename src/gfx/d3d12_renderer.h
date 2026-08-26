@@ -222,7 +222,10 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  // CCW). Zero means the register was unreadable, which decodes
                  // as CULL_NONE -- the behaviour every draw had before this was
                  // plumbed, so an unreadable register cannot make things worse.
-                 uint32_t cullMode = 0);
+                 uint32_t cullMode = 0,
+                 // PA_SU_VTX_CNTL. UINT32_MAX means the register could not be
+                 // read, which leaves the draw on the pre-existing path.
+                 uint32_t vtxCntl = 0xFFFFFFFFu);
 
 // Append a resolve to this frame's list, in order with the draws around it.
 //
@@ -1146,6 +1149,13 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // See the note on DrawCall::pa_su_sc_mode_cntl for why ignoring this
     // painted the menu background black.
     uint32_t cullMode = 0;
+    // Half a pixel when the guest asks for Direct3D 9 pixel centres, otherwise
+    // zero. Applied to the VIEWPORT ORIGIN rather than to the position in the
+    // shader: the reference adds it to the vertex as `ndc_offset * w`, which
+    // after the perspective divide is exactly a screen-space translation, so
+    // doing it on the viewport needs no new shader constant and no change to
+    // the 276-entry vertex constant buffer.
+    float halfPixel = 0.0f;
     // The guest's D3DRS_* blend state, translated in BlendedPSO.
     bool blendEnable = false;
     uint32_t srcBlend = 0;
@@ -1462,6 +1472,12 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // refusal and an offscreen-target refusal have different causes and different
   // fixes, and reporting both as "routing refused: budget" hid the former.
   uint64_t m_snapshotRejectBudget = 0;
+  // Draws that took the Direct3D 9 half-pixel offset, against those left alone
+  // because PA_SU_VTX_CNTL was unreadable or already asked for .5 centres. If
+  // the second figure is everything, the register is not being read and this is
+  // inert.
+  uint64_t m_halfPixelDraws = 0;
+  uint64_t m_halfPixelSkipped = 0;
   // Snapshot eviction. m_snapshotEvictBlocked is the one that matters: a sweep
   // that ran AT THE HARD CAP and freed nothing means every live snapshot is
   // genuinely in use, so the cap rather than the lifetime wants revisiting.
