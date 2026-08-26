@@ -3205,7 +3205,93 @@ ShaderApplyResult ApplyShaderOutputs(
   struct ReportApply {
     uint64_t attempt;
     ~ReportApply() {
-      if (attempt > 10 && (attempt % 250) != 0) return;
+      // THROTTLED 2026-08-26. This was every 250th attempt, which in run 1435
+      // meant 1511 lines / 1.23MB -- 19% of the run by bytes and the largest
+      // contributor once the two wide censuses were dealt with. `attempt` is a
+      // draw counter, so the cadence tracked how BUSY the frame was, not
+      // whether anything in the line had changed.
+      //
+      // Which fields actually move was MEASURED, not guessed -- diffing two
+      // reports 526000 attempts apart in run 1435:
+      //
+      //   CLIMB every frame, routine:  applied, vertices, identity, viewport,
+      //     VTE scale-on/off, tie-break disagreement, GPU vertex path qualify,
+      //     skipped total, no-VTE, no-PS, depth-only, GPU FETCH draws,
+      //     rectlist, CLAMPED, BUILD zero-filled.
+      // TWO WRONG MEMBERS, both caught only by running it. Each one made the
+      // sum move on nearly every draw, so the predicate was always true and the
+      // line printed on nearly every draw -- ~250x WORSE than the modulo it
+      // replaced (43795 lines / 152505 attempts in run 1436; 42889 / 293511 in
+      // run 1437). A throttle whose predicate is always true is not a throttle.
+      //
+      //   run 1436: mx::hle::HleVertexZeroFillCount(), which is "BUILD
+      //     zero-filled" and CLIMBS -- not "CPU zero-filled"
+      //     (g_hleShaderZeroFilledVertex), which is the static one. The two sit
+      //     adjacent in the format string with near-identical labels.
+      //   run 1437: mx::hle::g_rectArrangement[0..2], which tracks rect draws
+      //     and climbs in lockstep with the rectlist refusals right beside it.
+      //
+      // BOTH came from reading a label off a positional field-diff that only
+      // resolved 29 of the ~35 fields -- a limitation I had already noticed and
+      // then relied on anyway. The tail fields, which is exactly where both
+      // offenders live, were never in that diff at all. What finally settled it
+      // was grepping the RAW substring out of three consecutive prints and
+      // watching "rect arrangement 0123" go 45918 -> 45919 -> 45920.
+      //
+      // So: if a member is ever added here, verify it against a real log by
+      // reading the raw field, not by trusting a parse of the whole line.
+      //
+      // THE TRAP, paid for in run 1436: the format string has TWO adjacent
+      // zero-fill counters with near-identical labels --
+      //   "CPU zero-filled {} vertices"   g_hleShaderZeroFilledVertex   STATIC
+      //   "BUILD zero-filled {} vertices" HleVertexZeroFillCount()      CLIMBS
+      // The first cut of this signature took the climbing one. The sum then
+      // changed on nearly every draw, so the line printed on nearly every draw:
+      // 43795 lines over 152505 attempts, ~250x WORSE than the modulo it
+      // replaced. A throttle whose predicate is always true is not a throttle,
+      // and the measurement that would have caught it was already in hand --
+      // BUILD zero-filled was in the CLIMB list below the whole time.
+      //
+      //   STATIC in a healthy run:  every no-code/decode/stream/constants/
+      //     vertex refusal (0), VTE unreadable (0), all four live-shader
+      //     outcomes (0), undeclared reg (0), no-VS (0), VS-samplers (frozen
+      //     at 4), too-many-inputs (0), GPU FETCH no-variant / ordinal-mismatch
+      //     / unaligned (0), CPU zero-filled (0), attribute-past-stride (0),
+      //     rect arrangement and degenerate.
+      //
+      // The second group is the diagnostic payload: each one is zero or frozen
+      // while things are working, and each one moving is genuine news. So the
+      // line prints when THAT SUM changes, plus a 10s heartbeat so the climbing
+      // totals still get sampled, plus the first ten attempts as before.
+      //
+      // The sum is a sound change-detector because every counter in it is
+      // monotonically increasing: the total moves if and only if at least one
+      // member moved. Two cannot cancel.
+      //
+      // VS-samplers frozen at 4 rather than 0 is the case that shows why the
+      // frozen ones belong in here as well as the zero ones: a fifth appearing
+      // is exactly the event worth a line.
+      //
+      // The statics are plain, matching every counter they read -- those are
+      // non-atomic globals incremented from several draw threads already. The
+      // worst a race here can do is duplicate or drop one log line.
+      static uint64_t s_lastFailures = ~0ull;
+      static std::chrono::steady_clock::time_point s_lastReport{};
+      const uint64_t failures =
+          g_hleShaderNoCode + g_hleShaderBadDecode + g_hleShaderBadStream +
+          g_hleShaderBadConstants + g_hleShaderBadVertex + g_vteSeen[0] +
+          g_liveVertexResolved + g_liveVertexNoMatch + g_liveVertexAmbiguous +
+          g_liveVertexUnreadable + g_gpuVertexUndeclared + g_gpuVertexNoVs +
+          g_gpuVertexVsSamplers + g_gpuVertexTooManyInputs +
+          g_gpuFetchNoVariant + g_gpuFetchOrdinalMismatch + g_gpuFetchUnaligned +
+          g_hleShaderBadAttribute + g_hleShaderZeroFilledVertex +
+          mx::hle::g_rectDegenerate.load();
+      const auto now = std::chrono::steady_clock::now();
+      if (attempt > 10 && failures == s_lastFailures &&
+          now - s_lastReport < std::chrono::seconds(10))
+        return;
+      s_lastFailures = failures;
+      s_lastReport = now;
       REXLOG_INFO(
           "d3d9: HLE shader output attempts {}: applied {} draws / {} "
           "vertices; skipped no-code {} decode {} stream {} constants {} "
