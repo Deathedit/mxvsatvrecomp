@@ -2521,6 +2521,55 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
       pa_su_sc = REX_LOAD_U32(device + kPaSuScModeCntl);
       pa_su_sc_seen = true;
       dc.pa_su_sc_mode_cntl = pa_su_sc;
+      // GUEST VIEWPORT vs the one we actually set.
+      //
+      // PA_CL_VTE_CNTL reads 0x43F, so the GPU applies the viewport transform
+      // and the guest's vertex shader exports CLIP SPACE -- which is why the
+      // mvp here is identity for 99.8% of draws. That part is right. What is
+      // NOT established is that the host viewport we hand D3D12 is the one the
+      // guest asked for: the renderer sets it to the full render-target extent
+      // (drawTarget->width/height) and never consults these registers.
+      //
+      // The 0x21xx block base is device+0x28CC (register 0x2100), from the same
+      // decompiled flush that gives the 0x22xx block its base, so
+      // PA_CL_VPORT_XSCALE (0x210F) is at +0x2908. A stray observation in this
+      // file already recorded 640/640/-90/90 there, which is x 0..1280 but y
+      // 0..180 -- NOT a full 720-tall target. If that is common the host
+      // viewport is wrong for those draws.
+      //
+      // Census only. Distinct rectangles, so the whole set appears once each.
+      {
+        constexpr uint32_t kPaClVportXScale = 0x2908;  // 0x210F
+        if (HostPageReadable(REX_RAW_ADDR(device + kPaClVportXScale)) &&
+            HostPageReadable(REX_RAW_ADDR(device + kPaClVportXScale + 12))) {
+          auto f = [&](uint32_t i) {
+            const uint32_t bits =
+                REX_LOAD_U32(device + kPaClVportXScale + i * 4);
+            float v;
+            std::memcpy(&v, &bits, 4);
+            return v;
+          };
+          const float xs = f(0), xo = f(1), ys = f(2), yo = f(3);
+          if (std::isfinite(xs) && std::isfinite(xo) && std::isfinite(ys) &&
+              std::isfinite(yo)) {
+            const int32_t x0 = int32_t(std::lround(xo - std::fabs(xs)));
+            const int32_t x1 = int32_t(std::lround(xo + std::fabs(xs)));
+            const int32_t y0 = int32_t(std::lround(yo - std::fabs(ys)));
+            const int32_t y1 = int32_t(std::lround(yo + std::fabs(ys)));
+            // Recorded, not classified. The first version of this compared
+            // against dc.render_target_width -- the D3D9 render-target extent
+            // -- and called the result agree/MISMATCH. That is the wrong
+            // reference: the renderer hands D3D12 `drawTarget->width` from its
+            // OWN target lookup, which comes from a different path and can
+            // differ, and three rows came back "target 0x0" because that field
+            // is not populated for every draw. The comparison belongs where the
+            // viewport is actually set, so it is made in RenderGameFrame.
+            dc.guest_vp_width = uint32_t(x1 - x0);
+            dc.guest_vp_height = uint32_t(y1 - y0);
+          }
+        }
+      }
+
       // PA_SU_VTX_CNTL is NOT here, and is not read at all. Recorded so the
       // next person does not spend the afternoon this cost.
       //

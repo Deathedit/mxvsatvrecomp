@@ -72,6 +72,26 @@ REXCVAR_DEFINE_BOOL(hle_capture, false, "Debug",
 // guest dwords and scores every vertex of every draw to log a ranking nothing
 // acts on — and a run is now expected to be a measurement of the emulator, not
 // of its instrumentation. Per-FRAME reporting is unaffected and stays on.
+// Use the viewport the GUEST programmed, instead of the render target's full
+// extent, when the two disagree.
+//
+// Measured at the point the viewport is set: match 47665, MISMATCH 1676,
+// unreadable 0, and every mismatch is one shape -- guest 640x360 rendered
+// through a 640x720 target, so that geometry is stretched 2x vertically.
+//
+// The target is probably oversized by our own doing: EnsureGameRenderTarget
+// grows a pooled surface to the UNION of the extents asked of it ("so a later
+// band cannot shrink away an earlier one"), so a surface grown for one draw
+// hands the next an extent the guest never asked for. Using the guest's
+// viewport is right either way -- it is what the hardware transforms into.
+//
+// A/B rather than applied outright: the surface is still oversized, so whatever
+// samples it afterwards may expect the content laid out the way it is now.
+REXCVAR_DEFINE_BOOL(d3d9_guest_viewport, false, "Graphics",
+                    "Set the host viewport from the guest's PA_CL_VPORT "
+                    "registers rather than the render target extent, when they "
+                    "disagree.");
+
 // The Direct3D 9 half-pixel offset, as an A/B switch.
 //
 // The reference applies +0.5 pixels to every vertex whenever
@@ -459,7 +479,9 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                       ? d->pa_su_sc_mode_cntl
                                       : 0u,
                                   REXCVAR_GET(d3d9_half_pixel_offset) ? 0u
-                                                                      : 1u);
+                                                                      : 1u,
+                                  d->guest_vp_width, d->guest_vp_height,
+                                  REXCVAR_GET(d3d9_guest_viewport));
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;

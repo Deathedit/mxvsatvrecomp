@@ -225,7 +225,12 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  uint32_t cullMode = 0,
                  // PA_SU_VTX_CNTL. UINT32_MAX means the register could not be
                  // read, which leaves the draw on the pre-existing path.
-                 uint32_t vtxCntl = 0xFFFFFFFFu);
+                 uint32_t vtxCntl = 0xFFFFFFFFu,
+                 // The viewport the guest programmed, from PA_CL_VPORT. Zero
+                 // means unreadable. Compared against the target extent the
+                 // renderer actually uses -- see m_vpMatch.
+                 uint32_t guestVpWidth = 0, uint32_t guestVpHeight = 0,
+                 bool useGuestVp = false);
 
 // Append a resolve to this frame's list, in order with the draws around it.
 //
@@ -1156,6 +1161,13 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // doing it on the viewport needs no new shader constant and no change to
     // the 276-entry vertex constant buffer.
     float halfPixel = 0.0f;
+    // What the guest programmed into PA_CL_VPORT, for comparison against the
+    // target extent this renderer hands D3D12. Zero means unreadable.
+    uint32_t guestVpWidth = 0;
+    uint32_t guestVpHeight = 0;
+    // Whether to prefer the two above over the target extent. Carried per draw
+    // rather than read in the renderer so the cvar stays in one place.
+    bool useGuestVp = false;
     // The guest's D3DRS_* blend state, translated in BlendedPSO.
     bool blendEnable = false;
     uint32_t srcBlend = 0;
@@ -1478,6 +1490,15 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // inert.
   uint64_t m_halfPixelDraws = 0;
   uint64_t m_halfPixelSkipped = 0;
+  // Does the guest's own viewport equal the render-target extent we hand D3D12?
+  // Measured HERE rather than in the hooks, because this is where the viewport
+  // is set: an earlier census compared against the D3D9 render-target extent
+  // instead, which is a different field from a different path.
+  uint64_t m_vpMatch = 0;
+  uint64_t m_vpMismatch = 0;
+  uint64_t m_vpUnknown = 0;
+  // Draws whose viewport actually came from the guest rather than the target.
+  uint64_t m_vpTakenFromGuest = 0;
   // Snapshot eviction. m_snapshotEvictBlocked is the one that matters: a sweep
   // that ran AT THE HARD CAP and freed nothing means every live snapshot is
   // genuinely in use, so the cap rather than the lifetime wants revisiting.

@@ -257,6 +257,13 @@ struct DrawCall {
   // shadow/off-screen passes when render-target identity is not yet modelled.
   uint32_t viewport_width = 0;
   uint32_t viewport_height = 0;
+  // The viewport the GUEST programmed, decoded from PA_CL_VPORT_XSCALE/XOFFSET/
+  // YSCALE/YOFFSET (0x210F..0x2112, shadow base device+0x28CC). Distinct from
+  // viewport_width/height above, which is the D3D9 struct: this is what the
+  // hardware actually transforms into, and the renderer hands D3D12 the render
+  // TARGET's extent instead of consulting it. Zero means unreadable.
+  uint32_t guest_vp_width = 0;
+  uint32_t guest_vp_height = 0;
   // HLE path: exact D3D9 render-target snapshot. `render_target_object` is the
   // stable API identity; the raw Xenos words are retained for matching a later
   // SetTexture binding to render-to-texture storage without guessing by size.

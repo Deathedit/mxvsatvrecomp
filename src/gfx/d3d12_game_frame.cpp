@@ -1002,8 +1002,41 @@ void D3D12Renderer::RenderGameFrame() {
         // vertex, without a shader constant.
         viewport.TopLeftX = d.halfPixel;
         viewport.TopLeftY = d.halfPixel;
-        viewport.Width = float(drawTarget->width);
-        viewport.Height = float(drawTarget->height);
+        // Does the guest's own viewport agree with the extent we are about
+        // to use? Census only -- the extent is still the target's.
+        if (!d.guestVpWidth || !d.guestVpHeight) {
+          ++m_vpUnknown;
+        } else if (d.guestVpWidth == drawTarget->width &&
+                   d.guestVpHeight == drawTarget->height) {
+          ++m_vpMatch;
+        } else {
+          ++m_vpMismatch;
+          static std::map<uint64_t, uint64_t> s_rows;
+          const uint64_t key = (uint64_t(d.guestVpWidth) << 48) |
+                               (uint64_t(d.guestVpHeight) << 32) |
+                               (uint64_t(drawTarget->width) << 16) |
+                               uint64_t(drawTarget->height);
+          if (++s_rows[key] == 1 && s_rows.size() <= 24) {
+            char m[176];
+            std::snprintf(m, sizeof(m),
+                          "VIEWPORT MISMATCH: guest %ux%u, host uses target "
+                          "%ux%u",
+                          d.guestVpWidth, d.guestVpHeight, drawTarget->width,
+                          drawTarget->height);
+            LogInfo(m);
+          }
+        }
+        // The guest's own viewport when it disagrees and the cvar is on;
+        // otherwise the target extent, which is what every draw used before.
+        const bool takeGuestVp = d.useGuestVp && d.guestVpWidth &&
+                                 d.guestVpHeight &&
+                                 (d.guestVpWidth != drawTarget->width ||
+                                  d.guestVpHeight != drawTarget->height);
+        viewport.Width =
+            float(takeGuestVp ? d.guestVpWidth : drawTarget->width);
+        viewport.Height =
+            float(takeGuestVp ? d.guestVpHeight : drawTarget->height);
+        if (takeGuestVp) ++m_vpTakenFromGuest;
         viewport.MinDepth = 0.0f;
         viewport.MaxDepth = 1.0f;
         // No scissor here: the per-draw block below owns the rectangle for
@@ -1799,13 +1832,19 @@ void D3D12Renderer::RenderGameFrame() {
     std::snprintf(message, sizeof(message),
                   "alpha test: honoured %llu, STAND-IN %llu; "
                   "fixed16 -32..32 targets %llu draws (scale identity); 7e3 clamped %llu; "
-                  "half-pixel offset applied %llu, skipped %llu",
+                  "half-pixel offset applied %llu, skipped %llu; "
+                  "guest viewport vs host target: match %llu, MISMATCH %llu, "
+                  "unreadable %llu, taken-from-guest %llu",
                   static_cast<unsigned long long>(m_alphaTestHonoured),
                   static_cast<unsigned long long>(m_alphaTestStandIn),
                   static_cast<unsigned long long>(m_fixed16Scaled),
                   static_cast<unsigned long long>(m_float7e3Clamped),
                   static_cast<unsigned long long>(m_halfPixelDraws),
-                  static_cast<unsigned long long>(m_halfPixelSkipped));
+                  static_cast<unsigned long long>(m_halfPixelSkipped),
+                  static_cast<unsigned long long>(m_vpMatch),
+                  static_cast<unsigned long long>(m_vpMismatch),
+                  static_cast<unsigned long long>(m_vpUnknown),
+                  static_cast<unsigned long long>(m_vpTakenFromGuest));
     LogInfo(message);
     // DIAG: what the WHITE-SKIPPED draws were aimed at.
     for (const auto& [extent, e] : m_skipByTarget) {
@@ -2230,7 +2269,9 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t targetColorFormat,
                                  const int32_t* scissor,
                                  uint32_t alphaControl, float alphaRef,
-                                 uint32_t cullMode, uint32_t vtxCntl) {
+                                 uint32_t cullMode, uint32_t vtxCntl,
+                                 uint32_t guestVpWidth,
+                                 uint32_t guestVpHeight, bool useGuestVp) {
   // PERF(per-frame-allocs): DONE. This used to create an ID3D12Resource on the
   // UPLOAD heap for each of the buffers below — up to nine per call, once per
   // submitted draw — and the note here called for "a ring of upload buffers
@@ -2823,6 +2864,9 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   // value currently comes from the d3d9_half_pixel_offset cvar rather than from
   // the register, which is not locatable in the device shadow. Keeping the
   // decode identical means the register drops straight in when it is found.
+  d.guestVpWidth = guestVpWidth;
+  d.guestVpHeight = guestVpHeight;
+  d.useGuestVp = useGuestVp;
   d.halfPixel = (vtxCntl != 0xFFFFFFFFu && (vtxCntl & 1u) == 0) ? 0.5f : 0.0f;
   if (d.halfPixel != 0.0f) ++m_halfPixelDraws; else ++m_halfPixelSkipped;
   if (scissor) {
