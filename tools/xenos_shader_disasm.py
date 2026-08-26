@@ -1495,7 +1495,20 @@ def run_xenia_mode(xenia_dir, paths):
             if not printed:
                 continue
             if is_fetch:
-                mine = [_normalise_mnemonic(format_fetch(instruction).split()[0])]
+                # Strip a leading predicate prefix before taking the mnemonic.
+                # format_fetch emits "(p0) tfetch2D ..." for a predicated fetch,
+                # so .split()[0] used to yield "(p0)" and every predicated fetch
+                # was reported as a divergence against Xenia -- which puts the
+                # predicate in its own column. That was the ONLY FAIL over a
+                # 108-shader corpus on 2026-08-26, and it was ours, not a real
+                # disagreement: both sides read instruction 20 of ps_215F16A0
+                # as tfetch2D. A permanent false FAIL is worse than none,
+                # because the next real divergence gets waved off as the known
+                # one.
+                words = format_fetch(instruction).split()
+                if words and words[0].startswith("(") and len(words) > 1:
+                    words = words[1:]
+                mine = [_normalise_mnemonic(words[0])]
                 if mine != printed:
                     notes.append("  %4d  fetch mine=%-22s xenia=%s"
                                  % (address, mine[0], "+".join(printed)))
