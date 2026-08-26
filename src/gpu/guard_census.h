@@ -51,7 +51,6 @@ enum class Guard : uint32_t {
   // hooks_d3d9.cpp. Dominated by scratch registers that input_mask flags as
   // inputs. A new pair appearing is worth seeing; the absolute level is not.
   kInterpolatorZeroFill,    // mov oN, 0 for exports the guest VS never wrote
-  kOutputClamp,             // xe_colorscale clamping the final colour
   kCount
 };
 

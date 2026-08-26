@@ -24,7 +24,7 @@ constexpr const char* kNames[size_t(Guard::kCount)] = {
     "stand-in-draw",        "scratch-colour-target",
     "blank-texture",        "constant-nan-to-zero",
     "material-gate-fill",   "vertex-zero-fill",
-    "interpolator-zero-fill", "output-clamp",
+    "interpolator-zero-fill",
 };
 
 }  // namespace

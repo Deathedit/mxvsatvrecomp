@@ -2942,10 +2942,28 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
         const float cs[4] = {1.0f,
                              float7e3 ? 31.875f : 0.0f,
                              float7e3 ? 1.0f : 0.0f, 0.0f};
-        // The output clamp. Population is every draw that publishes
-        // xe_colorscale; fires are the ones given a clamping range rather than
-        // the pass-through (0 in .y disables it shader-side).
-        mx::gpu::guard::Note(mx::gpu::guard::Guard::kOutputClamp, float7e3);
+        // NOT A GUARD, and removed from the census 2026-08-27. It read 24.7%
+        // freeroam / 24.3% menu -- the top entry -- and it does not belong
+        // there at all.
+        //
+        // docs/strict_mode.md classifies by what a thing DOES: class A refuses
+        // to act on bad input and models reality; class B manufactures a value
+        // we do not have. This is neither. It applies the GUEST FORMAT'S OWN
+        // RANGE: formats 3 and 12 are 7e3, unsigned [0, 32), and 31.875 is the
+        // largest value the format can hold. A 7e3 target physically cannot
+        // store a negative or a value at or above 32, so clamping to that range
+        // is what the hardware storage does -- exactly as formats 0/1/2/10 get
+        // it for free from their UNORM host formats. We do it in the shader
+        // only because our half-float host target would otherwise keep values
+        // the guest buffer never could.
+        //
+        // So 24.7% is not a guard rate. It is the share of draws that render to
+        // a 7e3 target, which is a fact about the workload. Leaving it in the
+        // census would have made correct format modelling look like the single
+        // largest source of invented output in the renderer.
+        //
+        // m_float7e3Clamped still counts it, on the format line where it
+        // belongs.
         if (float7e3) ++m_float7e3Clamped;
         std::memcpy(static_cast<uint8_t*>(p) + bankBytes + texInvBytes +
                         texSignBytes + paramGenBytes + alphaTestBytes,
