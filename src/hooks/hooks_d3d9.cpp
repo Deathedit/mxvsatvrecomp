@@ -5258,17 +5258,42 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
       }
     }
 
-    // One line per distinct VERTEX shader. There are 32 of them in a run, so
-    // this is bounded and unconditional. A vertex shader that samples is the
+    // One line per distinct VERTEX CENSUS. A vertex shader that samples is the
     // shape a bone-matrix palette takes when the engine binds it as
     // g_BoneMatrixVectors rather than as a constant array, and it is currently
     // refused the GPU vertex path -- see the g_gpuVertexVsSamplers counter.
+    //
+    // This used to be unconditional, on the claim "there are 32 of them in a
+    // run, so this is bounded". MEASURED 2026-08-26, run 1433: 4200 of these in
+    // a 210-frame segment -- 20 per frame, every one the SAME handle
+    // 0x217AB7A0, with byte-identical fields. Together with the VFETCH line
+    // below they were 70% of the log and rotated it away every 30 seconds,
+    // which is how three empty greps nearly became a false conclusion.
+    //
+    // They reach this line at all because the (handle, code_key) dedupe at the
+    // top of this function sees a DIFFERENT code hash each time, so each one is
+    // a full re-translation. That is a real defect and it is not this line's to
+    // fix -- so the dedupe here is on the CENSUS ITSELF, which suppresses the
+    // repetition without suppressing the evidence: a genuinely different census
+    // still prints, and the recycle count now rides on the coverage line below
+    // where someone reading coverage will see it.
     if (stage == mx::hle::HlslStage::kVertex) {
-      REXLOG_INFO(
-          "d3d9: VS census 0x{:08X}: samplers {} (mask 0x{:X}) inputs 0x{:08X} "
-          "max const c{}",
-          handle, out.sampler_count, out.sampler_mask, out.input_mask,
-          out.max_const_index);
+      static std::set<uint64_t> s_census;
+      const uint64_t census_key = (uint64_t(handle) << 32) ^
+                                  (uint64_t(out.max_const_index) << 24) ^
+                                  (uint64_t(out.sampler_count) << 20) ^
+                                  (uint64_t(out.sampler_mask) << 8) ^
+                                  uint64_t(out.input_mask);
+      // Capped as well as deduped: a run that really does recycle a handle onto
+      // thousands of distinct shaders must not get the log back by another
+      // route.
+      if (s_census.size() < 256 && s_census.insert(census_key).second) {
+        REXLOG_INFO(
+            "d3d9: VS census 0x{:08X}: samplers {} (mask 0x{:X}) inputs "
+            "0x{:08X} max const c{}",
+            handle, out.sampler_count, out.sampler_mask, out.input_mask,
+            out.max_const_index);
+      }
     }
     if (out.sampler_array_mask) {
       REXLOG_INFO("d3d9: HLSL {} 0x{:08X} declares cube slots 0x{:X}{}",
@@ -5309,17 +5334,45 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
     REXLOG_INFO("d3d9: HLSL {} coverage over {} shaders: {}", tag, seen.size(),
                 HlslCoverageSummary(cov));
   }
-  // Every new vertex shader, not on the coverage report's schedule: that one
-  // fires at 6 and then at multiples of 16, so a run ending at 11 shaders never
-  // shows its final tally -- which is exactly what happened the first time.
+  // Deliberately NOT on the coverage report's schedule: that one fires at 6 and
+  // then at multiples of 16, so a run ending at 11 shaders never shows its final
+  // tally -- which is exactly what happened the first time. Worth knowing that
+  // the same schedule is why `HLSL VS coverage` stops printing entirely once
+  // seen.size() parks on a value that is not a multiple of 16 (42 in run 1433).
+  //
+  // But "every new vertex shader" was never what this did. It ran on every pass
+  // through this function, and g_vfetchCompiled advances on every RE-translation
+  // rather than once per shader, which is why run 1433 reports the nonsense
+  // "30573 of 42". 4200 lines in 210 frames.
+  //
+  // Bounded on the only thing here that actually changes -- a new distinct
+  // shader -- plus a slow heartbeat, so a run that ends between shaders still
+  // shows its last state and the "final tally" property above survives.
+  //
+  // The recycle count is printed HERE rather than left to its own summary,
+  // because it is the denominator that makes the first number readable: 37080
+  // recycles against 42 distinct shaders in run 1433 is what "30573 of 42"
+  // was trying to say. Its declaration comment still reads "Zero means handles
+  // are never recycled and that fix is inert" -- it is not zero, and it is not
+  // inert.
   if (stage == mx::hle::HlslStage::kVertex) {
-    std::string refused;
-    for (const auto& [why, n] : g_vfetchRefused)
-      refused += fmt::format(" {}={}", why, n);
-    REXLOG_INFO(
-        "d3d9: VFETCH coverage: {} of {} vertex shaders fetch on the GPU;{}",
-        g_vfetchCompiled, seen.size(),
-        refused.empty() ? " none refused" : refused);
+    static size_t s_lastSeen = 0;
+    static std::chrono::steady_clock::time_point s_lastReport{};
+    const auto now = std::chrono::steady_clock::now();
+    const bool grew = seen.size() != s_lastSeen;
+    if (grew || now - s_lastReport >= std::chrono::seconds(10)) {
+      s_lastSeen = seen.size();
+      s_lastReport = now;
+      std::string refused;
+      for (const auto& [why, n] : g_vfetchRefused)
+        refused += fmt::format(" {}={}", why, n);
+      REXLOG_INFO(
+          "d3d9: VFETCH coverage: {} compiles over {} distinct vertex "
+          "shaders;{} (handles recycled onto different microcode: {})",
+          g_vfetchCompiled, seen.size(),
+          refused.empty() ? " none refused" : refused,
+          g_shaderHandleRecycled.load());
+    }
   }
 }
 
