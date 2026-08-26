@@ -199,18 +199,39 @@ uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
     // `hle_sanitize_constants`, which was retired for zeroing every non-finite
     // constant on every draw forever. A guest can legitimately compute +Inf and
     // mean it (see the divide-by-zero exposure path); no guest ever means NaN.
-    // Population is every non-finite component examined; fires are the ones we
-    // overwrite. The bank-wide total is not the denominator -- a NaN we leave
-    // alone is not a guard firing, and counting it as one would make this look
-    // vanishingly rare.
-    // STRICT: leave the NaN in the bank. It reaches the shader and the
-    // corruption IS the signal -- which is the whole point, because a zero here
-    // is indistinguishable from a constant the guest meant to be zero.
-    if (!published && (cur & 0x007FFFFFu) != 0 &&
-        !mx::gpu::guard::Strict(mx::gpu::guard::Guard::kConstantNanToZero)) {
-      bank[i] = 0;
-      ++g_zeroed;
-    }
+    // THE SUBSTITUTION IS GONE, 2026-08-27. The NaN stays in the bank and
+    // reaches the shader. The measurement above stays, so the population is
+    // still known -- the same move made for FillMaterialGate.
+    //
+    // Its justification was the comment two screens up: c392..c395 (xe_c[136..
+    // 139]) NaN for a bounded startup prefix, "which is why the legal, loading
+    // and start screens have no background: a NaN interpolator saturates the
+    // backdrop draw to white". Both halves of that are now falsified.
+    //
+    //   THE TIMING. Censused on its own, that block reads 0/32 at the first
+    //   report and 540360/2510272 (21.5%) at the last. It does not freeze, it
+    //   CLIMBS -- starting clean and becoming NaN all run. Not a prefix.
+    //
+    //   THE SYMPTOM. Run with hle_strict=8, i.e. every NaN repair suppressed
+    //   and 1.76M NaNs reaching the shaders: the logo and intro are FINE, and a
+    //   level is unchanged. The white backdrop this was built to prevent does
+    //   not come back. Whatever caused it was fixed elsewhere, and this has
+    //   been masking NaNs ever since.
+    //
+    // So it was a workaround for a defect that no longer exists, and its cost
+    // is that a genuine NaN -- ours or the guest's -- is silently turned into a
+    // zero, which is indistinguishable from a constant the guest meant to be
+    // zero. That is the exact shape docs/strict_mode.md exists to remove.
+    //
+    // If a NaN ever does matter again it will now be VISIBLE, and the census
+    // row says how many there are. That is the trade, taken deliberately.
+    //
+    // g_zeroed is REPURPOSED rather than deleted: it now counts NaNs LEFT IN
+    // PLACE, which is the same population it used to count substituting. A
+    // counter whose increment site disappears prints a permanent zero that
+    // reads as a measurement -- the trap g_psFromDeviceRecord set earlier
+    // today. Its log line is reworded to match.
+    if (!published && (cur & 0x007FFFFFu) != 0) ++g_zeroed;
   }
 
   // SECOND PASS: a component our sources left at a FINITE ZERO, which PM4

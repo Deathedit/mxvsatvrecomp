@@ -6171,8 +6171,9 @@ void ReportDrawCounts(uint8_t* base) {
     uint32_t seen = 0;
     mx::gpu::alu::Stats(written, repaired, seen, zeroed, filled_zero);
     REXLOG_INFO("d3d9: ALU constant file — {} dwords written by PM4 over {} "
-                "distinct constants; {} repaired from PM4, {} NaN set to the "
-                "power-on 0.0, {} finite zeros PM4 could fill but we do NOT "
+                "distinct constants; {} repaired from PM4, {} NaN LEFT IN "
+                "PLACE (the substitution was deleted 2026-08-27), {} finite "
+                "zeros PM4 could fill but we do NOT "
                 "(measurement only); shader load-table overlays {}",
                 written, seen, repaired, zeroed, filled_zero,
                 g_shaderConstOverlays);
