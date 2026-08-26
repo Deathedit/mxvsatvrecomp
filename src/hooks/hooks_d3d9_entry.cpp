@@ -21,6 +21,7 @@
 #include <array>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -1252,6 +1253,107 @@ extern "C" REX_FUNC(sub_8255B258) {
   const uint32_t flags = ctx.r6.u32;
   const uint32_t color = ctx.r7.u32;
   const auto& target = DeviceState().render_target[0];
+
+  // CLEAR CENSUS -- every call, BEFORE any bit test.
+  //
+  // The existing CLEAR line below lives inside the `flags & 1` branch, so it
+  // can only ever report clears that touch colour. A depth-only clear is
+  // invisible to it, which makes it useless for the one question being asked:
+  // does the guest ask for depth clears we drop on the floor?
+  //
+  // That question is live. freeroam.rdc: the D32S8 depth target ResourceId::384
+  // is Cleared exactly ONCE in the whole frame (event 15183) and then used as
+  // the DepthStencilTarget by six separate passes with no clear between them --
+  // 17635..17963, 18005..18902, 19031..19941, 19969..23822, 23863..23889,
+  // 24199..24803. Draw 19889 paints the ground: it has xe_tex0/1/2 bound, a
+  // translated shader, and a shaderOut of (0.309, 0.300, 0.026) -- sand -- and
+  // it is discarded `depthTestFailed` against depth it did not write.
+  //
+  // So the ground is not a texture bug. It samples its textures and computes
+  // the right colour, and stale depth rejects it. See also the known-open note
+  // that D3DCLEAR_ZBUFFER is 0x10 on this hardware, not the 0x2 a PC D3D9
+  // header would tell you.
+  //
+  // Reported as a HISTOGRAM with a total, not a sample, so the answer carries
+  // its own denominator: "0 of N calls had 0x10" and "the probe never ran" have
+  // to be different-looking outcomes. One line per distinct flags value, so a
+  // clear issued every frame costs one line, and the total keeps counting past
+  // the line budget.
+  //
+  // LET THE FLAGS NAME THEMSELVES. The first cut printed the bit pattern and
+  // annotated it from an assumed layout (bit 0 TARGET, bit 4 ZBUFFER). Run 1442
+  // showed seven distinct values -- 0x1, 0xF, 0x1F, 0x20, 0x30, 0x3F, 0x60 --
+  // and 0x60 alone was 18280 of 28000 calls, which no assumed layout accounted
+  // for. Guessing what bit 6 means is exactly the move that has cost this
+  // session twice already.
+  //
+  // The call carries the answer. The decompiled signature is
+  //
+  //   D3DDevice_Clear(pDevice, Count, pRects, Flags, Color, Z, Stencil,
+  //                   EDRAMClear)
+  //
+  // so Z arrives in f1, Stencil in r8 and EDRAMClear in r9. A flag value whose
+  // calls carry Z=1.0 is a DEPTH clear whatever its bit pattern; one that never
+  // varies Z is not. That identifies each value from its own arguments instead
+  // of from a header this project does not have -- the same "let it name
+  // itself" move that resolved the UI submit target.
+  {
+    struct FlagStat {
+      uint64_t calls = 0;
+      double first_z = 0.0;
+      uint32_t first_r8 = 0, first_r9 = 0, first_r10 = 0;
+      uint64_t r9_nonzero = 0;
+      bool z_varies = false;
+    };
+    // ARGUMENT SLOTS ARE NOT ASSUMED. Run 1444 read Z as *(float*)&ctx.f1 and
+    // got 0 for every one of 24000 calls -- which is what the LOW half of a
+    // double looks like, and rex::ppc's FP register is a union with separate
+    // f32 and f64 members. Z = 1.0 as a double has a zero low word, so the
+    // instrument was blind to exactly the value it existed to find. Read f64.
+    //
+    // The integer slots were wrong too. Taking r8 as Stencil produced 47185920
+    // for flags 0x30, 0x3F AND 0x60 alike -- one identical value across three
+    // unrelated groups is a leftover register, not an argument. PowerPC ABIs
+    // differ over whether a float argument also consumes its GPR slot, so
+    // Stencil may sit at r9 or r10 rather than r8. Print r8, r9 and r10 raw and
+    // let the correlation say which one tracks the flags; do not annotate them
+    // until it does.
+    static std::mutex s_mu;
+    static std::map<uint32_t, FlagStat> s_byFlags;
+    static uint64_t s_total = 0, s_fullSurface = 0;
+    const double z = ctx.f1.f64;
+    const uint32_t r8 = ctx.r8.u32;
+    const uint32_t r9 = ctx.r9.u32;
+    const uint32_t r10 = ctx.r10.u32;
+    std::lock_guard<std::mutex> lk(s_mu);
+    ++s_total;
+    if (rect_count == 0 && rects == 0) ++s_fullSurface;
+    FlagStat& st = s_byFlags[flags];
+    const bool fresh = ++st.calls == 1;
+    if (fresh) {
+      st.first_z = z;
+      st.first_r8 = r8;
+      st.first_r9 = r9;
+      st.first_r10 = r10;
+    } else if (z != st.first_z) {
+      st.z_varies = true;
+    }
+    if (r9) ++st.r9_nonzero;
+    if ((fresh && s_byFlags.size() <= 32) || (s_total % 4000) == 0) {
+      std::string hist;
+      for (const auto& [f, v] : s_byFlags) {
+        hist += fmt::format(
+            " [0x{:X} x{} z={:g}{} r8=0x{:X} r9=0x{:X}(nz{}) r10=0x{:X}]", f,
+            v.calls, v.first_z, v.z_varies ? "(varies)" : "", v.first_r8,
+            v.first_r9, v.r9_nonzero, v.first_r10);
+      }
+      REXLOG_INFO("d3d9: CLEAR CENSUS {} calls, {} whole-surface, {} distinct "
+                  "flag values; handled today: only those with bit0 and a "
+                  "valid colour target --{}",
+                  s_total, s_fullSurface, s_byFlags.size(), hist);
+    }
+  }
+
   // D3DCLEAR_TARGET is bit 0. Count zero and a null rectangle pointer are the
   // whole-target form used by the measured atlas initializer.
   if ((flags & 1u) && rect_count == 0 && rects == 0 && target.valid) {
@@ -1283,6 +1385,49 @@ extern "C" REX_FUNC(sub_8255B258) {
       REXLOG_INFO("d3d9: CLEAR target 0x{:08X} {}x{} color=0x{:08X} "
                   "flags=0x{:X}",
                   target.object, target.width, target.height, color, flags);
+    }
+  }
+  // D3DCLEAR_ZBUFFER is 0x10 on this hardware, NOT the 0x2 a PC D3D9 header
+  // would tell you. Narrow on purpose: run 1445 saw seven distinct flag values
+  // and FIVE of them carry Z=1.0 (0xF, 0x1F, 0x30, 0x3F, 0x60), which is
+  // 22703 of 24000 calls. Z is an ARGUMENT though, not a flag -- a caller
+  // passing 1.0 suggests depth-clear intent without proving the bit was set --
+  // so this gates on 0x10 alone (0x1F, 0x30, 0x3F = 4930 calls) rather than on
+  // the wider Z reading.
+  //
+  // 0x60 is deliberately EXCLUDED even though it carries Z=1.0 and is 16139 of
+  // the 24000. It is the only value whose r9 is set, on every single call, and
+  // r9 is the EDRAMClear argument -- so it is a distinct operation, most likely
+  // the EDRAM tile clear, and wiping the whole depth buffer for each one would
+  // erase the depth prepass and be worse than the bug. If the narrow gate does
+  // not restore the ground, widening to 0x60 is the next experiment, not a
+  // correction of this one.
+  //
+  // Bits 1..6 are still not named. IDA's bounds for D3DDevice_Clear stop at
+  // 0x8255B284 on a misdecoded vcmpneb., so the body is unreachable through the
+  // decompiler, and the constants are in no header in this tree or the SDK.
+  // Anything beyond bit 0 and bit 4 here is measurement, not documentation.
+  {
+    const auto& depth = DeviceState().depth_stencil;
+    if ((flags & 0x10u) && rect_count == 0 && rects == 0 && depth.valid) {
+      mx::hle::DrawCall dclear{};
+      dclear.clear_depth_target = true;
+      // The guest's own Z, not a hardcoded 1.0. It is 1.0 in every call
+      // measured, but reading it costs nothing and a reversed-depth pass would
+      // otherwise be cleared to the wrong end.
+      dclear.clear_depth = float(ctx.f1.f64);
+      dclear.depth_target_object = depth.object;
+      dclear.depth_target_width = depth.width;
+      dclear.depth_target_height = depth.height;
+      dclear.depth_target_base = depth.color_info & 0xFFFu;
+      mx::hle::HleFrameDraws().push_back(std::move(dclear));
+      static std::set<uint32_t> s_logged;
+      if (s_logged.insert(depth.object).second && s_logged.size() <= 16) {
+        REXLOG_INFO("d3d9: DEPTH CLEAR target 0x{:08X} {}x{} z={:g} "
+                    "flags=0x{:X}",
+                    depth.object, depth.width, depth.height,
+                    double(dclear.clear_depth), flags);
+      }
     }
   }
   orig_Clear(ctx, base);

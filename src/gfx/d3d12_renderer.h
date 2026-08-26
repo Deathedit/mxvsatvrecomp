@@ -259,6 +259,12 @@ void AddGameClear(uint32_t targetObject, uint32_t targetWidth,
                   uint32_t targetColorFormat, uint32_t color,
                   const float* floatColor = nullptr);
 
+// Append a full-surface DEPTH clear in order with draws and resolves. Ordered
+// for the same reason the colour one is: it has to land between the draws it
+// separates, and the renderer's own once-per-frame first-use clear cannot.
+void AddGameDepthClear(uint32_t depthObject, uint32_t width, uint32_t height,
+                       uint32_t edramBase, float depth);
+
 // Append a SURFACE BIND in order with draws, clears and resolves: the guest
 // named this surface as an attachment, so host storage for it must exist even
 // if no draw we route ever targets it. See DrawCall::surface_bind.
@@ -1030,6 +1036,12 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // is left after subtracting all three is the only part that could be a lost
   // draw -- and that residue is the number to look at, not the total.
   uint64_t m_standInNoHandleClear = 0;
+  // Guest depth clears honoured, and those whose depth surface we could not
+  // resolve to a host target. Counted separately because "the guest never
+  // clears depth" and "it clears depth into a surface we do not have" are
+  // different defects and would otherwise both read as a silent zero.
+  uint64_t m_guestDepthClears = 0;
+  uint64_t m_guestDepthClearsUnresolved = 0;
   uint64_t m_standInNoHandleBind = 0;
   uint64_t m_standInNoVertexInputs = 0;
   uint64_t m_standInNoConstants = 0;
@@ -1213,6 +1225,8 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     uint32_t targetColorFormat = 0;
     // Ordered full-surface D3DDevice_Clear. Carries no geometry.
     bool colorClear = false;
+    bool depthClear = false;
+    float clearDepth = 1.0f;
     uint32_t clearColor = 0;  // D3DCOLOR A8R8G8B8.
     bool clearColorIsFloat = false;
     std::array<float, 4> clearColorFloat = {};

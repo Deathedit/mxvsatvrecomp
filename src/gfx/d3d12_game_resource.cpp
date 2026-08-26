@@ -1428,6 +1428,21 @@ void D3D12Renderer::AddGameClear(uint32_t targetObject, uint32_t targetWidth,
   m_gameDraws.push_back(std::move(d));
 }
 
+void D3D12Renderer::AddGameDepthClear(uint32_t depthObject, uint32_t width,
+                                      uint32_t height, uint32_t edramBase,
+                                      float depth) {
+  if (!depthObject || !width || !height) return;
+  if (m_gameDraws.size() >= kMaxGameDraws) return;
+  GameDraw d;
+  d.depthClear = true;
+  d.clearDepth = depth;
+  d.depthObject = depthObject;
+  d.depthWidth = width;
+  d.depthHeight = height;
+  d.depthBase = edramBase;
+  m_gameDraws.push_back(std::move(d));
+}
+
 void D3D12Renderer::AddGameSurface(uint32_t object, uint32_t width,
                                    uint32_t height, uint32_t edramBase,
                                    uint32_t colorFormat, bool isDepth) {

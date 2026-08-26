@@ -772,6 +772,50 @@ void D3D12Renderer::RenderGameFrame() {
         QueueLuminanceReadback(snap, d.resolveDest);
       continue;
     }
+    // A full-surface D3D9 DEPTH clear, ordered among the draws.
+    //
+    // Before this the ONLY depth clear was the once-per-frame first-use one
+    // further down, whose comment ("one depth surface serves several colour
+    // targets in a pass, so clearing it with each of them would wipe what the
+    // previous target established") is right WITHIN a pass and wrong ACROSS
+    // passes -- the guest separates its passes with its own clears and we were
+    // discarding every one. freeroam.rdc: ResourceId::384 Cleared once at event
+    // 15183, then DepthStencilTarget for six passes with nothing between them.
+    //
+    // usedThisFrame is set here too, so this and the first-use clear cannot
+    // both fire on the same target in the same frame -- the guest's clear wins
+    // and ours becomes the fallback for a frame where the guest issues none.
+    if (d.depthClear) {
+      GameRenderTarget* dt = EnsureGameDepthTarget(d.depthObject, d.depthWidth,
+                                                   d.depthHeight, d.depthBase);
+      if (dt) {
+        if (dt->state != D3D12_RESOURCE_STATE_DEPTH_WRITE) {
+          D3D12_RESOURCE_BARRIER toDepth = {};
+          toDepth.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+          toDepth.Transition.pResource = dt->resource.Get();
+          toDepth.Transition.StateBefore = dt->state;
+          toDepth.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+          toDepth.Transition.Subresource =
+              D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+          m_commandList->ResourceBarrier(1, &toDepth);
+          dt->state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        }
+        auto dsv = m_gameDepthDsvHeap->GetCPUDescriptorHandleForHeapStart();
+        dsv.ptr += SIZE_T(dt->rtvIndex) * m_gameDsvDescriptorSize;
+        m_commandList->ClearDepthStencilView(dsv, kGameDepthClearFlags,
+                                             d.clearDepth, 0, 0, nullptr);
+        dt->usedThisFrame = true;
+        dt->everDrawn = true;
+        ++m_guestDepthClears;
+      } else {
+        ++m_guestDepthClearsUnresolved;
+      }
+      // Clear does not bind through the normal draw path. Force the following
+      // draw to restore its RTV/DSV and viewport.
+      boundTargetObject = 0xFFFFFFFFu;
+      boundDepthObject = 0xFFFFFFFFu;
+      continue;
+    }
     // A full-surface D3D9 colour clear. This is an ordered command, not setup:
     // the guest may resolve the cleared target immediately with no draw in
     // between (the front-end default-texture atlas does exactly that).
@@ -1933,6 +1977,16 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_edramTransferNotDrawn),
                   static_cast<unsigned long long>(m_targetCarriedContent),
                   static_cast<unsigned long long>(m_targetPersisted));
+    LogInfo(message);
+    // Guest depth clears. Printed unconditionally, zero included: "the guest
+    // never asked" and "it asked and we could not place it" are the two
+    // outcomes this change exists to tell apart, and a missing line looks like
+    // neither.
+    std::snprintf(message, sizeof(message),
+                  "  GUEST DEPTH CLEARS %llu honoured, %llu with no host "
+                  "depth surface",
+                  static_cast<unsigned long long>(m_guestDepthClears),
+                  static_cast<unsigned long long>(m_guestDepthClearsUnresolved));
     LogInfo(message);
     // DIAG: what the WHITE-SKIPPED draws were aimed at.
     for (const auto& [extent, e] : m_skipByTarget) {

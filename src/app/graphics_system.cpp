@@ -272,7 +272,8 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
         // the draw order rather than at the end of the frame, and a bind that
         // arrives after a resolve must not create the surface the resolve
         // wanted.
-        if (d.resolve_dest_texture || d.clear_color_target || d.surface_bind) {
+        if (d.resolve_dest_texture || d.clear_color_target ||
+            d.clear_depth_target || d.surface_bind) {
           submittable.push_back(&d);
           continue;
         }
@@ -351,6 +352,12 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                 d->surface_bind_object, d->surface_bind_width,
                 d->surface_bind_height, d->surface_bind_base,
                 d->surface_bind_color_format, d->surface_bind_is_depth);
+            continue;
+          }
+          if (d->clear_depth_target) {
+            m_renderer->AddGameDepthClear(
+                d->depth_target_object, d->depth_target_width,
+                d->depth_target_height, d->depth_target_base, d->clear_depth);
             continue;
           }
           if (d->clear_color_target) {

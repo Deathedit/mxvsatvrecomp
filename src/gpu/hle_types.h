@@ -284,6 +284,18 @@ struct DrawCall {
   // cleared and resolved without any draw between the two.
   bool clear_color_target = false;
   uint32_t clear_color = 0;  // D3DCOLOR A8R8G8B8.
+  // A full-surface D3D9 DEPTH clear, carried as an ordered event for the same
+  // reason the colour one is: it has to land between the draws it separates.
+  //
+  // Until 2026-08-26 the renderer cleared depth exactly ONCE PER FRAME, on the
+  // depth target's first use, and the guest's own clears were dropped on the
+  // floor -- the Clear hook tested only bit 0 (COLOUR). freeroam.rdc shows what
+  // that costs: the D32S8 target is Cleared once, at event 15183, then shared by
+  // six passes with no clear between them, and the ground draw 19889 -- which
+  // has all three textures bound and computes a sand colour (0.309, 0.300,
+  // 0.026) -- is discarded `depthTestFailed` against depth it never wrote.
+  bool clear_depth_target = false;
+  float clear_depth = 1.0f;
   // Resolve flag 0x100 clears the source after copying and takes a float4
   // colour, unlike D3DDevice_Clear's packed D3DCOLOR. Keeping the two forms
   // distinct avoids quantizing HDR clear values.
