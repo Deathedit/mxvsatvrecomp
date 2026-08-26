@@ -2900,6 +2900,10 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
       }
       REXLOG_INFO("d3d9: NO-PS DEVICES over {} draws:{}", s_total, draws);
       REXLOG_INFO("d3d9: SETTER DEVICES:{}", PixelShaderDeviceSummary());
+      // RECYCLED counts handles the guest reused for DIFFERENT microcode. A
+      // non-zero figure means the translation cache would have been serving a
+      // previous shader's translation -- see g_hlslReportedVs.
+      REXLOG_INFO("d3d9: {}", ShaderTranslationSummary());
     }
   }
   if (!resolved) {

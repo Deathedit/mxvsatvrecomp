@@ -233,6 +233,7 @@ void NoteDrawThread();
 std::string PixelShaderDeviceSummary();
 uint32_t PixelShaderForDevice(uint32_t device, bool* from_fallback);
 uint32_t PixelShaderForDeviceStrict(uint32_t device);
+std::string ShaderTranslationSummary();
 bool PrepareBinkPlanes(mx::hle::DrawCall& dc, uint32_t device, uint8_t* base);
 bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
                         uint32_t device, uint8_t* base,

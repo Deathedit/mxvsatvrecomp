@@ -1073,6 +1073,15 @@ uint32_t PixelShaderForDeviceStrict(uint32_t device) {
 // The mis-paired stages that prompted this are real, but the cause is the
 // translation cache being keyed on a recycled ADDRESS -- see
 // g_hlslReportedVs.
+// Addresses observed carrying a DIFFERENT shader than the one translated for
+// them. Zero means handles are never recycled and that fix is inert.
+std::atomic<uint64_t> g_shaderHandleRecycled{0};
+
+std::string ShaderTranslationSummary() {
+  return fmt::format(
+      "shader handles RECYCLED onto different microcode: {}",
+      g_shaderHandleRecycled.load());
+}
 // Every device SetPixelShader has ever been called on, with the shader it last
 // received. Rendered for the report below so the devices that SET a shader can
 // be read directly against the devices that DRAW without one.
@@ -4524,7 +4533,22 @@ struct HlslCoverage {
 HlslCoverage g_hlslVs, g_hlslPs;
 // map rather than set only because <map> is already included here and <set> is
 // not; the value is unused.
-std::map<uint32_t, bool> g_hlslReportedVs, g_hlslReportedPs;
+// Handle -> a hash of the GUEST MICROCODE that handle carried when it was
+// translated. Was `map<uint32_t, bool>`, i.e. "have we ever seen this handle",
+// which is wrong because a handle is an ADDRESS.
+//
+// The guest frees shaders on a map unload and allocates the next map's at
+// recycled addresses. With a bool, the second shader to land on an address was
+// never translated at all -- ReportHlslCoverage returned early -- and
+// g_translatedVs[handle] went on serving the PREVIOUS shader's translation.
+// The draw then ran a faithful vertex shader against a faithful pixel shader
+// from a DIFFERENT material, which is why the bike's tyre read fog out of a UV
+// and came out a flat ramp: the pixel stage wants fog at interpolator 4 (a
+// 5-export vertex variant, export_mask 0x1f) and the stale vertex shader was
+// the 6-export one (0x3f) that puts fog at 5.
+//
+// Keyed on content, so a recycled address re-translates.
+std::map<uint32_t, uint64_t> g_hlslReportedVs, g_hlslReportedPs;
 
 // logs/hlsldump, emptied once per process before the first file of the run.
 //
@@ -4706,7 +4730,23 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
                         const uint32_t* code, uint32_t count) {
   auto& seen = stage == mx::hle::HlslStage::kPixel ? g_hlslReportedPs
                                                    : g_hlslReportedVs;
-  if (!seen.emplace(handle, true).second) return;
+  // FNV-1a over the microcode. Content, not identity -- see g_hlslReportedVs.
+  uint64_t code_key = 1469598103934665603ull;
+  for (uint32_t i = 0; i < count; ++i) {
+    code_key ^= code[i];
+    code_key *= 1099511628211ull;
+  }
+  {
+    const auto [it, inserted] = seen.emplace(handle, code_key);
+    if (!inserted) {
+      // Same address, same code: already translated, nothing to do.
+      if (it->second == code_key) return;
+      // Same address, DIFFERENT code: the guest reused it for another shader.
+      // Fall through and re-translate, overwriting g_translatedVs[handle].
+      it->second = code_key;
+      ++g_shaderHandleRecycled;
+    }
+  }
   auto& cov = stage == mx::hle::HlslStage::kPixel ? g_hlslPs : g_hlslVs;
   // First-use cost split: translation vs FXC vs the dump/disassembly tail.
   //
