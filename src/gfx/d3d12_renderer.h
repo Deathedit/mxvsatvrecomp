@@ -230,7 +230,7 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  // means unreadable. Compared against the target extent the
                  // renderer actually uses -- see m_vpMatch.
                  uint32_t guestVpWidth = 0, uint32_t guestVpHeight = 0,
-                 bool useGuestVp = false);
+                 bool useGuestVp = false, bool edramCopy = false);
 
 // Append a resolve to this frame's list, in order with the draws around it.
 //
@@ -1002,6 +1002,16 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // matching a takeover by object alone picks an arbitrary one of them and
   // reports "format differs" as 0 even when it does.
   std::map<uint32_t, EdramOwner> m_edramLastOwner;
+  // Object that TOOK OVER an EDRAM base -> the object that held it before, when
+  // the two agree on extent and format. On the console those two are the same
+  // physical memory, so the new owner inherits what the old one left; here they
+  // are separate D3D12 textures and it inherits nothing. Consumed once, at the
+  // new owner's first use in a frame, where the copy takes the place of the
+  // clear that would otherwise wipe exactly the contents being inherited.
+  std::map<uint32_t, uint32_t> m_edramPendingSource;
+  uint64_t m_edramTransfers = 0;
+  uint64_t m_edramTransferNoSource = 0;
+  uint64_t m_edramTransferNotDrawn = 0;
   uint64_t m_edramTakeovers = 0;         // bind at a base another object held
   uint64_t m_edramTakeoverSameExtent = 0;  // ...same w/h  (bounded fix applies)
   uint64_t m_edramTakeoverFormatDiff = 0;  // ...and format differs (needs convert)
@@ -1168,6 +1178,9 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // Whether to prefer the two above over the target extent. Carried per draw
     // rather than read in the renderer so the cvar stays in one place.
     bool useGuestVp = false;
+    // Whether same-extent EDRAM takeovers should inherit the previous owner's
+    // contents. Carried per draw so the cvar stays in one place.
+    bool edramCopy = false;
     // The guest's D3DRS_* blend state, translated in BlendedPSO.
     bool blendEnable = false;
     uint32_t srcBlend = 0;

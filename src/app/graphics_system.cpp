@@ -72,6 +72,28 @@ REXCVAR_DEFINE_BOOL(hle_capture, false, "Debug",
 // guest dwords and scores every vertex of every draw to log a ranking nothing
 // acts on — and a run is now expected to be a measurement of the emulator, not
 // of its instrumentation. Per-FRAME reporting is unaffected and stays on.
+// Inherit the previous owner's contents when a surface takes over an EDRAM
+// base at the same extent and format.
+//
+// EDRAM is a fixed 10MB scratch. The guest makes many D3D9 surface views onto
+// it -- 11 objects on base 0x2D0 alone -- and binding a base on the console
+// shows whatever the previous owner left there, because they ARE the same
+// memory. Here each object owns its own D3D12 texture and inherits nothing.
+// Measured: 64194 takeovers a run, of which 17029 are same-extent and 0 of
+// those differ in format, so a straight CopyResource carries the contents with
+// no reinterpretation. The other ~47k change extent and need a real EDRAM
+// model; this does not attempt them.
+//
+// The copy REPLACES the per-frame first-use clear rather than preceding it --
+// that clear is precisely what would destroy the contents being inherited.
+//
+// Default off. Two changes this session that were "obviously more correct"
+// made things worse when measured (a blanket half-pixel shift broke the
+// luminance chain), so this gets A/B'd like the others before it is trusted.
+REXCVAR_DEFINE_BOOL(d3d12_edram_takeover_copy, false, "Graphics",
+                    "On a same-extent EDRAM takeover, copy the previous "
+                    "owner's contents into the new owner instead of clearing.");
+
 // Use the viewport the GUEST programmed, instead of the render target's full
 // extent, when the two disagree.
 //
@@ -495,7 +517,8 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   REXCVAR_GET(d3d9_half_pixel_offset) ? 0u
                                                                       : 1u,
                                   d->guest_vp_width, d->guest_vp_height,
-                                  REXCVAR_GET(d3d9_guest_viewport));
+                                  REXCVAR_GET(d3d9_guest_viewport),
+                                  REXCVAR_GET(d3d12_edram_takeover_copy));
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;

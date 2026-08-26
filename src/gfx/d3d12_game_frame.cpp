@@ -1046,9 +1046,61 @@ void D3D12Renderer::RenderGameFrame() {
         boundTargetObject = targetObject;
       }
       if (!drawTarget->usedThisFrame) {
-        auto rtv = m_gameRtvHeap->GetCPUDescriptorHandleForHeapStart();
-        rtv.ptr += SIZE_T(drawTarget->rtvIndex) * m_gameRtvDescriptorSize;
-        m_commandList->ClearRenderTargetView(rtv, kOffscreenClear, 0, nullptr);
+        // An EDRAM takeover inherits the previous owner's contents INSTEAD of
+        // being cleared. The clear is the thing that would destroy them, so
+        // this has to be the same decision, not an extra step before it.
+        bool inherited = false;
+        if (d.edramCopy) {
+          const auto pend = m_edramPendingSource.find(targetObject);
+          if (pend != m_edramPendingSource.end()) {
+            const uint32_t srcObject = pend->second;
+            m_edramPendingSource.erase(pend);
+            auto src = m_gameRenderTargets.find(srcObject);
+            if (src == m_gameRenderTargets.end() || !src->second.resource) {
+              ++m_edramTransferNoSource;
+            } else if (!src->second.everDrawn) {
+              // Nothing was ever rendered into it, so there is nothing to
+              // inherit and a copy would only propagate its creation clear.
+              ++m_edramTransferNotDrawn;
+            } else if (src->second.width == drawTarget->width &&
+                       src->second.height == drawTarget->height &&
+                       src->second.format == drawTarget->format) {
+              D3D12_RESOURCE_BARRIER pre[2] = {};
+              pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+              pre[0].Transition.pResource = src->second.resource.Get();
+              pre[0].Transition.StateBefore = src->second.state;
+              pre[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+              pre[0].Transition.Subresource =
+                  D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+              pre[1] = pre[0];
+              pre[1].Transition.pResource = drawTarget->resource.Get();
+              pre[1].Transition.StateBefore = drawTarget->state;
+              pre[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+              m_commandList->ResourceBarrier(2, pre);
+              m_commandList->CopyResource(drawTarget->resource.Get(),
+                                          src->second.resource.Get());
+              D3D12_RESOURCE_BARRIER post[2] = {pre[0], pre[1]};
+              post[0].Transition.StateBefore =
+                  D3D12_RESOURCE_STATE_COPY_SOURCE;
+              post[0].Transition.StateAfter = src->second.state;
+              post[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+              post[1].Transition.StateAfter =
+                  D3D12_RESOURCE_STATE_RENDER_TARGET;
+              m_commandList->ResourceBarrier(2, post);
+              drawTarget->state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+              ++m_edramTransfers;
+              inherited = true;
+            } else {
+              ++m_edramTransferNoSource;
+            }
+          }
+        }
+        if (!inherited) {
+          auto rtv = m_gameRtvHeap->GetCPUDescriptorHandleForHeapStart();
+          rtv.ptr += SIZE_T(drawTarget->rtvIndex) * m_gameRtvDescriptorSize;
+          m_commandList->ClearRenderTargetView(rtv, kOffscreenClear, 0,
+                                               nullptr);
+        }
         drawTarget->usedThisFrame = true;
         drawTarget->everDrawn = true;
       }
@@ -1834,7 +1886,8 @@ void D3D12Renderer::RenderGameFrame() {
                   "fixed16 -32..32 targets %llu draws (scale identity); 7e3 clamped %llu; "
                   "half-pixel offset applied %llu, skipped %llu; "
                   "guest viewport vs host target: match %llu, MISMATCH %llu, "
-                  "unreadable %llu, taken-from-guest %llu",
+                  "unreadable %llu, taken-from-guest %llu; edram takeover "
+                  "transfers %llu (no-source %llu, source-never-drawn %llu)",
                   static_cast<unsigned long long>(m_alphaTestHonoured),
                   static_cast<unsigned long long>(m_alphaTestStandIn),
                   static_cast<unsigned long long>(m_fixed16Scaled),
@@ -1844,7 +1897,10 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_vpMatch),
                   static_cast<unsigned long long>(m_vpMismatch),
                   static_cast<unsigned long long>(m_vpUnknown),
-                  static_cast<unsigned long long>(m_vpTakenFromGuest));
+                  static_cast<unsigned long long>(m_vpTakenFromGuest),
+                  static_cast<unsigned long long>(m_edramTransfers),
+                  static_cast<unsigned long long>(m_edramTransferNoSource),
+                  static_cast<unsigned long long>(m_edramTransferNotDrawn));
     LogInfo(message);
     // DIAG: what the WHITE-SKIPPED draws were aimed at.
     for (const auto& [extent, e] : m_skipByTarget) {
@@ -2271,7 +2327,8 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t alphaControl, float alphaRef,
                                  uint32_t cullMode, uint32_t vtxCntl,
                                  uint32_t guestVpWidth,
-                                 uint32_t guestVpHeight, bool useGuestVp) {
+                                 uint32_t guestVpHeight, bool useGuestVp,
+                                 bool edramCopy) {
   // PERF(per-frame-allocs): DONE. This used to create an ID3D12Resource on the
   // UPLOAD heap for each of the buffers below — up to nine per call, once per
   // submitted draw — and the note here called for "a ring of upload buffers
@@ -2867,6 +2924,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.guestVpWidth = guestVpWidth;
   d.guestVpHeight = guestVpHeight;
   d.useGuestVp = useGuestVp;
+  d.edramCopy = edramCopy;
   d.halfPixel = (vtxCntl != 0xFFFFFFFFu && (vtxCntl & 1u) == 0) ? 0.5f : 0.0f;
   if (d.halfPixel != 0.0f) ++m_halfPixelDraws; else ++m_halfPixelSkipped;
   if (scissor) {

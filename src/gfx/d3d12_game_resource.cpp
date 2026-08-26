@@ -764,7 +764,16 @@ void D3D12Renderer::NoteEdramOwnership(uint32_t object, uint32_t width,
     ++m_edramTakeovers;
     if (prev.width == width && prev.height == height) {
       ++m_edramTakeoverSameExtent;
-      if (prev.format != format) ++m_edramTakeoverFormatDiff;
+      if (prev.format != format) {
+        ++m_edramTakeoverFormatDiff;
+      } else {
+        // Same size, same format: a straight CopyResource carries the contents
+        // across with no reinterpretation. Recorded rather than performed here
+        // -- this runs before the new owner's texture necessarily exists, and
+        // the copy has to land at first use so it is not undone by the
+        // per-frame clear.
+        m_edramPendingSource[object] = prev.object;
+      }
     }
   }
   m_edramLastOwner[edramBase] = EdramOwner{object, width, height, format, 0};
