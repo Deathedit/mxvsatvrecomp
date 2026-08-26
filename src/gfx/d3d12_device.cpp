@@ -333,6 +333,10 @@ void D3D12Renderer::Shutdown() {
   // the heap being released here, so keeping them would hand out descriptors
   // into freed storage on the next device.
   m_freeGameSrvDescriptors.clear();
+  // Same reasoning for the RTV bump allocator: recycled slots index into the
+  // heap being released here.
+  m_freeGameRtvIndices.clear();
+  m_nextGameRtvIndex = 1;
   m_hasGamePipeline = false;
 
   m_gameDraws.clear();

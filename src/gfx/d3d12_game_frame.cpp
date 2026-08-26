@@ -1674,7 +1674,8 @@ void D3D12Renderer::RenderGameFrame() {
     char message[512];
     std::snprintf(message, sizeof(message),
                   "game RT routing: offscreen %llu, main %llu, OVERPAINT %llu "
-                  "(refused: budget %llu, resized %llu); live targets %u/%u, "
+                  "(refused: budget %llu, resized %llu); live targets %u/%u "
+                  "(evicted %llu, sweeps freeing nothing %llu), "
                   "srv %u/%u (cached %zu, free %zu, evicted %llu, "
                   "evict-blocked %llu)",
                   static_cast<unsigned long long>(m_rtDrawsOffscreen),
@@ -1683,6 +1684,8 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_rtRejectBudget),
                   static_cast<unsigned long long>(m_rtRejectResized),
                   uint32_t(m_gameRenderTargets.size()), kMaxGameRenderTargets,
+                  static_cast<unsigned long long>(m_rtEvictions),
+                  static_cast<unsigned long long>(m_rtEvictBlocked),
                   m_nextGameSrvDescriptor, kMaxGameTextures,
                   m_gameTextures.size(), m_freeGameSrvDescriptors.size(),
                   static_cast<unsigned long long>(m_gameTextureEvictions),

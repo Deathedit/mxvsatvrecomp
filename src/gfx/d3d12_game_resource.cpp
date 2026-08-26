@@ -783,17 +783,32 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameRenderTarget(
       RetireResource(std::move(it->second.resource));
       m_gameRenderTargets.erase(it);
     } else {
+      // The guest asked for this target by object address, which is the
+      // definition of still-in-use. EvictGameRenderTargets reclaims on this
+      // stamp, and stamping here also guarantees no pointer handed to a caller
+      // can refer to an entry a later sweep considers idle.
+      it->second.lastUsedFrame = m_gameFrame;
       return &it->second;
     }
+  }
+  // Reclaim dead targets before declaring the budget spent. Once per frame at
+  // the high water and always at the hard cap, matching the snapshot path.
+  if (reuseSrvIndex == UINT32_MAX &&
+      m_gameRenderTargets.size() >= kTargetHighWater &&
+      (m_targetSweepFrame != m_gameFrame ||
+       m_gameRenderTargets.size() >= kMaxGameRenderTargets)) {
+    m_targetSweepFrame = m_gameFrame;
+    const bool atCap = m_gameRenderTargets.size() >= kMaxGameRenderTargets;
+    if (EvictGameRenderTargets() == 0 && atCap) ++m_rtEvictBlocked;
   }
   // Budget exhausted. Counted separately from every other refusal because the
   // consequence is invisible: the caller falls back to the main target and the
   // draw overpaints the scene, which is exactly the bug offscreen routing was
-  // built to fix. m_gameRenderTargets is never evicted, so once this trips it
-  // stays tripped.
+  // built to fix.
   if (reuseSrvIndex == UINT32_MAX &&
       (m_gameRenderTargets.size() >= kMaxGameRenderTargets ||
-       m_nextGameSrvDescriptor >= kMaxGameTextures)) {
+       (m_freeGameSrvDescriptors.empty() &&
+        m_nextGameSrvDescriptor >= kMaxGameTextures))) {
     ++m_rtRejectBudget;
     return nullptr;
   }
@@ -803,9 +818,18 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameRenderTarget(
   entry.height = height;
   entry.edramBase = edramBase;
   entry.format = format;
-  entry.rtvIndex = reuseRtvIndex != UINT32_MAX
-                       ? reuseRtvIndex
-                       : uint32_t(m_gameRenderTargets.size()) + 1;
+  // A recycled slot before a fresh one. NOT `m_gameRenderTargets.size() + 1`:
+  // that was unique only while the map could never shrink, and eviction makes
+  // it collide.
+  if (reuseRtvIndex != UINT32_MAX) {
+    entry.rtvIndex = reuseRtvIndex;
+  } else if (!m_freeGameRtvIndices.empty()) {
+    entry.rtvIndex = m_freeGameRtvIndices.back();
+    m_freeGameRtvIndices.pop_back();
+  } else {
+    entry.rtvIndex = m_nextGameRtvIndex++;
+  }
+  entry.lastUsedFrame = m_gameFrame;
 
   D3D12_CLEAR_VALUE cv = {};
   cv.Format = format;
@@ -1089,6 +1113,37 @@ void D3D12Renderer::QueueLuminanceReadback(GameRenderTarget* snap,
 // content, resolved once -- is legitimate. If a sweep frees nothing the caller
 // still refuses, and m_snapshotEvictBlocked says so, which is the signal that
 // the cap rather than the lifetime is what wants revisiting.
+// Reclaim offscreen colour targets nothing has touched for kSnapshotIdleFrames.
+//
+// Idle-only for the same reason as EvictGameSnapshots, and one more besides: a
+// target holds ACCUMULATED CONTENT. Evicting one the guest still draws into
+// loses what it has built up and the guest gets a cleared surface back, so the
+// threshold has to be long enough that only a dead map's targets qualify.
+//
+// Both descriptor slots go back to their free lists. The RTV one is the reason
+// rtvIndex stopped being derived from the map's size -- see m_nextGameRtvIndex.
+uint32_t D3D12Renderer::EvictGameRenderTargets() {
+  const size_t before = m_gameRenderTargets.size();
+  for (auto it = m_gameRenderTargets.begin();
+       it != m_gameRenderTargets.end();) {
+    const bool idle = m_gameFrame > it->second.lastUsedFrame &&
+                      (m_gameFrame - it->second.lastUsedFrame) >=
+                          kSnapshotIdleFrames;
+    // Never evict a target this frame has already touched: RenderGameFrame
+    // holds raw pointers into this map across the draw loop.
+    if (!idle || it->second.usedThisFrame) {
+      ++it;
+      continue;
+    }
+    if (it->second.resource) RetireResource(std::move(it->second.resource));
+    m_freeGameSrvDescriptors.push_back(it->second.srvIndex);
+    m_freeGameRtvIndices.push_back(it->second.rtvIndex);
+    it = m_gameRenderTargets.erase(it);
+    ++m_rtEvictions;
+  }
+  return uint32_t(before - m_gameRenderTargets.size());
+}
+
 uint32_t D3D12Renderer::EvictGameSnapshots() {
   const size_t before = m_gameSnapshots.size();
   for (auto it = m_gameSnapshots.begin(); it != m_gameSnapshots.end();) {

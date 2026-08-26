@@ -480,6 +480,13 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // Returns how many entries it freed, so the caller can tell an ordinary
   // no-op sweep from one that failed at the hard cap.
   uint32_t EvictGameSnapshots();
+  // The same reclamation for offscreen colour targets, which had the same
+  // defect: m_gameRenderTargets is keyed by guest object address and the code
+  // said outright that it "is never evicted, so once this trips it stays
+  // tripped". After a few map loads it sat at 256/256 with 4845 budget
+  // refusals and 1730 draws OVERPAINTING the main scene, which is the exact
+  // failure offscreen routing exists to prevent.
+  uint32_t EvictGameRenderTargets();
 
   void WaitForGpu();
   void MoveToNextFrame();
@@ -1474,6 +1481,19 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // full, so the first map that legitimately wants a burst of new snapshots
   // meets the wall anyway.
   static constexpr uint32_t kSnapshotHighWater = kMaxGameSnapshots * 3 / 4;
+  static constexpr uint32_t kTargetHighWater = kMaxGameRenderTargets * 3 / 4;
+  // RTV slots freed by eviction, and the bump allocator behind them.
+  //
+  // This pair REPLACES `rtvIndex = m_gameRenderTargets.size() + 1`, which was
+  // correct only for as long as the map never shrank. Evicting with that
+  // formula still in place would hand two live targets the same RTV slot and
+  // corrupt both -- strictly worse than the exhaustion it was meant to fix.
+  // Descriptor 0 is the final 1280x720 target, so real targets start at 1.
+  std::vector<uint32_t> m_freeGameRtvIndices;
+  uint32_t m_nextGameRtvIndex = 1;
+  uint64_t m_rtEvictions = 0;
+  uint64_t m_rtEvictBlocked = 0;
+  uint64_t m_targetSweepFrame = UINT64_MAX;
   // The frame of the last sweep. A sweep is a linear scan of the map, and
   // EnsureGameSnapshot is called per resolve -- 211413 of them in one run --
   // so once the live count is above the high water an unguarded sweep would
