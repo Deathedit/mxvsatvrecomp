@@ -154,9 +154,15 @@ uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
     {
       const uint32_t dd = first_reg * 4 + i;
       const bool pub = (g_have[dd >> 5] & (1u << (dd & 31))) != 0;
+      // Fires only when we ACTUALLY substitute, so the census tracks the
+      // guard rather than the opportunity -- with strict on it should fall to
+      // zero, and a non-zero reading would mean the switch is not reaching
+      // here.
       mx::gpu::guard::Note(
           mx::gpu::guard::Guard::kConstantNanToZero,
-          NonFinite(cur) && !pub && (cur & 0x007FFFFFu) != 0);
+          NonFinite(cur) && !pub && (cur & 0x007FFFFFu) != 0 &&
+              !mx::gpu::guard::Strict(
+                  mx::gpu::guard::Guard::kConstantNanToZero));
     }
     if (!NonFinite(cur)) continue;
     const uint32_t d = first_reg * 4 + i;
@@ -189,7 +195,11 @@ uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
     // overwrite. The bank-wide total is not the denominator -- a NaN we leave
     // alone is not a guard firing, and counting it as one would make this look
     // vanishingly rare.
-    if (!published && (cur & 0x007FFFFFu) != 0) {
+    // STRICT: leave the NaN in the bank. It reaches the shader and the
+    // corruption IS the signal -- which is the whole point, because a zero here
+    // is indistinguishable from a constant the guest meant to be zero.
+    if (!published && (cur & 0x007FFFFFu) != 0 &&
+        !mx::gpu::guard::Strict(mx::gpu::guard::Guard::kConstantNanToZero)) {
       bank[i] = 0;
       ++g_zeroed;
     }

@@ -62,6 +62,44 @@ void Note(Guard g, bool fired, uint64_t weight = 1);
 // One line, every guard, zero included.
 std::string Report();
 
+//---------------------------------------------------------------------------
+// STRICT MODE -- phase 2 of docs/strict_mode.md.
+//
+// A BITMASK, deliberately, not a bool. All-off produces a black screen, which
+// is one bit of information; a bitmask lets you binary-search which guard is
+// holding which defect up. Bit N disables Guard(N).
+//
+// Set from the app layer once per frame rather than read here, so src/gpu keeps
+// no cvar dependency -- it has none today and this is not worth introducing one
+// for.
+//
+// NOT EVERY GUARD IS SWITCHABLE, and pretending otherwise would be its own kind
+// of invention. Three are, because turning them off degrades visibly without
+// breaking the pipeline:
+//
+//   kStandInDraw          the draw is skipped -- it disappears, which is a
+//                         diagnostic
+//   kBlankTexturePayload  the blank is not recorded, so the decode is retried
+//   kConstantNanToZero    the NaN reaches the shader; corruption is the signal
+//
+// Four are NOT wired, and the reasons are structural rather than caution:
+//
+//   kScratchColourTarget  every PSO declares NumRenderTargets = 1, so binding
+//                         no RTV is invalid work against the pipeline, not a
+//                         diagnostic
+//   kVertexZeroFill       the fill covers a read PAST THE END of the guest
+//                         buffer; not doing it is an out-of-bounds read
+//   kInterpolatorZeroFill not ours to disable -- it is the HLSL struct
+//                         initialiser, emitted by FXC, with no host-side switch
+//   kMaterialGateFill     already inert; the substitution was stripped and only
+//                         the measurement remains
+//
+// Strict(g) is false for all four, always, and the call sites say so.
+void SetStrictMask(uint32_t mask);
+
+// True when this guard is disabled and must NOT invent.
+bool Strict(Guard g);
+
 // Human-readable name, stable across builds — it is grepped out of logs.
 const char* Name(Guard g);
 

@@ -2273,8 +2273,13 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // knowing about, and the line now says outright whether a fallback exists.
   // Population is every decode that reaches this test; fires are the ones that
   // came out uniform and get recorded as blank.
-  mx::gpu::guard::Note(mx::gpu::guard::Guard::kBlankTexturePayload, decode_is_blank);
-  if (decode_is_blank) {
+  // STRICT: do not record the blank, so the decode is retried instead of a
+  // uniform payload being cached as if it were the texture.
+  const bool blank_strict =
+      mx::gpu::guard::Strict(mx::gpu::guard::Guard::kBlankTexturePayload);
+  mx::gpu::guard::Note(mx::gpu::guard::Guard::kBlankTexturePayload,
+                       decode_is_blank && !blank_strict);
+  if (decode_is_blank && !blank_strict) {
     NoteBlankDecode(key);
     // Memory had nothing and a partly-written snapshot exists: its resolved
     // tiles beat a constant everywhere, and the blank is still recorded above so

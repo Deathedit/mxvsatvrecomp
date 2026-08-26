@@ -29,6 +29,28 @@ constexpr const char* kNames[size_t(Guard::kCount)] = {
 
 }  // namespace
 
+namespace {
+// Read on the draw path; written once per frame from the app layer.
+std::atomic<uint32_t> g_strictMask{0};
+
+// The guards strict mode may actually disable. Everything else returns false
+// from Strict() no matter what bit is set -- see the header for why each one is
+// structural rather than cautious.
+constexpr uint32_t kSwitchable = (1u << uint32_t(Guard::kStandInDraw)) |
+                                 (1u << uint32_t(Guard::kBlankTexturePayload)) |
+                                 (1u << uint32_t(Guard::kConstantNanToZero));
+}  // namespace
+
+void SetStrictMask(uint32_t mask) {
+  g_strictMask.store(mask, std::memory_order_relaxed);
+}
+
+bool Strict(Guard g) {
+  const uint32_t bit = 1u << uint32_t(g);
+  if (!(bit & kSwitchable)) return false;
+  return (g_strictMask.load(std::memory_order_relaxed) & bit) != 0;
+}
+
 const char* Name(Guard g) {
   const size_t i = size_t(g);
   return i < size_t(Guard::kCount) ? kNames[i] : "?";

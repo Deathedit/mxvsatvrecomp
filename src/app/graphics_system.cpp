@@ -15,6 +15,7 @@
 
 #include <windows.h>
 
+#include "gpu/guard_census.h"
 #include "gpu/hle_types.h"
 #include "gpu/d3d9_layout.h"
 #include "hooks/native_bridge.h"
@@ -65,6 +66,17 @@ REXCVAR_DEFINE_BOOL(hle_capture, false, "Debug",
                     "what fraction is fully described, plus the first few "
                     "resolved draws to logs/decldump/decls.txt. Capture only — it "
                     "submits nothing and renders nothing");
+
+// Strict mode: a bitmask of class-B guards to DISABLE, so a real bug is exposed
+// instead of being papered over with a plausible value. See docs/strict_mode.md
+// and guard_census.h. 0 is the shipping behaviour.
+//
+// Bit N is Guard(N). Only bits 0 (stand-in draw), 3 (blank texture) and 4
+// (constant NaN->0) have any effect; the rest are structurally unswitchable and
+// Strict() refuses them regardless.
+REXCVAR_DEFINE_INT32(hle_strict, 0, "Debug",
+                     "Bitmask of inventing guards to disable, so the defect "
+                     "underneath shows instead of a plausible substitute.");
 
 REXCVAR_DEFINE_BOOL(d3d12_edram_takeover_copy, false, "Graphics",
                     "On a same-extent EDRAM takeover, copy the previous "
@@ -221,6 +233,19 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       // know the new frame has something in it — a frame whose draws were all
       // skipped for stride would otherwise blank the screen just as surely as a
       // frame that never arrived.
+      // STRICT MODE -- docs/strict_mode.md phase 2. A BITMASK, not a bool:
+      // all-off is a black screen, which is one bit of information, and a
+      // bitmask lets you binary-search which guard holds which defect up.
+      // Pushed once per frame so the draw path reads an atomic rather than a
+      // cvar, and so src/gpu keeps no cvar dependency.
+      //
+      // Only three bits do anything -- see guard_census.h for why the other
+      // four are structurally unswitchable rather than merely risky:
+      //   bit 0  stand-in draws        the draw is skipped
+      //   bit 3  blank texture payload the blank is not recorded, decode retried
+      //   bit 4  constant NaN -> 0     the NaN reaches the shader
+      mx::gpu::guard::SetStrictMask(
+          static_cast<uint32_t>(REXCVAR_GET(hle_strict)));
       std::vector<const mx::hle::DrawCall*> submittable;
       for (const auto& d : draws) {
         // A resolve, a clear and a surface bind are not draws. None has

@@ -1734,6 +1734,12 @@ void D3D12Renderer::RenderGameFrame() {
       mx::gpu::guard::Note(mx::gpu::guard::Guard::kStandInDraw, false);
       continue;
     }
+    // STRICT: skip the draw entirely rather than paint an invented tex*col.
+    // The geometry disappearing is a diagnostic; a plausible colour is not.
+    if (mx::gpu::guard::Strict(mx::gpu::guard::Guard::kStandInDraw)) {
+      mx::gpu::guard::Note(mx::gpu::guard::Guard::kStandInDraw, false);
+      continue;
+    }
     mx::gpu::guard::Note(mx::gpu::guard::Guard::kStandInDraw, true);
     ++m_standInDraws;
 
