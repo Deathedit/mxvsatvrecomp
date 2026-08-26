@@ -429,7 +429,15 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   // position is ever revisited.
                                   d->alpha_state_seen ? d->colour_control : 0u,
                                   d->alpha_state_seen ? d->alpha_ref : 0.0f,
-                                  d->pa_su_sc_mode_cntl);
+                                  // Face culling applies only to primitives
+                                  // that HAVE faces. Passing 0 for the rest
+                                  // decodes to CULL_NONE with
+                                  // FrontCounterClockwise FALSE, which is both
+                                  // what the reference does for them and the
+                                  // state they had before cull was plumbed.
+                                  mx::hle::IsPrimitivePolygonal(d->prim_type)
+                                      ? d->pa_su_sc_mode_cntl
+                                      : 0u);
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;

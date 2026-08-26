@@ -165,6 +165,39 @@ enum class PrimitiveType : uint8_t {
   kUnknown         = 0xFF,
 };
 
+// Whether a primitive has front and back faces, and so is subject to face
+// culling at all. Points, lines and RECTANGLE LISTS are always "front" -- the
+// reference is explicit that they are drawn even when both cull bits are set.
+//
+// kRectangleList is the one that matters here, and it is deliberately NOT in
+// this set. Quoting the reference (draw_util.h:71-74):
+//
+//   TODO(Triang3l): Investigate how kRectangleList should be treated -
+//   possibly actually drawn as two polygons on the console, however, the
+//   current geometry shader doesn't care about the winding order - allowing
+//   backface culling for rectangles currently breaks 4D53082D.
+//
+// So the reference does not cull rectangles, and records that culling them
+// breaks a title. It broke one here too: the guest submits its post-process
+// passes as rectangle lists, we expand each into two triangles with a winding
+// we choose ourselves, and once cull mode started being honoured (d52f442)
+// that synthesised winding met a real cull_back and the whole quad vanished.
+// The luminance downsample is one of those quads, so its 320x180 target kept
+// its cleared zero, average luminance came out 0, and the guest's
+// exposure = key / 0 blew every channel past the tone curve's knee -- which
+// reads as a DESATURATED grey frame, not a blown-out white one.
+constexpr bool IsPrimitivePolygonal(uint32_t prim_type) {
+  switch (static_cast<PrimitiveType>(prim_type)) {
+    case PrimitiveType::kTriangleList:
+    case PrimitiveType::kTriangleFan:
+    case PrimitiveType::kTriangleStrip:
+    case PrimitiveType::kQuadList:
+      return true;
+    default:
+      return false;
+  }
+}
+
 // Host topology, carried on DrawCall so the renderer stays a dumb consumer.
 // The values are deliberately the D3D_PRIMITIVE_TOPOLOGY ones so the renderer
 // can cast rather than translate; d3d12_game.cpp static_asserts that they still
