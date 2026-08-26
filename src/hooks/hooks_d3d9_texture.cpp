@@ -349,6 +349,97 @@ void NoteBlankDecode(uint64_t key) {
   s.last_frame = mx::hle::D3D9FrameCount();
   ++s.strikes;
 }
+
+// FLAT-DECODE PROBE, 2026-08-27. MEASUREMENT ONLY -- nothing acts on this, and
+// nothing should until it has said which side the flatness comes from.
+//
+// HleTextureIsConstant asks whether EVERY byte of the base level is identical,
+// and that "every" is exactly why it missed the texture the black ground turned
+// out to hang on. ground.rdc's ResourceId::7022 -- 1024x1024 B4G4R4A4, the
+// terrain composite's tile-index map -- decodes to one value on every texel of
+// every mip EXCEPT texel (0,0). ONE differing texel, so the exact test returns
+// false, the `uniform decode` line never prints, and the texture whose flatness
+// blacks out the whole near ground reports as ordinary. A test that has to be
+// perfect to fire is a test that misses by one.
+//
+// So this measures the DOMINANT BYTE'S SHARE instead of demanding 100%, and it
+// scans the GUEST BYTES as well as the decode. The second scan is the whole
+// point and the reason this is worth adding at all:
+//
+//   guest flat, decode flat  -- the game's own data. Not our bug; stop here.
+//   guest varied, decode flat -- the untile/copy/upload path lost it. Ours.
+//
+// Nothing else in the tree can tell those two apart, and the difference decides
+// whether the ground is chased in our decoder or in the guest.
+struct FlatScan {
+  uint8_t dominant = 0;
+  uint32_t distinct = 0;
+  size_t total = 0;
+  size_t dominant_count = 0;
+  double share() const {
+    return total ? double(dominant_count) / double(total) : 0.0;
+  }
+};
+
+FlatScan ScanFlatness(const uint8_t* data, size_t bytes) {
+  FlatScan s;
+  if (!data || !bytes) return s;
+  size_t hist[256] = {};
+  for (size_t i = 0; i < bytes; ++i) ++hist[data[i]];
+  s.total = bytes;
+  for (uint32_t v = 0; v < 256; ++v) {
+    if (!hist[v]) continue;
+    ++s.distinct;
+    if (hist[v] > s.dominant_count) {
+      s.dominant_count = hist[v];
+      s.dominant = uint8_t(v);
+    }
+  }
+  return s;
+}
+
+// Fires AND population, printed on every line the probe emits, so the rate
+// travels with the evidence instead of having to be looked up separately.
+struct FlatProbeCounts {
+  uint64_t decodes = 0;
+  uint64_t flat = 0;
+  // What the per-address cap threw away. See the note at the cap.
+  uint64_t suppressed = 0;
+};
+FlatProbeCounts g_flatProbe;
+
+// DECODE CENSUS BY SHAPE. The per-address lines answer "is this texture flat";
+// this answers "was it decoded AT ALL", which run 1468 could not settle. That
+// run decoded 248 textures across a full level and printed eight flat ones, and
+// there was no way to tell whether the 1024x1024 FMT_4_4_4_4 the black ground
+// hangs on was ABSENT or merely healthy. **Absence and health look identical
+// without the population** -- the same hole the guard census exists to close,
+// reopened here because the probe only ever reported its fires.
+//
+// Keyed on {guest format, width, height} rather than address, because the
+// question is about a kind of texture, and one shape can live at many
+// addresses.
+std::map<std::array<uint32_t, 3>, std::pair<uint64_t, uint64_t>> g_flatShapes;
+
+void ReportDecodeShapes() {
+  std::vector<std::pair<std::array<uint32_t, 3>, std::pair<uint64_t, uint64_t>>>
+      ranked(g_flatShapes.begin(), g_flatShapes.end());
+  std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+    if (a.second.second != b.second.second)
+      return a.second.second > b.second.second;
+    return a.second.first > b.second.first;
+  });
+  std::string top;
+  for (size_t i = 0; i < ranked.size() && i < 20; ++i) {
+    top += fmt::format(" [fmt{}({}) {}x{} n={} flat={}]", ranked[i].first[0],
+                       mx::hle::GuestTextureFormatName(ranked[i].first[0]),
+                       ranked[i].first[1], ranked[i].first[2],
+                       ranked[i].second.first, ranked[i].second.second);
+  }
+  REXLOG_INFO("d3d9: DECODE SHAPES {} distinct over {} decodes, {} flat:{}",
+              g_flatShapes.size(), g_flatProbe.decodes, g_flatProbe.flat,
+              top.empty() ? " (none)" : top);
+}
 // The blank payload itself, so the draws that sample a still-blank key within
 // one frame share a decode instead of repeating it.
 std::map<uint64_t, std::shared_ptr<const mx::hle::HleTexturePayload>>
@@ -2259,6 +2350,65 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
           partial_snapshot_object
               ? fmt::format("0x{:08X}", partial_snapshot_object)
               : std::string("NONE, binding the constant anyway"));
+    }
+  }
+  // FLAT-DECODE PROBE. Population is every decode that reaches this point;
+  // fires are the ones whose base level is at least 99.9% a single byte. The
+  // threshold is deliberately not 1.0 -- see ScanFlatness for the one texel
+  // that cost the ground a session. One line per distinct guest address and
+  // capped, because a flat texture is re-decoded every frame and this is a
+  // diagnostic, not a per-bind log.
+  {
+    PhaseTimer t(g_tex.scanUs);
+    const size_t flat_base_bytes =
+        payload->level_count > 1
+            ? std::min<size_t>(payload->levels[1].offset, payload->data.size())
+            : payload->data.size();
+    const FlatScan decoded_flat =
+        ScanFlatness(payload->data.data(), flat_base_bytes);
+    ++g_flatProbe.decodes;
+    auto& shape = g_flatShapes[{source.guest_format, source.width,
+                                source.height}];
+    ++shape.first;
+    if (g_flatProbe.decodes % 100 == 0) ReportDecodeShapes();
+    if (decoded_flat.total && decoded_flat.share() >= 0.999) {
+      ++shape.second;
+      ++g_flatProbe.flat;
+      // THE CAP WAS 24 AND IT HID THE CASE THIS EXISTS FOR. Run 1466 reached
+      // 24 addresses at decode 236 and then went on to render 1860 frames of a
+      // level; every texture first bound after that -- the terrain's tile-index
+      // map among them -- was dropped without a word, and the log read as
+      // though only eight flat textures existed. A limit whose effect is
+      // invisible is the same defect as a counter that cannot fire, so the cap
+      // now counts what it drops and prints that on every line.
+      static std::set<uint32_t> s_flatSeen;
+      const bool flat_first_seen = s_flatSeen.insert(source.address).second;
+      if (flat_first_seen && s_flatSeen.size() > 256) ++g_flatProbe.suppressed;
+      if (flat_first_seen && s_flatSeen.size() <= 256) {
+        // The guest bytes as COPIED, before untiling -- the only reading that
+        // can acquit or convict our decode path.
+        const FlatScan guest_flat = ScanFlatness(guest.data(), guest.size());
+        std::string head;
+        for (size_t i = 0; i < guest.size() && i < 16; ++i)
+          head += fmt::format("{:02X} ", guest[i]);
+        REXLOG_INFO(
+            "d3d9: FLAT DECODE addr 0x{:08X} fmt {} ({}) {}x{} sampler {} "
+            "pitch {} blk {}x{}x{}B endian {} swizzle 0x{:X} tiled {} "
+            "packed_mips {} mip_addr 0x{:08X} levels {} | DECODED dom 0x{:02X} "
+            "{:.5f} of {} bytes {} distinct | GUEST dom 0x{:02X} {:.5f} of {} "
+            "bytes {} distinct | guest head {}| flat {}/{} decodes, {} "
+            "addresses, {} suppressed",
+            source.address, source.guest_format,
+            mx::hle::GuestTextureFormatName(source.guest_format), source.width,
+            source.height, guest_sampler, source.pitch_blocks,
+            source.block_width, source.block_height, source.bytes_per_block,
+            source.endian, source.swizzle, source.tiled ? 1 : 0,
+            source.packed_mips ? 1 : 0, source.mip_address, source.level_count,
+            decoded_flat.dominant, decoded_flat.share(), decoded_flat.total,
+            decoded_flat.distinct, guest_flat.dominant, guest_flat.share(),
+            guest_flat.total, guest_flat.distinct, head, g_flatProbe.flat,
+            g_flatProbe.decodes, s_flatSeen.size(), g_flatProbe.suppressed);
+      }
     }
   }
   // REVERTED 2026-08-14: `decode_is_uniform` used to be admitted here alongside
