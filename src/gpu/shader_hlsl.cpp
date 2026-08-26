@@ -423,16 +423,28 @@ class Emitter {
       case Op::kMad:
         r = "(XeMul(" + a + ", " + b + ") + " + Src(alu, 3) + ")";
         break;
-      // lerp with a selector of exactly 0 or 1 is an exact select, and unlike a
-      // vector ternary it is unambiguous about being component-wise.
+      // A true select. This was a lerp, on the reasoning that a selector of
+      // exactly 0 or 1 makes lerp exact -- which holds only for finite
+      // operands. FXC expands lerp(x, y, s) to x + s * (y - x), so the
+      // UNSELECTED operand stays in the arithmetic: with s = 0 and y = +INF
+      // that is 0 * INF = NaN, and the result is NaN whichever way the
+      // condition went. kRcp legitimately produces +INF for 1/0, and this
+      // title's shaders divide by possibly-zero quantities constantly, so a
+      // cnd guarding such a value is exactly the shape that breaks.
+      //
+      // Both Xenia backends select (DXBC OpEq + OpMovC, SPIR-V OpSelect) and
+      // so does our own interpreter, so the lerp was also an
+      // emitter/interpreter split of the kind the LegacyMul note warns about.
+      // HLSL's ?: on vectors is component-wise, and FXC compiles it to a
+      // single movc -- three slots against lerp's seven.
       case Op::kCndEq:
-        r = "lerp(" + Src(alu, 3) + ", " + b + ", float4(" + a + " == 0.0))";
+        r = "(" + a + " == 0.0 ? " + b + " : " + Src(alu, 3) + ")";
         break;
       case Op::kCndGe:
-        r = "lerp(" + Src(alu, 3) + ", " + b + ", float4(" + a + " >= 0.0))";
+        r = "(" + a + " >= 0.0 ? " + b + " : " + Src(alu, 3) + ")";
         break;
       case Op::kCndGt:
-        r = "lerp(" + Src(alu, 3) + ", " + b + ", float4(" + a + " > 0.0))";
+        r = "(" + a + " > 0.0 ? " + b + " : " + Src(alu, 3) + ")";
         break;
       case Op::kDp4: r = "XeDot4(" + a + ", " + b + ").xxxx"; break;
       case Op::kDp3: r = "XeDot3((" + a + ").xyz, (" + b + ").xyz).xxxx"; break;
@@ -645,9 +657,19 @@ class Emitter {
       case Op::kTruncs: r = "trunc(" + a + ")"; break;
       case Op::kFloors: r = "floor(" + a + ")"; break;
       case Op::kExp: r = "exp2(" + a + ")"; break;
-      // log(0) is -inf on the hardware; the clamped form saturates to -FLT_MAX.
-      case Op::kLog: r = "log2(abs(" + a + "))"; break;
-      case Op::kLogc: r = "max(log2(abs(" + a + ")), -3.402823466e+38)"; break;
+      // No abs() on the operand. Direct3D 9 defines ITS log/rsq as operating
+      // on |src|, but Xenos does not: the operand carries an abs MODIFIER,
+      // which Src() already honours, and the Xbox 360 compiler sets that bit
+      // itself wherever the D3D9 semantic calls for it. All 115 rsq sites
+      // across the 150 dumped shaders arrive with it already set, so the
+      // hardcoded abs was a second, unconditional application -- and it masked
+      // the three log sites that deliberately have it clear. ucode.h, both
+      // Xenia backends and Xenia's interpreter all apply the operation bare.
+      //
+      // logc saturates -INF to -FLT_MAX and ONLY -INF: log2(+INF) stays +INF
+      // on the hardware, and a NaN stays NaN. The max() folded both.
+      case Op::kLog: r = "log2(" + a + ")"; break;
+      case Op::kLogc: r = "XeClampNegInf(log2(" + a + "))"; break;
       // The three reciprocal forms differ ONLY on what they do with an
       // infinity, and that difference is the whole of this game's black main
       // menu. From the SDK (ucode.h:1082-1114):
@@ -669,14 +691,10 @@ class Emitter {
       // guarding it. A title relies on that.
       case Op::kRcp: r = "rcp(" + a + ")"; break;
       case Op::kRcpf: r = "XeFlushInf(rcp(" + a + "))"; break;
-      case Op::kRcpc:
-        r = "clamp(rcp(" + a + "), -3.402823466e+38, 3.402823466e+38)";
-        break;
-      case Op::kRsq: r = "rsqrt(abs(" + a + "))"; break;
-      case Op::kRsqf: r = "XeFlushInf(rsqrt(abs(" + a + ")))"; break;
-      case Op::kRsqc:
-        r = "min(rsqrt(abs(" + a + ")), 3.402823466e+38)";
-        break;
+      case Op::kRcpc: r = "XeClampInf(rcp(" + a + "))"; break;
+      case Op::kRsq: r = "rsqrt(" + a + ")"; break;
+      case Op::kRsqf: r = "XeFlushInf(rsqrt(" + a + "))"; break;
+      case Op::kRsqc: r = "XeClampInf(rsqrt(" + a + "))"; break;
       case Op::kSqrt: r = "sqrt(" + a + ")"; break;
       case Op::kSin: r = "sin(" + a + ")"; break;
       case Op::kCos: r = "cos(" + a + ")"; break;
@@ -718,7 +736,15 @@ class Emitter {
         break;
       case Op::kSetpPop:
         Line("xe_p0 = ((" + a + " - 1.0) <= 0.0);");
-        r = "max(" + a + " - 1.0, 0.0)";
+        // A select, matching Xenia's OpGE + OpMovC, so this reads the way the
+        // interpreter does. It does NOT change the compiled DXBC: FXC folds
+        // `(x <= 0) ? 0 : x` straight back to `max(x, 0)`, because one arm
+        // equals the constant being compared against. Verified with
+        // fxc /T ps_5_0. The NaN divergence therefore survives here -- and is
+        // unobservable, because setp_pop appears in 0 of this title's 150
+        // shaders. Left as a select rather than fought, so that if the opcode
+        // ever does turn up, the source already says what it means.
+        r = "((" + a + " - 1.0) <= 0.0 ? 0.0 : " + a + " - 1.0)";
         ++unhonoured_predicate_ops;
         break;
       case Op::kSetpClr:
@@ -1835,6 +1861,21 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   src +=
       "float XeFlushInf(float v) {\n"
       "  return isinf(v) ? (v < 0.0 ? -0.0 : 0.0) : v;\n"
+      "}\n";
+  // The clamping forms (rcpc, rsqc, logc) saturate an infinity to the finite
+  // extreme and leave EVERYTHING else alone, NaN included. Done the way Xenia
+  // does it, on the integer representation: 0x7F800000 - 1 is 0x7F7FFFFF and
+  // 0xFF800000 - 1 is 0xFF7FFFFF, which are exactly +-FLT_MAX. clamp() and
+  // min() folded NaN to FLT_MAX -- the same swallowing the Shader Model 3
+  // min/max change removed from the vector ops.
+  src +=
+      "float XeClampInf(float v) {\n"
+      "  return (asuint(v) & 0x7FFFFFFFu) == 0x7F800000u\n"
+      "             ? asfloat(asint(v) - 1)\n"
+      "             : v;\n"
+      "}\n"
+      "float XeClampNegInf(float v) {\n"
+      "  return asuint(v) == 0xFF800000u ? -3.402823466e+38 : v;\n"
       "}\n";
   // Direct3D 9 "legacy" multiply, which is what every multiplying operation on
   // this hardware does -- mul, mad, the dot products, and their scalar forms.

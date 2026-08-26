@@ -465,23 +465,32 @@ class Interpreter {
       case Op::kTruncs: r = std::trunc(a); break;
       case Op::kFloors: r = std::floor(a); break;
       case Op::kExp: r = std::exp2(a); break;
+      // No fabs, matching the emitter: the abs is an operand MODIFIER the
+      // guest's compiler sets, not part of the operation. log2(0) is already
+      // -INF, so the zero special case was doing nothing but hiding -0.0.
+      // logc saturates -INF and only -INF; isinf() also caught log2(+INF).
       case Op::kLog: case Op::kLogc:
-        r = a == 0.0f ? -INFINITY : std::log2(std::fabs(a));
-        if (op == Op::kLogc && std::isinf(r)) r = -3.402823466e+38f;
+        r = std::log2(a);
+        if (op == Op::kLogc && r == -INFINITY) r = -3.402823466e+38f;
         break;
       // The three forms differ only on an infinity, and treating the FF form
       // as IEEE is what blacked out the menu on the HLSL side -- see the note
       // beside kRcpf in shader_hlsl.cpp. Corrected here too so the interpreter
       // and the emitter cannot disagree about a shader they both run.
       //   RECIP_IEEE  +INF          RECIP_CLAMP  +/-FLT_MAX   RECIP_FF  +/-0.0
+      // The `a == 0` special cases are gone: 1/0 is +INF and 1/-0 is -INF
+      // already, and forcing +INF for both lost the sign that kRcpf then
+      // flushes -- it handed back +0.0 where the hardware gives -0.0. The
+      // emitter's rcp()/rsqrt() never had that bug, so this was one more
+      // emitter/interpreter split. rsqc clamps both signs, as Xenia does.
       case Op::kRcp: case Op::kRcpc: case Op::kRcpf:
-        r = a == 0.0f ? INFINITY : 1.0f / a;
+        r = 1.0f / a;
         if (op == Op::kRcpc && std::isinf(r)) r = r > 0 ? 3.402823466e+38f : -3.402823466e+38f;
         if (op == Op::kRcpf && std::isinf(r)) r = r > 0 ? 0.0f : -0.0f;
         break;
       case Op::kRsq: case Op::kRsqc: case Op::kRsqf:
-        r = a == 0.0f ? INFINITY : 1.0f / std::sqrt(std::fabs(a));
-        if (op == Op::kRsqc && std::isinf(r)) r = 3.402823466e+38f;
+        r = 1.0f / std::sqrt(a);
+        if (op == Op::kRsqc && std::isinf(r)) r = r > 0 ? 3.402823466e+38f : -3.402823466e+38f;
         if (op == Op::kRsqf && std::isinf(r)) r = r > 0 ? 0.0f : -0.0f;
         break;
       case Op::kSqrt: r = std::sqrt(a); break;
