@@ -85,6 +85,19 @@ void Stats(uint64_t& written, uint64_t& repaired, uint32_t& constants_seen,
 // frame-global PM4 file as authoritative for a mid-frame draw.
 std::string FilledHistogram(uint32_t top);
 
+// Substitutions APPLIED in the narrow material-gate window (pixel c84..c87).
+// Distinct from the dry-run zero-fill count: a zero here means the window never
+// fired, which is a different outcome from firing and changing nothing.
+uint64_t MaterialGateFilled();
+
+// Fill the narrow material-gate window (pixel c84..c87) from the Type-0 PM4
+// file, for dwords the shader's own load table did NOT publish and that are
+// still zero. `bank` is the PIXEL bank (guest c256 at index 0), `load_written`
+// is one byte per bank dword, non-zero where the load table wrote. Call AFTER
+// ApplyShaderLoadTable -- before it, the table overwrites the fill.
+uint32_t FillMaterialGate(uint32_t* bank, uint32_t bank_regs,
+                          const uint8_t* load_written);
+
 }  // namespace alu
 
 class XenosGpuState {

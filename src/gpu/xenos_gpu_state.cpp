@@ -1,6 +1,7 @@
 #include "gpu/xenos_gpu_state.h"
 
 #include <cstdio>
+#include <cstring>
 #include <algorithm>
 #include <array>
 #include <mutex>
@@ -82,6 +83,20 @@ uint64_t g_filledZero = 0;
 // spraying the bank, and those want opposite fixes: the first narrows to a
 // range, the second means the PM4 file is the wrong authority per draw.
 uint64_t g_filledByConst[kAluConstants] = {};
+// Substitutions actually APPLIED in the narrow material-gate window, as opposed
+// to g_filledZero which counts the whole dry-run population. Separate because
+// "the window never fires" and "the window fires and changes nothing" are
+// different outcomes and a shared counter would hide the first.
+uint64_t g_materialGateFilled = 0;
+
+// The pixel ALU bank starts at guest constant 256; callers pass first_reg=256
+// for it and 0 for the vertex bank.
+constexpr uint32_t kPixelBankFirstReg = 256;
+// Guest c340..c343 == PIXEL xe_c[84..87]: the material block PM4 publishes as a
+// unit via SHADER_CONSTANT_340_X. See the substitution site for why this window
+// and no wider.
+constexpr uint32_t kMaterialGateFirstConst = 256 + 84;
+constexpr uint32_t kMaterialGateEndConst = 256 + 88;
 
 bool NonFinite(uint32_t bits) {
   // IEEE-754: exponent all ones is Inf (mantissa 0) or NaN (mantissa non-zero).
@@ -211,15 +226,131 @@ uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
     // the frame's final constants. Harmless for NaN repair, which is rare and
     // startup-bounded; destructive the moment it reaches an array.
     //
-    // Kept as a COUNT because the question it answers is still open -- which
-    // constants are published only by Type-0 PM4 and left at zero by our two
-    // modelled sources. Answering that needs the measurement, not the
-    // substitution.
+    // Kept as a COUNT for the bank at large, because the question it answers is
+    // still open -- which constants are published only by Type-0 PM4 and left at
+    // zero by our two modelled sources.
     ++g_filledZero;
     ++g_filledByConst[d >> 2];
+
+    // The substitution that used to live here has MOVED to FillMaterialGate,
+    // which runs after the shader load table instead of before it. Doing it
+    // here was wrong for a reason this file already documents two screens up:
+    // "Callers apply the shader load tables AFTER this, so those still override
+    // it." Measured 2026-08-26 (mx_1447): 368,313 substitutions fired and the
+    // terrain did not change, because the terrain shader's own load table wrote
+    // c85 straight back to zero -- while materials with NO load-table entry in
+    // that window kept the value, which is why the BIKE AND RIDER changed
+    // appearance and the ground did not. The fix landed on exactly the shaders
+    // it was not aimed at.
+    //
+    // Kept below for the record: the window and the proof.
+    //
+    // The blanket version failed for a specific reason: g_file is FRAME-GLOBAL
+    // last-write-wins, so a mid-frame draw gets the frame's FINAL value. That
+    // is destructive the moment it reaches an ARRAY -- the vertex bank's
+    // stride-6 matrix palette (c155, c161, c167 ...) tore the geometry apart.
+    // The window below is not an array. It is a four-constant material block
+    // that PM4 publishes as a unit: SHADER_CONSTANT_340_X (0x4550) is written
+    // 330 times across the pm4 dumps, 182 x cnt=16 -> guest c340-343 and
+    // 148 x cnt=32 -> c340-347, which is PIXEL c84-c87.
+    //
+    // PROVEN, capture3.rdc draw 19725 (terrain, 1741 indices), pixel (640,640),
+    // full PS trace:
+    //
+    //   193: add r7.x, r1.w, xe_c[85].w   0.774069 + 0         = 0.774069
+    //   204: add r6.xy, r7.ywyy, r7.xzxx  0.774069 + -0.018824 = 0.755246
+    //   205: add_sat r0.x, r6.x, c255.w   saturate(0.755246 - 0.8) = 0.0
+    //   209: mul r1.xyz, r0.xxxx, r1.xyzx 0 x (0.070, 0.034, -0.014) = 0
+    //
+    // c85.w = 1 makes that saturate(1.755 - 0.8) = 0.955 and the terrain
+    // diffuse survives. It misses the threshold by 0.045 and the constant is
+    // worth exactly 1.0. With the diffuse zeroed all that reaches the output is
+    // the ambient interpolator 0.00048 x the gain c43 = 15.18 = 0.034, which is
+    // the flat dark grey on screen. Everything else in that draw is correct:
+    // world Y 611.4 is real terrain height, xe_tex1 -> 0.113 and xe_tex2 ->
+    // 0.848 sample fine, and c86/c87 (the sand tint) are populated. c85 is the
+    // only zero among populated neighbours -- unwritten, not wrong.
+    //
+    // PIXEL BANK ONLY. The vertex bank is where the palette damage happened and
+    // nothing here needs it.
+    //
+    // The frame-global risk is not gone, it is bounded: within this window the
+    // worst case is a material gated OFF this frame being lit as though it were
+    // ON. That is visible and reversible; a sprayed matrix palette was neither.
   }
   g_repaired += fixed;
   return fixed;
+}
+
+uint64_t MaterialGateFilled() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  return g_materialGateFilled;
+}
+
+uint32_t FillMaterialGate(uint32_t* bank, uint32_t bank_regs,
+                          const uint8_t* load_written) {
+  // Runs AFTER the shader's load table, and never overwrites it. Two guards,
+  // and both matter:
+  //
+  //   load_written[d]  the shader published this dword itself. Its value is
+  //                    authoritative even when it is zero, so we do not touch
+  //                    it. This is the guard that was missing when the fill
+  //                    lived inside OverlayNonFinite: there it ran BEFORE the
+  //                    load table and was simply overwritten for terrain, while
+  //                    surviving on materials the table did not cover.
+  //   bank[d] != 0     something already supplied a value. We only ever fill a
+  //                    hole, never replace.
+  //
+  // The window is pixel c84..c87 -- guest c340..c343, the material block PM4
+  // publishes as a unit via SHADER_CONSTANT_340_X (written 330 times across the
+  // pm4 dumps). It is NOT an array, which is why the frame-global staleness of
+  // g_file that tore the vertex matrix palette apart does not apply here.
+  if (!bank || !load_written) return 0;
+  uint32_t filled = 0;
+  std::lock_guard<std::mutex> lk(g_mu);
+  // WHAT DOES PM4 ACTUALLY PUBLISH HERE? Never checked, and the whole theory
+  // rests on it: "c85.w should be 1" came from reading the shader arithmetic
+  // backwards, not from observing a published value. If PM4's own c85.w is 0 or
+  // unpublished then this fill can never set it, ordering or no ordering -- the
+  // loop skips `v == 0` and skips unpublished -- and every run so far is
+  // consistent with that. One line, once, so the assumption is either confirmed
+  // or killed instead of being reasoned about again.
+  {
+    static bool s_reported = false;
+    if (!s_reported) {
+      s_reported = true;
+      std::string w;
+      for (uint32_t c = kMaterialGateFirstConst; c < kMaterialGateEndConst; ++c) {
+        w += fmt::format(" ps c{}=[", c - kPixelBankFirstReg);
+        for (uint32_t comp = 0; comp < 4; ++comp) {
+          const uint32_t d = c * 4 + comp;
+          const bool pub = (g_have[d >> 5] & (1u << (d & 31))) != 0;
+          float f;
+          std::memcpy(&f, &g_file[d], sizeof(f));
+          w += fmt::format("{}{}{}", comp ? " " : "", pub ? "" : "unpub:", f);
+        }
+        w += "]";
+      }
+      REXLOG_INFO("gpu: MATERIAL GATE PM4 STATE --{}", w);
+    }
+  }
+  for (uint32_t c = kMaterialGateFirstConst; c < kMaterialGateEndConst; ++c) {
+    const uint32_t reg = c - kPixelBankFirstReg;  // bank is pixel-relative
+    if (reg >= bank_regs) continue;
+    for (uint32_t comp = 0; comp < 4; ++comp) {
+      const uint32_t b = reg * 4 + comp;
+      if (load_written[b]) continue;
+      if (bank[b] != 0) continue;
+      const uint32_t d = c * 4 + comp;  // g_file is indexed by guest dword
+      if (!(g_have[d >> 5] & (1u << (d & 31)))) continue;
+      const uint32_t v = g_file[d];
+      if (v == 0 || NonFinite(v)) continue;
+      bank[b] = v;
+      ++filled;
+      ++g_materialGateFilled;
+    }
+  }
+  return filled;
 }
 
 // The zero-fill population, worst first. `guest` is the ALU constant index;

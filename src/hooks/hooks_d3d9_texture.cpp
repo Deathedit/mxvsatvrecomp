@@ -2347,8 +2347,13 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
 // its dword offset from register 0x4000, so pixel constants 256..511 map to this
 // bank at reg-256. Texture fetch constants do NOT live in this list; they are
 // in the second, inline state-patch list walked by ApplyShaderFetchPatchTable.
+// `written`, when given, receives one byte per bank dword, non-zero where this
+// table published a value. FillMaterialGate needs it to distinguish "the shader
+// wrote a zero here and means it" from "nothing wrote this at all" -- those are
+// the same bits and opposite decisions.
 void ApplyShaderLoadTable(uint32_t shader, uint32_t table_at, uint32_t data_at,
-                          uint8_t* base, std::vector<uint32_t>& bank) {
+                          uint8_t* base, std::vector<uint32_t>& bank,
+                          std::vector<uint8_t>* written = nullptr) {
   if (!shader || bank.size() < 256 * 4) return;
   const uint32_t kPsLoadTableAt = table_at;
   const uint32_t kPsDataBaseAt = data_at;
@@ -2385,6 +2390,7 @@ void ApplyShaderLoadTable(uint32_t shader, uint32_t table_at, uint32_t data_at,
       if (dst >= bank.size()) continue;
       if (!HostPageReadable(REX_RAW_ADDR(src + j * 4))) continue;
       bank[dst] = REX_LOAD_U32(src + j * 4);
+      if (written && dst < written->size()) (*written)[dst] = 1;
       ++applied;
     }
     if (entries <= 4)
@@ -2567,7 +2573,19 @@ void ApplyPixelShaderLoadTable(
   if (bank.size() >= 256 * 4)
     mx::gpu::alu::OverlayNonFinite(256, bank.data(), 256,
                                    /*count_finite_zeros=*/true);
-  ApplyShaderLoadTable(shader, 0x28, 0x18, base, bank);
+  // Which dwords the shader publishes itself. Collected so the material-gate
+  // fill below can leave them alone -- including the ones it sets to zero
+  // deliberately, which is the case that makes a "fill every zero" rule wrong.
+  std::vector<uint8_t> ps_written(bank.size(), 0);
+  ApplyShaderLoadTable(shader, 0x28, 0x18, base, bank, &ps_written);
+  // AFTER the load table, not before. The first cut of this ran inside
+  // OverlayNonFinite above and was overwritten for every shader whose table
+  // covers c84..c87 -- which is the terrain -- while sticking on materials
+  // whose table does not, which is why mx_1447 changed the bike and rider and
+  // left the ground exactly as dark as before. 368,313 substitutions, none of
+  // them where it was aimed.
+  if (bank.size() >= 256 * 4)
+    mx::gpu::alu::FillMaterialGate(bank.data(), 256, ps_written.data());
   ApplyShaderFetchPatchTable(shader, 0x28, base, fetch);
   // device+0x3248 is the vertex shader object; its table sits at +0x368 with
   // its data base at +0x20.

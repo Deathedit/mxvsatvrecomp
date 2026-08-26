@@ -6054,6 +6054,12 @@ void ReportDrawCounts(uint8_t* base) {
     if (filled_zero)
       REXLOG_INFO("d3d9: ZERO-FILL BY CONSTANT:{}",
                   mx::gpu::alu::FilledHistogram(12));
+    // The narrow window that actually substitutes. Printed unconditionally,
+    // zero included: "never fired" and "fired and changed nothing" are the two
+    // outcomes worth telling apart, and a suppressed line looks like neither.
+    REXLOG_INFO("d3d9: MATERIAL GATE FILL {} substitutions (pixel c84-c87, the "
+                "PM4-only material block; c85.w is the terrain diffuse gate)",
+                mx::gpu::alu::MaterialGateFilled());
   }
   ReportDeclHistogram();
   if (REXCVAR_GET(hle_capture)) ReportCoverage(base);
