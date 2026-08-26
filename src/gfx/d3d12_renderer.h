@@ -468,6 +468,18 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // reading one this frame; releasing inline made every later create of that
   // size fail — 1834 failures in one run.
   void RetireResource(Microsoft::WRL::ComPtr<ID3D12Resource>&& res);
+  // Drop resolve snapshots that nothing has sampled for a long time, returning
+  // their SRV slots to the free list. m_gameSnapshots is keyed by GUEST OBJECT
+  // ADDRESS and had no eviction at all: the single erase in
+  // EnsureGameSnapshot only ever replaced a same-key entry. Across a map
+  // unload the guest frees those textures and allocates the next map's at
+  // different addresses, so every previous map's snapshots stayed resident
+  // forever. Four loads reached 108 of 128 live with 17540 budget refusals and
+  // 49162 draws left with no snapshot to bind -- which is the missing water and
+  // the unlit terrain wedge.
+  // Returns how many entries it freed, so the caller can tell an ordinary
+  // no-op sweep from one that failed at the hard cap.
+  uint32_t EvictGameSnapshots();
 
   void WaitForGpu();
   void MoveToNextFrame();
@@ -1443,6 +1455,30 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // refusal and an offscreen-target refusal have different causes and different
   // fixes, and reporting both as "routing refused: budget" hid the former.
   uint64_t m_snapshotRejectBudget = 0;
+  // Snapshot eviction. m_snapshotEvictBlocked is the one that matters: a sweep
+  // that ran AT THE HARD CAP and freed nothing means every live snapshot is
+  // genuinely in use, so the cap rather than the lifetime wants revisiting.
+  // Sweeps above the high water that free nothing are ordinary and uncounted --
+  // counting those would make this climb constantly and mean nothing.
+  uint64_t m_snapshotEvictions = 0;
+  uint64_t m_snapshotEvictBlocked = 0;
+  // How many frames a snapshot may go unsampled before it is evictable. Deliberately
+  // generous: the steady-state live count is ~33 against a cap of 128, so this
+  // only ever has to reclaim genuinely dead entries, and a static compositor
+  // image that is sampled rarely must survive. At 60fps this is four seconds.
+  static constexpr uint64_t kSnapshotIdleFrames = 240;
+  // Sweep at a HIGH WATER mark, not at the hard cap -- the same shape as
+  // EvictGameTexturesToHighWater, and for the same reason. Sweeping only when
+  // the cap is reached measured as a sawtooth: the map sat at 112 of 128 for a
+  // whole run, sweeping once to 60. That works, but it spends its life at 87%
+  // full, so the first map that legitimately wants a burst of new snapshots
+  // meets the wall anyway.
+  static constexpr uint32_t kSnapshotHighWater = kMaxGameSnapshots * 3 / 4;
+  // The frame of the last sweep. A sweep is a linear scan of the map, and
+  // EnsureGameSnapshot is called per resolve -- 211413 of them in one run --
+  // so once the live count is above the high water an unguarded sweep would
+  // run on every one of those calls.
+  uint64_t m_snapshotSweepFrame = UINT64_MAX;
   // Resolve snapshots. m_snapshotFallbacks is the one that matters: a draw that
   // wanted a snapshot, found none, and fell back to sampling the source
   // target's live surface — which is the old aliasing behaviour, so a large
@@ -1632,6 +1668,12 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // legitimately old -- from a leftover full-screen frame that nothing has
     // refreshed and that a draw is about to paint over the current one.
     uint64_t lastCopyFrame = 0;
+    // Snapshots only: the frame counter value at the last time this snapshot
+    // was BOUND for sampling. Distinct from lastCopyFrame, and it has to be:
+    // static compositor content is resolved once and sampled for many frames,
+    // so copy age says nothing about whether anything still wants it. Sample
+    // age does, and it is what EvictGameSnapshots evicts on.
+    uint64_t lastUsedFrame = 0;
     // Depth targets only: the EDRAM tile base this surface was rendered at.
     uint32_t edramBase = 0;
     // The format this surface was created with, so a PSO can be built to match

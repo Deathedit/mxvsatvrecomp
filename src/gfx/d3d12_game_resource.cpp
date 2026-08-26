@@ -690,8 +690,18 @@ bool D3D12Renderer::CreatePooledSurface(GameRenderTarget& entry, uint32_t width,
   // Claimed only once the resource exists. Claiming before the call leaks a
   // descriptor on every failure, and the caller retries the same object every
   // frame — that drained the heap to 1024/1024 in about twenty seconds.
-  entry.srvIndex =
-      reuseSrvIndex != UINT32_MAX ? reuseSrvIndex : m_nextGameSrvDescriptor++;
+  // A recycled slot before a fresh one, matching EnsureGameTexture. Without
+  // this the free list EvictGameSnapshots pushes to would only ever be drained
+  // by textures, and the descriptor allocator would stay a ratchet even once
+  // the snapshot map stopped being one.
+  if (reuseSrvIndex != UINT32_MAX) {
+    entry.srvIndex = reuseSrvIndex;
+  } else if (!m_freeGameSrvDescriptors.empty()) {
+    entry.srvIndex = m_freeGameSrvDescriptors.back();
+    m_freeGameSrvDescriptors.pop_back();
+  } else {
+    entry.srvIndex = m_nextGameSrvDescriptor++;
+  }
 
   D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
   srv.Format = spec.srvFormat;
@@ -1069,6 +1079,41 @@ void D3D12Renderer::QueueLuminanceReadback(GameRenderTarget* snap,
   m_luminancePending[m_frameIndex] = 1;
 }
 
+// Reclaim snapshots nothing has sampled for kSnapshotIdleFrames.
+//
+// Idle-only, never least-recently-used-to-make-room. The steady-state live
+// count is ~33 against a cap of 128, so everything above that is a dead map's
+// leftovers and an idle sweep reclaims exactly those. Evicting the coldest
+// LIVE entry to force progress would instead thrash a snapshot the guest still
+// samples, and a snapshot that is merely sampled rarely -- static compositor
+// content, resolved once -- is legitimate. If a sweep frees nothing the caller
+// still refuses, and m_snapshotEvictBlocked says so, which is the signal that
+// the cap rather than the lifetime is what wants revisiting.
+uint32_t D3D12Renderer::EvictGameSnapshots() {
+  const size_t before = m_gameSnapshots.size();
+  for (auto it = m_gameSnapshots.begin(); it != m_gameSnapshots.end();) {
+    // Unsigned, so compare rather than subtract: a snapshot stamped on a later
+    // frame than m_gameFrame would otherwise wrap to a huge age and be evicted
+    // on the spot.
+    const bool idle = m_gameFrame > it->second.lastUsedFrame &&
+                      (m_gameFrame - it->second.lastUsedFrame) >=
+                          kSnapshotIdleFrames;
+    if (!idle) {
+      ++it;
+      continue;
+    }
+    // The descriptor goes back to the shared pool, and the resource goes to the
+    // retirement list rather than being released inline -- the GPU may still be
+    // reading it this frame. Releasing inline is what made every later create
+    // of that size fail; see RetireResource.
+    if (it->second.resource) RetireResource(std::move(it->second.resource));
+    m_freeGameSrvDescriptors.push_back(it->second.srvIndex);
+    it = m_gameSnapshots.erase(it);
+    ++m_snapshotEvictions;
+  }
+  return uint32_t(before - m_gameSnapshots.size());
+}
+
 D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameSnapshot(
     uint32_t destTexture, uint32_t width, uint32_t height,
     DXGI_FORMAT format) {
@@ -1125,18 +1170,42 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameSnapshot(
     RetireResource(std::move(it->second.resource));
     m_gameSnapshots.erase(it);
   }
+  // Reclaim dead entries before declaring the budget spent. Without this the
+  // map is a ratchet -- see the note on EvictGameSnapshots.
+  //
+  // Once per frame at the high water, and unconditionally at the hard cap: the
+  // once-per-frame guard keeps the scan off the per-resolve path, but a frame
+  // that reaches the cap having already swept must still get a second chance
+  // rather than refuse.
+  if (reuseSrvIndex == UINT32_MAX &&
+      m_gameSnapshots.size() >= kSnapshotHighWater &&
+      (m_snapshotSweepFrame != m_gameFrame ||
+       m_gameSnapshots.size() >= kMaxGameSnapshots)) {
+    m_snapshotSweepFrame = m_gameFrame;
+    // Counted as blocked ONLY at the hard cap. Above the high water a sweep
+    // that frees nothing is ordinary -- the working set is simply large and
+    // nothing has aged out yet -- so counting those would make this climb
+    // constantly and mean nothing. At the cap it means the very next snapshot
+    // gets refused, which is the thing worth seeing.
+    const bool atCap = m_gameSnapshots.size() >= kMaxGameSnapshots;
+    if (EvictGameSnapshots() == 0 && atCap) ++m_snapshotEvictBlocked;
+  }
   // Counted apart from m_rtRejectBudget. Sharing that counter put snapshot
   // refusals in the "game RT routing" line, where they read as an offscreen
   // target being refused -- 1894 of them sat there being read as something else
   // while the post-process chain went unresolved.
   if (reuseSrvIndex == UINT32_MAX &&
       (m_gameSnapshots.size() >= kMaxGameSnapshots ||
-       m_nextGameSrvDescriptor >= kMaxGameTextures)) {
+       (m_freeGameSrvDescriptors.empty() &&
+        m_nextGameSrvDescriptor >= kMaxGameTextures))) {
     ++m_snapshotRejectBudget;
     return nullptr;
   }
 
   GameRenderTarget entry;
+  // Stamped at creation, not left at 0: a fresh snapshot would otherwise
+  // read as maximally idle and be the first thing the next sweep evicted.
+  entry.lastUsedFrame = m_gameFrame;
   entry.width = width;
   entry.height = height;
   // No RTV: a snapshot is only ever a copy destination and a shader resource.

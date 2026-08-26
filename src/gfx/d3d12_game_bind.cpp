@@ -94,6 +94,12 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
       // A resolve result: sample the snapshot the guest resolved into, which is
       // the same resource the stand-in path samples for this object.
       auto it = m_gameSnapshots.find(object);
+      // Stamped here, on the bind, because this is the one place that means the
+      // snapshot was actually handed to a draw. EvictGameSnapshots reclaims on
+      // this stamp, so anything not stamped here is by definition unreferenced.
+      if (it != m_gameSnapshots.end() && it->second.resource) {
+        it->second.lastUsedFrame = m_gameFrame;
+      }
       if (it == m_gameSnapshots.end() || !it->second.resource) {
         // TRIED AND REMOVED: binding a 1x1 far-plane (white) stand-in here
         // instead of failing the draw. The intent was that a depth resolve can

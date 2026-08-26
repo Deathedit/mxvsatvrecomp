@@ -1146,6 +1146,10 @@ void D3D12Renderer::RenderGameFrame() {
           d.sampledTextureObject && !depthSnapshot &&
           snap != m_gameSnapshots.end() && !snap->second.stale) {
         sampledPtr = &snap->second;
+        // The stand-in path bypasses BindTranslatedTextures, so it has to stamp
+        // its own use or EvictGameSnapshots would reclaim snapshots that only
+        // this path ever samples.
+        snap->second.lastUsedFrame = m_gameFrame;
         ++m_snapshotHits;
         if (snap->second.width * 2 >= m_width) {
           const uint64_t age = m_gameFrame - snap->second.lastCopyFrame;
@@ -1750,7 +1754,8 @@ void D3D12Renderer::RenderGameFrame() {
                   "resolve snapshots: copies %llu, hits %llu, FALLBACKS %llu, "
                   "source-not-offscreen %llu, WHITE-SKIPPED %llu, "
                   "BLANK-SOURCE %llu, STALE-REFUSED %llu; live snapshots %u/%u "
-                  "(REFUSED-BUDGET %llu), "
+                  "(REFUSED-BUDGET %llu, evicted %llu, sweeps freeing "
+                  "nothing %llu), "
                   "DEPTH resolves %llu (%llu band-stitched) from %zu depth "
                   "surfaces, stand-in depth refused %llu, "
                   "aliased-source matches %llu (+%llu contained, +%llu "
@@ -1764,6 +1769,8 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_snapshotStaleRefused),
                   uint32_t(m_gameSnapshots.size()), kMaxGameSnapshots,
                   static_cast<unsigned long long>(m_snapshotRejectBudget),
+                  static_cast<unsigned long long>(m_snapshotEvictions),
+                  static_cast<unsigned long long>(m_snapshotEvictBlocked),
                   static_cast<unsigned long long>(m_depthResolves),
                   static_cast<unsigned long long>(m_depthBandResolves),
                   m_gameDepthTargets.size(),
@@ -2917,6 +2924,9 @@ void D3D12Renderer::PresentGameFrame() {
       auto it = m_gameSnapshots.find(m_presentResolveTexture);
       if (it != m_gameSnapshots.end() && it->second.resource &&
           !it->second.stale) {
+        // Present does not go through BindTranslatedTextures, so without this
+        // the one snapshot the whole frame is built from would age out.
+        it->second.lastUsedFrame = m_gameFrame;
         presentSource = &it->second;
       }
     }
