@@ -405,8 +405,8 @@ class Emitter {
     switch (op) {
       case Op::kAdd: r = "(" + a + " + " + b + ")"; break;
       case Op::kMul: r = "XeMul(" + a + ", " + b + ")"; break;
-      case Op::kMax: r = "max(" + a + ", " + b + ")"; break;
-      case Op::kMin: r = "min(" + a + ", " + b + ")"; break;
+      case Op::kMax: r = "XeMax(" + a + ", " + b + ")"; break;
+      case Op::kMin: r = "XeMin(" + a + ", " + b + ")"; break;
       case Op::kSeq: r = "float4(" + a + " == " + b + ")"; break;
       case Op::kSgt: r = "float4(" + a + " > " + b + ")"; break;
       case Op::kSge: r = "float4(" + a + " >= " + b + ")"; break;
@@ -418,7 +418,7 @@ class Emitter {
         // max, plus the address-register side effect: a0 = clamp(floor(w+0.5)).
         // The clamp is the hardware's signed 9-bit range.
         Line("xe_a0 = (int)clamp(floor((" + a + ").w + 0.5), -256.0, 255.0);");
-        r = "max(" + a + ", " + b + ")";
+        r = "XeMax(" + a + ", " + b + ")";
         break;
       case Op::kMad:
         r = "(XeMul(" + a + ", " + b + ") + " + Src(alu, 3) + ")";
@@ -441,7 +441,7 @@ class Emitter {
             ").x).xxxx";
         break;
       case Op::kMax4: {
-        r = "max(max((" + a + ").x, (" + a + ").y), max((" + a + ").z, (" + a +
+        r = "XeMax(XeMax((" + a + ").x, (" + a + ").y), XeMax((" + a + ").z, (" + a +
             ").w)).xxxx";
         break;
       }
@@ -621,8 +621,8 @@ class Emitter {
       case Op::kAdds: r = "(" + a + " + " + b + ")"; break;
       case Op::kMuls: r = "XeMul(" + a + ", " + b + ")"; break;
       case Op::kSubs: r = "(" + a + " - " + b + ")"; break;
-      case Op::kMaxs: r = "max(" + a + ", " + b + ")"; break;
-      case Op::kMins: r = "min(" + a + ", " + b + ")"; break;
+      case Op::kMaxs: r = "XeMax(" + a + ", " + b + ")"; break;
+      case Op::kMins: r = "XeMin(" + a + ", " + b + ")"; break;
       case Op::kSeqs: r = "float(" + a + " == 0.0)"; break;
       case Op::kSgts: r = "float(" + a + " > 0.0)"; break;
       case Op::kSges: r = "float(" + a + " >= 0.0)"; break;
@@ -683,12 +683,12 @@ class Emitter {
       case Op::kMaxAs:
         // The address source and left maximum operand are both scalar a.
         Line("xe_a0 = (int)clamp(floor(" + a + " + 0.5), -256.0, 255.0);");
-        r = "max(" + a + ", " + b + ")";
+        r = "XeMax(" + a + ", " + b + ")";
         break;
       case Op::kMaxAsf:
         // The floor variant: truncates toward negative infinity, same clamp.
         Line("xe_a0 = (int)clamp(floor(" + a + "), -256.0, 255.0);");
-        r = "max(" + a + ", " + b + ")";
+        r = "XeMax(" + a + ", " + b + ")";
         break;
       case Op::kRetainPrev: r = "xe_ps"; break;
       // The predicate-set family. p0 itself is NOT honoured yet — nothing reads
@@ -1900,6 +1900,57 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
       "float4 XeMul(float4 a, float4 b) {\n"
       "  return float4(XeMul(a.x, b.x), XeMul(a.y, b.y), XeMul(a.z, b.z),\n"
       "                XeMul(a.w, b.w));\n"
+      "}\n"
+      // ---- Shader Model 3 min/max ------------------------------------------
+      // `a op b ? a : b`, NOT the HLSL intrinsics. The difference is NaN and
+      // only NaN: D3D min/max return the NON-NaN operand, so max(5, NaN) is 5,
+      // while the SM3 form asks `5 >= NaN`, which is false, and yields NaN.
+      // The console propagates; the intrinsic swallows.
+      //
+      // The same reference note that carries the legacy-multiply rule above
+      // ends "and for NaN in min/max. It is very important to respect"
+      // (ucode.h:975), and Xenia implements it deliberately in BOTH of its
+      // translators -- "Shader Model 3 NaN behavior (a op b ? a : b, not
+      // fmax/fmin)" at dxbc_shader_translator_alu.cc:131, :631, :761, :880 and
+      // spirv_shader_translator_alu.cc:452, :1160.
+      //
+      // This closes an EMITTER/INTERPRETER DIVERGENCE, which is the precise
+      // hazard the XeMul note warns about: shader_alu.cpp has always used the
+      // SM3 form (:308, :309, :447, :448), so one draw could change colour
+      // depending on which path served it, and a debug_pixel trace would
+      // disagree with the interpreter.
+      //
+      // A helper rather than an inline ternary because the operands are
+      // expression STRINGS, some large (`-(abs(r[0].xxxx))`), and expanding
+      // each twice per min/max would bloat every shader against
+      // kInstructionCap for no benefit.
+      //
+      // Deliberately NOT applied to: kLogc/kRsqc, whose max/min against
+      // +-FLT_MAX is part of those opcodes' own clamped semantics; the
+      // vertex-fetch SNORM `max(x, -1.0)`, a format rule; or the 7e3 output
+      // clamp, which models the ROP -- there D3D NaN->0 IS the hardware
+      // behaviour being reproduced.
+      "float XeMax(float a, float b) { return a >= b ? a : b; }\n"
+      "float XeMin(float a, float b) { return a < b ? a : b; }\n"
+      "float2 XeMax(float2 a, float2 b) {\n"
+      "  return float2(XeMax(a.x, b.x), XeMax(a.y, b.y));\n"
+      "}\n"
+      "float2 XeMin(float2 a, float2 b) {\n"
+      "  return float2(XeMin(a.x, b.x), XeMin(a.y, b.y));\n"
+      "}\n"
+      "float3 XeMax(float3 a, float3 b) {\n"
+      "  return float3(XeMax(a.x, b.x), XeMax(a.y, b.y), XeMax(a.z, b.z));\n"
+      "}\n"
+      "float3 XeMin(float3 a, float3 b) {\n"
+      "  return float3(XeMin(a.x, b.x), XeMin(a.y, b.y), XeMin(a.z, b.z));\n"
+      "}\n"
+      "float4 XeMax(float4 a, float4 b) {\n"
+      "  return float4(XeMax(a.x, b.x), XeMax(a.y, b.y), XeMax(a.z, b.z),\n"
+      "                XeMax(a.w, b.w));\n"
+      "}\n"
+      "float4 XeMin(float4 a, float4 b) {\n"
+      "  return float4(XeMin(a.x, b.x), XeMin(a.y, b.y), XeMin(a.z, b.z),\n"
+      "                XeMin(a.w, b.w));\n"
       "}\n"
       "float XeDot2(float2 a, float2 b) {\n"
       "  float2 p = XeMul(a, b);\n"
