@@ -36,6 +36,7 @@
 // exists to prevent.
 #include <rex/graphics/format/ucode.h>
 
+#include "gpu/guard_census.h"
 #include "gpu/d3d9_draw.h"
 #include "gpu/d3d9_layout.h"
 #include "gpu/d3d9_texture.h"
@@ -2270,6 +2271,9 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   //
   // The DETECTION stays, and its log line with it: a uniform decode is worth
   // knowing about, and the line now says outright whether a fallback exists.
+  // Population is every decode that reaches this test; fires are the ones that
+  // came out uniform and get recorded as blank.
+  mx::gpu::guard::Note(mx::gpu::guard::Guard::kBlankTexturePayload, decode_is_blank);
   if (decode_is_blank) {
     NoteBlankDecode(key);
     // Memory had nothing and a partly-written snapshot exists: its resolved
@@ -2978,6 +2982,12 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
   }
   if (!resolved) {
     resolved = PixelShaderForDeviceStrict(device);
+    // Population is every draw that arrives with no shader from either of the
+    // two per-device sources; fires are the ones we hand *a* shader from the
+    // cross-thread record. Not "every draw" -- a draw that already had its own
+    // shader never gave this guard an opportunity, and counting it would make
+    // the rate look vanishingly small.
+    mx::gpu::guard::Note(mx::gpu::guard::Guard::kCrossThreadPixelShader, resolved != 0);
     if (resolved) ++g_psFromDeviceRecord;
   }
   if (resolved) {

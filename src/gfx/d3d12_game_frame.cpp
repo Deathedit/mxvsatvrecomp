@@ -920,6 +920,10 @@ void D3D12Renderer::RenderGameFrame() {
     // would be invalid work against a pipeline that expects one.
     const bool depthOnlyPass =
         !d.targetObject && d.depthObject && d.depthWidth && d.depthHeight;
+    // A depth-only draw gets a colour attachment it never asked for, because
+    // every PSO declares NumRenderTargets = 1. Population is every draw
+    // considered; fires are the ones handed a scratch target.
+    mx::gpu::guard::Note(mx::gpu::guard::Guard::kScratchColourTarget, depthOnlyPass);
     const uint32_t targetObject = depthOnlyPass ? d.depthObject : d.targetObject;
     const uint32_t targetWidth = depthOnlyPass ? d.depthWidth : d.targetWidth;
     const uint32_t targetHeight = depthOnlyPass ? d.depthHeight : d.targetHeight;
@@ -2938,6 +2942,10 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
         const float cs[4] = {1.0f,
                              float7e3 ? 31.875f : 0.0f,
                              float7e3 ? 1.0f : 0.0f, 0.0f};
+        // The output clamp. Population is every draw that publishes
+        // xe_colorscale; fires are the ones given a clamping range rather than
+        // the pass-through (0 in .y disables it shader-side).
+        mx::gpu::guard::Note(mx::gpu::guard::Guard::kOutputClamp, float7e3);
         if (float7e3) ++m_float7e3Clamped;
         std::memcpy(static_cast<uint8_t*>(p) + bankBytes + texInvBytes +
                         texSignBytes + paramGenBytes + alphaTestBytes,

@@ -53,6 +53,7 @@
 // exists to prevent.
 #include <rex/graphics/format/ucode.h>
 
+#include "gpu/guard_census.h"
 #include "gpu/d3d9_draw.h"
 #include "gpu/d3d9_layout.h"
 #include "gpu/d3d9_texture.h"
@@ -5427,6 +5428,24 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
     // still prints, and the recycle count now rides on the coverage line below
     // where someone reading coverage will see it.
     if (stage == mx::hle::HlslStage::kVertex) {
+      // INTERPOLATOR ZERO-FILL. Every slot in the linkage that this vertex
+      // shader does not export is emitted as its float4(0,0,0,0) initialiser
+      // and reaches the pixel stage as a literal zero -- invented output, and
+      // the reason the terrain PS was once thought to be reading a missing
+      // interpolator. Counted per DISTINCT SHADER, not per draw: it is a
+      // property of the translation, and weighting it by draw count would make
+      // one hot shader look like a systemic rate.
+      //
+      // Counted here rather than in the emitter because shader_hlsl.cpp is a
+      // pure translation unit with no logging, deliberately, and every other
+      // shader diagnostic is already reported from this caller.
+      // One Note per slot: population 8, fires the unexported ones. The first
+      // cut tried to add the population in bulk and then the fires with
+      // weight 0 -- which Note() drops on the floor, because a zero weight is
+      // no opportunity at all. Fires would have read 0 forever.
+      for (uint32_t i = 0; i < mx::hle::kHlslInterpolatorLinkage; ++i)
+        mx::gpu::guard::Note(mx::gpu::guard::Guard::kInterpolatorZeroFill,
+                             (out.export_mask & (1u << i)) == 0);
       static std::set<uint64_t> s_census;
       const uint64_t census_key = (uint64_t(handle) << 32) ^
                                   (uint64_t(out.max_const_index) << 24) ^
