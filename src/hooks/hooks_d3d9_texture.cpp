@@ -2980,16 +2980,36 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
       REXLOG_INFO("d3d9: {}", ShaderTranslationSummary());
     }
   }
-  if (!resolved) {
-    resolved = PixelShaderForDeviceStrict(device);
-    // Population is every draw that arrives with no shader from either of the
-    // two per-device sources; fires are the ones we hand *a* shader from the
-    // cross-thread record. Not "every draw" -- a draw that already had its own
-    // shader never gave this guard an opportunity, and counting it would make
-    // the rate look vanishingly small.
-    mx::gpu::guard::Note(mx::gpu::guard::Guard::kCrossThreadPixelShader, resolved != 0);
-    if (resolved) ++g_psFromDeviceRecord;
-  }
+  // THE CROSS-THREAD PIXEL SHADER FALLBACK IS GONE. Deleted 2026-08-27, the
+  // second guard removed under docs/strict_mode.md.
+  //
+  // It called PixelShaderForDeviceStrict(device) for any draw that arrived with
+  // no shader from either per-device source, so a draw could run a program
+  // bound on another thread. Measured across both scenes it never once supplied
+  // one:
+  //
+  //   freeroam  cross-thread-ps  0/36062
+  //   menu      cross-thread-ps  0/5804
+  //
+  // and the population is not draws we are failing -- it is draws that
+  // correctly have no pixel program. NULL-PS TARGETS, both scenes: every one
+  // binds depth only, or binds colour with the write mask OFF. WOULD PAINT 0 of
+  // 30536 in freeroam, 0 of 2098 in the menu. A null pixel shader on a draw
+  // that writes no colour is a depth prepass, which is what these are.
+  //
+  // It also settles the hypothesis at the probe above: NO-PS DEVICES reports
+  // ONE device on ONE thread (0x2123DE00/t16604) and SETTER DEVICES lists that
+  // same device at 0x00000000. Not the three-worker-device mix-up that was
+  // feared -- the guest genuinely called SetPixelShader(NULL).
+  //
+  // THE 4.45 -> 9.88 FPS MENU WIN IN THE HISTORY IS NOT THIS FUNCTION. There
+  // are two: PixelShaderForDevice falls back to the last shader seen on ANY
+  // device, and PixelShaderForDeviceStrict is per-device only, "kept separate
+  // rather than changing the existing function". That speedup came from the
+  // any-device one. Strict is still called from the SQ_PROGRAM_CNTL ATDRAW
+  // diagnostic in hooks_d3d9.cpp, which prints it beside `any` precisely to
+  // show when a device never received SetPixelShader -- that caller reports,
+  // it does not bind, and it stays.
   if (resolved) {
     // Normally reached via ReadBoundPixelShader, which is below the contest and
     // therefore never ran for these draws -- so their microcode was never
@@ -3026,12 +3046,15 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
       // reaching here may well be running a translated shader with every slot
       // bound. Left as it was, the next reader would diagnose 80,000 lost
       // draws that are not lost.
+      // The "rescued by the per-device record" figure is GONE with the
+      // fallback that produced it. Leaving it would print a permanent zero,
+      // which reads as a measurement of a mechanism that no longer exists --
+      // the same trap as a counter that cannot fire.
       REXLOG_INFO("d3d9: stand-in has no single texture to sample: {} of {} "
-                  "attempts ({} with no setter handle at all, {} rescued by "
-                  "the per-device record); this one setter=0x{:08X}, "
-                  "device+0x3244=0x{:08X}",
-                  s_no_shader, s_attempts, s_no_shader_no_setter,
-                  g_psFromDeviceRecord, pixel_shader, direct);
+                  "attempts ({} with no setter handle at all); this one "
+                  "setter=0x{:08X}, device+0x3244=0x{:08X}",
+                  s_no_shader, s_attempts, s_no_shader_no_setter, pixel_shader,
+                  direct);
     }
     return false;
   }

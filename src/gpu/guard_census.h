@@ -43,7 +43,6 @@ namespace mx::gpu::guard {
 enum class Guard : uint32_t {
   kStandInDraw,             // a tex*col colour when no shader resolved
   kScratchColourTarget,     // a colour attachment for a depth-only draw
-  kCrossThreadPixelShader,  // *a* pixel shader when the draw carries none
   kBlankTexturePayload,     // a blank decode for a texture that read empty
   kConstantNanToZero,       // OverlayNonFinite NaN -> 0
   kMaterialGateFill,        // FillMaterialGate PM4 substitution

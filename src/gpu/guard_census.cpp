@@ -22,8 +22,7 @@ std::array<Counters, size_t(Guard::kCount)> g_counters;
 
 constexpr const char* kNames[size_t(Guard::kCount)] = {
     "stand-in-draw",        "scratch-colour-target",
-    "cross-thread-ps",      "blank-texture",
-    "constant-nan-to-zero",
+    "blank-texture",        "constant-nan-to-zero",
     "material-gate-fill",   "vertex-zero-fill",
     "interpolator-zero-fill", "output-clamp",
 };

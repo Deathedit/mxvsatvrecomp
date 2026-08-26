@@ -1096,7 +1096,6 @@ std::string PixelShaderDeviceSummary() {
 
 // How often the per-device record is what rescues a draw. Read against
 // s_no_shader_no_setter: the gap between them is draws still unattributed.
-uint64_t g_psFromDeviceRecord = 0;
 // Luminance readings replaced by the floor because the GPU reported exactly
 // zero. Should be a handful at startup; a number that keeps climbing means the
 // reduction chain is producing nothing and the floor is masking that.

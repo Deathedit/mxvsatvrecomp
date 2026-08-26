@@ -213,7 +213,6 @@ extern VsWindowCensus g_vsWindow;           // 7 patch-window counters
 extern ResolveAddressCensus g_resolveAddr;  // 3 resolve-address counters
 extern ShaderPatchState g_patch;            // psBlobs / codeOffsets / patched
 extern TexDecodeIndex g_texIndex;           // decode sites and keys
-extern uint64_t g_psFromDeviceRecord;       // the one that resisted grouping
 
 // ---- constants -------------------------------------------------------------
 constexpr uint32_t kHostPageSize = 4096;
