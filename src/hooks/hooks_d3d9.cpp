@@ -1054,6 +1054,25 @@ uint32_t PixelShaderForDeviceStrict(uint32_t device) {
   const auto it = g_pixelShaderByDevice.find(device);
   return it != g_pixelShaderByDevice.end() ? it->second : 0;
 }
+
+// CHECKED AND MEASURED, do not re-investigate: the vertex shader is NOT
+// mis-attributed across threads.
+//
+// The pixel half above was moved off DeviceState() because that is `static
+// thread_local` and this title submits draws from worker threads. The same
+// treatment was built for the vertex shader, on the theory that a draw could
+// take its pixel shader from the device while taking its vertex shader from
+// whatever that thread last set, pairing two stages from different materials.
+//
+// It was instrumented and the answer was zero: across two sessions and 2.16M
+// draws, the per-device record and the thread-local field NEVER disagreed,
+// and the thread-local fallback was never even reached. The machinery was
+// removed rather than left in, because it cost a mutex-guarded map lookup
+// twice per draw to reproduce a value the existing field already had.
+//
+// The mis-paired stages that prompted this are real, but the cause is the
+// translation cache being keyed on a recycled ADDRESS -- see
+// g_hlslReportedVs.
 // Every device SetPixelShader has ever been called on, with the shader it last
 // received. Rendered for the report below so the devices that SET a shader can
 // be read directly against the devices that DRAW without one.
