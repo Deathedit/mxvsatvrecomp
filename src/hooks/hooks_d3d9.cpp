@@ -1641,7 +1641,8 @@ bool CaptureVertexConstants(uint32_t device, uint8_t* base, uint32_t shader,
   // Applied BEFORE the shader's own load table so a per-draw literal still
   // wins its slots — the hardware order, same reasoning as the comment on
   // OverlayShaderConstants.
-  mx::gpu::alu::OverlayNonFinite(0, out.data(), kD3d9ConstRegs);
+  mx::gpu::alu::OverlayNonFinite(0, out.data(), kD3d9ConstRegs,
+                                 /*count_finite_zeros=*/true);
   // One bit per register: did it hold a NaN before the shader's literal overlay
   // ran? Everything up to this point is per-DEVICE and shared by every draw;
   // OverlayShaderConstants is the only per-SHADER step, so this is the split
@@ -5511,13 +5512,21 @@ void ReportDrawCounts(uint8_t* base) {
   // `constants seen` — with zero seen, the PM4 feed is not reaching the file and
   // the repair count says nothing at all.
   {
-    uint64_t written = 0, repaired = 0, zeroed = 0;
+    uint64_t written = 0, repaired = 0, zeroed = 0, filled_zero = 0;
     uint32_t seen = 0;
-    mx::gpu::alu::Stats(written, repaired, seen, zeroed);
+    mx::gpu::alu::Stats(written, repaired, seen, zeroed, filled_zero);
     REXLOG_INFO("d3d9: ALU constant file — {} dwords written by PM4 over {} "
                 "distinct constants; {} repaired from PM4, {} NaN set to the "
-                "power-on 0.0; shader load-table overlays {}",
-                written, seen, repaired, zeroed, g_shaderConstOverlays);
+                "power-on 0.0, {} finite zeros PM4 could fill but we do NOT "
+                "(measurement only); shader load-table overlays {}",
+                written, seen, repaired, zeroed, filled_zero,
+                g_shaderConstOverlays);
+    // Which constants the zero-fill hit. A short tail means the fill can be
+    // narrowed to a range; a long one means the frame-global PM4 file is simply
+    // the wrong authority for a mid-frame draw, and the fix is upstream.
+    if (filled_zero)
+      REXLOG_INFO("d3d9: ZERO-FILL BY CONSTANT:{}",
+                  mx::gpu::alu::FilledHistogram(12));
   }
   ReportDeclHistogram();
   if (REXCVAR_GET(hle_capture)) ReportCoverage(base);

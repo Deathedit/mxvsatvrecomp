@@ -49,8 +49,26 @@ void NoteType0Write(uint32_t reg_base, const uint32_t* data, uint32_t count);
 // value — a register the PM4 stream never wrote either is left alone, which is
 // the line `hle_sanitize_constants` crossed when it zeroed non-finites and was
 // retired for it.
+//
+// SINCE 2026-08-26 it ALSO substitutes where our bank holds a finite ZERO and
+// PM4 published a non-zero value there — a case the loop above cannot reach,
+// because it opens by skipping finite values.
+//
+// THAT SECOND PASS IS NOT VALIDATED. It fired 6,705,127 times in a 1020-frame
+// menu run, did not brighten the scene it was written for, and introduced a
+// visible fault in the menu. Read `filled_zero` as a WARNING — "we overrode
+// this many zeros the guest may have meant" — not as a repair count.
+// `count_finite_zeros` enables the second pass, which MEASURES ONLY — it counts
+// components our sources left at a finite zero that Type-0 PM4 published a
+// value for, and changes nothing. Both banks, since it is now harmless.
+//
+// It briefly SUBSTITUTED those values and that was wrong in both banks: vertex
+// sprayed a stride-6 matrix palette and tore the geometry apart, pixel still
+// flashed and never brightened. `g_file` is frame-global last-write-wins, so a
+// mid-frame draw gets the frame's final constants — fine for rare NaN repair,
+// destructive the moment it reaches an array.
 uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
-                          uint32_t reg_count);
+                          uint32_t reg_count, bool count_finite_zeros);
 
 // Dwords written by PM4, dwords repaired, and how many distinct constants the
 // file has ever seen written. For the report line.
@@ -59,7 +77,13 @@ uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
 // different claims: one replays a value the GPU was given, the other supplies
 // the hardware default.
 void Stats(uint64_t& written, uint64_t& repaired, uint32_t& constants_seen,
-           uint64_t& zeroed);
+           uint64_t& zeroed, uint64_t& filled_zero);
+
+// Which constants the zero-fill actually touched, worst first. The total alone
+// cannot distinguish "a handful of registers" from "spraying the whole bank",
+// and those want opposite fixes — narrow the range, or stop treating a
+// frame-global PM4 file as authoritative for a mid-frame draw.
+std::string FilledHistogram(uint32_t top);
 
 }  // namespace alu
 

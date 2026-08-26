@@ -2513,7 +2513,8 @@ void ApplyPixelShaderLoadTable(
   // guest c256..c511, so first_reg is 256 — this is the one that matters, since
   // the measured NaN block is c392..c395 and lands here as xe_c[136..139].
   if (bank.size() >= 256 * 4)
-    mx::gpu::alu::OverlayNonFinite(256, bank.data(), 256);
+    mx::gpu::alu::OverlayNonFinite(256, bank.data(), 256,
+                                   /*count_finite_zeros=*/true);
   ApplyShaderLoadTable(shader, 0x28, 0x18, base, bank);
   ApplyShaderFetchPatchTable(shader, 0x28, base, fetch);
   // device+0x3248 is the vertex shader object; its table sits at +0x368 with

@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <array>
 #include <mutex>
+#include <string>
+#include <vector>
 
 #include <rex/logging.h>
 
@@ -70,6 +72,16 @@ uint32_t g_have[kFileDwords / 32] = {};
 uint64_t g_written = 0;
 uint64_t g_repaired = 0;
 uint64_t g_zeroed = 0;
+// Components substituted from the PM4 file where our own bank held a finite
+// ZERO. Separate from g_repaired on purpose: that one replays a value over a
+// NaN nobody could have meant, this one overrides a zero the guest might have
+// meant. Different claims, different counters.
+uint64_t g_filledZero = 0;
+// WHICH constants the zero-fill touches, per guest constant index. The total
+// alone cannot say whether the fill is hitting a handful of registers or
+// spraying the bank, and those want opposite fixes: the first narrows to a
+// range, the second means the PM4 file is the wrong authority per draw.
+uint64_t g_filledByConst[kAluConstants] = {};
 
 bool NonFinite(uint32_t bits) {
   // IEEE-754: exponent all ones is Inf (mantissa 0) or NaN (mantissa non-zero).
@@ -110,7 +122,7 @@ void NoteType0Write(uint32_t reg_base, const uint32_t* data, uint32_t count) {
 }
 
 uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
-                          uint32_t reg_count) {
+                          uint32_t reg_count, bool count_finite_zeros) {
   if (!bank || first_reg >= kAluConstants) return 0;
   const uint32_t regs = std::min(reg_count, kAluConstants - first_reg);
   uint32_t fixed = 0;
@@ -149,16 +161,101 @@ uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
       ++g_zeroed;
     }
   }
+
+  // SECOND PASS: a component our sources left at a FINITE ZERO, which PM4
+  // published a non-zero value for. The pass above cannot reach these -- it
+  // opens with `if (!NonFinite(cur)) continue;` and a zero is finite -- so a
+  // constant whose ONLY publisher is Type-0 PM4 stayed 0.0 forever.
+  //
+  // `SHADER_CONSTANT_340_X(0x4550)` is written 330 times across the pm4 dumps
+  // (182 x cnt=16 -> guest c340-343, 148 x cnt=32 -> c340-347) = PIXEL c84-c87,
+  // and the menu rider's material gates a lighting term on c85.w:
+  //
+  //     saturate(tex1.x + c85.w - 1)     w=1 -> tex1.x ;  w=0 -> 0
+  //
+  // Guards keep this away from the retired `hle_sanitize_constants`: exact
+  // zeros only, only where PM4 genuinely published, never substituting a zero
+  // or a non-finite. Callers apply the shader load tables AFTER this, so those
+  // still override it.
+  //
+  // MEASURED CONSEQUENCE, 2026-08-26 (mx_1367): 6,705,127 substitutions in a
+  // 1020-frame menu run, 1.87% of the bank dwords rebuilt. It did NOT brighten
+  // the scene, and the menu developed a new visual fault. So on this title the
+  // population it reaches is dominated by zeros the guest MEANT, and the
+  // residual risk documented below is not residual -- it is the common case.
+  // Kept at the user's instruction; treat a non-zero `filled_zero` as a warning
+  // rather than a repair until that fault is understood.
+  //
+  // Both banks now, because it no longer mutates. The histogram is why it must
+  // not: with substitution on, the vertex top was With it on everywhere the
+  // top of the fill was c175/c176/c177 and a run at c155, c161, c167, c173,
+  // c179, c185 -- STRIDE 6, counts decaying smoothly -- a matrix palette being
+  // filled entry by entry with end-of-frame values. Corrupted skinning is
+  // exactly what the menu "trying to do a shader it can't" looked like. 207
+  // distinct constants, so this is not a range to narrow; the frame-global file
+  // is simply the wrong authority for a mid-frame VERTEX draw.
+  for (uint32_t i = 0; count_finite_zeros && i < regs * 4; ++i) {
+    if (bank[i] != 0) continue;
+    const uint32_t d = first_reg * 4 + i;
+    if (!(g_have[d >> 5] & (1u << (d & 31)))) continue;
+    const uint32_t v = g_file[d];
+    if (v == 0 || NonFinite(v)) continue;
+    // DRY RUN. This used to assign `bank[i] = v`, and that was wrong in BOTH
+    // banks: vertex, where it sprayed a stride-6 matrix palette (c155, c161,
+    // c167 ...) with end-of-frame values and tore the geometry apart; and
+    // pixel, where 84 constants including the runs ps c68-c71 and ps c231-c236
+    // still produced flashing and no brightening.
+    //
+    // The cause is that `g_file` is FRAME-GLOBAL last-write-wins: it has no
+    // notion of when in the frame a value was written, so a mid-frame draw gets
+    // the frame's final constants. Harmless for NaN repair, which is rare and
+    // startup-bounded; destructive the moment it reaches an array.
+    //
+    // Kept as a COUNT because the question it answers is still open -- which
+    // constants are published only by Type-0 PM4 and left at zero by our two
+    // modelled sources. Answering that needs the measurement, not the
+    // substitution.
+    ++g_filledZero;
+    ++g_filledByConst[d >> 2];
+  }
   g_repaired += fixed;
   return fixed;
 }
 
+// The zero-fill population, worst first. `guest` is the ALU constant index;
+// subtract 256 for the pixel bank's xe_c[] numbering.
+std::string FilledHistogram(uint32_t top) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  std::vector<std::pair<uint64_t, uint32_t>> v;
+  v.reserve(kAluConstants);
+  for (uint32_t c = 0; c < kAluConstants; ++c)
+    if (g_filledByConst[c]) v.emplace_back(g_filledByConst[c], c);
+  std::sort(v.rbegin(), v.rend());
+  std::string out;
+  char one[64];
+  for (size_t i = 0; i < v.size() && i < top; ++i) {
+    const uint32_t c = v[i].second;
+    if (c >= 256)
+      std::snprintf(one, sizeof(one), " c%u(ps c%u)x%llu", c, c - 256,
+                    static_cast<unsigned long long>(v[i].first));
+    else
+      std::snprintf(one, sizeof(one), " c%u(vs)x%llu", c,
+                    static_cast<unsigned long long>(v[i].first));
+    out += one;
+  }
+  if (v.size() > top) out += " ...";
+  std::snprintf(one, sizeof(one), " [%zu distinct]", v.size());
+  out += one;
+  return out;
+}
+
 void Stats(uint64_t& written, uint64_t& repaired, uint32_t& constants_seen,
-           uint64_t& zeroed) {
+           uint64_t& zeroed, uint64_t& filled_zero) {
   std::lock_guard<std::mutex> lk(g_mu);
   written = g_written;
   repaired = g_repaired;
   zeroed = g_zeroed;
+  filled_zero = g_filledZero;
   uint32_t seen = 0;
   for (uint32_t c = 0; c < kAluConstants; ++c) {
     const uint32_t d = c * 4;
