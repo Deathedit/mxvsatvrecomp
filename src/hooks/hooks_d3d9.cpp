@@ -2129,9 +2129,35 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   //   dc.pixel_param_gen is zero when disabled, else param_gen_pos + 1.
   //
   //   input_mask OVER-REPORTS. It marks any temp read before written in walk
-  //   order, so a conditionally-written register can look like an input. This
-  //   is therefore an UPPER BOUND on the real rate, and the comment says so
-  //   rather than the number pretending otherwise.
+  //   order, so a conditionally-written register can look like an input.
+  //
+  // READ THIS BEFORE ACTING ON THE NUMBER. That upper bound turned out to be so
+  // loose that the figure is NOT a defect count. Run 1459 named the worst eight
+  // pairs by draw count and all eight are benign:
+  //
+  //   Seven are SCRATCH REGISTERS. ps 0x216B80E0 reports missing 0x38 (r3, r4,
+  //   r5) against a VS exporting 0x7 -- and its microcode writes all three
+  //   before use: `tfetch2D r3.x???`, `dp3 r4.x`, `dp3 r5.x` at instructions 3,
+  //   5 and 7. They were never interpolators. The tell is the SHAPE: in every
+  //   row ps_in is a contiguous low run, vs_out a shorter contiguous low run,
+  //   and missing exactly the difference -- never a gap in the middle. That is
+  //   register allocation. A real linkage mismatch would scatter.
+  //
+  //   The eighth is ARITHMETICALLY INERT. vs 0x21686F60 / ps 0x21686C60 has
+  //   vs_out 0x0, and the VS says so itself: `alloc interpolators/colors
+  //   size=0`. Its PS is two instructions -- `max export0 [no write], r0, r0`
+  //   and `sgts export0.x, -|r0|.x` -- and sgts on a negated absolute value is
+  //   0 for every possible r0. The output cannot depend on the input.
+  //
+  // A TRAP ON THE WAY: checking the generated HLSL "confirmed" the reads,
+  // because the emitter reads whatever input_mask says -- they agree by
+  // construction. Only the guest microcode is independent. Same shape as
+  // `--verify` only asking ourselves.
+  //
+  // Fixing it properly means a real interpolator mask -- read before ANY write
+  // on ALL paths -- which changes what every shader reads, not just a counter.
+  // Not worth that risk for a diagnostic. The figure is kept because a NEW pair
+  // appearing is still worth seeing; the absolute level is what means nothing.
   //
   // Per DRAW, not per shader: the zero reaches the pixel stage on every draw of
   // the pair, so draws are the population that says how much of the frame is
@@ -2143,12 +2169,66 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     const TranslatedShader* p = ps_h ? TranslatedPixelShader(ps_h) : nullptr;
     if (v && p) {
       const uint32_t gen = dc.pixel_param_gen;  // 0 = disabled, else pos + 1
+      uint32_t missing = 0;
       for (uint32_t i = 0; i < mx::hle::kHlslInterpolatorLinkage; ++i) {
         const bool read = (p->input_mask & (1u << i)) != 0;
         const bool exported = (v->export_mask & (1u << i)) != 0;
         const bool param_gen = gen && (gen - 1) == i;
+        const bool fill = read && !exported && !param_gen;
+        if (fill) missing |= 1u << i;
         mx::gpu::guard::Note(mx::gpu::guard::Guard::kInterpolatorZeroFill,
-                             read && !exported && !param_gen);
+                             fill);
+      }
+      // NAME THE PAIRS. A percentage is not actionable; a handful of named
+      // VS/PS pairs is. Keyed on (vs, ps, missing-slot mask) and weighted by
+      // DRAW COUNT, because one pair drawn 40,000 times and forty pairs drawn
+      // once are the same rate and completely different problems.
+      //
+      // Handles are addresses and vary per run, so the row carries the masks
+      // too -- that is what makes a pair identifiable across runs
+      // (shader handles are not stable).
+      if (missing) {
+        struct PairRow {
+          uint64_t draws = 0;
+          uint32_t missing = 0, ps_in = 0, vs_out = 0, gen = 0;
+        };
+        static std::mutex s_mu;
+        static std::map<uint64_t, PairRow> s_pairs;
+        static uint64_t s_total = 0;
+        bool report = false;
+        {
+          std::lock_guard<std::mutex> lk(s_mu);
+          const uint64_t key = (uint64_t(vs_h) << 32) | ps_h;
+          PairRow& r = s_pairs[key];
+          ++r.draws;
+          r.missing = missing;
+          r.ps_in = p->input_mask;
+          r.vs_out = v->export_mask;
+          r.gen = gen;
+          report = (++s_total % 40000) == 0;
+        }
+        if (report) {
+          std::vector<std::pair<uint64_t, uint64_t>> worst;
+          std::string rows;
+          {
+            std::lock_guard<std::mutex> lk(s_mu);
+            for (const auto& [k, r] : s_pairs) worst.emplace_back(r.draws, k);
+            std::sort(worst.rbegin(), worst.rend());
+            for (size_t i = 0; i < worst.size() && i < 8; ++i) {
+              const PairRow& r = s_pairs[worst[i].second];
+              rows += fmt::format(
+                  " [vs 0x{:08X} ps 0x{:08X} x{} missing 0x{:X} (ps_in 0x{:X} "
+                  "vs_out 0x{:X} param_gen {})]",
+                  uint32_t(worst[i].second >> 32),
+                  uint32_t(worst[i].second & 0xFFFFFFFFu), r.draws, r.missing,
+                  r.ps_in, r.vs_out, r.gen ? int(r.gen - 1) : -1);
+            }
+          }
+          REXLOG_INFO("d3d9: ZERO-FILLED INTERPOLATORS {} pairs over {} draws, "
+                      "worst first (input_mask over-reports, so this is an "
+                      "upper bound):{}",
+                      worst.size(), s_total, rows);
+        }
       }
     }
   }
