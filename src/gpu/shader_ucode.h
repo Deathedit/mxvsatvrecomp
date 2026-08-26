@@ -67,15 +67,28 @@ struct PixelTextureBinding {
 
 // Walk the executable clauses of a pixel shader and enumerate every 2D
 // texture fetch in program order. This is the evidence/diagnostic decoder: it
-// does not impose the renderer's current one-texture limit. Relative or non-2D
-// fetches still reject the blob because their sampler/coordinate linkage cannot
-// be represented by PixelTextureBinding without guessing.
+// does not impose the renderer's current one-texture limit. Relative fetches
+// still reject the blob because their sampler/coordinate linkage cannot be
+// represented by PixelTextureBinding without guessing.
 //
-// Appends to `out` (does not clear it). Returns false for malformed or
-// unsupported fetch instructions and sets *fail to a static reason string.
+// A non-2D fetch is SKIPPED, not fatal. It used to reject the whole blob, which
+// threw away every 2D binding already decoded: measured in run 1439, 34 of the
+// 35 shaders refused for a non-2D fetch had decoded 3 to 7 good 2D fetches
+// first, and one cube refusal discarded 15. Those shaders are ordinary 2D
+// material shaders carrying one extra fetch of another kind, and losing all of
+// their textures over it is far worse than losing the one we cannot represent.
+// `skipped_out`, if given, receives how many were passed over. When anything
+// was skipped, *fail carries the skipped kind EVEN ON SUCCESS -- it reads as a
+// diagnostic note there, not a failure, and callers test the return value.
+//
+// Appends to `out` (does not clear it). Returns false only when NO 2D fetch
+// survives, and sets *fail to a static reason string -- naming the skipped kind
+// when that is why nothing survived, so "the fetches were all cube" stays
+// distinguishable from "there were no fetches".
 bool DecodePixelTextureFetches(const uint32_t* dwords, uint32_t dword_count,
                                std::vector<PixelTextureBinding>& out,
-                               const char** fail = nullptr);
+                               const char** fail = nullptr,
+                               uint32_t* skipped_out = nullptr);
 
 // Accepts only a pixel shader containing exactly one 2D texture fetch. Other
 // fetch profiles deliberately fall back to the colour-only host pipeline.

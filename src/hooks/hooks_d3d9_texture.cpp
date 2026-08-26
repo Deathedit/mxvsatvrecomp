@@ -54,6 +54,11 @@ struct ResolvedPixelBinding {
   std::vector<mx::hle::PixelTextureBinding> bindings;
   const char* fail = nullptr;
   uint32_t code_offset_dwords = 0;
+  // Non-2D fetches passed over rather than rejected. Kept and reported so the
+  // population stays visible: these are the slots the draw still does not get,
+  // and a silent skip would look exactly like a shader that never wanted them.
+  uint32_t skipped_fetches = 0;
+  const char* skipped_kind = nullptr;
   bool decoded = false;
 };
 std::map<uint32_t, ResolvedPixelBinding> g_resolvedPixelBindings;
@@ -366,28 +371,44 @@ const ResolvedPixelBinding* ResolvePixelProfile(uint32_t handle) {
   // reaches before any shader is emitted, and the emitter has no cvar access.
   ReportHlslCoverage(mx::hle::HlslStage::kPixel, handle, code, code_count);
   resolved.decoded = mx::hle::DecodePixelTextureFetches(
-      code, code_count, resolved.bindings, &resolved.fail);
+      code, code_count, resolved.bindings, &resolved.fail,
+      &resolved.skipped_fetches);
+  if (resolved.skipped_fetches) resolved.skipped_kind = resolved.fail;
   if (!resolved.decoded) {
     // Pixel shader allocations with literal constants place those values in
     // front of the CF stream (the loaded main-pass shaders consistently begin
     // at dword 16). Do not hardcode that observation: try a bounded set of
     // suffixes and accept only a unique valid decode. A second valid alignment
     // makes the blob ambiguous and leaves the draw on the colour fallback.
+    //
+    // WATCH THIS COUNT. The acceptance test here is "DecodePixelTextureFetches
+    // returned true", and that predicate just became more permissive: a non-2D
+    // fetch is skipped now rather than rejecting the blob, so alignments that
+    // used to be disqualified by one odd fetch can come back valid. More valid
+    // alignments means more blobs landing in the `> 1` ambiguous branch below,
+    // which would turn shaders that resolve today into shaders that do not.
+    // Run 1439 had exactly ONE ambiguous blob; if that number climbs, this
+    // loop -- not the skip -- is what needs tightening.
     uint32_t valid_offsets = 0;
     std::vector<mx::hle::PixelTextureBinding> unique_bindings;
     uint32_t unique_offset = 0;
+    uint32_t unique_skipped = 0;
+    const char* unique_kind = nullptr;
     const uint32_t limit =
         std::min<uint32_t>(64, uint32_t(bi->second.size()));
     for (uint32_t offset = 1; offset + 3 <= limit; ++offset) {
       std::vector<mx::hle::PixelTextureBinding> candidate;
       const char* candidate_fail = nullptr;
+      uint32_t candidate_skipped = 0;
       if (!mx::hle::DecodePixelTextureFetches(
               bi->second.data() + offset,
               uint32_t(bi->second.size()) - offset, candidate,
-              &candidate_fail))
+              &candidate_fail, &candidate_skipped))
         continue;
       ++valid_offsets;
       unique_offset = offset;
+      unique_skipped = candidate_skipped;
+      unique_kind = candidate_fail;
       unique_bindings = std::move(candidate);
     }
     if (valid_offsets == 1) {
@@ -395,6 +416,10 @@ const ResolvedPixelBinding* ResolvePixelProfile(uint32_t handle) {
       resolved.fail = nullptr;
       resolved.code_offset_dwords = unique_offset;
       resolved.bindings = std::move(unique_bindings);
+      // Carried through the retry as well, or a shader resolved at a suffix
+      // would silently under-report what it lost.
+      resolved.skipped_fetches = unique_skipped;
+      resolved.skipped_kind = unique_skipped ? unique_kind : nullptr;
     } else if (valid_offsets > 1) {
       resolved.fail = "ambiguous CF offset in D3D9 allocation";
     }
@@ -406,11 +431,16 @@ const ResolvedPixelBinding* ResolvePixelProfile(uint32_t handle) {
     linkage += fmt::format(" s{}<-r{}{}", b.sampler, b.src_reg,
                            b.unnormalized ? "(unnorm)" : "");
   }
-  REXLOG_INFO("d3d9: pixel shader 0x{:08X} texture profile: {}{}{}; source {}",
+  REXLOG_INFO("d3d9: pixel shader 0x{:08X} texture profile: {}{}{}{}; source {}",
               handle,
               profile.decoded
                   ? fmt::format("{} 2D fetch(es)", profile.bindings.size())
                   : "rejected",
+              profile.skipped_fetches
+                  ? fmt::format(" (+{} SKIPPED: {})", profile.skipped_fetches,
+                                profile.skipped_kind ? profile.skipped_kind
+                                                     : "?")
+                  : "",
               linkage,
               profile.decoded
                   ? ""
@@ -421,8 +451,19 @@ const ResolvedPixelBinding* ResolvePixelProfile(uint32_t handle) {
                   : fmt::format("whole {}-dword D3D9 allocation",
                                 bi->second.size()));
   if (!profile.decoded) {
+    // CAP WAS 16, and 16 is not a population. Run 1438 rejected 75 of 178
+    // distinct pixel shaders here -- 42% -- and this dump showed the first 16,
+    // which reads exactly like "16 shaders are rejected". The cap now clears a
+    // level's whole shader set, and it stays a cap only so a handle-recycling
+    // run cannot get the log back by this route (see g_shaderHandleRecycled,
+    // which is neither zero nor inert).
+    //
+    // The REASON rides on this line too. It is already on the profile line
+    // immediately above, but pairing them meant correlating two lines per
+    // shader, and the point of the dwords is to read them against the reason
+    // that refused them.
     static std::map<uint32_t, bool> s_dumped_rejected;
-    if (s_dumped_rejected.size() < 16 &&
+    if (s_dumped_rejected.size() < 256 &&
         s_dumped_rejected.emplace(handle, true).second) {
       std::string words;
       uint32_t shown = 0;
@@ -431,9 +472,10 @@ const ResolvedPixelBinding* ResolvePixelProfile(uint32_t handle) {
         words += fmt::format(" [{}]={:08X}", i, bi->second[i]);
         ++shown;
       }
-      REXLOG_INFO("d3d9: rejected pixel shader 0x{:08X} first nonzero "
+      REXLOG_INFO("d3d9: rejected pixel shader 0x{:08X} ({}) first nonzero "
                   "allocation dwords:{}",
-                  handle, words.empty() ? " none" : words);
+                  handle, profile.fail ? profile.fail : "?",
+                  words.empty() ? " none" : words);
     }
   }
   return &profile;

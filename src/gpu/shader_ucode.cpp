@@ -670,12 +670,18 @@ bool VertexShaderStructureMatches(const uint32_t* shader_template,
 
 bool DecodePixelTextureFetches(const uint32_t* dwords, uint32_t dword_count,
                                std::vector<PixelTextureBinding>& out,
-                               const char** fail) {
+                               const char** fail, uint32_t* skipped_out) {
   auto reject = [&](const char* why) {
     if (fail) *fail = why;
     return false;
   };
   if (fail) *fail = nullptr;
+  if (skipped_out) *skipped_out = 0;
+  // Remembered so that a blob whose fetches are ALL non-2D can still say which
+  // kind, rather than collapsing into the "no texture fetch" message that means
+  // something quite different.
+  uint32_t skipped = 0;
+  const char* skipped_kind = nullptr;
   if (!dwords || dword_count < 3) return reject("blob too short");
   const size_t out_base = out.size();
 
@@ -712,8 +718,51 @@ bool DecodePixelTextureFetches(const uint32_t* dwords, uint32_t dword_count,
         std::memcpy(&tf, dwords + at, sizeof(tf));
         if (tf.is_src_relative() || tf.is_dest_relative())
           return reject("relative texture fetch");
-        if (tf.dimension() != rex::graphics::xenos::FetchOpDimension::k2D)
-          return reject("non-2D texture fetch");
+        // NAME THE DIMENSION. This was a single static "non-2D texture
+        // fetch" for every kind, which made the population unactionable: run
+        // 1438 refused 48 of 178 pixel shaders here and the log could not say
+        // whether they wanted cube, 3D or 1D. Those are three different pieces
+        // of work -- kCube and k3DOrStacked need real sampling support, k1D is
+        // a 2D fetch with a degenerate axis -- and the fix for one is not the
+        // fix for another.
+        //
+        // Static literals, one per dimension, because `fail` is a const char**
+        // with no storage of its own. No allocation, no lifetime question, and
+        // the string still groups cleanly under `sort | uniq -c`.
+        //
+        // Naming it is cheap and the precedent is expensive: a fetch refusal
+        // read from a too-vague message already cost this project a session
+        // (the exp_adjust "phantom", where a misread FetchOpcode refusal held
+        // ~89k draws off the GPU fetch path).
+        if (tf.dimension() != rex::graphics::xenos::FetchOpDimension::k2D) {
+          // SKIP IT, do not reject the blob. See the header for the
+          // measurement; the short version is that this used to discard 3-7
+          // already-decoded 2D bindings (15 in one case) because of a single
+          // fetch we cannot represent, so the draw got NO textures instead of
+          // most of them.
+          //
+          // The skipped fetch's sampler is simply absent from the profile, so
+          // that one slot falls back to whatever an unbound sampler does today
+          // -- which is exactly what all of its siblings did before this.
+          ++skipped;
+          if (!skipped_kind) {
+            switch (tf.dimension()) {
+              case rex::graphics::xenos::FetchOpDimension::k1D:
+                skipped_kind = "non-2D texture fetch: 1D";
+                break;
+              case rex::graphics::xenos::FetchOpDimension::k3DOrStacked:
+                skipped_kind = "non-2D texture fetch: 3D-or-stacked";
+                break;
+              case rex::graphics::xenos::FetchOpDimension::kCube:
+                skipped_kind = "non-2D texture fetch: cube";
+                break;
+              default:
+                skipped_kind = "non-2D texture fetch: unknown dimension";
+                break;
+            }
+          }
+          continue;
+        }
         PixelTextureBinding binding;
         binding.sampler = tf.fetch_constant_index();
         binding.src_reg = tf.src();
@@ -723,7 +772,20 @@ bool DecodePixelTextureFetches(const uint32_t* dwords, uint32_t dword_count,
       }
     }
   }
-  return out.size() != out_base ? true : reject("no texture fetch");
+  if (skipped_out) *skipped_out = skipped;
+  if (out.size() != out_base) {
+    // `fail` doubles as a diagnostic note on SUCCESS when something was
+    // skipped. It is the only channel available without widening the signature
+    // further, and every caller reads it under a !decoded test, so a non-null
+    // fail alongside a true return cannot be mistaken for a failure. Documented
+    // in the header.
+    if (skipped && fail) *fail = skipped_kind;
+    return true;
+  }
+  // Nothing survived. Name the kind when there WAS a fetch and we could not use
+  // it, because "every fetch was cube" and "there were no fetches at all" are
+  // different diagnoses and used to print the same message.
+  return reject(skipped_kind ? skipped_kind : "no texture fetch");
 }
 
 bool DecodeSingleTexturePixelShader(const uint32_t* dwords,
