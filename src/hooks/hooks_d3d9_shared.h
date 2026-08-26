@@ -111,6 +111,10 @@ struct TexDecodeSite {
 struct TranslatedShader {
   std::shared_ptr<const std::string> source;  // null unless emitted AND compiled
   uint32_t input_mask = 0;
+  // Which interpolator slots a VERTEX shader actually exports. Needed to pair
+  // against a pixel shader's input_mask at draw time: a slot the PS reads and
+  // the VS never exports arrives as a literal zero.
+  uint32_t export_mask = 0;
   uint32_t sampler_mask = 0;
   uint32_t sampler_count = 0;
   uint32_t sampler_array_mask = 0;

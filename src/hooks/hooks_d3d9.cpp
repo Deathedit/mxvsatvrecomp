@@ -2112,6 +2112,46 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     }
     return;
   }
+  // INTERPOLATOR ZERO-FILL, counted where BOTH stages are known.
+  //
+  // A slot the pixel shader reads that the vertex shader never exports arrives
+  // as a literal float4(0,0,0,0). That is invented output. A slot nobody reads
+  // is not -- which is why the first version of this counter, sitting at VS
+  // translation and firing on every unexported slot, read ~80% in both scenes
+  // and meant nothing.
+  //
+  // TWO EXCLUSIONS, both of which this project has already been burned by:
+  //
+  //   PARAM_GEN. The hardware fills one slot with the pixel position, and the
+  //   VS does not export it. Counting that as a missing interpolator is exactly
+  //   the mistake that produced the "terrain reads an unexported interpolator"
+  //   theory, which was wrong: r6 was PARAM_GEN and working.
+  //   dc.pixel_param_gen is zero when disabled, else param_gen_pos + 1.
+  //
+  //   input_mask OVER-REPORTS. It marks any temp read before written in walk
+  //   order, so a conditionally-written register can look like an input. This
+  //   is therefore an UPPER BOUND on the real rate, and the comment says so
+  //   rather than the number pretending otherwise.
+  //
+  // Per DRAW, not per shader: the zero reaches the pixel stage on every draw of
+  // the pair, so draws are the population that says how much of the frame is
+  // affected -- and it matches every other per-draw entry in the census.
+  {
+    const uint32_t vs_h = st.vs_seen ? st.vertex_shader : 0;
+    const uint32_t ps_h = st.ps_seen ? st.pixel_shader : 0;
+    const TranslatedShader* v = vs_h ? TranslatedVertexShader(vs_h) : nullptr;
+    const TranslatedShader* p = ps_h ? TranslatedPixelShader(ps_h) : nullptr;
+    if (v && p) {
+      const uint32_t gen = dc.pixel_param_gen;  // 0 = disabled, else pos + 1
+      for (uint32_t i = 0; i < mx::hle::kHlslInterpolatorLinkage; ++i) {
+        const bool read = (p->input_mask & (1u << i)) != 0;
+        const bool exported = (v->export_mask & (1u << i)) != 0;
+        const bool param_gen = gen && (gen - 1) == i;
+        mx::gpu::guard::Note(mx::gpu::guard::Guard::kInterpolatorZeroFill,
+                             read && !exported && !param_gen);
+      }
+    }
+  }
   ++HleBuiltCount();
 
   // PsParamGen is draw state, not a vertex-shader export. Xenos writes the
@@ -5298,6 +5338,7 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
                                   : g_translatedVs)[handle];
     kept.source = std::make_shared<const std::string>(std::move(out.source));
     kept.input_mask = out.input_mask;
+    kept.export_mask = out.export_mask;
     kept.sampler_mask = out.sampler_mask;
     kept.sampler_count = out.sampler_count;
     kept.sampler_array_mask = out.sampler_array_mask;
@@ -5428,23 +5469,12 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
     // where someone reading coverage will see it.
     if (stage == mx::hle::HlslStage::kVertex) {
       // INTERPOLATOR ZERO-FILL. Every slot in the linkage that this vertex
-      // shader does not export is emitted as its float4(0,0,0,0) initialiser
-      // and reaches the pixel stage as a literal zero -- invented output, and
-      // the reason the terrain PS was once thought to be reading a missing
-      // interpolator. Counted per DISTINCT SHADER, not per draw: it is a
-      // property of the translation, and weighting it by draw count would make
-      // one hot shader look like a systemic rate.
-      //
-      // Counted here rather than in the emitter because shader_hlsl.cpp is a
-      // pure translation unit with no logging, deliberately, and every other
-      // shader diagnostic is already reported from this caller.
-      // One Note per slot: population 8, fires the unexported ones. The first
-      // cut tried to add the population in bulk and then the fires with
-      // weight 0 -- which Note() drops on the floor, because a zero weight is
-      // no opportunity at all. Fires would have read 0 forever.
-      for (uint32_t i = 0; i < mx::hle::kHlslInterpolatorLinkage; ++i)
-        mx::gpu::guard::Note(mx::gpu::guard::Guard::kInterpolatorZeroFill,
-                             (out.export_mask & (1u << i)) == 0);
+      // shader does not export is emitted as its float4(0,0,0,0) initialiser.
+      // The census for that MOVED to the draw path -- see NoteInterpolatorFill
+      // -- because counting it here measured the wrong thing: it fired on every
+      // unexported slot, and most shaders simply do not use all eight, so it
+      // read ~80% in both scenes and meant nothing. A slot nobody reads is not
+      // invented output.
       static std::set<uint64_t> s_census;
       const uint64_t census_key = (uint64_t(handle) << 32) ^
                                   (uint64_t(out.max_const_index) << 24) ^
