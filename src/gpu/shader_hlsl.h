@@ -201,6 +201,24 @@ struct HlslShader {
   // indistinguishable from outside. Destinations >= 32 are not represented.
   uint32_t dropped_export_mask = 0;
 
+  // PS only. Bit i set = the shader EXPORTED to colour target i, so export_mask
+  // reports it as produced, but no export to it ever assigned a channel.
+  //
+  // An export whose vector, scalar, constant-0 and constant-1 write masks are
+  // all empty assigns nothing, and per the reference that is correct: xenia-edge
+  // `ucode.h` documents "vector_write_mask 0, scalar_write_mask 0 /
+  // scalar_dest_rel 0 - unchanged". What is not obviously correct is still
+  // declaring the target produced, because `xe_colorN` then keeps its
+  // float4(0,0,0,0) initialiser and the shader compiles to
+  // `mov o0.xyzw, l(0, 0, 0, 0)` -- one that opaquely paints black.
+  //
+  // That is the exact body of the pixel shader on the 35-index draw which
+  // replaces the menu background (HDR ~11.4) with (0,0,0,0) in menu1.rdc event
+  // 8324, and whose guest state is blend ONE/ZERO with colour mask 0xF, so the
+  // black is written rather than discarded. Measured, not acted on: "unchanged"
+  // may equally be the guest's intent, and only the count tells them apart.
+  uint32_t color_unassigned_mask = 0;
+
   // The highest constant index the shader reads within its OWN stage bank, or
   // 0 if it reads none. Each stage indexes its bank from 0: the vertex bank is
   // ALU constants 0-255 at device+0x780, the pixel bank is 256-511 at

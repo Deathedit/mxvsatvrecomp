@@ -2421,19 +2421,6 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     dc.blend_control = packed;
     dc.om_seen |= 1u << 2;
 
-    // This is the exact draw that RenderDoc event 6809 identifies as the first
-    // black overpaint in test-2.rdc. Keep the first few occurrences visible so
-    // the next run proves that the effective Xenos equation reaches the host.
-    static uint32_t s_zero_ps_state_logs = 0;
-    if (dc.index_count == 35 && s_zero_ps_state_logs++ < 8) {
-      REXLOG_INFO("d3d9: 35-index OM state device 0x{:08X}: "
-                  "RB_BLENDCONTROL0 0x{:08X} => enable {} color "
-                  "src {} dest {} op {}, alpha src {} dest {} op {}; "
-                  "color mask 0x{:X}",
-                  device, packed, dc.blend_enable, dc.src_blend,
-                  dc.dest_blend, dc.blend_op, alpha_src, alpha_dest, alpha_op,
-                  dc.colour_mask);
-    }
   } else {
     // Only meaningful when the guest actually enabled it, so the factors are
     // read but not defaulted: an entirely unobserved state stays opaque.
@@ -2471,6 +2458,116 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
                     dc.colour_control, (dc.colour_control >> 3) & 1u,
                     dc.colour_control & 7u, dc.alpha_ref);
       }
+    }
+  }
+
+  // PA_SU_SC_MODE_CNTL -- the cull mode, which this renderer does not read at
+  // all: both PSO paths hardcode D3D12_CULL_MODE_NONE (d3d12_game.cpp:259 and
+  // :890). MEASURED here before anything acts on it.
+  //
+  // Register 0x2205, so device+0x2934 + 5*4 = device+0x2948, from the same
+  // block base as RB_DEPTHCONTROL (0x2200 -> +0x2934), RB_BLENDCONTROL0 (0x2201
+  // -> +0x2938) and RB_COLORCONTROL (0x2202 -> +0x293C). Four registers now
+  // agree on that offset rule.
+  //
+  // Why this is suspected: the draw that erases the menu background is a closed
+  // 24-vertex BOX (menu1.rdc event 8324, export_mesh: TriangleStrip with
+  // degenerate joins) whose pixel shader always outputs (0,0,0,0), and it covers
+  // EVERY pixel sampled -- (200,180), (640,100), (50,650). Covering the whole
+  // screen from a closed box means the camera is INSIDE it, so every visible
+  // face is a back face. Cull back and the console draws nothing at all; cull
+  // NONE, as we do, rasterises the interior and paints the screen black.
+  //
+  // That also explains why nothing else obviously broke: for opaque solids an
+  // unculled back face is simply hidden by the depth test. A volume containing
+  // the camera is the case where it is catastrophic.
+  //
+  // Bit layout from the reference (registers.h:456): cull_front +0, cull_back
+  // +1, face +2 (0 = front is CCW, 1 = CW). One line per DISTINCT value, so the
+  // whole set of modes the game programs appears once each.
+  uint32_t pa_su_sc = 0;
+  bool pa_su_sc_seen = false;
+  {
+    constexpr uint32_t kPaSuScModeCntl = 0x2948;  // PA_SU_SC_MODE_CNTL 0x2205
+    if (device && HostPageReadable(REX_RAW_ADDR(device + kPaSuScModeCntl))) {
+      pa_su_sc = REX_LOAD_U32(device + kPaSuScModeCntl);
+      pa_su_sc_seen = true;
+      dc.pa_su_sc_mode_cntl = pa_su_sc;
+      static std::mutex s_mu;
+      static std::map<uint32_t, uint64_t> s_modes;
+      bool fresh = false;
+      {
+        std::lock_guard<std::mutex> lk(s_mu);
+        fresh = ++s_modes[pa_su_sc] == 1 && s_modes.size() <= 32;
+      }
+      if (fresh) {
+        REXLOG_INFO("d3d9: PA_SU_SC_MODE_CNTL 0x{:08X}: cull_front {} "
+                    "cull_back {} face {} (0=CCW front)",
+                    pa_su_sc, pa_su_sc & 1u, (pa_su_sc >> 1) & 1u,
+                    (pa_su_sc >> 2) & 1u);
+      }
+    }
+  }
+
+  // The 35-index draw that overpaints the menu background black -- event 6809
+  // in test-2.rdc, event 8324 in menu1.rdc, where it replaces an HDR ~11.4
+  // background with (0,0,0,0) at RT 721.
+  //
+  // This WAS "first 8 occurrences", which is the wrong population and said so
+  // in a way that read like an answer: all 8 reported ONE/ZERO opaque with
+  // colour mask 0xF. A cap of 8 samples whatever draws 35 indices FIRST in the
+  // run -- loading and intro geometry -- and cannot speak for the menu draw.
+  // Now one line per DISTINCT state tuple, so every shape reports exactly once
+  // no matter when it occurs.
+  //
+  // It also sits AFTER the alpha-test read rather than beside the blend read,
+  // because the whole output-merger verdict for this draw has to be on ONE
+  // line. Three separate first-N probes for blend, alpha and depth are three
+  // chances to sample three different draws and read the result as one state.
+  //
+  // What is already settled about this draw, so the next run does not re-ask:
+  //   - the pixel shader (0x264F39E0) is 1 ALU and ALWAYS outputs (0,0,0,0):
+  //     `max oC0._000, r0, r0` + `sgts oC0.x___, -r_abs[0].x`, and -|x| > 0 is
+  //     unsatisfiable. Xenia's own disassembly of the same bytes agrees slot
+  //     for slot, so this is not a translation defect.
+  //   - blend is ONE/ZERO/ADD and the colour mask is 0xF, so the black lands.
+  //   - the geometry is a closed 24-vertex BOX drawn as one degenerate-joined
+  //     triangle strip -- a stencil/light volume, not a colour draw.
+  // A shader that deliberately writes zero over a closed volume is gated by
+  // something we do not implement, and stencil is the candidate: hence
+  // stencilfunc/ops and the ref/masks are decoded here rather than left raw.
+  // Bit layout from the reference, registers.h:799.
+  if (dc.index_count == 35) {
+    static std::mutex s_mu;
+    static std::set<uint64_t> s_seen;
+    const uint64_t key = (uint64_t(dc.blend_control) << 32) ^
+                         (uint64_t(dc.depth_control) << 8) ^
+                         (uint64_t(dc.colour_mask) << 4) ^
+                         uint64_t(dc.colour_control) ^
+                         (uint64_t(dc.pixel_shader_handle) << 16) ^
+                         (uint64_t(pa_su_sc) << 40);
+    bool fresh = false;
+    {
+      std::lock_guard<std::mutex> lk(s_mu);
+      fresh = s_seen.size() < 32 && s_seen.insert(key).second;
+    }
+    if (fresh) {
+      REXLOG_INFO(
+          "d3d9: 35-index OM state ps 0x{:08X}: blend 0x{:08X} (enable {} "
+          "src {} dest {} op {}) mask 0x{:X}; alpha 0x{:08X} (enable {} "
+          "func {}) ref {}; depth 0x{:08X} z_enable {} z_write {} zfunc {}; "
+          "STENCIL enable {} func {} fail {} zpass {} zfail {}; "
+          "CULL 0x{:08X} seen {} front {} back {} face {}",
+          dc.pixel_shader_handle, dc.blend_control, dc.blend_enable,
+          dc.src_blend, dc.dest_blend, dc.blend_op, dc.colour_mask,
+          dc.colour_control, (dc.colour_control >> 3) & 1u,
+          dc.colour_control & 7u, dc.alpha_ref, dc.depth_control,
+          (dc.depth_control >> 1) & 1u, (dc.depth_control >> 2) & 1u,
+          (dc.depth_control >> 4) & 7u, dc.depth_control & 1u,
+          (dc.depth_control >> 8) & 7u, (dc.depth_control >> 11) & 7u,
+          (dc.depth_control >> 14) & 7u, (dc.depth_control >> 17) & 7u,
+          pa_su_sc, pa_su_sc_seen ? 1 : 0, pa_su_sc & 1u,
+          (pa_su_sc >> 1) & 1u, (pa_su_sc >> 2) & 1u);
     }
   }
 
@@ -4562,6 +4659,41 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
                           mx::hle::kHlslInterpolatorLinkage, out);
   t_emit = std::chrono::steady_clock::now();
 
+  // ZERO-EXPORT census: pixel shaders that name a colour target and never
+  // assign it, so the target compiles to `mov o0.xyzw, l(0, 0, 0, 0)`.
+  //
+  // Placed at the ONE translate site rather than in the dump path, because the
+  // dump is capped and would sample whichever shaders happen to be dumped --
+  // the same first-N error that made the 35-index OM probe read like an answer.
+  // Every shader the game translates passes through here exactly once.
+  //
+  // Reported unconditionally, zero included, so "this never happens" and "the
+  // probe never ran" stay distinguishable. A zero here kills the hypothesis
+  // that our translation is what blacks out the menu background, and moves the
+  // question back to the guest's own blend state.
+  if (stage == mx::hle::HlslStage::kPixel) {
+    static std::atomic<uint64_t> s_psTranslated{0};
+    static std::atomic<uint64_t> s_psZeroExport{0};
+    const uint64_t n = ++s_psTranslated;
+    if (out.color_unassigned_mask) {
+      const uint64_t z = ++s_psZeroExport;
+      if (z <= 16) {
+        REXLOG_INFO("d3d9: ZERO-EXPORT PS 0x{:08X}: export_mask 0x{:X} "
+                    "unassigned 0x{:X} -- colour target emitted as the zero "
+                    "initialiser (opaque black)",
+                    handle, out.export_mask, out.color_unassigned_mask);
+      }
+    }
+    // Every 25, not 100: a menu-only run translates ~66 pixel shaders, so a
+    // 100 interval reports nothing at all and "no zero-exports" is then
+    // indistinguishable from "the census never printed".
+    if ((n % 25) == 0) {
+      REXLOG_INFO("d3d9: ZERO-EXPORT census: {} pixel shaders translated, {} "
+                  "with a colour target named but never assigned",
+                  n, s_psZeroExport.load());
+    }
+  }
+
   // Emitting is only half the claim. Source FXC rejects is exactly as useless
   // as a shader the emitter refused, and the two failures have entirely
   // different causes — so they are counted apart and the compiler's own message
@@ -4673,6 +4805,12 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
             << out.input_mask << " export_mask 0x" << out.export_mask
             << " dropped_export_mask 0x" << out.dropped_export_mask << std::dec
             << " writes_position " << (out.writes_position ? 1 : 0);
+          // Only when non-zero, so its presence in a dump means the shader has
+          // a colour target that compiles to `mov o0, l(0,0,0,0)`.
+          if (out.color_unassigned_mask)
+            f << "\n; COLOUR TARGET NAMED BUT NEVER ASSIGNED: 0x" << std::hex
+              << out.color_unassigned_mask << std::dec
+              << " (emitted as the zero initialiser -- opaque black)";
           // Only when non-zero, so its presence in a dump means something.
           if (out.unhonoured_predicate_ops)
             f << "\n; SETP OPS WRITING p0: " << out.unhonoured_predicate_ops;

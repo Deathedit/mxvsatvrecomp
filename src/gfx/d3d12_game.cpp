@@ -256,6 +256,10 @@ bool D3D12Renderer::CreateGamePipeline() {
   pso.PS.pShaderBytecode = psBlob->GetBufferPointer();
   pso.PS.BytecodeLength = psBlob->GetBufferSize();
   pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+  // Deliberately CULL_NONE: these are the 32 eagerly-built variants, which are
+  // by definition the packed-cull-bits-0 state ("cull nothing, front is CW").
+  // OpaquePSO and BlendedPSO override the rasterizer for every other mode via
+  // ApplyCullBits. This line is NOT the hardcode that blacked out the menu.
   pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
   pso.SampleMask = UINT_MAX;
   pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
@@ -887,7 +891,10 @@ ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
   pso.PS.pShaderBytecode = ps->GetBufferPointer();
   pso.PS.BytecodeLength = ps->GetBufferSize();
   pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-  pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  // The guest's cull mode, carried in flags bits 5-7. Hardcoding CULL_NONE
+  // here is what let a closed volume containing the camera paint the menu
+  // background black -- see DrawCall::pa_su_sc_mode_cntl.
+  ApplyCullBits((key.flags >> 5) & 7u, pso.RasterizerState);
   pso.SampleMask = UINT_MAX;
   pso.PrimitiveTopologyType = key.topoType;
   pso.NumRenderTargets = 1;
@@ -1082,19 +1089,28 @@ D3D12_PRIMITIVE_TOPOLOGY_TYPE TopologyTypeOf(D3D12_PRIMITIVE_TOPOLOGY topo) {
 ID3D12PipelineState* D3D12Renderer::OpaquePSO(
     uint32_t variant, DXGI_FORMAT rtvFormat,
     D3D12_PRIMITIVE_TOPOLOGY_TYPE topoType) {
-  if (topoType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE &&
+  // m_gamePSOs is the 32 eagerly-built variants, indexed by the low five bits.
+  // Cull lives in bits 5-7 and is NOT part of that array: growing it to 256
+  // would build eight times the pipelines at startup to serve a state most
+  // draws do not use. Bits 5-7 == 0 is exactly "cull nothing, front is CW",
+  // which is the fixed state those 32 were built with, so an unculled draw
+  // still takes the array untouched and everything else goes on demand below.
+  const uint32_t cullBits = (variant >> 5) & 7u;
+  const uint32_t baseVariant = variant & 0x1Fu;
+  if (cullBits == 0 && topoType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE &&
       (rtvFormat == kBackBufferFormat || rtvFormat == DXGI_FORMAT_UNKNOWN))
-    return m_gamePSOs[variant].Get();
+    return m_gamePSOs[baseVariant].Get();
   const uint32_t key = (uint32_t(rtvFormat) << 8) | (variant & 0xFFu) |
                        (uint32_t(topoType) << 28);
   if (auto it = m_gamePSOsByFormat.find(key); it != m_gamePSOsByFormat.end())
     return it->second.Get();
   if (!m_gameVsBlob || m_gamePsBlobs[0] == nullptr)
-    return m_gamePSOs[variant].Get();
+    return m_gamePSOs[baseVariant].Get();
 
   D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = m_gamePsoTemplate;
   pso.RTVFormats[0] = rtvFormat;
   pso.PrimitiveTopologyType = topoType;
+  ApplyCullBits(cullBits, pso.RasterizerState);
   const bool depth_enable = (variant & 1u) != 0;
   const bool depth_write = depth_enable && (variant & 2u) != 0;
   const bool color_write = (variant & 4u) == 0;
@@ -1131,7 +1147,7 @@ ID3D12PipelineState* D3D12Renderer::OpaquePSO(
                     uint32_t(pso.DSVFormat), uint32_t(topoType), variant);
       LogError(message);
     }
-    return m_gamePSOs[variant].Get();
+    return m_gamePSOs[baseVariant].Get();
   }
   auto [it, ok] = m_gamePSOsByFormat.emplace(key, std::move(created));
   return it->second.Get();
@@ -1165,7 +1181,9 @@ ID3D12PipelineState* D3D12Renderer::BlendedPSO(const BlendKey& key) {
     return nullptr;
   }
 
-  D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = m_gamePsoTemplate;
+D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = m_gamePsoTemplate;
+  // Cull travels in pso_index bits 5-7, the same packing OpaquePSO uses.
+  ApplyCullBits((key.pso_index >> 5) & 7u, pso.RasterizerState);
   pso.RTVFormats[0] = key.rtvFormat;
   pso.PrimitiveTopologyType = key.topoType;
   const bool depth_enable = (key.pso_index & 1u) != 0;

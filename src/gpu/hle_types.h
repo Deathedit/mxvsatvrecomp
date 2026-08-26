@@ -664,6 +664,25 @@ struct DrawCall {
   uint32_t colour_mask = 0;    // RB_COLOR_MASK    0x2104, bits 0-3 = RGBA of RT0
   uint32_t depth_control = 0;  // RB_DEPTHCONTROL  0x2200
 
+  // PA_SU_SC_MODE_CNTL 0x2205: cull_front +0, cull_back +1, face +2 (0 = front
+  // is CCW, 1 = CW). Raw, like the three above.
+  //
+  // Both PSO paths hardcoded D3D12_CULL_MODE_NONE before this existed, so the
+  // guest's cull mode was not merely approximated -- it was never read. For
+  // opaque solids that is nearly invisible, because an unculled back face is
+  // hidden by the depth test anyway. It is catastrophic for a closed volume
+  // that CONTAINS the camera: every visible face is then a back face, so the
+  // console culls the whole primitive and we rasterise its interior.
+  //
+  // That is the menu background. A 24-vertex box (menu1.rdc event 8324) with a
+  // pixel shader that always outputs (0,0,0,0) covers every sampled pixel and
+  // replaces an HDR ~11.4 backdrop with black. Its register reads 0x00018006 --
+  // cull_back 1 -- so on console it draws nothing at all.
+  //
+  // Zero means the register was unreadable, which decodes as "cull nothing" and
+  // so leaves such a draw on the path it had before.
+  uint32_t pa_su_sc_mode_cntl = 0;  // PA_SU_SC_MODE_CNTL 0x2205
+
   // Alpha blending from RB_BLENDCONTROL0. Raw for the same reason as the two
   // above: the translation to host enums belongs in the renderer, and keeping
   // the guest's Xenos numbers here means a wrong mapping shows up as a wrong

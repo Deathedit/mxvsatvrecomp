@@ -152,6 +152,27 @@ class Emitter {
   uint32_t export_mask = 0;
   uint32_t dropped_export_mask = 0;
   uint32_t color_mask = 0;
+  // Colour targets that received an ACTUAL assignment, as opposed to merely
+  // being named as an export destination.
+  //
+  // These two masks are set in different places on purpose. `color_mask` is set
+  // as soon as an export names a colour target, BEFORE the write-mask check --
+  // and an export whose vector, scalar, constant-0 and constant-1 masks are all
+  // empty legitimately assigns nothing. Per the reference (xenia-edge
+  // ucode.h:2053): "vector_write_mask 0, scalar_write_mask 0 / scalar_dest_rel 0
+  // - unchanged". Returning without assigning is correct.
+  //
+  // What is NOT obviously correct is still reporting the shader as producing
+  // that target. If every export to colour 0 has an empty mask, `xe_color0`
+  // keeps its float4(0,0,0,0) initialiser and we emit `o0 = xe_color0`, which
+  // the compiler folds to `mov o0.xyzw, l(0,0,0,0)` -- a shader that opaquely
+  // paints black. That is the exact body of the pixel shader on the 35-index
+  // draw that erases the menu background (menu1.rdc event 8324), whose guest
+  // blend is ONE/ZERO and colour mask 0xF, so the black lands.
+  //
+  // Measured, not acted on: "unchanged" may also be the guest's intent, and
+  // the two readings are told apart by the count, not by argument.
+  uint32_t color_assigned_mask = 0;
   bool writes_position = false;
   bool writes_depth = false;
   uint32_t max_const_index = 0;
@@ -928,6 +949,7 @@ class Emitter {
       // Priority matches the interpreter: vector, then scalar, then the
       // constant 1 and constant 0 encodings.
       uint32_t taken = 0;
+      if (pixel() && dest < kMaxColorTargets) color_assigned_mask |= 1u << dest;
       if (vmask) {
         Line(target + MaskSwizzle(vmask) + " = xe_v" + MaskSwizzle(vmask) +
              ";");
@@ -1704,6 +1726,16 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
       if (honour_p0) em.Line("}");
     }
   }
+
+  // Colour targets named by an export but never actually ASSIGNED. See
+  // `color_assigned_mask` in the emitter for why the two masks differ: such a
+  // target is emitted as its float4(0,0,0,0) initialiser, i.e. opaque black.
+  //
+  // Surfaced on the result rather than logged here, exactly like
+  // dropped_export_mask above -- this file is a pure translation unit with no
+  // logging, and the caller is where every other shader diagnostic is reported.
+  out.color_unassigned_mask =
+      stage == HlslStage::kPixel ? (em.color_mask & ~em.color_assigned_mask) : 0;
 
   const bool produced = stage == HlslStage::kPixel ? (em.color_mask != 0)
                                                    : em.writes_position;

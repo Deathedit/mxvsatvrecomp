@@ -428,7 +428,8 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   // so the moment the enable bit's polarity or
                                   // position is ever revisited.
                                   d->alpha_state_seen ? d->colour_control : 0u,
-                                  d->alpha_state_seen ? d->alpha_ref : 0.0f);
+                                  d->alpha_state_seen ? d->alpha_ref : 0.0f,
+                                  d->pa_su_sc_mode_cntl);
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;

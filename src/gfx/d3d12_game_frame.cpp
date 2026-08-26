@@ -15,8 +15,11 @@
 #include "gpu/shader_hlsl.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <set>
 #include <string>
 #include <tuple>
@@ -1273,6 +1276,67 @@ void D3D12Renderer::RenderGameFrame() {
     // (white-menu.rdc) even though these draws paint nothing themselves.
     //
     // Fabricating white requires writing colour. These cannot.
+    // CULL census, at PSO-SELECTION time rather than where cullMode is stored.
+    //
+    // The guest-side probe already proves the register reads 0x00018006
+    // (cull_back) for the draw that blacks out the menu background. What that
+    // cannot show is whether the value survives the trip through
+    // graphics_system -> AddGameDraw -> the PSO key, and honouring the cull mode
+    // changed nothing on screen -- so the question is precisely where between
+    // those two points it is lost, if it is.
+    //
+    // Counts the PACKED bits (PackCullBits), because those are what the key
+    // carries and what ApplyCullBits consumes; counting the raw register would
+    // re-measure what is already known. Reported unconditionally, all eight
+    // buckets, so an all-zero histogram is distinguishable from no report.
+    {
+      static std::atomic<uint64_t> s_cullBuckets[8]{};
+      static std::atomic<uint64_t> s_cullDraws{0};
+      ++s_cullBuckets[PackCullBits(d.cullMode) & 7u];
+      const uint64_t n = ++s_cullDraws;
+      if ((n % 20000) == 0) {
+        char line[224];
+        std::snprintf(line, sizeof(line),
+                      "CULL census %llu draws: none %llu/%llu front %llu/%llu "
+                      "back %llu/%llu (second of each pair = front-CCW)",
+                      (unsigned long long)n,
+                      (unsigned long long)s_cullBuckets[0].load(),
+                      (unsigned long long)s_cullBuckets[4].load(),
+                      (unsigned long long)s_cullBuckets[1].load(),
+                      (unsigned long long)s_cullBuckets[5].load(),
+                      (unsigned long long)s_cullBuckets[2].load(),
+                      (unsigned long long)s_cullBuckets[6].load());
+        LogInfo(line);
+      }
+      // The one draw this is all about, named on its own line. The aggregate
+      // above can be healthy while THIS draw still arrives with cullMode 0, and
+      // an aggregate cannot show that -- 128 draws a frame would drown it.
+      // One line per distinct (raw register, packed bits, translated) tuple.
+      if (d.indexCount == 35) {
+        static std::mutex s_mu;
+        static std::set<uint64_t> s_seen;
+        const uint64_t k = (uint64_t(d.cullMode) << 8) |
+                           (uint64_t(PackCullBits(d.cullMode)) << 1) |
+                           (d.translated ? 1u : 0u);
+        bool fresh = false;
+        {
+          std::lock_guard<std::mutex> lk(s_mu);
+          fresh = s_seen.size() < 16 && s_seen.insert(k).second;
+        }
+        if (fresh) {
+          char l2[224];
+          std::snprintf(l2, sizeof(l2),
+                        "CULL 35-index draw: raw 0x%08X -> packed %u "
+                        "(mode %u, frontCCW %u); translated %d ps 0x%08X",
+                        d.cullMode, PackCullBits(d.cullMode),
+                        PackCullBits(d.cullMode) & 3u,
+                        (PackCullBits(d.cullMode) >> 2) & 1u,
+                        d.translated ? 1 : 0, d.pixelShaderHandle);
+          LogInfo(l2);
+        }
+      }
+    }
+
     const bool fabricatedWhite =
         !depthOnlyPass && d.colorWrite &&
         d.colorSource == uint8_t(mx::hle::DrawCall::ColorSource::kNone) &&
@@ -1311,7 +1375,8 @@ void D3D12Renderer::RenderGameFrame() {
                           (tDepthWrite ? 2u : 0u) |
                           (d.colorWrite ? 0u : 4u) |
                           (d.blendEnable ? 8u : 0u) |
-                          (d.gpuVertexFetch ? 16u : 0u));
+                          (d.gpuVertexFetch ? 16u : 0u) |
+                          (PackCullBits(d.cullMode) << 5));
       // A depth pass has no guest pixel shader to compile, so it takes the
       // stand-in. key.handle is 0 for these — no real shader has that handle,
       // so m_translatedPsBlobs caches exactly one compilation of it for the
@@ -1528,11 +1593,14 @@ void D3D12Renderer::RenderGameFrame() {
     // smaller RTV, which is invalid D3D12 state.
     const bool depthEnable = tDepthEnable;
     const bool depthWrite = tDepthWrite;
+    // Cull occupies bits 5-7, keeping the variant inside the low 8 bits that
+    // m_gamePSOsByFormat's (format << 8) | variant key reserves for it.
     const uint32_t pso_index = (depthEnable ? 1u : 0u) |
                                (depthWrite ? 2u : 0u) |
                                (d.colorWrite ? 0u : 4u) |
                                (textured ? 8u : 0u) |
-                               (yuv ? 16u : 0u);
+                               (yuv ? 16u : 0u) |
+                               (PackCullBits(d.cullMode) << 5);
     // A blended draw takes a pipeline built for its exact blend state; anything
     // that cannot be translated falls back to the opaque one it used before.
     ID3D12PipelineState* pipeline = nullptr;
@@ -2137,7 +2205,8 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t targetBase,
                                  uint32_t targetColorFormat,
                                  const int32_t* scissor,
-                                 uint32_t alphaControl, float alphaRef) {
+                                 uint32_t alphaControl, float alphaRef,
+                                 uint32_t cullMode) {
   // PERF(per-frame-allocs): DONE. This used to create an ID3D12Resource on the
   // UPLOAD heap for each of the buffers below — up to nine per call, once per
   // submitted draw — and the note here called for "a ring of upload buffers
@@ -2675,6 +2744,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.srcBlend = srcBlend;
   d.destBlend = destBlend;
   d.blendOp = blendOp;
+  d.cullMode = cullMode;
   if (scissor) {
     d.scissorSeen = true;
     d.scissorLeft = scissor[0];

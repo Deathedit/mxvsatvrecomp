@@ -120,6 +120,57 @@ struct GpuVertexStage {
   const uint16_t* sampledSwizzles = nullptr;
 };
 
+// PA_SU_SC_MODE_CNTL -> three bits both PSO key spaces can carry.
+//
+//   bits 0-1  cull mode: 0 = none, 1 = front, 2 = back
+//   bit  2    frontCounterClockwise
+//
+// Packed rather than passed as two fields because the translated path keys its
+// pipelines on a uint8_t `flags` with bits 0-4 already taken, and the stand-in
+// path keys on a variant index that must stay inside the low 8 bits of
+// (format << 8) | variant. Three bits fit both exactly.
+//
+// Xenos `face` is 0 for "front is CCW" and 1 for "front is CW", measured in
+// screen space with Y down -- the same convention as D3D12's
+// FrontCounterClockwise, which is why this is a direct mapping and not a flip.
+// The window->clip transform negates Y (BuildViewportMvp's `ys`) and D3D12's
+// viewport transform negates it back, so screen-space winding is preserved
+// end to end.
+//
+// cull_front AND cull_back together has no D3D12 equivalent -- the hardware
+// would draw nothing. It does not occur in this title (the observed set is
+// 0x18000/4/5/6 and 0x218000/6), and mapping it to BACK rather than inventing
+// a discard keeps this a pure state translation; DrawCall::pa_su_sc_mode_cntl
+// carries the raw value if that ever needs revisiting.
+inline uint32_t PackCullBits(uint32_t paSuScModeCntl) {
+  // A raw 0 means the register could not be read, and must decode to exactly
+  // the state every draw had before this was plumbed: CULL_NONE with
+  // FrontCounterClockwise FALSE, i.e. packed bits 0.
+  //
+  // Not merely tidiness. Falling through would set frontIsCw false and return
+  // 4, which (a) flips FrontCounterClockwise and so flips SV_IsFrontFace, the
+  // PARAM_GEN face input the pixel stage reads, and (b) makes the packed bits
+  // non-zero, pushing every such draw off the 32 prebuilt m_gamePSOs onto the
+  // on-demand path. An unreadable register would then change behaviour AND
+  // cost pipelines. Every value this title actually programs has high bits set
+  // (0x00018000/4/5/6, 0x00218000/6), so a genuine 0 does not occur.
+  if (paSuScModeCntl == 0) return 0;
+  const bool cullFront = (paSuScModeCntl & 1u) != 0;
+  const bool cullBack = (paSuScModeCntl & 2u) != 0;
+  const bool frontIsCw = (paSuScModeCntl & 4u) != 0;
+  const uint32_t mode = cullBack ? 2u : (cullFront ? 1u : 0u);
+  return mode | (frontIsCw ? 0u : 4u);
+}
+
+inline void ApplyCullBits(uint32_t bits, D3D12_RASTERIZER_DESC& rs) {
+  switch (bits & 3u) {
+    case 1: rs.CullMode = D3D12_CULL_MODE_FRONT; break;
+    case 2: rs.CullMode = D3D12_CULL_MODE_BACK; break;
+    default: rs.CullMode = D3D12_CULL_MODE_NONE; break;
+  }
+  rs.FrontCounterClockwise = (bits & 4u) != 0 ? TRUE : FALSE;
+}
+
 void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  const uint8_t* indices, uint32_t idxBytes, bool idx16,
                  uint32_t idxCount, const float* mvp, uint32_t topology,
@@ -165,7 +216,13 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  // bits 0-2 the comparison, bit 3 its enable. Zero means the
                  // registers were unreadable, which decodes as "disabled" and
                  // so keeps the draw on the path it has today.
-                 uint32_t alphaControl = 0, float alphaRef = 0.0f);
+                 uint32_t alphaControl = 0, float alphaRef = 0.0f,
+                 // PA_SU_SC_MODE_CNTL as read from the guest's register shadow:
+                 // cull_front bit 0, cull_back bit 1, face bit 2 (0 = front is
+                 // CCW). Zero means the register was unreadable, which decodes
+                 // as CULL_NONE -- the behaviour every draw had before this was
+                 // plumbed, so an unreadable register cannot make things worse.
+                 uint32_t cullMode = 0);
 
 // Append a resolve to this frame's list, in order with the draws around it.
 //
@@ -1066,6 +1123,10 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     bool depthEnable = false;
     bool depthWrite = false;
     bool colorWrite = true;
+    // PA_SU_SC_MODE_CNTL: cull_front bit 0, cull_back bit 1, face bit 2.
+    // See the note on DrawCall::pa_su_sc_mode_cntl for why ignoring this
+    // painted the menu background black.
+    uint32_t cullMode = 0;
     // The guest's D3DRS_* blend state, translated in BlendedPSO.
     bool blendEnable = false;
     uint32_t srcBlend = 0;
