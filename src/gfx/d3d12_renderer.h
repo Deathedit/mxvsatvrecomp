@@ -1696,6 +1696,10 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // means two sources of different formats are alternating into one texture,
   // which would thrash and wants a per-format snapshot instead.
   uint64_t m_snapshotFormatChanged = 0;
+  // Fabricated-white draws let through on a SMALL OFFSCREEN target
+  // rather than skipped -- the terrain tile pass. Separate from
+  // m_sampleMissSkipped so the exemption's population stays its own.
+  uint64_t m_whiteAllowedOffscreen = 0;
   // The 1x1 auto-exposure result on its way back to the guest. The guest reads
   // the resolve destination's bytes out of its own memory rather than sampling
   // them (mx::hle::g_luminanceReadbackBits explains why that matters), so the

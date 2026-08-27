@@ -451,6 +451,8 @@ bool D3D12Renderer::BindTranslatedSamplers(const GameDraw& d,
   const auto& stageTextures = vertex ? d.vertexTextures : d.pixelTextures;
   const auto& stageSamplerSigns =
       vertex ? d.vertexSamplerSigns : d.pixelSamplerSigns;
+  const auto& stageSampledSwizzles =
+      vertex ? d.vertexSampledSwizzles : d.pixelSampledSwizzles;
   if (!m_samplerHeap) return false;
 
   // The configuration first, as a key. Slots past what the shader declares
@@ -463,11 +465,24 @@ bool D3D12Renderer::BindTranslatedSamplers(const GameDraw& d,
   for (uint32_t i = 0; i < kSamplerBlockSlots; ++i) {
     const uint32_t slot = i < stageSamplerCount ? i : 0;
     uint32_t variant = 0;
-    // A resolve snapshot is a host render target, not a guest texture: there is
-    // no fetch constant to read a mode off, and it is sampled 1:1, so it takes
-    // the clamped point variant rather than inheriting slot 0's.
+    // A resolve snapshot is a host render target sampled 1:1, so it keeps the
+    // POINT filter. It used to take a hardcoded CLAMP as well, on the reasoning
+    // that there is "no fetch constant to read a mode off" -- and there is one:
+    // ResolvePixelSlotTexture reads it for the swizzle and now packs the guest
+    // clamp into bits 12-13 of the same word.
+    //
+    // Hardcoding clamp is right for a full-screen post-process copy and wrong
+    // for the terrain ATLAS, which is sampled with computed UVs. Tile index 10
+    // gives U = 1.283; clamped it pins to the right edge and reads an empty
+    // tile, which is the black ground. Wrapped it is tile 2, which is one of
+    // the three the tile pass fills.
     if (slot < stageSampledObjects.size() && stageSampledObjects[slot]) {
-      variant = kSamplerClampU | kSamplerClampV | kSamplerPoint;
+      variant = kSamplerPoint;
+      const uint16_t packed = slot < stageSampledSwizzles.size()
+                                  ? stageSampledSwizzles[slot]
+                                  : uint16_t(0);
+      if (packed & (1u << 12)) variant |= kSamplerClampU;
+      if (packed & (1u << 13)) variant |= kSamplerClampV;
     } else if (slot < stageTextures.size() && stageTextures[slot]) {
       variant = SamplerVariantFor(*stageTextures[slot]);
     }

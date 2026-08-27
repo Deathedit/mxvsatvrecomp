@@ -2191,18 +2191,59 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
         have_swz = true;
       }
       if (fresh) {
+        // CLAMP alongside the swizzle. Both come from the same fetch dword, and
+        // leaving it out made a run that had just changed the clamp behaviour
+        // unable to say what clamp it chose -- a value added without its
+        // readout, which is the gap this log exists to close. Prints the raw
+        // 3-bit guest modes AND the wrap/clamp they resolve to, because
+        // SamplerVariantFor's rule (>= 2 clamps, kRepeat 0 / kMirroredRepeat 1
+        // wrap) is the thing worth checking, not the enum value.
+        const uint32_t cx = have_swz ? ((sfetch[0] >> 10) & 7u) : 0u;
+        const uint32_t cy = have_swz ? ((sfetch[0] >> 13) & 7u) : 0u;
         REXLOG_INFO(
             "d3d9: SLOT MAP {} 0x{:08X} slot {} (guest sampler {}): object "
             "0x{:08X} -> SNAPSHOT of a resolve destination (no guest-memory "
-            "decode); guest swizzle {}",
+            "decode); guest swizzle {} clamp {}/{} -> {}/{}",
             vertex ? "vs" : "ps", stage_handle, slot, guest_sampler,
             texture_state.object,
-            have_swz ? fmt::format("{:#o}", swz) : std::string("unreadable"));
+            have_swz ? fmt::format("{:#o}", swz) : std::string("unreadable"),
+            have_swz ? fmt::format("{}", cx) : std::string("?"),
+            have_swz ? fmt::format("{}", cy) : std::string("?"),
+            have_swz ? (cx >= 2 ? "CLAMP" : "wrap") : "CLAMP(fallback)",
+            have_swz ? (cy >= 2 ? "CLAMP" : "wrap") : "CLAMP(fallback)");
       }
       out_objects[slot] = texture_state.object;
       // The renderer has no fetch constant of its own for a snapshot slot; this
       // is the only place the guest swizzle is in hand. See the field's note.
-      out_swizzles[slot] = have_swz ? uint16_t(swz) : uint16_t(0);
+      //
+      // AND THE CLAMP MODE, packed into bits 12-13. The swizzle is 12 bits, the
+      // field is a uint16_t, and nothing reads the top nibble -- BindTranslated-
+      // Textures declares the array and only mentions it in a comment, so there
+      // is no consumer to break. That beats threading a parallel array through
+      // DrawCall, graphics_system and AddGameDraw for two bits.
+      //
+      // Why it is needed: BindTranslatedSamplers gave every snapshot slot a
+      // HARDCODED clamp, on the reasoning that a snapshot "is sampled 1:1" and
+      // has "no fetch constant to read a mode off". True for a full-screen
+      // post-process copy; false for the terrain ATLAS, which is sampled with
+      // computed UVs and needs REPEAT. With clamp, tile index 10 gives U =
+      // 1.283, pins to the right edge, and lands in an empty tile -- the black
+      // ground. And the fetch constant is plainly readable: it is the same one
+      // the swizzle on this line comes from.
+      //
+      // dword 0 layout (xenia-edge gpu/xenos.h): type:2 sign_xyzw:8 then
+      // clamp_x:3 at bit 10 and clamp_y:3 at bit 13. SamplerVariantFor's rule
+      // is `>= 2 means clamp` (kRepeat 0 / kMirroredRepeat 1 wrap), applied
+      // here so both sites cannot drift apart on it.
+      uint16_t packed = have_swz ? uint16_t(swz) : uint16_t(0);
+      if (have_swz) {
+        if (((sfetch[0] >> 10) & 7u) >= 2u) packed |= uint16_t(1u << 12);
+        if (((sfetch[0] >> 13) & 7u) >= 2u) packed |= uint16_t(1u << 13);
+      } else {
+        // Unreadable fetch: keep the old behaviour rather than guessing wrap.
+        packed |= uint16_t((1u << 12) | (1u << 13));
+      }
+      out_swizzles[slot] = packed;
       return true;
     }
     if (resolve_entry) ++resolve_entry->slot_partial;
@@ -2334,7 +2375,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
           "d3d9: SLOT MAP {} 0x{:08X} slot {} (guest sampler {}): object "
           "0x{:08X} resolved={} mostly_written={} addr_match={} (dest 0x{:08X})"
           " | fetch addr 0x{:08X} {}x{} fmt {} bytes {} swizzle {:#o} signs"
-          " {:#x}",
+          " {:#x} clamp {}/{} -> {}/{}",
           vertex ? "vs" : "ps", stage_handle, slot, guest_sampler,
           texture_state.object,
           texture_state.object &&
@@ -2344,7 +2385,9 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
           partial_snapshot_object ? 0 : 1, addr_match ? 1 : 0,
           addr_match ? addr_match->dest_object : 0u, source.address,
           source.width, source.height, source.guest_format,
-          source.source_bytes, source.swizzle, source.signs);
+          source.source_bytes, source.swizzle, source.signs, source.clamp_x,
+          source.clamp_y, source.clamp_x >= 2 ? "CLAMP" : "wrap",
+          source.clamp_y >= 2 ? "CLAMP" : "wrap");
     }
   }
   // Permuted into host component order here, at the bind, because this is

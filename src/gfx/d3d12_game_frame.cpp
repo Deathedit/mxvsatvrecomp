@@ -1601,7 +1601,50 @@ void D3D12Renderer::RenderGameFrame() {
     // white and buried the rider and bike under it. WHITE-SKIPPED fell 451 -> 76
     // and the picture got worse; the counter was measuring the draws starting to
     // render, not starting to render correctly.
-    if (!translatedPso && fabricatedWhite) {
+    // NARROW EXEMPTION, for the terrain tile pass. A blanket version of this
+    // was tried and reverted (mx_960, see the note above): letting every draw
+    // that HAD a translation and lost it through turned the whole menu backdrop
+    // white and buried the rider and bike. That failure was on the SCENE
+    // TARGET -- 1280x640 and 1280x80 -- where a fabricated white covers
+    // everything behind it.
+    //
+    // The terrain tile draws are not on the scene target. They render into a
+    // 256x256 offscreen surface (0x2653F020) that is then resolved into the
+    // 2048x2048 terrain atlas at 0x1A2E3000, and skipping them is why that
+    // atlas is empty on all 64 tiles and why the ground is black:
+    //
+    //   WHITE-SKIPPED target 256x256 obj 0x2653F020:
+    //     3 draws, 3 translated, 3 wanted sampler slots
+    //
+    //   resolve dest ... (phys 0x1A2E3000) 2048x2048
+    //     <- ... from surface 0x2653F020 (256x256)   x3 resolves
+    //
+    // Three skipped draws, three resolves. So: exempt ONLY small offscreen
+    // targets, which cannot be a scene band, and count them separately so the
+    // trade stays visible. A fabricated-white TILE is wrong too -- the real fix
+    // is upstream, in whatever makes the texture bind fail for ps 0x216866E0 --
+    // but a white ground and a black one are both wrong and only one of them
+    // proves the chain.
+    if (!translatedPso && fabricatedWhite && d.translated &&
+        d.targetWidth <= 512 && d.targetHeight <= 512) {
+      ++m_whiteAllowedOffscreen;
+      static std::mutex s_amu;
+      static std::set<uint32_t> s_aseen;
+      bool afresh = false;
+      {
+        std::lock_guard<std::mutex> lk(s_amu);
+        afresh = s_aseen.size() < 8 && s_aseen.insert(d.targetObject).second;
+      }
+      if (afresh) {
+        char aline[192];
+        std::snprintf(aline, sizeof(aline),
+                      "WHITE-ALLOW (offscreen): target 0x%08X %ux%u ps 0x%08X "
+                      "samplers %u -- letting it draw instead of skipping",
+                      d.targetObject, d.targetWidth, d.targetHeight,
+                      d.pixelShaderHandle, d.pixelSamplerCount);
+        LogInfo(aline);
+      }
+    } else if (!translatedPso && fabricatedWhite) {
       ++m_sampleMissSkipped;
       // DIAG: what the skipped draws are aimed at.
       auto& e =
@@ -1873,7 +1916,7 @@ void D3D12Renderer::RenderGameFrame() {
     std::snprintf(message, sizeof(message),
                   "game RT routing: offscreen %llu, main %llu, OVERPAINT %llu "
                   "(refused: budget %llu, resized %llu of which fmt-changed "
-                  "%llu); live targets %u/%u "
+                  "%llu, white-allowed-offscreen %llu); live targets %u/%u "
                   "(evicted %llu, sweeps freeing nothing %llu), "
                   "srv %u/%u (cached %zu, free %zu, evicted %llu, "
                   "evict-blocked %llu)",
@@ -1888,6 +1931,7 @@ void D3D12Renderer::RenderGameFrame() {
                   // and this is the one that says whether a snapshot's
                   // accumulated content was thrown away.
                   static_cast<unsigned long long>(m_snapshotFormatChanged),
+                  static_cast<unsigned long long>(m_whiteAllowedOffscreen),
                   uint32_t(m_gameRenderTargets.size()), kMaxGameRenderTargets,
                   static_cast<unsigned long long>(m_rtEvictions),
                   static_cast<unsigned long long>(m_rtEvictBlocked),
