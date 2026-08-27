@@ -1768,6 +1768,14 @@ void D3D12Renderer::RenderGameFrame() {
       }
       continue;
     }
+    // WHICH PATH does a stencil draw actually take, and is a DSV bound when it
+    // gets there? Counted per path: a stencil draw on a path with no depth
+    // attachment cannot be tested however correct its pipeline is.
+    if (d.stencilIndex) {
+      if (translatedPso) ++m_stencilViaTranslated;
+      else ++m_stencilViaStandIn;
+      if (!depthTarget) ++m_stencilNoDsv;
+    }
     if (translatedPso) {
       m_commandList->SetGraphicsRootSignature(m_translatedRootSig.Get());
       // Per draw, not pipeline state -- same reason as the stand-in path, and
@@ -2194,7 +2202,8 @@ void D3D12Renderer::RenderGameFrame() {
                   "comparison that can REJECT -- zero means the test is not "
                   "live), %llu distinct states interned, %llu refused past the "
                   "cap (must be 0); blend PSOs %llu of %llu, by-format PSOs "
-                  "%llu, TRANSLATED PSOs %llu of %llu (capped %llu)",
+                  "%llu, TRANSLATED PSOs %llu of %llu (capped %llu); paths: "
+                  "%llu translated, %llu stand-in, %llu WITH NO DSV",
                   static_cast<unsigned long long>(m_stencilDraws),
                   static_cast<unsigned long long>(m_stencilTestingDraws),
                   static_cast<unsigned long long>(m_stencilStates.size()),
@@ -2204,7 +2213,10 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_gamePSOsByFormat.size()),
                   static_cast<unsigned long long>(m_translatedPSOs.size()),
                   static_cast<unsigned long long>(kMaxTranslatedPSOs),
-                  static_cast<unsigned long long>(m_translatedPsoCapped));
+                  static_cast<unsigned long long>(m_translatedPsoCapped),
+                  static_cast<unsigned long long>(m_stencilViaTranslated),
+                  static_cast<unsigned long long>(m_stencilViaStandIn),
+                  static_cast<unsigned long long>(m_stencilNoDsv));
     LogInfo(message);
     // DIAG: what the WHITE-SKIPPED draws were aimed at.
     for (const auto& [extent, e] : m_skipByTarget) {

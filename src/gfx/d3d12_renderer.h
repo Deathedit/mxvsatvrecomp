@@ -616,6 +616,12 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // predicate that is always true is not a test, and "no visual change" means
   // nothing at all if this reads zero.
   uint64_t m_stencilTestingDraws = 0;
+  // Which pipeline path a stencil draw actually took, and whether a depth
+  // attachment was bound when it got there. A stencil draw with no DSV cannot
+  // be tested however correct its pipeline is.
+  uint64_t m_stencilViaTranslated = 0;
+  uint64_t m_stencilViaStandIn = 0;
+  uint64_t m_stencilNoDsv = 0;
 
   std::unordered_map<uint64_t, Microsoft::WRL::ComPtr<ID3D12PipelineState>>
       m_gamePSOsByFormat;

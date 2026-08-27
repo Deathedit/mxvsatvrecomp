@@ -1004,6 +1004,31 @@ ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
   // Read from the DRAW, not from the key: the key carries stencilIndex only to
   // keep variants apart, and the state itself already travels on the draw.
   if (draw.stencilIndex) ApplyStencil(draw.stencil, pso.DepthStencilState);
+  // WHAT WE ACTUALLY HAND D3D12, once per built pipeline. Everything upstream
+  // says the state is correct and the mutation test says it has no effect, so
+  // the next thing worth knowing is whether the description leaving here
+  // carries stencil at all. Reasoning further without this is guessing.
+  {
+    static uint32_t s_logged = 0;
+    if (s_logged < 12) {
+      ++s_logged;
+      char m[256];
+      std::snprintf(m, sizeof(m),
+                    "TranslatedPSO stencil: idx %u enable %u func %u/%u ops "
+                    "%u/%u/%u masks %02X/%02X dsvfmt %u",
+                    draw.stencilIndex,
+                    uint32_t(pso.DepthStencilState.StencilEnable),
+                    uint32_t(pso.DepthStencilState.FrontFace.StencilFunc),
+                    uint32_t(pso.DepthStencilState.BackFace.StencilFunc),
+                    uint32_t(pso.DepthStencilState.FrontFace.StencilFailOp),
+                    uint32_t(pso.DepthStencilState.FrontFace.StencilDepthFailOp),
+                    uint32_t(pso.DepthStencilState.FrontFace.StencilPassOp),
+                    uint32_t(pso.DepthStencilState.StencilReadMask),
+                    uint32_t(pso.DepthStencilState.StencilWriteMask),
+                    uint32_t(pso.DSVFormat));
+      LogInfo(m);
+    }
+  }
   auto& rt = pso.BlendState.RenderTarget[0];
   rt.RenderTargetWriteMask =
       colorWrite ? D3D12_COLOR_WRITE_ENABLE_ALL : 0;
