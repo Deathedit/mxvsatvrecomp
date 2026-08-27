@@ -1797,14 +1797,23 @@ void D3D12Renderer::RenderGameFrame() {
       // A plain one-shot: the first 40 stencil draws this process ever
       // submits. They are all in one frame -- a menu frame carries hundreds --
       // and the sequence repeats, so one pass through it is the whole question.
+      // WHICH SURFACE, and that is the point of the line now. The stencil plane
+      // is per depth OBJECT, and menu.rdc shows the geometry that increments
+      // running against one surface while the fill that tests runs against
+      // another -- verified to be a different EDRAM base, so nothing was
+      // supposed to carry between them. The open question is what increments
+      // the plane on the surface the fill actually reads, and a sequence
+      // without the surface on it cannot answer that.
       static uint32_t s_seq = 0;
-      if (s_seq < 40) {
+      if (s_seq < 120) {
         ++s_seq;
-        char m[224];
+        char m[256];
         std::snprintf(m, sizeof(m),
-                      "  STENCIL SEQ %u: idx%u indices %u func %u/%u ref %u "
-                      "ops %u/%u/%u masks %02X/%02X",
-                      s_seq, d.stencilIndex, d.indexCount,
+                      "  STENCIL SEQ %u: depth 0x%08X %ux%u base 0x%03X | "
+                      "idx%u indices %u func %u/%u ref %u ops %u/%u/%u "
+                      "masks %02X/%02X",
+                      s_seq, d.depthObject, d.depthWidth, d.depthHeight,
+                      d.depthBase, d.stencilIndex, d.indexCount,
                       uint32_t(d.stencil.frontFunc), uint32_t(d.stencil.backFunc),
                       uint32_t(d.stencil.ref), uint32_t(d.stencil.frontFail),
                       uint32_t(d.stencil.frontZFail),
