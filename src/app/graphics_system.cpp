@@ -98,6 +98,27 @@ REXCVAR_DEFINE_BOOL(d3d9_stencil_test, true, "Graphics",
                     "writes but forces every test to ALWAYS, which cannot "
                     "reject a fragment.");
 
+// MUTATION TEST for the stencil path. Diagnostic only, never for normal play.
+//
+// Phase 3 went live with 44,749 draws carrying a comparison that can reject,
+// and the picture did not change. That has two explanations and they want
+// opposite work: the masks are correct and this scene looks the same either
+// way, OR our stencil state never reaches the GPU and the comparison is inert.
+// The counter proves we BUILT the state; it proves nothing about whether D3D12
+// applied it.
+//
+// So: force kNever on every stencil draw. NEVER rejects every fragment, so all
+// ~118,000 stencil draws must disappear. If the screen does NOT change, the
+// stencil state is not reaching the pipeline and every result from Phase 2 and
+// 3 is vacuous.
+//
+// A test that has only ever passed is not yet a test. See docs and the
+// "prove the test can fail" rule this tree keeps re-learning.
+REXCVAR_DEFINE_BOOL(d3d9_stencil_force_never, false, "Debug",
+                    "DIAGNOSTIC: force every stencil comparison to NEVER. The "
+                    "screen MUST lose all stencil geometry; if it does not, the "
+                    "stencil state is not reaching the GPU.");
+
 REXCVAR_DEFINE_BOOL(d3d12_edram_takeover_copy, false, "Graphics",
                     "On a same-extent EDRAM takeover, copy the previous "
                     "owner's contents into the new owner instead of clearing.");
@@ -511,7 +532,13 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
             //
             // Read from the SAME bits the census reports, so a config that
             // shows as `func 4` there is func 4 here and the two cannot drift.
-            if (REXCVAR_GET(d3d9_stencil_test)) {
+            if (REXCVAR_GET(d3d9_stencil_force_never)) {
+              // Checked FIRST so it cannot be masked by the test switch: the
+              // whole point is to answer "does any of this reach the GPU",
+              // which is a question about the pipeline, not about the guest.
+              sten.frontFunc = 0;  // kNever
+              sten.backFunc = 0;
+            } else if (REXCVAR_GET(d3d9_stencil_test)) {
               sten.frontFunc = uint8_t((dcb >> 8) & 7u);
               sten.backFunc =
                   uint8_t(two_sided ? (dcb >> 20) & 7u : sten.frontFunc);
