@@ -747,6 +747,25 @@ struct DrawCall {
   // that report it, and storing raw keeps a misread visible.
   uint32_t colour_mask = 0;    // RB_COLOR_MASK    0x2104, bits 0-3 = RGBA of RT0
   uint32_t depth_control = 0;  // RB_DEPTHCONTROL  0x2200
+  // The other two registers the stencil state needs, captured beside
+  // depth_control so all three describe the SAME draw. Reading them later, in
+  // the renderer, would read whatever the device happens to hold by then --
+  // which for a deferred draw is the end of the frame.
+  //
+  //   RB_STENCILREFMASK  ref bits 0-7, read mask 8-15, write mask 16-23
+  //   RB_MODECONTROL     edram_mode is the low 3 bits
+  //
+  // edram_mode is carried rather than pre-judged because the reference gates
+  // the WHOLE depth-stencil register on it: outside kColorDepth(4) and
+  // kDepthOnly(5) the hardware ignores depth and stencil alike and Xenia
+  // returns a zeroed RB_DEPTHCONTROL (draw_util.cc:90). A draw can have the
+  // enable bit set and mean nothing by it.
+  //
+  // 0xFFFFFFFF means the register could not be read, and is deliberately
+  // distinguishable from every real value: edram_mode is 3 bits, so no genuine
+  // reading collides with it.
+  uint32_t stencil_ref_mask = 0xFFFFFFFFu;  // RB_STENCILREFMASK 0x210D
+  uint32_t edram_mode = 0xFFFFFFFFu;        // RB_MODECONTROL    0x2208, low 3
 
   // PA_SU_SC_MODE_CNTL 0x2205: cull_front +0, cull_back +1, face +2 (0 = front
   // is CCW, 1 = CW). Raw, like the three above.

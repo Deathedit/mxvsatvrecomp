@@ -1805,6 +1805,39 @@ void NoteStencilCensusUnreadable() {
   ++g_stencilDrawsUnreadable;
 }
 
+// PHASE 1 CHECK. Counts the same population as NoteStencilCensus, but from the
+// fields actually carried on the DrawCall rather than from registers read at
+// the census site. The two must agree exactly.
+//
+// This is the whole point of Phase 1: nothing renders differently yet, so the
+// only thing that can be verified is whether the values the renderer will
+// eventually see are the values the guest programmed. If these two lines
+// disagree on the config set, the plumbing is wrong and it is caught while no
+// pixel has moved.
+//
+// A restatement would be worthless -- if this read the registers itself it
+// would agree with the census by construction and say nothing about the
+// DrawCall. It reads dc only.
+std::mutex g_plumbedStencilMu;
+uint64_t g_plumbedSeen = 0, g_plumbedUnreadable = 0, g_plumbedEffective = 0;
+std::map<std::pair<uint32_t, uint32_t>, uint64_t> g_plumbedConfigs;
+
+void NotePlumbedStencil(const mx::hle::DrawCall& dc) {
+  std::lock_guard<std::mutex> lk(g_plumbedStencilMu);
+  ++g_plumbedSeen;
+  // Either register unreadable is counted apart rather than folded into the
+  // config set: an unreadable refmask would otherwise enter the map as
+  // 0xFFFFFFFF and invent a nineteenth configuration out of a failed read.
+  if (dc.stencil_ref_mask == 0xFFFFFFFFu || dc.edram_mode == 0xFFFFFFFFu) {
+    ++g_plumbedUnreadable;
+    return;
+  }
+  if (!(dc.depth_control & 1u)) return;
+  if (dc.edram_mode != 4u && dc.edram_mode != 5u) return;
+  ++g_plumbedEffective;
+  ++g_plumbedConfigs[{dc.depth_control, dc.stencil_ref_mask}];
+}
+
 void NoteStencilCensus(uint32_t depth_control, uint32_t device, uint8_t* base) {
   constexpr uint32_t kRbModeControl = 0x2954;      // RB_MODECONTROL   0x2208
   constexpr uint32_t kRbStencilRefMask = 0x2900;   // RB_STENCILREFMASK 0x210D
@@ -2576,7 +2609,18 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
                   (dc.depth_control >> 2) & 1u, (dc.depth_control >> 4) & 7u,
                   dc.depth_control & 1u);
     }
+    // Captured HERE, in the same block that reads RB_DEPTHCONTROL, so all
+    // three registers describe one draw. NoteStencilCensus reads the same two
+    // from the same device a line later, which is what makes the PLUMBED census
+    // below a real check on this rather than a restatement of it.
+    constexpr uint32_t kRbStencilRefMask = 0x2900;  // RB_STENCILREFMASK 0x210D
+    constexpr uint32_t kRbModeControl = 0x2954;     // RB_MODECONTROL    0x2208
+    if (HostPageReadable(REX_RAW_ADDR(device + kRbStencilRefMask)))
+      dc.stencil_ref_mask = REX_LOAD_U32(device + kRbStencilRefMask);
+    if (HostPageReadable(REX_RAW_ADDR(device + kRbModeControl)))
+      dc.edram_mode = REX_LOAD_U32(device + kRbModeControl) & 0x7u;
     NoteStencilCensus(dc.depth_control, device, base);
+    NotePlumbedStencil(dc);
   } else if (st.render_state.Seen(kRsZEnable)) {
     // Unreadable register only. Still the old approximation, because there is
     // nothing better to approximate from -- but it no longer hides the register
@@ -6356,6 +6400,26 @@ void ReportDrawCounts(uint8_t* base) {
                   (dc_bits >> 29) & 7u, rm & 0xFFu, (rm >> 8) & 0xFFu,
                   (rm >> 16) & 0xFFu);
     }
+  }
+  // PHASE 1 PASS CONDITION, printed next to the census it must match.
+  //
+  // Same population, read from the DrawCall instead of from the device. Equal
+  // effective counts and an equal config SET means the state the renderer will
+  // act on in Phase 2 is the state the guest programmed. A mismatch means the
+  // plumbing is wrong, and it is visible while nothing renders differently.
+  //
+  // The config set is compared by rendering both sorted, so a difference shows
+  // as a diff rather than as two numbers that happen to be equal.
+  {
+    std::lock_guard<std::mutex> lk(g_plumbedStencilMu);
+    std::string cfgs;
+    for (const auto& [key, n] : g_plumbedConfigs)
+      cfgs += fmt::format(" [{:08X}/{:08X} x{}]", key.first, key.second, n);
+    REXLOG_INFO("d3d9: STENCIL PLUMBED (must match the census above) — {} draws"
+                " carried the fields ({} had an unreadable register), {} "
+                "effective, {} distinct configs:{}",
+                g_plumbedSeen, g_plumbedUnreadable, g_plumbedEffective,
+                g_plumbedConfigs.size(), cfgs.empty() ? " none" : cfgs);
   }
   // The ALU constant file. `repaired 0` is only meaningful next to a non-zero
   // `constants seen` — with zero seen, the PM4 feed is not reaching the file and
