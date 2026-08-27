@@ -87,6 +87,11 @@ std::string FilledHistogram(uint32_t top);
 // Float values we declined to fill, for the given constant indices. Includes a
 // control group by convention -- see the definition.
 std::string WouldFillValues(const uint32_t* consts, size_t n);
+// The LIVE file contents for the given constants, with unpublished components
+// marked. NOT interchangeable with WouldFillValues, which cannot report a zero
+// -- it snapshots declined non-zero values only, and goes on printing a stale
+// one after the file has changed underneath it.
+std::string FileValues(const uint32_t* consts, size_t n);
 
 // Substitutions APPLIED in the narrow material-gate window (pixel c84..c87).
 // Distinct from the dry-run zero-fill count: a zero here means the window never
@@ -118,7 +123,8 @@ uint32_t FillVertexTint(uint32_t* bank, uint32_t bank_regs,
 // Vertex-tint outcomes, for the report line. Split because "never validated"
 // and "validated with nothing to fill" are different findings.
 void VertexTintStats(uint64_t& filled, uint64_t& applied, uint64_t& denormal,
-                     uint64_t& unpublished);
+                     uint64_t& unpublished, uint64_t& nonfinite,
+                     uint64_t& all_zero);
 
 }  // namespace alu
 

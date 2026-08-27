@@ -6411,11 +6411,15 @@ void ReportDrawCounts(uint8_t* base) {
     //                                      should now be visible on that share
     //                                      of draws, and flickering means the
     //                                      denormal is next
-    uint64_t vt_filled, vt_applied, vt_denorm, vt_unpub;
-    mx::gpu::alu::VertexTintStats(vt_filled, vt_applied, vt_denorm, vt_unpub);
+    uint64_t vt_filled, vt_applied, vt_denorm, vt_unpub, vt_nonfin, vt_zero;
+    mx::gpu::alu::VertexTintStats(vt_filled, vt_applied, vt_denorm, vt_unpub,
+                                  vt_nonfin, vt_zero);
+    static const uint32_t kTint[] = {32};
     REXLOG_INFO("d3d9: VERTEX TINT FILL (vs c32) {} dwords filled | float4s: "
-                "{} applied, {} rejected denormal, {} rejected unpublished",
-                vt_filled, vt_applied, vt_denorm, vt_unpub);
+                "{} applied, rejected {} denormal / {} non-finite / {} "
+                "unpublished / {} all-zero | file now:{}",
+                vt_filled, vt_applied, vt_denorm, vt_nonfin, vt_unpub, vt_zero,
+                mx::gpu::alu::FileValues(kTint, 1));
   }
   ReportDeclHistogram();
   if (REXCVAR_GET(hle_capture)) ReportCoverage(base);

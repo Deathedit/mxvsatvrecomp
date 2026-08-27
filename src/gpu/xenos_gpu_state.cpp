@@ -124,6 +124,14 @@ uint64_t g_vertexTintFilled = 0;    // dwords actually substituted
 uint64_t g_vertexTintApplied = 0;   // float4s that passed validation
 uint64_t g_vertexTintDenormal = 0;  // float4s rejected for a denormal component
 uint64_t g_vertexTintUnpub = 0;     // float4s rejected as not fully published
+// The two rejections the first cut counted NOWHERE, which cost a reading of
+// run 1529: the fill froze at 16787 dwords after ten seconds and stayed frozen
+// for another 386,000 opportunities, and neither `denormal` nor `unpublished`
+// moved -- so the reason it stopped was in a bucket with no counter. Every exit
+// from the validation is now counted. The rule this file keeps re-learning: an
+// outcome with no counter reads as an outcome that never happens.
+uint64_t g_vertexTintNonFinite = 0;  // float4s rejected as Inf/NaN
+uint64_t g_vertexTintAllZero = 0;    // published, valid, and all four are 0.0
 
 bool NonFinite(uint32_t bits) {
   // IEEE-754: exponent all ones is Inf (mantissa 0) or NaN (mantissa non-zero).
@@ -498,12 +506,15 @@ uint32_t FillMaterialGate(uint32_t* bank, uint32_t bank_regs,
 }
 
 void VertexTintStats(uint64_t& filled, uint64_t& applied, uint64_t& denormal,
-                     uint64_t& unpublished) {
+                     uint64_t& unpublished, uint64_t& nonfinite,
+                     uint64_t& all_zero) {
   std::lock_guard<std::mutex> lk(g_mu);
   filled = g_vertexTintFilled;
   applied = g_vertexTintApplied;
   denormal = g_vertexTintDenormal;
   unpublished = g_vertexTintUnpub;
+  nonfinite = g_vertexTintNonFinite;
+  all_zero = g_vertexTintAllZero;
 }
 
 uint32_t FillVertexTint(uint32_t* bank, uint32_t bank_regs,
@@ -544,20 +555,27 @@ uint32_t FillVertexTint(uint32_t* bank, uint32_t bank_regs,
     if (c >= bank_regs) continue;
     // VALIDATE THE WHOLE FLOAT4 FIRST, decide second.
     bool valid = true, any_nonzero = false, denormal = false, unpub = false;
+    bool nonfinite = false;
     for (uint32_t comp = 0; comp < 4; ++comp) {
       const uint32_t d = c * 4 + comp;
       if (!(g_have[d >> 5] & (1u << (d & 31)))) { unpub = true; valid = false; break; }
       const uint32_t v = g_file[d];
-      if (NonFinite(v)) { valid = false; break; }
+      if (NonFinite(v)) { nonfinite = true; valid = false; break; }
       if (Denormal(v)) { denormal = true; valid = false; break; }
       if (v != 0) any_nonzero = true;
     }
-    // An all-zero publish is not worth substituting -- it is what the bank
-    // already holds -- but it is not a REJECTION either, so it is counted
-    // nowhere rather than being folded into one of the failure rows.
-    if (valid && !any_nonzero) valid = false;
+    // An all-zero publish has nothing to substitute -- it is what the bank
+    // already holds -- but it gets its OWN counter rather than being silent.
+    // Silent was how run 1529 hid the reason the fill stopped.
+    bool all_zero = false;
+    if (valid && !any_nonzero) { all_zero = true; valid = false; }
+    // Most specific first, and every branch terminates in a counter. Ordering
+    // matters here for the same reason it did in the reason-code chain that
+    // produced a permanent zero and ate a session.
     if (denormal) ++g_vertexTintDenormal;
+    else if (nonfinite) ++g_vertexTintNonFinite;
     else if (unpub) ++g_vertexTintUnpub;
+    else if (all_zero) ++g_vertexTintAllZero;
     else if (valid) ++g_vertexTintApplied;
     for (uint32_t comp = 0; comp < 4; ++comp) {
       const uint32_t b = c * 4 + comp;
@@ -590,6 +608,35 @@ uint32_t FillVertexTint(uint32_t* bank, uint32_t bank_regs,
 // file is sane and a value read for any other register can be trusted. If they
 // come back as garbage, the file is stale or misindexed and NOTHING here should
 // be acted on, least of all a blanket substitution.
+std::string FileValues(const uint32_t* consts, size_t n) {
+  // The LIVE contents of g_file, which is not what WouldFillValues shows.
+  // WouldFillValues is a snapshot of values the zero-fill DECLINED, and that
+  // pass skips `v == 0` -- so it structurally cannot report a zero, and keeps
+  // printing the last non-zero it ever saw. In run 1529 it went on saying
+  // c32 = (1,1,1,1) for thirty seconds after the fill had stopped firing,
+  // because the thing that changed was exactly the thing it cannot show.
+  //
+  // `unpub:` marks a component PM4 has never written, which is a different
+  // state from a published 0.0 and must not print the same.
+  std::lock_guard<std::mutex> lk(g_mu);
+  std::string out;
+  for (size_t k = 0; k < n; ++k) {
+    const uint32_t c = consts[k];
+    if (c >= kAluConstants) continue;
+    out += c >= 256 ? fmt::format(" c{}(ps c{})=[", c, c - 256)
+                    : fmt::format(" c{}(vs)=[", c);
+    for (uint32_t i = 0; i < 4; ++i) {
+      const uint32_t d = c * 4 + i;
+      const bool pub = (g_have[d >> 5] & (1u << (d & 31))) != 0;
+      float f;
+      std::memcpy(&f, &g_file[d], sizeof(f));
+      out += fmt::format("{}{}{:g}", i ? " " : "", pub ? "" : "unpub:", f);
+    }
+    out += "]";
+  }
+  return out;
+}
+
 std::string WouldFillValues(const uint32_t* consts, size_t n) {
   std::lock_guard<std::mutex> lk(g_mu);
   std::string out;
