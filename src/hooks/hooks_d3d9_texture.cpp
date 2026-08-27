@@ -348,6 +348,38 @@ uint32_t GuestTextureFingerprint(const mx::hle::HleTextureSource& source,
   };
 
   constexpr uint32_t kWholeHashLimit = 4096;
+  // COVERAGE PROPORTIONAL TO SIZE, not a fixed 32 slices.
+  //
+  // 32 x 64 bytes is 2 KB however big the texture is, so coverage collapses as
+  // size grows: 25% of an 8 KB texture, 0.1% of a 2 MB one. The note below this
+  // function already records what that costs -- "the fingerprint samples 2 KB
+  // of a 256 KB atlas, so a localised glyph write lands between its sample
+  // points and reads as unchanged. That is what broke the pause HUD once
+  // already" -- and the glyph atlas escaped it only by getting an explicit
+  // generation instead.
+  //
+  // The terrain's virtual-texture INDEX MAP is the same shape and had no such
+  // escape: 1024x1024 k_4_4_4_4, 2 MB, updated SPARSELY as pages stream in. A
+  // handful of changed entries in 2 MB lands between 32 sample points every
+  // time, so the payload decoded once while the map was still uniform
+  // (`n=1 flat=1`) and was never re-read, even after the feedback loop started
+  // driving 421 tile resolves a run.
+  //
+  // One slice per 4 KB page instead, so a page that changes at all is sampled,
+  // with the total capped at 8 KB hashed per call -- a 2 MB texture costs 512
+  // slices of 16 bytes. That is four times the old byte count on the largest
+  // textures and LESS on everything under 128 KB, because the slices shrink.
+  // STILL 32 SLICES, and that is a measured decision rather than the old
+  // default left alone. Scaling the count to one point per 4 KB (128 points on
+  // a 2 MB texture) was tried and REVERTED: stale-check went 8ms -> 23ms per
+  // interval and frame time ~118ms -> ~146ms, a 25% regression, because this
+  // runs on every one of ~2200 slot calls.
+  //
+  // It bought nothing. Sampling cannot see a SPARSE write at any density worth
+  // paying for -- 128 points across 2 MB is still one per 16 KB -- so the
+  // texture it was meant to fix, the terrain index map, is handled at the cache
+  // insert instead by not caching a flat decode at all. Wholesale restreams,
+  // which is what every other texture does, are caught by 32 points already.
   constexpr uint32_t kSlices = 32, kSliceBytes = 64;
   if (bytes <= kWholeHashLimit) {
     eat(0, bytes);
@@ -505,6 +537,13 @@ struct FlatProbeCounts {
   uint64_t suppressed = 0;
 };
 FlatProbeCounts g_flatProbe;
+// Keys whose last decode came out flat, with the frame it happened on. A flat
+// texture is re-read on a BACKOFF rather than every bind -- see the note at the
+// cache insert for what every-bind cost.
+std::map<uint64_t, uint32_t> g_flatRetryKeys;
+constexpr uint32_t kFlatRetryFrames = 30;
+uint64_t g_flatNotCached = 0;
+uint64_t g_flatRetriesDue = 0;
 
 // THE PROBE CRASHED THE GAME AND THIS IS WHY. The census below inserts into a
 // std::map and a std::set, and once NoteDecodedTexture was called from all
@@ -2462,6 +2501,20 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
       PhaseTimer t(g_tex.staleUs);
       stale = TextureContentStale(source, base, *cached->second);
     }
+    // A previously FLAT decode is re-read on a backoff, because the fingerprint
+    // above cannot see the sparse write that fills it. Cheap: the map holds
+    // only keys that decoded flat, and this is one decode per key per
+    // kFlatRetryFrames rather than one per bind.
+    if (!stale) {
+      if (auto fr = g_flatRetryKeys.find(key); fr != g_flatRetryKeys.end()) {
+        const uint32_t now = mx::hle::D3D9FrameCount();
+        if (now - fr->second >= kFlatRetryFrames) {
+          fr->second = now;
+          ++g_flatRetriesDue;
+          stale = true;
+        }
+      }
+    }
     if (!stale) {
       ++g_tex.cacheHits;
       out_textures[slot] = cached->second;
@@ -2660,6 +2713,54 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
       TextureContentVersion(source, base, payload->format);
   mx::diag::DumpDecodedTexture(source, *payload, "slot", guest_sampler);
   out_textures[slot] = payload;
+  // A FLAT DECODE IS CACHED, AND MARKED FOR PERIODIC RE-READ.
+  //
+  // GuestTextureFingerprint SAMPLES, so a SPARSE write lands between its sample
+  // points and reads as unchanged however the sampling is tuned -- the note
+  // above that function records the same failure biting the glyph atlas, which
+  // escaped only by getting an explicit generation from the guest. The
+  // terrain's virtual-texture INDEX MAP had no such escape: it decoded once
+  // while still uniform (`n=1 flat=1`) and was never re-read, even after the
+  // feedback writeback started driving ~1000 tile resolves a run.
+  //
+  // NOT CACHING IT AT ALL WAS TRIED AND REVERTED. A flat decode carries no
+  // information, so refusing to cache it looks free -- it is not. Run 1506:
+  //
+  //   decode 359ms, scan 651ms | 50 decodes over 36880 KB
+  //   FRAMETIME 1746617us     (1.75 SECONDS a frame)
+  //
+  // 36 MB re-decoded and re-scanned per interval, because a 4 MB cutoff still
+  // admits the 2 MB index map and a 4 MB companion on EVERY bind. "Self-
+  // limiting" was true in principle and irrelevant in practice: it does not
+  // self-limit until the guest fills the texture, and the game has to stay
+  // playable until then.
+  //
+  // So: cache as normal, and record the key. The cache-hit path re-reads it
+  // once every kFlatRetryFrames instead of every bind, which is the same shape
+  // as the blank-retry backoff that already governs all-zero decodes.
+  constexpr size_t kFlatRetryLimit = 4u * 1024u * 1024u;
+  const size_t flat_base =
+      payload->level_count > 1
+          ? std::min<size_t>(payload->levels[1].offset, payload->data.size())
+          : payload->data.size();
+  const bool flat_now =
+      flat_base && flat_base <= kFlatRetryLimit &&
+      ScanFlatness(payload->data.data(), flat_base, source.bytes_per_block)
+              .share() >= 0.999;
+  if (flat_now) {
+    ++g_flatNotCached;
+    g_flatRetryKeys[key] = mx::hle::D3D9FrameCount();
+    static std::set<uint64_t> s_flatSeen;
+    if (s_flatSeen.insert(key).second && s_flatSeen.size() <= 12) {
+      REXLOG_INFO(
+          "d3d9: FLAT RETRY-MARKED addr 0x{:08X} {}x{} fmt {} ({} KB) -- "
+          "re-read every {} frames until it carries data",
+          source.address, source.width, source.height, source.guest_format,
+          uint32_t(flat_base / 1024), kFlatRetryFrames);
+    }
+  } else {
+    g_flatRetryKeys.erase(key);
+  }
   g_hleCpuTextures.emplace(key, std::move(payload));
   return true;
 }

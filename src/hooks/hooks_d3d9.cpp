@@ -4658,11 +4658,16 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
     REXLOG_INFO(
         "d3d9: TEXTURE COST {} slot calls -- describe {}ms, stale-check {}ms, "
         "copy {}ms, decode {}ms, scan {}ms | {} cache hits, {} stale evictions,"
-        " {} decodes over {} KB",
+        " {} decodes over {} KB | flat-marked {} retried {}",
         g_tex.slotCalls, g_tex.describeUs / 1000, g_tex.staleUs / 1000,
         g_tex.copyUs / 1000, g_tex.decodeUs / 1000, g_tex.scanUs / 1000,
         g_tex.cacheHits, g_tex.staleEvicts, g_tex.decodes,
-        g_tex.decodedBytes / 1024);
+        g_tex.decodedBytes / 1024,
+        // The readout for the flat-retry backoff. Without it a census row of
+        // `n=2 flat=2` cannot say whether the retry never fired or fired and
+        // found the texture still flat -- completely different diagnoses, and
+        // the exact hole this log exists to close.
+        g_flatNotCached, g_flatRetriesDue);
     // The repeat offenders, cumulative, worst first. Three textures own this
     // whole bucket; this names them and says why each one misses.
     {
