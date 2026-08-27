@@ -1825,6 +1825,57 @@ void NoteStencilCensusUnreadable() {
   ++g_stencilDrawsUnreadable;
 }
 
+// DEPTH-SURFACE ALIASING CENSUS.
+//
+// The existing EDRAM aliasing census covers COLOUR targets only -- every owner
+// it has ever listed is fmt10/28/34/41 -- so nothing in this tree can say
+// whether two DEPTH surfaces share an EDRAM base. That gap has a live
+// consequence now that stencil is honoured.
+//
+// menu.rdc: the geometry that stamps the stencil mask runs against depth
+// surface 682 (768x640), and the fullscreen fill that tests the mask runs
+// against 387 (1280x720). We key depth targets by OBJECT, so those are two
+// D3D12 textures with two independent stencil planes. On the console they may
+// be two views of one EDRAM allocation, in which case the mask the first pass
+// writes is exactly the mask the second should read -- and we lose it.
+//
+// This says whether they share a base. Owners per base, so "2 owners" on the
+// base the menu uses is the finding, and one owner per base kills the theory
+// outright.
+std::mutex g_depthSurfaceMu;
+struct DepthSurfaceInfo {
+  uint32_t width = 0, height = 0;
+  uint64_t draws = 0;
+};
+// base -> object -> info
+std::map<uint32_t, std::map<uint32_t, DepthSurfaceInfo>> g_depthSurfaces;
+
+void NoteDepthSurface(uint32_t object, uint32_t width, uint32_t height,
+                      uint32_t base) {
+  if (!object) return;
+  std::lock_guard<std::mutex> lk(g_depthSurfaceMu);
+  // Bounded: a runaway here would mean the base is not what we think it is,
+  // and that is itself worth seeing rather than growing without limit.
+  if (g_depthSurfaces.size() >= 32 && !g_depthSurfaces.count(base)) return;
+  auto& e = g_depthSurfaces[base][object];
+  e.width = width;
+  e.height = height;
+  ++e.draws;
+}
+
+std::string DepthSurfaceReport() {
+  std::lock_guard<std::mutex> lk(g_depthSurfaceMu);
+  std::string out;
+  for (const auto& [base, owners] : g_depthSurfaces) {
+    out += fmt::format("\n  base 0x{:03X}: {} owner{}", base, owners.size(),
+                       owners.size() == 1 ? "" : "s");
+    for (const auto& [obj, i] : owners)
+      out += fmt::format(" 0x{:08X}({}x{} x{})", obj, i.width, i.height,
+                         i.draws);
+  }
+  return out.empty() ? std::string("\n  (none)") : out;
+}
+
 // PHASE 1 CHECK. Counts the same population as NoteStencilCensus, but from the
 // fields actually carried on the DrawCall rather than from registers read at
 // the census site. The two must agree exactly.
@@ -2516,6 +2567,8 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     dc.depth_target_width = st.depth_stencil.width;
     dc.depth_target_height = st.depth_stencil.height;
     dc.depth_target_base = st.depth_stencil.color_info & 0xFFFu;
+    NoteDepthSurface(dc.depth_target_object, dc.depth_target_width,
+                     dc.depth_target_height, dc.depth_target_base);
   }
   ProbePixelProfileForDraw(st.ps_seen ? st.pixel_shader : 0, device, base, dc);
   // The Bink composite needs its whole plane set, so it takes its own path
@@ -6443,6 +6496,14 @@ void ReportDrawCounts(uint8_t* base) {
                   (rm >> 16) & 0xFFu);
     }
   }
+  // DEPTH SURFACES BY EDRAM BASE. More than one owner on a base means two
+  // D3D12 depth textures -- and two independent stencil planes -- stand in for
+  // one console allocation, so a mask written through one view is invisible
+  // through the other.
+  REXLOG_INFO("d3d9: DEPTH SURFACES BY EDRAM BASE (>1 owner means the stencil "
+              "plane is split across textures the guest treats as one):{}",
+              DepthSurfaceReport());
+
   // PHASE 1 PASS CONDITION.
   //
   // READ THIS BEFORE CONCLUDING THE COUNTS SHOULD BE EQUAL. They should not,
