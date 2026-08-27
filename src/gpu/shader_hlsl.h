@@ -198,8 +198,26 @@ struct HlslShader {
   // width. Reported rather than dropped in silence, because "the walk saw no
   // exports" and "the walk saw exports and threw them away" are different
   // defects with different fixes, and until this existed they were
-  // indistinguishable from outside. Destinations >= 32 are not represented.
+  // indistinguishable from outside. Destinations >= 32 are not represented --
+  // those are MEMORY EXPORT and are counted separately below, because the
+  // guard that fills this mask (`dest < 32`) excluded them by construction.
   uint32_t dropped_export_mask = 0;
+
+  // Number of ALU exports to a MEMORY EXPORT register: xenia-edge `ucode.h`
+  // names them kExportAddress = 32 and kExportData0..4 = 33..37. Memory export
+  // lets a shader write to guest memory rather than to a render target, and we
+  // do not implement it -- such an export is dropped.
+  //
+  // This exists because the drop was not merely unimplemented, it was
+  // UNCOUNTABLE. The mask above is written under `if (dest < 32)`, so a
+  // memexport skipped the mask and the else-branch alike and left no trace at
+  // all; from outside, a shader that exports to memory and one that exports
+  // nothing read identically. That is the same shape as the reason-code chain
+  // whose zero could not fire, and it cost a session then.
+  //
+  // A nonzero count here does NOT by itself mean a defect -- it means the
+  // question "does this title use memory export?" now has an answer.
+  uint32_t memexport_count = 0;
 
   // PS only. Bit i set = the shader EXPORTED to colour target i, so export_mask
   // reports it as produced, but no export to it ever assigned a channel.

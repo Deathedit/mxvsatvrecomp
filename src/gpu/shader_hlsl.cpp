@@ -151,6 +151,7 @@ class Emitter {
   uint32_t written_mask = 0;   // temps this shader has written so far
   uint32_t export_mask = 0;
   uint32_t dropped_export_mask = 0;
+  uint32_t memexport_count = 0;
   uint32_t color_mask = 0;
   // Colour targets that received an ACTUAL assignment, as opposed to merely
   // being named as an export destination.
@@ -967,6 +968,10 @@ class Emitter {
         // whether the walk had seen those exports and rejected them here or had
         // never reached them at all.
         if (dest < 32) dropped_export_mask |= 1u << dest;
+        // MEMORY EXPORT (dest 32..37) is dropped like the rest, but counted --
+        // the mask above cannot hold it, so without this a shader that writes
+        // guest memory is indistinguishable from one that exports nothing.
+        else if (dest <= 37) ++memexport_count;
         return;
       }
       const uint32_t zero_mask = alu.GetConstant0WriteMask();
@@ -2304,6 +2309,7 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   out.input_mask = em.input_mask;
   out.export_mask = stage == HlslStage::kPixel ? em.color_mask : em.export_mask;
   out.dropped_export_mask = em.dropped_export_mask;
+  out.memexport_count = em.memexport_count;
   out.writes_position = em.writes_position;
   out.writes_depth = em.writes_depth;
   out.max_const_index = em.max_const_index;

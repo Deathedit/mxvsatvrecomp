@@ -5142,6 +5142,44 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
   // probe never ran" stay distinguishable. A zero here kills the hypothesis
   // that our translation is what blacks out the menu background, and moves the
   // question back to the guest's own blend state.
+  // MEMORY EXPORT census, BOTH STAGES. Counted here rather than only for
+  // pixel shaders because memexport is a vertex-stage idiom -- a shader that
+  // writes guest memory instead of a render target.
+  //
+  // The question this answers: the terrain's virtual-texture PAGE TABLE is
+  // uniform in guest memory (every one of its 1048576 entries identical, and
+  // still identical after 230 forced re-reads), while the tile ATLAS beside it
+  // is correctly populated with 39 streamed tiles. Something fills the atlas
+  // and nothing fills the page table. Memory export is one way the guest could
+  // be writing it that we do not implement -- and until now could not even
+  // observe, because the drop was recorded under `if (dest < 32)` and the
+  // memexport registers are 32..37.
+  //
+  // Reported unconditionally, zero included. A zero is the useful answer here:
+  // it RULES OUT memexport and sends the page table back to the CPU-write
+  // path, which is a different search. An unreported zero would rule out
+  // nothing.
+  {
+    static std::atomic<uint64_t> s_translated{0};
+    static std::atomic<uint64_t> s_withMemexport{0};
+    static std::atomic<uint64_t> s_memexportOps{0};
+    const uint64_t t = ++s_translated;
+    if (out.memexport_count) {
+      const uint64_t w = ++s_withMemexport;
+      s_memexportOps += out.memexport_count;
+      if (w <= 16)
+        REXLOG_INFO("d3d9: MEMEXPORT {} shader 0x{:08X}: {} export(s) to "
+                    "registers 32-37 -- guest writes memory from a shader and "
+                    "we drop it",
+                    stage == mx::hle::HlslStage::kPixel ? "pixel" : "vertex",
+                    handle, out.memexport_count);
+    }
+    if ((t % 25) == 0)
+      REXLOG_INFO("d3d9: MEMEXPORT census: {} shaders translated, {} use "
+                  "memory export, {} exports total",
+                  t, s_withMemexport.load(), s_memexportOps.load());
+  }
+
   if (stage == mx::hle::HlslStage::kPixel) {
     static std::atomic<uint64_t> s_psTranslated{0};
     static std::atomic<uint64_t> s_psZeroExport{0};
