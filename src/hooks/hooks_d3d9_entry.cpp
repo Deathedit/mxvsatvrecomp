@@ -1921,17 +1921,25 @@ extern "C" REX_FUNC(sub_8255B258) {
     // The first cut read r8 and logged `s=0` on every line, which looked
     // correct and was not: 0x2D00000 & 0xFF is 0.
     //
-    // HOW STRONG IS THIS? The ABI rule and r8 holding junk are the evidence.
-    // The census CORROBORATES, it does not prove, and an earlier version of
-    // this comment claimed otherwise: r9 being exactly 0/1 is predicted just as
-    // well by r9 == EDRAMClear (a BOOL) as by r9 == Stencil (a value the guest
-    // happens to clear to 0 and 1). Nothing observed separates them.
+    // PROVEN 2026-08-27, by following the value through four frames rather than
+    // inferring it from the ABI. The earlier note here said the census only
+    // CORROBORATED this -- r9 being 0/1 is predicted equally well by
+    // EDRAMClear-as-a-BOOL -- and that was right to say. This is the trace that
+    // settles it:
     //
-    // It does not matter yet, which is why it is not chased here: under EITHER
-    // reading every clear we honour carries stencil 0 and 0x60 is skipped, so
-    // behaviour is identical. They diverge only when Phase 3 decides what 0x60
-    // is, and that wants the guest-side trace of which register reaches
-    // RB_STENCILREFMASK -- not another run of this census.
+    //   D3DDevice_Clear   8255b270  mr  r27, r9
+    //                     8255b2b8  mr  r8, r27          -> sub_8255B130
+    //   sub_8255B130                r8 untouched          -> sub_8255AAB0
+    //   sub_8255AAB0      prologue  mr  r22, r8
+    //                     8255afdc  stw r22, 0x100+var_A4(r1)   ; r1 + 0x5C
+    //                     8255b000  bl  sub_8255A510
+    //   sub_8255A510      8255a5d0  lwz r29, 0x130+arg_5C(r1)   ; same slot
+    //                     8255a5e4  insrwi r30, r29, 8,16
+    //                               and the RB_STENCILREFMASK write below it
+    //
+    // So r9 IS Stencil, r10 IS EDRAMClear, and the value this hook carries is
+    // the one that reaches the hardware register. The clear VALUE is therefore
+    // not a suspect in anything downstream.
     const uint32_t stencil_value = ctx.r9.u32;
     const bool want_depth = (flags & 0x10u) != 0;
     // 0x60 IS HONOURED. It was excluded twice, on two wrong readings:
