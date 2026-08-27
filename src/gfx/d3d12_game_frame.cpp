@@ -2181,10 +2181,13 @@ void D3D12Renderer::RenderGameFrame() {
     //                and stencil multiplies the variants that reach it.
     //   by-format    the on-demand opaque cache, same concern.
     std::snprintf(message, sizeof(message),
-                  "  STENCIL PSOs: %llu draws carried stencil, %llu distinct "
-                  "states interned, %llu refused past the cap (must be 0); "
-                  "blend PSOs %llu of %llu, by-format PSOs %llu",
+                  "  STENCIL PSOs: %llu draws carried stencil (%llu with a "
+                  "comparison that can REJECT -- zero means the test is not "
+                  "live), %llu distinct states interned, %llu refused past the "
+                  "cap (must be 0); blend PSOs %llu of %llu, by-format PSOs "
+                  "%llu",
                   static_cast<unsigned long long>(m_stencilDraws),
+                  static_cast<unsigned long long>(m_stencilTestingDraws),
                   static_cast<unsigned long long>(m_stencilStates.size()),
                   static_cast<unsigned long long>(m_stencilStatesRefused),
                   static_cast<unsigned long long>(m_blendPSOs.size()),
@@ -3286,6 +3289,9 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
     d.stencil = *stencil;
     d.stencilIndex = StencilIndexFor(*stencil);
     ++m_stencilDraws;
+    // kAlways is 7 in the GUEST encoding, which is what GameStencil carries.
+    if (stencil->frontFunc != 7u || stencil->backFunc != 7u)
+      ++m_stencilTestingDraws;
   }
   d.halfPixel = (vtxCntl != 0xFFFFFFFFu && (vtxCntl & 1u) == 0) ? 0.5f : 0.0f;
   if (d.halfPixel != 0.0f) ++m_halfPixelDraws; else ++m_halfPixelSkipped;

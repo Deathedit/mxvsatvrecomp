@@ -611,6 +611,11 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   uint64_t m_stencilStatesRefused = 0;
   // Draws that carried stencil state at all, the denominator for the above.
   uint64_t m_stencilDraws = 0;
+  // Of those, how many carry a comparison that can REJECT -- anything but
+  // kAlways on either face. This is the number that says Phase 3 is live: a
+  // predicate that is always true is not a test, and "no visual change" means
+  // nothing at all if this reads zero.
+  uint64_t m_stencilTestingDraws = 0;
 
   std::unordered_map<uint64_t, Microsoft::WRL::ComPtr<ID3D12PipelineState>>
       m_gamePSOsByFormat;

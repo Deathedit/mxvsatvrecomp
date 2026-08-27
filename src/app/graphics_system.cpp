@@ -85,6 +85,19 @@ REXCVAR_DEFINE_INT32(hle_strict, 0, "Debug",
                      "Bitmask of inventing guards to disable, so the defect "
                      "underneath shows instead of a plausible substitute.");
 
+// PHASE 3 of docs/stencil_plan.md: honour the guest's stencil COMPARISON, not
+// just its writes.
+//
+// Default ON, because it is the correct behaviour and half the frame asks for
+// it. Switchable because this is the first stencil step that can change a
+// pixel, and its failure mode is geometry VANISHING rather than degrading -- so
+// an A/B has to be available without a rebuild. Off restores Phase 2 exactly:
+// stencil still writes, every comparison is ALWAYS, nothing can be rejected.
+REXCVAR_DEFINE_BOOL(d3d9_stencil_test, true, "Graphics",
+                    "Honour the guest's stencil comparison. Off keeps stencil "
+                    "writes but forces every test to ALWAYS, which cannot "
+                    "reject a fragment.");
+
 REXCVAR_DEFINE_BOOL(d3d12_edram_takeover_copy, false, "Graphics",
                     "On a same-extent EDRAM takeover, copy the previous "
                     "owner's contents into the new owner instead of clearing.");
@@ -492,12 +505,20 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                               : sten.frontPass);
             sten.backZFail = uint8_t(two_sided ? (dcb >> 29) & 7u
                                                : sten.frontZFail);
-            // PHASE 2 ONLY, and the single line that makes this phase safe.
-            // ALWAYS cannot reject a fragment, so no geometry can vanish and
-            // "pixel-identical" is a meaningful pass condition. Phase 3 deletes
-            // these two lines and takes (dcb >> 8) & 7 and (dcb >> 20) & 7.
-            sten.frontFunc = 7;  // kAlways
-            sten.backFunc = 7;
+            // PHASE 3. The guest's real comparison, or ALWAYS when the test
+            // is switched off -- which reproduces Phase 2 exactly, since
+            // ALWAYS cannot reject a fragment.
+            //
+            // Read from the SAME bits the census reports, so a config that
+            // shows as `func 4` there is func 4 here and the two cannot drift.
+            if (REXCVAR_GET(d3d9_stencil_test)) {
+              sten.frontFunc = uint8_t((dcb >> 8) & 7u);
+              sten.backFunc =
+                  uint8_t(two_sided ? (dcb >> 20) & 7u : sten.frontFunc);
+            } else {
+              sten.frontFunc = 7;  // kAlways
+              sten.backFunc = 7;
+            }
           }
           m_renderer->AddGameDraw(d->vertices.data(),
                                   static_cast<uint32_t>(d->vertices.size()),

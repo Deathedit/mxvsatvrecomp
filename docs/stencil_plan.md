@@ -117,7 +117,7 @@ behaviour change.
 **Pass:** the plumbed values reproduce the 18 configs the census already
 reports. If they disagree the plumbing is wrong, and no pixel has moved yet.
 
-## Phase 2: stencil WRITE only
+## Phase 2: stencil WRITE only. DONE (`df3c0b2`).
 
 **`StencilEnable` comes from the GUEST, per draw. Never blanket-on.** An earlier
 draft of this plan said `StencilEnable = TRUE`, and that was wrong in three
@@ -152,13 +152,29 @@ nothing can vanish -- and it is the ONLY thing here that is temporary.
 any visual change is a plumbing bug, caught before it can be confused with a
 stencil-test effect.
 
+**PASSED**, run 1542:
+
+```
+STENCIL PSOs: 111613 draws carried stencil, 9 distinct states interned,
+  0 refused past the cap; blend PSOs 1 of 128, by-format PSOs 2
+```
+
+No visual change, no device removals, no PSO failures, frame times in band. 9
+states rather than 18 because `func` is forced and `ref` is out of the key, so
+configs differing only in those collapse -- Phase 3 raises it.
+
+Standing cross-check worth keeping: `STENCIL PLUMBED` effective and the
+renderer's draws-carried count gate identically and should be equal. Run 1542
+had 113,249 vs 111,613, a gap well inside one report interval. If it ever
+exceeds that, draws are being lost between the two points.
+
 **What this phase does NOT validate:** the stencil buffer's CONTENTS. With every
 func forced to `ALWAYS`, ops run on pixels the console would have rejected, so
 the mask is deliberately wrong here -- wrong and unobserved. It becomes correct
 the moment Phase 3 restores the real funcs, since the plane is cleared per frame
 anyway.
 
-## Phase 3: stencil TEST
+## Phase 3: stencil TEST. IN PROGRESS.
 
 Apply the guest's real func. **This is the first step that can change pixels.**
 
