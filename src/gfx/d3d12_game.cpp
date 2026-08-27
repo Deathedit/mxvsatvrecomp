@@ -380,6 +380,26 @@ bool D3D12Renderer::CreateGamePipeline() {
                                       D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
                                       IID_PPV_ARGS(&rb));
   }
+  // The same, for small destinations the guest reads out of memory -- the
+  // terrain feedback buffer. Up front for the same reason.
+  for (auto& rb : m_surfaceReadback) {
+    D3D12_HEAP_PROPERTIES heap = {};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd = {};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = kSurfaceReadbackBytes;
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.Format = DXGI_FORMAT_UNKNOWN;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    // Non-fatal: without it the guest keeps reading a stale feedback buffer,
+    // which is the behaviour it has today.
+    m_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &bd,
+                                      D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                      IID_PPV_ARGS(&rb));
+  }
 
   m_hasGamePipeline = true;
   // Non-fatal: a failure here costs the translated path, not the stand-in one,

@@ -1754,6 +1754,29 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   uint32_t m_luminanceLastBits = 0;
   void DrainLuminanceReadback();
   void QueueLuminanceReadback(GameRenderTarget* snap, uint32_t destObject);
+  // SMALL DESTINATIONS THE GUEST READS FROM MEMORY -- the terrain's virtual-
+  // texture feedback buffer. Separate from the luminance path rather than
+  // widened into it: that one carries luminance SEMANTICS (never hand the guest
+  // a zero, write every known 1x1 destination, one quantity sampled repeatedly)
+  // and none of it is true of a page-ID buffer.
+  //
+  // 64x64x4 = 16 KB, rounded to the placement alignment.
+  static constexpr uint32_t kSurfaceReadbackBytes = 64 * 1024;
+  static constexpr uint32_t kMaxSurfaceReadbackEdge = 64;
+  std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kFrameCount>
+      m_surfaceReadback;
+  std::array<uint32_t, kFrameCount> m_surfacePending = {};
+  std::array<uint32_t, kFrameCount> m_surfaceDestObject = {};
+  std::array<uint32_t, kFrameCount> m_surfaceWidth = {};
+  std::array<uint32_t, kFrameCount> m_surfaceHeight = {};
+  std::array<uint32_t, kFrameCount> m_surfaceRowPitch = {};
+  std::array<uint32_t, kFrameCount> m_surfaceTexelBytes = {};
+  std::array<uint32_t, kFrameCount> m_surfaceByteCount = {};
+  uint64_t m_surfaceReadbacks = 0;
+  uint64_t m_surfaceReadbackRefused = 0;
+  void DrainSurfaceReadback();
+  void QueueSurfaceReadback(GameRenderTarget* snap, uint32_t destObject,
+                            uint32_t destWidth, uint32_t destHeight);
   struct GameRenderTarget {
     Microsoft::WRL::ComPtr<ID3D12Resource> resource;
     uint32_t width = 0;

@@ -16,6 +16,12 @@
 
 #include "hooks/hook_common.h"
 
+// For the small-destination writeback: the SAME tiled address function the
+// decoder uses, run in the other direction. See the note at its call site.
+#include <rex/graphics/pipeline/texture/util.h>
+#include <bit>
+namespace tu = rex::graphics::texture_util;
+
 #include <rex/cvar.h>
 
 #include <array>
@@ -2016,6 +2022,94 @@ extern "C" REX_FUNC(sub_8255CE98) {
           entry.reached_y = std::max(entry.reached_y, dy + h);
           ++entry.resolves;
           g_resolveDestObjectPhys[dest_texture] = physical;
+        }
+        // SMALL DESTINATION WRITEBACK -- the terrain virtual-texture feedback
+        // buffer, and anything else the guest resolves small and then LOADS
+        // rather than samples.
+        //
+        // 0x1A2DD000 is 64x64, resolved once per frame, and `bind0 seen0
+        // draws0`: no shader ever touches it. The GPU writes page IDs there so
+        // the CPU can decide which tiles to stream. Landing the resolve only in
+        // a host snapshot leaves the guest reading whatever was at that address
+        // when it was allocated, so it never learns which pages the camera
+        // needs -- which is a uniform index map and 3 of 64 atlas tiles.
+        //
+        // Same moment as the 1x1 case above and for the same reason: the
+        // resolve the guest just issued is the one it is about to read, and the
+        // value is the previous frame's, which is the latency the console gives
+        // it anyway.
+        if (dest_desc.width > 1 && dest_desc.height > 1 &&
+            dest_desc.width <= 64 && dest_desc.height <= 64 &&
+            dest_desc.bytes_per_block && dest_desc.address) {
+          static uint32_t s_surfaceWroteSeq = 0;
+          const uint32_t seq =
+              mx::hle::g_surfaceReadbackSeq.load(std::memory_order_acquire);
+          if (seq != s_surfaceWroteSeq) {
+            uint32_t wrote = 0;
+            uint32_t skipped_unwritable = 0;
+            bool matched = false;
+            {
+              std::lock_guard<std::mutex> lk(mx::hle::g_surfaceReadbackMutex);
+              const auto& rb = mx::hle::g_surfaceReadback;
+              matched = rb.destObject == dest_texture && rb.width &&
+                        rb.height && rb.bytesPerTexel &&
+                        rb.bytesPerTexel == dest_desc.bytes_per_block;
+              if (matched) {
+                s_surfaceWroteSeq = seq;
+                const uint32_t bpb = dest_desc.bytes_per_block;
+                const uint32_t bpb_log2 = uint32_t(std::bit_width(bpb)) - 1u;
+                const uint32_t w = std::min(rb.width, dest_desc.width);
+                const uint32_t h = std::min(rb.height, dest_desc.height);
+                for (uint32_t y = 0; y < h; ++y) {
+                  for (uint32_t x = 0; x < w; ++x) {
+                    const size_t srcOff = size_t(y) * rb.rowPitch + size_t(x) * bpb;
+                    if (srcOff + bpb > rb.byteCount) continue;
+                    // The guest's own layout, tiled or linear, exactly as the
+                    // DECODER reads it -- the same tu::GetTiledOffset2D, run in
+                    // the other direction. Two address rules that disagree is
+                    // the bug an address rule exists to prevent.
+                    const uint32_t dstOff =
+                        dest_desc.tiled
+                            ? uint32_t(tu::GetTiledOffset2D(
+                                  int32_t(x), int32_t(y),
+                                  dest_desc.pitch_blocks, bpb_log2))
+                            : (y * dest_desc.pitch_blocks + x) * bpb;
+                    const uint32_t at = dest_desc.address + dstOff;
+                    if (!HostPageReadable(REX_RAW_ADDR(at)) ||
+                        !HostPageReadable(REX_RAW_ADDR(at + bpb - 1))) {
+                      ++skipped_unwritable;
+                      continue;
+                    }
+                    // Byte-reversed for the guest's endian, the same swap the
+                    // upload path applies coming the other way.
+                    uint8_t tmp[16];
+                    std::memcpy(tmp, rb.bytes + srcOff, bpb);
+                    if (bpb == 2 && dest_desc.endian != 0) {
+                      std::swap(tmp[0], tmp[1]);
+                    } else if (bpb == 4 && dest_desc.endian != 0) {
+                      std::swap(tmp[0], tmp[3]);
+                      std::swap(tmp[1], tmp[2]);
+                    }
+                    std::memcpy(REX_RAW_ADDR(at), tmp, bpb);
+                    ++wrote;
+                  }
+                }
+              }
+            }
+            if (matched) {
+              static uint32_t s_logged = 0;
+              if (s_logged++ < 8) {
+                REXLOG_INFO(
+                    "d3d9: SURFACE WRITEBACK dest 0x{:08X} addr 0x{:08X} "
+                    "{}x{} bpb {} tiled {} pitch {} -- wrote {} texels, {} "
+                    "unwritable",
+                    dest_texture, dest_desc.address, dest_desc.width,
+                    dest_desc.height, dest_desc.bytes_per_block,
+                    dest_desc.tiled ? 1 : 0, dest_desc.pitch_blocks, wrote,
+                    skipped_unwritable);
+              }
+            }
+          }
         }
         if (dest_desc.width == 1 && dest_desc.height == 1) {
           // Write the GPU's answer where the guest is about to read it.

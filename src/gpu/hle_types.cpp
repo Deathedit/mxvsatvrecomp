@@ -98,6 +98,13 @@ LuminanceReadback g_luminanceReadbacks[kMaxLuminanceReadbacks];
 uint32_t g_luminanceReadbackCount = 0;
 std::atomic<uint32_t> g_luminanceReadbackSeq{0};
 
+// See the note beside the declaration. One slot, not a set: the population it
+// serves is a single destination and a rotating array would be capacity nobody
+// asked for.
+std::mutex g_surfaceReadbackMutex;
+SurfaceReadback g_surfaceReadback;
+std::atomic<uint32_t> g_surfaceReadbackSeq{0};
+
 uint32_t ExpandRectangleList(DrawCall& dc) {
   const uint32_t stride = dc.vertex_stride;
   if (stride < 12 || dc.vertices.size() < size_t(dc.vertex_count) * stride)

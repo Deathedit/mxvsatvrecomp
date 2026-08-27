@@ -1062,6 +1062,125 @@ void D3D12Renderer::DrainLuminanceReadback() {
 // The snapshot is in PIXEL_SHADER_RESOURCE when this runs -- the resolve path
 // just put it there -- and is returned to it, because the composite samples it
 // later in the same frame.
+// Copy a freshly resolved SMALL destination into this frame's readback buffer,
+// so the D3D9 layer can put it back into guest memory where the guest reads it.
+//
+// One per frame, like the luminance path: the population is a single
+// destination (the terrain feedback buffer) and a rotating set would be
+// capacity nobody asked for. If a second ever appears, the refusal is counted.
+void D3D12Renderer::QueueSurfaceReadback(GameRenderTarget* snap,
+                                         uint32_t destObject,
+                                         uint32_t destWidth,
+                                         uint32_t destHeight) {
+  if (!snap || !snap->resource || !destObject) return;
+  if (!destWidth || !destHeight) return;
+  // 1x1 belongs to the luminance path, which carries semantics this one must
+  // not duplicate. Anything larger than the cap is refused rather than
+  // truncated -- a partial feedback buffer is worse than a stale one.
+  if (destWidth * destHeight <= 1) return;
+  if (destWidth > kMaxSurfaceReadbackEdge ||
+      destHeight > kMaxSurfaceReadbackEdge) {
+    return;
+  }
+  if (m_surfacePending[m_frameIndex]) {
+    ++m_surfaceReadbackRefused;
+    return;
+  }
+  const D3D12_RESOURCE_DESC sd = snap->resource->GetDesc();
+  // Typeless cannot be a buffer copy source -- the footprint has no way to say
+  // what the bytes mean, and the runtime defers the complaint to Close(), which
+  // then fails every frame and takes the command list with it.
+  if (sd.Format == DXGI_FORMAT_R32_TYPELESS ||
+      sd.Format == DXGI_FORMAT_R24G8_TYPELESS ||
+      sd.Format == DXGI_FORMAT_R32G8X24_TYPELESS ||
+      sd.Format == DXGI_FORMAT_UNKNOWN) {
+    return;
+  }
+  // The snapshot GROWS and never shrinks, so it can be larger than the resolve
+  // that just wrote it. Copy the destination's extent, not the resource's.
+  if (sd.Width < destWidth || sd.Height < destHeight) return;
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout = {};
+  UINT numRows = 0;
+  UINT64 rowSize = 0, totalBytes = 0;
+  m_device->GetCopyableFootprints(&sd, 0, 1, 0, &layout, &numRows, &rowSize,
+                                  &totalBytes);
+  if (!totalBytes || totalBytes > kSurfaceReadbackBytes) return;
+  auto& rb = m_surfaceReadback[m_frameIndex];
+  if (!rb) return;
+  D3D12_RESOURCE_BARRIER pre = {};
+  pre.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  pre.Transition.pResource = snap->resource.Get();
+  pre.Transition.StateBefore = snap->state;
+  pre.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  pre.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  m_commandList->ResourceBarrier(1, &pre);
+  D3D12_TEXTURE_COPY_LOCATION src = {};
+  src.pResource = snap->resource.Get();
+  src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  src.SubresourceIndex = 0;
+  D3D12_TEXTURE_COPY_LOCATION dst = {};
+  dst.pResource = rb.Get();
+  dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  dst.PlacedFootprint = layout;
+  m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  D3D12_RESOURCE_BARRIER post = pre;
+  post.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+  post.Transition.StateAfter = snap->state;
+  m_commandList->ResourceBarrier(1, &post);
+  m_surfacePending[m_frameIndex] = 1;
+  m_surfaceDestObject[m_frameIndex] = destObject;
+  m_surfaceWidth[m_frameIndex] = destWidth;
+  m_surfaceHeight[m_frameIndex] = destHeight;
+  m_surfaceRowPitch[m_frameIndex] = layout.Footprint.RowPitch;
+  m_surfaceTexelBytes[m_frameIndex] =
+      layout.Footprint.RowPitch && layout.Footprint.Width
+          ? uint32_t(rowSize / layout.Footprint.Width)
+          : 0;
+  m_surfaceByteCount[m_frameIndex] = uint32_t(totalBytes);
+}
+
+void D3D12Renderer::DrainSurfaceReadback() {
+  if (!m_surfacePending[m_frameIndex]) return;
+  m_surfacePending[m_frameIndex] = 0;
+  ID3D12Resource* rb = m_surfaceReadback[m_frameIndex].Get();
+  if (!rb) return;
+  const uint32_t bytes =
+      std::min(m_surfaceByteCount[m_frameIndex],
+               uint32_t(mx::hle::kMaxSurfaceReadbackBytes));
+  void* mapped = nullptr;
+  D3D12_RANGE readRange = {0, bytes};
+  if (FAILED(rb->Map(0, &readRange, &mapped)) || !mapped) return;
+  {
+    std::lock_guard<std::mutex> lk(mx::hle::g_surfaceReadbackMutex);
+    auto& s = mx::hle::g_surfaceReadback;
+    s.destObject = m_surfaceDestObject[m_frameIndex];
+    s.width = m_surfaceWidth[m_frameIndex];
+    s.height = m_surfaceHeight[m_frameIndex];
+    s.rowPitch = m_surfaceRowPitch[m_frameIndex];
+    s.bytesPerTexel = m_surfaceTexelBytes[m_frameIndex];
+    s.byteCount = bytes;
+    std::memcpy(s.bytes, mapped, bytes);
+  }
+  D3D12_RANGE noWrite = {0, 0};
+  rb->Unmap(0, &noWrite);
+  if (m_surfaceReadbacks < 8) {
+    char msg[192];
+    std::snprintf(msg, sizeof(msg),
+                  "SURFACE readback #%llu dest 0x%08X %ux%u pitch %u texel %uB "
+                  "%u bytes",
+                  static_cast<unsigned long long>(m_surfaceReadbacks),
+                  m_surfaceDestObject[m_frameIndex],
+                  m_surfaceWidth[m_frameIndex], m_surfaceHeight[m_frameIndex],
+                  m_surfaceRowPitch[m_frameIndex],
+                  m_surfaceTexelBytes[m_frameIndex], bytes);
+    LogInfo(msg);
+  }
+  ++m_surfaceReadbacks;
+  // Bumped last, so a reader that checks the sequence first cannot pair a new
+  // sequence with half-written bytes.
+  mx::hle::g_surfaceReadbackSeq.fetch_add(1, std::memory_order_release);
+}
+
 void D3D12Renderer::QueueLuminanceReadback(GameRenderTarget* snap,
                                            uint32_t destObject) {
   if (!snap || !snap->resource || !destObject) return;

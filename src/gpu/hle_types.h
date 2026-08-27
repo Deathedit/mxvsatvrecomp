@@ -924,4 +924,40 @@ extern LuminanceReadback g_luminanceReadbacks[kMaxLuminanceReadbacks];
 extern uint32_t g_luminanceReadbackCount;
 extern std::atomic<uint32_t> g_luminanceReadbackSeq;
 
+// SMALL RESOLVE DESTINATIONS THE GUEST READS FROM MEMORY.
+//
+// The luminance path above exists because sub_82AFB8A8 resolves a 1x1 and then
+// LOADS its bytes out of guest memory rather than sampling them -- see
+// [[guest-reads-resolves-from-memory]]. It is scoped to 1x1, and it is not the
+// only such reader.
+//
+// The terrain's virtual-texture FEEDBACK BUFFER is one: 0x1A2DD000, 64x64,
+// resolved once per frame and sampled by nothing (`1858res bind0 seen0
+// draws0`). The GPU writes page IDs, the CPU reads them to decide which tiles
+// to stream. With the resolve landing only in a host snapshot the guest reads
+// whatever was there at allocation, never learns which pages the camera needs,
+// and so never updates its index map or asks for more tiles -- which is a
+// uniform index map and 3 of 64 atlas tiles resident.
+//
+// 64x64x4 is the cap. That covers the feedback buffer and excludes the only
+// other never-sampled destination in the census, a 1280x720 scene target that
+// reaches the screen by another path and would cost a megabyte a frame.
+inline constexpr uint32_t kMaxSurfaceReadbackBytes = 64 * 64 * 4;
+struct SurfaceReadback {
+  uint32_t destObject = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  // Bytes per row IN `bytes`, which is the readback buffer's own pitch and is
+  // NOT the guest's -- D3D12 aligns footprint rows to 256.
+  uint32_t rowPitch = 0;
+  uint32_t bytesPerTexel = 0;
+  uint32_t byteCount = 0;
+  uint8_t bytes[kMaxSurfaceReadbackBytes] = {};
+};
+extern std::mutex g_surfaceReadbackMutex;
+extern SurfaceReadback g_surfaceReadback;
+// Bumped after the slot is filled, so a reader that checks it first can never
+// pair a new sequence with half-written bytes.
+extern std::atomic<uint32_t> g_surfaceReadbackSeq;
+
 }  // namespace mx::hle

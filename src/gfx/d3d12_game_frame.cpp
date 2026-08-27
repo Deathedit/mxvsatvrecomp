@@ -45,6 +45,9 @@ void D3D12Renderer::RenderGameFrame() {
   // Before anything is recorded into this slot: the copy issued the last time
   // round is complete, and the guest is waiting on its exposure.
   DrainLuminanceReadback();
+  // The same, for small destinations the guest reads out of memory -- the
+  // terrain virtual-texture feedback buffer. See QueueSurfaceReadback.
+  DrainSurfaceReadback();
   // This frame in flight takes its own slice of the descriptor blocks, so the
   // window resets every host frame rather than only when the guest hands off a
   // new draw list. See m_translatedBlocksPerFrame.
@@ -775,6 +778,11 @@ void D3D12Renderer::RenderGameFrame() {
           (oneByOneSeen++ % kMaxLuminanceSlots) ==
               (m_gameFrame % kMaxLuminanceSlots))
         QueueLuminanceReadback(snap, d.resolveDest);
+      // And the same for a small destination that is bigger than 1x1: the
+      // terrain feedback buffer is 64x64 and read the same way. Gated on the
+      // RESOLVE's extent, not the snapshot's, because the snapshot grows.
+      QueueSurfaceReadback(snap, d.resolveDest, d.resolveDestWidth,
+                           d.resolveDestHeight);
       continue;
     }
     // A full-surface D3D9 DEPTH clear, ordered among the draws.
