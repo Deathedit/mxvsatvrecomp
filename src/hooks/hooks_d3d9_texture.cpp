@@ -540,8 +540,30 @@ FlatProbeCounts g_flatProbe;
 // Keys whose last decode came out flat, with the frame it happened on. A flat
 // texture is re-read on a BACKOFF rather than every bind -- see the note at the
 // cache insert for what every-bind cost.
-std::map<uint64_t, uint32_t> g_flatRetryKeys;
+// A watched key: when it was last re-read, and whether its content has been
+// seen to CHANGE. The two get different intervals -- see kVolatileRetryFrames.
+struct FlatWatch {
+  uint32_t last_frame = 0;
+  bool volatile_content = false;
+};
+std::map<uint64_t, FlatWatch> g_flatRetryKeys;
+// Still uniform: nothing has changed yet, so re-read it rarely.
 constexpr uint32_t kFlatRetryFrames = 30;
+// PROVEN TO CHANGE: re-read it often. The terrain page table is rewritten by
+// the guest every frame, so at 30 frames we render from a mapping up to half a
+// second old.
+//
+// What makes 4 affordable is skipping the flatness scan below, not raw budget.
+// The measurement that killed "re-read on every bind" was
+//
+//     decode 359ms, scan 651ms | 50 decodes over 36880 KB
+//
+// and the SCAN is the bigger half -- ScanFlatness makes three full passes (a
+// 256-bin byte histogram, then two Boyer-Moore passes over elements). On a key
+// already known to change, that scan asks a question whose answer we have, so
+// it is pure waste. Dropping it takes the marginal cost of a re-read from
+// ~28ms/MB to ~10ms/MB, which is what buys the tighter interval.
+constexpr uint32_t kVolatileRetryFrames = 4;
 uint64_t g_flatNotCached = 0;
 uint64_t g_flatRetriesDue = 0;
 // Watched keys whose re-read came back with CONTENT -- i.e. the texture really
@@ -2512,8 +2534,11 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     if (!stale) {
       if (auto fr = g_flatRetryKeys.find(key); fr != g_flatRetryKeys.end()) {
         const uint32_t now = mx::hle::D3D9FrameCount();
-        if (now - fr->second >= kFlatRetryFrames) {
-          fr->second = now;
+        const uint32_t interval = fr->second.volatile_content
+                                      ? kVolatileRetryFrames
+                                      : kFlatRetryFrames;
+        if (now - fr->second.last_frame >= interval) {
+          fr->second.last_frame = now;
           ++g_flatRetriesDue;
           stale = true;
         }
@@ -2747,13 +2772,22 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
       payload->level_count > 1
           ? std::min<size_t>(payload->levels[1].offset, payload->data.size())
           : payload->data.size();
+  // DO NOT RE-SCAN A KEY ALREADY KNOWN TO CHANGE. The scan exists to ask "is
+  // this texture still empty?", and for a volatile key that question is
+  // already answered -- running it again is three full passes over the buffer
+  // for a result we hold. It is also the larger half of a re-read's cost, so
+  // skipping it is what makes kVolatileRetryFrames affordable.
+  const auto watch_it = g_flatRetryKeys.find(key);
+  const bool known_volatile = watch_it != g_flatRetryKeys.end() &&
+                              watch_it->second.volatile_content;
   const bool flat_now =
-      flat_base && flat_base <= kFlatRetryLimit &&
+      !known_volatile && flat_base && flat_base <= kFlatRetryLimit &&
       ScanFlatness(payload->data.data(), flat_base, source.bytes_per_block)
               .share() >= 0.999;
   if (flat_now) {
     ++g_flatNotCached;
-    g_flatRetryKeys[key] = mx::hle::D3D9FrameCount();
+    g_flatRetryKeys[key] =
+        FlatWatch{uint32_t(mx::hle::D3D9FrameCount()), false};
     static std::set<uint64_t> s_flatSeen;
     if (s_flatSeen.insert(key).second && s_flatSeen.size() <= 12) {
       // IS THIS ACTUALLY A GPU SURFACE WE FAILED TO CLAIM? On Xenos a render
@@ -2782,7 +2816,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
                                    rp.below_height, rp.below_delta)
                      : std::string(" -- NONE, and none below either")));
     }
-  } else if (auto it = g_flatRetryKeys.find(key); it != g_flatRetryKeys.end()) {
+  } else if (watch_it != g_flatRetryKeys.end()) {
     // KEEP WATCHING IT. Erasing here was a real bug and it cost the terrain.
     //
     // The backoff was written for a texture that STARTS empty and later fills:
@@ -2807,7 +2841,10 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     // backoff. Not caching at all is NOT the alternative -- that was measured
     // at 1.75 SECONDS a frame, because it re-decoded on every bind. A backoff
     // over the watched set is what already costs ~0ms today.
-    it->second = mx::hle::D3D9FrameCount();
+    watch_it->second.last_frame = mx::hle::D3D9FrameCount();
+    // Latches on: once a texture has been seen to carry content after being
+    // uniform, it is volatile for good and gets the tight interval.
+    watch_it->second.volatile_content = true;
     ++g_flatVolatile;
   }
   g_hleCpuTextures.emplace(key, std::move(payload));
