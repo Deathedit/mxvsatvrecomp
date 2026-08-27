@@ -3,11 +3,11 @@
 #include <algorithm>
 #include <cstring>
 
-// The SDK ships Xenia's GPU layer, and these two headers are header-only â€” no
+// The SDK ships Xenia's GPU layer, and these two headers are header-only -- no
 // linking (rexgpu-xenos.lib is a 2-symbol plugin import stub). We get the bit
 // layouts free and write the control-flow walk ourselves, because the things
-// that would do it for us â€” PacketDisassembler, Shader::AnalyzeUcode,
-// ParseVertexFetchInstruction â€” are all sealed inside the plugin DLL.
+// that would do it for us -- PacketDisassembler, Shader::AnalyzeUcode,
+// ParseVertexFetchInstruction -- are all sealed inside the plugin DLL.
 #include <rex/graphics/format/ucode.h>
 #include <rex/graphics/xenos.h>
 
@@ -27,7 +27,7 @@ constexpr uint32_t kMaxAttributes = 32;
 // address(), count() and sequence() sit at identical bit offsets in all three
 // exec structs, but they are distinct union members, so reaching them requires
 // a switch on the opcode rather than picking one arbitrarily. Getting this
-// wrong would compile silently and read the right bits by luck â€” until someone
+// wrong would compile silently and read the right bits by luck -- until someone
 // changed a field.
 bool IsExec(uc::ControlFlowOpcode op) { return uc::IsControlFlowOpcodeExec(op); }
 
@@ -85,15 +85,15 @@ uint32_t ExecSequence(const uc::ControlFlowInstruction& cf) {
   }
 }
 
-// How many source operands each vector opcode actually reads. The SDK knows â€”
-// kAluVectorOpcodeInfos::GetOperandCount â€” but that table is `extern const` and
+// How many source operands each vector opcode actually reads. The SDK knows --
+// kAluVectorOpcodeInfos::GetOperandCount -- but that table is `extern const` and
 // defined inside the sealed plugin DLL, so it cannot be linked against. This is
 // transcribed from the per-opcode signatures documented in the enum itself
 // (AluVectorOpcode in ucode.h), which give the operand list for every one.
 //
 // Reading a source the opcode does not use is not harmless here. The position
 // export in both ground-truth shaders is a two-operand op whose unused src3
-// field still names temp register 0 â€” the colour register â€” so consulting all
+// field still names temp register 0 -- the colour register -- so consulting all
 // three marked colour as feeding the position. That is the exact false positive
 // this table exists to prevent.
 //
@@ -129,7 +129,7 @@ uint32_t VertexFormatSizeBytes(uint32_t format, uint32_t* out_components) {
     case 37: components = 2; bytes = 8;  break;  // k_32_32_FLOAT
     case 38: components = 4; bytes = 16; break;  // k_32_32_32_32_FLOAT
     case 57: components = 3; bytes = 12; break;  // k_32_32_32_FLOAT
-    default: break;  // unrecognised â€” report 0 rather than assert
+    default: break;  // unrecognised -- report 0 rather than assert
   }
   if (out_components) *out_components = components;
   return bytes;
@@ -268,7 +268,7 @@ bool ReadVertexAttributeAs(const uint8_t* vertex_base, uint32_t vertex_bytes,
       return true;
     }
 
-    case 6: {  // k_8_8_8_8 â€” low byte is component 0
+    case 6: {  // k_8_8_8_8 -- low byte is component 0
       const uint32_t v = Rd32(p);
       for (int i = 0; i < 4; ++i) {
         const uint32_t b = (v >> (i * 8)) & 0xFF;
@@ -282,7 +282,7 @@ bool ReadVertexAttributeAs(const uint8_t* vertex_base, uint32_t vertex_bytes,
       return true;
     }
 
-    case 7: {  // k_2_10_10_10 â€” three 10-bit components then a 2-bit one
+    case 7: {  // k_2_10_10_10 -- three 10-bit components then a 2-bit one
       const uint32_t v = Rd32(p);
       const uint32_t raw[4] = {v & 0x3FF, (v >> 10) & 0x3FF, (v >> 20) & 0x3FF,
                                (v >> 30) & 0x3};
@@ -307,14 +307,14 @@ bool ReadVertexAttributeAs(const uint8_t* vertex_base, uint32_t vertex_bytes,
       return true;
     }
 
-    case 16: {  // k_10_11_11 â€” x:11 y:11 z:10, low to high
+    case 16: {  // k_10_11_11 -- x:11 y:11 z:10, low to high
       const uint32_t v = Rd32(p);
       out[0] = float(v & 0x7FF) / 2047.0f;
       out[1] = float((v >> 11) & 0x7FF) / 2047.0f;
       out[2] = float((v >> 22) & 0x3FF) / 1023.0f;
       return true;
     }
-    case 17: {  // k_11_11_10 â€” x:10 y:11 z:11
+    case 17: {  // k_11_11_10 -- x:10 y:11 z:11
       const uint32_t v = Rd32(p);
       out[0] = float(v & 0x3FF) / 1023.0f;
       out[1] = float((v >> 10) & 0x7FF) / 2047.0f;
@@ -348,8 +348,8 @@ const VertexAttribute* PickPositionAttribute(
   if (out_from_export) *out_from_export = false;
 
   // The shader's own answer, when the ALU trace produced one. Several
-  // attributes can legitimately reach the export â€” a skinned mesh exports a
-  // position built from bone weights and indices as well as the point â€” so
+  // attributes can legitimately reach the export -- a skinned mesh exports a
+  // position built from bone weights and indices as well as the point -- so
   // among the contributors still prefer the one that looks most like a
   // coordinate, lowest offset breaking the tie.
   const VertexAttribute* best = nullptr;
@@ -405,7 +405,7 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
   if (!dwords) return reject("null blob");
   if (dword_count < 3) return reject("blob shorter than one CF pair");
 
-  // Pass 1 â€” find where the control flow section ends.
+  // Pass 1 -- find where the control flow section ends.
   //
   // The blob carries no header saying so. CF instructions are 48-bit, packed
   // two per three dwords, and the section runs until the first instruction the
@@ -428,12 +428,12 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
   if (!saw_exec) return reject("no exec instruction");
   if (max_cf_dword == 0) return reject("exec target at address 0");
 
-  // Pass 2 â€” walk every exec block in program order and pull out the fetches.
+  // Pass 2 -- walk every exec block in program order and pull out the fetches.
   //
   // Branches are deliberately not followed and loops are not unrolled: each
   // exec is visited exactly once. That over-approximates the attribute set for
   // a shader with alternative paths, which is the right error for gathering a
-  // layout â€” every path fetches from the same buffer. A shader with two genuine
+  // layout -- every path fetches from the same buffer. A shader with two genuine
   // layouts would show up as two attributes at one offset with different
   // formats, and that should be reported, not smoothed over by a heuristic.
   //
@@ -452,7 +452,7 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
   // export to register 62 unions them into pos_taint. kMaxAttributes is 32, so
   // one uint32_t per register is exactly enough.
   //
-  // Only the operands the opcode actually reads count â€” see
+  // Only the operands the opcode actually reads count -- see
   // kVectorOperandCount, and the false positive that made it necessary.
   const size_t out_base = out.size();
   uint32_t taint[64] = {};
@@ -478,7 +478,7 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
         // Sequence bits, 2 per instruction: bit[2n] selects fetch (1) over ALU
         // (0), bit[2n+1] is serialize, which does not concern us.
         if (!((seq >> (n * 2)) & 0x1)) {
-          // An ALU instruction. We do not evaluate it â€” only follow which
+          // An ALU instruction. We do not evaluate it -- only follow which
           // registers its result depends on, which is all that is needed to
           // learn what feeds the position export.
           uc::AluInstruction alu{};
@@ -499,7 +499,7 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
 
           if (alu.is_export()) {
             // On an export both the vector and the scalar operation write to
-            // vector_dest, so one destination check covers the instruction â€”
+            // vector_dest, so one destination check covers the instruction --
             // but only the halves that actually write anything contribute.
             if (alu.vector_dest() == kPositionExportRegister) {
               saw_position_export = true;
@@ -511,8 +511,8 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
 
           // A full write mask replaces the register's provenance; a partial one
           // leaves the untouched components carrying whatever they had, so it
-          // has to union. Relative destination addressing is not resolved â€”
-          // the index lives in a register we do not evaluate â€” so such a write
+          // has to union. Relative destination addressing is not resolved --
+          // the index lives in a register we do not evaluate -- so such a write
           // lands on the base register and is a known imprecision.
           if (alu.vector_write_mask()) {
             uint32_t& t = taint[alu.vector_dest() & 63];

@@ -46,7 +46,7 @@
 #include <cmath>
 #include "gpu/d3d9_state.h"
 #include "gpu/hle_types.h"      // g_luminanceReadbackBits/Seq
-#include "gpu/xenos_gpu_state.h"  // mx::gpu::alu â€” the PM4 ALU constant file
+#include "gpu/xenos_gpu_state.h"  // mx::gpu::alu -- the PM4 ALU constant file
 #include "hooks/hooks_d3d9_shared.h"
 #include "hooks/texture_dump.h"         // --texture_dump=true, logs/texdump
 namespace mx::hooks::d3d9 {
