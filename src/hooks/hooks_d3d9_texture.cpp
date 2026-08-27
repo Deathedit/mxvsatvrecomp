@@ -474,6 +474,12 @@ struct FullHashWatch {
   std::set<uint32_t> sampled;  // distinct GuestTextureFingerprint values seen
   uint32_t width = 0, height = 0, format = 0, address = 0, bytes = 0;
   uint64_t unreadable = 0;     // hashes refused because the memory would fault
+  // HOW MANY TIMES WE ACTUALLY LOOKED. Without it `distinct FULL 1` is
+  // unreadable: one observation and five hundred produce the same 1, and only
+  // the second is evidence the bytes never move. The full hash is throttled and
+  // the sampled one is not, so their distinct counts are NOT directly
+  // comparable either -- print both denominators and let the ratio be judged.
+  uint64_t full_obs = 0, sampled_obs = 0;
 };
 std::map<uint64_t, FullHashWatch> g_fullHashWatch;
 // Only textures big enough for the sampler's coverage to actually be thin. At
@@ -488,7 +494,7 @@ void NoteFullHash(const mx::hle::HleTextureSource& source, uint8_t* base,
   const uint32_t now = mx::hle::D3D9FrameCount();
   // Record the SAMPLED value on every bind -- it is free, we were handed it,
   // and its distinct count is the control the full hash is compared against.
-  if (sampled) w.sampled.insert(sampled);
+  if (sampled) { w.sampled.insert(sampled); ++w.sampled_obs; }
   if (!w.full.empty() && now - w.last_frame < kFullHashFrames) return;
   w.last_frame = now;
   w.width = source.width;
@@ -519,6 +525,7 @@ void NoteFullHash(const mx::hle::HleTextureSource& source, uint8_t* base,
   }
   const uint32_t folded = uint32_t(h ^ (h >> 32));
   w.full.insert(folded ? folded : 1u);
+  ++w.full_obs;
 }
 
 std::string ReportFullHashWatch() {  // declared in hooks_d3d9_internal.h
@@ -528,10 +535,10 @@ std::string ReportFullHashWatch() {  // declared in hooks_d3d9_internal.h
     // nothing was missed and the art is absent at the source. `full > sampled`
     // is the sampler being blind, and the gap is how blind.
     out += fmt::format(
-        "\n  0x{:08X} {}x{} fmt{} bytes={} -- distinct FULL {} vs "
-        "SAMPLED {}{}",
+        "\n  0x{:08X} {}x{} fmt{} bytes={} -- FULL {} distinct of {} "
+        "reads | SAMPLED {} distinct of {} binds{}",
         w.address, w.width, w.height, w.format, w.bytes, w.full.size(),
-        w.sampled.size(),
+        w.full_obs, w.sampled.size(), w.sampled_obs,
         w.unreadable ? fmt::format(" ({} unreadable)", w.unreadable) : "");
   }
   return out;
