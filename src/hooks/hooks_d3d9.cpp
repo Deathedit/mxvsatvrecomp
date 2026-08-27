@@ -6460,6 +6460,13 @@ void ReportGlyphCache() {
               d::g_gfxMissingGlyph.load(std::memory_order_relaxed),
               d::g_gfxCacheFull.load(std::memory_order_relaxed));
 
+  REXLOG_INFO("d3d9: GLYPH LATCH cleared {} of {} compose calls -- clearing "
+              "the guest's once-per-movie latch so every DISTINCT missing "
+              "character reports. CLEARED 0 with COMPOSE 0 means the hook never "
+              "ran; CLEARED 0 with COMPOSE large means nothing was ever latched",
+              d::g_glyphLatchCleared.load(std::memory_order_relaxed),
+              d::g_glyphComposeCalls.load(std::memory_order_relaxed));
+
   // The fork. DROPPED > 0 keeps the hunt inside sub_828AC620's pass-dependent
   // flags; DROPPED == 0 against a healthy call count means the letter was never
   // in the line records and the search moves up into composition.

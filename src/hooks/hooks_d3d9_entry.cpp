@@ -426,6 +426,28 @@ void GfxGuestStr(uint8_t* base, uint32_t addr, char* out, size_t max) {
   out[i] = '\0';
 }
 
+// Distinct missing glyphs already reported. Once the latch is cleared the
+// guest will complain about the SAME glyph on every line that uses it, so the
+// log is deduplicated by codepoint -- what we want is the SET of characters a
+// font is missing, not a rate.
+//
+// A race here can at worst print one duplicate line, which is harmless, so this
+// is deliberately lock-free.
+constexpr uint32_t kMissingSeenMax = 64;
+uint32_t g_missingSeen[kMissingSeenMax];
+std::atomic<uint32_t> g_missingSeenCount{0};
+
+bool FirstTimeSeeingMissingGlyph(uint32_t code) {
+  const uint32_t n = g_missingSeenCount.load(std::memory_order_relaxed);
+  for (uint32_t i = 0; i < n && i < kMissingSeenMax; ++i)
+    if (g_missingSeen[i] == code) return false;
+  if (n < kMissingSeenMax) {
+    g_missingSeen[n] = code;
+    g_missingSeenCount.store(n + 1, std::memory_order_relaxed);
+  }
+  return true;
+}
+
 constexpr uint32_t kFmtMissingGlyph = 0x820E5020;
 constexpr uint32_t kFmtRasterCacheFull = 0x820D98D8;
 constexpr uint32_t kFmtVectorCacheFull = 0x820D9930;
@@ -444,11 +466,13 @@ extern "C" REX_FUNC(sub_8289EC20) {
     GfxGuestStr(base, ctx.r8.u32, in, sizeof in);
     GfxGuestStr(base, ctx.r10.u32, ranges, sizeof ranges);
     g_gfxMissingGlyph.fetch_add(1, std::memory_order_relaxed);
-    REXLOG_INFO("d3d9: GUEST SAYS MISSING GLYPH U+{:04X} ('{}') in font \"{}\" "
-                "for \"{}\" -- that font has {} glyphs, ranges {}",
-                code,
-                (code >= 32 && code < 127) ? static_cast<char>(code) : '?',
-                font, in, glyphs, ranges);
+    if (FirstTimeSeeingMissingGlyph(code)) {
+      REXLOG_INFO("d3d9: GUEST SAYS MISSING GLYPH U+{:04X} ('{}') in font "
+                  "\"{}\" for \"{}\" -- that font has {} glyphs, ranges {}",
+                  code,
+                  (code >= 32 && code < 127) ? static_cast<char>(code) : '?',
+                  font, in, glyphs, ranges);
+    }
   }
   g_gfxLogCalls.fetch_add(1, std::memory_order_relaxed);
   orig_GfxLog(ctx, base);
@@ -622,6 +646,60 @@ extern "C" REX_FUNC(sub_82945D20) {
               bad_nominal ? "  <<< NOMINAL SIZE 0: the parse produced nothing, "
                             "which the guest calls a broken gfx file"
                           : "");
+}
+
+//=============================================================================
+// 0x829A9838 - GFx_TextLine_ComposeGlyphs. CLEARS THE MISSING-GLYPH LATCH.
+//
+// THIS IS THE ONLY GUEST-MEMORY WRITE IN THIS FILE. Everything else here reads
+// and counts; this one byte does not.
+//
+// The guest knows exactly which character it could not find and says so:
+//
+//     if (glyphIndex == -1 && a1[591] && (*(BYTE *)(*a1 + 319) & 0x10) == 0) {
+//         sub_8289EC20(a1[591] + 12, "Missing \"%s\" glyph '%c' (0x%x) ...");
+//         *(BYTE *)(*a1 + 319) |= 0x10;      // <-- latches, ONCE PER MOVIE
+//     }
+//
+// That latch is why we only ever heard about one: U+00A0 (no-break space) in
+// font @UIExtended, whose ranges are 0x20-0x7e then 0xa1-0xff -- 0xA0 sits in
+// the one-codepoint gap between them. Real, reproducible in 12 of 20 runs, but
+// it is the FIRST missing glyph, not necessarily the visible one, and while it
+// holds the latch every later miss is silent.
+//
+// Clearing bit 0x10 after the original runs lets the next miss report too. The
+// honest accounting of what that costs:
+//
+//   - it makes the guest log MORE than it would on hardware
+//   - it does NOT change what is rendered: the branch this re-enables only
+//     formats a string, and the glyph was already lost before it was reached
+//   - it is cleared AFTER the original, so each call still reports at most
+//     once; the flood is bounded by lines-with-a-missing-glyph, and the sink
+//     log is deduplicated by codepoint on top of that
+//
+// g_glyphLatchCleared counts the writes, so if the set of reported glyphs looks
+// thin it can be checked against whether the clearing actually happened.
+//=============================================================================
+REX_IMPORT(__imp__sub_829A9838, orig_TextComposeGlyphs, void());
+extern "C" REX_FUNC(sub_829A9838) {
+  const uint32_t self = ctx.r3.u32;
+
+  orig_TextComposeGlyphs(ctx, base);
+
+  // The DENOMINATOR. Without it "cleared 0" cannot be told apart from "this
+  // hook never ran", which are opposite findings -- the first says nothing was
+  // ever latched, the second says the instrument is dead. Learned on the first
+  // run of this hook, which reached no screen that reports a missing glyph and
+  // so proved nothing either way.
+  g_glyphComposeCalls.fetch_add(1, std::memory_order_relaxed);
+
+  if (!self || !HostPageReadable(REX_RAW_ADDR(self))) return;
+  const uint32_t obj = REX_LOAD_U32(self);
+  if (!obj || !HostPageReadable(REX_RAW_ADDR(obj + 319))) return;
+  const uint8_t latch = REX_LOAD_U8(obj + 319);
+  if (!(latch & 0x10)) return;
+  REX_STORE_U8(obj + 319, static_cast<uint8_t>(latch & ~0x10));
+  g_glyphLatchCleared.fetch_add(1, std::memory_order_relaxed);
 }
 
 REX_IMPORT(__imp__sub_82550B80, orig_CreateVertexDeclaration, void());

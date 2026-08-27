@@ -350,6 +350,10 @@ extern std::atomic<uint64_t> g_lineBuildDropped;
 extern std::atomic<uint64_t> g_lineBuildCacheFull;
 extern std::atomic<uint64_t> g_lineBuildUnread;
 
+// Writes to the guest's missing-glyph latch. See the hook for the trade-off.
+extern std::atomic<uint64_t> g_glyphLatchCleared;
+extern std::atomic<uint64_t> g_glyphComposeCalls;
+
 extern std::atomic<uint64_t> g_gfxLogCalls;
 extern std::atomic<uint64_t> g_gfxMissingGlyph;
 extern std::atomic<uint64_t> g_gfxCacheFull;

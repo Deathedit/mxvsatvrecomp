@@ -237,6 +237,13 @@ std::atomic<uint64_t> g_lineBuildDropped{0};
 std::atomic<uint64_t> g_lineBuildCacheFull{0};
 std::atomic<uint64_t> g_lineBuildUnread{0};
 
+// How many times we cleared the guest's once-per-movie missing-glyph latch.
+// The only guest write in the glyph instrumentation; counted so a thin set of
+// reported glyphs can be distinguished from the clearing never happening.
+std::atomic<uint64_t> g_glyphLatchCleared{0};
+// Denominator for the above: every call to GFx_TextLine_ComposeGlyphs.
+std::atomic<uint64_t> g_glyphComposeCalls{0};
+
 std::atomic<uint64_t> g_gfxLogCalls{0};
 std::atomic<uint64_t> g_gfxMissingGlyph{0};
 std::atomic<uint64_t> g_gfxCacheFull{0};
