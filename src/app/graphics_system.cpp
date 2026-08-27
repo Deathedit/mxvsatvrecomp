@@ -533,6 +533,16 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   d->guest_vp_width, d->guest_vp_height,
                                   REXCVAR_GET(d3d9_guest_viewport),
                                   REXCVAR_GET(d3d12_edram_takeover_copy));
+          // MRT slot 1 as a follow-up rather than four more arguments on a
+          // call that already takes forty: it patches the draw AddGameDraw just
+          // pushed, and does nothing when the guest bound only one target.
+          if (d->render_target1_object) {
+            m_renderer->SetGameDrawSecondTarget(
+                d->render_target1_object, d->render_target1_width,
+                d->render_target1_height,
+                d->render_target1_color_info & 0xFFFu,
+                (d->render_target1_color_info >> 16) & 0xFu);
+          }
           static bool s_loggedFirst = false;
           if (!s_loggedFirst) {
             s_loggedFirst = true;

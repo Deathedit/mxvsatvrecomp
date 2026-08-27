@@ -89,6 +89,10 @@ void D3D12Renderer::RenderGameFrame() {
   D3D12_RECT boundScissor = {-1, -1, -1, -1};
   // Zero means "no DSV bound", which is a distinct state from any depth object.
   uint32_t boundDepthObject = 0;
+  // MRT slot 1's format for whatever is currently bound, so the PSO key below
+  // describes the RTVs that are ACTUALLY set rather than what the draw asked
+  // for. UNKNOWN means one target is bound, which is the overwhelming default.
+  DXGI_FORMAT boundTarget1Format = DXGI_FORMAT_UNKNOWN;
   static const float kOffscreenClear[4] = {0, 0, 0, 0};
   std::unordered_set<uint32_t> sampledTargets;
   sampledTargets.reserve(m_gameDraws.size());
@@ -1042,8 +1046,53 @@ void D3D12Renderer::RenderGameFrame() {
           dsv = m_gameDepthDsvHeap->GetCPUDescriptorHandleForHeapStart();
           dsv.ptr += SIZE_T(depthTarget->rtvIndex) * m_gameDsvDescriptorSize;
         }
-        m_commandList->OMSetRenderTargets(1, &rtv, FALSE,
-                                          depthTarget ? &dsv : nullptr);
+        // MRT SLOT 1. The guest's terrain tile pass binds two 256x256
+        // targets and resolves the SECOND one; rendering only slot 0 left slot
+        // 1 never drawn, its resolve dropped for want of a source, and the tile
+        // shader's texture bind failing. See DrawCall::render_target1_object.
+        //
+        // The second target is ensured the same way the first is, and a failure
+        // to get one falls back to single-target binding rather than dropping
+        // the draw -- half the output beats none, and the PSO key below is
+        // built from what was actually bound so the two cannot disagree.
+        GameRenderTarget* drawTarget1 = nullptr;
+        if (d.target1Object) {
+          // HostColorFormat, exactly as the first target does it -- the
+          // field carries the GUEST colour nibble, not a DXGI value.
+          drawTarget1 = EnsureGameRenderTarget(
+              d.target1Object, d.target1Width, d.target1Height, d.target1Base,
+              HostColorFormat(d.target1ColorFormat));
+        }
+        if (drawTarget1) {
+          D3D12_CPU_DESCRIPTOR_HANDLE rtvs[2] = {rtv, rtv};
+          rtvs[1] = m_gameRtvHeap->GetCPUDescriptorHandleForHeapStart();
+          rtvs[1].ptr +=
+              SIZE_T(drawTarget1->rtvIndex) * m_gameRtvDescriptorSize;
+          if (drawTarget1->state != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+            D3D12_RESOURCE_BARRIER toRt = {};
+            toRt.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            toRt.Transition.pResource = drawTarget1->resource.Get();
+            toRt.Transition.StateBefore = drawTarget1->state;
+            toRt.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            toRt.Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            m_commandList->ResourceBarrier(1, &toRt);
+            drawTarget1->state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+          }
+          m_commandList->OMSetRenderTargets(2, rtvs, FALSE,
+                                            depthTarget ? &dsv : nullptr);
+          // Drawn, so its resolve has a source. This is the flag whose absence
+          // read as `0x70105890 x3(drawn:N)` in the missing-source census.
+          drawTarget1->usedThisFrame = true;
+          drawTarget1->everDrawn = true;
+          boundTarget1Format = drawTarget1->format;
+          ++m_mrtDrawsBound;
+        } else {
+          m_commandList->OMSetRenderTargets(1, &rtv, FALSE,
+                                            depthTarget ? &dsv : nullptr);
+          boundTarget1Format = DXGI_FORMAT_UNKNOWN;
+          if (d.target1Object) ++m_mrtSecondTargetMissing;
+        }
         boundDepthObject = wantDepthObject;
         D3D12_VIEWPORT viewport = {};
         // See GameDraw::halfPixel. TopLeftX/Y are floats and a sub-pixel origin
@@ -1206,6 +1255,9 @@ void D3D12Renderer::RenderGameFrame() {
       auto dsv = m_gameDsvHeap->GetCPUDescriptorHandleForHeapStart();
       m_commandList->OMSetRenderTargets(1, &rtv, FALSE,
                                         m_gameDepth ? &dsv : nullptr);
+      // One RTV again. Without this a draw that followed an MRT pair kept
+      // rtvFormat1 set and asked for a two-target PSO against one bound RTV.
+      boundTarget1Format = DXGI_FORMAT_UNKNOWN;
       // A local copy: m_viewport is also used by the present blit, which draws
       // our own quad and must not be shifted.
       D3D12_VIEWPORT mainViewport = m_viewport;
@@ -1554,6 +1606,10 @@ void D3D12Renderer::RenderGameFrame() {
       key.dest = d.destBlend;
       key.op = d.blendOp;
       key.rtvFormat = drawTarget ? drawTarget->format : kBackBufferFormat;
+      // From what was bound, never from d.target1Object: if the second target
+      // could not be ensured we bound one RTV, and a PSO declaring two would
+      // not match it.
+      key.rtvFormat1 = boundTarget1Format;
       key.topoType = topoType;
       key.flags = uint8_t((tDepthEnable ? 1u : 0u) |
                           (tDepthWrite ? 2u : 0u) |
@@ -1916,7 +1972,8 @@ void D3D12Renderer::RenderGameFrame() {
     std::snprintf(message, sizeof(message),
                   "game RT routing: offscreen %llu, main %llu, OVERPAINT %llu "
                   "(refused: budget %llu, resized %llu of which fmt-changed "
-                  "%llu, white-allowed-offscreen %llu); live targets %u/%u "
+                  "%llu, white-allowed-offscreen %llu, MRT bound %llu "
+                  "missing %llu); live targets %u/%u "
                   "(evicted %llu, sweeps freeing nothing %llu), "
                   "srv %u/%u (cached %zu, free %zu, evicted %llu, "
                   "evict-blocked %llu)",
@@ -1932,6 +1989,8 @@ void D3D12Renderer::RenderGameFrame() {
                   // accumulated content was thrown away.
                   static_cast<unsigned long long>(m_snapshotFormatChanged),
                   static_cast<unsigned long long>(m_whiteAllowedOffscreen),
+                  static_cast<unsigned long long>(m_mrtDrawsBound),
+                  static_cast<unsigned long long>(m_mrtSecondTargetMissing),
                   uint32_t(m_gameRenderTargets.size()), kMaxGameRenderTargets,
                   static_cast<unsigned long long>(m_rtEvictions),
                   static_cast<unsigned long long>(m_rtEvictBlocked),

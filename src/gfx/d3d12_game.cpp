@@ -897,8 +897,12 @@ ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
   ApplyCullBits((key.flags >> 5) & 7u, pso.RasterizerState);
   pso.SampleMask = UINT_MAX;
   pso.PrimitiveTopologyType = key.topoType;
-  pso.NumRenderTargets = 1;
+  // MRT slot 1 when the caller bound two RTVs. NumRenderTargets and RTVFormats
+  // must match the bound set exactly; the key carries what was actually bound
+  // (see boundTarget1Format) rather than what the draw asked for.
+  pso.NumRenderTargets = key.rtvFormat1 == DXGI_FORMAT_UNKNOWN ? 1u : 2u;
   pso.RTVFormats[0] = key.rtvFormat;
+  if (key.rtvFormat1 != DXGI_FORMAT_UNKNOWN) pso.RTVFormats[1] = key.rtvFormat1;
   pso.DSVFormat = kGameDepthFormat;
   pso.SampleDesc.Count = 1;
   pso.InputLayout.pInputElementDescs = layout.data();

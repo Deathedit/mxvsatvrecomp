@@ -2355,6 +2355,16 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     }
     dc.render_target_width = rt.width;
     dc.render_target_height = rt.height;
+    // MRT slot 1, if the guest bound a distinct second target. See the note on
+    // the field. Guarded on a DIFFERENT object so a device that leaves slot 1
+    // pointing at slot 0 cannot produce a self-referential pair.
+    const auto& rt1 = st.render_target[1];
+    if (rt1.valid && rt1.object && rt1.object != rt.object) {
+      dc.render_target1_object = rt1.object;
+      dc.render_target1_color_info = rt1.color_info;
+      dc.render_target1_width = rt1.width;
+      dc.render_target1_height = rt1.height;
+    }
     // Reuse the established PM4-facing fields so diagnostics can compare the
     // two independent paths without another parallel vocabulary.
     dc.surface_base = rt.color_info & 0xFFFu;

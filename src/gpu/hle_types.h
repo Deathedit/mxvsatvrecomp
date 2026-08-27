@@ -274,6 +274,19 @@ struct DrawCall {
   // HLE path: exact D3D9 render-target snapshot. `render_target_object` is the
   // stable API identity; the raw Xenos words are retained for matching a later
   // SetTexture binding to render-to-texture storage without guessing by size.
+  // MRT SLOT 1, and only slot 1. The guest's terrain tile pass binds two
+  // 256x256 targets and resolves the SECOND into the texture its tile shader
+  // samples; we rendered only slot 0, so slot 1 was never drawn, its resolve
+  // was dropped for want of a source, and the tile came out untextured. That is
+  // the whole black-ground chain.
+  //
+  // Two, not N: measured across three level runs, `render target slot 1`
+  // appears once (0x70105890, 256x256) and slots 2 and 3 never appear at all.
+  // Supporting the general case would be speculative work for this title.
+  uint32_t render_target1_object = 0;
+  uint32_t render_target1_color_info = 0;
+  uint32_t render_target1_width = 0;
+  uint32_t render_target1_height = 0;
   uint32_t render_target_object = 0;
   uint32_t render_target_surface_info = 0;
   uint32_t render_target_color_info = 0;

@@ -1392,6 +1392,25 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameSnapshot(
   return &it->second;
 }
 
+void D3D12Renderer::SetGameDrawSecondTarget(uint32_t object, uint32_t width,
+                                           uint32_t height,
+                                           uint32_t edramBase,
+                                           uint32_t colorFormat) {
+  // Patches the draw AddGameDraw just pushed. Silent when there is none: the
+  // draw may have been refused for budget, and a second target with no draw to
+  // attach it to is simply nothing to do.
+  if (m_gameDraws.empty() || !object || !width || !height) return;
+  GameDraw& d = m_gameDraws.back();
+  // Only a real draw takes one. A resolve or clear entry shares the vector and
+  // must not have a colour target grafted onto it.
+  if (d.resolveDest || d.colorClear || d.depthClear) return;
+  d.target1Object = object;
+  d.target1Width = width;
+  d.target1Height = height;
+  d.target1Base = edramBase;
+  d.target1ColorFormat = colorFormat;
+}
+
 void D3D12Renderer::AddGameResolve(uint32_t destTexture,
                                    uint32_t sourceObject,
                                    int32_t destX, int32_t destY, int32_t srcX1,

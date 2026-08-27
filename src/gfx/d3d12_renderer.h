@@ -245,6 +245,11 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
 // Ordering is the whole point: the snapshot is the target's contents at this
 // position in the frame, so this shares the draw list rather than being
 // collected separately.
+// Attach MRT slot 1 to the draw AddGameDraw just pushed. Separate from
+// AddGameDraw so its already-enormous signature does not grow by five.
+void SetGameDrawSecondTarget(uint32_t object, uint32_t width, uint32_t height,
+                             uint32_t edramBase, uint32_t colorFormat);
+
 void AddGameResolve(uint32_t destTexture, uint32_t sourceObject,
                     int32_t destX, int32_t destY, int32_t srcX1, int32_t srcY1,
                     int32_t srcX2, int32_t srcY2,
@@ -693,13 +698,19 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     uint8_t flags = 0;
     // See BlendKey::rtvFormat.
     DXGI_FORMAT rtvFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    // MRT slot 1's format, or UNKNOWN for the single-target case. Part of the
+    // key because a PSO's RTVFormats and NumRenderTargets must match the RTVs
+    // actually bound; sharing one PSO between a one-target and a two-target
+    // draw is a debug-layer error and real undefined behaviour.
+    DXGI_FORMAT rtvFormat1 = DXGI_FORMAT_UNKNOWN;
     // See BlendKey::topoType.
     D3D12_PRIMITIVE_TOPOLOGY_TYPE topoType =
         D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     bool operator==(const TranslatedKey& o) const noexcept {
       return handle == o.handle && vsHandle == o.vsHandle && src == o.src &&
              dest == o.dest && op == o.op && flags == o.flags &&
-             rtvFormat == o.rtvFormat && topoType == o.topoType;
+             rtvFormat == o.rtvFormat && rtvFormat1 == o.rtvFormat1 &&
+             topoType == o.topoType;
     }
   };
   struct TranslatedKeyHash {
@@ -707,7 +718,8 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
       return (size_t(k.handle) << 20) ^ (size_t(k.vsHandle) << 28) ^
              (size_t(k.src) << 12) ^ (size_t(k.dest) << 6) ^
              (size_t(k.op) << 3) ^ size_t(k.flags) ^
-             (size_t(k.rtvFormat) << 40) ^ (size_t(k.topoType) << 50);
+             (size_t(k.rtvFormat) << 40) ^ (size_t(k.rtvFormat1) << 44) ^
+             (size_t(k.topoType) << 50);
     }
   };
   std::unordered_map<TranslatedKey, TranslatedPipeline, TranslatedKeyHash>
@@ -1214,6 +1226,13 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     int32_t scissorLeft = 0, scissorTop = 0, scissorRight = 0, scissorBottom = 0;
     std::shared_ptr<const mx::hle::HleTexturePayload> texture;
     uint32_t targetObject = 0;
+    // MRT slot 1. Zero when the guest bound a single target, which is almost
+    // every draw. See DrawCall::render_target1_object.
+    uint32_t target1Object = 0;
+    uint32_t target1Width = 0;
+    uint32_t target1Height = 0;
+    uint32_t target1Base = 0;
+    uint32_t target1ColorFormat = 0;
     uint32_t targetWidth = 0;
     uint32_t targetHeight = 0;
     // EDRAM tile base of the colour target. The guest gives one EDRAM
@@ -1700,6 +1719,11 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // rather than skipped -- the terrain tile pass. Separate from
   // m_sampleMissSkipped so the exemption's population stays its own.
   uint64_t m_whiteAllowedOffscreen = 0;
+  // MRT slot 1: draws that bound a second RTV, and draws that asked for one and
+  // could not get a target. The second is the interesting number -- it means a
+  // guest MRT pass is still half-rendered.
+  uint64_t m_mrtDrawsBound = 0;
+  uint64_t m_mrtSecondTargetMissing = 0;
   // The 1x1 auto-exposure result on its way back to the guest. The guest reads
   // the resolve destination's bytes out of its own memory rather than sampling
   // them (mx::hle::g_luminanceReadbackBits explains why that matters), so the
