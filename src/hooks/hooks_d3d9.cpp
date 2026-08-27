@@ -1442,7 +1442,7 @@ bool PrepareBinkPlanes(mx::hle::DrawCall& dc, uint32_t device, uint8_t* base);
 
 BinkPlaneRefusals BinkPlaneRefusalStats();
 bool CopyTexturePhysical(const mx::hle::HleTextureSource& source, uint8_t* base,
-                         std::vector<uint8_t>& out, uint32_t* out_mirror);
+                         std::vector<uint8_t>& out);
 
 
 std::vector<PendingHleDraw> g_pendingHleDraws;
