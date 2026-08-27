@@ -311,11 +311,22 @@ extern "C" REX_FUNC(sub_8293A888) {
 // refusal counter reads zero. See [[counter-that-cannot-fire]].
 //
 // sub_828AC620 passes a7 = 1u literally, so `a7 || !a5` is always true and the
-// fast path is always taken when the font has a texture-glyph array. The slow
-// raster path (sub_8293F248 -> sub_8293E720) is not reached from this call site
-// at all, which is why GetTexture, the sub_8293E5B8 height cap and the 0x8000
-// eviction pin all measured clean: they are on a path this game does not use
-// here.
+// fast path is always taken FROM THIS CALL SITE when the font has a
+// texture-glyph array.
+//
+// CORRECTED 2026-08-27, by measurement. This used to conclude "the slow raster
+// path is not reached at all, which is why GetTexture, the sub_8293E5B8 height
+// cap and the 0x8000 eviction pin all measured clean -- they are on a path this
+// game does not use". That conclusion was WRONG: it generalised from one call
+// site to the whole program without checking the others. The SLOW RASTER probe
+// on sub_8293E720 measures **323 entries per menu run** (mx_1577), so something
+// else calls it and those gates are live.
+//
+// They are also clean: 323 calls, 0 lost across all four exits, against 2020
+// GetRasterGlyph asks with 0 SILENT. That is a real exoneration of the glyph
+// cache, which the old reasoning could not have given -- "unreachable" and
+// "reached and always succeeding" produce identical zeros and are opposite
+// findings. Read the SLOW RASTER denominator before trusting either.
 //
 // SILENT is therefore the number that matters. REFUSED is kept because the slow
 // path still exists for fonts without a baked array, and UNREAD is kept so that
@@ -378,121 +389,84 @@ extern "C" REX_FUNC(sub_828A8C40) {
 }
 
 //=============================================================================
-// GFx LOG SINKS -- letting the guest's own diagnosis reach our log.
+// 0x829E0FB8 - GFx DrawBitmaps. THE IMAGE HALF OF THE UI.
 //
-// Scaleform knows exactly which glyph it could not find and says so. We have
-// never seen it say anything, because nothing in this project surfaces GFx log
-// output at all. Three runs of our own counters said only "not here"; this
-// prints the guest's answer instead of another proxy for it.
+// Every one of the 19765 Scaleform DrawVerticesUP calls in a menu run comes
+// from ONE call site inside this function (lr 0x829E1314, verts 6..288 avg 92 --
+// it packs 6-vertex quads and flushes at 288). The caller census cannot split
+// them finer than that, because GFx batches components together in here. So the
+// question moves inside, to the gate the whole body sits under:
 //
-// The one that matters is in GFx_TextLine_ComposeGlyphs (0x829A9838):
+//     if (*(BYTE*)(a1+16) && a2 && a6 && (a6[10] || sub_829E4458(a6)))
 //
-//     if (glyphIndex == -1 && a1[591] && (*(BYTE *)(*a1 + 319) & 0x10) == 0) {
-//         sub_8289EC20(a1[591] + 12, "Missing \"%s\" glyph '%c' (0x%x) in ...");
-//         *(BYTE *)(*a1 + 319) |= 0x10;      // latched: prints ONCE per movie
-//     }
+//   a1+16  renderer enabled
+//   a2     the array of 36-byte bitmap records
+//   a6     the image
+//   a6[10] its resident texture; sub_829E4458 is the attempt to create one
 //
-// Two things follow. It fires only when the movie has a log object (a1[591]),
-// and it fires only once -- so a SINGLE line is the expected yield, and that is
-// enough, because the line names the character, its code point, the font, and
-// the font's glyph ranges. That is the identity we have been trying to infer
-// from quad counts.
+// Fail any of them and the batch is dropped with NO error and NO log, and
+// nothing reaches our D3D9 hooks -- which is why the missing panels cannot be
+// found in a capture.
 //
-// g_gfxLogCalls counts EVERY call to either sink, matched or not. Without it a
-// silent run is ambiguous between "no glyph was missing" and "the guest never
-// had a log object to complain to", which are opposite findings.
-// See [[a-total-without-a-denominator]].
+// Why this is the right place to look: it draws BITMAPS. The menu furniture
+// that is missing -- bar backgrounds, (X)/(A)/(B) button glyphs, the star
+// widget, the top panel -- is all image-backed, while everything that survives
+// is TEXT, which takes the glyph path this file already measured clean (2020
+// asked, 0 lost). That split is the hypothesis, and these counters are how it
+// gets confirmed or killed.
 //
-// Matching is on the format-string ADDRESS, so the cost on the hot path is one
-// compare against a constant. GFx has already resolved these arguments to plain
-// char* at the call site ((p & ~3) + 8), so no unwrapping is needed here.
+// a6[10] can only be read BEFORE the original: if it is 0 the guest calls the
+// bind, which sets it. So the texture case is attributed with a thread_local
+// set by the bind hook, exactly as the slow-raster gates are.
 //=============================================================================
-namespace {
-
-// Bounded copy of a NUL-terminated guest string, page-checked at the start and
-// at every page boundary it crosses.
-void GfxGuestStr(uint8_t* base, uint32_t addr, char* out, size_t max) {
-  size_t i = 0;
-  if (addr && max) {
-    for (; i + 1 < max; ++i) {
-      const uint32_t a = addr + static_cast<uint32_t>(i);
-      if ((i == 0 || (a & 0xFFF) == 0) && !HostPageReadable(REX_RAW_ADDR(a)))
-        break;
-      const uint8_t c = REX_LOAD_U8(a);
-      if (!c) break;
-      out[i] = static_cast<char>(c);
-    }
-  }
-  out[i] = '\0';
+REX_IMPORT(__imp__sub_829DFDB8, orig_GfxEndSubmitMask, void());
+extern "C" REX_FUNC(sub_829DFDB8) {
+  const uint32_t renderer = ctx.r3.u32;
+  orig_GfxEndSubmitMask(ctx, base);
+  NoteMaskWindowClose();
+  g_maskEnd.fetch_add(1, std::memory_order_relaxed);
+  if (renderer && HostPageReadable(REX_RAW_ADDR(renderer + 288)) &&
+      REX_LOAD_U8(renderer + 288))
+    g_maskActiveSeen.fetch_add(1, std::memory_order_relaxed);
 }
 
-// Distinct missing glyphs already reported. Once the latch is cleared the
-// guest will complain about the SAME glyph on every line that uses it, so the
-// log is deduplicated by codepoint -- what we want is the SET of characters a
-// font is missing, not a rate.
-//
-// A race here can at worst print one duplicate line, which is harmless, so this
-// is deliberately lock-free.
-constexpr uint32_t kMissingSeenMax = 64;
-uint32_t g_missingSeen[kMissingSeenMax];
-std::atomic<uint32_t> g_missingSeenCount{0};
+REX_IMPORT(__imp__sub_829E1378, orig_GfxSubmitMask, void());
+extern "C" REX_FUNC(sub_829E1378) {
+  const uint32_t renderer = ctx.r3.u32;
+  const uint32_t mode = ctx.r4.u32;
 
-bool FirstTimeSeeingMissingGlyph(uint32_t code) {
-  const uint32_t n = g_missingSeenCount.load(std::memory_order_relaxed);
-  for (uint32_t i = 0; i < n && i < kMissingSeenMax; ++i)
-    if (g_missingSeen[i] == code) return false;
-  if (n < kMissingSeenMax) {
-    g_missingSeen[n] = code;
-    g_missingSeenCount.store(n + 1, std::memory_order_relaxed);
+  orig_GfxSubmitMask(ctx, base);
+
+  switch (mode) {
+    case 0:
+      g_maskClear.fetch_add(1, std::memory_order_relaxed);
+      // The stamping window opens here and closes at EndSubmitMask.
+      NoteMaskWindowOpen();
+      // And WHO opened it -- the display-list code that is supposed to draw a
+      // mask shape next and does not.
+      NoteMaskBeginCaller(static_cast<uint32_t>(ctx.lr));
+      break;
+    case 1: g_maskIncr.fetch_add(1, std::memory_order_relaxed); break;
+    case 2: g_maskDecr.fetch_add(1, std::memory_order_relaxed); break;
+    default: g_maskOther.fetch_add(1, std::memory_order_relaxed); break;
   }
-  return true;
-}
-
-constexpr uint32_t kFmtMissingGlyph = 0x820E5020;
-constexpr uint32_t kFmtRasterCacheFull = 0x820D98D8;
-constexpr uint32_t kFmtVectorCacheFull = 0x820D9930;
-
-}  // namespace
-
-REX_IMPORT(__imp__sub_8289EC20, orig_GfxLog, void());
-extern "C" REX_FUNC(sub_8289EC20) {
-  const uint32_t fmt = ctx.r4.u32;
-  if (fmt == kFmtMissingGlyph) {
-    // Read before the original runs -- the callee clobbers the volatiles.
-    const uint32_t code = ctx.r7.u32;
-    const uint32_t glyphs = ctx.r9.u32;
-    char font[96], in[96], ranges[192];
-    GfxGuestStr(base, ctx.r5.u32, font, sizeof font);
-    GfxGuestStr(base, ctx.r8.u32, in, sizeof in);
-    GfxGuestStr(base, ctx.r10.u32, ranges, sizeof ranges);
-    g_gfxMissingGlyph.fetch_add(1, std::memory_order_relaxed);
-    if (FirstTimeSeeingMissingGlyph(code)) {
-      REXLOG_INFO("d3d9: GUEST SAYS MISSING GLYPH U+{:04X} ('{}') in font "
-                  "\"{}\" for \"{}\" -- that font has {} glyphs, ranges {}",
-                  code,
-                  (code >= 32 && code < 127) ? static_cast<char>(code) : '?',
-                  font, in, glyphs, ranges);
-    }
+  if (!renderer) return;
+  if (HostPageReadable(REX_RAW_ADDR(renderer + 281)) &&
+      REX_LOAD_U8(renderer + 281) == 0) {
+    g_maskIncapable.fetch_add(1, std::memory_order_relaxed);
+    return;  // nothing was done, so the level below is not meaningful
   }
-  g_gfxLogCalls.fetch_add(1, std::memory_order_relaxed);
-  orig_GfxLog(ctx, base);
-}
-
-// The capacity warnings ride a different sink. Added alongside because they are
-// the other glyph diagnostic we have been deaf to, and both latch the same way
-// (the raster one clears glyphCache+37 on its way out), so each is a one-shot.
-REX_IMPORT(__imp__sub_828A89C8, orig_GfxLogWarn, void());
-extern "C" REX_FUNC(sub_828A89C8) {
-  const uint32_t fmt = ctx.r4.u32;
-  const bool raster = fmt == kFmtRasterCacheFull;
-  if (raster || fmt == kFmtVectorCacheFull) {
-    g_gfxCacheFull.fetch_add(1, std::memory_order_relaxed);
-    REXLOG_INFO("d3d9: GUEST SAYS the {} glyph cache is FULL -- it prints this "
-                "once and then goes quiet, so treat it as a latch, not a rate",
-                raster ? "RASTER" : "VECTOR");
-  }
-  g_gfxLogCalls.fetch_add(1, std::memory_order_relaxed);
-  orig_GfxLogWarn(ctx, base);
+  if (!HostPageReadable(REX_RAW_ADDR(renderer + 284))) return;
+  const int32_t level = static_cast<int32_t>(REX_LOAD_U32(renderer + 284));
+  g_maskLevelLast.store(level, std::memory_order_relaxed);
+  int32_t prev = g_maskLevelMax.load(std::memory_order_relaxed);
+  while (level > prev &&
+         !g_maskLevelMax.compare_exchange_weak(prev, level,
+                                               std::memory_order_relaxed)) {}
+  prev = g_maskLevelMin.load(std::memory_order_relaxed);
+  while (level < prev &&
+         !g_maskLevelMin.compare_exchange_weak(prev, level,
+                                               std::memory_order_relaxed)) {}
 }
 
 //=============================================================================
@@ -599,6 +573,28 @@ extern "C" REX_FUNC(sub_828AC620) {
 // loader fills font+28, and I have not reconciled that. The two numbers this
 // hook rests on are `written vs expected` and the nominal size, both of which
 // come straight from the loader's own code.
+namespace {
+
+// Bounded copy of a NUL-terminated guest string, page-checked at the start and
+// at every page boundary it crosses. Kept when the GFx log sinks were removed
+// because the font diagnostics below still read guest strings.
+void GfxGuestStr(uint8_t* base, uint32_t addr, char* out, size_t max) {
+  size_t i = 0;
+  if (addr && max) {
+    for (; i + 1 < max; ++i) {
+      const uint32_t a = addr + static_cast<uint32_t>(i);
+      if ((i == 0 || (a & 0xFFF) == 0) && !HostPageReadable(REX_RAW_ADDR(a)))
+        break;
+      const uint8_t c = REX_LOAD_U8(a);
+      if (!c) break;
+      out[i] = static_cast<char>(c);
+    }
+  }
+  out[i] = '\0';
+}
+
+}  // namespace
+
 //=============================================================================
 REX_IMPORT(__imp__sub_82945D20, orig_LoadFontCompacted, void());
 extern "C" REX_FUNC(sub_82945D20) {
@@ -646,60 +642,6 @@ extern "C" REX_FUNC(sub_82945D20) {
               bad_nominal ? "  <<< NOMINAL SIZE 0: the parse produced nothing, "
                             "which the guest calls a broken gfx file"
                           : "");
-}
-
-//=============================================================================
-// 0x829A9838 - GFx_TextLine_ComposeGlyphs. CLEARS THE MISSING-GLYPH LATCH.
-//
-// THIS IS THE ONLY GUEST-MEMORY WRITE IN THIS FILE. Everything else here reads
-// and counts; this one byte does not.
-//
-// The guest knows exactly which character it could not find and says so:
-//
-//     if (glyphIndex == -1 && a1[591] && (*(BYTE *)(*a1 + 319) & 0x10) == 0) {
-//         sub_8289EC20(a1[591] + 12, "Missing \"%s\" glyph '%c' (0x%x) ...");
-//         *(BYTE *)(*a1 + 319) |= 0x10;      // <-- latches, ONCE PER MOVIE
-//     }
-//
-// That latch is why we only ever heard about one: U+00A0 (no-break space) in
-// font @UIExtended, whose ranges are 0x20-0x7e then 0xa1-0xff -- 0xA0 sits in
-// the one-codepoint gap between them. Real, reproducible in 12 of 20 runs, but
-// it is the FIRST missing glyph, not necessarily the visible one, and while it
-// holds the latch every later miss is silent.
-//
-// Clearing bit 0x10 after the original runs lets the next miss report too. The
-// honest accounting of what that costs:
-//
-//   - it makes the guest log MORE than it would on hardware
-//   - it does NOT change what is rendered: the branch this re-enables only
-//     formats a string, and the glyph was already lost before it was reached
-//   - it is cleared AFTER the original, so each call still reports at most
-//     once; the flood is bounded by lines-with-a-missing-glyph, and the sink
-//     log is deduplicated by codepoint on top of that
-//
-// g_glyphLatchCleared counts the writes, so if the set of reported glyphs looks
-// thin it can be checked against whether the clearing actually happened.
-//=============================================================================
-REX_IMPORT(__imp__sub_829A9838, orig_TextComposeGlyphs, void());
-extern "C" REX_FUNC(sub_829A9838) {
-  const uint32_t self = ctx.r3.u32;
-
-  orig_TextComposeGlyphs(ctx, base);
-
-  // The DENOMINATOR. Without it "cleared 0" cannot be told apart from "this
-  // hook never ran", which are opposite findings -- the first says nothing was
-  // ever latched, the second says the instrument is dead. Learned on the first
-  // run of this hook, which reached no screen that reports a missing glyph and
-  // so proved nothing either way.
-  g_glyphComposeCalls.fetch_add(1, std::memory_order_relaxed);
-
-  if (!self || !HostPageReadable(REX_RAW_ADDR(self))) return;
-  const uint32_t obj = REX_LOAD_U32(self);
-  if (!obj || !HostPageReadable(REX_RAW_ADDR(obj + 319))) return;
-  const uint8_t latch = REX_LOAD_U8(obj + 319);
-  if (!(latch & 0x10)) return;
-  REX_STORE_U8(obj + 319, static_cast<uint8_t>(latch & ~0x10));
-  g_glyphLatchCleared.fetch_add(1, std::memory_order_relaxed);
 }
 
 REX_IMPORT(__imp__sub_82550B80, orig_CreateVertexDeclaration, void());
@@ -878,6 +820,8 @@ extern "C" REX_FUNC(sub_82564C50) {
 
 REX_IMPORT(__imp__sub_825565C8, orig_DrawIndexedVertices, void());
 extern "C" REX_FUNC(sub_825565C8) {
+  NoteDrawForMaskWindow();
+  NoteUpDrawCaller(static_cast<uint32_t>(ctx.lr), ctx.r6.u32, 0);
   // BEFORE the passthrough return, so the count is comparable across modes.
   g_guestDrawCalls.fetch_add(1, std::memory_order_relaxed);
   MX_D3D9_PLUGIN_PASSTHROUGH(orig_DrawIndexedVertices);
@@ -926,6 +870,8 @@ extern "C" REX_FUNC(sub_825565C8) {
 
 REX_IMPORT(__imp__sub_825561B0, orig_DrawVertices, void());
 extern "C" REX_FUNC(sub_825561B0) {
+  NoteDrawForMaskWindow();
+  NoteUpDrawCaller(static_cast<uint32_t>(ctx.lr), ctx.r6.u32, 1);
   g_guestDrawCalls.fetch_add(1, std::memory_order_relaxed);
   MX_D3D9_PLUGIN_PASSTHROUGH(orig_DrawVertices);
   const uint32_t primitive_type = ctx.r4.u32;
@@ -1155,6 +1101,7 @@ extern "C" REX_FUNC(sub_825556B8) {
 //-----------------------------------------------------------------------------
 REX_IMPORT(__imp__sub_82555B88, orig_DrawVerticesUP, void());
 extern "C" REX_FUNC(sub_82555B88) {
+  NoteDrawForMaskWindow();
   // DrawVerticesUP reserves its ring space THROUGH BeginVertices, so the
   // hook below would build a second DrawCall for every UP draw. RAII, not a
   // plain ++/--, because the plugin passthrough returns early.
@@ -1167,6 +1114,10 @@ extern "C" REX_FUNC(sub_82555B88) {
   const uint32_t vertex_data = ctx.r6.u32;
   const uint32_t stride = ctx.r7.u32;
   const uint64_t n = ++g_up_draws;
+  // Read BEFORE the original runs. lr survives the call in this recompiler,
+  // but reading it here keeps it next to the arguments it belongs with, and
+  // costs nothing.
+  NoteUpDrawCaller(static_cast<uint32_t>(ctx.lr), vertex_count, 2);
   ++mx::hle::D3D9DrawCounter();
   NoteDrawDeclaration(device, base);
   if (n <= kMaxDrawsLogged) {
@@ -1198,6 +1149,158 @@ extern "C" REX_FUNC(sub_82555B88) {
       REXLOG_INFO("d3d9: DrawVerticesUP #{} skipped — data=0x{:08X} count={} "
                   "stride={} not readable",
                   n, vertex_data, vertex_count, stride);
+    }
+  }
+  ReportDrawCounts(base);
+}
+
+//-----------------------------------------------------------------------------
+// 0x82556110 - D3DDevice_DrawIndexedVerticesUP(
+//                  D3DDevice*, D3DPRIMITIVETYPE, UINT MinVertexIndex,
+//                  UINT NumVertices, UINT IndexCount, const void* pIndexData,
+//                  D3DFORMAT IndexDataFormat, const void* pVertexStreamZeroData,
+//                  UINT VertexStreamZeroStride)
+//
+// THE FOURTH DRAW ENTRY POINT, and the second one this port shipped without.
+// DrawVerticesUP was the first (see its hook above); this is its INDEXED twin,
+// and it is the ONLY path Scaleform SHAPES use.
+//
+// How it was found: a caller census on the link register across all three
+// previously-hooked entry points found 31 distinct sites in a menu run and
+// exactly ONE of them in GFx -- lr 0x829E1314, inside DrawBitmaps. GFx's shape
+// path, GRenderer::DrawIndexedTriList (sub_829E0C80), draws through this
+// function instead, so every shape was invisible to us and never reached the
+// renderer. That single fact accounts for the missing panels, bar backgrounds,
+// star widget and button glyphs (all shapes), for text surviving (glyphs are
+// bitmaps, drawn by DrawBitmaps through DrawVerticesUP), and for the vanishing
+// menu text: the stencil MASK SHAPE never drew, so the plane kept the 0 that
+// BeginSubmitMask cleared it to and 7,465 EQUAL-ref-1 draws per run were all
+// rejected.
+//
+// SIGNATURE IS FROM THE DISASSEMBLY, not the decompiler (Hex-Rays gives this
+// function 28 phantom int args) and not the PC D3D9 headers, which have no such
+// entry point:
+//
+//     r3        device
+//     r4        primitive type          (GFx passes 4 = TRIANGLELIST)
+//     r5  -> r29  MinVertexIndex; also negated into the reserve call
+//     r6  -> r28  NumVertices           (r28 * stride = vertex bytes memcpy'd)
+//     r7  -> r27  IndexCount            (caller passes 3 * triangles)
+//     r8  -> r25  INDEX data pointer
+//     r9  -> r26  index format          (bit 2 set means 32-bit indices)
+//     r10 -> r24  VERTEX data pointer
+//     r1  + 0x54  vertex STRIDE         (9th arg: `lwz r30, 0x104(r1)` after a
+//                                        0xB0 stwu, so +0x54 at hook entry)
+//
+// The index WIDTH rule is the callee's own, not the caller's: it computes
+// `(r9 & 4) ? 4 : 2`. sub_82555BD0, the reserve helper, applies the identical
+// test (`rlwinm. r22, r8, 0,29,29`) and sizes vertices as `r6 * r9`, which
+// independently confirms the count and stride mapping.
+//
+// INDICES ARE ABSOLUTE. The guest uploads vertices starting at
+// `pVertexStreamZeroData + MinVertexIndex * stride` and passes -MinVertexIndex
+// to the reserve as the base-vertex bias, so the index values address the
+// caller's FULL array. Stream 0 is therefore synthesised at the array base with
+// the bias left at zero, rather than re-basing both and having to keep the two
+// consistent.
+//
+// The UpDepthGuard is applied even though sub_82555BD0 reserves ring space
+// itself rather than through BeginVertices: it costs nothing when nothing
+// nests, and if that reserve ever does reach BeginVertices the guard is what
+// stops this draw being built twice -- the exact bug it was added for on the
+// DrawVerticesUP path.
+//-----------------------------------------------------------------------------
+REX_IMPORT(__imp__sub_82556110, orig_DrawIndexedVerticesUP, void());
+extern "C" REX_FUNC(sub_82556110) {
+  NoteDrawForMaskWindow();
+  const UpDepthGuard up_depth_guard;
+  g_guestDrawCalls.fetch_add(1, std::memory_order_relaxed);
+  MX_D3D9_PLUGIN_PASSTHROUGH(orig_DrawIndexedVerticesUP);
+
+  // Every argument is read BEFORE the original runs: the callee clobbers the
+  // volatiles, and both data pointers are frequently caller stack locals --
+  // the same reason the DrawVerticesUP hook reads its bytes inside the call.
+  const uint32_t device = ctx.r3.u32;
+  const uint32_t primitive_type = ctx.r4.u32;
+  const uint32_t min_vertex = ctx.r5.u32;
+  const uint32_t vertex_count = ctx.r6.u32;
+  const uint32_t index_count = ctx.r7.u32;
+  const uint32_t index_data = ctx.r8.u32;
+  const uint32_t index_format = ctx.r9.u32;
+  const uint32_t vertex_data = ctx.r10.u32;
+  const uint32_t sp = ctx.r1.u32;
+  const uint32_t stride =
+      (sp && HostPageReadable(REX_RAW_ADDR(sp + 0x54))) ? REX_LOAD_U32(sp + 0x54)
+                                                        : 0;
+  const bool index_32 = (index_format & 4u) != 0;
+  const uint32_t index_width = index_32 ? 4u : 2u;
+
+  const uint64_t n = ++g_indexed_up_draws;
+  NoteUpDrawCaller(static_cast<uint32_t>(ctx.lr), vertex_count, 3);
+  ++mx::hle::D3D9DrawCounter();
+  NoteDrawDeclaration(device, base);
+  if (REXCVAR_GET(hle_capture)) {
+    DeviceState().NoteDevice(device, mx::hle::kEpDraw);
+    SampleFetchConstantFile(device, base);
+  }
+
+  orig_DrawIndexedVerticesUP(ctx, base);
+
+  // Same ordering as the other three: the original performs D3D9's lazy
+  // vertex-shader patching, so translating after it returns lets a shader's
+  // first draw use the code captured during this call.
+  //
+  // Vertices are needed up to MinVertexIndex + NumVertices, because the indices
+  // are absolute into the caller's array.
+  const uint64_t vtx_bytes =
+      (uint64_t(min_vertex) + uint64_t(vertex_count)) * uint64_t(stride);
+  const uint64_t idx_bytes = uint64_t(index_count) * uint64_t(index_width);
+  constexpr uint64_t kSaneBytes = 16ull * 1024ull * 1024ull;
+
+  // The stride comes off the STACK, which is the one argument that can be
+  // wrong-but-plausible in a way a register cannot. Bounded hard, and a failure
+  // is counted and skipped rather than turned into a draw over garbage.
+  const bool sane = device && stride && stride <= 256u && vertex_count &&
+                    index_count && vtx_bytes && vtx_bytes <= kSaneBytes &&
+                    idx_bytes <= kSaneBytes;
+  const bool readable =
+      sane && vertex_data && index_data &&
+      HostPageReadable(REX_RAW_ADDR(vertex_data)) &&
+      HostPageReadable(REX_RAW_ADDR(vertex_data + vtx_bytes - 1)) &&
+      HostPageReadable(REX_RAW_ADDR(index_data)) &&
+      HostPageReadable(REX_RAW_ADDR(index_data + idx_bytes - 1));
+
+  if (readable) {
+    // The inline indices are synthesised into the BOUND INDEX STATE for the
+    // duration of the build, exactly as UpVertexData is synthesised into
+    // stream 0 -- so this reuses BuildHleDraw whole instead of carving a second
+    // indexed path through it. DeviceState is thread-local, so no other thread
+    // can observe the swap.
+    auto& st = DeviceState();
+    const auto saved_index = st.index;
+    st.index.seen = true;
+    st.index.bound = true;
+    st.index.buffer_obj = 0;
+    st.index.common = 0;
+    st.index.address = index_data;
+    st.index.size_bytes = static_cast<uint32_t>(idx_bytes);
+    st.index.is_32bit = index_32;
+
+    UpVertexData up{vertex_data, stride, static_cast<uint32_t>(vtx_bytes)};
+    BuildAndQueueDraw(/*indexed=*/true, primitive_type, /*first=*/0,
+                      index_count, /*base_vertex=*/0, device, base, &up);
+
+    st.index = saved_index;
+  } else {
+    // Counted, with the values, because a silent skip here reproduces the very
+    // defect this hook exists to fix.
+    const uint64_t bad = ++g_indexed_up_skipped;
+    if (bad <= 8 || (bad % 1000) == 0) {
+      REXLOG_INFO(
+          "d3d9: DrawIndexedVerticesUP #{} SKIPPED ({}) - vtx=0x{:08X} min={} "
+          "count={} stride={} idx=0x{:08X} n={} w={}",
+          n, sane ? "unreadable" : "implausible args", vertex_data, min_vertex,
+          vertex_count, stride, index_data, index_count, index_width);
     }
   }
   ReportDrawCounts(base);

@@ -116,6 +116,8 @@ constexpr uint64_t kDrawReportEvery = 2500;  // see the om1 trap in AGENTS.md
 uint64_t g_indexed_draws = 0;
 uint64_t g_draws = 0;
 uint64_t g_up_draws = 0;
+uint64_t g_indexed_up_draws = 0;
+uint64_t g_indexed_up_skipped = 0;
 uint64_t g_decls = 0;
 uint64_t g_patchCalls = 0;
 
@@ -6465,12 +6467,104 @@ void ReportDeclHistogram() {
 // DrawVerticesUP was added 2026-08-07. It had been unhooked since the start,
 // so every draw total this project has ever quoted excluded it — including the
 // Bink video composite, which is why no video ever reached the screen.
+// DrawVerticesUP CALLER CENSUS.
+//
+// ~95 of the ~342 draws the guest submits each frame come through
+// DrawVerticesUP (sub_82555B88), and about 30 engine functions share it -- UI,
+// particles, and the Bink composite. A total tells us nothing about which of
+// them drew what, and the UI question is specifically "which caller draws the
+// nav bar, and what does it submit".
+//
+// The LINK REGISTER is the return address inside the caller, so it names the
+// call SITE, not just the function -- two draws from different points in the
+// same function stay distinguishable, which is what separates a component's
+// text batch from its background batch.
+//
+// BOUNDED, with the overflow counted rather than dropped: a census whose
+// denominator quietly stops growing is worse than none. See
+// [[a-total-without-a-denominator]].
+namespace {
+
+constexpr size_t kMaxUpCallers = 64;
+
+struct UpCaller {
+  uint32_t lr = 0;
+  uint32_t kind = 0;
+  uint64_t calls = 0;
+  uint64_t verts = 0;
+  uint32_t min_verts = 0xFFFFFFFFu;
+  uint32_t max_verts = 0;
+};
+
+std::mutex g_upCallerMu;
+std::array<UpCaller, kMaxUpCallers> g_upCallers{};
+size_t g_upCallerCount = 0;
+uint64_t g_upCallerOverflow = 0;
+
+}  // namespace
+
+void NoteUpDrawCaller(uint32_t lr, uint32_t verts, uint32_t kind) {
+  std::lock_guard<std::mutex> lk(g_upCallerMu);
+  for (size_t i = 0; i < g_upCallerCount; ++i) {
+    if (g_upCallers[i].lr != lr || g_upCallers[i].kind != kind) continue;
+    auto& c = g_upCallers[i];
+    ++c.calls;
+    c.verts += verts;
+    if (verts < c.min_verts) c.min_verts = verts;
+    if (verts > c.max_verts) c.max_verts = verts;
+    return;
+  }
+  if (g_upCallerCount >= kMaxUpCallers) {
+    ++g_upCallerOverflow;
+    return;
+  }
+  auto& c = g_upCallers[g_upCallerCount++];
+  c.lr = lr;
+  c.kind = kind;
+  c.calls = 1;
+  c.verts = verts;
+  c.min_verts = verts;
+  c.max_verts = verts;
+}
+
+void ReportUpDrawCallers() {
+  std::array<UpCaller, kMaxUpCallers> snap{};
+  size_t n = 0;
+  uint64_t overflow = 0;
+  {
+    std::lock_guard<std::mutex> lk(g_upCallerMu);
+    snap = g_upCallers;
+    n = g_upCallerCount;
+    overflow = g_upCallerOverflow;
+  }
+  std::sort(snap.begin(), snap.begin() + n,
+            [](const UpCaller& a, const UpCaller& b) { return a.calls > b.calls; });
+  std::string rows;
+  for (size_t i = 0; i < n; ++i) {
+    rows += fmt::format(" [{} lr0x{:08X} x{} verts{}..{} avg{}]",
+                        snap[i].kind == 0   ? "IDX"
+                        : snap[i].kind == 1 ? "VTX"
+                                            : "UP ",
+                        snap[i].lr,
+                        snap[i].calls, snap[i].min_verts, snap[i].max_verts,
+                        snap[i].calls ? snap[i].verts / snap[i].calls : 0);
+  }
+  REXLOG_INFO("d3d9: UP CALLERS {} distinct call sites{} --{}", n,
+              overflow ? fmt::format(", {} DROPPED past the {}-site cap (the "
+                                     "rows below are then not the whole set)",
+                                     overflow, kMaxUpCallers)
+                       : std::string(),
+              rows.empty() ? " (none)" : rows);
+}
+
 void ReportDrawCounts(uint8_t* base) {
-  const uint64_t total = g_indexed_draws + g_draws + g_up_draws;
+  const uint64_t total = g_indexed_draws + g_draws + g_up_draws + g_indexed_up_draws;
   if ((total % kDrawReportEvery) != 0) return;
   REXLOG_INFO("d3d9: draws — DrawIndexedVertices={} DrawVertices={} "
-              "DrawVerticesUP={} total={}",
-              g_indexed_draws, g_draws, g_up_draws, total);
+              "DrawVerticesUP={} DrawIndexedVerticesUP={} (skipped {}) total={}",
+              g_indexed_draws, g_draws, g_up_draws, g_indexed_up_draws,
+              g_indexed_up_skipped, total);
+  ReportUpDrawCallers();
   // Stencil sizing. See the census at its definition for why the effective
   // count is not just the enable bit. Printed here rather than at first sight
   // of each config because sizing needs the TOTALS, and a first-sight line
@@ -6732,21 +6826,57 @@ void ReportGlyphCache() {
               d::g_glyphRasterRefused.load(std::memory_order_relaxed),
               d::g_glyphRasterUnread.load(std::memory_order_relaxed));
 
-  // If GFx LOG is 0 the guest never reached either sink and the other two
-  // numbers mean nothing -- that is a broken microphone, not a quiet room.
-  REXLOG_INFO("d3d9: GFx LOG {} sink calls | {} MISSING GLYPH | {} cache-full "
-              "(both diagnostics LATCH in the guest, so 1 is the expected "
-              "yield and 0 sink calls means we simply cannot hear it)",
-              d::g_gfxLogCalls.load(std::memory_order_relaxed),
-              d::g_gfxMissingGlyph.load(std::memory_order_relaxed),
-              d::g_gfxCacheFull.load(std::memory_order_relaxed));
+  d::ReportMaskBeginCallers();
+  // THE DECIDING NUMBER. Windows opened by BeginSubmitMask vs how many saw any
+  // draw at all before EndSubmitMask. A window with no draws leaves the stencil
+  // plane at the 0 the Begin cleared it to, and every EQUAL-ref-1 test after it
+  // fails by construction.
+  {
+    const uint64_t opened = d::g_maskWindowsOpened.load(std::memory_order_relaxed);
+    const uint64_t withDraws = d::g_maskWindowsWithDraws.load(std::memory_order_relaxed);
+    REXLOG_INFO("d3d9: GFx MASK WINDOW {} opened | {} contained draws | {} "
+                "draws total{}",
+                opened, withDraws,
+                d::g_maskWindowDraws.load(std::memory_order_relaxed),
+                (opened && !withDraws)
+                    ? " -- NO MASK SHAPE IS EVER DRAWN: the plane keeps the 0 "
+                      "the clear left, so every later EQUAL-ref-1 test fails and "
+                      "all masked content is rejected"
+                    : "");
+  }
 
-  REXLOG_INFO("d3d9: GLYPH LATCH cleared {} of {} compose calls -- clearing "
-              "the guest's once-per-movie latch so every DISTINCT missing "
-              "character reports. CLEARED 0 with COMPOSE 0 means the hook never "
-              "ran; CLEARED 0 with COMPOSE large means nothing was ever latched",
-              d::g_glyphLatchCleared.load(std::memory_order_relaxed),
-              d::g_glyphComposeCalls.load(std::memory_order_relaxed));
+  // SCALEFORM MASK STACK. The number that matters is BALANCE: increments and
+  // decrements should match over a frame, and the level should return to where
+  // it started. A drifting level is masked content on its way to vanishing.
+  {
+    const uint64_t incr = d::g_maskIncr.load(std::memory_order_relaxed);
+    const uint64_t decr = d::g_maskDecr.load(std::memory_order_relaxed);
+    const uint64_t incap = d::g_maskIncapable.load(std::memory_order_relaxed);
+    const uint64_t begins = d::g_maskClear.load(std::memory_order_relaxed);
+    const uint64_t ends = d::g_maskEnd.load(std::memory_order_relaxed);
+    REXLOG_INFO("d3d9: GFx MASK begin {} | end {} | disable {} | incr {} | "
+                "other {} | active-after-end {} | level last {} range {}..{} | "
+                "{} calls with masking DISABLED{}{}",
+                begins, ends, decr, incr,
+                d::g_maskOther.load(std::memory_order_relaxed),
+                d::g_maskActiveSeen.load(std::memory_order_relaxed),
+                d::g_maskLevelLast.load(std::memory_order_relaxed),
+                d::g_maskLevelMin.load(std::memory_order_relaxed),
+                d::g_maskLevelMax.load(std::memory_order_relaxed), incap,
+                incap ? " -- the depth-stencil format failed GFx's check, so "
+                        "NO masking happens at all and the levels above mean "
+                        "nothing"
+                      : (incr == decr
+                             ? ""
+                             : " -- INCR != DECR, the mask stack is UNBALANCED"),
+                (ends > decr)
+                    ? " -- ENDS EXCEED DISABLES: the stencil is left in EQUAL "
+                      "test mode, so later draws are tested against a mask "
+                      "nobody asked for"
+                    : "");
+  }
+
+
 
   // The fork. DROPPED > 0 keeps the hunt inside sub_828AC620's pass-dependent
   // flags; DROPPED == 0 against a healthy call count means the letter was never

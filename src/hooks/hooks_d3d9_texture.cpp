@@ -221,9 +221,6 @@ std::atomic<uint64_t> g_glyphRasterRefused{0};
 // The one that can actually fire on this game's path: sub_828A8C40 returned
 // SUCCESS but left out+20 (the atlas texture) null, so sub_828AC620 emits no
 // quad. A lost glyph that never touches the return value.
-// The guest's own glyph diagnostics, which nothing surfaced until now.
-// g_gfxLogCalls is the denominator: zero there means the sinks are never
-// reached at all, which is a different finding from "nothing was missing".
 // sub_828AC620's own per-line verdict. DROPPED is the guest saying it emitted
 // fewer glyphs than the line asked for -- the last measurable point before the
 // vertex buffer. UNREAD keeps a zero in DROPPED honest.
@@ -237,16 +234,81 @@ std::atomic<uint64_t> g_lineBuildDropped{0};
 std::atomic<uint64_t> g_lineBuildCacheFull{0};
 std::atomic<uint64_t> g_lineBuildUnread{0};
 
-// How many times we cleared the guest's once-per-movie missing-glyph latch.
-// The only guest write in the glyph instrumentation; counted so a thin set of
-// reported glyphs can be distinguished from the clearing never happening.
-std::atomic<uint64_t> g_glyphLatchCleared{0};
-// Denominator for the above: every call to GFx_TextLine_ComposeGlyphs.
-std::atomic<uint64_t> g_glyphComposeCalls{0};
+//=============================================================================
+// SCALEFORM MASK STACK -- the REGRESSION TEST for the DrawIndexedVerticesUP fix.
+//
+// GFx clips UI with stencil: BeginSubmitMask clears the plane and stamps it,
+// EndSubmitMask switches to EQUAL, and the masked content is drawn against it.
+// While sub_82556110 was unhooked the mask SHAPE never reached the renderer, so
+// the plane stayed 0 and every masked draw was rejected -- the vanishing menu
+// text. See [[fourth-draw-entry-unhooked]].
+//
+// The invariant to watch is `windows opened == windows containing draws`. It
+// read 0 of 187 before the fix and 1040 of 1040 after, so it is exactly the
+// check that catches that entry point going unhooked again.
+//=============================================================================
+std::atomic<uint64_t> g_maskClear{0};
+std::atomic<uint64_t> g_maskIncr{0};
+std::atomic<uint64_t> g_maskDecr{0};
+std::atomic<uint64_t> g_maskOther{0};
+std::atomic<uint64_t> g_maskIncapable{0};
+std::atomic<int32_t> g_maskLevelMax{0};
+std::atomic<int32_t> g_maskLevelMin{0};
+std::atomic<int32_t> g_maskLevelLast{0};
+std::atomic<uint64_t> g_maskEnd{0};
+std::atomic<uint64_t> g_maskActiveSeen{0};
+std::atomic<uint64_t> g_maskWindowsOpened{0};
+std::atomic<uint64_t> g_maskWindowsWithDraws{0};
+std::atomic<uint64_t> g_maskWindowDraws{0};
+namespace {
+constexpr size_t kMaxMaskCallers = 16;
+std::mutex g_maskCallerMu;
+std::array<std::pair<uint32_t, uint64_t>, kMaxMaskCallers> g_maskCallers{};
+size_t g_maskCallerCount = 0;
+uint64_t g_maskCallerOverflow = 0;
+}  // namespace
+void NoteMaskBeginCaller(uint32_t lr) {
+  std::lock_guard<std::mutex> lk(g_maskCallerMu);
+  for (size_t i = 0; i < g_maskCallerCount; ++i)
+    if (g_maskCallers[i].first == lr) { ++g_maskCallers[i].second; return; }
+  if (g_maskCallerCount >= kMaxMaskCallers) { ++g_maskCallerOverflow; return; }
+  g_maskCallers[g_maskCallerCount++] = {lr, 1};
+}
+void ReportMaskBeginCallers() {
+  std::string rows;
+  size_t n = 0;
+  uint64_t overflow = 0;
+  std::array<std::pair<uint32_t, uint64_t>, kMaxMaskCallers> snap{};
+  {
+    std::lock_guard<std::mutex> lk(g_maskCallerMu);
+    snap = g_maskCallers; n = g_maskCallerCount; overflow = g_maskCallerOverflow;
+  }
+  for (size_t i = 0; i < n; ++i)
+    rows += fmt::format(" [lr0x{:08X} x{}]", snap[i].first, snap[i].second);
+  REXLOG_INFO("d3d9: GFx MASK BEGIN CALLERS {} sites{} --{}", n,
+              overflow ? fmt::format(", {} dropped", overflow) : std::string(),
+              rows.empty() ? " (none)" : rows);
+}
+namespace { thread_local bool t_maskWindow = false;
+            thread_local uint32_t t_maskWindowDraws = 0; }
+void NoteMaskWindowOpen() {
+  t_maskWindow = true;
+  t_maskWindowDraws = 0;
+  g_maskWindowsOpened.fetch_add(1, std::memory_order_relaxed);
+}
+void NoteMaskWindowClose() {
+  if (!t_maskWindow) return;
+  if (t_maskWindowDraws)
+    g_maskWindowsWithDraws.fetch_add(1, std::memory_order_relaxed);
+  t_maskWindow = false;
+}
+void NoteDrawForMaskWindow() {
+  if (!t_maskWindow) return;
+  ++t_maskWindowDraws;
+  g_maskWindowDraws.fetch_add(1, std::memory_order_relaxed);
+}
 
-std::atomic<uint64_t> g_gfxLogCalls{0};
-std::atomic<uint64_t> g_gfxMissingGlyph{0};
-std::atomic<uint64_t> g_gfxCacheFull{0};
+
 
 std::atomic<uint64_t> g_glyphRasterSilent{0};
 // Calls where out+20 could not be read, so SILENT == 0 means "did not happen"
