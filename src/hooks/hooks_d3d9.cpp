@@ -4622,7 +4622,77 @@ void NoteResolvePosition(uint32_t dest, size_t index) {
               dest);
 }
 
+// THE PAGE-TABLE UPDATE IS GATED, AND THIS READS THE GATE.
+//
+// sub_82AF5D38 is the guest's virtual-texture page-table update: it walks the
+// feedback buffer and writes 16-bit entries across the mip pyramid. Its entire
+// body sits behind a change-latch:
+//
+//     if (dword_830B334C != *(*(dword_830BE400 + 16) + 84)) { ...update... }
+//
+// dword_830B334C is read and written NOWHERE ELSE in the image -- 2 xrefs,
+// both inside that function -- so it is purely "the value we last acted on".
+// If the counter it compares against never moves, the page table is never
+// refined and keeps the state we observe: every entry 0xF00A, the guest's own
+// not-available marker (sub_82AF5D38 stamps that top nibble with
+// `*v132 |= 0xF000u`).
+//
+// No hook is needed to watch this. Both are FIXED guest globals -- imagebase
+// 0x82000000, no ASLR here -- so the host can read them straight out of guest
+// memory once a frame. That matters because midasm hooks are disabled.
+//
+// Reported unconditionally with its denominator, and NOT folded into the
+// FRAME COST block below, which is gated on cost thresholds: a cheap frame
+// would print nothing and "the gate never fired" would be indistinguishable
+// from "the probe never ran".
+//
+// Two outcomes, and both are useful:
+//   latch never moves  -> the gate never fires; chase the counter's producer
+//   latch moves        -> the update DOES run and writes only sentinels, and
+//                         the question becomes what our feedback contains
+void ReportPageTableLatch(uint8_t* base) {
+  constexpr uint32_t kLatchAddr = 0x830B334Cu;  // dword_830B334C
+  constexpr uint32_t kEngAddr = 0x830BE400u;
+  const uint32_t latch = REX_LOAD_U32(kLatchAddr);
+  const uint32_t eng = REX_LOAD_U32(kEngAddr);
+  const uint32_t sub = eng ? REX_LOAD_U32(eng + 16) : 0;
+  const uint32_t counter = sub ? REX_LOAD_U32(sub + 84) : 0;
+
+  static uint64_t s_samples = 0;
+  static uint64_t s_latchMoves = 0;
+  static uint64_t s_counterMoves = 0;
+  static uint32_t s_lastLatch = 0;
+  static uint32_t s_lastCounter = 0;
+  static bool s_have = false;
+
+  ++s_samples;
+  if (s_have) {
+    if (latch != s_lastLatch) {
+      ++s_latchMoves;
+      if (s_latchMoves <= 8)
+        REXLOG_INFO("d3d9: PAGE TABLE LATCH moved 0x{:08X} -> 0x{:08X} "
+                    "(counter 0x{:08X}) -- the guest ran its page-table update",
+                    s_lastLatch, latch, counter);
+    }
+    if (counter != s_lastCounter) ++s_counterMoves;
+  }
+  s_lastLatch = latch;
+  s_lastCounter = counter;
+  s_have = true;
+
+  // Every 300 frames. The chain is printed whole -- eng, eng+16, +84 -- so a
+  // zero can be read as "the chain is null" rather than "the counter is zero",
+  // which are different failures.
+  if ((s_samples % 300) == 0)
+    REXLOG_INFO("d3d9: PAGE TABLE LATCH census: {} samples, latch moved {}, "
+                "counter moved {} | latch 0x{:08X} counter 0x{:08X} "
+                "(eng 0x{:08X} +16 0x{:08X})",
+                s_samples, s_latchMoves, s_counterMoves, latch, counter, eng,
+                sub);
+}
+
 void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
+  ReportPageTableLatch(base);
   const size_t count = g_pendingHleDraws.size();
   uint64_t applied = 0, dropped = 0;
   const auto finalize_t0 = std::chrono::steady_clock::now();
