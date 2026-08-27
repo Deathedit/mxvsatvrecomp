@@ -6218,9 +6218,62 @@ void ReportGlyphCache() {
       "carried rects, {} rects total) | GetTexture {} calls, {} FAILED "
       "(a failure DISCARDS that slot's pending rects permanently, and is the "
       "one refusal point in the glyph chain that is OURS) | generation {}",
-      d::g_glyphFlushCalls, d::g_glyphFlushEmpty, d::g_glyphCacheFlushes,
-      d::g_glyphFlushRects, d::g_glyphGetTextureCalls,
-      d::g_glyphGetTextureFailed, d::g_glyphCacheGeneration);
+      d::g_glyphFlushCalls.load(std::memory_order_relaxed),
+      d::g_glyphFlushEmpty.load(std::memory_order_relaxed),
+      d::g_glyphCacheFlushes.load(std::memory_order_relaxed),
+      d::g_glyphFlushRects.load(std::memory_order_relaxed),
+      d::g_glyphGetTextureCalls.load(std::memory_order_relaxed),
+      d::g_glyphGetTextureFailed.load(std::memory_order_relaxed),
+      d::g_glyphCacheGeneration.load(std::memory_order_relaxed));
+
+  // Second line rather than a longer first one, so each is readable on its own.
+  //
+  // How to read it. HELD is the count of flushes that saw glyphCache+36 set,
+  // meaning the guest was holding the "used this frame" pin and sub_8293E1C0
+  // could not evict anything. RELEASED is the opposite arm. Both zero means the
+  // byte was never readable and this line says NOTHING -- do not read that as
+  // "released". A large HELD with RELEASED at zero is the case that would
+  // explain letters going missing once the atlas is full.
+  //
+  // clamp/cap are the two bounds behind sub_8293E5B8's `a4 > a1[5]` refusal.
+  // sub_8293E720 clamps the cell height to clamp BEFORE that test runs, so
+  // clamp <= cap means the exit is unreachable and the height-cap theory for
+  // the missing letters is dead. Zeroes mean not read, not "no limit".
+  const uint32_t clamp = d::g_glyphHeightClamp.load(std::memory_order_relaxed);
+  const uint32_t cap = d::g_glyphHeightCap.load(std::memory_order_relaxed);
+  REXLOG_INFO(
+      "d3d9: GLYPH PIN pin-held {} flushes, pin-released {} (both 0 = byte "
+      "never read, which is not evidence either way) | height clamp {} vs cap "
+      "{} -- {}",
+      d::g_glyphPinModeHeld.load(std::memory_order_relaxed),
+      d::g_glyphPinModeReleased.load(std::memory_order_relaxed), clamp, cap,
+      (!clamp || !cap) ? "not read"
+                       : (clamp <= cap ? "clamp is tighter, so the cap exit in "
+                                         "sub_8293E5B8 CANNOT fire"
+                                       : "cap is tighter, so the cap exit CAN "
+                                         "fire and is a live suspect"));
+
+  // The one that decides where to look next. REFUSED > 0 keeps the search in
+  // the raster cache; REFUSED == 0 with a healthy CALLS count moves it into
+  // composition, because then every glyph the guest asked for was delivered
+  // and the missing quads were never requested in the first place.
+  REXLOG_INFO("d3d9: GLYPH RASTER {} asked | {} SILENT (returned OK with a "
+              "null texture -- THE loss on this game's path, and invisible to "
+              "the return value) | {} refused outright | {} unreadable (if "
+              "this is large, SILENT is not trustworthy)",
+              d::g_glyphRasterCalls.load(std::memory_order_relaxed),
+              d::g_glyphRasterSilent.load(std::memory_order_relaxed),
+              d::g_glyphRasterRefused.load(std::memory_order_relaxed),
+              d::g_glyphRasterUnread.load(std::memory_order_relaxed));
+
+  // If GFx LOG is 0 the guest never reached either sink and the other two
+  // numbers mean nothing -- that is a broken microphone, not a quiet room.
+  REXLOG_INFO("d3d9: GFx LOG {} sink calls | {} MISSING GLYPH | {} cache-full "
+              "(both diagnostics LATCH in the guest, so 1 is the expected "
+              "yield and 0 sink calls means we simply cannot hear it)",
+              d::g_gfxLogCalls.load(std::memory_order_relaxed),
+              d::g_gfxMissingGlyph.load(std::memory_order_relaxed),
+              d::g_gfxCacheFull.load(std::memory_order_relaxed));
 }
 
 uint64_t HleDrawsAccepted() { return mx::hooks::d3d9::g_hleDrawsAccepted; }

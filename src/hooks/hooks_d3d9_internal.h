@@ -299,19 +299,52 @@ extern uint64_t g_draws;
 extern uint64_t g_up_draws;
 extern uint64_t g_decls;
 extern uint64_t g_patchCalls;
-extern uint32_t g_glyphCacheGeneration;
-extern uint64_t g_glyphCacheFlushes;
+// ATOMIC because the glyph cache is reached from more than one thread, and the
+// guest says so itself: sub_828ADA78 wraps BuildLineGlyphs and the flush in
+// RtlEnterCriticalSection(glyphCache + 2540), and sub_828AD998 is a second
+// wrapper on that same lock. Scaleform does not pay for a critical section on a
+// single-threaded path.
+//
+// g_glyphCacheGeneration is the one that matters for correctness rather than
+// for reporting: a lost increment leaves the generation unchanged, so
+// TextureContentStale says false, the atlas is never re-decoded, and the host
+// keeps serving the previous atlas contents. Stale glyphs, and silent -- the
+// flush counter would lose the same update, so the diagnostic under-reports in
+// exactly the runs where it happened.
+extern std::atomic<uint32_t> g_glyphCacheGeneration;
+extern std::atomic<uint64_t> g_glyphCacheFlushes;
 // The denominators for g_glyphCacheFlushes. It counts only flushes that carried
 // rects, so without these a zero cannot be read: "never called" and "called,
 // nothing pending" are the same number. Reported unconditionally, on a cadence
 // that fires even when every one of them is zero.
-extern uint64_t g_glyphFlushCalls;
-extern uint64_t g_glyphFlushEmpty;
-extern uint64_t g_glyphFlushRects;
+extern std::atomic<uint64_t> g_glyphFlushCalls;
+extern std::atomic<uint64_t> g_glyphFlushEmpty;
+extern std::atomic<uint64_t> g_glyphFlushRects;
 // GetTexture, the glyph chain's only refusal point inside our renderer. A
 // failure there makes sub_8293C778 drop that slot's pending rects permanently.
-extern uint64_t g_glyphGetTextureCalls;
-extern uint64_t g_glyphGetTextureFailed;
+extern std::atomic<uint64_t> g_glyphGetTextureCalls;
+extern std::atomic<uint64_t> g_glyphGetTextureFailed;
+
+// Whether the guest is holding the "used this frame" pin on cached glyphs. If
+// it is always held, eviction can never succeed and a full atlas refuses every
+// new glyph -- absent quads, which is the missing-letters symptom.
+extern std::atomic<uint64_t> g_glyphPinModeHeld;
+extern std::atomic<uint64_t> g_glyphPinModeReleased;
+// The clamp applied before sub_8293E5B8 and the cap it tests against. If the
+// clamp is the tighter of the two, that refusal exit cannot fire.
+extern std::atomic<uint32_t> g_glyphHeightClamp;
+extern std::atomic<uint32_t> g_glyphHeightCap;
+// sub_828A8C40's return: the direct count of glyphs asked for and not given.
+extern std::atomic<uint64_t> g_glyphRasterCalls;
+extern std::atomic<uint64_t> g_glyphRasterRefused;
+// Returned success with a null texture -- the loss the return value hides.
+// GFx log sinks: the guest naming its own missing glyph. See the hooks.
+extern std::atomic<uint64_t> g_gfxLogCalls;
+extern std::atomic<uint64_t> g_gfxMissingGlyph;
+extern std::atomic<uint64_t> g_gfxCacheFull;
+
+extern std::atomic<uint64_t> g_glyphRasterSilent;
+extern std::atomic<uint64_t> g_glyphRasterUnread;
 
 // The extent of a Scaleform glyph atlas, read off the cache object by the flush
 // hook. This is what makes the flush invalidation name the atlases instead of
