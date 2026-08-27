@@ -1779,6 +1779,40 @@ void D3D12Renderer::RenderGameFrame() {
       if (translatedPso) ++m_stencilViaTranslated;
       else ++m_stencilViaStandIn;
       if (!depthTarget) ++m_stencilNoDsv;
+      // THE FIRST STENCIL DRAWS OF A FRAME, IN ORDER, with the state they
+      // carry. menu.rdc shows a fullscreen quad (6 indices) stamping the mask
+      // and the very next fullscreen quad being rejected by it -- and a
+      // fullscreen fill that is entirely rejected is doing nothing, which the
+      // guest would not have issued.
+      //
+      // So the question is whether the WRITER and the READER agree: what value
+      // goes in, and what the next pass asks for. Nothing else in this tree can
+      // show that -- RenderDoc's pipeline JSON has no depthStencilState field
+      // at all -- and it cannot be reasoned out from the census, which reports
+      // configurations without their order.
+      //
+      // Draw ORDINAL is logged so the lines can be matched against a capture's
+      // draw order. First frame only: the sequence repeats, and one frame of it
+      // is the whole question.
+      // A plain one-shot: the first 40 stencil draws this process ever
+      // submits. They are all in one frame -- a menu frame carries hundreds --
+      // and the sequence repeats, so one pass through it is the whole question.
+      static uint32_t s_seq = 0;
+      if (s_seq < 40) {
+        ++s_seq;
+        char m[224];
+        std::snprintf(m, sizeof(m),
+                      "  STENCIL SEQ %u: idx%u indices %u func %u/%u ref %u "
+                      "ops %u/%u/%u masks %02X/%02X",
+                      s_seq, d.stencilIndex, d.indexCount,
+                      uint32_t(d.stencil.frontFunc), uint32_t(d.stencil.backFunc),
+                      uint32_t(d.stencil.ref), uint32_t(d.stencil.frontFail),
+                      uint32_t(d.stencil.frontZFail),
+                      uint32_t(d.stencil.frontPass),
+                      uint32_t(d.stencil.readMask),
+                      uint32_t(d.stencil.writeMask));
+        LogInfo(m);
+      }
     }
     if (translatedPso) {
       m_commandList->SetGraphicsRootSignature(m_translatedRootSig.Get());
