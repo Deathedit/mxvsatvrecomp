@@ -317,48 +317,11 @@ extern uint64_t g_patchCalls;
 // flush counter would lose the same update, so the diagnostic under-reports in
 // exactly the runs where it happened.
 extern std::atomic<uint32_t> g_glyphCacheGeneration;
-extern std::atomic<uint64_t> g_glyphCacheFlushes;
-// The denominators for g_glyphCacheFlushes. It counts only flushes that carried
-// rects, so without these a zero cannot be read: "never called" and "called,
-// nothing pending" are the same number. Reported unconditionally, on a cadence
-// that fires even when every one of them is zero.
-extern std::atomic<uint64_t> g_glyphFlushCalls;
-extern std::atomic<uint64_t> g_glyphFlushEmpty;
-extern std::atomic<uint64_t> g_glyphFlushRects;
-// GetTexture, the glyph chain's only refusal point inside our renderer. A
-// failure there makes sub_8293C778 drop that slot's pending rects permanently.
-extern std::atomic<uint64_t> g_glyphGetTextureCalls;
-extern std::atomic<uint64_t> g_glyphGetTextureFailed;
-
-// Whether the guest is holding the "used this frame" pin on cached glyphs. If
-// it is always held, eviction can never succeed and a full atlas refuses every
-// new glyph -- absent quads, which is the missing-letters symptom.
-extern std::atomic<uint64_t> g_glyphPinModeHeld;
-extern std::atomic<uint64_t> g_glyphPinModeReleased;
-// The clamp applied before sub_8293E5B8 and the cap it tests against. If the
-// clamp is the tighter of the two, that refusal exit cannot fire.
-extern std::atomic<uint32_t> g_glyphHeightClamp;
-extern std::atomic<uint32_t> g_glyphHeightCap;
-// sub_828A8C40's return: the direct count of glyphs asked for and not given.
-extern std::atomic<uint64_t> g_glyphRasterCalls;
-extern std::atomic<uint64_t> g_glyphRasterRefused;
-// Returned success with a null texture -- the loss the return value hides.
-// GFx log sinks: the guest naming its own missing glyph. See the hooks.
-// sub_828AC620: whether the guest thinks it dropped a glyph from a line.
-// Font loads and the silent glyph-table truncation latch (font+20 & 0x1000).
-extern std::atomic<uint64_t> g_fontLoads;
-extern std::atomic<uint64_t> g_fontLoadsTruncated;
-extern std::atomic<uint64_t> g_fontLoadsUnread;
-
-extern std::atomic<uint64_t> g_lineBuildCalls;
-extern std::atomic<uint64_t> g_lineBuildDropped;
-extern std::atomic<uint64_t> g_lineBuildCacheFull;
-extern std::atomic<uint64_t> g_lineBuildUnread;
 
 
 
-extern std::atomic<uint64_t> g_glyphRasterSilent;
-extern std::atomic<uint64_t> g_glyphRasterUnread;
+
+
 
 
 

@@ -170,18 +170,7 @@ std::atomic<uint64_t> g_guestDrawCalls{0};
 // the bump has to publish the atlas bytes orig_GlyphCacheFlush just wrote, or a
 // reader can observe the new generation and then re-decode the old pixels.
 std::atomic<uint32_t> g_glyphCacheGeneration{1};
-std::atomic<uint64_t> g_glyphCacheFlushes{0};
 
-// g_glyphCacheFlushes only moves when the flush carried rects, so on its own it
-// cannot tell "the flush never ran" from "it ran with nothing pending". Those
-// are completely different findings -- the first says the guest never reaches
-// the upload at all, the second says the atlas is simply already warm -- and a
-// freeroam run showing zero flushes is unreadable without this pair.
-// See [[counter-that-cannot-fire]]: a counter you cannot distinguish a zero in
-// is not a measurement.
-std::atomic<uint64_t> g_glyphFlushCalls{0};  // EVERY call, before the test
-std::atomic<uint64_t> g_glyphFlushEmpty{0};  // of those, the ones with 0 rects
-std::atomic<uint64_t> g_glyphFlushRects{0};  // total rects uploaded
 
 // sub_8293A888 is GetTexture: it hands back the atlas texture for a slot,
 // creating it through OUR renderer's vtable on first use. It is the one refusal
@@ -194,8 +183,6 @@ std::atomic<uint64_t> g_glyphFlushRects{0};  // total rects uploaded
 //
 // so a failed create silently DISCARDS that slot's pending rects for the life
 // of the cache. That is the exact shape of "some letters never appear".
-std::atomic<uint64_t> g_glyphGetTextureCalls{0};
-std::atomic<uint64_t> g_glyphGetTextureFailed{0};
 
 // PIN-MODE CENSUS -- see the read site in hooks_d3d9_entry.cpp for the offset
 // derivation, which is the part that is easy to get wrong.
@@ -203,21 +190,12 @@ std::atomic<uint64_t> g_glyphGetTextureFailed{0};
 // BOTH arms are counted on purpose. A census with only the "held" arm cannot
 // tell "the pin is always held" from "we never managed to read the byte", and
 // those are opposite conclusions. See [[a-total-without-a-denominator]].
-std::atomic<uint64_t> g_glyphPinModeHeld{0};      // glyphCache+36 != 0
-std::atomic<uint64_t> g_glyphPinModeReleased{0};  // glyphCache+36 == 0
 
-// The two bounds that decide sub_8293E5B8's FIRST refusal. Latest observed
-// value; 0 means never read. Not counters -- these are constants of the cache,
-// recorded so the height-cap theory can be settled rather than argued.
-std::atomic<uint32_t> g_glyphHeightClamp{0};  // rasterCache+12
-std::atomic<uint32_t> g_glyphHeightCap{0};    // rasterCache+1828
 
 // sub_828A8C40 returning 0 is a glyph the guest asked for and did not get.
 // This is the failure itself rather than a proxy for it, so REFUSED at zero
 // exonerates the raster cache outright and moves the search upstream into
 // composition. Calls is the denominator that makes that zero readable.
-std::atomic<uint64_t> g_glyphRasterCalls{0};
-std::atomic<uint64_t> g_glyphRasterRefused{0};
 // The one that can actually fire on this game's path: sub_828A8C40 returned
 // SUCCESS but left out+20 (the atlas texture) null, so sub_828AC620 emits no
 // quad. A lost glyph that never touches the return value.
@@ -225,14 +203,7 @@ std::atomic<uint64_t> g_glyphRasterRefused{0};
 // fewer glyphs than the line asked for -- the last measurable point before the
 // vertex buffer. UNREAD keeps a zero in DROPPED honest.
 // Font loads, and how many came back with the silent truncation latch set.
-std::atomic<uint64_t> g_fontLoads{0};
-std::atomic<uint64_t> g_fontLoadsTruncated{0};
-std::atomic<uint64_t> g_fontLoadsUnread{0};
 
-std::atomic<uint64_t> g_lineBuildCalls{0};
-std::atomic<uint64_t> g_lineBuildDropped{0};
-std::atomic<uint64_t> g_lineBuildCacheFull{0};
-std::atomic<uint64_t> g_lineBuildUnread{0};
 
 //=============================================================================
 // SCALEFORM MASK STACK -- the REGRESSION TEST for the DrawIndexedVerticesUP fix.
@@ -310,10 +281,8 @@ void NoteDrawForMaskWindow() {
 
 
 
-std::atomic<uint64_t> g_glyphRasterSilent{0};
 // Calls where out+20 could not be read, so SILENT == 0 means "did not happen"
 // and not "could not look". See [[a-total-without-a-denominator]].
-std::atomic<uint64_t> g_glyphRasterUnread{0};
 
 // Tiny -- one entry per distinct atlas geometry, which is one or two. The
 // atomic is the fast path: the flush hook runs once per guest DrawText, and the

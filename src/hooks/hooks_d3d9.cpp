@@ -1,18 +1,18 @@
-// D3D9 entry-point hooks — observation only.
+// D3D9 entry-point hooks â€” observation only.
 //
 // The title statically links D3D9 v2.0.20209.3, so these functions are in the
 // XEX but were nameless until an XDK d3d9.lib was matched against it by bytes
 // (see "The D3D9 entry points are located" in AGENTS.md, and
 // tools/match_d3d9.py). The control for that match was D3DDevice_Swap, whose
-// COMDAT is 0x684 bytes — the exact size of the already-confirmed
+// COMDAT is 0x684 bytes â€” the exact size of the already-confirmed
 // sub_82566B58, and its pattern matched that address and nothing else.
 //
 // Why this is worth hooking at all: every colour round so far has inferred
 // vertex layout from PM4 and shader microcode, because on Xenos a vfetch
 // carries format and offset but not semantic. The semantics exist one layer
 // up, in the D3DVERTEXELEMENT9 arrays the game hands to
-// D3DDevice_CreateVertexDeclaration. They are not static data — four different
-// 12-byte D3DDECL_END sentinels return zero matches binary-wide — so the only
+// D3DDevice_CreateVertexDeclaration. They are not static data â€” four different
+// 12-byte D3DDECL_END sentinels return zero matches binary-wide â€” so the only
 // way to see them is to catch them being built.
 //
 // Everything here passes through to the original and changes no guest state.
@@ -63,7 +63,7 @@
 #include <cmath>
 #include "gpu/d3d9_state.h"
 #include "gpu/hle_types.h"      // g_luminanceReadbackBits/Seq
-#include "gpu/xenos_gpu_state.h"  // mx::gpu::alu — the PM4 ALU constant file
+#include "gpu/xenos_gpu_state.h"  // mx::gpu::alu â€” the PM4 ALU constant file
 #include "hooks/hooks_d3d9_shared.h"  // shared with hooks_d3d9_entry.cpp
 #include "hooks/texture_dump.h"         // --texture_dump=true, logs/texdump
 
@@ -81,11 +81,11 @@ namespace uc = rex::graphics::ucode;
 using mx::hle::DeviceState;
 
 // Declarations are built during load, and the rotating log (3 x 5MB) only
-// retains the last ~50 seconds of a 165s run — the first attempt at this probe
+// retains the last ~50 seconds of a 165s run â€” the first attempt at this probe
 // logged every declaration and then lost all of them. Anything created early
 // has to go somewhere that does not rotate, so this writes its own file into
 // logs/decldump/, alongside the other dump directories. Opened with trunc, so
-// unlike hlsldump and pm4dump it needs no wipe — one run overwrites the last.
+// unlike hlsldump and pm4dump it needs no wipe â€” one run overwrites the last.
 std::ofstream& DeclFile() {
   static std::ofstream f = [] {
     std::error_code ec;
@@ -102,7 +102,7 @@ std::ofstream& DeclFile() {
 // round searched the XEX for the 8-byte PC sentinel, which is one reason it
 // found nothing.
 //
-// Stream is the halfword at offset 0 and terminates the array at 0xFF — that
+// Stream is the halfword at offset 0 and terminates the array at 0xFF â€” that
 // much is read directly by both functions. The remaining ten bytes are dumped
 // raw rather than decoded, because nothing observed so far pins their layout.
 // Both now live in gpu/d3d9_layout.h, which the decoder and its test share.
@@ -127,7 +127,7 @@ uint64_t g_patchCalls = 0;
 // The draw entry points take D3DDevice* in r3 but not the declaration, so it
 // has to be read off the device. D3DDevice_SetVertexDeclaration would be the
 // obvious hook instead, but it is 20 bytes and under 128 bytes a byte match is
-// not evidence — hence reading the device.
+// not evidence â€” hence reading the device.
 //
 // **Nothing here dereferences an unknown pointer.** An earlier version walked
 // the device treating each dword as a pointer and checking the target for
@@ -193,7 +193,7 @@ int RecordDeclaration(uint32_t decl, bool has_colour, uint32_t elems,
 // 0x2ed8(r3)`), which settles it independently of how the store is read.
 //
 // Two earlier scans "proved" the declaration was not on the device struct. Both
-// covered device + 0..0x2000, and 0x2ED8 is outside that — the scans were
+// covered device + 0..0x2000, and 0x2ED8 is outside that â€” the scans were
 // under-scoped, not the conclusion sound. Scoping a scan by what the struct
 // actually spans (SetStreamSource writes +0x3480) was the missing step both
 // times, and reading the offset from the code that writes it makes the scan
@@ -204,7 +204,7 @@ constexpr uint32_t kDeviceVertexDeclaration = 0x2ED8;
 // not: the device pointer arrives as the draw's own r3, D3D9 is reading the
 // same struct on either side of this hook, and the offset is well inside it.
 // The value read is only ever compared against declarations we watched
-// CreateVertexDeclaration build — never followed.
+// CreateVertexDeclaration build â€” never followed.
 int g_currentDecl = -1;
 
 // What PatchVertexShaderToMatchVertexDeclaration last saw. Kept only to measure
@@ -212,7 +212,7 @@ int g_currentDecl = -1;
 // the previous round mistook attribution-to-a-stale-value for attribution.
 int g_patchDecl = -1;
 
-uint64_t g_declDeviceNull = 0;      // field is 0 — no declaration bound yet
+uint64_t g_declDeviceNull = 0;      // field is 0 â€” no declaration bound yet
 uint64_t g_declDeviceUnknown = 0;   // non-zero, but never seen created
 uint64_t g_declAgree = 0;           // device field == the patch hook's value
 uint64_t g_declDisagree = 0;        // it does not, i.e. the patch value is stale
@@ -251,7 +251,7 @@ void NoteDrawDeclaration(uint32_t device, uint8_t* base) {
 //
 // The question this round has to answer in writing: at each draw, is the
 // description complete? Anything missing is counted under the field that was
-// missing, never folded into one "incomplete" total — a renderer built on a
+// missing, never folded into one "incomplete" total â€” a renderer built on a
 // partial description fails in ways that look like rendering bugs, and by then
 // the reason is three layers away.
 //
@@ -290,7 +290,7 @@ int g_vbTooSmallNamed = 0;
 
 // Does the buffer actually hold the vertices the draw asks for? The fetch
 // constant's size and the draw's vertex count come from opposite ends of the
-// API, so agreeing is evidence that both were read correctly — and this is the
+// API, so agreeing is evidence that both were read correctly â€” and this is the
 // number the PM4 path had to *infer* the stride from.
 uint64_t g_vbFits = 0;
 uint64_t g_vbTooSmall = 0;
@@ -298,7 +298,7 @@ uint64_t g_ibFits = 0;
 uint64_t g_ibTooSmall = 0;
 
 //---------------------------------------------------------------------------
-// Stage 0 — why does the vertex range check fail?
+// Stage 0 â€” why does the vertex range check fail?
 //
 // 20,125 of 210,799 stream-checks pass, while every one of 66,726 index buffers
 // holds its range. Two candidate causes, and this probe separates them.
@@ -311,7 +311,7 @@ uint64_t g_ibTooSmall = 0;
 //
 // (b) Streams are not indexed by a common vertex index. Xenos vertex shaders
 //     issue their own vfetch, so a four-entry stream read by something like
-//     `index % 4` is legal — and would make the check, not the game, wrong.
+//     `index % 4` is legal â€” and would make the check, not the game, wrong.
 //     A per-stream split shows whether the failures are confined to small
 //     auxiliary streams.
 //
@@ -325,13 +325,13 @@ uint64_t g_ibTooSmall = 0;
 // Located empirically instead, by a method that carries its own proof: at
 // SetStreamSource we know the exact dwords, so every device offset holding one
 // of them is a candidate, and intersecting the candidate sets across many
-// different binds leaves only offsets that track the binding. Comparison only —
+// different binds leaves only offsets that track the binding. Comparison only â€”
 // no value read out of the device is ever dereferenced.
 //---------------------------------------------------------------------------
 
 // **The scan asks the OS whether a page is readable instead of guessing where
 // the struct ends.** Two guesses were tried and both faulted at guest
-// 0x1D00B000: first 0x4000, then 0x3484 — the latter chosen because
+// 0x1D00B000: first 0x4000, then 0x3484 â€” the latter chosen because
 // SetStreamSource writes +0x3480, which proves that offset is mapped for *some*
 // device and proves nothing about this one. The arena is sparse; a bound picked
 // from a different object is not a bound.
@@ -343,7 +343,7 @@ constexpr uint32_t kDeviceScanBytes = 0x4000;
 constexpr uint32_t kDeviceScanDwords = kDeviceScanBytes / 4;
 
 // VirtualQuery here was ~100% of native frame time: 502 calls a frame costing
-// 3082ms of a 3128ms MainLoop body, measured 2026-08-06. Note the shape — it is
+// 3082ms of a 3128ms MainLoop body, measured 2026-08-06. Note the shape â€” it is
 // **~6ms per call**, not a large number of cheap calls. A VirtualQuery is
 // normally microseconds; six milliseconds is what it costs against this
 // process's address space, and that also explains why a Release build cost
@@ -367,7 +367,7 @@ REXCVAR_DEFINE_BOOL(d3d9_page_cache_verify, false, "Debug",
                     "for the region cache");
 
 // Measured in real gameplay for the first time in mx_698: 33,043 calls a frame
-// collapse to 39-79 VirtualQuery, so the cache works — but those few cost
+// collapse to 39-79 VirtualQuery, so the cache works â€” but those few cost
 // 143-298ms of a ~450ms frame, ~3.7ms each. The cost is per CALL, so the only
 // thing that helps is missing less often.
 //
@@ -381,7 +381,7 @@ REXCVAR_DEFINE_BOOL(d3d9_page_cache_verify, false, "Debug",
 //    torn read of {base, size, ok} can return a stale positive for a
 //    decommitted page, which is the exact crash the function exists to stop.
 //
-// Per-thread caches fix both at once — no lock, no sharing, and each thread's
+// Per-thread caches fix both at once â€” no lock, no sharing, and each thread's
 // working set is smaller than the union. Invalidation still has to reach every
 // thread, so it bumps a generation counter that each thread notices on its next
 // call rather than trying to reach into other threads' caches.
@@ -412,7 +412,7 @@ std::atomic<uint64_t> g_hprNanos{0};
 // crash. But it also means every frame pays first-touch misses for every region
 // it uses, which is the whole remaining cost. Guest allocations cluster at load
 // and the arena is not torn down mid-scene, so retention across frames is
-// cheap and very probably safe — "probably" is why it is a flag and why the
+// cheap and very probably safe â€” "probably" is why it is a flag and why the
 // backstop clear below still runs.
 REXCVAR_DEFINE_BOOL(d3d9_page_cache_persist, true, "Debug",
                     "Keep the page-readability cache across frames instead of "
@@ -449,7 +449,7 @@ bool HostPageReadable(const void* p) {
           static uint64_t s_bad = 0;
           if (++s_bad <= 40)
             REXLOG_ERROR(
-                "d3d9: page cache MISMATCH #{} at {} — cached {}, actual {} "
+                "d3d9: page cache MISMATCH #{} at {} â€” cached {}, actual {} "
                 "(region {} +{:#x})",
                 s_bad, p, e.ok, truth, static_cast<const void*>(e.base),
                 e.size);
@@ -535,8 +535,8 @@ uint64_t g_fileRescues[mx::hle::kMaxStreams] = {};
 uint64_t g_vbFailStream[mx::hle::kMaxStreams] = {};
 
 // Indexed draws were never range-checked on the vertex side, because the range
-// depends on the index values. Reading them looked safe — the index buffer
-// "holds its range" 66,726/66,726 — and it is **off**, because it faults.
+// depends on the index values. Reading them looked safe â€” the index buffer
+// "holds its range" 66,726/66,726 â€” and it is **off**, because it faults.
 //
 // Three runs took an access violation at guest 0x1D00B000, and a VirtualQuery
 // guard on the device scan did not stop it, which is what identified this read
@@ -544,7 +544,7 @@ uint64_t g_vbFailStream[mx::hle::kMaxStreams] = {};
 //
 // The reason is almost certainly the address decode: SetIndices records
 // `address = REX_LOAD_U32(buffer + 0x18) & 0x1FFFFFFF`, and that mask is the
-// same one already found wrong for vertex buffers — it clears the top three
+// same one already found wrong for vertex buffers â€” it clears the top three
 // bits rather than the bottom two, so it silently relocates any buffer whose
 // address has them set. The 66,726/66,726 result does not contradict this: it
 // compares a count against a size and never dereferences the address, so a
@@ -595,7 +595,7 @@ void SampleFetchConstantFile(uint32_t device, uint8_t* base) {
       g_fcCand1[i] = g_fcCand1[i] && hit1;
     }
   }
-  // Anything past where this sample could read is not a candidate — leaving it
+  // Anything past where this sample could read is not a candidate â€” leaving it
   // set would let an offset survive on samples that never actually checked it.
   for (uint32_t i = reached / 4; i < kDeviceScanDwords; ++i) {
     g_fcCand0[i] = false;
@@ -607,8 +607,8 @@ void SampleFetchConstantFile(uint32_t device, uint8_t* base) {
   ++g_fcSamples;
 
   // The scan pinned dword1 to exactly one offset, 0x77C, and that retro-fits
-  // SetStreamSource's own arithmetic: `subfic r11, r4, 0x11` — which a first
-  // reading dismissed as dead — gives (0x11 - stream) * 8 + 0x6F4 = 0x77C for
+  // SetStreamSource's own arithmetic: `subfic r11, r4, 0x11` â€” which a first
+  // reading dismissed as dead â€” gives (0x11 - stream) * 8 + 0x6F4 = 0x77C for
   // stream 0. Two independent methods agreeing is what makes this an offset
   // rather than a coincidence.
   //
@@ -636,25 +636,25 @@ uint32_t FetchFileDword1Offset(uint32_t stream) {
 }
 
 //---------------------------------------------------------------------------
-// Stage 3 — the vertex shader float constant file.
+// Stage 3 â€” the vertex shader float constant file.
 //
 // Read out of D3DDevice_SetVertexShaderConstantFN's own arithmetic
 // (shader.obj, and 0x82550320 in the XEX), which is four instructions long
 // before it starts storing:
 //
 //     addi   r10, r4, 0x78          ; StartRegister + 0x78
-//     rlwinm r10, r10, 4, 0, 27     ; * 16 — one vec4 per register
+//     rlwinm r10, r10, 4, 0, 27     ; * 16 â€” one vec4 per register
 //     add    r10, r10, r3           ; + the device
 //
 // so register N lives at `device + 0x780 + N * 16`. The pixel-shader twin at
-// 0x825503F8 is the same function with 0x178 in place of 0x78, giving 0x1780 —
+// 0x825503F8 is the same function with 0x178 in place of 0x78, giving 0x1780 â€”
 // two 256-register files, 0x1000 bytes each, and they land exactly between the
 // vertex fetch constants (which end at 0x780) and the declaration at 0x2ED8.
 // Three independently-derived offsets tiling the struct with no overlap is what
 // makes this a layout rather than three lucky guesses.
 //
 // **Not hooked, deliberately.** The device holds the live value whichever path
-// wrote it — including the state-block path in blocks.obj that bypasses every
+// wrote it â€” including the state-block path in blocks.obj that bypasses every
 // hook in this file. That is the third time reading the field has beaten
 // hooking the setter, after the declaration and the fetch constants.
 //---------------------------------------------------------------------------
@@ -684,7 +684,7 @@ bool ReadVsConstants(uint32_t device, uint8_t* base,
 //
 // `D3DDevice_SetViewport` (0x8254BF50) forwards to sub_8254BCE8, which stores
 // six floats and, crucially, **clamps Width and Height against the render
-// target** first — the surface extent it reads from `0x24(r9)` bounds
+// target** first â€” the surface extent it reads from `0x24(r9)` bounds
 // `X + Width` and `Y + Height` before the store:
 //
 //   stfs f31, 0x3218(r31)   X
@@ -695,7 +695,7 @@ bool ReadVsConstants(uint32_t device, uint8_t* base,
 //   stfs f28, 0x322C(r31)   MaxZ
 //
 // That clamp is the whole fix. The argument shadow recorded `65535x65535` on
-// 9,130 of ~15,500 calls — a full-surface reset — and last-write-wins meant
+// 9,130 of ~15,500 calls â€” a full-surface reset â€” and last-write-wins meant
 // most draws inherited it, so BuildViewportMvp divided by 32767 and collapsed
 // every position toward the origin. The device holds what D3D9 actually uses.
 //
@@ -732,7 +732,7 @@ bool ReadDeviceViewport(uint32_t device, uint8_t* base, float out[6]) {
 // position, and no VS export feeds it at all.
 //
 // The offset is not guessed. `D3DDevice_DrawVertices` (0x825561B0) flushes the
-// register with `sub_82564768(device, 0, 8576, device + 10528)` — 8576 is
+// register with `sub_82564768(device, 0, 8576, device + 10528)` â€” 8576 is
 // 0x2180, SQ_PROGRAM_CNTL, and 10528 is the shadow it sends. Both
 // `SetPixelShader` (0x825506E8) and `SetVertexShader` (0x825508A8) reach the
 // same word: each walks an AND/OR patch list carried in the shader object and
@@ -762,8 +762,8 @@ uint64_t g_indexCondRead = 0, g_indexCondResetOn = 0;
 uint64_t g_vteSeen[4] = {};  // [0]=unreadable [1]=scale off [2]=scale on
 
 // True when the GPU applies the viewport scale itself, meaning the vertex
-// shader exported clip space. False — including when the register cannot be
-// read — means the export is window space and needs the viewport inverse,
+// shader exported clip space. False â€” including when the register cannot be
+// read â€” means the export is window space and needs the viewport inverse,
 // which is the measured case for this game (PA_CL_VTE_CNTL = 0x300) and the
 // safe default: it is what the code did unconditionally before.
 // The VGT block at register 0x2100 is m_ValuesPacket, device+0x28CC -- the same
@@ -908,7 +908,7 @@ bool ReadSqContextMisc(uint32_t device, uint8_t* base, SqContextMisc* out) {
 // D3D9's own scale/offset: xs = width/2, xo = x + width/2, and y is flipped.
 //
 // Prefers the device's clamped copy and falls back to the argument shadow only
-// when the device cannot be read, counting which was used — a silent fallback
+// when the device cannot be read, counting which was used â€” a silent fallback
 // to the value that caused the bug would be the worst of both.
 bool BuildViewportMvp(uint32_t device, uint8_t* base, float out[16],
                       uint32_t* out_width = nullptr,
@@ -952,7 +952,7 @@ bool BuildViewportMvp(uint32_t device, uint8_t* base, float out[16],
 }
 
 //---------------------------------------------------------------------------
-// Stage 2 — build a renderable draw from the description.
+// Stage 2 â€” build a renderable draw from the description.
 //
 // The hook owns guest access, so it resolves each buffer to a host pointer and
 // hands plain pointers to d3d9_draw.cpp, which stays free of the recompiler
@@ -1480,7 +1480,7 @@ uint64_t g_transcodeDeferred = 0, g_transcodeLate = 0, g_transcodeLost = 0;
 // some of it is not cheap: the Stage-3 transform probe alone reads 256 guest
 // dwords and scores every vertex, FOR EVERY DRAW, purely to log a ranking
 // nothing acts on. Per-FRAME reporting (FRAME COST, the periodic summaries) is
-// negligible and stays on unconditionally — only work proportional to draws or
+// negligible and stays on unconditionally â€” only work proportional to draws or
 // vertices is gated here.
 //
 // Default OFF, so a plain run is the fast one and `--hle_diag=1` is what you
@@ -1488,7 +1488,7 @@ uint64_t g_transcodeDeferred = 0, g_transcodeLate = 0, g_transcodeLost = 0;
 // itself an A/B rather than a rebuild.
 // Read once per frame rather than per draw: the cvar lookup is itself the sort
 // of per-draw cost this exists to remove. Declared beside the other cvars at
-// the top of the file — a REXCVAR_DECLARE inside this anonymous namespace looks
+// the top of the file â€” a REXCVAR_DECLARE inside this anonymous namespace looks
 // for namespace-local storage and does not link.
 bool g_diag = false;
 // Vertex fetch translation coverage, keyed by refusal reason.
@@ -1571,14 +1571,14 @@ uint64_t g_shaderConstOverlays = 0;
 // Measured: every shader publishes one entry covering c252..c255, holding
 // screen-space scale/bias values like (0.5, -0.5, 0, 0) and (0, 1, 0.5, -0.5).
 // None of it passes through the device shadow, which is why c255 read as zero
-// there and why the one-instruction compositor shaders — MAD on c255 — exported
+// there and why the one-instruction compositor shaders â€” MAD on c255 â€” exported
 // (0,0,0,0).
 //
 // Read from the shader object, not from the ring: the packet only carries an
 // address, and that address is guest memory we can read directly. No PM4.
 //
 // Applied AFTER the device file so a shader literal wins for its own slots.
-// That is the hardware order — the load is emitted at draw time, after any
+// That is the hardware order â€” the load is emitted at draw time, after any
 // SetVertexShaderConstantF the app made.
 // `written`, when given, receives one byte per bank dword, non-zero where this
 // overlay published a value -- the vertex twin of ApplyShaderLoadTable's param.
@@ -1652,7 +1652,7 @@ void OverlayShaderConstants(uint32_t shader, uint8_t* base,
 //
 // It used to tally NaN per register over EVERY draw, which made its own stated
 // rule unsound. `c136=10977nan/9023ok` was read as "ever_finite > 0, therefore
-// the guest writes it and we are sampling stale" — but the denominator included
+// the guest writes it and we are sampling stale" â€” but the denominator included
 // every draw whose shader never reads c136 at all, and OverlayShaderConstants
 // writes shader literals into the same bank, so an unrelated shader publishing
 // c136 scores as "the guest writes it". Two opposite defects, one number.
@@ -1660,7 +1660,7 @@ void OverlayShaderConstants(uint32_t shader, uint8_t* base,
 // Keyed by SHADER now, and a register is only counted for a shader that can
 // actually read it (`r <= max_const_index`, the highest constant the translated
 // microcode references). `max_const_index` is a BOUND, not a read set, so a
-// shader can still be charged for a register it happens not to touch — but it
+// shader can still be charged for a register it happens not to touch â€” but it
 // can never be charged for one it provably cannot touch, which is the half that
 // was wrong before.
 //
@@ -1760,7 +1760,7 @@ bool CaptureVertexConstants(uint32_t device, uint8_t* base, uint32_t shader,
   // Repair registers the device file never held, from the ALU constant file the
   // PM4 stream publishes. Vertex constants are 0..255, so first_reg is 0.
   // Applied BEFORE the shader's own load table so a per-draw literal still
-  // wins its slots — the hardware order, same reasoning as the comment on
+  // wins its slots â€” the hardware order, same reasoning as the comment on
   // OverlayShaderConstants.
   mx::gpu::alu::OverlayNonFinite(0, out.data(), kD3d9ConstRegs,
                                  /*count_finite_zeros=*/true);
@@ -2056,7 +2056,7 @@ bool BuildFvfLayout(uint32_t fvf, mx::hle::HleInputLayout& out,
     e.usage = 0;  // D3DDECLUSAGE_POSITION
     e.xenos_format = 57;  // xenos::VertexFormat::k_32_32_32_FLOAT
     // The identity swizzle for this component count, as the guest's own
-    // decoder produces it — see the table in d3d9_layout.h. Zero is NOT the
+    // decoder produces it â€” see the table in d3d9_layout.h. Zero is NOT the
     // identity: every selector reads component x, so the element comes back
     // splatted. That is what left the composite's texcoord as (u,u).
     e.swizzle = 0xA88;  // (x,y,z,1)
@@ -2072,7 +2072,7 @@ bool BuildFvfLayout(uint32_t fvf, mx::hle::HleInputLayout& out,
     e.usage = 10;  // D3DDECLUSAGE_COLOR
     e.xenos_format = 6;  // xenos::VertexFormat::k_8_8_8_8
     e.is_normalized = true;
-    e.swizzle = 0x60A;  // (z,y,x,w) — D3DCOLOR is BGRA, wanted as RGBA
+    e.swizzle = 0x60A;  // (z,y,x,w) â€” D3DCOLOR is BGRA, wanted as RGBA
     out.elements.push_back(e);
     stride += 4;
   }
@@ -2168,7 +2168,7 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   }
 
   // Before any early return. This probe previously sat after BuildHleDraw, so
-  // a draw that failed to translate never reached it — the probe was gated on
+  // a draw that failed to translate never reached it â€” the probe was gated on
   // the very thing it exists to diagnose, which is the third time that shape
   // of mistake has cost this branch a round.
   ProbeBinkComposite(st.ps_seen ? st.pixel_shader : 0,
@@ -2196,7 +2196,7 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   const int id = g_currentDecl;
   if (id >= 0 && g_declLayoutOk[id]) in.layout = &g_declLayout[id];
 
-  // A UP draw usually has no declaration — it uses SetFVF instead — so fall
+  // A UP draw usually has no declaration â€” it uses SetFVF instead â€” so fall
   // back to a layout derived from the FVF the device is holding. Only when a
   // declaration did not already supply one, so nothing that works today
   // changes path.
@@ -2259,7 +2259,7 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   }
 
   // The transform the draw is *rendered* with, this stage, is the viewport
-  // inverse — the same one the PM4 path uses. That is not a claim that it is
+  // inverse â€” the same one the PM4 path uses. That is not a claim that it is
   // right; it is the only transform with evidence behind it today, and it makes
   // the HLE picture directly comparable to the PM4 one on screen. What the
   // constant file says is measured beside it, below, and acted on afterwards.
@@ -2279,7 +2279,7 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
 
   // Will this draw fetch its own vertices on the GPU? Asked HERE, before the
   // draw is built, because the answer decides whether to spend a per-vertex
-  // pass transcoding a 36-byte host vertex the fetch path never reads — 26-31ms
+  // pass transcoding a 36-byte host vertex the fetch path never reads â€” 26-31ms
   // of a menu frame over 289,379 vertices.
   //
   // Only the conditions knowable this early are tested. The pixel shader has
@@ -2486,7 +2486,7 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
           f << "    first host position = " << hp[0] << " " << hp[1] << " "
             << hp[2] << "\n";
         } else {
-          f << "    first host position = (not transcoded — GPU fetch)\n";
+          f << "    first host position = (not transcoded â€” GPU fetch)\n";
         }
         f.flush();
       }
@@ -2663,7 +2663,7 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     dc.colour_mask = st.render_state.value[kRsColorWriteEnable] & 0xFu;
     dc.om_seen |= 1u << 0;
   }
-  // RB_DEPTHCONTROL, from the device's register shadow — the same block base
+  // RB_DEPTHCONTROL, from the device's register shadow â€” the same block base
   // and the same reason as RB_COLOR_MASK above, RB_BLENDCONTROL0 and
   // RB_COLORCONTROL below. Register 0x2200 is the m_ControlPacket base itself,
   // so it sits at device+0x2934 exactly; its two neighbours 0x2201 and 0x2202
@@ -3095,7 +3095,7 @@ void ScoreDraw(bool indexed, uint32_t first, uint32_t count,
         // The layout needs more bytes per vertex than the game bound: the last
         // attribute would read past the end of each vertex. Either the decode
         // is wrong or the stream was bound for a different declaration than the
-        // one in force. Counted separately, and the first few are named — a
+        // one in force. Counted separately, and the first few are named â€” a
         // bare count would say nothing about which of the two it is.
         ++g_strideTooSmall;
         complete = false;
@@ -3120,7 +3120,7 @@ void ScoreDraw(bool indexed, uint32_t first, uint32_t count,
       }
 
       // For a non-indexed draw the vertex range is known exactly. For an
-      // indexed one it depends on the index values — which are readable, since
+      // indexed one it depends on the index values â€” which are readable, since
       // the index buffer provably holds its own range, so the real highest
       // index is used rather than skipping the check.
       uint32_t hi_vertex = 0;
@@ -3148,7 +3148,7 @@ void ScoreDraw(bool indexed, uint32_t first, uint32_t count,
 
       // **The decisive comparison.** If binds are reaching the device through a
       // path this file does not hook, the device's own fetch constant will
-      // differ from the snapshot SetStreamSource recorded — and the size is the
+      // differ from the snapshot SetStreamSource recorded â€” and the size is the
       // field the range check actually depends on.
       {
         const uint32_t d1 = REX_LOAD_U32(device + FetchFileDword1Offset(s));
@@ -3230,7 +3230,7 @@ void ScoreDraw(bool indexed, uint32_t first, uint32_t count,
 // question it answered still matters.
 //
 // It located the vertex microcode *inside* the blob by searching for what PM4
-// had decoded from the ring — `DecodeVertexShaderFetches` needs an array
+// had decoded from the ring â€” `DecodeVertexShaderFetches` needs an array
 // starting at the control-flow section ("the blob carries no header saying
 // so", shader_ucode.cpp:396), and no UCODE header parser exists in this tree
 // or in the SDK at rex/graphics/format/ucode.h.
@@ -3238,7 +3238,7 @@ void ScoreDraw(bool indexed, uint32_t first, uint32_t count,
 // That search is unnecessary now. `CapturePatchedCode` takes the microcode
 // straight out of the command-ring destination inside the PatchVertexShader
 // hook and records `code_off` by decoding it, so the offset is known rather
-// than found by comparison — and stageG measured that route at 100% of draws
+// than found by comparison â€” and stageG measured that route at 100% of draws
 // against the search's 0%. The vertex blob at +0x368 is no longer collected at
 // all; only the pixel-shader blob below is still read.
 //
@@ -3252,7 +3252,7 @@ constexpr uint32_t kMaxBlobDwords = 4096;   // 16 KB ceiling on one blob
 
 
 //---------------------------------------------------------------------------
-// Stage C — execute the shader and see where the position lands.
+// Stage C â€” execute the shader and see where the position lands.
 //
 // Everything needed is now located: the microcode at SH_pPhysical + 0x40, the
 // constants at device + 0x780, and an interpreter that is already validated.
@@ -3263,8 +3263,8 @@ constexpr uint32_t kMaxBlobDwords = 4096;   // 16 KB ceiling on one blob
 // **Two honest bridges, both temporary and both stated.**
 //
 // 1. The attributes come from PM4's decode of the same shader, not from the
-//    declaration. The copy at +0x40 is the unpatched template — its format,
-//    offset and stride are blank (Stage B) — and pairing declaration elements
+//    declaration. The copy at +0x40 is the unpatched template â€” its format,
+//    offset and stride are blank (Stage B) â€” and pairing declaration elements
 //    to vfetch instructions is a rule this has not read out of
 //    PatchVertexShaderToMatchVertexDeclaration yet. Guessing that pairing here
 //    would put a second unknown inside the one measurement meant to settle the
@@ -3279,24 +3279,24 @@ constexpr uint32_t kMaxBlobDwords = 4096;   // 16 KB ceiling on one blob
 // right, because nothing else would produce that.
 //---------------------------------------------------------------------------
 //---------------------------------------------------------------------------
-// Stage D2 — REMOVED 2026-08-17 as never-wired scaffolding.
+// Stage D2 â€” REMOVED 2026-08-17 as never-wired scaffolding.
 //
 // ClipBucket / kClipBucketName / ClassifyClip bucketed exported positions by
 // how far outside the clip volume they landed, to replace Stage C's single
 // "35% inside the clip volume" with a distribution. ClassifyClip was never
 // called and ShaderScore (Stage I, also removed below) was never instantiated,
-// so **the distribution was never measured** — this was intent, not a result.
+// so **the distribution was never measured** â€” this was intent, not a result.
 //
 // Kept because the design is sound if the question is ever reopened: bucket on
 // x and y only (z has its own near-plane convention and folding it in blurs the
 // axis being read), and give the viewport inverse the identical treatment on
 // the identical vertices, because without a reference the buckets are just
-// numbers. The question itself is likely moot — the space hypothesis it was
+// numbers. The question itself is likely moot â€” the space hypothesis it was
 // built to test is settled, see the FINDING block in gpu/hle_types.h.
 //---------------------------------------------------------------------------
 
 //---------------------------------------------------------------------------
-// Stage G — execute the shader that was actually bound.
+// Stage G â€” execute the shader that was actually bound.
 //
 // Draws are matched to microcode by >=90% content similarity against PM4's
 // cache (g_bestKeyAtDraw). That is a heuristic on two counts: it can pick a
@@ -3304,7 +3304,7 @@ constexpr uint32_t kMaxBlobDwords = 4096;   // 16 KB ceiling on one blob
 // every number so far comes from a 37% minority.
 //
 // The patch hook has the real thing. r4 is where D3D9 writes the patched
-// microcode and r3 names the shader — an exact key, no similarity involved.
+// microcode and r3 names the shader â€” an exact key, no similarity involved.
 //
 // **The window's start is checked, not assumed.** Vfetch triples land at
 // dest + 12*index, so dest is the instruction section and the CF section
@@ -3315,7 +3315,7 @@ constexpr uint32_t kMaxBlobDwords = 4096;   // 16 KB ceiling on one blob
 //---------------------------------------------------------------------------
 // A first attempt assumed the CF section sat 0x40 bytes before dest, the gap
 // Stage A found inside SH_pPhysical. It does not: every decode refused with
-// "exec target at address 0", which is the self-check earning its place — a
+// "exec target at address 0", which is the self-check earning its place â€” a
 // wrong start would otherwise have decoded into plausible nonsense.
 //
 // So the start is *searched* rather than assumed, and the search has a
@@ -3421,7 +3421,7 @@ const PatchedCode* CodeFromShaderObject(uint32_t shader, uint8_t* base) {
 
 
 
-// Stage I — REMOVED 2026-08-17. `ShaderScore` and `kCtlSpreadEpsilon` were
+// Stage I â€” REMOVED 2026-08-17. `ShaderScore` and `kCtlSpreadEpsilon` were
 // declared here and the struct was NEVER INSTANTIATED, so none of it ever ran.
 //
 // The reasoning that motivated it is worth keeping, because it is general and
@@ -3430,7 +3430,7 @@ const PatchedCode* CodeFromShaderObject(uint32_t shader, uint8_t* base) {
 // scenes cull, draw shadow maps and run off-screen passes, so 100% in-clip is
 // wrong and 36% may be right. Four independent improvements moved that number
 // by nothing and a fifth appeared to move it for a reason that cannot have
-// caused it. **A number with no target value cannot judge a change** — ask
+// caused it. **A number with no target value cannot judge a change** â€” ask
 // where the failure is, not how big it is. Three shaders is a bug with an
 // address; an even spread over forty means the defect is in the model.
 //
@@ -3876,7 +3876,7 @@ ShaderApplyResult ApplyShaderOutputs(
   //    pixel shader would still owe it the reconstructed param_gen UV and the
   //    single selected interpolator, both of which are computed from
   //    ExecuteVertexShader's result below. Taking the stages together means
-  //    none of that has to be reproduced — the rasterizer does it natively.
+  //    none of that has to be reproduced â€” the rasterizer does it natively.
   //  - Every attribute's destination must be a register the shader declares.
   //    An attribute writing an undeclared register has nowhere to go, and
   //    dropping it silently would feed the shader a zero it never saw on the
@@ -3889,20 +3889,20 @@ ShaderApplyResult ApplyShaderOutputs(
   // swizzles, and one element each would clobber rather than merge.
   //  - The vertex shader must read no textures. The translated root signature
   //    gives its SRV and sampler tables PIXEL visibility only, so a vertex
-  //    fetch would fail pipeline creation rather than render wrongly — but
+  //    fetch would fail pipeline creation rather than render wrongly â€” but
   //    refusing here keeps the draw on a path that works instead of on one that
   //    silently produces no pipeline.
   //  - PA_CL_VTE_CNTL must say the hardware applies the viewport transform, so
   //    the shader's position export is clip space and dc.mvp is identity. The
-  //    translated pipeline's vertex stage does not apply mvp at all — neither
-  //    the passthrough one nor the guest's — so a draw needing the viewport
+  //    translated pipeline's vertex stage does not apply mvp at all â€” neither
+  //    the passthrough one nor the guest's â€” so a draw needing the viewport
   //    inverse has nowhere to apply it. Measured, the register reads 0x43F on
   //    every draw in this game, so this refuses nothing today; it is here so
   //    that if it ever does not, the draw falls back rather than moves.
   const TranslatedShader* vs_translated = TranslatedVertexShader(handle);
   // Evaluated as separate tests rather than one `&&` chain so each refusal is
   // attributed. The chain short-circuits, so a draw refused for two reasons is
-  // counted against the first — read the counters as "the reason that fired",
+  // counted against the first â€” read the counters as "the reason that fired",
   // not as a partition of independent causes.
   bool gpu_vertex = true;
   if (!vs_translated || !vs_translated->source) {
@@ -4227,7 +4227,7 @@ ShaderApplyResult ApplyShaderOutputs(
   }
 
   // The fetch prediction was made before this draw was built, so its 36-byte
-  // host vertices were never transcoded — and everything from here down reads
+  // host vertices were never transcoded â€” and everything from here down reads
   // them. Filling the gap now costs exactly what building them eagerly would
   // have; the saving is entirely on the draws that DID fetch and returned above.
   if (dc.vertex_stride == 0 && dc.vertex_count) {
@@ -4246,7 +4246,7 @@ ShaderApplyResult ApplyShaderOutputs(
     // `transformed` was copied from dc.vertices at the top of this function,
     // which for a deferred draw was EMPTY. The per-vertex loop below writes the
     // shader's clip-space export into it by offset, so leaving it empty is a
-    // memcpy to nullptr — an access violation writing address 0, which is
+    // memcpy to nullptr â€” an access violation writing address 0, which is
     // exactly what mx_882 and mx_883 crashed on.
     transformed = dc.vertices;
     ++g_transcodeLate;
@@ -4259,7 +4259,7 @@ ShaderApplyResult ApplyShaderOutputs(
   float uv_max[2] = {-1.0e30f, -1.0e30f};
   // First referenced vertex, kept whole so a collapsed UV can be traced to the
   // stage that produced it: the attribute values that went into the shader,
-  // and every export that came out — not only the one the texture profile
+  // and every export that came out â€” not only the one the texture profile
   // selected. Reporting the selected export alone cannot distinguish "the
   // shader exported zero" from "the UV is in a different export".
   AluResult probe{};
@@ -4328,7 +4328,7 @@ ShaderApplyResult ApplyShaderOutputs(
     }
 
     // Merge the attributes into their destination registers, by exactly the
-    // rule shader_alu.cpp:614 seeds its register file with — three bits per
+    // rule shader_alu.cpp:614 seeds its register file with â€” three bits per
     // destination component, 0-3 selecting x/y/z/w of the fetched value, 4 and
     // 5 the constants 0.0 and 1.0, 7 meaning keep. `kKeep` is the whole reason
     // two fetches can share a register, so writing all four components would
@@ -4396,9 +4396,9 @@ ShaderApplyResult ApplyShaderOutputs(
 
     // The position export is homogeneous clip space, passed through to the
     // host untouched. This used to drop w on the claim that PA_CL_VTE_CNTL was
-    // 0x300 — XYZ already multiplied by 1/W0. Measured, that register lives at
+    // 0x300 â€” XYZ already multiplied by 1/W0. Measured, that register lives at
     // device+10572 and reads 0x400 or 0x43F, never 0x300, and bits 8 and 9
-    // (VTX_XY_FMT, VTX_Z_FMT) — the ones that would mean "already divided" —
+    // (VTX_XY_FMT, VTX_Z_FMT) â€” the ones that would mean "already divided" â€”
     // are clear in every sample. Dropping w scaled all 3D geometry by whatever
     // it should have divided by, which is why the front end's pre-transformed
     // 2D (w = 1) was unaffected while everything else blew up.
@@ -4408,7 +4408,7 @@ ShaderApplyResult ApplyShaderOutputs(
     // vertices per run carry w <= 0, behind the eye. A negative w mirrors the
     // vertex through the origin rather than removing it, so those triangles
     // must be clipped against the near plane *before* any divide. D3D12 does
-    // exactly that, in hardware, given clip space — so give it clip space.
+    // exactly that, in hardware, given clip space â€” so give it clip space.
     const float p[4] = {r.position[0], r.position[1], r.position[2], w};
     std::memcpy(transformed.data() + size_t(v) * dc.vertex_stride, p,
                 sizeof(p));
@@ -4417,7 +4417,7 @@ ShaderApplyResult ApplyShaderOutputs(
     // No reconstruction and no viewport transform: these are the values the
     // pixel shader's registers are seeded with on the hardware, and the
     // rasterizer interpolates them. The param_gen synthesis further down is a
-    // separate thing — it fabricates the ONE interpolator the hardware
+    // separate thing â€” it fabricates the ONE interpolator the hardware
     // generates rather than the shader exporting, and only the stand-in path
     // needs it.
     if (want_interpolators) {
@@ -4446,7 +4446,7 @@ ShaderApplyResult ApplyShaderOutputs(
       //
       // Written normalized and NOT divided by the texture extent. The fetch is
       // unnormalized and the hardware parameter is in pixels, but that pixel
-      // count is the render target's, not the sampled texture's — the divide
+      // count is the render target's, not the sampled texture's â€” the divide
       // below uses the sampled extent, and the two are only incidentally equal.
       // Normalizing here is the same result without depending on that.
       float uv[2] = {0.0f, 0.0f};
@@ -4607,7 +4607,7 @@ ShaderApplyResult ApplyShaderOutputs(
             probe.const_max_index, alu_in.alu_const_dwords);
         // How much of the constant file is populated at all. "c255 is zero"
         // means one thing if the file is otherwise full and quite another if
-        // the whole file is blank — the second would indict the read, not the
+        // the whole file is blank â€” the second would indict the read, not the
         // guest.
         {
           uint32_t live = 0, first_live = 0xFFFFFFFF, last_live = 0;
@@ -4628,7 +4628,7 @@ ShaderApplyResult ApplyShaderOutputs(
         }
         // The microcode itself. A shader that reads exactly one constant, and
         // that constant is index 255 = 0xFF, is as consistent with a masked or
-        // saturated index as with a real c255 — and only the instruction words
+        // saturated index as with a real c255 â€” and only the instruction words
         // tell the two apart.
         {
           const uint32_t* code = patch.code.data() + patch.code_off;
@@ -4700,7 +4700,7 @@ ShaderApplyResult ApplyShaderOutputs(
   // The offset was checked before being acted on, because the derivation
   // disagreed with this file's note that PA_CL_VTE_CNTL is 0x300. A dump of the
   // surrounding dwords settled it: 17 dwords below sits 640.0, then 640.0,
-  // -90.0, 90.0, 1.0 — PA_CL_VPORT_XSCALE/XOFFSET/YSCALE/YOFFSET/ZSCALE
+  // -90.0, 90.0, 1.0 â€” PA_CL_VPORT_XSCALE/XOFFSET/YSCALE/YOFFSET/ZSCALE
   // (0x210F..0x2113), whose own shadow base puts XSCALE exactly there. 640 is
   // half of 1280. The offset is right and the 0x300 note is stale.
   //
@@ -4861,7 +4861,7 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
   const auto finalize_t0 = std::chrono::steady_clock::now();
   for (PendingHleDraw& pending : g_pendingHleDraws) {
     // A resolve carries no geometry, so it has no shader to run and no topology
-    // to finalize — both would refuse it and it would be counted as a dropped
+    // to finalize â€” both would refuse it and it would be counted as a dropped
     // draw. It still has to keep its slot in the frame's ordered list: the
     // snapshot it stands for is the target's contents *at this point*, and
     // every draw after it must sample that rather than the surface's later
@@ -5163,7 +5163,7 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
 // Measured before anything renders through it, because the whole plan rests on
 // a claim that has not been tested: that a straight-line HLSL emitter can carry
 // this game's shaders. If most of them refuse, the wiring downstream is worth
-// nothing and the design has to change — so the cheap decisive number comes
+// nothing and the design has to change â€” so the cheap decisive number comes
 // first.
 //
 // Per distinct shader handle, not per draw: the question is how much of the
@@ -5181,7 +5181,7 @@ struct HlslCoverage {
   // well as per dump, because the question "does this game predicate at all"
   // is answered by one number and was never asked.
   uint64_t predicated = 0;    // p0-gated, seen
-  uint64_t p0_honoured = 0;   // …of which fully obeyed (all blocks emitted)
+  uint64_t p0_honoured = 0;   // â€¦of which fully obeyed (all blocks emitted)
   uint64_t bool_gated = 0;    // bool-constant-gated
 };
 HlslCoverage g_hlslVs, g_hlslPs;
@@ -5230,7 +5230,7 @@ void EnsureHlslDumpDir() {
 
 // Persisted DXBC cache, keyed by the EMITTED HLSL rather than the shader object
 // handle. Bink re-creates its shader objects for every video, so a handle-keyed
-// cache misses at every video start and pays FXC again — 18-145ms per shader at
+// cache misses at every video start and pays FXC again â€” 18-145ms per shader at
 // O0, which is the Bink-start hang. The handle-keyed maps above still serve
 // same-object repeats; this one serves repeats across objects, across videos
 // and across runs.
@@ -5240,7 +5240,7 @@ void EnsureHlslDumpDir() {
 // days: the cached bytes are the output of EmitShaderHlsl, so any change to the
 // emitter leaves every already-cached shader loading its stale DXBC while the
 // log reports a healthy hit rate. A translation fix would then render nothing
-// and read as "no visual change" — the exact symptom this project spends its
+// and read as "no visual change" â€” the exact symptom this project spends its
 // time chasing. Hashing the source makes the key change whenever the emitter
 // does, with no version stamp to remember to bump.
 //
@@ -5411,8 +5411,8 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
   // per shader means the cache is missing, and the hits/misses line alone
   // cannot distinguish "missing" from "nothing to hit yet".
   //
-  // Costs three steady_clock reads per NEW shader — this function runs once per
-  // handle, not once per draw — and the log line is capped at the first eight
+  // Costs three steady_clock reads per NEW shader â€” this function runs once per
+  // handle, not once per draw â€” and the log line is capped at the first eight
   // of each stage.
   const auto t_first_use = std::chrono::steady_clock::now();
   auto t_emit = t_first_use, t_compile = t_first_use;
@@ -5500,7 +5500,7 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
 
   // Emitting is only half the claim. Source FXC rejects is exactly as useless
   // as a shader the emitter refused, and the two failures have entirely
-  // different causes — so they are counted apart and the compiler's own message
+  // different causes â€” so they are counted apart and the compiler's own message
   // is logged, since "it did not compile" without the reason is not a finding.
   std::string compile_error;
   bool compiled = false;
@@ -5530,7 +5530,7 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
         ++g_dxbcCacheMisses;
         SaveShaderDxbc(stage, content_key, blob.Get());
         // Carry the fresh bytes too, so the renderer skips its own O3
-        // recompile of a first-sight shader — the O0 compile here already
+        // recompile of a first-sight shader â€” the O0 compile here already
         // produced everything the PSO needs.
         const auto* p = static_cast<const uint8_t*>(blob->GetBufferPointer());
         dxbc_bytes = std::make_shared<const std::vector<uint8_t>>(
@@ -5649,7 +5649,7 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
                  " individually, which is what the console does per lane)";
           if (out.bool_exec_blocks)
             f << "\n; BOOL-GATED EXEC BLOCKS: " << out.bool_exec_blocks
-              << " (cond_exec / cond_exec_pred_clean walked as a plain exec — "
+              << " (cond_exec / cond_exec_pred_clean walked as a plain exec â€” "
                  "gated on a BOOL CONSTANT, and this translator has no bool "
                  "constant bank, so the condition cannot be evaluated yet)";
           if (out.unhonoured_fetch_ops)
@@ -5725,7 +5725,7 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
 
   // Cache health, every 256 lookups. The number to watch is MISSES on a second
   // run of the same content: it should be ~0, and anything else means the key
-  // is not stable. Note what a HIGH hit rate does not prove — the key is the
+  // is not stable. Note what a HIGH hit rate does not prove â€” the key is the
   // emitted HLSL, so a hit only says "this exact source compiled before". If
   // the emitter changes, every affected key changes and the misses are correct.
   {
@@ -6010,7 +6010,7 @@ void CollectPixelShaderBlob(uint32_t handle, uint8_t* base) {
   // do not share the vertex shader's inline +0x368 representation.
   //
   // **The CF stream does not start at the beginning of that allocation.** Big
-  // shaders carry a prologue — the first dwords read as zeros — and only the
+  // shaders carry a prologue â€” the first dwords read as zeros â€” and only the
   // small ones begin at dword 0. This used to be worked around by searching
   // the blob for what PM4 had loaded, and failing that by trying every offset
   // and accepting a unique valid decode, which left 14 shaders on
@@ -6029,7 +6029,7 @@ void CollectPixelShaderBlob(uint32_t handle, uint8_t* base) {
   //     *(object+0x18) + *(object + *(object+0x40) + 0x28)
   //
   // and its length is *(object + *(object+0x40) + 0x2C). Read out of the
-  // consuming code, never guessed — same rule as every offset in AGENTS.md's
+  // consuming code, never guessed â€” same rule as every offset in AGENTS.md's
   // device table. +0x30 is the *allocation* size and is kept only as a bound.
   constexpr uint32_t kPsCodePointerAt = 0x18;
   constexpr uint32_t kPsAllocSizeAt = 0x30;
@@ -6218,10 +6218,10 @@ void ProbeVertexObjectSecondBlob(uint32_t device, uint8_t* base) {
 void ReportCoverage(uint8_t* base) {
   const auto& st = DeviceState();
   if (g_drawsChecked == 0) {
-    REXLOG_INFO("d3d9: hle — no draws scored");
+    REXLOG_INFO("d3d9: hle â€” no draws scored");
     return;
   }
-  REXLOG_INFO("d3d9: hle — {} of {} draws fully described ({}%)",
+  REXLOG_INFO("d3d9: hle â€” {} of {} draws fully described ({}%)",
               g_drawsComplete, g_drawsChecked,
               (g_drawsComplete * 100) / g_drawsChecked);
   for (uint32_t g = 0; g < kDrawGapCount; ++g) {
@@ -6231,7 +6231,7 @@ void ReportCoverage(uint8_t* base) {
   }
   //-------------------------------------------------------------------------
   // Stage 2: what was actually built, and why the rest was not. Every skip is
-  // named — a bare total cannot separate "the decoder refuses this format"
+  // named â€” a bare total cannot separate "the decoder refuses this format"
   // from "this stream is not indexed the way we model it", and those need
   // opposite fixes.
   //-------------------------------------------------------------------------
@@ -6242,7 +6242,7 @@ void ReportCoverage(uint8_t* base) {
     for (uint32_t i = 1; i < uint32_t(mx::hle::HleSkip::kCount); ++i)
       attempted += counts[i];
     if (attempted) {
-      REXLOG_INFO("d3d9: hle-render — {} of {} draws built ({}%)", built,
+      REXLOG_INFO("d3d9: hle-render â€” {} of {} draws built ({}%)", built,
                   attempted, (built * 100) / attempted);
       for (uint32_t i = 1; i < uint32_t(mx::hle::HleSkip::kCount); ++i) {
         if (!counts[i]) continue;
@@ -6281,7 +6281,7 @@ void ReportCoverage(uint8_t* base) {
   for (uint32_t s = 0; s < mx::hle::kMaxStreams; ++s) {
     if (!g_fileAgree[s] && !g_fileDiffer[s]) continue;
     REXLOG_INFO(
-        "d3d9: stage0  stream {}: device fetch constant vs our snapshot — "
+        "d3d9: stage0  stream {}: device fetch constant vs our snapshot â€” "
         "same {} differ {}, and the device's size explains {} of the failures",
         s, g_fileAgree[s], g_fileDiffer[s], g_fileRescues[s]);
   }
@@ -6441,7 +6441,7 @@ void ReportDeclHistogram() {
     (g_declHasColour[i] ? with : without) += g_declDraws[i];
   }
   REXLOG_INFO(
-      "d3d9: decl-draws — {} declarations known; COLOUR={} NO-COLOUR={} "
+      "d3d9: decl-draws â€” {} declarations known; COLOUR={} NO-COLOUR={} "
       "unattributed={} patch_calls={}",
       g_declCount, with, without, g_drawsNoDecl, g_patchCalls);
   // The declaration now comes from device + 0x2ED8, per draw. These four say
@@ -6449,7 +6449,7 @@ void ReportDeclHistogram() {
   // must stay at 0 or the field is not what SetVertexDeclaration writes, and a
   // large `stale` is the 2508-calls-per-165000-draws problem, measured.
   REXLOG_INFO(
-      "d3d9: decl-source — from device+0x2ED8: null={} unknown={} | vs the "
+      "d3d9: decl-source â€” from device+0x2ED8: null={} unknown={} | vs the "
       "patch hook: same={} stale={}",
       g_declDeviceNull, g_declDeviceUnknown, g_declAgree, g_declDisagree);
   for (int i = 0; i < g_declCount; ++i) {
@@ -6461,11 +6461,11 @@ void ReportDeclHistogram() {
 
 // All three draw entry points report through here so the counters are always
 // read together. A 150s run reaches 5000-10000 transcoded draws, so a coarser
-// cadence than 2500 reports nothing at all — the first output-merger probe was
+// cadence than 2500 reports nothing at all â€” the first output-merger probe was
 // lost to exactly that.
 //
 // DrawVerticesUP was added 2026-08-07. It had been unhooked since the start,
-// so every draw total this project has ever quoted excluded it — including the
+// so every draw total this project has ever quoted excluded it â€” including the
 // Bink video composite, which is why no video ever reached the screen.
 // DrawVerticesUP CALLER CENSUS.
 //
@@ -6560,7 +6560,7 @@ void ReportUpDrawCallers() {
 void ReportDrawCounts(uint8_t* base) {
   const uint64_t total = g_indexed_draws + g_draws + g_up_draws + g_indexed_up_draws;
   if ((total % kDrawReportEvery) != 0) return;
-  REXLOG_INFO("d3d9: draws — DrawIndexedVertices={} DrawVertices={} "
+  REXLOG_INFO("d3d9: draws â€” DrawIndexedVertices={} DrawVertices={} "
               "DrawVerticesUP={} DrawIndexedVerticesUP={} (skipped {}) total={}",
               g_indexed_draws, g_draws, g_up_draws, g_indexed_up_draws,
               g_indexed_up_skipped, total);
@@ -6581,7 +6581,7 @@ void ReportDrawCounts(uint8_t* base) {
                                                : "reserved";
       modes += fmt::format(" {}({})={}", name, mode, n);
     }
-    REXLOG_INFO("d3d9: STENCIL census — {} draws reached the read ({} could "
+    REXLOG_INFO("d3d9: STENCIL census â€” {} draws reached the read ({} could "
                 "not); enable bit set {}, of which {} are in an edram_mode "
                 "that honours it; {} distinct configs; edram_mode:{}",
                 g_stencilDrawsSeen, g_stencilDrawsUnreadable, g_stencilBitSet,
@@ -6592,7 +6592,7 @@ void ReportDrawCounts(uint8_t* base) {
       const uint32_t dc_bits = key.first;
       const uint32_t rm = key.second;
       REXLOG_INFO("d3d9:   stencil cfg depthcontrol=0x{:08X} refmask=0x{:08X}"
-                  " x{} — func {} fail {} zpass {} zfail {} backface {}"
+                  " x{} â€” func {} fail {} zpass {} zfail {} backface {}"
                   " (bf func {} fail {} zpass {} zfail {});"
                   " ref {} mask 0x{:02X} writemask 0x{:02X}",
                   dc_bits, rm, n, (dc_bits >> 8) & 7u, (dc_bits >> 11) & 7u,
@@ -6643,7 +6643,7 @@ void ReportDrawCounts(uint8_t* base) {
         int64_t(g_stencilDrawsSeen) - int64_t(g_plumbedSeen);
     const int64_t eff_gap =
         int64_t(g_stencilEffective) - int64_t(g_plumbedEffective);
-    REXLOG_INFO("d3d9: STENCIL PLUMBED at the CONSUMER — {} draws carried the "
+    REXLOG_INFO("d3d9: STENCIL PLUMBED at the CONSUMER â€” {} draws carried the "
                 "fields ({} had an unreadable register), {} effective, {} "
                 "distinct configs. Counts are EXPECTED to be lower than the "
                 "census: {} draws and {} effective never reached the renderer "
@@ -6654,13 +6654,13 @@ void ReportDrawCounts(uint8_t* base) {
                 cfgs.empty() ? " none" : cfgs);
   }
   // The ALU constant file. `repaired 0` is only meaningful next to a non-zero
-  // `constants seen` — with zero seen, the PM4 feed is not reaching the file and
+  // `constants seen` â€” with zero seen, the PM4 feed is not reaching the file and
   // the repair count says nothing at all.
   {
     uint64_t written = 0, repaired = 0, zeroed = 0, filled_zero = 0;
     uint32_t seen = 0;
     mx::gpu::alu::Stats(written, repaired, seen, zeroed, filled_zero);
-    REXLOG_INFO("d3d9: ALU constant file — {} dwords written by PM4 over {} "
+    REXLOG_INFO("d3d9: ALU constant file â€” {} dwords written by PM4 over {} "
                 "distinct constants; {} repaired from PM4, {} NaN LEFT IN "
                 "PLACE (the substitution was deleted 2026-08-27), {} finite "
                 "zeros PM4 could fill but we do NOT "
@@ -6773,18 +6773,6 @@ uint64_t GuestDrawCalls() {
 // zero has to be a readable result, not an absent one.
 void ReportGlyphCache() {
   namespace d = mx::hooks::d3d9;
-  REXLOG_INFO(
-      "d3d9: GLYPH CACHE flush called {} times ({} with nothing pending, {} "
-      "carried rects, {} rects total) | GetTexture {} calls, {} FAILED "
-      "(a failure DISCARDS that slot's pending rects permanently, and is the "
-      "one refusal point in the glyph chain that is OURS) | generation {}",
-      d::g_glyphFlushCalls.load(std::memory_order_relaxed),
-      d::g_glyphFlushEmpty.load(std::memory_order_relaxed),
-      d::g_glyphCacheFlushes.load(std::memory_order_relaxed),
-      d::g_glyphFlushRects.load(std::memory_order_relaxed),
-      d::g_glyphGetTextureCalls.load(std::memory_order_relaxed),
-      d::g_glyphGetTextureFailed.load(std::memory_order_relaxed),
-      d::g_glyphCacheGeneration.load(std::memory_order_relaxed));
 
   // Second line rather than a longer first one, so each is readable on its own.
   //
@@ -6799,32 +6787,11 @@ void ReportGlyphCache() {
   // sub_8293E720 clamps the cell height to clamp BEFORE that test runs, so
   // clamp <= cap means the exit is unreachable and the height-cap theory for
   // the missing letters is dead. Zeroes mean not read, not "no limit".
-  const uint32_t clamp = d::g_glyphHeightClamp.load(std::memory_order_relaxed);
-  const uint32_t cap = d::g_glyphHeightCap.load(std::memory_order_relaxed);
-  REXLOG_INFO(
-      "d3d9: GLYPH PIN pin-held {} flushes, pin-released {} (both 0 = byte "
-      "never read, which is not evidence either way) | height clamp {} vs cap "
-      "{} -- {}",
-      d::g_glyphPinModeHeld.load(std::memory_order_relaxed),
-      d::g_glyphPinModeReleased.load(std::memory_order_relaxed), clamp, cap,
-      (!clamp || !cap) ? "not read"
-                       : (clamp <= cap ? "clamp is tighter, so the cap exit in "
-                                         "sub_8293E5B8 CANNOT fire"
-                                       : "cap is tighter, so the cap exit CAN "
-                                         "fire and is a live suspect"));
 
   // The one that decides where to look next. REFUSED > 0 keeps the search in
   // the raster cache; REFUSED == 0 with a healthy CALLS count moves it into
   // composition, because then every glyph the guest asked for was delivered
   // and the missing quads were never requested in the first place.
-  REXLOG_INFO("d3d9: GLYPH RASTER {} asked | {} SILENT (returned OK with a "
-              "null texture -- THE loss on this game's path, and invisible to "
-              "the return value) | {} refused outright | {} unreadable (if "
-              "this is large, SILENT is not trustworthy)",
-              d::g_glyphRasterCalls.load(std::memory_order_relaxed),
-              d::g_glyphRasterSilent.load(std::memory_order_relaxed),
-              d::g_glyphRasterRefused.load(std::memory_order_relaxed),
-              d::g_glyphRasterUnread.load(std::memory_order_relaxed));
 
   d::ReportMaskBeginCallers();
   // THE DECIDING NUMBER. Windows opened by BeginSubmitMask vs how many saw any
@@ -6881,20 +6848,7 @@ void ReportGlyphCache() {
   // The fork. DROPPED > 0 keeps the hunt inside sub_828AC620's pass-dependent
   // flags; DROPPED == 0 against a healthy call count means the letter was never
   // in the line records and the search moves up into composition.
-  REXLOG_INFO("d3d9: GLYPH LINE {} built | {} DROPPED a glyph | {} saw the "
-              "cache full | {} unreadable (DROPPED 0 with a non-zero build "
-              "count means the short line was INTENDED -- look upstream)",
-              d::g_lineBuildCalls.load(std::memory_order_relaxed),
-              d::g_lineBuildDropped.load(std::memory_order_relaxed),
-              d::g_lineBuildCacheFull.load(std::memory_order_relaxed),
-              d::g_lineBuildUnread.load(std::memory_order_relaxed));
 
-  REXLOG_INFO("d3d9: FONT LOADS {} total | {} SHORT/BROKEN (blob truncated or "
-              "nominal size 0 -- the glyph table ends early and every character "
-              "past the cut is unreachable by index) | {} unreadable",
-              d::g_fontLoads.load(std::memory_order_relaxed),
-              d::g_fontLoadsTruncated.load(std::memory_order_relaxed),
-              d::g_fontLoadsUnread.load(std::memory_order_relaxed));
 }
 
 bool GuestRangeReadable(uint8_t* base, uint32_t addr, uint32_t bytes) {

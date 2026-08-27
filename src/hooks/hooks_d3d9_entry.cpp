@@ -80,6 +80,54 @@ void ReportHostPageQueryStats() {
 }
 
 //=============================================================================
+// 0x8293C778 - Scaleform GFx: the glyph cache flush.
+//
+// NOT a diagnostic hook. It is kept, stripped of the counters it used to carry,
+// because two things in it are LOAD-BEARING for texture invalidation:
+//
+//   g_glyphCacheGeneration  the atlas staleness key. Glyph atlases are rewritten
+//                           IN PLACE, so GuestTextureFingerprint cannot see the
+//                           change and this bump is their ONLY invalidation
+//                           signal. TextureContentVersion returns it instead of
+//                           a fingerprint for any texture IsGlyphCacheTexture
+//                           recognises.
+//   NoteGlyphCacheGeometry  what teaches IsGlyphCacheTexture which extents ARE
+//                           atlases. Without it every kR8 texture either falls
+//                           back to the fingerprint or gets invalidated
+//                           alongside the atlas, depending on the gate.
+//
+// The rest of the glyph instrumentation was removed 2026-08-28 after the shape
+// fix; this hook survived that pass only because the bump was noticed inside it.
+// If it is ever removed, glyph atlases stop being invalidated and text goes
+// stale whenever Scaleform repacks -- silently, with no error anywhere.
+//
+// RELEASE, and AFTER the original: the bump publishes the atlas bytes the
+// original just wrote. A reader that acquire-loads the new generation is then
+// guaranteed to see those bytes when it re-decodes. Relaxed would let the
+// compiler sink the writes past the bump and hand a reader the new generation
+// with the old pixels -- the exact stale atlas this mechanism exists to prevent.
+//=============================================================================
+REX_IMPORT(__imp__sub_8293C778, orig_GlyphCacheFlush, void());
+extern "C" REX_FUNC(sub_8293C778) {
+  const uint32_t cache = ctx.r3.u32;
+  uint32_t pending = 0;
+  if (cache && HostPageReadable(REX_RAW_ADDR(cache + 28)))
+    pending = REX_LOAD_U32(cache + 28);
+  // The extent is the discriminator between a glyph atlas and any other kR8
+  // texture, so it has to be recorded even on a flush that carries no rects.
+  if (cache && HostPageReadable(REX_RAW_ADDR(cache)) &&
+      HostPageReadable(REX_RAW_ADDR(cache + 4))) {
+    NoteGlyphCacheGeometry(REX_LOAD_U32(cache), REX_LOAD_U32(cache + 4));
+  }
+
+  orig_GlyphCacheFlush(ctx, base);
+
+  // Nothing was uploaded, so nothing to invalidate.
+  if (!pending) return;
+  g_glyphCacheGeneration.fetch_add(1, std::memory_order_release);
+}
+
+//=============================================================================
 // Plugin-mode passthrough
 //=============================================================================
 // This whole layer is the native renderer. When --gpu_plugin=xenos is set the
@@ -123,270 +171,6 @@ REXCVAR_DEFINE_BOOL(d3d9_hooks_passthrough, false, "Debug",
     return;                                                              \
   }                                                                      \
   std::lock_guard<std::recursive_mutex> _hle_lock(mx::hle::HleGlobalMutex())
-
-//=============================================================================
-// 0x82550B80 — D3DVertexDeclaration* D3DDevice_CreateVertexDeclaration(
-//                  const D3DVERTEXELEMENT9* pVertexElements)
-//
-// One argument, and the declaration object comes back in r3. 18 call sites in
-// game code.
-//
-// The object it returns is laid out by XGSetVertexDeclaration: +0x00 magic
-// 0x00100005, +0x04 refcount, +0x18 element count, +0x1C highest stream index,
-// +0x20 a 16-byte per-stream usage map, and **+0x34 the copied element array**.
-// Recorded here because a later round hooking SetVertexDeclaration will need
-// it to get from a declaration pointer back to the elements.
-//=============================================================================
-
-//=============================================================================
-// 0x8293C778 — Scaleform GFx: flush the raster glyph cache's dirty rects.
-//
-// The one guest call that means "the font atlas contents just changed". See
-// the long note by g_glyphCacheGeneration for how it was found and why the
-// texture cache cannot notice this on its own.
-//
-// The pending-rect count at +28 is read BEFORE the original runs, because the
-// original clears it on the way out. Zero pending means this call updates
-// nothing, so frames where no glyph moved cost one load and no invalidation.
-//
-// The atlas EXTENT at +0 and +4 is read here too, and unconditionally -- it is
-// the cache's own answer to "how big are the textures I create", straight from
-// sub_8293A888's InitTexture(cache[0], cache[1], 9, 0, 16). That pair is what
-// lets the invalidation name the glyph atlases instead of every single-channel
-// texture in the game; see the note by g_glyphCacheGeneration for the 5 MB of
-// unrelated kR8 the format-only test used to sweep up. Unconditional because a
-// flush with nothing pending still tells the truth about the geometry, and the
-// registration is a relaxed atomic compare on all but the first call.
-//=============================================================================
-REX_IMPORT(__imp__sub_8293C778, orig_GlyphCacheFlush, void());
-extern "C" REX_FUNC(sub_8293C778) {
-  const uint32_t cache = ctx.r3.u32;
-  uint32_t pending = 0;
-  if (cache && HostPageReadable(REX_RAW_ADDR(cache + 28)))
-    pending = REX_LOAD_U32(cache + 28);
-  uint32_t atlas_w = 0, atlas_h = 0;
-  if (cache && HostPageReadable(REX_RAW_ADDR(cache)) &&
-      HostPageReadable(REX_RAW_ADDR(cache + 4))) {
-    atlas_w = REX_LOAD_U32(cache);
-    atlas_h = REX_LOAD_U32(cache + 4);
-    NoteGlyphCacheGeometry(atlas_w, atlas_h);
-  }
-
-  // PIN-MODE CENSUS. sub_828A8C40 sets bit 0x8000 at glyphdesc+32 on every
-  // glyph it hands back -- the "used this frame" pin -- and sub_8293E1C0
-  // refuses to evict anything carrying it. The ONLY place it is released is
-  // sub_828AC620, and that release is gated:
-  //
-  //     if (!*(BYTE *)(glyphCache + 36))
-  //         *(WORD *)(desc + 32) &= ~0x8000;
-  //
-  // So if glyphCache+36 is stuck non-zero, pins never come off, eviction can
-  // never succeed, and once the atlas fills every new glyph is refused. That is
-  // absent quads rather than wrong pixels, which is the shape of the missing
-  // ghost-title letters. Measurement only -- nothing acts on this yet.
-  //
-  // MIND THE OFFSET. r3 here is the RASTER cache, which is the sub-object at
-  // glyphCache+76: sub_828ADA78 calls this as sub_8293C778(a1 + 76, ...), and
-  // sub_828A8C40 reaches the same object as a1 + 76. The pin gate belongs to
-  // the OUTER GlyphCache, so it sits at cache - 76 + 36 = cache - 40. Reading
-  // cache + 36 would land on a raster-cache field and quietly answer a
-  // different question with a confident-looking number.
-  if (cache >= 40 && HostPageReadable(REX_RAW_ADDR(cache - 40))) {
-    if (REX_LOAD_U8(cache - 40))
-      g_glyphPinModeHeld.fetch_add(1, std::memory_order_relaxed);
-    else
-      g_glyphPinModeReleased.fetch_add(1, std::memory_order_relaxed);
-  }
-
-  // The two bounds behind sub_8293E5B8's first refusal, `a4 > a1[5]`.
-  // sub_8293E720 CLAMPS the cell height to rasterCache+12 before making that
-  // call, and the cap tested is rasterCache+1828. If clamp <= cap the exit is
-  // unreachable, and the height-cap explanation for the missing letters dies.
-  if (cache && HostPageReadable(REX_RAW_ADDR(cache + 12)))
-    g_glyphHeightClamp.store(REX_LOAD_U32(cache + 12),
-                             std::memory_order_relaxed);
-  if (cache && HostPageReadable(REX_RAW_ADDR(cache + 1828)))
-    g_glyphHeightCap.store(REX_LOAD_U32(cache + 1828),
-                           std::memory_order_relaxed);
-
-  // Counted BEFORE the pending test, and before the original, so that a run
-  // which never reaches the upload is distinguishable from one whose atlas is
-  // simply already warm. Both look like "no flush lines" without this.
-  g_glyphFlushCalls.fetch_add(1, std::memory_order_relaxed);
-  if (!pending) g_glyphFlushEmpty.fetch_add(1, std::memory_order_relaxed);
-
-  orig_GlyphCacheFlush(ctx, base);
-
-  if (!pending) return;
-  g_glyphFlushRects.fetch_add(pending, std::memory_order_relaxed);
-
-  // RELEASE, and after the original: the bump is what publishes the atlas bytes
-  // the original just wrote. A reader that acquire-loads the new generation is
-  // then guaranteed to see those bytes when it re-decodes. Relaxed here would
-  // let the compiler sink the writes past the bump and hand a reader the new
-  // generation with the old pixels -- which is the same stale atlas this whole
-  // mechanism exists to prevent.
-  //
-  // Both results are CAPTURED rather than re-read. fetch_add returns the
-  // previous value, so +1 is this thread's own count; re-reading the globals
-  // would let another thread's flush move the number between the cadence test
-  // and the log line, and print a count that never existed.
-  const uint32_t generation =
-      g_glyphCacheGeneration.fetch_add(1, std::memory_order_release) + 1;
-  const uint64_t flushes =
-      g_glyphCacheFlushes.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (flushes <= 8 || (flushes % 250) == 0) {
-    // The extent is printed because it is now load-bearing, not decoration: it
-    // is the whole discriminator between a glyph atlas and the 4 MB kR8 that
-    // used to be invalidated alongside it. A 0x0 here means the cache object
-    // did not read and every kR8 texture has fallen back to the fingerprint.
-    REXLOG_INFO("d3d9: glyph cache flushed {} times ({} rects this time); "
-                "atlas generation {}; atlas extent {}x{}",
-                flushes, pending, generation, atlas_w, atlas_h);
-  }
-}
-
-//=============================================================================
-// 0x8293A888 — Scaleform GFx: GetTexture(cache, renderer, slot).
-//
-// Returns the atlas texture for a slot, creating it through OUR renderer's
-// vtable on first use:
-//
-//     v4 = &cache[5 * slot + 14];          // slots at cache+56, stride 20
-//     if (*v4) return 1;                   // already have one
-//     *v4 = renderer->vtable[2](renderer); // CreateTexture -- OURS
-//     if (!*v4) return 0;
-//     ...
-//     return texture->vtable[2](tex, cache[0], cache[1], 9, 0, 16) != 0;
-//
-// This is the only refusal point in the glyph chain that runs through our code
-// rather than the guest's, and a failure here is NOT retried: sub_8293C778
-// clears the slot's dirty flag outside the success test, so the rects that were
-// waiting for this texture are discarded for the life of the cache. Hooked to
-// count, not to change anything -- if `FAILED` is ever non-zero, that is a
-// missing-glyph cause and not a theory.
-//
-// Called from both the rasteriser (sub_8293E720) and the flush; both are
-// counted, because a failure on either path loses the same glyph.
-//=============================================================================
-REX_IMPORT(__imp__sub_8293A888, orig_GlyphGetTexture, void());
-extern "C" REX_FUNC(sub_8293A888) {
-  orig_GlyphGetTexture(ctx, base);
-
-  g_glyphGetTextureCalls.fetch_add(1, std::memory_order_relaxed);
-  if (ctx.r3.u32 & 0xFF) return;
-  const uint64_t n =
-      g_glyphGetTextureFailed.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (n <= 8) {
-    REXLOG_INFO("d3d9: GLYPH GetTexture FAILED (#{}) -- this slot's pending "
-                "rects are now discarded and will not be retried",
-                n);
-  }
-}
-
-//=============================================================================
-// 0x828A8C40 - Scaleform GFx: GetRasterGlyph(cache, out, desc, ...) -> bool.
-//
-// Counts the two ways a glyph is lost here. They are NOT both failures of the
-// return value, and that distinction cost a run to learn.
-//
-// A first version of this hook watched only the return and measured 2864 asks
-// with 0 refusals -- which read as "the raster cache is innocent" but was
-// really a counter that could not fire. The fast path:
-//
-//     if (a7 || !a5) {
-//         v12 = *(DWORD *)(*a3 + 16);
-//         if (v12) {
-//             v13 = sub_82945A40(v12, glyphIndex);  // dummy on OOB, not null
-//             v14 = sub_82945A08(v13, ...);
-//             if (v14) *(DWORD *)(a2 + 20) = ...;   // the texture
-//             return 1;                             // <-- 1 REGARDLESS of v14
-//         }
-//     }
-//
-// a2+20 is zeroed on entry, so v14 == 0 returns SUCCESS carrying a null
-// texture. sub_828AC620 then emits no quad, clears the 0x8000 "has a cell" bit
-// on the line record, and sets its missing byte -- the glyph is gone, and the
-// return value said it was fine. That is why the letters vanish while every
-// refusal counter reads zero. See [[counter-that-cannot-fire]].
-//
-// sub_828AC620 passes a7 = 1u literally, so `a7 || !a5` is always true and the
-// fast path is always taken FROM THIS CALL SITE when the font has a
-// texture-glyph array.
-//
-// CORRECTED 2026-08-27, by measurement. This used to conclude "the slow raster
-// path is not reached at all, which is why GetTexture, the sub_8293E5B8 height
-// cap and the 0x8000 eviction pin all measured clean -- they are on a path this
-// game does not use". That conclusion was WRONG: it generalised from one call
-// site to the whole program without checking the others. The SLOW RASTER probe
-// on sub_8293E720 measures **323 entries per menu run** (mx_1577), so something
-// else calls it and those gates are live.
-//
-// They are also clean: 323 calls, 0 lost across all four exits, against 2020
-// GetRasterGlyph asks with 0 SILENT. That is a real exoneration of the glyph
-// cache, which the old reasoning could not have given -- "unreachable" and
-// "reached and always succeeding" produce identical zeros and are opposite
-// findings. Read the SLOW RASTER denominator before trusting either.
-//
-// SILENT is therefore the number that matters. REFUSED is kept because the slow
-// path still exists for fonts without a baked array, and UNREAD is kept so that
-// a zero in SILENT means "did not happen" rather than "could not look".
-//
-// out (r4) and desc (r5) are both read BEFORE the original: the callee clobbers
-// the volatiles. The descriptor layout comes from the caller building one on
-// its stack: +0 font resource, +4 u16 glyph index, +6 u8 rasterised size,
-// +7 u8 flags, +8/+9 u8 blur X/Y.
-//=============================================================================
-REX_IMPORT(__imp__sub_828A8C40, orig_GlyphGetRasterGlyph, void());
-extern "C" REX_FUNC(sub_828A8C40) {
-  const uint32_t out = ctx.r4.u32;
-  const uint32_t desc = ctx.r5.u32;
-
-  orig_GlyphGetRasterGlyph(ctx, base);
-
-  g_glyphRasterCalls.fetch_add(1, std::memory_order_relaxed);
-  const bool ok = (ctx.r3.u32 & 0xFF) != 0;
-
-  uint32_t texture = 0;
-  bool out_read = false;
-  if (out && HostPageReadable(REX_RAW_ADDR(out + 20))) {
-    texture = REX_LOAD_U32(out + 20);
-    out_read = true;
-  }
-
-  if (ok && out_read && texture) return;  // delivered, the normal case
-  if (ok && !out_read) {
-    // No opinion: the struct could not be read, so this call is evidence of
-    // nothing and must not be filed under either failure.
-    g_glyphRasterUnread.fetch_add(1, std::memory_order_relaxed);
-    return;
-  }
-
-  const bool silent = ok;  // returned success, but handed back no texture
-  const uint64_t n =
-      silent ? g_glyphRasterSilent.fetch_add(1, std::memory_order_relaxed) + 1
-             : g_glyphRasterRefused.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (n > 24 && (n % 500) != 0) return;
-
-  // +9 is the last field read and can sit on the next page from +0.
-  uint32_t index = 0xFFFFu, size = 0, flags = 0, blur_x = 0, blur_y = 0;
-  bool read = false;
-  if (desc && HostPageReadable(REX_RAW_ADDR(desc)) &&
-      HostPageReadable(REX_RAW_ADDR(desc + 9))) {
-    index = REX_LOAD_U16(desc + 4);
-    size = REX_LOAD_U8(desc + 6);
-    flags = REX_LOAD_U8(desc + 7);
-    blur_x = REX_LOAD_U8(desc + 8);
-    blur_y = REX_LOAD_U8(desc + 9);
-    read = true;
-  }
-  REXLOG_INFO("d3d9: GLYPH LOST [{}] (#{}) -- no quad will be emitted. glyph "
-              "index {} size {} flags 0x{:02X} blur {}x{}{}",
-              silent ? "SILENT: returned OK with a NULL texture"
-                     : "REFUSED: returned failure",
-              n, index, size, flags, blur_x, blur_y,
-              read ? "" : " (DESCRIPTOR UNREADABLE -- fields above are junk)");
-}
 
 //=============================================================================
 // 0x829E0FB8 - GFx DrawBitmaps. THE IMAGE HALF OF THE UI.
@@ -470,76 +254,6 @@ extern "C" REX_FUNC(sub_829E1378) {
 }
 
 //=============================================================================
-// 0x828AC620 - Scaleform GFx: build one line of glyphs. THE LAST LINK.
-//
-// This is the function that writes a quad or does not, so whatever loses the
-// letter is inside it. Everything downstream of here is now excluded on
-// evidence: GetTexture never failed (0 of 457), the sub_8293E5B8 height cap is
-// unreachable (clamp 48 vs cap 48), the eviction pin was released on 123 of 123
-// flushes, and sub_828A8C40 delivered a real texture on all 2455 asks.
-//
-// It keeps its own verdict, and both bytes are ZEROED at function entry, so
-// they describe this call alone rather than accumulating:
-//
-//     out+36  at least one glyph was dropped from this line
-//     out+37  the glyph cache reported itself full
-//     out+20  how many glyphs actually got a cell
-//
-// Reading them after the original is the guest telling us whether it thinks it
-// lost anything, without having to guess which of its internal skips ran.
-//
-// What each outcome means, decided BEFORE the run so the result cannot be read
-// to taste:
-//
-//   DROPPED > 0  the line really is short a glyph, and since the null-texture
-//                path measured zero and the bright pass renders the U from the
-//                same records (so the index is not 0xFFFF), what remains is the
-//                pass-dependent flag pair -- bit 0x8000 tested on pass != 0 and
-//                bit 0x20 on pass 0, each written by a DIFFERENT pass than the
-//                one that tests it.
-//
-//   DROPPED == 0 this function does not believe it dropped anything, the
-//                42-index draw is what it meant to emit, and the letter was
-//                never in the line records at all. That moves the search up
-//                into composition -- GFx_TextLine_ComposeGlyphs and the reuse
-//                branch in GFx_TextDoc_FormatLines that can skip it entirely.
-//
-// UNREAD is carried so a zero in DROPPED cannot be confused with a failed read.
-// out (r4) is captured before the original because the callee clobbers the
-// volatiles.
-//=============================================================================
-REX_IMPORT(__imp__sub_828AC620, orig_GlyphBuildLine, void());
-extern "C" REX_FUNC(sub_828AC620) {
-  const uint32_t out = ctx.r4.u32;
-
-  orig_GlyphBuildLine(ctx, base);
-
-  g_lineBuildCalls.fetch_add(1, std::memory_order_relaxed);
-
-  // Both ends probed: +20 and +37 are 17 bytes apart and can straddle a page.
-  if (!out || !HostPageReadable(REX_RAW_ADDR(out + 20)) ||
-      !HostPageReadable(REX_RAW_ADDR(out + 37))) {
-    g_lineBuildUnread.fetch_add(1, std::memory_order_relaxed);
-    return;
-  }
-
-  const uint32_t placed = REX_LOAD_U32(out + 20);
-  const uint8_t dropped = REX_LOAD_U8(out + 36);
-  const uint8_t full = REX_LOAD_U8(out + 37);
-
-  if (full) g_lineBuildCacheFull.fetch_add(1, std::memory_order_relaxed);
-  if (!dropped) return;
-
-  const uint64_t n =
-      g_lineBuildDropped.fetch_add(1, std::memory_order_relaxed) + 1;
-  if (n <= 24 || (n % 500) == 0) {
-    REXLOG_INFO("d3d9: GLYPH LINE DROPPED (#{}) -- the guest marked this line "
-                "short a glyph; {} glyphs got a cell, cache-full flag {}",
-                n, placed, full ? 1 : 0);
-  }
-}
-
-//=============================================================================
 // 0x82945D20 - DefineCompactedFont. THE LOADER THIS GAME ACTUALLY USES.
 //
 // This title does NOT load fonts through DefineFont, DefineFont2 or
@@ -594,55 +308,6 @@ void GfxGuestStr(uint8_t* base, uint32_t addr, char* out, size_t max) {
 }
 
 }  // namespace
-
-//=============================================================================
-REX_IMPORT(__imp__sub_82945D20, orig_LoadFontCompacted, void());
-extern "C" REX_FUNC(sub_82945D20) {
-  const uint32_t font = ctx.r3.u32;
-  const uint32_t tag = ctx.r5.u32;
-  uint32_t expected = 0;
-  bool have_expected = false;
-  if (tag && HostPageReadable(REX_RAW_ADDR(tag + 8))) {
-    const uint32_t len = REX_LOAD_U32(tag + 8);
-    if (len >= 2) {
-      expected = len - 2;
-      have_expected = true;
-    }
-  }
-
-  orig_LoadFontCompacted(ctx, base);
-
-  g_fontLoads.fetch_add(1, std::memory_order_relaxed);
-  if (!font || !HostPageReadable(REX_RAW_ADDR(font + 84))) {
-    g_fontLoadsUnread.fetch_add(1, std::memory_order_relaxed);
-    return;
-  }
-  const uint32_t written = REX_LOAD_U32(font + 32);
-  const uint32_t nominal = REX_LOAD_U32(font + 84);
-  const uint32_t glyphs = REX_LOAD_U32(font + 52);
-
-  const bool short_read = have_expected && written < expected;
-  const bool bad_nominal = nominal == 0;
-  if (short_read || bad_nominal)
-    g_fontLoadsTruncated.fetch_add(1, std::memory_order_relaxed);
-
-  char name[96];
-  name[0] = 0;
-  const uint32_t name_ptr = REX_LOAD_U32(font + 24);
-  if (name_ptr && HostPageReadable(REX_RAW_ADDR(name_ptr)))
-    GfxGuestStr(base, name_ptr, name, sizeof name);
-
-  REXLOG_INFO("d3d9: FONT LOAD [compacted] name '{}' -- {} of {} payload bytes "
-              "read, nominal size {}, glyph count {} (unverified){}{}",
-              name[0] ? name : "(none)", written,
-              have_expected ? expected : 0, nominal, glyphs,
-              short_read ? "  <<< SHORT READ: the compacted blob is truncated "
-                           "and the glyph table ends early"
-                         : "",
-              bad_nominal ? "  <<< NOMINAL SIZE 0: the parse produced nothing, "
-                            "which the guest calls a broken gfx file"
-                          : "");
-}
 
 REX_IMPORT(__imp__sub_82550B80, orig_CreateVertexDeclaration, void());
 extern "C" REX_FUNC(sub_82550B80) {
