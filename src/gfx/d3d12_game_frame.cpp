@@ -1929,10 +1929,18 @@ void D3D12Renderer::RenderGameFrame() {
         drawTarget ? drawTarget->format : kBackBufferFormat;
     if (d.blendEnable) {
       pipeline = BlendedPSO(BlendKey{pso_index, d.srcBlend, d.destBlend,
-                                     d.blendOp, rtvFormat, topoType});
+                                     d.blendOp, rtvFormat, topoType,
+                                     d.stencilIndex});
     }
-    if (!pipeline) pipeline = OpaquePSO(pso_index, rtvFormat, topoType);
+    if (!pipeline)
+      pipeline = OpaquePSO(pso_index, rtvFormat, topoType, d.stencilIndex);
     m_commandList->SetPipelineState(pipeline);
+    // The reference value is NOT pipeline state -- it is set per draw, which is
+    // why configs differing only in ref share one pipeline. Set unconditionally
+    // when this draw has stencil so it cannot inherit the previous draw's ref;
+    // a stale ref is the kind of fault that only shows on the second draw of a
+    // pair and reads as a geometry bug.
+    if (d.stencilIndex) m_commandList->OMSetStencilRef(d.stencil.ref);
     // Each translated draw brings its own transform; a draw whose cb failed to
     // allocate falls back to the identity matrix rather than being dropped.
     const D3D12_GPU_VIRTUAL_ADDRESS cb =
@@ -2154,6 +2162,34 @@ void D3D12Renderer::RenderGameFrame() {
                   "depth surface",
                   static_cast<unsigned long long>(m_guestDepthClears),
                   static_cast<unsigned long long>(m_guestDepthClearsUnresolved));
+    LogInfo(message);
+    // PHASE 2 STENCIL. Every number that decides whether this phase is sound,
+    // on one line, zeros included.
+    //
+    //   states       distinct pipeline variants interned. The census says the
+    //                guest uses 18 configurations and those differing only in
+    //                ref collapse here, so a healthy run is well under 20. A
+    //                number that climbs run over run means something varying is
+    //                leaking into the key.
+    //   refused      draws that wanted stencil past the intern cap and rendered
+    //                WITHOUT it. Must be 0. Non-zero is a wrong picture rather
+    //                than an error, which is why it is printed rather than
+    //                trusted.
+    //   blend PSOs   occupancy against kMaxBlendPSOs. This is the sharpest
+    //                hazard in the plan: past the cap a blended draw silently
+    //                falls back to its opaque pipeline and loses its blending,
+    //                and stencil multiplies the variants that reach it.
+    //   by-format    the on-demand opaque cache, same concern.
+    std::snprintf(message, sizeof(message),
+                  "  STENCIL PSOs: %llu draws carried stencil, %llu distinct "
+                  "states interned, %llu refused past the cap (must be 0); "
+                  "blend PSOs %llu of %llu, by-format PSOs %llu",
+                  static_cast<unsigned long long>(m_stencilDraws),
+                  static_cast<unsigned long long>(m_stencilStates.size()),
+                  static_cast<unsigned long long>(m_stencilStatesRefused),
+                  static_cast<unsigned long long>(m_blendPSOs.size()),
+                  static_cast<unsigned long long>(kMaxBlendPSOs),
+                  static_cast<unsigned long long>(m_gamePSOsByFormat.size()));
     LogInfo(message);
     // DIAG: what the WHITE-SKIPPED draws were aimed at.
     for (const auto& [extent, e] : m_skipByTarget) {
@@ -2581,7 +2617,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t cullMode, uint32_t vtxCntl,
                                  uint32_t guestVpWidth,
                                  uint32_t guestVpHeight, bool useGuestVp,
-                                 bool edramCopy) {
+                                 bool edramCopy, const GameStencil* stencil) {
   // PERF(per-frame-allocs): DONE. This used to create an ID3D12Resource on the
   // UPLOAD heap for each of the buffers below — up to nine per call, once per
   // submitted draw — and the note here called for "a ring of upload buffers
@@ -3241,6 +3277,16 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.guestVpHeight = guestVpHeight;
   d.useGuestVp = useGuestVp;
   d.edramCopy = edramCopy;
+  // Interned HERE rather than at draw time: StencilIndexFor mutates the intern
+  // table, and the draw loop runs on the render thread while this runs on the
+  // submitting one. Doing it at submission also means the index is fixed by the
+  // time the draw is queued, so a state that arrives later cannot renumber a
+  // draw already in the list.
+  if (stencil && stencil->enable) {
+    d.stencil = *stencil;
+    d.stencilIndex = StencilIndexFor(*stencil);
+    ++m_stencilDraws;
+  }
   d.halfPixel = (vtxCntl != 0xFFFFFFFFu && (vtxCntl & 1u) == 0) ? 0.5f : 0.0f;
   if (d.halfPixel != 0.0f) ++m_halfPixelDraws; else ++m_halfPixelSkipped;
   if (scissor) {

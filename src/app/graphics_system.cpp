@@ -457,6 +457,48 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
           // deferred queue" is a real question rather than a restatement of
           // the assignment two lines after the register read.
           NotePlumbedStencil(*d);
+          // PHASE 2: the guest's stencil state, gated exactly as the census
+          // defines "effective". The enable bit ALONE over-counts -- outside
+          // edram_mode kColorDepth(4)/kDepthOnly(5) the hardware ignores the
+          // whole register, so a draw can set the bit and mean nothing by it.
+          //
+          // Blanket-enabling was the first draft and it was wrong: the guest
+          // leaves the bit CLEAR on about half of all draws, and enabling
+          // stencil on those applies their fail/zpass/zfail ops, which WRITE.
+          // That would stamp the mask from every draw the console never lets
+          // touch it -- corrupting the buffer Phase 3 then tests against.
+          D3D12Renderer::GameStencil sten;
+          const bool mode_honours =
+              d->edram_mode == 4u || d->edram_mode == 5u;
+          if ((d->depth_control & 1u) && mode_honours &&
+              d->stencil_ref_mask != 0xFFFFFFFFu) {
+            const uint32_t dcb = d->depth_control;
+            const uint32_t rm = d->stencil_ref_mask;
+            sten.enable = true;
+            sten.ref = uint8_t(rm & 0xFFu);
+            sten.readMask = uint8_t((rm >> 8) & 0xFFu);
+            sten.writeMask = uint8_t((rm >> 16) & 0xFFu);
+            sten.frontFail = uint8_t((dcb >> 11) & 7u);
+            sten.frontPass = uint8_t((dcb >> 14) & 7u);
+            sten.frontZFail = uint8_t((dcb >> 17) & 7u);
+            // Two-sided is its own bit. With it clear the guest means the FRONT
+            // state for both faces, and D3D12 always reads BackFace -- so
+            // copying front into back is required, not a convenience. Leaving
+            // back at its defaults would apply KEEP/ALWAYS to every back face.
+            const bool two_sided = (dcb >> 7) & 1u;
+            sten.backFail = uint8_t(two_sided ? (dcb >> 23) & 7u
+                                              : sten.frontFail);
+            sten.backPass = uint8_t(two_sided ? (dcb >> 26) & 7u
+                                              : sten.frontPass);
+            sten.backZFail = uint8_t(two_sided ? (dcb >> 29) & 7u
+                                               : sten.frontZFail);
+            // PHASE 2 ONLY, and the single line that makes this phase safe.
+            // ALWAYS cannot reject a fragment, so no geometry can vanish and
+            // "pixel-identical" is a meaningful pass condition. Phase 3 deletes
+            // these two lines and takes (dcb >> 8) & 7 and (dcb >> 20) & 7.
+            sten.frontFunc = 7;  // kAlways
+            sten.backFunc = 7;
+          }
           m_renderer->AddGameDraw(d->vertices.data(),
                                   static_cast<uint32_t>(d->vertices.size()),
                                   d->vertex_stride, d->indices.data(),
@@ -541,7 +583,8 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                                                       : 1u,
                                   d->guest_vp_width, d->guest_vp_height,
                                   REXCVAR_GET(d3d9_guest_viewport),
-                                  REXCVAR_GET(d3d12_edram_takeover_copy));
+                                  REXCVAR_GET(d3d12_edram_takeover_copy),
+                                  sten.enable ? &sten : nullptr);
           // MRT slot 1 as a follow-up rather than four more arguments on a
           // call that already takes forty: it patches the draw AddGameDraw just
           // pushed, and does nothing when the guest bound only one target.

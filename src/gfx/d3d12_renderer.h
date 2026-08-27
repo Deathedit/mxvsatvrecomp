@@ -171,6 +171,41 @@ inline void ApplyCullBits(uint32_t bits, D3D12_RASTERIZER_DESC& rs) {
   rs.FrontCounterClockwise = (bits & 4u) != 0 ? TRUE : FALSE;
 }
 
+// The guest's stencil state for one draw, already decoded.
+//
+// A STRUCT, not eleven more scalars on AddGameDraw, for the reason that
+// signature already states about the scissor: a call site reading
+// `..., 0, 0, 0, 0)` cannot be checked by eye.
+//
+// Guest -> D3D12 for both enums is `+ 1`, and that is verified against the
+// reference rather than assumed (rex/graphics/xenos.h:677 CompareFunction
+// kNever=0..kAlways=7 against D3D12 NEVER=1..ALWAYS=8, and :688 StencilOp
+// kKeep=0..kDecrementWrap=7 against D3D12 KEEP=1..DECR=8). Both orderings match
+// element for element, so the conversion is an offset and not a table.
+struct GameStencil {
+  bool enable = false;
+  uint8_t readMask = 0xFF;
+  uint8_t writeMask = 0xFF;
+  // NOT part of the pipeline state -- OMSetStencilRef takes it per draw, which
+  // is why two guest configs differing only in ref cost one PSO and not two.
+  uint8_t ref = 0;
+  // Guest encoding throughout (0-7). Converted at the point of use.
+  uint8_t frontFail = 0, frontZFail = 0, frontPass = 0, frontFunc = 7;
+  uint8_t backFail = 0, backZFail = 0, backPass = 0, backFunc = 7;
+
+  // Everything that varies the PIPELINE, and nothing that does not. `ref` is
+  // excluded deliberately; including it would multiply the pipeline count by
+  // the number of reference values for no reason.
+  uint64_t PipelineKey() const {
+    if (!enable) return 0;  // 0 is reserved for "no stencil".
+    return 1ull | (uint64_t(readMask) << 1) | (uint64_t(writeMask) << 9) |
+           (uint64_t(frontFail & 7u) << 17) | (uint64_t(frontZFail & 7u) << 20) |
+           (uint64_t(frontPass & 7u) << 23) | (uint64_t(frontFunc & 7u) << 26) |
+           (uint64_t(backFail & 7u) << 29) | (uint64_t(backZFail & 7u) << 32) |
+           (uint64_t(backPass & 7u) << 35) | (uint64_t(backFunc & 7u) << 38);
+  }
+};
+
 void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  const uint8_t* indices, uint32_t idxBytes, bool idx16,
                  uint32_t idxCount, const float* mvp, uint32_t topology,
@@ -230,7 +265,12 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  // means unreadable. Compared against the target extent the
                  // renderer actually uses -- see m_vpMatch.
                  uint32_t guestVpWidth = 0, uint32_t guestVpHeight = 0,
-                 bool useGuestVp = false, bool edramCopy = false);
+                 bool useGuestVp = false, bool edramCopy = false,
+                 // Null means "the guest did not ask for stencil on this draw",
+                 // which is the behaviour every draw had before stencil was
+                 // plumbed -- so an unreadable register cannot make things
+                 // worse. See GameStencil.
+                 const GameStencil* stencil = nullptr);
 
 // Append a resolve to this frame's list, in order with the draws around it.
 //
@@ -555,12 +595,28 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // reduction is k_16_16_FLOAT -- cannot be drawn by a pipeline that declares
   // RGBA8, and drawing it into an RGBA8 surface clamped the log-average to
   // [0,1] before anything could read it.
-  std::unordered_map<uint32_t, Microsoft::WRL::ComPtr<ID3D12PipelineState>>
+  // Distinct stencil states, interned. Index 0 is always "no stencil", so a
+  // zero index needs no lookup and every pre-stencil call site keeps its
+  // meaning. Bounded by what the guest programs -- the census says 18
+  // configurations, of which those differing only in ref collapse.
+  std::vector<GameStencil> m_stencilStates{GameStencil{}};
+  std::unordered_map<uint64_t, uint32_t> m_stencilStateIndex;
+  // Intern a stencil state and return its dense index. 0 for disabled.
+  uint32_t StencilIndexFor(const GameStencil& s);
+  // How many distinct states have been interned, for the report. A number that
+  // keeps climbing means something varying is leaking into the key.
+  size_t StencilStateCount() const { return m_stencilStates.size(); }
+  // Draws that wanted stencil past the intern cap and rendered without it.
+  // Non-zero means the cap is wrong, or something varying leaked into the key.
+  uint64_t m_stencilStatesRefused = 0;
+  // Draws that carried stencil state at all, the denominator for the above.
+  uint64_t m_stencilDraws = 0;
+
+  std::unordered_map<uint64_t, Microsoft::WRL::ComPtr<ID3D12PipelineState>>
       m_gamePSOsByFormat;
-  ID3D12PipelineState* OpaquePSO(
-      uint32_t variant, DXGI_FORMAT rtvFormat,
-      D3D12_PRIMITIVE_TOPOLOGY_TYPE topoType =
-          D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+  ID3D12PipelineState* OpaquePSO(uint32_t variant, DXGI_FORMAT rtvFormat,
+                                 D3D12_PRIMITIVE_TOPOLOGY_TYPE topoType,
+                                 uint32_t stencilIndex = 0);
   // The host format an offscreen target takes for a given guest
   // ColorRenderTargetFormat (RB_COLOR_INFO bits [16:19]).
   static DXGI_FORMAT HostColorFormat(uint32_t guestColorFormat);
@@ -587,16 +643,23 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // belongs in the key for the same reason rtvFormat does.
     D3D12_PRIMITIVE_TOPOLOGY_TYPE topoType =
         D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    // Dense index into m_stencilStates; 0 is no stencil. In the key because
+    // stencil is pipeline state -- a blended draw that also tests or writes
+    // stencil needs its own pipeline, and reusing one built without it would
+    // silently drop the stencil half.
+    uint32_t stencilIndex = 0;
     bool operator==(const BlendKey& o) const noexcept {
       return pso_index == o.pso_index && src == o.src && dest == o.dest &&
-             op == o.op && rtvFormat == o.rtvFormat && topoType == o.topoType;
+             op == o.op && rtvFormat == o.rtvFormat && topoType == o.topoType &&
+             stencilIndex == o.stencilIndex;
     }
   };
   struct BlendKeyHash {
     size_t operator()(const BlendKey& k) const noexcept {
       return (size_t(k.pso_index) << 24) ^ (size_t(k.src) << 16) ^
              (size_t(k.dest) << 8) ^ size_t(k.op) ^
-             (size_t(k.rtvFormat) << 32) ^ (size_t(k.topoType) << 44);
+             (size_t(k.rtvFormat) << 32) ^ (size_t(k.topoType) << 44) ^
+             (size_t(k.stencilIndex) << 52);
     }
   };
   // Bounded so an unrecognised state cannot grow this without limit; past the
@@ -1252,6 +1315,13 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // it clears is the pair below -- the guest issues depth-only, stencil-only
     // and both, and clearing the stencil plane whenever depth is cleared would
     // wipe a mask the guest meant to keep.
+    // The guest's stencil state, and the dense index of its pipeline variant.
+    // The index is interned rather than packed into the PSO key: the key is
+    // already tight (rtv format at bit 8, topology at bit 28) and the state is
+    // 41 bits, which does not fit anywhere in it. Interning keeps the key small
+    // and bounds the variant count by what the guest actually uses.
+    GameStencil stencil;
+    uint32_t stencilIndex = 0;  // 0 == no stencil
     bool depthClear = false;
     float clearDepth = 1.0f;
     bool clearDepthPlane = true;
