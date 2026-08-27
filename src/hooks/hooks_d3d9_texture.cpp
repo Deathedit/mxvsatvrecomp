@@ -544,6 +544,10 @@ std::map<uint64_t, uint32_t> g_flatRetryKeys;
 constexpr uint32_t kFlatRetryFrames = 30;
 uint64_t g_flatNotCached = 0;
 uint64_t g_flatRetriesDue = 0;
+// Watched keys whose re-read came back with CONTENT -- i.e. the texture really
+// does change under us, and dropping it from the watch set would pin it. See
+// the note at the cache insert for what dropping the page table cost.
+uint64_t g_flatVolatile = 0;
 
 // THE PROBE CRASHED THE GAME AND THIS IS WHY. The census below inserts into a
 // std::map and a std::set, and once NoteDecodedTexture was called from all
@@ -2778,8 +2782,33 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
                                    rp.below_height, rp.below_delta)
                      : std::string(" -- NONE, and none below either")));
     }
-  } else {
-    g_flatRetryKeys.erase(key);
+  } else if (auto it = g_flatRetryKeys.find(key); it != g_flatRetryKeys.end()) {
+    // KEEP WATCHING IT. Erasing here was a real bug and it cost the terrain.
+    //
+    // The backoff was written for a texture that STARTS empty and later fills:
+    // recover it, then stop paying. So a decode that came back non-flat was
+    // read as "done" and the key was dropped. But a texture that was uniform
+    // and is now not uniform has just proved the opposite -- it CHANGES -- and
+    // that is precisely the texture GuestTextureFingerprint cannot track,
+    // because it samples 2 KB and the writes are sparse.
+    //
+    // The terrain's virtual-texture PAGE TABLE is exactly this shape. Measured
+    // in run 1516, in-level, with every other stage of the system working
+    // (the guest's update gate fires every frame, and the feedback we hand it
+    // carries ~530 page requests per frame):
+    //
+    //     DECODE SHAPES 76 distinct over 16000 decodes
+    //       fmt15(FMT_4_4_4_4) 1024x1024 n=3
+    //
+    // THREE decodes in sixteen thousand. We pinned whatever mapping existed
+    // early in the run and rendered every subsequent frame from it.
+    //
+    // So: once a key has been watched, it stays watched, on the same 30-frame
+    // backoff. Not caching at all is NOT the alternative -- that was measured
+    // at 1.75 SECONDS a frame, because it re-decoded on every bind. A backoff
+    // over the watched set is what already costs ~0ms today.
+    it->second = mx::hle::D3D9FrameCount();
+    ++g_flatVolatile;
   }
   g_hleCpuTextures.emplace(key, std::move(payload));
   return true;

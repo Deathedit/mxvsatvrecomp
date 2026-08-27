@@ -220,7 +220,8 @@ extern TexDecodeIndex g_texIndex;
 // Flat-decode retry backoff: keys marked, and retries actually taken. Both,
 // because `marked N retried 0` and `marked N retried M` are different bugs.
 extern uint64_t g_flatNotCached;
-extern uint64_t g_flatRetriesDue;           // decode sites and keys
+extern uint64_t g_flatRetriesDue;
+extern uint64_t g_flatVolatile;           // decode sites and keys
 
 // ---- constants -------------------------------------------------------------
 constexpr uint32_t kHostPageSize = 4096;
