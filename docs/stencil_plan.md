@@ -178,7 +178,7 @@ the mask is deliberately wrong here -- wrong and unobserved. It becomes correct
 the moment Phase 3 restores the real funcs, since the plane is cleared per frame
 anyway.
 
-## Phase 3: stencil TEST. IN PROGRESS.
+## Phase 3: stencil TEST. PASSED (`aa7e9a2`, verified run 1549).
 
 Apply the guest's real func. **This is the first step that can change pixels.**
 
@@ -188,7 +188,37 @@ reverted for missing its target (`judge-a-change-on-the-whole-frame`).
 **Pass:** no geometry vanishes. Vanishing geometry means Phase 0 got the clear
 wrong. Go back to it rather than papering over it.
 
-## Phase 4: two-sided
+**PASSED**, run 1549, on the connected path:
+
+```
+151719 draws carried stencil (80001 with a comparison that can REJECT),
+  9 states, 0 refused, 0 WITH NO DSV, blend PSOs 1 of 128
+TranslatedPSO stencil: idx 1 enable 1 func 6/6 ops 4/4/4 masks FF/FF dsvfmt 20
+```
+
+`func 6` is D3D12 `NOT_EQUAL`, the guest's `kNotEqual`. Nothing vanished: bike,
+rider, every menu row, both XP bars. White halos on that screen were checked
+against the user and are pre-existing.
+
+**This is the stronger result, and it subsumes the Phase 2 re-check.** If the
+masks were being WRITTEN wrongly the tests would reject the wrong fragments and
+something would have disappeared. Nothing did, so the write side is right too.
+
+Also confirms the enum conversion end to end on real data: guest ops
+3/4/0 (`kIncrementClamp`/`kDecrementClamp`/`kKeep`) arrive as D3D12 4/5/1
+(`INCR_SAT`/`DECR_SAT`/`KEEP`), and `kNotEqual` 5 arrives as 6.
+
+## Phase 4: two-sided. ALREADY DONE, folded into Phase 2.
+
+Kept as a heading because the plan named it separately and it is not obvious
+from the commits that it is finished. Two-sided was implemented in Phase 2
+rather than deferred, because the alternative was WRONG rather than merely
+incomplete: D3D12 always reads `BackFace`, so leaving it at defaults applies
+`KEEP`/`ALWAYS` to every back-facing triangle. With `RB_DEPTHCONTROL` bit 7
+clear the guest means the front state for both faces, so front is copied into
+back; with it set, the back fields are read from bits 23-31.
+
+Original note, still true about the risk:
 
 Only 3 of the 18 configs set `backface_enable` -- the shadow volumes. A separate
 phase because two-sided interacts with the cull-mode / `FrontCounterClockwise`
