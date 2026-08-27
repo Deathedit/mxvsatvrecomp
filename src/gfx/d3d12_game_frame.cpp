@@ -1263,8 +1263,12 @@ void D3D12Renderer::RenderGameFrame() {
         D3D12_CPU_DESCRIPTOR_HANDLE dsv =
             m_gameDepthDsvHeap->GetCPUDescriptorHandleForHeapStart();
         dsv.ptr += SIZE_T(depthTarget->rtvIndex) * m_gameDsvDescriptorSize;
-        m_commandList->ClearDepthStencilView(dsv, kGameDepthClearFlags, 1.0f,
-                                             0, 0, nullptr);
+        // DEPTH ONLY. This is our per-frame schedule, not the guest's, and the
+        // stencil plane belongs to the guest's own clears -- see
+        // kGameDepthFrameClearFlags. The creation-time clear at the
+        // needsInitialClear sites is what gives stencil its first value.
+        m_commandList->ClearDepthStencilView(dsv, kGameDepthFrameClearFlags,
+                                             1.0f, 0, 0, nullptr);
         depthTarget->usedThisFrame = true;
         depthTarget->everDrawn = true;
       }

@@ -427,8 +427,19 @@ void D3D12Renderer::BeginFrame() {
     // Clear depth each frame: DSV was bound but never cleared, so without
     // this, depth accumulates across frames and real geometry would
     // depth-fail against random initial values.
+    //
+    // DEPTH ONLY after the first frame. Stencil is the guest's -- it clears the
+    // plane where it wants to and withholds the clear where it does not, and
+    // wiping it every frame on our schedule destroys the mask it built. This
+    // surface has no needsInitialClear of its own, so the first frame gives
+    // stencil its one defined value and every frame after refreshes depth
+    // alone. See kGameDepthFrameClearFlags.
     m_commandList->ClearDepthStencilView(
-        dsvHandle, kGameDepthClearFlags, 1.0f, 0, 0, nullptr);
+        dsvHandle,
+        m_gameDepthStencilInitialised ? kGameDepthFrameClearFlags
+                                      : kGameDepthClearFlags,
+        1.0f, 0, 0, nullptr);
+    m_gameDepthStencilInitialised = true;
     m_commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, &dsvHandle);
   } else {
     m_commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);

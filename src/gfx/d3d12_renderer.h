@@ -396,6 +396,25 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // All four depth clears go through this so the stencil plane cannot be left
   // out of one of them. Undefined stencil is invisible until the test is turned
   // on, and then geometry vanishes rather than degrades.
+  // PER-FRAME depth refresh: DEPTH ONLY, deliberately.
+  //
+  // Our first-use clear exists so depth does not accumulate across frames. That
+  // is our schedule, not the guest's, and applying it to STENCIL was wrong:
+  // the guest clears stencil at points it chooses (Flags 0x20, 0x30) and
+  // deliberately WITHHOLDS it at others -- 0x1F is depth with no stencil, and
+  // it issues that. Wiping the plane whenever a depth surface is first touched
+  // in a frame destroys a mask the guest built and expects to survive.
+  //
+  // Invisible until something tested the plane. It broke the TERRAIN the moment
+  // d3d9_stencil_test went live, and the comparison was innocent: the terrain
+  // draw passes, no stencilTestFailed appears anywhere, and the pipeline
+  // carries exactly the state the guest programmed.
+  //
+  // kGameDepthClearFlags below keeps BOTH planes and is for CREATION only --
+  // the needsInitialClear sites, where the stencil contents really are
+  // undefined and must be given a value.
+  static constexpr D3D12_CLEAR_FLAGS kGameDepthFrameClearFlags =
+      D3D12_CLEAR_FLAG_DEPTH;
   static constexpr D3D12_CLEAR_FLAGS kGameDepthClearFlags =
       D3D12_CLEAR_FLAGS(D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL);
   // Sampler variants, indexed by these bits. The guest's per-texture address
@@ -611,6 +630,10 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   uint64_t m_stencilStatesRefused = 0;
   // Draws that carried stencil state at all, the denominator for the above.
   uint64_t m_stencilDraws = 0;
+  // The main depth surface has no needsInitialClear of its own -- BeginFrame is
+  // the only place it is cleared. So its stencil plane is given a value exactly
+  // once, and every later frame refreshes depth alone.
+  bool m_gameDepthStencilInitialised = false;
   // Of those, how many carry a comparison that can REJECT -- anything but
   // kAlways on either face. This is the number that says Phase 3 is live: a
   // predicate that is always true is not a test, and "no visual change" means
