@@ -1910,17 +1910,28 @@ extern "C" REX_FUNC(sub_8255B258) {
     // The prototype is (pDevice, Count, pRects, Flags, Color, Z, Stencil,
     // EDRAMClear). On this ABI a float argument consumes its integer register
     // slot, so Z in f1 RESERVES r8 and the two integer args after it land in r9
-    // and r10. The clear census settles it from data rather than from the
-    // convention alone:
+    // and r10. Census, reproduced over two runs:
     //
     //   r8   0x2D00000 / 0x810000 / 0x18280186   never 0..255, and constant
     //                                            within a flag group: a
     //                                            leftover, not an argument
-    //   r9   0 everywhere, 1 on 0x60             exactly a stencil value
-    //   r10  0 always                            EDRAMClear, never set
+    //   r9   0 everywhere, 1 on 0x60
+    //   r10  0 always
     //
     // The first cut read r8 and logged `s=0` on every line, which looked
     // correct and was not: 0x2D00000 & 0xFF is 0.
+    //
+    // HOW STRONG IS THIS? The ABI rule and r8 holding junk are the evidence.
+    // The census CORROBORATES, it does not prove, and an earlier version of
+    // this comment claimed otherwise: r9 being exactly 0/1 is predicted just as
+    // well by r9 == EDRAMClear (a BOOL) as by r9 == Stencil (a value the guest
+    // happens to clear to 0 and 1). Nothing observed separates them.
+    //
+    // It does not matter yet, which is why it is not chased here: under EITHER
+    // reading every clear we honour carries stencil 0 and 0x60 is skipped, so
+    // behaviour is identical. They diverge only when Phase 3 decides what 0x60
+    // is, and that wants the guest-side trace of which register reaches
+    // RB_STENCILREFMASK -- not another run of this census.
     const uint32_t stencil_value = ctx.r9.u32;
     const bool want_depth = (flags & 0x10u) != 0;
     // 0x60 IS EXCLUDED, but not for the reason previously given. The old note
