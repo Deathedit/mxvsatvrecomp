@@ -59,7 +59,7 @@ Every one of these is absent, not partial:
   never reaches `DrawCall`.
 - `DrawCall` carries `clear_depth` but **no `clear_stencil`**.
 
-## Phase 0: name the stencil clear bit. BLOCKING.
+## Phase 0: name the stencil clear bit. DONE (`227e410`).
 
 Nothing downstream is safe until this is answered: a test against a wrongly
 cleared buffer makes geometry VANISH rather than degrade.
@@ -69,18 +69,40 @@ hardware, not the 0x2 a PC D3D9 header says**, and states plainly that bits 1..6
 are still not named. Run 1445 saw seven flag values: `0xF, 0x1F, 0x30, 0x3F,
 0x60`.
 
-Working hypothesis, to be confirmed and not assumed: **0x20 is
-D3DCLEAR_STENCIL**. `0x30 == 0x10|0x20` is the classic depth+stencil pair, and
-0x20 is adjacent to a ZBUFFER bit that has already moved from its PC value.
+**ANSWER: `0x20` is `D3DCLEAR_STENCIL`.** Proven, not extrapolated.
 
-Settle it from the reference. `D3DDevice_Clear`'s body is NOT reachable through
-the decompiler (IDA's bounds stop at `0x8255B284` on a misdecoded `vcmpneb.`),
-so IDA cannot answer this one; check xenia-edge and the SDK headers.
+Neither xenia-edge nor the SDK carries `D3DCLEAR`, and `D3DDevice_Clear` really
+is unreachable through Hex-Rays. But the flag decoding is not in it: it is a
+thin wrapper over `sub_8255B130` -> `sub_8255AAB0` -> `sub_8255A510`, and the
+last two decompile cleanly.
 
-Then carry `clear_stencil` on `DrawCall` and stop clearing stencil
-unconditionally with depth.
+`sub_8255AAB0` loops bits 0..3 over the four render targets at `device+12616`
+and masks off `0xF0` after the first, so the depth-stencil half clears once:
+**bits 0-3 are the MRT colour targets**, `0x10/0x20/0x40/0x80` are the
+depth-stencil group.
 
-**Pass:** the bit is named from a reference and the flag distribution agrees.
+`sub_8255A510` decides it:
+
+```c
+if ( (Flags & 0x10) != 0 )  v41 |= 1u;              // depth
+if ( (Flags & 0x20) != 0 ) {
+    v41 |= 4u;                                      // stencil
+    *v44++ = 8461;                                  // 8461 == 0x210D
+    *v44 = 0x00FF0000 | (Stencil & 0xFF);           // RB_STENCILREFMASK
+}
+```
+
+**Passed.** Every observed flag value decodes: `0xF` colours, `0x1F`
+colours+depth, `0x20` stencil alone, `0x30` depth+stencil, `0x3F` all three,
+`0x60` stencil+EDRAM.
+
+Carried through in `227e410`: `DrawCall` gained `clear_stencil_target` /
+`clear_stencil`, `AddGameDepthClear` gained the plane pair, and the guest-driven
+`ClearDepthStencilView` builds its flags from what the guest asked rather than
+the unconditional `kGameDepthClearFlags` (which stays right for our own
+first-use clears). EDRAM clears are excluded as the depth gate already excludes
+them -- `0x60` carries `0x20` and is 16,139 of 24,000 calls -- and the exclusion
+is counted, not silent.
 
 ## Phase 1: plumb the registers, change nothing
 
