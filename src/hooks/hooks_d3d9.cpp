@@ -1559,10 +1559,11 @@ uint64_t g_shaderConstOverlays = 0;
 // That is the hardware order — the load is emitted at draw time, after any
 // SetVertexShaderConstantF the app made.
 // `written`, when given, receives one byte per bank dword, non-zero where this
-// overlay published a value. FillVertexTint needs it for the same reason
-// ApplyShaderLoadTable's twin exists on the pixel side: a shader that writes a
-// deliberate ZERO here and a slot nothing ever wrote are the same bits and the
-// opposite decision.
+// overlay published a value -- the vertex twin of ApplyShaderLoadTable's param.
+// Its only consumer was the reverted vs-c32 fill, and it is kept because the
+// distinction it draws is the one any future fill here needs first: a shader
+// that writes a deliberate ZERO and a slot nothing ever wrote are the same bits
+// and the opposite decision.
 void OverlayShaderConstants(uint32_t shader, uint8_t* base,
                             std::array<uint32_t, kD3d9ConstRegs * 4>& out,
                             std::array<uint8_t, kD3d9ConstRegs * 4>* written =
@@ -1755,14 +1756,7 @@ bool CaptureVertexConstants(uint32_t device, uint8_t* base, uint32_t shader,
     }
     if (nan) before[r >> 5] |= 1u << (r & 31);
   }
-  std::array<uint8_t, kD3d9ConstRegs * 4> vs_written{};
-  OverlayShaderConstants(shader, base, out, &vs_written);
-  // AFTER the shader's own literals, never before them. The pixel-side twin of
-  // this fill was placed before its load table on the first cut and was simply
-  // overwritten for every shader whose table covers the window -- surviving
-  // only on the shaders it was not aimed at, which is how a change lands on the
-  // wrong geometry and reads as a partial success.
-  mx::gpu::alu::FillVertexTint(out.data(), kD3d9ConstRegs, vs_written.data());
+  OverlayShaderConstants(shader, base, out);
   NoteVertexConstantNaN(out, shader, before);
   return true;
 }
@@ -6411,14 +6405,11 @@ void ReportDrawCounts(uint8_t* base) {
     //                                      should now be visible on that share
     //                                      of draws, and flickering means the
     //                                      denormal is next
-    uint64_t vt_filled, vt_applied, vt_denorm, vt_unpub, vt_nonfin, vt_zero;
-    mx::gpu::alu::VertexTintStats(vt_filled, vt_applied, vt_denorm, vt_unpub,
-                                  vt_nonfin, vt_zero);
+    // vs c32 WAS filled from this file and is not any more -- see the revert.
+    // The value stays on the report because it is the evidence: PM4 publishes
+    // it as a plain zero, which is what killed the substitution.
     static const uint32_t kTint[] = {32};
-    REXLOG_INFO("d3d9: VERTEX TINT FILL (vs c32) {} dwords filled | float4s: "
-                "{} applied, rejected {} denormal / {} non-finite / {} "
-                "unpublished / {} all-zero | file now:{}",
-                vt_filled, vt_applied, vt_denorm, vt_nonfin, vt_unpub, vt_zero,
+    REXLOG_INFO("d3d9: ALU FILE SPOT CHECK{}",
                 mx::gpu::alu::FileValues(kTint, 1));
   }
   ReportDeclHistogram();

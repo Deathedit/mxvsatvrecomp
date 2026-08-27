@@ -106,32 +106,24 @@ constexpr uint32_t kPixelBankFirstReg = 256;
 constexpr uint32_t kMaterialGateFirstConst = 256 + 84;
 constexpr uint32_t kMaterialGateEndConst = 256 + 88;
 
-// VERTEX c32 -- the tint the UI/logo draws multiply their sampled texel by.
-// Proven in legal.rdc: the texture samples white, xe_c[32] arrives (0,0,0,1),
-// and LegacyMul turns white x 0 into +0. PM4 publishes (1,1,1,1) for it.
+// vs c32 IS NOT A TINT, and the fill that assumed it was is gone. Kept as a
+// short record so the next reading of this file does not re-derive it:
 //
-// ONE constant wide, on purpose. The precedent in this file is that a fill from
-// the frame-global g_file is safe exactly when its window is not an ARRAY: the
-// blanket version tore a stride-6 vertex matrix palette apart with end-of-frame
-// values. A single tint register cannot be a palette entry.
-constexpr uint32_t kVertexTintFirstConst = 32;
-constexpr uint32_t kVertexTintEndConst = 33;
+//   - PM4 publishes vs c32 as a plain (0,0,0,0) for 97.2% of a run
+//     (468,445 all-zero float4s against 13,520 non-zero). The zero is the
+//     guest's own value, not a hole we failed to fill.
+//   - the (1,1,1,1) that made it look like a white tint is an early-boot value
+//     that g_file's last-write-wins simply never let go of. WOULD-FILL VALUES
+//     kept printing it for the whole run because that report snapshots declined
+//     NON-ZERO values and structurally cannot show a zero.
+//   - no shader in legal.rdc reads xe_c[32] at all.
+//   - and the premise underneath was wrong anyway: the legal-screen logo and
+//     the intro are NOT missing. They render. The missing images are elsewhere.
+//
+// Substituting it changed nothing except to add a flashing line at the bottom
+// of those screens -- the third time a fill from this frame-global file has
+// produced flashing and no repair.
 
-// Vertex-tint fill outcomes. Three counters, not one, because "the window never
-// validated" and "the window validated and had nothing to fill" are different
-// findings and a single total would print the same number for both.
-uint64_t g_vertexTintFilled = 0;    // dwords actually substituted
-uint64_t g_vertexTintApplied = 0;   // float4s that passed validation
-uint64_t g_vertexTintDenormal = 0;  // float4s rejected for a denormal component
-uint64_t g_vertexTintUnpub = 0;     // float4s rejected as not fully published
-// The two rejections the first cut counted NOWHERE, which cost a reading of
-// run 1529: the fill froze at 16787 dwords after ten seconds and stayed frozen
-// for another 386,000 opportunities, and neither `denormal` nor `unpublished`
-// moved -- so the reason it stopped was in a bucket with no counter. Every exit
-// from the validation is now counted. The rule this file keeps re-learning: an
-// outcome with no counter reads as an outcome that never happens.
-uint64_t g_vertexTintNonFinite = 0;  // float4s rejected as Inf/NaN
-uint64_t g_vertexTintAllZero = 0;    // published, valid, and all four are 0.0
 
 bool NonFinite(uint32_t bits) {
   // IEEE-754: exponent all ones is Inf (mantissa 0) or NaN (mantissa non-zero).
@@ -500,99 +492,6 @@ uint32_t FillMaterialGate(uint32_t* bank, uint32_t bank_regs,
       if (!eligible) continue;
       ++filled;
       ++g_materialGateFilled;
-    }
-  }
-  return filled;
-}
-
-void VertexTintStats(uint64_t& filled, uint64_t& applied, uint64_t& denormal,
-                     uint64_t& unpublished, uint64_t& nonfinite,
-                     uint64_t& all_zero) {
-  std::lock_guard<std::mutex> lk(g_mu);
-  filled = g_vertexTintFilled;
-  applied = g_vertexTintApplied;
-  denormal = g_vertexTintDenormal;
-  unpublished = g_vertexTintUnpub;
-  nonfinite = g_vertexTintNonFinite;
-  all_zero = g_vertexTintAllZero;
-}
-
-uint32_t FillVertexTint(uint32_t* bank, uint32_t bank_regs,
-                        const uint8_t* load_written) {
-  // The one substitution from g_file that survives its own history, and the
-  // history is the design. Everything above this function that tried to fill
-  // finite zeros from PM4 was reverted, twice, for the same two reasons:
-  //
-  //   1. it reached ARRAYS. g_file is frame-global last-write-wins, so a
-  //      mid-frame draw reading a matrix palette gets the frame's FINAL rows.
-  //      Fixed here by a one-register window that cannot be an array.
-  //   2. it injected values that were not shader constants. FillMaterialGate
-  //      shipped a 2.074e-42 denormal into ps c85.y on ~94,000 draws a run
-  //      before anyone looked at what was being written.
-  //
-  // (2) is what the validation below exists for, and it is deliberately
-  // WHOLE-VECTOR. A per-component guard is worse than none here: measured over
-  // one run, PM4 publishes vs c32 as (1,1,1,1) on 12 samples and
-  // (1, 2.074e-42, 1, 1) on 32. Skipping only the bad component would leave
-  // .y at zero and light the logo MAGENTA -- a plausible-looking wrong answer,
-  // which is the exact failure mode docs/strict_mode.md is about. Rejecting the
-  // whole float4 leaves it black instead: unchanged, and still obviously
-  // broken.
-  //
-  // So the expected first result is a PARTIAL fix -- the tint appearing on the
-  // ~27% of samples that validate. If it never fires, the source is junk and
-  // this comes straight back out; if it fires and flickers, the denormal in .y
-  // is the next thing to chase and not this window.
-  //
-  // Runs AFTER the shader's own literal overlay, never over it. Same ordering
-  // lesson FillMaterialGate paid for: placed before the table, a fill is simply
-  // overwritten for every shader whose table covers the window, and survives
-  // only on the shaders it was not aimed at.
-  if (!bank || !load_written) return 0;
-  uint32_t filled = 0;
-  std::lock_guard<std::mutex> lk(g_mu);
-  for (uint32_t c = kVertexTintFirstConst; c < kVertexTintEndConst; ++c) {
-    if (c >= bank_regs) continue;
-    // VALIDATE THE WHOLE FLOAT4 FIRST, decide second.
-    bool valid = true, any_nonzero = false, denormal = false, unpub = false;
-    bool nonfinite = false;
-    for (uint32_t comp = 0; comp < 4; ++comp) {
-      const uint32_t d = c * 4 + comp;
-      if (!(g_have[d >> 5] & (1u << (d & 31)))) { unpub = true; valid = false; break; }
-      const uint32_t v = g_file[d];
-      if (NonFinite(v)) { nonfinite = true; valid = false; break; }
-      if (Denormal(v)) { denormal = true; valid = false; break; }
-      if (v != 0) any_nonzero = true;
-    }
-    // An all-zero publish has nothing to substitute -- it is what the bank
-    // already holds -- but it gets its OWN counter rather than being silent.
-    // Silent was how run 1529 hid the reason the fill stopped.
-    bool all_zero = false;
-    if (valid && !any_nonzero) { all_zero = true; valid = false; }
-    // Most specific first, and every branch terminates in a counter. Ordering
-    // matters here for the same reason it did in the reason-code chain that
-    // produced a permanent zero and ate a session.
-    if (denormal) ++g_vertexTintDenormal;
-    else if (nonfinite) ++g_vertexTintNonFinite;
-    else if (unpub) ++g_vertexTintUnpub;
-    else if (all_zero) ++g_vertexTintAllZero;
-    else if (valid) ++g_vertexTintApplied;
-    for (uint32_t comp = 0; comp < 4; ++comp) {
-      const uint32_t b = c * 4 + comp;
-      // Every dword is an opportunity whether or not the vector validated, so
-      // the census denominator is structural rather than a count of the times
-      // we happened to agree with ourselves.
-      const bool fired = valid && !load_written[b] && bank[b] == 0;
-      mx::gpu::guard::Note(mx::gpu::guard::Guard::kVertexTintFill, fired);
-      // Switchable, unlike the other fills in this file: turning it off leaves
-      // the tint at the black the guest bank already holds, which is exactly
-      // the pre-change behaviour. That makes the strict bit a one-run A/B on
-      // whether this is what changed the screen, with no rebuild.
-      if (!fired || mx::gpu::guard::Strict(mx::gpu::guard::Guard::kVertexTintFill))
-        continue;
-      bank[b] = g_file[c * 4 + comp];
-      ++filled;
-      ++g_vertexTintFilled;
     }
   }
   return filled;
