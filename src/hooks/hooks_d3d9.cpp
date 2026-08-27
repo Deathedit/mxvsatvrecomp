@@ -6486,6 +6486,21 @@ void ReportGlyphCache() {
               d::g_fontLoadsUnread.load(std::memory_order_relaxed));
 }
 
+bool GuestRangeReadable(uint8_t* base, uint32_t addr, uint32_t bytes) {
+  if (!base || !addr || !bytes) return false;
+  return mx::hooks::d3d9::HostPageReadable(REX_RAW_ADDR(addr)) &&
+         mx::hooks::d3d9::HostPageReadable(REX_RAW_ADDR(addr + bytes - 1));
+}
+
+uint32_t ResolveGuestRange(uint8_t* base, uint32_t addr, uint32_t bytes) {
+  if (!base || !addr || !bytes) return 0;
+  for (uint32_t m : {0u, 0xA0000000u, 0xC0000000u, 0xE0000000u}) {
+    const uint32_t candidate = addr | m;
+    if (GuestRangeReadable(base, candidate, bytes)) return candidate;
+  }
+  return 0;
+}
+
 uint64_t HleDrawsAccepted() { return mx::hooks::d3d9::g_hleDrawsAccepted; }
 uint64_t HleDrawsRefused() {
   // Both last-gate refusals and the deferred path's own discards, because a

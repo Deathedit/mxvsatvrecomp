@@ -71,3 +71,17 @@ uint64_t HleDrawsRefused();
 // prints only when a flush happens renders that case as silence. Call it on a
 // swap cadence so every one of these being zero is itself a readable result.
 void ReportGlyphCache();
+
+// Is [addr, addr+bytes) readable guest memory? Wraps HostPageReadable, which
+// lives in hooks_d3d9_internal.h -- declared out here for the same reason as
+// ReportGlyphCache: the frame hook needs it and must not include that header.
+//
+// Probes both ends, so a range straddling a page boundary is not called
+// readable on the strength of its first byte.
+bool GuestRangeReadable(uint8_t* base, uint32_t addr, uint32_t bytes);
+
+// Resolve a guest PHYSICAL address to one that is actually readable, returning
+// 0 when none is. A bare physical address usually is not the readable one --
+// the same mirrors CopyTexturePhysical and GuestTextureFingerprint walk apply
+// here. Xenia gets this for free from Memory::TranslatePhysical; we do not.
+uint32_t ResolveGuestRange(uint8_t* base, uint32_t addr, uint32_t bytes);

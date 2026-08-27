@@ -29,6 +29,7 @@
 
 #include <chrono>
 #include <mutex>
+#include <vector>
 
 #include "gpu/d3d9_draw.h"
 #include "gpu/d3d9_state.h"
@@ -360,6 +361,10 @@ extern "C" REX_FUNC(sub_82566B58) {
     // and the "finite zero we decline to fill" story has a second cause.
     // MEASUREMENT ONLY: nothing here changes what is recorded or drawn.
     uint32_t ring_draws = 0, t3_set_const = 0, t3_set_shader = 0, t3_load_alu = 0;
+    // Cumulative, so a zero in APPLIED is readable against what we saw and why
+    // each skip happened rather than being one undifferentiated number.
+    static uint64_t s_alu_applied = 0, s_alu_dwords = 0, s_alu_nonalu = 0,
+                    s_alu_unreadable = 0, s_alu_range = 0, s_alu_short = 0;
     for (const auto* list : {&frame_packets, &swap_packets}) {
       for (const auto& p : *list) {
         if (p.type == mx::pm4::PacketType::Type3) {
@@ -372,7 +377,62 @@ extern "C" REX_FUNC(sub_82566B58) {
               break;
             case mx::pm4::Pm4Opcode::SET_CONSTANT:       ++t3_set_const; break;
             case mx::pm4::Pm4Opcode::SET_SHADER_CONSTANTS: ++t3_set_shader; break;
-            case mx::pm4::Pm4Opcode::LOAD_ALU_CONSTANT:  ++t3_load_alu; break;
+            case mx::pm4::Pm4Opcode::LOAD_ALU_CONSTANT: {
+              // THE SECOND PUBLISHER. The ALU constant file was fed from Type0
+              // writes only, and this Type3 opcode runs ~234 times a frame
+              // carrying constants we recorded none of.
+              //
+              // Body layout and the index arithmetic are Xenia's, from
+              // ExecutePacketType3_LOAD_ALU_CONSTANT and WriteALURangeFromMem
+              // (pm4_command_processor_implement.h:1525, command_processor.cc:
+              // 966). Reproduced rather than guessed:
+              //
+              //   body[0] address     & 0x3FFFFFFF
+              //   body[1] offset_type -> index = & 0x7FF, type = >> 16 & 0xFF
+              //   body[2] size_dwords & 0xFFF          (a REGISTER count)
+              //   ALU registers live at 0x4000 + index, which is our
+              //   kAluRegBase -- the two agree exactly.
+              //
+              // The packet carries an ADDRESS, not values: the constants sit in
+              // guest memory, so this reads them the same way
+              // OverlayShaderConstants already reads a shader's own table.
+              // p.body is host-order (the parser byte-swaps on the way in);
+              // guest memory is not, hence REX_LOAD_U32.
+              //
+              // ONLY type 0 (ALU) is applied. 1=FETCH, 2=BOOL, 3=LOOP,
+              // 4=REGISTERS are counted and skipped -- FETCH in particular is
+              // the texture-binding path and does not belong in this file.
+              ++t3_load_alu;
+              if (p.body.size() < 3) { ++s_alu_short; break; }
+              const uint32_t addr = p.body[0] & 0x3FFFFFFFu;
+              const uint32_t offset_type = p.body[1];
+              const uint32_t index = offset_type & 0x7FFu;
+              const uint32_t type = (offset_type >> 16) & 0xFFu;
+              uint32_t n = p.body[2] & 0xFFFu;
+              if (type != 0) { ++s_alu_nonalu; break; }
+              if (!n || index >= mx::gpu::alu::kAluConstants * 4) { ++s_alu_range; break; }
+              if (index + n > mx::gpu::alu::kAluConstants * 4)
+                n = mx::gpu::alu::kAluConstants * 4 - index;
+              // The masked physical address is rarely the readable one, so
+              // walk the mirrors. First cut of this skipped 55,357 packets and
+              // applied ZERO purely because it trusted `addr` as-is -- the
+              // separate unreadable bucket is what said so, rather than the
+              // whole thing just reading 0.
+              const uint32_t src = ResolveGuestRange(base, addr, n * 4);
+              if (!src) {
+                ++s_alu_unreadable;
+                break;
+              }
+              static thread_local std::vector<uint32_t> vals;
+              vals.resize(n);
+              for (uint32_t k = 0; k < n; ++k)
+                vals[k] = REX_LOAD_U32(src + k * 4);
+              mx::gpu::alu::NoteType0Write(mx::gpu::alu::kAluRegBase + index,
+                                           vals.data(), n);
+              ++s_alu_applied;
+              s_alu_dwords += n;
+              break;
+            }
             default: break;
           }
           continue;
@@ -396,6 +456,11 @@ extern "C" REX_FUNC(sub_82566B58) {
                   "fed from Type0 only, is missing a publish path)",
                   tag, swap_count, ring_draws, hle_draws, t3_set_const,
                   t3_set_shader, t3_load_alu);
+      REXLOG_INFO("{}: ALU LOAD applied {} packets / {} dwords into the "
+                  "constant file | skipped: {} non-ALU type, {} unreadable "
+                  "address, {} out of range, {} short body",
+                  tag, s_alu_applied, s_alu_dwords, s_alu_nonalu,
+                  s_alu_unreadable, s_alu_range, s_alu_short);
     }
 
     // Only write dump files for spot-check swaps — keeps the disk clean when
