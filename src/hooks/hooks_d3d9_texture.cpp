@@ -227,6 +227,11 @@ std::atomic<uint64_t> g_glyphRasterRefused{0};
 // sub_828AC620's own per-line verdict. DROPPED is the guest saying it emitted
 // fewer glyphs than the line asked for -- the last measurable point before the
 // vertex buffer. UNREAD keeps a zero in DROPPED honest.
+// Font loads, and how many came back with the silent truncation latch set.
+std::atomic<uint64_t> g_fontLoads{0};
+std::atomic<uint64_t> g_fontLoadsTruncated{0};
+std::atomic<uint64_t> g_fontLoadsUnread{0};
+
 std::atomic<uint64_t> g_lineBuildCalls{0};
 std::atomic<uint64_t> g_lineBuildDropped{0};
 std::atomic<uint64_t> g_lineBuildCacheFull{0};

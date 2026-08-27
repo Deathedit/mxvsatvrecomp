@@ -6285,6 +6285,13 @@ void ReportGlyphCache() {
               d::g_lineBuildDropped.load(std::memory_order_relaxed),
               d::g_lineBuildCacheFull.load(std::memory_order_relaxed),
               d::g_lineBuildUnread.load(std::memory_order_relaxed));
+
+  REXLOG_INFO("d3d9: FONT LOADS {} total | {} SHORT/BROKEN (blob truncated or "
+              "nominal size 0 -- the glyph table ends early and every character "
+              "past the cut is unreachable by index) | {} unreadable",
+              d::g_fontLoads.load(std::memory_order_relaxed),
+              d::g_fontLoadsTruncated.load(std::memory_order_relaxed),
+              d::g_fontLoadsUnread.load(std::memory_order_relaxed));
 }
 
 uint64_t HleDrawsAccepted() { return mx::hooks::d3d9::g_hleDrawsAccepted; }

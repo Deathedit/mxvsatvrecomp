@@ -535,6 +535,172 @@ extern "C" REX_FUNC(sub_828AC620) {
   }
 }
 
+//=============================================================================
+// FONT LOADERS - 0x82947418 and 0x82949E10.
+//
+// If a glyph index comes back -1 the font simply does not have that character,
+// and the place a character goes missing from a font is the load. Both loaders
+// have a SILENT truncation path (see docs/glyph_functions.md): a zero offset
+// part-way through the glyph offset table cuts the glyph list short, the loader
+// sets font+20 |= 0x1000 and carries on, and nothing is logged. Everything past
+// the cut is then unreachable by index -- which would leave a specific SUBSET
+// of characters missing, sharing nothing but their position in the table. That
+// fits the observed U, S, C far better than any shape-based pattern.
+//
+// The two loaders BOTH claim tags 48 and 75 and build different things
+// (0x82947418 a native font, 0x82949E10 GFxShape objects), so which one ran
+// matters and the tag is logged with each line.
+//
+// Fields after the call:
+//     font+20   flags; bit 0x1000 is the truncation latch, 0x2000 HasLayout,
+//               0x4000 wide codes
+//     font+36   glyph shapes actually stored (0x82949E10)
+//     font+104  declared glyph count (0x82947418)
+//     font+24   name, char* (0x82949E10 sets it; may be junk in the other)
+//
+// Fonts are few, so every load is logged rather than sampled -- the useful
+// output is the whole table at once, and a short count next to a healthy one is
+// the comparison that names the bad font.
+//=============================================================================
+namespace {
+
+void NoteFontLoad(uint8_t* base, const char* which, uint32_t font,
+                  uint32_t tag) {
+  g_fontLoads.fetch_add(1, std::memory_order_relaxed);
+  if (!font || !HostPageReadable(REX_RAW_ADDR(font + 104))) {
+    g_fontLoadsUnread.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  const uint32_t flags = REX_LOAD_U32(font + 20);
+  const uint32_t shapes = REX_LOAD_U32(font + 36);
+  const uint32_t declared = REX_LOAD_U32(font + 104);
+  const bool truncated = (flags & 0x1000u) != 0;
+  if (truncated) g_fontLoadsTruncated.fetch_add(1, std::memory_order_relaxed);
+
+  char name[96];
+  name[0] = 0;
+  const uint32_t name_ptr = REX_LOAD_U32(font + 24);
+  if (name_ptr && HostPageReadable(REX_RAW_ADDR(name_ptr)))
+    GfxGuestStr(base, name_ptr, name, sizeof name);
+
+  REXLOG_INFO("d3d9: FONT LOAD [{}] tag {} name '{}' -- declared {} glyphs, {} "
+              "shapes stored, flags 0x{:04X}{}",
+              which, tag, name[0] ? name : "(none)", declared, shapes, flags,
+              truncated ? "  <<< TRUNCATED: the glyph table was cut short and "
+                          "everything past the cut is unreachable by index"
+                        : "");
+}
+
+}  // namespace
+
+REX_IMPORT(__imp__sub_82947418, orig_LoadFontNative, void());
+extern "C" REX_FUNC(sub_82947418) {
+  const uint32_t font = ctx.r3.u32;
+  const uint32_t tag_ptr = ctx.r5.u32;
+  uint32_t tag = 0;
+  if (tag_ptr && HostPageReadable(REX_RAW_ADDR(tag_ptr)))
+    tag = REX_LOAD_U32(tag_ptr);
+
+  orig_LoadFontNative(ctx, base);
+
+  NoteFontLoad(base, "native", font, tag);
+}
+
+REX_IMPORT(__imp__sub_82949E10, orig_LoadFontShape, void());
+extern "C" REX_FUNC(sub_82949E10) {
+  const uint32_t font = ctx.r3.u32;
+  const uint32_t tag_ptr = ctx.r5.u32;
+  uint32_t tag = 0;
+  if (tag_ptr && HostPageReadable(REX_RAW_ADDR(tag_ptr)))
+    tag = REX_LOAD_U32(tag_ptr);
+
+  orig_LoadFontShape(ctx, base);
+
+  NoteFontLoad(base, "shape", font, tag);
+}
+
+//=============================================================================
+// 0x82945D20 - DefineCompactedFont. THE LOADER THIS GAME ACTUALLY USES.
+//
+// The two hooks above measured 0 loads across a whole process lifetime, and
+// that counter is cumulative, so log rotation cannot explain it: this title
+// does not load fonts through DefineFont/DefineFont2/DefineFont3 at all. It
+// ships .gfx (compacted) data, and fonts arrive as DefineCompactedFont --
+// a THIRD loader, with a completely different field layout. Hooking the first
+// two was my mistake; they are kept because their zero is now a documented
+// fact rather than an absence of evidence.
+//
+// This one has exactly the failure shape the truncation theory needs, and it
+// computes the answer itself rather than relying on the guest's logging (which
+// is unreachable -- 0 sink calls, no GFxLog installed):
+//
+//     expected = *(DWORD *)(tag + 8) - 2      the payload it intends to read
+//     font+32                                  bytes it actually copied in
+//     font+84                                  nominal size; 0 means the parse
+//                                              produced nothing
+//
+// The copy loop reads in 4096-byte chunks and BREAKS on a short read, then
+// falls through to parse whatever it got. So written < expected is a literally
+// truncated font blob -- and sub_82944D90 bails outright if the blob is under
+// 15 bytes, leaving nominal size 0, which the loader reports as a broken gfx
+// file. Either way the glyph table ends early and every character past the cut
+// is unreachable by index, which is the shape of the missing U, S and C.
+//
+// font+52 is the glyph count as read by sub_82944D90 (which is called with
+// font+40, so its a1+12 is font+52). Logged for information, but treat it as
+// UNVERIFIED -- the parser also reads its source blob from font+48 while the
+// loader fills font+28, and I have not reconciled that. The two numbers this
+// hook rests on are `written vs expected` and the nominal size, both of which
+// come straight from the loader's own code.
+//=============================================================================
+REX_IMPORT(__imp__sub_82945D20, orig_LoadFontCompacted, void());
+extern "C" REX_FUNC(sub_82945D20) {
+  const uint32_t font = ctx.r3.u32;
+  const uint32_t tag = ctx.r5.u32;
+  uint32_t expected = 0;
+  bool have_expected = false;
+  if (tag && HostPageReadable(REX_RAW_ADDR(tag + 8))) {
+    const uint32_t len = REX_LOAD_U32(tag + 8);
+    if (len >= 2) {
+      expected = len - 2;
+      have_expected = true;
+    }
+  }
+
+  orig_LoadFontCompacted(ctx, base);
+
+  g_fontLoads.fetch_add(1, std::memory_order_relaxed);
+  if (!font || !HostPageReadable(REX_RAW_ADDR(font + 84))) {
+    g_fontLoadsUnread.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  const uint32_t written = REX_LOAD_U32(font + 32);
+  const uint32_t nominal = REX_LOAD_U32(font + 84);
+  const uint32_t glyphs = REX_LOAD_U32(font + 52);
+
+  const bool short_read = have_expected && written < expected;
+  const bool bad_nominal = nominal == 0;
+  if (short_read || bad_nominal)
+    g_fontLoadsTruncated.fetch_add(1, std::memory_order_relaxed);
+
+  char name[96];
+  name[0] = 0;
+  const uint32_t name_ptr = REX_LOAD_U32(font + 24);
+  if (name_ptr && HostPageReadable(REX_RAW_ADDR(name_ptr)))
+    GfxGuestStr(base, name_ptr, name, sizeof name);
+
+  REXLOG_INFO("d3d9: FONT LOAD [compacted] name '{}' -- {} of {} payload bytes "
+              "read, nominal size {}, glyph count {} (unverified){}{}",
+              name[0] ? name : "(none)", written,
+              have_expected ? expected : 0, nominal, glyphs,
+              short_read ? "  <<< SHORT READ: the compacted blob is truncated "
+                           "and the glyph table ends early"
+                         : "",
+              bad_nominal ? "  <<< NOMINAL SIZE 0: the parse produced nothing, "
+                            "which the guest calls a broken gfx file"
+                          : "");
+}
+
 REX_IMPORT(__imp__sub_82550B80, orig_CreateVertexDeclaration, void());
 extern "C" REX_FUNC(sub_82550B80) {
   MX_D3D9_PLUGIN_PASSTHROUGH(orig_CreateVertexDeclaration);
