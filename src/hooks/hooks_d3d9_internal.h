@@ -339,6 +339,12 @@ extern std::atomic<uint64_t> g_glyphRasterCalls;
 extern std::atomic<uint64_t> g_glyphRasterRefused;
 // Returned success with a null texture -- the loss the return value hides.
 // GFx log sinks: the guest naming its own missing glyph. See the hooks.
+// sub_828AC620: whether the guest thinks it dropped a glyph from a line.
+extern std::atomic<uint64_t> g_lineBuildCalls;
+extern std::atomic<uint64_t> g_lineBuildDropped;
+extern std::atomic<uint64_t> g_lineBuildCacheFull;
+extern std::atomic<uint64_t> g_lineBuildUnread;
+
 extern std::atomic<uint64_t> g_gfxLogCalls;
 extern std::atomic<uint64_t> g_gfxMissingGlyph;
 extern std::atomic<uint64_t> g_gfxCacheFull;

@@ -6274,6 +6274,17 @@ void ReportGlyphCache() {
               d::g_gfxLogCalls.load(std::memory_order_relaxed),
               d::g_gfxMissingGlyph.load(std::memory_order_relaxed),
               d::g_gfxCacheFull.load(std::memory_order_relaxed));
+
+  // The fork. DROPPED > 0 keeps the hunt inside sub_828AC620's pass-dependent
+  // flags; DROPPED == 0 against a healthy call count means the letter was never
+  // in the line records and the search moves up into composition.
+  REXLOG_INFO("d3d9: GLYPH LINE {} built | {} DROPPED a glyph | {} saw the "
+              "cache full | {} unreadable (DROPPED 0 with a non-zero build "
+              "count means the short line was INTENDED -- look upstream)",
+              d::g_lineBuildCalls.load(std::memory_order_relaxed),
+              d::g_lineBuildDropped.load(std::memory_order_relaxed),
+              d::g_lineBuildCacheFull.load(std::memory_order_relaxed),
+              d::g_lineBuildUnread.load(std::memory_order_relaxed));
 }
 
 uint64_t HleDrawsAccepted() { return mx::hooks::d3d9::g_hleDrawsAccepted; }

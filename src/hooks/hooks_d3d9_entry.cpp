@@ -465,6 +465,76 @@ extern "C" REX_FUNC(sub_828A89C8) {
   orig_GfxLogWarn(ctx, base);
 }
 
+//=============================================================================
+// 0x828AC620 - Scaleform GFx: build one line of glyphs. THE LAST LINK.
+//
+// This is the function that writes a quad or does not, so whatever loses the
+// letter is inside it. Everything downstream of here is now excluded on
+// evidence: GetTexture never failed (0 of 457), the sub_8293E5B8 height cap is
+// unreachable (clamp 48 vs cap 48), the eviction pin was released on 123 of 123
+// flushes, and sub_828A8C40 delivered a real texture on all 2455 asks.
+//
+// It keeps its own verdict, and both bytes are ZEROED at function entry, so
+// they describe this call alone rather than accumulating:
+//
+//     out+36  at least one glyph was dropped from this line
+//     out+37  the glyph cache reported itself full
+//     out+20  how many glyphs actually got a cell
+//
+// Reading them after the original is the guest telling us whether it thinks it
+// lost anything, without having to guess which of its internal skips ran.
+//
+// What each outcome means, decided BEFORE the run so the result cannot be read
+// to taste:
+//
+//   DROPPED > 0  the line really is short a glyph, and since the null-texture
+//                path measured zero and the bright pass renders the U from the
+//                same records (so the index is not 0xFFFF), what remains is the
+//                pass-dependent flag pair -- bit 0x8000 tested on pass != 0 and
+//                bit 0x20 on pass 0, each written by a DIFFERENT pass than the
+//                one that tests it.
+//
+//   DROPPED == 0 this function does not believe it dropped anything, the
+//                42-index draw is what it meant to emit, and the letter was
+//                never in the line records at all. That moves the search up
+//                into composition -- GFx_TextLine_ComposeGlyphs and the reuse
+//                branch in GFx_TextDoc_FormatLines that can skip it entirely.
+//
+// UNREAD is carried so a zero in DROPPED cannot be confused with a failed read.
+// out (r4) is captured before the original because the callee clobbers the
+// volatiles.
+//=============================================================================
+REX_IMPORT(__imp__sub_828AC620, orig_GlyphBuildLine, void());
+extern "C" REX_FUNC(sub_828AC620) {
+  const uint32_t out = ctx.r4.u32;
+
+  orig_GlyphBuildLine(ctx, base);
+
+  g_lineBuildCalls.fetch_add(1, std::memory_order_relaxed);
+
+  // Both ends probed: +20 and +37 are 17 bytes apart and can straddle a page.
+  if (!out || !HostPageReadable(REX_RAW_ADDR(out + 20)) ||
+      !HostPageReadable(REX_RAW_ADDR(out + 37))) {
+    g_lineBuildUnread.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+
+  const uint32_t placed = REX_LOAD_U32(out + 20);
+  const uint8_t dropped = REX_LOAD_U8(out + 36);
+  const uint8_t full = REX_LOAD_U8(out + 37);
+
+  if (full) g_lineBuildCacheFull.fetch_add(1, std::memory_order_relaxed);
+  if (!dropped) return;
+
+  const uint64_t n =
+      g_lineBuildDropped.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n <= 24 || (n % 500) == 0) {
+    REXLOG_INFO("d3d9: GLYPH LINE DROPPED (#{}) -- the guest marked this line "
+                "short a glyph; {} glyphs got a cell, cache-full flag {}",
+                n, placed, full ? 1 : 0);
+  }
+}
+
 REX_IMPORT(__imp__sub_82550B80, orig_CreateVertexDeclaration, void());
 extern "C" REX_FUNC(sub_82550B80) {
   MX_D3D9_PLUGIN_PASSTHROUGH(orig_CreateVertexDeclaration);

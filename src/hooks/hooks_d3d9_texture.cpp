@@ -224,6 +224,14 @@ std::atomic<uint64_t> g_glyphRasterRefused{0};
 // The guest's own glyph diagnostics, which nothing surfaced until now.
 // g_gfxLogCalls is the denominator: zero there means the sinks are never
 // reached at all, which is a different finding from "nothing was missing".
+// sub_828AC620's own per-line verdict. DROPPED is the guest saying it emitted
+// fewer glyphs than the line asked for -- the last measurable point before the
+// vertex buffer. UNREAD keeps a zero in DROPPED honest.
+std::atomic<uint64_t> g_lineBuildCalls{0};
+std::atomic<uint64_t> g_lineBuildDropped{0};
+std::atomic<uint64_t> g_lineBuildCacheFull{0};
+std::atomic<uint64_t> g_lineBuildUnread{0};
+
 std::atomic<uint64_t> g_gfxLogCalls{0};
 std::atomic<uint64_t> g_gfxMissingGlyph{0};
 std::atomic<uint64_t> g_gfxCacheFull{0};
