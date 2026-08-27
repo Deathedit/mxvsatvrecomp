@@ -400,4 +400,11 @@ void DumpHleDraw(bool indexed, uint64_t n, uint32_t prim, int32_t base_vertex,
                  uint32_t start, uint32_t count);
 void ReportDrawCounts(uint8_t* base);
 
+// FULL-HASH PROBE, one line per large atlas. Distinct WHOLE-buffer hashes
+// beside distinct sampled GuestTextureFingerprint values for the same key.
+// `full 1` says the guest never rewrote the buffer -- the art is absent at the
+// source and no cache change can help. `full > sampled` says the sampler is
+// blind to writes that are happening, and the gap is how blind.
+std::string ReportFullHashWatch();
+
 }  // namespace mx::hooks::d3d9

@@ -438,6 +438,105 @@ bool TextureContentStale(const mx::hle::HleTextureSource& source,
   return now != payload.content_version;
 }
 
+// FULL-HASH PROBE for large atlases. MEASUREMENT ONLY.
+//
+// The question, and it has exactly two answers:
+//
+//   the guest's bytes never change  -> the art was never written into the
+//                                      atlas. Not a cache bug; the missing
+//                                      panel is a load/stream problem and this
+//                                      whole file is the wrong place to look.
+//   the bytes change and we missed it -> GuestTextureFingerprint is blind here,
+//                                      and the fix is a denser hash for this
+//                                      class of texture.
+//
+// Nothing else in the tree separates those, and they want opposite work.
+//
+// WHY THE SAMPLED FINGERPRINT IS SUSPECT HERE, specifically. It takes 32 slices
+// of 64 bytes -- 2 KB of a 1 MB atlas, one sample per 32 KB. A wholesale
+// restream changes all 32 and is caught. A LOCALISED write that fills in one
+// element, say a 64x64 patch at 4 KB, lands between sample points roughly seven
+// times in eight. This file already carries that failure twice: the glyph atlas
+// needed an explicit generation to escape it, and the terrain index map needed
+// the flat-decode retry. A UI atlas that is neither flat nor glyph gets neither
+// escape.
+//
+// Both hashes are recorded per key so the comparison is direct: if the FULL
+// hash has more distinct values than the SAMPLED one, the sampler is provably
+// missing writes and the count says how many.
+//
+// Cost is bounded by the throttle, not by the size: one 1 MB hash per key per
+// kFullHashFrames, against the ~2200 slot calls a frame that made a denser
+// GuestTextureFingerprint cost 25% of frame time when it was tried.
+struct FullHashWatch {
+  uint32_t last_frame = 0;
+  std::set<uint32_t> full;     // distinct WHOLE-buffer hashes seen
+  std::set<uint32_t> sampled;  // distinct GuestTextureFingerprint values seen
+  uint32_t width = 0, height = 0, format = 0, address = 0, bytes = 0;
+  uint64_t unreadable = 0;     // hashes refused because the memory would fault
+};
+std::map<uint64_t, FullHashWatch> g_fullHashWatch;
+// Only textures big enough for the sampler's coverage to actually be thin. At
+// 256 KB the 2 KB sample is under 1%, which is where the blind spot opens.
+constexpr uint32_t kFullHashMinBytes = 256 * 1024;
+constexpr uint32_t kFullHashFrames = 30;
+
+void NoteFullHash(const mx::hle::HleTextureSource& source, uint8_t* base,
+                  uint64_t key, uint32_t sampled) {
+  if (source.source_bytes < kFullHashMinBytes || !source.address) return;
+  auto& w = g_fullHashWatch[key];
+  const uint32_t now = mx::hle::D3D9FrameCount();
+  // Record the SAMPLED value on every bind -- it is free, we were handed it,
+  // and its distinct count is the control the full hash is compared against.
+  if (sampled) w.sampled.insert(sampled);
+  if (!w.full.empty() && now - w.last_frame < kFullHashFrames) return;
+  w.last_frame = now;
+  w.width = source.width;
+  w.height = source.height;
+  w.format = source.guest_format;
+  w.address = source.address;
+  w.bytes = source.source_bytes;
+
+  uint32_t addr = 0;
+  for (uint32_t m : {0u, 0xA0000000u, 0xC0000000u, 0xE0000000u}) {
+    const uint32_t candidate = source.address | m;
+    if (HostPageReadable(REX_RAW_ADDR(candidate))) { addr = candidate; break; }
+  }
+  if (!addr) { ++w.unreadable; return; }
+  // Page-checked as it walks. A probe is never worth a fault, and a partially
+  // mapped atlas is itself a finding rather than a reason to hash garbage.
+  uint64_t h = 1469598103934665603ull;
+  for (uint32_t off = 0; off < source.source_bytes; off += 4096) {
+    const uint32_t n = std::min(4096u, source.source_bytes - off);
+    if (!HostPageReadable(REX_RAW_ADDR(addr + off)) ||
+        !HostPageReadable(REX_RAW_ADDR(addr + off + n - 1))) {
+      ++w.unreadable;
+      return;
+    }
+    const auto* q =
+        reinterpret_cast<const uint8_t*>(REX_RAW_ADDR(addr + off));
+    for (uint32_t i = 0; i < n; ++i) { h ^= q[i]; h *= 1099511628211ull; }
+  }
+  const uint32_t folded = uint32_t(h ^ (h >> 32));
+  w.full.insert(folded ? folded : 1u);
+}
+
+std::string ReportFullHashWatch() {  // declared in hooks_d3d9_internal.h
+  std::string out;
+  for (const auto& [key, w] : g_fullHashWatch) {
+    // BOTH counts, always. `full 1` says the guest never rewrote the buffer, so
+    // nothing was missed and the art is absent at the source. `full > sampled`
+    // is the sampler being blind, and the gap is how blind.
+    out += fmt::format(
+        "\n  0x{:08X} {}x{} fmt{} bytes={} -- distinct FULL {} vs "
+        "SAMPLED {}{}",
+        w.address, w.width, w.height, w.format, w.bytes, w.full.size(),
+        w.sampled.size(),
+        w.unreadable ? fmt::format(" ({} unreadable)", w.unreadable) : "");
+  }
+  return out;
+}
+
 void NoteBlankDecode(uint64_t key) {
   BlankState& s = g_hleEmptyTextures[key];
   s.last_frame = mx::hle::D3D9FrameCount();
@@ -2534,6 +2633,11 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
       PhaseTimer t(g_tex.staleUs);
       stale = TextureContentStale(source, base, *cached->second);
     }
+    // On the CACHE-HIT path deliberately: this asks whether the bytes behind a
+    // texture we are about to serve from cache have moved under us, which is
+    // only a question for textures we did not just decode.
+    NoteFullHash(source, base, key,
+                 TextureContentVersion(source, base, cached->second->format));
     // A previously FLAT decode is re-read on a backoff, because the fingerprint
     // above cannot see the sparse write that fills it. Cheap: the map holds
     // only keys that decoded flat, and this is one decode per key per
