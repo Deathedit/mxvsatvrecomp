@@ -1524,6 +1524,26 @@ uint64_t g_pendingQueued = 0, g_pendingApplied = 0, g_pendingDropped = 0;
 // is legitimately zero. It looked like the queue point because it sits at a
 // push_back; it is the wrong population.
 uint64_t g_hleDrawsAccepted = 0, g_hleDrawsRefused = 0;
+// WHERE THE REST GO. FRAME DRAWS reports `guest`, `accepted` and `refused`, and
+// its own comment names the case those three cannot explain:
+//
+//     guest >  accepted + refused    draws vanish before BuildAndQueueDraw
+//
+// A level run sits there permanently -- cumulative guest 234,174 against
+// accepted 219,328 with refused 0, a gap of 14,846 (6.9%) that no counter
+// attributes. BuildAndQueueDraw has three exits and only one of them was
+// counted at all:
+//
+//   BuildHleDraw skip     counted, but only PRINTED under --hle_capture, so it
+//                         is invisible on every normal run
+//   no viewport           counted NOWHERE except for Bink draws
+//   shader not applied    counted NOWHERE unless the result was kNoCode
+//
+// These two close it. Reported unconditionally beside FRAME DRAWS, because a
+// gap that needs a debug cvar to explain is a gap nobody explains.
+uint64_t g_drawNoViewport = 0;
+uint64_t g_drawShaderFailed = 0;   // ApplyShaderOutputs returned kFailed
+uint64_t g_drawShaderNoCodeFull = 0;  // kNoCode, and the pending queue was full
 constexpr size_t kMaxPendingHleDraws = 2048;
 
 // Vertex shader object layout, read out of sub_82565928's VS branch at
@@ -2186,6 +2206,7 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   // identity. Unknown is not a usable viewport.
   if (!have_vp) {
     bink_lost("no viewport");
+    ++g_drawNoViewport;
     return;
   }
   if (have_vp) in.mvp = vp;
@@ -2943,7 +2964,15 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   }
   if (applied != ShaderApplyResult::kNoCode ||
       g_pendingHleDraws.size() >= kMaxPendingHleDraws) {
-    if (applied == ShaderApplyResult::kNoCode) ++g_pendingDropped;
+    if (applied == ShaderApplyResult::kNoCode) {
+      ++g_pendingDropped;
+      ++g_drawShaderNoCodeFull;
+    } else {
+      // kFailed. Previously returned with nothing incremented at all, which is
+      // how a draw disappears between `guest` and `accepted` leaving `refused`
+      // at zero -- the exact shape of the 6.9% gap.
+      ++g_drawShaderFailed;
+    }
     return;
   }
 
@@ -6526,6 +6555,21 @@ void ReportDrawCounts(uint8_t* base) {
 // include the internal header.
 void NotePlumbedStencil(const mx::hle::DrawCall& dc) {
   mx::hooks::d3d9::NotePlumbedStencilImpl(dc);
+}
+
+// Declared in hooks_d3d9.h. The three exits that make `guest` exceed
+// `accepted + refused`, so the FRAME DRAWS gap is attributable without a debug
+// cvar. `skips` is the BuildHleDraw population, which was already counted but
+// only ever printed under --hle_capture.
+void UnbuiltDrawReasons(uint64_t& no_viewport, uint64_t& shader_failed,
+                        uint64_t& nocode_queue_full, uint64_t& skips) {
+  no_viewport = mx::hooks::d3d9::g_drawNoViewport;
+  shader_failed = mx::hooks::d3d9::g_drawShaderFailed;
+  nocode_queue_full = mx::hooks::d3d9::g_drawShaderNoCodeFull;
+  skips = 0;
+  const uint64_t* counts = mx::hle::HleSkipCounts();
+  for (uint32_t i = 1; i < uint32_t(mx::hle::HleSkip::kCount); ++i)
+    skips += counts[i];
 }
 
 uint64_t GuestDrawCalls() {

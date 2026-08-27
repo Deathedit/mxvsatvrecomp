@@ -183,6 +183,18 @@ extern "C" REX_FUNC(sub_82566B58) {
                     ? d_guest - d_accepted - d_refused
                     : 0,
                 guest, accepted, refused);
+    // The gap, attributed. Printed on the same cadence so the two are read
+    // together: `unbuilt` above is a subtraction between populations, and these
+    // are the actual exits that produce it. They should sum to it.
+    uint64_t no_vp = 0, sh_failed = 0, nocode_full = 0, skips = 0;
+    UnbuiltDrawReasons(no_vp, sh_failed, nocode_full, skips);
+    const uint64_t attributed = no_vp + sh_failed + nocode_full + skips;
+    REXLOG_INFO("{}: UNBUILT WHY cumulative — {} no viewport, {} shader "
+                "failed, {} no-code with the queue full, {} BuildHleDraw skips "
+                "= {} attributed against a gap of {}",
+                mx::native::g_plugin_mode ? "plugin" : "native", no_vp,
+                sh_failed, nocode_full, skips, attributed,
+                guest > accepted + refused ? guest - accepted - refused : 0);
   }
 
   // Glyph cache, on a fixed swap cadence. Deliberately NOT printed from inside

@@ -27,6 +27,12 @@ void ReportHostPageQueryStats();
 // because hooks_frame.cpp cannot include the internal header.
 uint64_t GuestDrawCalls();
 
+// The exits that make FRAME DRAWS' `guest` exceed `accepted + refused`. Without
+// these the gap is 6.9% of a level run with nothing attributing it, and the one
+// population that WAS counted printed only under --hle_capture.
+void UnbuiltDrawReasons(uint64_t& no_viewport, uint64_t& shader_failed,
+                        uint64_t& nocode_queue_full, uint64_t& skips);
+
 // HLE draws this layer ACCEPTED into the frame draw list and REFUSED, both
 // cumulative.
 //
