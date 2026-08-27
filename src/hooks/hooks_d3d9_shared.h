@@ -229,8 +229,13 @@ constexpr uint32_t kVsInfoCodeSize = 0x36C;    // program length in bytes
 // ---- functions -------------------------------------------------------------
 
 BinkPlaneRefusals BinkPlaneRefusalStats();
+// `out_mirror` receives WHICH of the four address mirrors the base level was
+// actually read through -- see CopyGuestExtent. The bare physical address is
+// reserved-but-uncommitted on the host, so any caller that wants to touch the
+// same bytes itself (the write watch does) needs this, not source.address.
 bool CopyTexturePhysical(const mx::hle::HleTextureSource& source, uint8_t* base,
-                         std::vector<uint8_t>& out);
+                         std::vector<uint8_t>& out,
+                         uint32_t* out_mirror = nullptr);
 bool IsBinkCompositeDraw(uint32_t pixel_shader, uint8_t* base);
 void NoteDrawThread();
 std::string PixelShaderDeviceSummary();

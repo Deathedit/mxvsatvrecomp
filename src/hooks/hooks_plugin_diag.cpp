@@ -7,6 +7,7 @@
 // means its call site is jumped, not that the mode is wrong.
 
 #include "hooks/hook_common.h"
+#include "hooks/guest_write_watch.h"
 #include "hooks/hooks_ui_probe.h"
 #include "hooks/hooks_d3d9.h"  // GuestDrawCalls
 
@@ -2158,6 +2159,50 @@ extern "C" REX_FUNC(sub_826295E8) {
                   "dest 0x{:08X}; by usage:{}",
                   s_calls, s_no_dest, width, height, depth, levels, usage,
                   format, restype, dest, usages);
+    }
+  }
+
+  // ARM THE WRITE WATCH AT CREATION. The flat probe arms at first DECODE,
+  // which is already too late to see a fill during level load -- run 1476 duly
+  // reported three armed ranges and not one hit across 1458 frames. That is a
+  // real negative for "written while playing" and says nothing at all about
+  // "written at load". This is the earliest point the address exists.
+  //
+  // Shape filter, not format: the `format` argument is the ENGINE's own enum
+  // and its encoding is not established, so gating on it would be a guess. The
+  // terrain tile-index map is 1024x1024 with a deep mip chain, and that shape
+  // is rare enough to sit inside the watch's slots. The format is printed so
+  // its encoding stops being a guess.
+  if (width == 1024 && height == 1024 && levels >= 8 && dest) {
+    // base_address lives in fetch DWORD_1, not dword_0, and holds the address
+    // ALREADY SHIFTED RIGHT BY 12 -- xenia-edge/src/xenia/gpu/xenos.h:1285,
+    // "uint32_t base_address : 20;  // +12 base address >> 12". Reading it out
+    // of dword_0 gave 0x88000000 for every 1024x1024 texture in run 1477,
+    // which is the type/pitch word masked, not an address: four different
+    // textures cannot share one base. d3d9_texture.cpp:736 does
+    // `out.address = fetch.base_address << 12` and is the source of truth.
+    const uint32_t fetch0 = REX_LOAD_U32(dest + 0x1C);
+    const uint32_t fetch1 = REX_LOAD_U32(dest + 0x20);
+    const uint32_t phys = (fetch1 >> 12) << 12;
+    static std::mutex s_amu;
+    static uint32_t s_armed = 0;
+    std::lock_guard<std::mutex> lk(s_amu);
+    if (s_armed < 8) {
+      ++s_armed;
+      REXLOG_INFO(
+          "native: ENGINE TEX 1024x1024 levels {} usage {} format {} restype {}"
+          " dest 0x{:08X} fetch 0x{:08X} 0x{:08X} -> base 0x{:08X}",
+          levels, usage, format, restype, dest, fetch0, fetch1, phys);
+      // A zero base is not a failure to read -- it means the engine has not
+      // assigned storage yet at header-fill time, which is itself the answer to
+      // "when does this buffer get its memory". Say so rather than skipping.
+      if (phys)
+        mx::hooks::ArmGuestWriteWatch(phys, 1024u * 1024u * 2u,
+                                      "1024 creation");
+      else
+        REXLOG_INFO(
+            "native: ENGINE TEX   base is 0 at header-fill time -- storage is "
+            "assigned later, so creation is the wrong arming point");
     }
   }
 

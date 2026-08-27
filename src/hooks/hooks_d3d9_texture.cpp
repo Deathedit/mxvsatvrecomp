@@ -37,6 +37,7 @@
 #include <rex/graphics/format/ucode.h>
 
 #include "gpu/guard_census.h"
+#include "hooks/guest_write_watch.h"
 #include "gpu/d3d9_draw.h"
 #include "gpu/d3d9_layout.h"
 #include "gpu/d3d9_texture.h"
@@ -528,7 +529,7 @@ void ReportDecodeShapes() {
 void NoteDecodedTexture(const mx::hle::HleTextureSource& source,
                         const mx::hle::HleTexturePayload& payload,
                         const uint8_t* guest_bytes, size_t guest_size,
-                        uint32_t sampler, const char* site) {
+                        uint32_t sampler, const char* site, uint32_t mirror) {
   PhaseTimer t(g_tex.scanUs);
   std::lock_guard<std::mutex> flat_lock(g_flatMutex);
   const size_t flat_base_bytes =
@@ -567,6 +568,26 @@ void NoteDecodedTexture(const mx::hle::HleTextureSource& source,
       std::string head;
       for (size_t i = 0; i < guest_size && i < 16; ++i)
         head += fmt::format("{:02X} ", guest_bytes[i]);
+      // ARM A WRITE WATCH on the big ones. A flat texture is either the
+      // guest's own initialisation -- sub_82AF7240 memsets the terrain
+      // deformation buffers to 0x80 on purpose -- or a buffer whose filler
+      // never ran, and only the writer's identity separates those. Big ones
+      // only: a flat 2x2 is noise, and there are four watch slots.
+      //
+      // Armed at FIRST DECODE, which is the earliest point we know the address
+      // exists, and that is a real limit worth stating: a fill that happened
+      // before the texture was ever sampled is already missed. A range that
+      // never reports is therefore evidence about the rest of the run, not
+      // proof that nothing ever wrote it.
+      // On the MIRROR, never source.address. Run 1475 refused all three
+      // arms with "protect 0x0 is not writable (state 0x2000)" -- MEM_RESERVE,
+      // uncommitted -- because the bare physical address is not where these
+      // bytes live in the host. CopyGuestExtent picked the right mirror to
+      // read them; arm on the same one it read.
+      if (flat_base_bytes >= (1u << 20) && mirror) {
+        mx::hooks::ArmGuestWriteWatch(mirror, uint32_t(flat_base_bytes),
+                                      "flat decode");
+      }
       REXLOG_INFO(
           "d3d9: FLAT DECODE [{}] addr 0x{:08X} fmt {} ({}) {}x{} sampler {} "
           "pitch {} blk {}x{}x{}B endian {} swizzle 0x{:X} tiled {} "
@@ -1073,7 +1094,8 @@ bool PrepareBinkPlanes(mx::hle::DrawCall& dc, uint32_t device, uint8_t* base) {
       return false;
     }
     std::vector<uint8_t> guest;
-    if (!CopyTexturePhysical(source, base, guest)) {
+    uint32_t mirror = 0;
+    if (!CopyTexturePhysical(source, base, guest, &mirror)) {
       charge(&BinkPlaneRefusals::copy, s);
       return false;
     }
@@ -1083,7 +1105,8 @@ bool PrepareBinkPlanes(mx::hle::DrawCall& dc, uint32_t device, uint8_t* base) {
       charge(&BinkPlaneRefusals::decode, s);
       return false;
     }
-    NoteDecodedTexture(source, *payload, guest.data(), guest.size(), s, "bink");
+    NoteDecodedTexture(source, *payload, guest.data(), guest.size(), s, "bink",
+                       mirror);
     // An all-zero plane is normal for a video that has not decoded its first
     // frame yet, so unlike the immutable path this is not memoised as empty —
     // the same descriptor will carry real pixels a frame later.
@@ -1497,12 +1520,19 @@ uint64_t g_mipCopyFailed = 0;
 // regardless and the decoder truncates the chain to what it can read, so an
 // unmapped chain costs mip levels rather than the texture.
 bool CopyTexturePhysical(const mx::hle::HleTextureSource& source, uint8_t* base,
-                         std::vector<uint8_t>& out) {
+                         std::vector<uint8_t>& out, uint32_t* out_mirror) {
   const uint32_t mip_bytes =
       source.level_count > 1 ? source.mip_source_bytes : 0;
   out.resize(size_t(source.source_bytes) + mip_bytes);
-  if (!CopyGuestExtent(source.address, source.source_bytes, base, out, 0))
-    return false;
+  // CopyGuestExtent already knows which of the four address mirrors is
+  // resident, and it RETURNS it -- this used to throw that away. The bare
+  // physical address is reserved-but-uncommitted (MEM_RESERVE, protect 0), so
+  // anything that wants to touch the same bytes through the host needs the
+  // mirror, not source.address. The write watch found this out the hard way.
+  const uint32_t mirror =
+      CopyGuestExtent(source.address, source.source_bytes, base, out, 0);
+  if (out_mirror) *out_mirror = mirror;
+  if (!mirror) return false;
   if (mip_bytes &&
       !CopyGuestExtent(source.mip_address, mip_bytes, base, out,
                        source.source_bytes)) {
@@ -2411,10 +2441,11 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     }
   }
   std::vector<uint8_t> guest;
+  uint32_t guest_mirror = 0;
   bool copied = false;
   {
     PhaseTimer t(g_tex.copyUs);
-    copied = CopyTexturePhysical(source, base, guest);
+    copied = CopyTexturePhysical(source, base, guest, &guest_mirror);
   }
   if (!copied) {
     ++g_slotFailCopy;
@@ -2506,7 +2537,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // FLAT-DECODE PROBE. See NoteDecodedTexture -- it is called from ALL THREE
   // decode sites, which is the whole reason it is a function.
   NoteDecodedTexture(source, *payload, guest.data(), guest.size(),
-                     guest_sampler, "slot");
+                     guest_sampler, "slot", guest_mirror);
   // REVERTED 2026-08-14: `decode_is_uniform` used to be admitted here alongside
   // the blank case, on the theory that a uniformly-0xFF decode was as empty as
   // an all-zero one. The texture that motivated it was MISIDENTIFIED -- it was
@@ -3458,7 +3489,8 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
     g_hleCpuTextures.erase(cached);
   }
   std::vector<uint8_t> guest;
-  if (!CopyTexturePhysical(source, base, guest)) {
+  uint32_t standin_mirror = 0;
+  if (!CopyTexturePhysical(source, base, guest, &standin_mirror)) {
     ++s_unreadable;
     if (s_unreadable <= 8) {
       REXLOG_INFO("d3d9: HLE texture fallback: sampler {} source 0x{:08X} "
@@ -3476,7 +3508,7 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
     return false;
   }
   NoteDecodedTexture(source, *payload, guest.data(), guest.size(),
-                     binding.sampler, "standin");
+                     binding.sampler, "standin", standin_mirror);
   size_t nonzero_bytes = 0;
   if (!HleTextureHasNonzeroData(*payload, &nonzero_bytes)) {
     NoteBlankDecode(key);

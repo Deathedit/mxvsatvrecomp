@@ -5,6 +5,7 @@
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
 
+#include "hooks/guest_write_watch.h"
 #include "hooks/native_bridge.h"
 #include "mx_init.h"
 
@@ -88,6 +89,47 @@ const PPCContext* GuestContextFrom(const CONTEXT* c, uint64_t gbase) {
 LONG CALLBACK CrashReporter(EXCEPTION_POINTERS* info) {
   const auto* rec = info->ExceptionRecord;
   if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+    // WRITE WATCH first, and it CONTINUES rather than falling through to the
+    // crash path. An armed range is not a crash: we stripped write access on
+    // purpose to find out who writes it. Checked before the logging below so a
+    // deliberate fault does not print as a fatal one.
+    if (rec->ExceptionInformation[0] == 1) {
+      const uint64_t wbase = reinterpret_cast<uint64_t>(
+          mx::native::NativeGraphics::Get().GetGuestMemory());
+      const mx::hooks::WriteWatchHit w = mx::hooks::NoteGuestWrite(
+          static_cast<uint64_t>(rec->ExceptionInformation[1]), wbase);
+      if (w.matched && !w.first) return EXCEPTION_CONTINUE_EXECUTION;
+      if (w.matched) {
+        const uint64_t wrip = reinterpret_cast<uint64_t>(rec->ExceptionAddress);
+        const GuestFuncHit wh = ResolveGuestFunction(wrip);
+        // The whole point: name the guest function, not the host RVA.
+        if (wh.guest && (!wh.next_host || wrip < wh.next_host)) {
+          REXLOG_INFO(
+              "d3d9: WRITE WATCH HIT guest 0x{:08X} (+0x{:X} into 0x{:08X}) "
+              "written by guest function 0x{:08X} (+0x{:X} of host code) -- {}",
+              w.guest_addr, w.guest_addr - w.range_base, w.range_base, wh.guest,
+              wrip - wh.host, w.why);
+        } else {
+          // Still worth printing. A write from HOST code -- one of our own
+          // hooks, or a memcpy inside the runtime -- is a different answer
+          // from a guest write, not a failure to answer.
+          REXLOG_INFO(
+              "d3d9: WRITE WATCH HIT guest 0x{:08X} (+0x{:X} into 0x{:08X}) "
+              "written by HOST code at RVA 0x{:X} (no recompiled function "
+              "contains it; nearest below 0x{:08X}) -- {}",
+              w.guest_addr, w.guest_addr - w.range_base, w.range_base,
+              wrip - reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr)),
+              wh.guest, w.why);
+        }
+        if (const PPCContext* wc =
+                GuestContextFrom(info->ContextRecord, wbase)) {
+          REXLOG_INFO("d3d9: WRITE WATCH   lr=0x{:08X} ctr=0x{:08X}",
+                      static_cast<uint32_t>(wc->lr), wc->ctr.u32);
+        }
+        rex::FlushLogging();
+        return EXCEPTION_CONTINUE_EXECUTION;
+      }
+    }
     const char* op = rec->ExceptionInformation[0] == 0   ? "read"
                      : rec->ExceptionInformation[0] == 1 ? "write"
                                                          : "execute";
