@@ -88,35 +88,34 @@ REXCVAR_DEFINE_INT32(hle_strict, 0, "Debug",
 // PHASE 3 of docs/stencil_plan.md: honour the guest's stencil COMPARISON, not
 // just its writes.
 //
-// DEFAULT OFF, 2026-08-27, and the reason is a measurement rather than caution:
-// with it ON the TERRAIN BREAKS, and with it off the frame is normal. Confirmed
-// by A/B, not inferred.
+// DEFAULT ON. Honouring the guest's stencil comparison is the correct
+// behaviour and half of every level frame asks for it.
 //
-// The comparison itself is not the bug. Verified in terrain.rdc: at a ground
-// pixel the terrain draw PASSES, no stencilTestFailed appears anywhere in the
-// history, and the pipeline carries exactly the state the guest programmed. So
-// the test is reading a buffer that is not in the state the guest expects, and
-// two candidates are already identified:
+// It was briefly defaulted OFF because it broke the terrain, and that was worth
+// doing: the comparison was innocent the whole time -- terrain.rdc showed the
+// terrain draw passing, no stencilTestFailed anywhere, and the pipeline
+// carrying exactly the state the guest programmed. The test was reading a
+// buffer we had corrupted. TWO of our own clear defects, and it needed both:
 //
-//   OUR first-use clear (d3d12_game_frame.cpp:1262) wipes DEPTH AND STENCIL
-//   whenever a depth surface is first touched in a frame. That schedule is
-//   ours, not the guest's -- the guest clears stencil at specific points (0x20,
-//   0x30) and deliberately WITHHOLDS it at others (0x1F is depth with no
-//   stencil). Right for depth, wrong for stencil.
+//   1. our per-frame first-use clear wiped DEPTH AND STENCIL on OUR schedule.
+//      The guest clears stencil where it wants to (0x20, 0x30) and withholds it
+//      where it does not (0x1F is depth with no stencil). Fixed by splitting
+//      kGameDepthClearFlags, which is now creation-only, from
+//      kGameDepthFrameClearFlags.
+//   2. the Clear hook dropped every 0x60 -- 13,370 of 20,000 calls -- reading
+//      the 0x40 bit as an alternative to the stencil clear when it is only a
+//      modifier of it. Those calls are "clear stencil to 1", and without them
+//      the plane sat at 0 all frame so a terrain testing NotEqual-0 failed
+//      everywhere.
 //
-//   THE 0x60 EXCLUSION in the Clear hook drops 13,370 of 20,000 clear calls
-//   that carry 0x20, on the strength of the 0x40 bit meaning something we have
-//   not decoded.
+// Fixing either alone was not enough. Verified by A/B: terrain correct with the
+// test on once both landed.
 //
-// Off restores Phase 2 exactly: stencil still WRITES, every comparison is
-// ALWAYS, and ALWAYS cannot reject a fragment. Everything below the test is
-// verified and stays live.
-//
-// It is off rather than reverted because the mechanism is right and the cost of
-// being wrong is asymmetric: honouring stencil bought NOTHING visible even when
-// fully working, and breaks the ground when the buffer is wrong. Turn it back on
-// after the clear semantics are fixed, with the terrain as the test.
-REXCVAR_DEFINE_BOOL(d3d9_stencil_test, false, "Graphics",
+// Kept switchable. The failure mode of a wrong stencil buffer is geometry
+// VANISHING rather than degrading, so an A/B without a rebuild is worth having,
+// and the TERRAIN is the regression test -- it is the thing that broke, and it
+// broke visibly.
+REXCVAR_DEFINE_BOOL(d3d9_stencil_test, true, "Graphics",
                     "Honour the guest's stencil comparison. Off keeps stencil "
                     "writes but forces every test to ALWAYS, which cannot "
                     "reject a fragment.");

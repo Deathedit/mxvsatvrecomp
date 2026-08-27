@@ -178,7 +178,7 @@ the mask is deliberately wrong here -- wrong and unobserved. It becomes correct
 the moment Phase 3 restores the real funcs, since the plane is cleared per frame
 anyway.
 
-## Phase 3: stencil TEST. PASSED (`aa7e9a2`, verified run 1549).
+## Phase 3: stencil TEST. DONE (`aa7e9a2`), after two clear defects of our own.
 
 Apply the guest's real func. **This is the first step that can change pixels.**
 
@@ -284,3 +284,41 @@ and can never be tested.
    writes only, every func ALWAYS. **Pass: pixel-identical.**
 2. `--d3d9_stencil_test=true` (default) -- Phase 3, the guest's real
    comparisons. **Pass: nothing vanishes.**
+
+
+## The two clear defects the test exposed
+
+Phase 3 went live, the menu was fine, and then the TERRAIN broke. The comparison
+was innocent throughout -- `terrain.rdc` draw 20009 shows the terrain draw
+PASSING, no `stencilTestFailed` anywhere in the pixel history, and the pipeline
+carrying exactly the state the guest programmed. **The test was reading a buffer
+we had corrupted, in two separate places, and it needed both fixed.**
+
+**1. Our per-frame clear wiped the plane** (`9cb4851`). The first-use depth clear
+exists so depth does not accumulate across frames -- OUR schedule. Applying it to
+stencil destroyed a mask the guest had built: the guest clears stencil where it
+wants (`0x20`, `0x30`) and deliberately withholds it where it does not (`0x1F`
+is depth with no stencil, and it issues that). Split into
+`kGameDepthClearFlags` (creation only, both planes) and
+`kGameDepthFrameClearFlags` (per-frame, depth only).
+
+**2. We dropped every `0x60` clear** (`444ecb0`) -- 13,370 of 20,000 calls. I
+excluded it twice, on two wrong readings: first as "the EDRAM tile clear",
+because `r9` was set (`r9` is the Stencil argument, so that was a value of 1 read
+as a boolean); then as "the `0x40` path is not a stencil clear", with the
+decompilation in front of me:
+
+```c
+if ( (Flags & 0x20) != 0 ) {
+    v41 |= 4u;                                    // set BEFORE the branch
+    if ( (Flags & 0x40) != 0 )
+        v41 = (Stencil << 8) & 0xFF00 | v41 & 0xFFFF00DF;
+```
+
+`0x40` is a MODIFIER of the stencil clear, not an alternative to it -- it only
+moves the value into bits 8-15. `0x60` is "clear stencil to 1". Without those the
+plane sat at 0 all frame and a terrain testing `NotEqual-0` failed everywhere.
+
+**Verified by A/B: terrain correct with the test on, once both landed.** Default
+is back ON, and the TERRAIN is the regression test -- it is what broke, and it
+broke visibly.
