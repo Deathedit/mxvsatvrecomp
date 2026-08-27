@@ -1842,6 +1842,19 @@ void NoteStencilCensusUnreadable() {
 // This says whether they share a base. Owners per base, so "2 owners" on the
 // base the menu uses is the finding, and one owner per base kills the theory
 // outright.
+//
+// THE BASE IS VERIFIED, not extrapolated. It comes from the guest's D3D9
+// surface object at +0x1C, the same field for colour and depth surfaces, and
+// the reference confirms both registers place the base in the same bits:
+// RB_DEPTH_INFO is `depth_base : 11` then `depth_base_bit_11 : 1`
+// (rex/graphics/registers.h:834), i.e. bits [11:0], exactly what `& 0xFFF`
+// takes -- the same placement as RB_COLOR_INFO::color_base. That check
+// mattered: a wrong offset here reads a plausible value rather than failing,
+// and the aliasing conclusion rests entirely on these numbers.
+//
+// The FORMAT field does differ -- depth_format is one bit at +16 against
+// colour's four -- so `(color_info >> 16) & 0xF` is meaningless for a depth
+// surface. Nothing reads it as one; noted so nobody adds it.
 std::mutex g_depthSurfaceMu;
 struct DepthSurfaceInfo {
   uint32_t width = 0, height = 0;
