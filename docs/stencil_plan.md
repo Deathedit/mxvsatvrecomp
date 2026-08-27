@@ -152,6 +152,10 @@ nothing can vanish -- and it is the ONLY thing here that is temporary.
 any visual change is a plumbing bug, caught before it can be confused with a
 stencil-test effect.
 
+**FIRST "PASS" WAS FALSE.** Run 1542 reported clean and was inert -- see the
+translated-path section at the end. The numbers below are all real; what they
+were not is evidence that stencil did anything.
+
 **PASSED**, run 1542:
 
 ```
@@ -211,3 +215,42 @@ snapshot 944 times a run. Grep every site and state the count.
 
 **One thing at a time.** The failed attempt moved three formats, four clear
 sites and two resource paths together, and the fault could have been in any.
+
+
+## The path that made phases 2 and 3 inert
+
+Both phases reported clean and did nothing. There are THREE pipeline builders:
+`OpaquePSO` (plus the 32 eager `m_gamePSOs`), `BlendedPSO`, and **`TranslatedPSO`**
+-- and in a level nearly every draw has a translated guest shader, so nearly
+every draw took the one that was never wired.
+
+Every upstream check passed the whole time: state built, interned, on the draw,
+in the key, applied before anything could overwrite it, DSV `D32S8`, `DSVFormat`
+matching, both draw sites patched. **A chain of green checks is not a working
+feature.**
+
+What caught it was `--d3d9_stencil_force_never`, which forces `kNever` on every
+stencil draw. NEVER cannot pass a fragment under any circumstances, so the
+screen must break:
+
+| build | mutation | result |
+|---|---|---|
+| before `da5c9be` | force NEVER | screen unchanged -> **inert** |
+| after `da5c9be` | force NEVER | screen **visibly broken** -> live |
+
+A counter proving state was BUILT says nothing about whether it was APPLIED.
+
+Also confirmed by logging what is actually passed to
+`CreateGraphicsPipelineState` -- `enable 1 func 1/1 masks FF/FF dsvfmt 20` --
+because the RenderDoc MCP's `get_pipeline_state` has no `depthStencilState`
+field and cannot answer it.
+
+**Open, small:** 476 stencil draws are issued with no depth attachment at all
+and can never be tested.
+
+**Both phases now need re-validating on the connected path**, in this order:
+
+1. `--d3d9_stencil_force_never=false --d3d9_stencil_test=false` -- Phase 2,
+   writes only, every func ALWAYS. **Pass: pixel-identical.**
+2. `--d3d9_stencil_test=true` (default) -- Phase 3, the guest's real
+   comparisons. **Pass: nothing vanishes.**
