@@ -584,10 +584,34 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
     case xenos::TextureFormat::k_16_16_16_16_FLOAT:
       out.host_format = HostTextureFormat::kRgba16Float;
       break;
-    // Measured, not assumed. k_4_4_4_4 is the front end's texture format and
-    // the only one it was ever seen to ask for; B4G4R4A4_UNORM is the same bit
-    // layout, so the existing untile-and-swap path carries it unchanged and
-    // the fetch swizzle still resolves component order in the SRV.
+    // NO CHANNEL CONVERSION, and this is now measured rather than asserted.
+    //
+    // The reference appears to disagree: xenia-edge d3d12_texture_cache.h:303
+    // pairs DXGI_FORMAT_B4G4R4A4_UNORM with kLoadShaderIndexRGBA4ToBGRA4 --
+    // "Red and blue swapped in the load shader for simplicity" -- and
+    // texture_cache.cc:79-83 shows the same for every packed format
+    // (kR5G5B5A1ToB5G5R5A1, kR5G6B5ToB5G6R5, kRGBA4ToBGRA4, kRGBA4ToARGB4).
+    // I added that swap here on 2026-08-27 and then took it back out, because
+    // the capture says the guest format is ARGB4444, not RGBA4444:
+    //
+    //   The index map stores host word 0xF00A and RenderDoc reads it as
+    //   (R=0, G=0, B=0xA, A=0xF). That pins the HOST layout to A,R,G,B.
+    //   UI texture 6933 (128x128, k_4_4_4_4) then decodes to 11287 texels of
+    //   (0,0,0,0) and 3465 of (221,221,221,255), with every other value also
+    //   R==G==B and alpha exactly 0 or 255 -- a clean greyscale mask, which is
+    //   what UI art looks like. Under the RGBA4 reading the SAME bytes would
+    //   mean "red 0xF, alpha 0xD": a pinkish, semi-transparent texture with no
+    //   clean alpha anywhere. Only one of those is a real asset.
+    //
+    // D3DFMT_A4R4G4B4 is also the format a D3D9 title would actually ask for.
+    //
+    // Why the reference still swaps: Xenia binds a FIXED host swizzle
+    // (XE_GPU_TEXTURE_SWIZZLE_RGBA) and corrects channels in the load shader.
+    // We apply the GUEST fetch swizzle directly in the SRV instead. Those are
+    // two different pipelines, and lifting one step out of theirs without the
+    // other composes two permutations that were never meant to compose.
+    // Do not "fix" this to match the reference without re-running the 6933
+    // check above.
     case xenos::TextureFormat::k_4_4_4_4:
       out.host_format = HostTextureFormat::kBgra4;
       break;
