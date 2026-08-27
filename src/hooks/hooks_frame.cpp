@@ -195,6 +195,12 @@ extern "C" REX_FUNC(sub_82566B58) {
                 mx::native::g_plugin_mode ? "plugin" : "native", no_vp,
                 sh_failed, nocode_full, skips, attributed,
                 guest > accepted + refused ? guest - accepted - refused : 0);
+    // Measured 2026-08-27: the skips ARE the gap, 16,706 of 16,706, with every
+    // other exit at zero. So the reasons are the finding and belong on the
+    // ungated line rather than behind --hle_capture.
+    REXLOG_INFO("{}: UNBUILT SKIPS BY REASON:{}",
+                mx::native::g_plugin_mode ? "plugin" : "native",
+                UnbuiltSkipBreakdown());
   }
 
   // Glyph cache, on a fixed swap cadence. Deliberately NOT printed from inside

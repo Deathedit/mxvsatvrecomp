@@ -6572,6 +6572,26 @@ void UnbuiltDrawReasons(uint64_t& no_viewport, uint64_t& shader_failed,
     skips += counts[i];
 }
 
+std::string UnbuiltSkipBreakdown() {
+  // Run 1551 attributed the whole gap to BuildHleDraw -- 16,706 of 16,706, with
+  // no-viewport and shader-failed both at zero. So the reasons ARE the answer,
+  // and they were only ever printed from ReportCoverage under --hle_capture.
+  // Promoted here rather than left there: the gap is a standing property of
+  // every run, not a debugging session.
+  //
+  // Ranked, and zero rows omitted -- with eleven possible reasons a full list
+  // is mostly zeros and the one that matters does not stand out.
+  const uint64_t* counts = mx::hle::HleSkipCounts();
+  std::vector<std::pair<uint64_t, uint32_t>> ranked;
+  for (uint32_t i = 1; i < uint32_t(mx::hle::HleSkip::kCount); ++i)
+    if (counts[i]) ranked.emplace_back(counts[i], i);
+  std::sort(ranked.begin(), ranked.end(), std::greater<>());
+  std::string out;
+  for (const auto& [n, i] : ranked)
+    out += fmt::format(" {}={}", mx::hle::HleSkipName(mx::hle::HleSkip(i)), n);
+  return out.empty() ? std::string(" none") : out;
+}
+
 uint64_t GuestDrawCalls() {
   return mx::hooks::d3d9::g_guestDrawCalls.load(std::memory_order_relaxed);
 }

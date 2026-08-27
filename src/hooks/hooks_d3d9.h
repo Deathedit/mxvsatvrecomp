@@ -33,6 +33,10 @@ uint64_t GuestDrawCalls();
 void UnbuiltDrawReasons(uint64_t& no_viewport, uint64_t& shader_failed,
                         uint64_t& nocode_queue_full, uint64_t& skips);
 
+// The BuildHleDraw skip reasons, ranked, zero rows omitted. Measured to be the
+// WHOLE of the gap, so this is the row that names the work.
+std::string UnbuiltSkipBreakdown();
+
 // HLE draws this layer ACCEPTED into the frame draw list and REFUSED, both
 // cumulative.
 //
