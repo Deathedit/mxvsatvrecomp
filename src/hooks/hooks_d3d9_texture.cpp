@@ -371,30 +371,73 @@ void NoteBlankDecode(uint64_t key) {
 //
 // Nothing else in the tree can tell those two apart, and the difference decides
 // whether the ground is chased in our decoder or in the guest.
+// PER TEXEL, NOT PER BYTE -- and that distinction is the whole probe.
+//
+// The first cut counted BYTES, and it could not see the one texture it was
+// written to catch. ground2.rdc's 1024x1024 B4G4R4A4 is the constant word
+// 0x0AF0 on every texel; as bytes that is `0A F0 0A F0 ...`, a dominant share of
+// exactly 0.5, nowhere near the 0.999 threshold. Run 1472 duly reported
+// `[fmt15(FMT_4_4_4_4) 1024x1024 n=2 flat=0]` for a texture the capture shows is
+// perfectly flat. A byte histogram can only see constants that are byte-uniform
+// -- 0x00, 0x80, 0xFF -- which is why every hit so far was one of those three.
+// The measurement agreed with itself and disagreed with the texture.
+//
+// Boyer-Moore majority over `element_bytes`-wide elements: one pass to find the
+// candidate, one to count it. O(1) memory, so a 16 MB base level costs nothing,
+// and exact whenever the dominant element is over half -- which is the only
+// region the >= 99.9% threshold cares about.
 struct FlatScan {
-  uint8_t dominant = 0;
-  uint32_t distinct = 0;
-  size_t total = 0;
+  // Element-level: what the threshold reads.
+  uint64_t dominant = 0;
+  uint32_t element_bytes = 1;
+  size_t total = 0;            // elements, not bytes
   size_t dominant_count = 0;
+  // Byte-level, kept alongside because "how many distinct byte values" is still
+  // the cheapest way to say whether a buffer carries any variety at all.
+  uint32_t distinct_bytes = 0;
   double share() const {
     return total ? double(dominant_count) / double(total) : 0.0;
   }
 };
 
-FlatScan ScanFlatness(const uint8_t* data, size_t bytes) {
+FlatScan ScanFlatness(const uint8_t* data, size_t bytes, uint32_t element_bytes) {
   FlatScan s;
   if (!data || !bytes) return s;
+  // 1, 2, 4 or 8 only. A BC block is 8 or 16 bytes; 16 folds to 8, which still
+  // reads a constant block as constant.
+  uint32_t w = element_bytes ? element_bytes : 1;
+  if (w >= 8) w = 8;
+  else if (w >= 4) w = 4;
+  else if (w >= 2) w = 2;
+  else w = 1;
+  s.element_bytes = w;
+
   size_t hist[256] = {};
   for (size_t i = 0; i < bytes; ++i) ++hist[data[i]];
-  s.total = bytes;
-  for (uint32_t v = 0; v < 256; ++v) {
-    if (!hist[v]) continue;
-    ++s.distinct;
-    if (hist[v] > s.dominant_count) {
-      s.dominant_count = hist[v];
-      s.dominant = uint8_t(v);
-    }
+  for (uint32_t v = 0; v < 256; ++v)
+    if (hist[v]) ++s.distinct_bytes;
+
+  const size_t n = bytes / w;
+  if (!n) return s;
+  auto at = [&](size_t i) {
+    uint64_t v = 0;
+    std::memcpy(&v, data + i * w, w);
+    return v;
+  };
+  uint64_t cand = 0;
+  size_t votes = 0;
+  for (size_t i = 0; i < n; ++i) {
+    const uint64_t v = at(i);
+    if (!votes) { cand = v; votes = 1; }
+    else if (v == cand) ++votes;
+    else --votes;
   }
+  size_t count = 0;
+  for (size_t i = 0; i < n; ++i)
+    if (at(i) == cand) ++count;
+  s.dominant = cand;
+  s.dominant_count = count;
+  s.total = n;
   return s;
 }
 
@@ -407,6 +450,24 @@ struct FlatProbeCounts {
   uint64_t suppressed = 0;
 };
 FlatProbeCounts g_flatProbe;
+
+// THE PROBE CRASHED THE GAME AND THIS IS WHY. The census below inserts into a
+// std::map and a std::set, and once NoteDecodedTexture was called from all
+// three decode sites those inserts happened on SEVERAL GUEST THREADS at once.
+// Concurrent std::map::insert corrupts the heap, and the fault that surfaced
+// was nowhere near here: an access violation on the UI thread inside recompiled
+// guest function 0x8236EB30, reading 0x4C69746C -- ASCII "Litl", a string being
+// dereferenced as a pointer. Classic downstream heap damage. Runs 1466/1468/
+// 1469/1470 were clean and 1471, the first with three sites wired, was not.
+//
+// hooks_d3d9_entry.cpp:1902 already states the rule for this codebase: "this
+// runs on guest threads and the resolve maps are unguarded, so it must not
+// insert." A diagnostic is not exempt from it.
+//
+// The lock is uncontended in practice -- a whole level run decodes ~600
+// textures -- and it covers the counters as well, so the printed rate is not a
+// torn read.
+std::mutex g_flatMutex;
 
 // DECODE CENSUS BY SHAPE. The per-address lines answer "is this texture flat";
 // this answers "was it decoded AT ALL", which run 1468 could not settle. That
@@ -429,8 +490,15 @@ void ReportDecodeShapes() {
       return a.second.second > b.second.second;
     return a.second.first > b.second.first;
   });
+  // EVERY shape, not a top-N. The top-20 cut was the THIRD truncation in this
+  // one instrument to hide the case it was built for: a 1024x1024 FMT_4_4_4_4
+  // that decodes with REAL content sorts to the bottom (flat=0, n small), gets
+  // cut, and prints no FLAT DECODE line either -- so "decoded and healthy" and
+  // "never decoded at all" render identically. Same defect as the 24-address
+  // cap and as reporting only fires, committed a third time. The list is ~74
+  // entries; print it.
   std::string top;
-  for (size_t i = 0; i < ranked.size() && i < 20; ++i) {
+  for (size_t i = 0; i < ranked.size(); ++i) {
     top += fmt::format(" [fmt{}({}) {}x{} n={} flat={}]", ranked[i].first[0],
                        mx::hle::GuestTextureFormatName(ranked[i].first[0]),
                        ranked[i].first[1], ranked[i].first[2],
@@ -440,6 +508,88 @@ void ReportDecodeShapes() {
               g_flatShapes.size(), g_flatProbe.decodes, g_flatProbe.flat,
               top.empty() ? " (none)" : top);
 }
+
+// EVERY DECODE SITE, and that is the point. This lived inline in
+// ResolvePixelSlotTexture and therefore measured ONE of the three places a
+// texture is decoded. DecodeHleTexture2D is called from the Bink plane path,
+// from PrepareDrawTexture (the stand-in route) and from ResolvePixelSlotTexture
+// (the translated route), and they SHARE A CACHE -- so a texture first decoded
+// by one route is a cache hit for the others and never reaches their code at
+// all.
+//
+// ground2.rdc caught it. The 1024x1024 B4G4R4A4 tile-index map is present as a
+// bound payload -- d3d12_game_bind's slot census prints its bytes -- while the
+// census in this file reported no 1024x1024 FMT_4_4_4_4 decode in the same run.
+// Both were right. The decode happened somewhere the census could not see, and
+// a census that watches one of three doors reports absence as health.
+//
+// `site` names the door, because knowing WHICH route decoded a texture is half
+// of what the last three runs were missing.
+void NoteDecodedTexture(const mx::hle::HleTextureSource& source,
+                        const mx::hle::HleTexturePayload& payload,
+                        const uint8_t* guest_bytes, size_t guest_size,
+                        uint32_t sampler, const char* site) {
+  PhaseTimer t(g_tex.scanUs);
+  std::lock_guard<std::mutex> flat_lock(g_flatMutex);
+  const size_t flat_base_bytes =
+      payload.level_count > 1
+          ? std::min<size_t>(payload.levels[1].offset, payload.data.size())
+          : payload.data.size();
+  const FlatScan decoded_flat = ScanFlatness(payload.data.data(),
+                                             flat_base_bytes,
+                                             source.bytes_per_block);
+  ++g_flatProbe.decodes;
+  auto& shape = g_flatShapes[{source.guest_format, source.width,
+                              source.height}];
+  ++shape.first;
+  // Every 500 rather than every 100: the line now carries every shape, and the
+  // Bink planes decode each frame, so 4100 decodes a run would otherwise be 41
+  // copies of a 3 KB line.
+  if (g_flatProbe.decodes % 500 == 0) ReportDecodeShapes();
+  if (decoded_flat.total && decoded_flat.share() >= 0.999) {
+    ++shape.second;
+    ++g_flatProbe.flat;
+    // THE CAP WAS 24 AND IT HID THE CASE THIS EXISTS FOR. Run 1466 reached
+    // 24 addresses at decode 236 and then went on to render 1860 frames of a
+    // level; every texture first bound after that -- the terrain's tile-index
+    // map among them -- was dropped without a word, and the log read as
+    // though only eight flat textures existed. A limit whose effect is
+    // invisible is the same defect as a counter that cannot fire, so the cap
+    // now counts what it drops and prints that on every line.
+    static std::set<uint32_t> s_flatSeen;
+    const bool flat_first_seen = s_flatSeen.insert(source.address).second;
+    if (flat_first_seen && s_flatSeen.size() > 256) ++g_flatProbe.suppressed;
+    if (flat_first_seen && s_flatSeen.size() <= 256) {
+      // The guest bytes as COPIED, before untiling -- the only reading that
+      // can acquit or convict our decode path.
+      const FlatScan guest_flat =
+          ScanFlatness(guest_bytes, guest_size, source.bytes_per_block);
+      std::string head;
+      for (size_t i = 0; i < guest_size && i < 16; ++i)
+        head += fmt::format("{:02X} ", guest_bytes[i]);
+      REXLOG_INFO(
+          "d3d9: FLAT DECODE [{}] addr 0x{:08X} fmt {} ({}) {}x{} sampler {} "
+          "pitch {} blk {}x{}x{}B endian {} swizzle 0x{:X} tiled {} "
+          "packed_mips {} mip_addr 0x{:08X} levels {} | DECODED dom 0x{:X} "
+          "{:.5f} of {} x{}B elems, {} distinct bytes | GUEST dom 0x{:X} "
+          "{:.5f} of {} x{}B elems, {} distinct bytes | guest head {}| "
+          "flat {}/{} decodes, {} addresses, {} suppressed",
+          site, source.address, source.guest_format,
+          mx::hle::GuestTextureFormatName(source.guest_format), source.width,
+          source.height, sampler, source.pitch_blocks,
+          source.block_width, source.block_height, source.bytes_per_block,
+          source.endian, source.swizzle, source.tiled ? 1 : 0,
+          source.packed_mips ? 1 : 0, source.mip_address, source.level_count,
+          decoded_flat.dominant, decoded_flat.share(), decoded_flat.total,
+          decoded_flat.element_bytes, decoded_flat.distinct_bytes,
+          guest_flat.dominant, guest_flat.share(), guest_flat.total,
+          guest_flat.element_bytes, guest_flat.distinct_bytes, head,
+          g_flatProbe.flat,
+          g_flatProbe.decodes, s_flatSeen.size(), g_flatProbe.suppressed);
+    }
+  }
+}
+
 // The blank payload itself, so the draws that sample a still-blank key within
 // one frame share a decode instead of repeating it.
 std::map<uint64_t, std::shared_ptr<const mx::hle::HleTexturePayload>>
@@ -933,6 +1083,7 @@ bool PrepareBinkPlanes(mx::hle::DrawCall& dc, uint32_t device, uint8_t* base) {
       charge(&BinkPlaneRefusals::decode, s);
       return false;
     }
+    NoteDecodedTexture(source, *payload, guest.data(), guest.size(), s, "bink");
     // An all-zero plane is normal for a video that has not decoded its first
     // frame yet, so unlike the immutable path this is not memoised as empty —
     // the same descriptor will carry real pixels a frame later.
@@ -2352,65 +2503,10 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
               : std::string("NONE, binding the constant anyway"));
     }
   }
-  // FLAT-DECODE PROBE. Population is every decode that reaches this point;
-  // fires are the ones whose base level is at least 99.9% a single byte. The
-  // threshold is deliberately not 1.0 -- see ScanFlatness for the one texel
-  // that cost the ground a session. One line per distinct guest address and
-  // capped, because a flat texture is re-decoded every frame and this is a
-  // diagnostic, not a per-bind log.
-  {
-    PhaseTimer t(g_tex.scanUs);
-    const size_t flat_base_bytes =
-        payload->level_count > 1
-            ? std::min<size_t>(payload->levels[1].offset, payload->data.size())
-            : payload->data.size();
-    const FlatScan decoded_flat =
-        ScanFlatness(payload->data.data(), flat_base_bytes);
-    ++g_flatProbe.decodes;
-    auto& shape = g_flatShapes[{source.guest_format, source.width,
-                                source.height}];
-    ++shape.first;
-    if (g_flatProbe.decodes % 100 == 0) ReportDecodeShapes();
-    if (decoded_flat.total && decoded_flat.share() >= 0.999) {
-      ++shape.second;
-      ++g_flatProbe.flat;
-      // THE CAP WAS 24 AND IT HID THE CASE THIS EXISTS FOR. Run 1466 reached
-      // 24 addresses at decode 236 and then went on to render 1860 frames of a
-      // level; every texture first bound after that -- the terrain's tile-index
-      // map among them -- was dropped without a word, and the log read as
-      // though only eight flat textures existed. A limit whose effect is
-      // invisible is the same defect as a counter that cannot fire, so the cap
-      // now counts what it drops and prints that on every line.
-      static std::set<uint32_t> s_flatSeen;
-      const bool flat_first_seen = s_flatSeen.insert(source.address).second;
-      if (flat_first_seen && s_flatSeen.size() > 256) ++g_flatProbe.suppressed;
-      if (flat_first_seen && s_flatSeen.size() <= 256) {
-        // The guest bytes as COPIED, before untiling -- the only reading that
-        // can acquit or convict our decode path.
-        const FlatScan guest_flat = ScanFlatness(guest.data(), guest.size());
-        std::string head;
-        for (size_t i = 0; i < guest.size() && i < 16; ++i)
-          head += fmt::format("{:02X} ", guest[i]);
-        REXLOG_INFO(
-            "d3d9: FLAT DECODE addr 0x{:08X} fmt {} ({}) {}x{} sampler {} "
-            "pitch {} blk {}x{}x{}B endian {} swizzle 0x{:X} tiled {} "
-            "packed_mips {} mip_addr 0x{:08X} levels {} | DECODED dom 0x{:02X} "
-            "{:.5f} of {} bytes {} distinct | GUEST dom 0x{:02X} {:.5f} of {} "
-            "bytes {} distinct | guest head {}| flat {}/{} decodes, {} "
-            "addresses, {} suppressed",
-            source.address, source.guest_format,
-            mx::hle::GuestTextureFormatName(source.guest_format), source.width,
-            source.height, guest_sampler, source.pitch_blocks,
-            source.block_width, source.block_height, source.bytes_per_block,
-            source.endian, source.swizzle, source.tiled ? 1 : 0,
-            source.packed_mips ? 1 : 0, source.mip_address, source.level_count,
-            decoded_flat.dominant, decoded_flat.share(), decoded_flat.total,
-            decoded_flat.distinct, guest_flat.dominant, guest_flat.share(),
-            guest_flat.total, guest_flat.distinct, head, g_flatProbe.flat,
-            g_flatProbe.decodes, s_flatSeen.size(), g_flatProbe.suppressed);
-      }
-    }
-  }
+  // FLAT-DECODE PROBE. See NoteDecodedTexture -- it is called from ALL THREE
+  // decode sites, which is the whole reason it is a function.
+  NoteDecodedTexture(source, *payload, guest.data(), guest.size(),
+                     guest_sampler, "slot");
   // REVERTED 2026-08-14: `decode_is_uniform` used to be admitted here alongside
   // the blank case, on the theory that a uniformly-0xFF decode was as empty as
   // an all-zero one. The texture that motivated it was MISIDENTIFIED -- it was
@@ -3379,6 +3475,8 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
                   why ? why : "?");
     return false;
   }
+  NoteDecodedTexture(source, *payload, guest.data(), guest.size(),
+                     binding.sampler, "standin");
   size_t nonzero_bytes = 0;
   if (!HleTextureHasNonzeroData(*payload, &nonzero_bytes)) {
     NoteBlankDecode(key);
