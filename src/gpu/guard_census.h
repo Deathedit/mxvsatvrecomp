@@ -66,6 +66,10 @@ enum class Guard : uint32_t {
   // here would shift every bit below -- exactly the drift that sent run 1461 at
   // an inert guard. New entries go on the end, always.
   kConstantNanBackdrop,
+  // The vertex tint window (vertex c32), filled from the PM4 ALU constant file
+  // only when the WHOLE float4 validates. Appended, per the rule three lines
+  // up: hle_strict is keyed on enum position.
+  kVertexTintFill,
   kCount
 };
 
@@ -96,6 +100,10 @@ std::string Report();
 //                         diagnostic
 //   kBlankTexturePayload  the blank is not recorded, so the decode is retried
 //   kConstantNanToZero    the NaN reaches the shader; corruption is the signal
+//   kVertexTintFill       the tint stays at the black the guest bank holds,
+//                         which is the pre-change behaviour -- so this bit is
+//                         a one-run A/B on whether the fill is what changed the
+//                         screen, without a rebuild
 //
 // Four are NOT wired, and the reasons are structural rather than caution:
 //

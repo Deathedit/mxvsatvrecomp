@@ -1558,8 +1558,15 @@ uint64_t g_shaderConstOverlays = 0;
 // Applied AFTER the device file so a shader literal wins for its own slots.
 // That is the hardware order — the load is emitted at draw time, after any
 // SetVertexShaderConstantF the app made.
+// `written`, when given, receives one byte per bank dword, non-zero where this
+// overlay published a value. FillVertexTint needs it for the same reason
+// ApplyShaderLoadTable's twin exists on the pixel side: a shader that writes a
+// deliberate ZERO here and a slot nothing ever wrote are the same bits and the
+// opposite decision.
 void OverlayShaderConstants(uint32_t shader, uint8_t* base,
-                            std::array<uint32_t, kD3d9ConstRegs * 4>& out) {
+                            std::array<uint32_t, kD3d9ConstRegs * 4>& out,
+                            std::array<uint8_t, kD3d9ConstRegs * 4>* written =
+                                nullptr) {
   (void)base;
   if (!shader) return;
   const uint32_t h = shader + kVsPatchHeaderAt;
@@ -1589,6 +1596,7 @@ void OverlayShaderConstants(uint32_t shader, uint8_t* base,
       const uint32_t src = data + i * 4;
       if (!HostPageReadable(REX_RAW_ADDR(src))) break;
       out[reg * 4 + i] = REX_LOAD_U32(src);
+      if (written) (*written)[reg * 4 + i] = 1;
     }
     ++g_shaderConstOverlays;
   }
@@ -1747,7 +1755,14 @@ bool CaptureVertexConstants(uint32_t device, uint8_t* base, uint32_t shader,
     }
     if (nan) before[r >> 5] |= 1u << (r & 31);
   }
-  OverlayShaderConstants(shader, base, out);
+  std::array<uint8_t, kD3d9ConstRegs * 4> vs_written{};
+  OverlayShaderConstants(shader, base, out, &vs_written);
+  // AFTER the shader's own literals, never before them. The pixel-side twin of
+  // this fill was placed before its load table on the first cut and was simply
+  // overwritten for every shader whose table covers the window -- surviving
+  // only on the shaders it was not aimed at, which is how a change lands on the
+  // wrong geometry and reads as a partial success.
+  mx::gpu::alu::FillVertexTint(out.data(), kD3d9ConstRegs, vs_written.data());
   NoteVertexConstantNaN(out, shader, before);
   return true;
 }
@@ -6368,12 +6383,39 @@ void ReportDrawCounts(uint8_t* base) {
     if (filled_zero)
       REXLOG_INFO("d3d9: ZERO-FILL BY CONSTANT:{}",
                   mx::gpu::alu::FilledHistogram(12));
+  {
+    // c32 is the vertex tint that renders the legal screen's logos black:
+    // the pixel shader multiplies a correctly-sampled white texel by it and
+    // LegacyMul forces +0 because it is zero. c252..c255 are the CONTROL --
+    // known screen-space scale/bias, so if they read wrong the file cannot be
+    // trusted and c32's value means nothing either.
+    static const uint32_t kWatch[] = {32, 252, 253, 254, 255};
+    REXLOG_INFO("d3d9: WOULD-FILL VALUES (c252-255 are the control -- expect "
+                "screen-space scale/bias like 0.5/-0.5):{}",
+                mx::gpu::alu::WouldFillValues(kWatch, 5));
+  }
     // The narrow window that actually substitutes. Printed unconditionally,
     // zero included: "never fired" and "fired and changed nothing" are the two
     // outcomes worth telling apart, and a suppressed line looks like neither.
     REXLOG_INFO("d3d9: MATERIAL GATE FILL {} substitutions (pixel c84-c87, the "
                 "PM4-only material block; c85.w is the terrain diffuse gate)",
                 mx::gpu::alu::MaterialGateFilled());
+    // Every outcome on one line, zeros included, because each says something
+    // different and only one of them means the change worked:
+    //   applied 0, denormal 0, unpub N  -> PM4 never publishes c32; remove this
+    //   applied 0, denormal N           -> the source is junk; remove this
+    //   applied N, filled 0             -> validated, but the slot was never a
+    //                                      hole -- the tint comes from
+    //                                      elsewhere and c32 was a red herring
+    //   applied N, filled M             -> the substitution is live; the logos
+    //                                      should now be visible on that share
+    //                                      of draws, and flickering means the
+    //                                      denormal is next
+    uint64_t vt_filled, vt_applied, vt_denorm, vt_unpub;
+    mx::gpu::alu::VertexTintStats(vt_filled, vt_applied, vt_denorm, vt_unpub);
+    REXLOG_INFO("d3d9: VERTEX TINT FILL (vs c32) {} dwords filled | float4s: "
+                "{} applied, {} rejected denormal, {} rejected unpublished",
+                vt_filled, vt_applied, vt_denorm, vt_unpub);
   }
   ReportDeclHistogram();
   if (REXCVAR_GET(hle_capture)) ReportCoverage(base);

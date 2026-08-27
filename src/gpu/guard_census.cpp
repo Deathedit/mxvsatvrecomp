@@ -25,6 +25,7 @@ constexpr const char* kNames[size_t(Guard::kCount)] = {
     "blank-texture",        "constant-nan-to-zero",
     "material-gate-fill",   "vertex-zero-fill",
     "interpolator-zero-fill", "constant-nan-backdrop",
+    "vertex-tint-fill",
 };
 
 }  // namespace
@@ -41,7 +42,8 @@ std::atomic<uint32_t> g_strictMask{0};
 // census row stay -- the NaNs are still counted, they are just no longer
 // replaced. Removing the ENTRY would shift every bit below it.
 constexpr uint32_t kSwitchable = (1u << uint32_t(Guard::kStandInDraw)) |
-                                 (1u << uint32_t(Guard::kBlankTexturePayload));
+                                 (1u << uint32_t(Guard::kBlankTexturePayload)) |
+                                 (1u << uint32_t(Guard::kVertexTintFill));
 }  // namespace
 
 void SetStrictMask(uint32_t mask) {

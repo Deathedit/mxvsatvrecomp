@@ -84,6 +84,9 @@ void Stats(uint64_t& written, uint64_t& repaired, uint32_t& constants_seen,
 // and those want opposite fixes — narrow the range, or stop treating a
 // frame-global PM4 file as authoritative for a mid-frame draw.
 std::string FilledHistogram(uint32_t top);
+// Float values we declined to fill, for the given constant indices. Includes a
+// control group by convention -- see the definition.
+std::string WouldFillValues(const uint32_t* consts, size_t n);
 
 // Substitutions APPLIED in the narrow material-gate window (pixel c84..c87).
 // Distinct from the dry-run zero-fill count: a zero here means the window never
@@ -97,6 +100,25 @@ uint64_t MaterialGateFilled();
 // ApplyShaderLoadTable -- before it, the table overwrites the fill.
 uint32_t FillMaterialGate(uint32_t* bank, uint32_t bank_regs,
                           const uint8_t* load_written);
+
+// Fill VERTEX c32 -- the UI/logo tint -- from the Type-0 PM4 file, and ONLY
+// when the whole float4 validates: every component published, finite, and not
+// denormal. `bank` is the VERTEX bank (guest c0 at index 0, no rebasing),
+// `load_written` is one byte per bank dword, non-zero where the shader's own
+// literal overlay wrote. Call AFTER OverlayShaderConstants.
+//
+// Whole-vector, not per-component, and that is the whole point: PM4 publishes
+// this constant as (1,1,1,1) most-but-not-all of the time, and the rest of the
+// time .y holds a denormal that LegacyMul reads as zero. Filling three of four
+// components would produce a magenta logo -- plausible and wrong. Rejecting the
+// vector leaves it black, which is unchanged and still visibly broken.
+uint32_t FillVertexTint(uint32_t* bank, uint32_t bank_regs,
+                        const uint8_t* load_written);
+
+// Vertex-tint outcomes, for the report line. Split because "never validated"
+// and "validated with nothing to fill" are different findings.
+void VertexTintStats(uint64_t& filled, uint64_t& applied, uint64_t& denormal,
+                     uint64_t& unpublished);
 
 }  // namespace alu
 

@@ -85,6 +85,12 @@ uint64_t g_filledZero = 0;
 // spraying the bank, and those want opposite fixes: the first narrows to a
 // range, the second means the PM4 file is the wrong authority per draw.
 uint64_t g_filledByConst[kAluConstants] = {};
+// The VALUE we declined to write, per dword. Counting how often a constant
+// could be filled says nothing about whether the thing we would have filled it
+// with is sane -- and the last attempt at this substitution was reverted for
+// spraying end-of-frame garbage. Recording the value makes that checkable
+// BEFORE turning anything on.
+uint32_t g_wouldFillVal[kFileDwords] = {};
 // Substitutions actually APPLIED in the narrow material-gate window, as opposed
 // to g_filledZero which counts the whole dry-run population. Separate because
 // "the window never fires" and "the window fires and changes nothing" are
@@ -100,9 +106,42 @@ constexpr uint32_t kPixelBankFirstReg = 256;
 constexpr uint32_t kMaterialGateFirstConst = 256 + 84;
 constexpr uint32_t kMaterialGateEndConst = 256 + 88;
 
+// VERTEX c32 -- the tint the UI/logo draws multiply their sampled texel by.
+// Proven in legal.rdc: the texture samples white, xe_c[32] arrives (0,0,0,1),
+// and LegacyMul turns white x 0 into +0. PM4 publishes (1,1,1,1) for it.
+//
+// ONE constant wide, on purpose. The precedent in this file is that a fill from
+// the frame-global g_file is safe exactly when its window is not an ARRAY: the
+// blanket version tore a stride-6 vertex matrix palette apart with end-of-frame
+// values. A single tint register cannot be a palette entry.
+constexpr uint32_t kVertexTintFirstConst = 32;
+constexpr uint32_t kVertexTintEndConst = 33;
+
+// Vertex-tint fill outcomes. Three counters, not one, because "the window never
+// validated" and "the window validated and had nothing to fill" are different
+// findings and a single total would print the same number for both.
+uint64_t g_vertexTintFilled = 0;    // dwords actually substituted
+uint64_t g_vertexTintApplied = 0;   // float4s that passed validation
+uint64_t g_vertexTintDenormal = 0;  // float4s rejected for a denormal component
+uint64_t g_vertexTintUnpub = 0;     // float4s rejected as not fully published
+
 bool NonFinite(uint32_t bits) {
   // IEEE-754: exponent all ones is Inf (mantissa 0) or NaN (mantissa non-zero).
   return (bits & 0x7F800000u) == 0x7F800000u;
+}
+
+// Exponent zero with a non-zero mantissa: a DENORMAL. Its own tiny magnitude is
+// not the problem -- what matters is that shader_alu.cpp's LegacyMul treats
+// anything under kSmallestNormal (1.175e-38) as an exact zero, because that is
+// what D3D9 fixed-function multiply does on Xenos. So a denormal reaching a
+// tint constant is indistinguishable from black at the point of use.
+//
+// It is also, on this title, a reliable junk MARKER. The one value PM4 has ever
+// been seen publishing into a colour slot is 2.074e-42, whose bit pattern is
+// 1480 -- a small INTEGER read as a float, seen at both ps c85.y (see
+// FillMaterialGate) and vs c32.y. A shader constant does not look like that.
+bool Denormal(uint32_t bits) {
+  return (bits & 0x7F800000u) == 0 && (bits & 0x007FFFFFu) != 0;
 }
 
 }  // namespace
@@ -288,6 +327,7 @@ uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
     // zero by our two modelled sources.
     ++g_filledZero;
     ++g_filledByConst[d >> 2];
+    g_wouldFillVal[d] = v;
 
     // The substitution that used to live here has MOVED to FillMaterialGate,
     // which runs after the shader load table instead of before it. Doing it
@@ -457,8 +497,124 @@ uint32_t FillMaterialGate(uint32_t* bank, uint32_t bank_regs,
   return filled;
 }
 
+void VertexTintStats(uint64_t& filled, uint64_t& applied, uint64_t& denormal,
+                     uint64_t& unpublished) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  filled = g_vertexTintFilled;
+  applied = g_vertexTintApplied;
+  denormal = g_vertexTintDenormal;
+  unpublished = g_vertexTintUnpub;
+}
+
+uint32_t FillVertexTint(uint32_t* bank, uint32_t bank_regs,
+                        const uint8_t* load_written) {
+  // The one substitution from g_file that survives its own history, and the
+  // history is the design. Everything above this function that tried to fill
+  // finite zeros from PM4 was reverted, twice, for the same two reasons:
+  //
+  //   1. it reached ARRAYS. g_file is frame-global last-write-wins, so a
+  //      mid-frame draw reading a matrix palette gets the frame's FINAL rows.
+  //      Fixed here by a one-register window that cannot be an array.
+  //   2. it injected values that were not shader constants. FillMaterialGate
+  //      shipped a 2.074e-42 denormal into ps c85.y on ~94,000 draws a run
+  //      before anyone looked at what was being written.
+  //
+  // (2) is what the validation below exists for, and it is deliberately
+  // WHOLE-VECTOR. A per-component guard is worse than none here: measured over
+  // one run, PM4 publishes vs c32 as (1,1,1,1) on 12 samples and
+  // (1, 2.074e-42, 1, 1) on 32. Skipping only the bad component would leave
+  // .y at zero and light the logo MAGENTA -- a plausible-looking wrong answer,
+  // which is the exact failure mode docs/strict_mode.md is about. Rejecting the
+  // whole float4 leaves it black instead: unchanged, and still obviously
+  // broken.
+  //
+  // So the expected first result is a PARTIAL fix -- the tint appearing on the
+  // ~27% of samples that validate. If it never fires, the source is junk and
+  // this comes straight back out; if it fires and flickers, the denormal in .y
+  // is the next thing to chase and not this window.
+  //
+  // Runs AFTER the shader's own literal overlay, never over it. Same ordering
+  // lesson FillMaterialGate paid for: placed before the table, a fill is simply
+  // overwritten for every shader whose table covers the window, and survives
+  // only on the shaders it was not aimed at.
+  if (!bank || !load_written) return 0;
+  uint32_t filled = 0;
+  std::lock_guard<std::mutex> lk(g_mu);
+  for (uint32_t c = kVertexTintFirstConst; c < kVertexTintEndConst; ++c) {
+    if (c >= bank_regs) continue;
+    // VALIDATE THE WHOLE FLOAT4 FIRST, decide second.
+    bool valid = true, any_nonzero = false, denormal = false, unpub = false;
+    for (uint32_t comp = 0; comp < 4; ++comp) {
+      const uint32_t d = c * 4 + comp;
+      if (!(g_have[d >> 5] & (1u << (d & 31)))) { unpub = true; valid = false; break; }
+      const uint32_t v = g_file[d];
+      if (NonFinite(v)) { valid = false; break; }
+      if (Denormal(v)) { denormal = true; valid = false; break; }
+      if (v != 0) any_nonzero = true;
+    }
+    // An all-zero publish is not worth substituting -- it is what the bank
+    // already holds -- but it is not a REJECTION either, so it is counted
+    // nowhere rather than being folded into one of the failure rows.
+    if (valid && !any_nonzero) valid = false;
+    if (denormal) ++g_vertexTintDenormal;
+    else if (unpub) ++g_vertexTintUnpub;
+    else if (valid) ++g_vertexTintApplied;
+    for (uint32_t comp = 0; comp < 4; ++comp) {
+      const uint32_t b = c * 4 + comp;
+      // Every dword is an opportunity whether or not the vector validated, so
+      // the census denominator is structural rather than a count of the times
+      // we happened to agree with ourselves.
+      const bool fired = valid && !load_written[b] && bank[b] == 0;
+      mx::gpu::guard::Note(mx::gpu::guard::Guard::kVertexTintFill, fired);
+      // Switchable, unlike the other fills in this file: turning it off leaves
+      // the tint at the black the guest bank already holds, which is exactly
+      // the pre-change behaviour. That makes the strict bit a one-run A/B on
+      // whether this is what changed the screen, with no rebuild.
+      if (!fired || mx::gpu::guard::Strict(mx::gpu::guard::Guard::kVertexTintFill))
+        continue;
+      bank[b] = g_file[c * 4 + comp];
+      ++filled;
+      ++g_vertexTintFilled;
+    }
+  }
+  return filled;
+}
+
 // The zero-fill population, worst first. `guest` is the ALU constant index;
 // subtract 256 for the pixel bank's xe_c[] numbering.
+// What we WOULD have filled a given constant with, as floats.
+//
+// Read it with the control in mind. c252..c255 are the screen-space scale/bias
+// the D3D9 shader load table is measured to carry -- values like (0.5, -0.5, 0,
+// 0) and (0, 1, 0.5, -0.5). If those come back looking like that, the constant
+// file is sane and a value read for any other register can be trusted. If they
+// come back as garbage, the file is stale or misindexed and NOTHING here should
+// be acted on, least of all a blanket substitution.
+std::string WouldFillValues(const uint32_t* consts, size_t n) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  std::string out;
+  char one[128];
+  for (size_t k = 0; k < n; ++k) {
+    const uint32_t c = consts[k];
+    if (c >= kAluConstants) continue;
+    float f[4];
+    bool any = false;
+    for (uint32_t i = 0; i < 4; ++i) {
+      const uint32_t bits = g_wouldFillVal[c * 4 + i];
+      std::memcpy(&f[i], &bits, 4);
+      if (bits) any = true;
+    }
+    if (c >= 256)
+      std::snprintf(one, sizeof(one), " c%u(ps c%u)=%s(%.4g,%.4g,%.4g,%.4g)", c,
+                    c - 256, any ? "" : "NEVER ", f[0], f[1], f[2], f[3]);
+    else
+      std::snprintf(one, sizeof(one), " c%u(vs)=%s(%.4g,%.4g,%.4g,%.4g)", c,
+                    any ? "" : "NEVER ", f[0], f[1], f[2], f[3]);
+    out += one;
+  }
+  return out;
+}
+
 std::string FilledHistogram(uint32_t top) {
   std::lock_guard<std::mutex> lk(g_mu);
   std::vector<std::pair<uint64_t, uint32_t>> v;

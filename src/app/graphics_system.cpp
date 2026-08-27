@@ -78,7 +78,7 @@ REXCVAR_DEFINE_BOOL(hle_capture, false, "Debug",
 // log line prints each guard's bit, computed from the same enum the switch is.
 // Read it there.
 //
-// Only three are switchable at all; the rest are structurally unswitchable and
+// Only a few are switchable at all; the rest are structurally unswitchable and
 // Strict() refuses them regardless of the bit. See guard_census.h.
 REXCVAR_DEFINE_INT32(hle_strict, 0, "Debug",
                      "Bitmask of inventing guards to disable, so the defect "
