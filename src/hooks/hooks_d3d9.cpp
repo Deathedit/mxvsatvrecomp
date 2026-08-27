@@ -4831,17 +4831,6 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
       REXLOG_INFO("d3d9: TEXTURE REPEATS {} addresses:{}",
                   g_texIndex.sites.size(), top.empty() ? " (none)" : top);
     }
-    // Printed unconditionally, empty included: "no large atlas was ever bound"
-    // and "one was bound and never changed" are different findings and a
-    // suppressed line looks like neither.
-    {
-      const std::string fh = ReportFullHashWatch();
-      REXLOG_INFO(
-          "d3d9: ATLAS FULL-HASH vs SAMPLED (full 1 = the guest never rewrote "
-          "it, so the art is absent at the source; full > sampled = the "
-          "fingerprint is blind to real writes):{}",
-          fh.empty() ? " (no atlas over 256KB was served from cache)" : fh);
-    }
     // RESOLVE CONSUMPTION. Every destination the guest has resolved into, and
     // whether it ever asked for it back through SetTexture.
     //

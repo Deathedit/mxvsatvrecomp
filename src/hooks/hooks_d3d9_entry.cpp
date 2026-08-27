@@ -1905,22 +1905,43 @@ extern "C" REX_FUNC(sub_8255B258) {
     // it: 0xF colours, 0x1F colours+depth, 0x20 stencil alone, 0x30
     // depth+stencil, 0x3F all three, 0x60 stencil+EDRAM.
     //
-    // D3DDevice_Clear's prototype is (pDevice, Count, pRects, Flags, Color, Z,
-    // Stencil, EDRAMClear), and r6/r7 are already read as Flags/Color above, so
-    // Stencil is r8 and EDRAMClear is r9.
-    const uint32_t stencil_value = ctx.r8.u32;
-    const bool edram_clear = ctx.r9.u32 != 0;
+    // STENCIL IS r9, NOT r8, and this file said otherwise until run 1536.
+    //
+    // The prototype is (pDevice, Count, pRects, Flags, Color, Z, Stencil,
+    // EDRAMClear). On this ABI a float argument consumes its integer register
+    // slot, so Z in f1 RESERVES r8 and the two integer args after it land in r9
+    // and r10. The clear census settles it from data rather than from the
+    // convention alone:
+    //
+    //   r8   0x2D00000 / 0x810000 / 0x18280186   never 0..255, and constant
+    //                                            within a flag group: a
+    //                                            leftover, not an argument
+    //   r9   0 everywhere, 1 on 0x60             exactly a stencil value
+    //   r10  0 always                            EDRAMClear, never set
+    //
+    // The first cut read r8 and logged `s=0` on every line, which looked
+    // correct and was not: 0x2D00000 & 0xFF is 0.
+    const uint32_t stencil_value = ctx.r9.u32;
     const bool want_depth = (flags & 0x10u) != 0;
-    // EDRAM clears are EXCLUDED, exactly as the depth gate above excludes them
-    // -- 0x60 carries 0x20 and would otherwise wipe the stencil mask on 16,139
-    // of 24,000 calls. It is a distinct operation (r9 set on every one), and
-    // erasing the mask each time would be worse than not clearing at all.
-    // Counted rather than silently dropped, so the exclusion is visible if it
-    // turns out to be wrong.
-    const bool want_stencil = (flags & 0x20u) != 0 && !edram_clear;
-    static std::atomic<uint64_t> s_stencilSkippedEdram{0};
-    if ((flags & 0x20u) && edram_clear)
-      s_stencilSkippedEdram.fetch_add(1, std::memory_order_relaxed);
+    // 0x60 IS EXCLUDED, but not for the reason previously given. The old note
+    // called it "the EDRAM tile clear" on the strength of r9 being set, and r9
+    // is the Stencil argument -- so that claim was reading a stencil value of 1
+    // as a boolean. r10, the actual EDRAMClear, is zero on every call in the
+    // run, so nothing here is an EDRAM clear.
+    //
+    // It stays excluded on the 0x40 bit instead: in sub_8255A510 the 0x40 path
+    // takes a DIFFERENT branch from the plain stencil clear, packing the value
+    // into bits 8-15 of the clear register rather than the low byte. Whatever
+    // that second field is, it is not "clear the stencil plane to N", and 0x60
+    // is 13,370 of 20,000 calls -- honouring it as a full clear on a guess
+    // would wipe the mask constantly.
+    //
+    // Counted, not silently dropped. Phase 3 decides whether 0x60 needs
+    // honouring, and this number is what that decision is made on.
+    const bool want_stencil = (flags & 0x20u) != 0 && (flags & 0x40u) == 0;
+    static std::atomic<uint64_t> s_stencilSkipped40{0};
+    if ((flags & 0x20u) && (flags & 0x40u))
+      s_stencilSkipped40.fetch_add(1, std::memory_order_relaxed);
     if ((want_depth || want_stencil) && rect_count == 0 && rects == 0 &&
         depth.valid) {
       mx::hle::DrawCall dclear{};
@@ -1944,11 +1965,11 @@ extern "C" REX_FUNC(sub_8255B258) {
           s_logged.size() <= 24) {
         REXLOG_INFO("d3d9: DEPTH/STENCIL CLEAR target 0x{:08X} {}x{} z={:g} "
                     "depth={} stencil={} s={} flags=0x{:X} (stencil clears "
-                    "skipped as EDRAM: {})",
+                    "skipped for the 0x40 variant: {})",
                     depth.object, depth.width, depth.height,
                     double(dclear.clear_depth), want_depth, want_stencil,
                     stencil_value & 0xFFu, flags,
-                    s_stencilSkippedEdram.load(std::memory_order_relaxed));
+                    s_stencilSkipped40.load(std::memory_order_relaxed));
       }
     }
   }
