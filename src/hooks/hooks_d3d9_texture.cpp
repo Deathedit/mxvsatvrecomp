@@ -1065,13 +1065,68 @@ bool ShaderPublishedFetch(uint32_t shader, uint32_t sampler, uint32_t out[6]) {
 // never the thread-local one: DeviceState() is thread_local and a worker-thread
 // draw would name the wrong shader, which here would mean binding another
 // draw's texture rather than merely missing one.
+// WHY a fetch could not be found. The function used to return a bare `false`
+// for six different situations and its caller asserted one of them -- "the
+// guest never bound anything to this sampler" -- which is true for exactly ONE
+// of the six. The other five are us failing to find a binding that exists, and
+// they are indistinguishable from the outside while the result is a black
+// texel either way.
+//
+// This matters at scale: a level run reports ~10,000 draws sampling black with
+// 9,995 of them on this path. If even a slice of that is rows 0/1/4/5 rather
+// than row 2, those are textures the guest bound and we lost.
+//
+// Ordered MOST-SPECIFIC-FIRST, and every path terminates in exactly one code.
+// An earlier reason-code chain in this tree was ordered the other way, made its
+// last entry unreachable, and printed a permanent zero that read as a
+// measurement -- see the note on that in hooks_d3d9.cpp.
+enum class FetchMiss : uint32_t {
+  kNoDevice,          // device pointer is 0 -- OURS
+  kShadowUnreadable,  // device shadow page would fault -- OURS
+  kNotATexture,       // shadow read fine, type != kTexture -- GUEST, black is
+                      // the hardware's own answer and nothing is wrong
+  kPublishedNoType,   // shader published a descriptor, but not a texture one
+  kThreadLocalUnset,  // no thread-local binding either -- see
+                      // [[device-state-is-thread-local]]: a worker thread can
+                      // legitimately have none while the drawing thread does
+  kThreadLocalInvalid,  // bound but flagged invalid
+  kCount
+};
+const char* FetchMissName(FetchMiss m) {
+  switch (m) {
+    case FetchMiss::kNoDevice: return "no-device(OURS)";
+    case FetchMiss::kShadowUnreadable: return "shadow-unreadable(OURS)";
+    case FetchMiss::kNotATexture: return "not-a-texture(GUEST)";
+    case FetchMiss::kPublishedNoType: return "published-not-texture";
+    case FetchMiss::kThreadLocalUnset: return "thread-local-unset";
+    case FetchMiss::kThreadLocalInvalid: return "thread-local-invalid";
+    default: return "?";
+  }
+}
+uint64_t g_fetchMiss[size_t(FetchMiss::kCount)] = {};
+// Per sampler AND per reason. The aggregate cannot say whether s1's failures
+// are the same kind as s5's, and the whole question is whether one family of
+// slots is legitimately unbound while another is being lost.
+std::map<std::pair<uint32_t, uint32_t>, uint64_t> g_fetchMissBySampler;
+
 bool ReadLiveTextureFetch(uint32_t device, uint8_t* base, uint32_t sampler,
-                          uint32_t out[6], uint32_t ps_handle = 0) {
+                          uint32_t out[6], uint32_t ps_handle = 0,
+                          FetchMiss* out_miss = nullptr) {
+  const auto miss = [&](FetchMiss m) {
+    ++g_fetchMiss[size_t(m)];
+    ++g_fetchMissBySampler[{sampler, uint32_t(m)}];
+    if (out_miss) *out_miss = m;
+    return false;
+  };
   if (!out || sampler >= mx::hle::kMaxSamplers) return false;
   std::memset(out, 0, sizeof(uint32_t) * 6);
   const uint32_t fetch_at = device + 0x480 + sampler * 24;
-  if (device && HostPageReadable(REX_RAW_ADDR(fetch_at)) &&
-      HostPageReadable(REX_RAW_ADDR(fetch_at + 20))) {
+  bool shadow_readable = false;
+  if (device) {
+    shadow_readable = HostPageReadable(REX_RAW_ADDR(fetch_at)) &&
+                      HostPageReadable(REX_RAW_ADDR(fetch_at + 20));
+  }
+  if (shadow_readable) {
     for (uint32_t i = 0; i < 6; ++i)
       out[i] = REX_LOAD_U32(fetch_at + i * 4);
     // FetchConstantType::kTexture == 2 (SDK rex/graphics/xenos.h:1093-1098).
@@ -1080,19 +1135,52 @@ bool ReadLiveTextureFetch(uint32_t device, uint8_t* base, uint32_t sampler,
   // Second, and only when the device shadow has nothing: the descriptor the
   // shader published for itself. A live SetTexture must still win, so this sits
   // below the shadow rather than above it.
+  bool published_seen = false;
   if (ps_handle) {
     uint32_t published[6] = {};
-    if (ShaderPublishedFetch(ps_handle, sampler, published) &&
-        (published[0] & 3u) == 2u) {
-      std::memcpy(out, published, sizeof(uint32_t) * 6);
-      ++g_shaderFetchServed;
-      return true;
+    if (ShaderPublishedFetch(ps_handle, sampler, published)) {
+      published_seen = true;
+      if ((published[0] & 3u) == 2u) {
+        std::memcpy(out, published, sizeof(uint32_t) * 6);
+        ++g_shaderFetchServed;
+        return true;
+      }
     }
   }
   const auto& tb = DeviceState().texture[sampler];
-  if (!tb.bound || !tb.valid) return false;
-  std::memcpy(out, tb.fetch, sizeof(uint32_t) * 6);
-  return true;
+  if (tb.bound && tb.valid) {
+    std::memcpy(out, tb.fetch, sizeof(uint32_t) * 6);
+    return true;
+  }
+  // Nothing produced a binding. Attribute it to the most specific thing that
+  // went wrong, hardest evidence first: a shadow we could READ and that said
+  // "not a texture" is the guest's own answer and outranks every downstream
+  // miss, because the later sources are fallbacks for a shadow we could not
+  // consult at all.
+  if (!device) return miss(FetchMiss::kNoDevice);
+  if (!shadow_readable) return miss(FetchMiss::kShadowUnreadable);
+  if ((out[0] & 3u) != 2u) return miss(FetchMiss::kNotATexture);
+  if (published_seen) return miss(FetchMiss::kPublishedNoType);
+  if (tb.bound) return miss(FetchMiss::kThreadLocalInvalid);
+  return miss(FetchMiss::kThreadLocalUnset);
+}
+
+// One line, every reason, zeros included -- and the per-sampler split beside
+// it, because "s1 is a different failure from s5" is the finding this exists to
+// make visible.
+std::string FetchMissReport() {
+  std::string out;
+  uint64_t total = 0;
+  for (uint64_t n : g_fetchMiss) total += n;
+  for (uint32_t i = 0; i < uint32_t(FetchMiss::kCount); ++i)
+    out += fmt::format(" {}={}", FetchMissName(FetchMiss(i)), g_fetchMiss[i]);
+  out += fmt::format(" | total {}", total);
+  std::string by;
+  for (const auto& [k, n] : g_fetchMissBySampler)
+    by += fmt::format(" s{}:{}={}", k.first, FetchMissName(FetchMiss(k.second)),
+                      n);
+  if (!by.empty()) out += "\n  by sampler:" + by;
+  return out;
 }
 
 // The milestone can sample one texture even when the guest shader uses many.
@@ -1916,6 +2004,12 @@ void ReportBoundZero() {
               g_resolveAddr.extentMiss, g_resolveDroppedNoSource,
               g_shaderFetchPublished.load(std::memory_order_relaxed),
               g_shaderFetchServed.load(std::memory_order_relaxed));
+  // WHY each of those unbound samplers had no fetch. Only `not-a-texture` is
+  // the guest's own answer, where black is what the hardware returns and
+  // nothing is missing. Everything marked (OURS), and arguably the two
+  // thread-local rows, is a binding that exists and we did not find -- i.e. a
+  // texture the player should be seeing.
+  REXLOG_INFO("d3d9: FETCH MISS BY REASON:{}", FetchMissReport());
 }
 
 // Every distinct (guest format, swizzle) pair that reaches a binding, printed
