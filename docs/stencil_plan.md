@@ -119,12 +119,44 @@ reports. If they disagree the plumbing is wrong, and no pixel has moved yet.
 
 ## Phase 2: stencil WRITE only
 
-`StencilEnable = TRUE`, func forced to `ALWAYS`, the guest's ops applied,
-`OMSetStencilRef` per draw. The buffer gets stamped; nothing tests it.
+**`StencilEnable` comes from the GUEST, per draw. Never blanket-on.** An earlier
+draft of this plan said `StencilEnable = TRUE`, and that was wrong in three
+separate ways:
+
+- **It corrupts the thing Phase 3 tests.** The guest sets the enable bit on
+  122,894 of 218,250 draws. The other ~107,000 have it CLEAR, and enabling
+  stencil on them applies their `fail`/`zpass`/`zfail` ops -- which WRITE. That
+  stamps the mask from draws the console never lets touch it, so Phase 3 would
+  then test against a buffer this phase corrupted.
+- **It blows the PSO cache.** `kMaxBlendPSOs` is 128 and overflow silently drops
+  a draw to its opaque pipeline. Every draw needing a stencil variant is the
+  fastest way there; gating on the guest bit keeps it to the ~14 real variants.
+- **It costs work for nothing** on half the frame.
+
+So the gate is exactly the census's own definition, and for the same reason:
+
+```
+StencilEnable = (depth_control & 1) && edram_mode in {4, 5}
+```
+
+Note `edram_mode` is part of it. Outside `kColorDepth(4)` / `kDepthOnly(5)` the
+hardware ignores the register, so a draw can have the enable bit set and mean
+nothing by it.
+
+With the gate right, the rest of the phase is: guest's ops, guest's read/write
+masks, `OMSetStencilRef` from the guest ref, and **func forced to `ALWAYS`**.
+Forcing the func is what makes this phase safe -- no draw can be rejected, so
+nothing can vanish -- and it is the ONLY thing here that is temporary.
 
 **Pass: the frame is pixel-identical.** A stencil write cannot change colour, so
-any visual change here is a plumbing bug, caught before it can be confused with
-a stencil-test effect.
+any visual change is a plumbing bug, caught before it can be confused with a
+stencil-test effect.
+
+**What this phase does NOT validate:** the stencil buffer's CONTENTS. With every
+func forced to `ALWAYS`, ops run on pixels the console would have rejected, so
+the mask is deliberately wrong here -- wrong and unobserved. It becomes correct
+the moment Phase 3 restores the real funcs, since the plane is cleared per frame
+anyway.
 
 ## Phase 3: stencil TEST
 
