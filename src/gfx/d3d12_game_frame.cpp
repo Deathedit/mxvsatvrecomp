@@ -1267,6 +1267,13 @@ void D3D12Renderer::RenderGameFrame() {
         // stencil plane belongs to the guest's own clears -- see
         // kGameDepthFrameClearFlags. The creation-time clear at the
         // needsInitialClear sites is what gives stencil its first value.
+        //
+        // MEASURED, so nobody has to try it twice: adding
+        // D3D12_CLEAR_FLAG_STENCIL here was A/B'd on 2026-08-27 and it is
+        // WORSE -- the menu text stops appearing entirely and the white tires
+        // come back. The guest DELIBERATELY PERSISTS STENCIL MASKS ACROSS
+        // FRAMES, and several things on screen depend on a mask stamped in an
+        // earlier frame. Wiping the plane on our own schedule is wrong.
         m_commandList->ClearDepthStencilView(dsv, kGameDepthFrameClearFlags,
                                              1.0f, 0, 0, nullptr);
         depthTarget->usedThisFrame = true;
@@ -2183,6 +2190,7 @@ void D3D12Renderer::RenderGameFrame() {
     std::snprintf(message, sizeof(message),
                   "alpha test: honoured %llu, STAND-IN %llu; "
                   "fixed16 -32..32 targets %llu draws (scale identity); 7e3 clamped %llu; "
+                  "texinv snapshot-shadowed slots %llu; "
                   "half-pixel offset applied %llu, skipped %llu; "
                   "guest viewport vs host target: match %llu, MISMATCH %llu, "
                   "unreadable %llu, taken-from-guest %llu; edram takeover "
@@ -2194,6 +2202,7 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_alphaTestStandIn),
                   static_cast<unsigned long long>(m_fixed16Scaled),
                   static_cast<unsigned long long>(m_float7e3Clamped),
+                  static_cast<unsigned long long>(m_texinvSlotMismatch),
                   static_cast<unsigned long long>(m_halfPixelDraws),
                   static_cast<unsigned long long>(m_halfPixelSkipped),
                   static_cast<unsigned long long>(m_vpMatch),
@@ -3063,21 +3072,57 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
         // Texture2DArray it samples wants a slice index. See EmitTextureFetch.
         // Left at zero for a snapshot or an absent texture, which pins such a
         // fetch to slice 0 instead of sampling off the end.
+        // SNAPSHOT FIRST, because that is the order the DESCRIPTOR uses.
+        // BindTranslatedTextures tests stageSampledObjects[i] before anything
+        // else, and a slot carrying an object either binds that snapshot or
+        // fails the whole draw. This fill used to test the payload first, so a
+        // slot bound to a snapshot could be NORMALIZED by a different texture's
+        // extent -- an unnormalized fetch then reads the wrong texel entirely.
+        //
+        // The shadowing texture is usually `d.texture`, NOT d.pixelTextures[s].
+        // That distinction cost a revert: inside ResolvePixelSlotTexture,
+        // out_objects[slot] and out_textures[slot] are mutually exclusive (each
+        // site sets one and returns), so "slot has both" looks impossible and a
+        // census keyed on d.pixelTextures[s] reads a structural ZERO. But
+        // `d.texture` is a SEPARATE field from the single-texture path, with its
+        // own producer, and slot 0 falls back to it. That is the real
+        // population, and it is invisible to a check that only looks at
+        // pixelTextures.
+        //
+        // Measured in menu.rdc event 8829, the rider material: xe_texinv[0] was
+        // 1/512 with .z = 1 -- .z is array_size and the snapshot branch leaves
+        // it 0, so a payload branch had run -- while the descriptor held the
+        // 1280x720 RGBA16F scene snapshot.
         for (uint32_t s = 0; s < kTranslatedSamplerSlots; ++s) {
           uint32_t w = 0, h = 0, layers = 0;
-          const auto& tex = s < d.pixelTextures.size() && d.pixelTextures[s]
-                                ? d.pixelTextures[s]
-                                : (s == 0 ? d.texture : nullptr);
-          if (tex && tex->width && tex->height) {
-            w = tex->width;
-            h = tex->height;
-            layers = tex->array_size;
-          } else if (s < d.pixelSampledObjects.size() &&
-                     d.pixelSampledObjects[s]) {
-            const auto snap = m_gameSnapshots.find(d.pixelSampledObjects[s]);
+          const uint32_t object =
+              s < d.pixelSampledObjects.size() ? d.pixelSampledObjects[s] : 0;
+          if (object) {
+            const auto snap = m_gameSnapshots.find(object);
             if (snap != m_gameSnapshots.end()) {
               w = snap->second.width;
               h = snap->second.height;
+              // What the OLD ordering would have used instead. Counted only
+              // when the extents actually DIFFER -- a shadowing texture that
+              // happens to match normalized correctly by accident. Includes the
+              // d.texture fallback, which is the whole point: without it this
+              // reads zero while the defect is live.
+              const auto& shadowed =
+                  (s < d.pixelTextures.size() && d.pixelTextures[s])
+                      ? d.pixelTextures[s]
+                      : (s == 0 ? d.texture : nullptr);
+              if (shadowed && shadowed->width && shadowed->height &&
+                  (shadowed->width != w || shadowed->height != h))
+                ++m_texinvSlotMismatch;
+            }
+          } else {
+            const auto& tex = s < d.pixelTextures.size() && d.pixelTextures[s]
+                                  ? d.pixelTextures[s]
+                                  : (s == 0 ? d.texture : nullptr);
+            if (tex && tex->width && tex->height) {
+              w = tex->width;
+              h = tex->height;
+              layers = tex->array_size;
             }
           }
           if (!w || !h) continue;

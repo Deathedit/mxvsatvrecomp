@@ -1744,6 +1744,13 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // invisible from outside: a negative in an R16G16B16A16_FLOAT target looks
   // like ordinary data until it reaches the luminance reduction.
   uint64_t m_float7e3Clamped = 0;
+  // Slots where the DESCRIPTOR bound a resolve snapshot while a DIFFERENT
+  // texture -- usually `d.texture`, the single-texture path's field -- would
+  // have supplied the extent under the old ordering, and disagreed about it.
+  // Counted per slot, only when the extents actually differ. It MUST include
+  // the d.texture fallback: a version of this that looked only at
+  // d.pixelTextures[s] read a structural zero and got a working fix reverted.
+  uint64_t m_texinvSlotMismatch = 0;
   // DIAG: WHITE-SKIPPED draws grouped by target extent.
   struct SkipTargetInfo {
     uint64_t count = 0;

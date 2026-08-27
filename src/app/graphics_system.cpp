@@ -115,10 +115,17 @@ REXCVAR_DEFINE_INT32(hle_strict, 0, "Debug",
 // VANISHING rather than degrading, so an A/B without a rebuild is worth having,
 // and the TERRAIN is the regression test -- it is the thing that broke, and it
 // broke visibly.
+// NOT a clean test/write split, and the old wording here said it was.
+//
+// Forcing the comparison to ALWAYS means the stencil test never FAILS, so
+// StencilFailOp becomes unreachable and only the pass and depth-fail ops ever
+// run. The writes are therefore NOT preserved -- one of the three op paths is
+// removed with them. Anything this flag exonerates, it exonerates as a pair.
 REXCVAR_DEFINE_BOOL(d3d9_stencil_test, true, "Graphics",
-                    "Honour the guest's stencil comparison. Off keeps stencil "
-                    "writes but forces every test to ALWAYS, which cannot "
-                    "reject a fragment.");
+                    "Honour the guest's stencil comparison. Off forces every "
+                    "test to ALWAYS, which cannot reject a fragment -- and so "
+                    "also makes StencilFailOp unreachable. Not a test/write "
+                    "split.");
 
 // MUTATION TEST for the stencil path. Diagnostic only, never for normal play.
 //

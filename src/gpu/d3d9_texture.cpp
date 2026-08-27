@@ -694,12 +694,22 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
       out.host_format = HostTextureFormat::kRg32Float;
       break;
     // The two FIXED-POINT ones. Not float, and not the -32..32 the render-target
-    // side of these same formats uses: that scale belongs to
-    // ColorRenderTargetFormat 4 and 5 on the WRITE path, where the pixel shader
-    // already divides by 32 (see xe_colorscale in d3d12_game.cpp), so what is
-    // actually in memory is normalized and is read back normalized. Getting
-    // this backwards would be a silent 32x on everything sampled from a
-    // G-buffer.
+    // side of these same formats uses.
+    //
+    // The justification here USED to be "the pixel shader already divides by 32
+    // on the write path, so memory holds normalized values". That is no longer
+    // true and was never the reason: the 1/32 was Xenia's SNORM-target hack, it
+    // had no inverse on our half-float targets, and it was removed -- a
+    // ColorRenderTargetFormat 4 or 5 target now holds raw -32..32. See the
+    // xe_colorscale note in d3d12_game_frame.cpp.
+    //
+    // The mapping below is unchanged and stands on its own reason: this is the
+    // TEXTURE format table, and TextureFormat k_16_16 / k_16_16_16_16 are
+    // normalized fixed point by the fetch's own sign bits, which is a different
+    // question from what ColorRenderTargetFormat 4 and 5 mean. A surface
+    // written as an RT and sampled back does not come through here at all -- it
+    // takes the resolve-snapshot branch in BindTranslatedTextures, which views
+    // the host resource directly and never reinterprets the range.
     //
     // UNORM or SNORM by the fetch's own sign bits, exactly as the reference
     // does it -- see the note on kRg16Unorm in hle_types.h for why the choice
