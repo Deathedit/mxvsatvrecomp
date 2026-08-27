@@ -340,57 +340,10 @@ void NoteUpDrawCaller(uint32_t lr, uint32_t verts, uint32_t kind);
 void ReportUpDrawCallers();
 
 
-// SCALEFORM MASK STACK -- sub_829E1378, GRenderer::BeginSubmitMask/EndSubmitMask.
-// One function, mode in a2: 0 = Clear, 1 = Increment, 2 = Decrement, >=3 = no-op.
-// The mask LEVEL lives at renderer+284 and the capability flag at renderer+281.
-//
-// Increments and decrements must BALANCE. If they do not, the level drifts and
-// masked UI content stops passing the stencil compare -- which is a defect that
-// takes many frames to become visible and only bites when the comparison is
-// live. That is the shape of "MAIN MENU slides off after 1-2 seconds, only with
-// d3d9_stencil_test=true".
-extern std::atomic<uint64_t> g_maskClear;
-extern std::atomic<uint64_t> g_maskIncr;
-extern std::atomic<uint64_t> g_maskDecr;
-extern std::atomic<uint64_t> g_maskOther;
-extern std::atomic<uint64_t> g_maskIncapable;  // renderer+281 == 0: NO masking
-extern std::atomic<int32_t> g_maskLevelMax;
-extern std::atomic<int32_t> g_maskLevelMin;
-extern std::atomic<int32_t> g_maskLevelLast;
-// sub_829DFDB8 = EndSubmitMask: colour writes back ON, stencil func EQUAL at
-// ref = level, pass op KEEP, and renderer+288 set to 1 ("a mask is active").
-// The third leg of the stack, and without it "94 begins, 0 disables" cannot be
-// told apart from "masking is not used at all".
-extern std::atomic<uint64_t> g_maskEnd;
-extern std::atomic<uint64_t> g_maskActiveSeen;  // renderer+288 == 1 afterwards
 
 
 
-// DRAWS ISSUED WHILE THE MASK IS BEING STAMPED.
-//
-// Between BeginSubmitMask (stencil ALWAYS/REPLACE ref 1, colour writes off) and
-// EndSubmitMask (switch to EQUAL) the guest is supposed to draw the mask SHAPE.
-// If it draws nothing, the plane keeps the 0 the Begin cleared it to, and every
-// later EQUAL-ref-1 test fails -- content vanishes, and no counter anywhere else
-// would show it.
-//
-// The census supports this: it contains EQUAL ref 1 (x7465, the masked content)
-// but NO ALWAYS/REPLACE ref 1 at all. That is either "no draw happened in the
-// window" or "a draw happened and something reset the ref", and only a count
-// taken INSIDE the window can tell them apart.
-void NoteMaskWindowOpen();
-void NoteMaskWindowClose();
-void NoteDrawForMaskWindow();
-extern std::atomic<uint64_t> g_maskWindowsOpened;
-extern std::atomic<uint64_t> g_maskWindowsWithDraws;
-extern std::atomic<uint64_t> g_maskWindowDraws;
 
-// WHO OPENS THE MASK WINDOW. BeginSubmitMask and EndSubmitMask are vtable-only
-// (single data xref each at 0x821BC5A8 / 0x821BC518), so there is no static
-// caller to read -- the link register at the call is the only way to name the
-// display-list code that opens a mask and then draws nothing into it.
-void NoteMaskBeginCaller(uint32_t lr);
-void ReportMaskBeginCallers();
 
 // The extent of a Scaleform glyph atlas, read off the cache object by the flush
 // hook. This is what makes the flush invalidation name the atlases instead of

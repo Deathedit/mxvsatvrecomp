@@ -173,87 +173,6 @@ REXCVAR_DEFINE_BOOL(d3d9_hooks_passthrough, false, "Debug",
   std::lock_guard<std::recursive_mutex> _hle_lock(mx::hle::HleGlobalMutex())
 
 //=============================================================================
-// 0x829E0FB8 - GFx DrawBitmaps. THE IMAGE HALF OF THE UI.
-//
-// Every one of the 19765 Scaleform DrawVerticesUP calls in a menu run comes
-// from ONE call site inside this function (lr 0x829E1314, verts 6..288 avg 92 --
-// it packs 6-vertex quads and flushes at 288). The caller census cannot split
-// them finer than that, because GFx batches components together in here. So the
-// question moves inside, to the gate the whole body sits under:
-//
-//     if (*(BYTE*)(a1+16) && a2 && a6 && (a6[10] || sub_829E4458(a6)))
-//
-//   a1+16  renderer enabled
-//   a2     the array of 36-byte bitmap records
-//   a6     the image
-//   a6[10] its resident texture; sub_829E4458 is the attempt to create one
-//
-// Fail any of them and the batch is dropped with NO error and NO log, and
-// nothing reaches our D3D9 hooks -- which is why the missing panels cannot be
-// found in a capture.
-//
-// Why this is the right place to look: it draws BITMAPS. The menu furniture
-// that is missing -- bar backgrounds, (X)/(A)/(B) button glyphs, the star
-// widget, the top panel -- is all image-backed, while everything that survives
-// is TEXT, which takes the glyph path this file already measured clean (2020
-// asked, 0 lost). That split is the hypothesis, and these counters are how it
-// gets confirmed or killed.
-//
-// a6[10] can only be read BEFORE the original: if it is 0 the guest calls the
-// bind, which sets it. So the texture case is attributed with a thread_local
-// set by the bind hook, exactly as the slow-raster gates are.
-//=============================================================================
-REX_IMPORT(__imp__sub_829DFDB8, orig_GfxEndSubmitMask, void());
-extern "C" REX_FUNC(sub_829DFDB8) {
-  const uint32_t renderer = ctx.r3.u32;
-  orig_GfxEndSubmitMask(ctx, base);
-  NoteMaskWindowClose();
-  g_maskEnd.fetch_add(1, std::memory_order_relaxed);
-  if (renderer && HostPageReadable(REX_RAW_ADDR(renderer + 288)) &&
-      REX_LOAD_U8(renderer + 288))
-    g_maskActiveSeen.fetch_add(1, std::memory_order_relaxed);
-}
-
-REX_IMPORT(__imp__sub_829E1378, orig_GfxSubmitMask, void());
-extern "C" REX_FUNC(sub_829E1378) {
-  const uint32_t renderer = ctx.r3.u32;
-  const uint32_t mode = ctx.r4.u32;
-
-  orig_GfxSubmitMask(ctx, base);
-
-  switch (mode) {
-    case 0:
-      g_maskClear.fetch_add(1, std::memory_order_relaxed);
-      // The stamping window opens here and closes at EndSubmitMask.
-      NoteMaskWindowOpen();
-      // And WHO opened it -- the display-list code that is supposed to draw a
-      // mask shape next and does not.
-      NoteMaskBeginCaller(static_cast<uint32_t>(ctx.lr));
-      break;
-    case 1: g_maskIncr.fetch_add(1, std::memory_order_relaxed); break;
-    case 2: g_maskDecr.fetch_add(1, std::memory_order_relaxed); break;
-    default: g_maskOther.fetch_add(1, std::memory_order_relaxed); break;
-  }
-  if (!renderer) return;
-  if (HostPageReadable(REX_RAW_ADDR(renderer + 281)) &&
-      REX_LOAD_U8(renderer + 281) == 0) {
-    g_maskIncapable.fetch_add(1, std::memory_order_relaxed);
-    return;  // nothing was done, so the level below is not meaningful
-  }
-  if (!HostPageReadable(REX_RAW_ADDR(renderer + 284))) return;
-  const int32_t level = static_cast<int32_t>(REX_LOAD_U32(renderer + 284));
-  g_maskLevelLast.store(level, std::memory_order_relaxed);
-  int32_t prev = g_maskLevelMax.load(std::memory_order_relaxed);
-  while (level > prev &&
-         !g_maskLevelMax.compare_exchange_weak(prev, level,
-                                               std::memory_order_relaxed)) {}
-  prev = g_maskLevelMin.load(std::memory_order_relaxed);
-  while (level < prev &&
-         !g_maskLevelMin.compare_exchange_weak(prev, level,
-                                               std::memory_order_relaxed)) {}
-}
-
-//=============================================================================
 // 0x82945D20 - DefineCompactedFont. THE LOADER THIS GAME ACTUALLY USES.
 //
 // This title does NOT load fonts through DefineFont, DefineFont2 or
@@ -485,7 +404,6 @@ extern "C" REX_FUNC(sub_82564C50) {
 
 REX_IMPORT(__imp__sub_825565C8, orig_DrawIndexedVertices, void());
 extern "C" REX_FUNC(sub_825565C8) {
-  NoteDrawForMaskWindow();
   NoteUpDrawCaller(static_cast<uint32_t>(ctx.lr), ctx.r6.u32, 0);
   // BEFORE the passthrough return, so the count is comparable across modes.
   g_guestDrawCalls.fetch_add(1, std::memory_order_relaxed);
@@ -535,7 +453,6 @@ extern "C" REX_FUNC(sub_825565C8) {
 
 REX_IMPORT(__imp__sub_825561B0, orig_DrawVertices, void());
 extern "C" REX_FUNC(sub_825561B0) {
-  NoteDrawForMaskWindow();
   NoteUpDrawCaller(static_cast<uint32_t>(ctx.lr), ctx.r6.u32, 1);
   g_guestDrawCalls.fetch_add(1, std::memory_order_relaxed);
   MX_D3D9_PLUGIN_PASSTHROUGH(orig_DrawVertices);
@@ -766,7 +683,6 @@ extern "C" REX_FUNC(sub_825556B8) {
 //-----------------------------------------------------------------------------
 REX_IMPORT(__imp__sub_82555B88, orig_DrawVerticesUP, void());
 extern "C" REX_FUNC(sub_82555B88) {
-  NoteDrawForMaskWindow();
   // DrawVerticesUP reserves its ring space THROUGH BeginVertices, so the
   // hook below would build a second DrawCall for every UP draw. RAII, not a
   // plain ++/--, because the plugin passthrough returns early.
@@ -877,7 +793,6 @@ extern "C" REX_FUNC(sub_82555B88) {
 //-----------------------------------------------------------------------------
 REX_IMPORT(__imp__sub_82556110, orig_DrawIndexedVerticesUP, void());
 extern "C" REX_FUNC(sub_82556110) {
-  NoteDrawForMaskWindow();
   const UpDepthGuard up_depth_guard;
   g_guestDrawCalls.fetch_add(1, std::memory_order_relaxed);
   MX_D3D9_PLUGIN_PASSTHROUGH(orig_DrawIndexedVerticesUP);

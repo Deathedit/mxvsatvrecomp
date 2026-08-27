@@ -6793,55 +6793,7 @@ void ReportGlyphCache() {
   // composition, because then every glyph the guest asked for was delivered
   // and the missing quads were never requested in the first place.
 
-  d::ReportMaskBeginCallers();
-  // THE DECIDING NUMBER. Windows opened by BeginSubmitMask vs how many saw any
-  // draw at all before EndSubmitMask. A window with no draws leaves the stencil
-  // plane at the 0 the Begin cleared it to, and every EQUAL-ref-1 test after it
-  // fails by construction.
-  {
-    const uint64_t opened = d::g_maskWindowsOpened.load(std::memory_order_relaxed);
-    const uint64_t withDraws = d::g_maskWindowsWithDraws.load(std::memory_order_relaxed);
-    REXLOG_INFO("d3d9: GFx MASK WINDOW {} opened | {} contained draws | {} "
-                "draws total{}",
-                opened, withDraws,
-                d::g_maskWindowDraws.load(std::memory_order_relaxed),
-                (opened && !withDraws)
-                    ? " -- NO MASK SHAPE IS EVER DRAWN: the plane keeps the 0 "
-                      "the clear left, so every later EQUAL-ref-1 test fails and "
-                      "all masked content is rejected"
-                    : "");
-  }
 
-  // SCALEFORM MASK STACK. The number that matters is BALANCE: increments and
-  // decrements should match over a frame, and the level should return to where
-  // it started. A drifting level is masked content on its way to vanishing.
-  {
-    const uint64_t incr = d::g_maskIncr.load(std::memory_order_relaxed);
-    const uint64_t decr = d::g_maskDecr.load(std::memory_order_relaxed);
-    const uint64_t incap = d::g_maskIncapable.load(std::memory_order_relaxed);
-    const uint64_t begins = d::g_maskClear.load(std::memory_order_relaxed);
-    const uint64_t ends = d::g_maskEnd.load(std::memory_order_relaxed);
-    REXLOG_INFO("d3d9: GFx MASK begin {} | end {} | disable {} | incr {} | "
-                "other {} | active-after-end {} | level last {} range {}..{} | "
-                "{} calls with masking DISABLED{}{}",
-                begins, ends, decr, incr,
-                d::g_maskOther.load(std::memory_order_relaxed),
-                d::g_maskActiveSeen.load(std::memory_order_relaxed),
-                d::g_maskLevelLast.load(std::memory_order_relaxed),
-                d::g_maskLevelMin.load(std::memory_order_relaxed),
-                d::g_maskLevelMax.load(std::memory_order_relaxed), incap,
-                incap ? " -- the depth-stencil format failed GFx's check, so "
-                        "NO masking happens at all and the levels above mean "
-                        "nothing"
-                      : (incr == decr
-                             ? ""
-                             : " -- INCR != DECR, the mask stack is UNBALANCED"),
-                (ends > decr)
-                    ? " -- ENDS EXCEED DISABLES: the stencil is left in EQUAL "
-                      "test mode, so later draws are tested against a mask "
-                      "nobody asked for"
-                    : "");
-  }
 
 
 
