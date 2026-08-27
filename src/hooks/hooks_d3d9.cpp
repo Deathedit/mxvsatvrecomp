@@ -1351,6 +1351,68 @@ void NoteVideoShapeSlot(const uint32_t* fetch, bool fetch_valid) {
 // and refuses when the extents disagree -- an address the guest allocator has
 // recycled describes a different texture, and inheriting the old snapshot would
 // swap a black surface for a confidently wrong one.
+// DOES THE GPU EVER WRITE THIS RANGE? Answers with a denominator.
+//
+// On Xenos a render target lives in EDRAM. The ONLY way GPU output reaches
+// guest memory is a RESOLVE. So "no resolve overlaps this range" is not a hint
+// -- it is proof the GPU never wrote these bytes, and a texture that reads as
+// uniform in guest memory really is uniform rather than a surface we failed to
+// claim. That distinction is the whole question for the terrain's
+// virtual-texture page table, which is uniform in memory while the tile atlas
+// beside it streams correctly.
+//
+// ResolvedTargetForAddress cannot answer it. That function needs an EXACT base
+// match AND equal extents AND mostly-written coverage, and returns nullptr for
+// all three failures, every one of which prints `resolved=0`. So the flag we
+// already had cannot separate "nothing resolves here" from "something resolves
+// here and we declined to claim it" -- the same collapse as a reason-code chain
+// whose branches share an outcome.
+//
+// This overlaps RANGES at any extent and any offset, which is also the shape an
+// atlas built from small sub-rect resolves actually has. Destination byte size
+// is not recorded, so rather than guess a bytes-per-pixel and risk a fabricated
+// overlap, the test is stated in terms this data supports exactly:
+//
+//   exact   - a resolve destination starts precisely at this address
+//   inside  - resolve destinations whose base falls WITHIN this range, i.e.
+//             the range is being filled piecewise (the atlas pattern)
+//   below   - nearest destination base below this address, with the delta, so
+//             a range that sits INSIDE a larger destination is still visible
+//
+// `total` is the denominator: without it a zero cannot be told from a registry
+// that was never populated.
+ResolveRangeProbe ProbeResolveRange(uint32_t address, uint32_t bytes) {
+  ResolveRangeProbe p;
+  if (!address) return p;
+  const uint32_t base = GpuPhysicalAddress(address);
+  const uint32_t end = bytes ? base + bytes : base + 1u;
+  p.total = uint32_t(g_resolvedTargetsByAddress.size());
+  for (const auto& [addr, e] : g_resolvedTargetsByAddress) {
+    if (addr == base) {
+      p.exact = 1;
+      p.first_width = e.width;
+      p.first_height = e.height;
+      p.first_addr = addr;
+    } else if (addr > base && addr < end) {
+      if (!p.inside) {
+        p.first_addr = addr;
+        p.first_width = e.width;
+        p.first_height = e.height;
+      }
+      ++p.inside;
+    } else if (addr < base) {
+      const uint32_t delta = base - addr;
+      if (!p.below_addr || delta < p.below_delta) {
+        p.below_addr = addr;
+        p.below_delta = delta;
+        p.below_width = e.width;
+        p.below_height = e.height;
+      }
+    }
+  }
+  return p;
+}
+
 const ResolvedTargetByAddress* ResolvedTargetForAddress(
     const mx::hle::HleTextureSource& described) {
   if (!described.address) return nullptr;

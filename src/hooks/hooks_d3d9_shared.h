@@ -265,6 +265,25 @@ void CapturePatchedCode(uint32_t self, uint32_t dest, uint32_t variant,
                         uint8_t* base);
 uint32_t ReadPatchFetchCount(uint32_t self, uint32_t variant, uint8_t* base);
 void ReportPatchRule();
+// Whether any RESOLVE reaches a guest address range, with the denominator.
+// On Xenos a render target lives in EDRAM and only a resolve moves GPU output
+// into guest memory, so a zero here proves the GPU never wrote those bytes.
+// See the note at the definition for why `resolved=0` could not answer this.
+struct ResolveRangeProbe {
+  uint32_t total = 0;         // resolve destinations known -- the denominator
+  uint32_t exact = 0;         // a destination starts exactly at this address
+  uint32_t inside = 0;        // destinations whose base is within the range
+  uint32_t first_addr = 0;    // the exact or first inside destination
+  uint32_t first_width = 0;
+  uint32_t first_height = 0;
+  uint32_t below_addr = 0;    // nearest destination base below the range
+  uint32_t below_delta = 0;
+  uint32_t below_width = 0;
+  uint32_t below_height = 0;
+  bool any() const { return exact || inside; }
+};
+ResolveRangeProbe ProbeResolveRange(uint32_t address, uint32_t bytes);
+
 const ResolvedTargetByAddress* ResolvedTargetForAddress(
     const mx::hle::HleTextureSource& described);
 

@@ -2752,11 +2752,31 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     g_flatRetryKeys[key] = mx::hle::D3D9FrameCount();
     static std::set<uint64_t> s_flatSeen;
     if (s_flatSeen.insert(key).second && s_flatSeen.size() <= 12) {
+      // IS THIS ACTUALLY A GPU SURFACE WE FAILED TO CLAIM? On Xenos a render
+      // target lives in EDRAM and only a RESOLVE moves GPU output into guest
+      // memory, so a zero here proves the GPU never wrote these bytes and the
+      // texture is genuinely uniform -- not a surface we decoded from a stale
+      // CPU-side copy. `resolved=0` on the SLOT MAP cannot say this: it is
+      // also what an extent mismatch and a coverage refusal both print.
+      const mx::hooks::d3d9::ResolveRangeProbe rp =
+          mx::hooks::d3d9::ProbeResolveRange(source.address,
+                                             uint32_t(flat_base));
       REXLOG_INFO(
           "d3d9: FLAT RETRY-MARKED addr 0x{:08X} {}x{} fmt {} ({} KB) -- "
-          "re-read every {} frames until it carries data",
+          "re-read every {} frames until it carries data | RESOLVE REACH: "
+          "exact {} inside {} of {} destinations{}",
           source.address, source.width, source.height, source.guest_format,
-          uint32_t(flat_base / 1024), kFlatRetryFrames);
+          uint32_t(flat_base / 1024), kFlatRetryFrames, rp.exact, rp.inside,
+          rp.total,
+          rp.any()
+              ? fmt::format(" -- dest 0x{:08X} {}x{}", rp.first_addr,
+                            rp.first_width, rp.first_height)
+              : (rp.below_addr
+                     ? fmt::format(" -- NONE; nearest below 0x{:08X} {}x{} "
+                                   "(delta 0x{:X})",
+                                   rp.below_addr, rp.below_width,
+                                   rp.below_height, rp.below_delta)
+                     : std::string(" -- NONE, and none below either")));
     }
   } else {
     g_flatRetryKeys.erase(key);
