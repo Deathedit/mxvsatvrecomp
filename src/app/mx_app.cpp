@@ -33,6 +33,10 @@ struct GuestFuncHit {
   uint32_t guest = 0;
   uint64_t host = 0;
   uint64_t next_host = 0;
+  // Guest bytes of the function itself, from the next entry in GUEST order.
+  // Without it the offset below cannot be sanity-checked -- see the note at
+  // the report.
+  uint32_t guest_size = 0;
 };
 
 GuestFuncHit ResolveGuestFunction(uint64_t rip) {
@@ -47,6 +51,15 @@ GuestFuncHit ResolveGuestFunction(uint64_t rip) {
     } else if (!hit.next_host || host < hit.next_host) {
       hit.next_host = host;
     }
+  }
+  // Second sweep for the next GUEST address, which gives the function's size.
+  if (hit.guest) {
+    uint32_t next_guest = 0;
+    for (const PPCFuncMapping* m = PPCFuncMappings; m->guest; ++m) {
+      const uint32_t g = static_cast<uint32_t>(m->guest);
+      if (g > hit.guest && (!next_guest || g < next_guest)) next_guest = g;
+    }
+    if (next_guest) hit.guest_size = next_guest - hit.guest;
   }
   return hit;
 }
@@ -109,10 +122,57 @@ LONG CALLBACK CrashReporter(EXCEPTION_POINTERS* info) {
       REXLOG_ERROR("***   -> NOT in guest range (base 0x{:016X}) — host-side pointer", gbase);
     }
 
+    // WHERE THE FAULT IS, AND HOW MUCH THAT CLAIM IS WORTH.
+    //
+    // The containment test below is `rip < next_host`, and next_host is the
+    // next mapped function in HOST order. That is not a bound on THIS
+    // function's body: anything the linker placed in the gap -- runtime
+    // helpers, host code, padding -- is inside [host, next_host) and gets
+    // attributed here anyway. So a RIP well past the end of a small function
+    // still reported as "in" it, confidently and wrongly.
+    //
+    // That is not hypothetical. The recurring UI-thread fault in this build
+    // (read at guest 0x4C69746C, "Litl" in ASCII -- a string being used as a
+    // pointer) reported for its entire history as
+    //
+    //     -> in recompiled guest function 0x8236EB30 (+0x1078 of host code)
+    //
+    // while 0x8236EB30 is 0x7C guest bytes long. 0x1078 of host code for 0x7C
+    // of guest is ~34 host bytes per guest BYTE, an order out. And the
+    // register dump below never printed for it, meaning GuestContextFrom found
+    // no PPCContext in the argument registers -- which recompiled functions
+    // always have. Two independent signals that the RIP was not in recompiled
+    // code at all, and the line asserted otherwise across 17 crashes.
+    //
+    // So the claim now carries its evidence: the offset is reported against
+    // the function's guest size, and the absence of a PPCContext is stated
+    // rather than left as a missing line. An honest "I do not know" is worth
+    // more than a plausible function name, because the name sends you into
+    // IDA after the wrong code.
     const GuestFuncHit hit = ResolveGuestFunction(rip);
+    const PPCContext* ctx = GuestContextFrom(info->ContextRecord, gbase);
     if (hit.guest && (!hit.next_host || rip < hit.next_host)) {
-      REXLOG_ERROR("***   -> in recompiled guest function 0x{:08X} (+0x{:X} of host code)",
-                   hit.guest, rip - hit.host);
+      const uint64_t off = rip - hit.host;
+      // Recompiled x64 runs roughly 5-15 bytes of host per guest byte. Well
+      // past that means the RIP is in whatever sits after the function, not in
+      // it. Deliberately generous -- this only has to catch the order-of-
+      // magnitude case.
+      const bool implausible =
+          hit.guest_size && off > uint64_t(hit.guest_size) * 24ull;
+      if (implausible || !ctx) {
+        REXLOG_ERROR(
+            "***   -> host RIP is +0x{:X} past recompiled 0x{:08X} (guest size "
+            "0x{:X}){}{} -- ATTRIBUTION UNRELIABLE, treat as host code, not as "
+            "this guest function",
+            off, hit.guest, hit.guest_size,
+            implausible ? "; offset too large for that size" : "",
+            ctx ? "" : "; no PPCContext in argument registers");
+      } else {
+        REXLOG_ERROR(
+            "***   -> in recompiled guest function 0x{:08X} (+0x{:X} of host "
+            "code, guest size 0x{:X})",
+            hit.guest, off, hit.guest_size);
+      }
     } else {
       REXLOG_ERROR("***   -> not inside any recompiled guest function (nearest below 0x{:08X})",
                    hit.guest);
@@ -120,7 +180,7 @@ LONG CALLBACK CrashReporter(EXCEPTION_POINTERS* info) {
 
     // The registers are the whole point of catching this: they name which
     // pointer was bad, and every field of it the guest had already loaded.
-    if (const PPCContext* ctx = GuestContextFrom(info->ContextRecord, gbase)) {
+    if (ctx) {
       // Indexed by hand because PPCContext stores r3 first, ahead of r0, so
       // the registers are not an array and pointer arithmetic would silently
       // report the wrong one.
