@@ -1629,6 +1629,7 @@ void D3D12Renderer::RenderGameFrame() {
       // not match it.
       key.rtvFormat1 = boundTarget1Format;
       key.topoType = topoType;
+      key.stencilIndex = d.stencilIndex;
       key.flags = uint8_t((tDepthEnable ? 1u : 0u) |
                           (tDepthWrite ? 2u : 0u) |
                           (d.colorWrite ? 0u : 4u) |
@@ -1769,6 +1770,10 @@ void D3D12Renderer::RenderGameFrame() {
     }
     if (translatedPso) {
       m_commandList->SetGraphicsRootSignature(m_translatedRootSig.Get());
+      // Per draw, not pipeline state -- same reason as the stand-in path, and
+      // it has to be set on THIS path too or a translated stencil draw
+      // inherits whatever reference the previous draw left behind.
+      if (d.stencilIndex) m_commandList->OMSetStencilRef(d.stencil.ref);
       // The block heap is a different heap from the stand-in path's, so it has
       // to be bound alongside the sampler heap for this draw.
       ID3D12DescriptorHeap* theaps[] = {m_translatedSrvHeap.Get(),
@@ -2180,19 +2185,26 @@ void D3D12Renderer::RenderGameFrame() {
     //                falls back to its opaque pipeline and loses its blending,
     //                and stencil multiplies the variants that reach it.
     //   by-format    the on-demand opaque cache, same concern.
+    //   translated   THE ONE THAT MATTERS NOW. Stencil is in the translated
+    //                key, so every stencil state multiplies the variants of
+    //                every shader that meets it. `capped` non-zero means the
+    //                cache is full and pipelines are no longer being built.
     std::snprintf(message, sizeof(message),
                   "  STENCIL PSOs: %llu draws carried stencil (%llu with a "
                   "comparison that can REJECT -- zero means the test is not "
                   "live), %llu distinct states interned, %llu refused past the "
                   "cap (must be 0); blend PSOs %llu of %llu, by-format PSOs "
-                  "%llu",
+                  "%llu, TRANSLATED PSOs %llu of %llu (capped %llu)",
                   static_cast<unsigned long long>(m_stencilDraws),
                   static_cast<unsigned long long>(m_stencilTestingDraws),
                   static_cast<unsigned long long>(m_stencilStates.size()),
                   static_cast<unsigned long long>(m_stencilStatesRefused),
                   static_cast<unsigned long long>(m_blendPSOs.size()),
                   static_cast<unsigned long long>(kMaxBlendPSOs),
-                  static_cast<unsigned long long>(m_gamePSOsByFormat.size()));
+                  static_cast<unsigned long long>(m_gamePSOsByFormat.size()),
+                  static_cast<unsigned long long>(m_translatedPSOs.size()),
+                  static_cast<unsigned long long>(kMaxTranslatedPSOs),
+                  static_cast<unsigned long long>(m_translatedPsoCapped));
     LogInfo(message);
     // DIAG: what the WHITE-SKIPPED draws were aimed at.
     for (const auto& [extent, e] : m_skipByTarget) {

@@ -791,6 +791,64 @@ bool D3D12Renderer::CreateTranslatedRootSignature() {
   return true;
 }
 
+// Guest stencil op / compare -> D3D12. Both enums are the same ordering with
+// D3D12 starting at 1, verified against rex/graphics/xenos.h:677 and :688, so
+// this is an offset rather than a table. Clamped rather than trusted: the field
+// is three bits and every value is legal, but a caller passing an already-
+// converted value would otherwise index off the end of the D3D12 enum.
+D3D12_STENCIL_OP GuestStencilOp(uint8_t v) {
+  return D3D12_STENCIL_OP((v & 7u) + 1u);
+}
+D3D12_COMPARISON_FUNC GuestStencilFunc(uint8_t v) {
+  return D3D12_COMPARISON_FUNC((v & 7u) + 1u);
+}
+
+// Write the stencil half of a pipeline description. Called from BOTH PSO
+// builders so they cannot drift: a stencil variant built one way in the opaque
+// path and another in the blended path would differ only for blended draws,
+// which is exactly the kind of divergence that is invisible until it is not.
+void ApplyStencil(const D3D12Renderer::GameStencil& st,
+                  D3D12_DEPTH_STENCIL_DESC& ds) {
+  ds.StencilEnable = st.enable ? TRUE : FALSE;
+  if (!st.enable) return;
+  ds.StencilReadMask = st.readMask;
+  ds.StencilWriteMask = st.writeMask;
+  ds.FrontFace.StencilFailOp = GuestStencilOp(st.frontFail);
+  ds.FrontFace.StencilDepthFailOp = GuestStencilOp(st.frontZFail);
+  ds.FrontFace.StencilPassOp = GuestStencilOp(st.frontPass);
+  ds.FrontFace.StencilFunc = GuestStencilFunc(st.frontFunc);
+  ds.BackFace.StencilFailOp = GuestStencilOp(st.backFail);
+  ds.BackFace.StencilDepthFailOp = GuestStencilOp(st.backZFail);
+  ds.BackFace.StencilPassOp = GuestStencilOp(st.backPass);
+  ds.BackFace.StencilFunc = GuestStencilFunc(st.backFunc);
+}
+
+uint32_t D3D12Renderer::StencilIndexFor(const GameStencil& st) {
+  const uint64_t key = st.PipelineKey();
+  if (!key) return 0;  // disabled: index 0, no lookup, no entry.
+  if (auto it = m_stencilStateIndex.find(key); it != m_stencilStateIndex.end())
+    return it->second;
+  // BOUNDED. The census says the guest uses 18 configurations, and those
+  // differing only in ref collapse here because ref is not in the key -- so a
+  // healthy run interns well under 20. A cap rather than unbounded growth
+  // because every new state is a new PIPELINE per (format, topology, blend)
+  // combination it meets, and the blend cache is already capped at 128: an
+  // unbounded stencil table would reach that cap and start silently dropping
+  // draws to their opaque pipeline, which is a wrong picture and not an error.
+  //
+  // Past the cap a draw renders WITHOUT stencil rather than being dropped. That
+  // is the same trade the rest of this file makes, and it is counted.
+  constexpr size_t kMaxStencilStates = 64;
+  if (m_stencilStates.size() >= kMaxStencilStates) {
+    ++m_stencilStatesRefused;
+    return 0;
+  }
+  const uint32_t index = uint32_t(m_stencilStates.size());
+  m_stencilStates.push_back(st);
+  m_stencilStateIndex.emplace(key, index);
+  return index;
+}
+
 ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
                                                   const std::string& hlsl,
                                                   const GameDraw& draw) {
@@ -937,6 +995,15 @@ ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
   pso.DepthStencilState.DepthWriteMask =
       depthWrite ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
   pso.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+  // THE PATH THAT ACTUALLY MATTERS. Phases 2 and 3 wired stencil into the
+  // opaque and blended builders and left this one alone, and in a level nearly
+  // every draw is translated -- so the whole thing was inert. The mutation test
+  // (--d3d9_stencil_force_never) is what exposed it: 99,571 draws forced to
+  // NEVER, which cannot pass a fragment, and the screen did not change.
+  //
+  // Read from the DRAW, not from the key: the key carries stencilIndex only to
+  // keep variants apart, and the state itself already travels on the draw.
+  if (draw.stencilIndex) ApplyStencil(draw.stencil, pso.DepthStencilState);
   auto& rt = pso.BlendState.RenderTarget[0];
   rt.RenderTargetWriteMask =
       colorWrite ? D3D12_COLOR_WRITE_ENABLE_ALL : 0;
@@ -1141,64 +1208,6 @@ D3D12_PRIMITIVE_TOPOLOGY_TYPE TopologyTypeOf(D3D12_PRIMITIVE_TOPOLOGY topo) {
 // group other than triangles. The 32 built at startup cover the back-buffer
 // format and triangles only; these are the same descriptions with RTVFormats[0]
 // and PrimitiveTopologyType changed, built once each on demand.
-// Guest stencil op / compare -> D3D12. Both enums are the same ordering with
-// D3D12 starting at 1, verified against rex/graphics/xenos.h:677 and :688, so
-// this is an offset rather than a table. Clamped rather than trusted: the field
-// is three bits and every value is legal, but a caller passing an already-
-// converted value would otherwise index off the end of the D3D12 enum.
-D3D12_STENCIL_OP GuestStencilOp(uint8_t v) {
-  return D3D12_STENCIL_OP((v & 7u) + 1u);
-}
-D3D12_COMPARISON_FUNC GuestStencilFunc(uint8_t v) {
-  return D3D12_COMPARISON_FUNC((v & 7u) + 1u);
-}
-
-// Write the stencil half of a pipeline description. Called from BOTH PSO
-// builders so they cannot drift: a stencil variant built one way in the opaque
-// path and another in the blended path would differ only for blended draws,
-// which is exactly the kind of divergence that is invisible until it is not.
-void ApplyStencil(const D3D12Renderer::GameStencil& st,
-                  D3D12_DEPTH_STENCIL_DESC& ds) {
-  ds.StencilEnable = st.enable ? TRUE : FALSE;
-  if (!st.enable) return;
-  ds.StencilReadMask = st.readMask;
-  ds.StencilWriteMask = st.writeMask;
-  ds.FrontFace.StencilFailOp = GuestStencilOp(st.frontFail);
-  ds.FrontFace.StencilDepthFailOp = GuestStencilOp(st.frontZFail);
-  ds.FrontFace.StencilPassOp = GuestStencilOp(st.frontPass);
-  ds.FrontFace.StencilFunc = GuestStencilFunc(st.frontFunc);
-  ds.BackFace.StencilFailOp = GuestStencilOp(st.backFail);
-  ds.BackFace.StencilDepthFailOp = GuestStencilOp(st.backZFail);
-  ds.BackFace.StencilPassOp = GuestStencilOp(st.backPass);
-  ds.BackFace.StencilFunc = GuestStencilFunc(st.backFunc);
-}
-
-uint32_t D3D12Renderer::StencilIndexFor(const GameStencil& st) {
-  const uint64_t key = st.PipelineKey();
-  if (!key) return 0;  // disabled: index 0, no lookup, no entry.
-  if (auto it = m_stencilStateIndex.find(key); it != m_stencilStateIndex.end())
-    return it->second;
-  // BOUNDED. The census says the guest uses 18 configurations, and those
-  // differing only in ref collapse here because ref is not in the key -- so a
-  // healthy run interns well under 20. A cap rather than unbounded growth
-  // because every new state is a new PIPELINE per (format, topology, blend)
-  // combination it meets, and the blend cache is already capped at 128: an
-  // unbounded stencil table would reach that cap and start silently dropping
-  // draws to their opaque pipeline, which is a wrong picture and not an error.
-  //
-  // Past the cap a draw renders WITHOUT stencil rather than being dropped. That
-  // is the same trade the rest of this file makes, and it is counted.
-  constexpr size_t kMaxStencilStates = 64;
-  if (m_stencilStates.size() >= kMaxStencilStates) {
-    ++m_stencilStatesRefused;
-    return 0;
-  }
-  const uint32_t index = uint32_t(m_stencilStates.size());
-  m_stencilStates.push_back(st);
-  m_stencilStateIndex.emplace(key, index);
-  return index;
-}
-
 ID3D12PipelineState* D3D12Renderer::OpaquePSO(
     uint32_t variant, DXGI_FORMAT rtvFormat,
     D3D12_PRIMITIVE_TOPOLOGY_TYPE topoType, uint32_t stencilIndex) {

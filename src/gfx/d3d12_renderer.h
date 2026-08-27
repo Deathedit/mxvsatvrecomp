@@ -777,11 +777,16 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // See BlendKey::topoType.
     D3D12_PRIMITIVE_TOPOLOGY_TYPE topoType =
         D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    // Stencil is pipeline state, so two draws sharing a shader but differing in
+    // stencil need different pipelines. Leaving it out of the key is not merely
+    // a missed variant: the FIRST draw to build a given shader's pipeline would
+    // fix its stencil state for every later draw sharing that shader.
+    uint32_t stencilIndex = 0;
     bool operator==(const TranslatedKey& o) const noexcept {
       return handle == o.handle && vsHandle == o.vsHandle && src == o.src &&
              dest == o.dest && op == o.op && flags == o.flags &&
              rtvFormat == o.rtvFormat && rtvFormat1 == o.rtvFormat1 &&
-             topoType == o.topoType;
+             topoType == o.topoType && stencilIndex == o.stencilIndex;
     }
   };
   struct TranslatedKeyHash {
@@ -790,7 +795,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
              (size_t(k.src) << 12) ^ (size_t(k.dest) << 6) ^
              (size_t(k.op) << 3) ^ size_t(k.flags) ^
              (size_t(k.rtvFormat) << 40) ^ (size_t(k.rtvFormat1) << 44) ^
-             (size_t(k.topoType) << 50);
+             (size_t(k.topoType) << 50) ^ (size_t(k.stencilIndex) << 56);
     }
   };
   std::unordered_map<TranslatedKey, TranslatedPipeline, TranslatedKeyHash>
