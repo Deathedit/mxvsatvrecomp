@@ -6414,25 +6414,47 @@ void ReportDrawCounts(uint8_t* base) {
                   (rm >> 16) & 0xFFu);
     }
   }
-  // PHASE 1 PASS CONDITION, printed next to the census it must match.
+  // PHASE 1 PASS CONDITION.
   //
-  // Same population, read from the DrawCall instead of from the device. Equal
-  // effective counts and an equal config SET means the state the renderer will
-  // act on in Phase 2 is the state the guest programmed. A mismatch means the
-  // plumbing is wrong, and it is visible while nothing renders differently.
+  // READ THIS BEFORE CONCLUDING THE COUNTS SHOULD BE EQUAL. They should not,
+  // and an earlier version of this line said "must match the census above",
+  // which was written when both counters ran at the same site. Since the check
+  // moved to the CONSUMER the two count different populations by construction:
+  // the census sees every draw that reached the register read, this sees only
+  // the ones that reached AddGameDraw. Everything captured and never submitted
+  // is legitimately missing here.
   //
-  // The config set is compared by rendering both sorted, so a difference shows
-  // as a diff rather than as two numbers that happen to be equal.
+  // So the pass condition is:
+  //
+  //   config KEY SET   must be IDENTICAL. A configuration present in the census
+  //                    and absent here would be state Phase 2 can never act on,
+  //                    which is the failure this check exists to catch.
+  //   counts           must differ by exactly the draws that never reached the
+  //                    renderer -- cross-check against FRAME DRAWS
+  //                    `guest` minus `accepted`.
+  //
+  // The gap is PRINTED rather than left to be worked out, because a reader who
+  // expects equality will otherwise read a correct result as a failure.
   {
     std::lock_guard<std::mutex> lk(g_plumbedStencilMu);
     std::string cfgs;
     for (const auto& [key, n] : g_plumbedConfigs)
       cfgs += fmt::format(" [{:08X}/{:08X} x{}]", key.first, key.second, n);
-    REXLOG_INFO("d3d9: STENCIL PLUMBED (must match the census above) — {} draws"
-                " carried the fields ({} had an unreadable register), {} "
-                "effective, {} distinct configs:{}",
+    // Signed: the consumer cannot legitimately see MORE than the census, so a
+    // negative gap is itself a finding rather than an impossible number.
+    const int64_t seen_gap =
+        int64_t(g_stencilDrawsSeen) - int64_t(g_plumbedSeen);
+    const int64_t eff_gap =
+        int64_t(g_stencilEffective) - int64_t(g_plumbedEffective);
+    REXLOG_INFO("d3d9: STENCIL PLUMBED at the CONSUMER — {} draws carried the "
+                "fields ({} had an unreadable register), {} effective, {} "
+                "distinct configs. Counts are EXPECTED to be lower than the "
+                "census: {} draws and {} effective never reached the renderer "
+                "(cross-check FRAME DRAWS guest-minus-accepted). The KEY SET "
+                "is what must match:{}",
                 g_plumbedSeen, g_plumbedUnreadable, g_plumbedEffective,
-                g_plumbedConfigs.size(), cfgs.empty() ? " none" : cfgs);
+                g_plumbedConfigs.size(), seen_gap, eff_gap,
+                cfgs.empty() ? " none" : cfgs);
   }
   // The ALU constant file. `repaired 0` is only meaningful next to a non-zero
   // `constants seen` — with zero seen, the PM4 feed is not reaching the file and
