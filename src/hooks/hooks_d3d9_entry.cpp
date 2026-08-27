@@ -1934,25 +1934,31 @@ extern "C" REX_FUNC(sub_8255B258) {
     // RB_STENCILREFMASK -- not another run of this census.
     const uint32_t stencil_value = ctx.r9.u32;
     const bool want_depth = (flags & 0x10u) != 0;
-    // 0x60 IS EXCLUDED, but not for the reason previously given. The old note
-    // called it "the EDRAM tile clear" on the strength of r9 being set, and r9
-    // is the Stencil argument -- so that claim was reading a stencil value of 1
-    // as a boolean. r10, the actual EDRAMClear, is zero on every call in the
-    // run, so nothing here is an EDRAM clear.
+    // 0x60 IS HONOURED. It was excluded twice, on two wrong readings:
     //
-    // It stays excluded on the 0x40 bit instead: in sub_8255A510 the 0x40 path
-    // takes a DIFFERENT branch from the plain stencil clear, packing the value
-    // into bits 8-15 of the clear register rather than the low byte. Whatever
-    // that second field is, it is not "clear the stencil plane to N", and 0x60
-    // is 13,370 of 20,000 calls -- honouring it as a full clear on a guess
-    // would wipe the mask constantly.
+    //   1. "the EDRAM tile clear", because r9 was set on every one of its
+    //      calls. r9 is the Stencil ARGUMENT, so that was a stencil value of 1
+    //      read as a boolean. r10, the real EDRAMClear, is zero on all 20,000
+    //      calls -- nothing in the run is an EDRAM clear.
+    //   2. "the 0x40 path is not a stencil clear". Reading sub_8255A510 again
+    //      says it is:
     //
-    // Counted, not silently dropped. Phase 3 decides whether 0x60 needs
-    // honouring, and this number is what that decision is made on.
-    const bool want_stencil = (flags & 0x20u) != 0 && (flags & 0x40u) == 0;
-    static std::atomic<uint64_t> s_stencilSkipped40{0};
-    if ((flags & 0x20u) && (flags & 0x40u))
-      s_stencilSkipped40.fetch_add(1, std::memory_order_relaxed);
+    //          if ( (Flags & 0x20) != 0 ) {
+    //              v41 |= 4u;                                    // stencil
+    //              if ( (Flags & 0x40) != 0 )
+    //                  v41 = (Stencil << 8) & 0xFF00 | v41 & 0xFFFF00DF;
+    //              *v44 = 0x00FF0000 | (Stencil & 0xFF);         // REFMASK
+    //          }
+    //
+    //      0x40 does NOT suppress the clear -- bit 2 of v41 is set before the
+    //      branch and stays set. It only moves the value into bits 8-15 and
+    //      clears bit 5. So 0x60 is a stencil clear that carries its value in a
+    //      second field, and r9 = 1 on every one of those calls: "clear stencil
+    //      to 1", 13,370 times a run.
+    //
+    // Dropping them left the plane stuck at 0, and a terrain testing
+    // NotEqual-0 against 0 fails everywhere -- which is the broken ground.
+    const bool want_stencil = (flags & 0x20u) != 0;
     if ((want_depth || want_stencil) && rect_count == 0 && rects == 0 &&
         depth.valid) {
       mx::hle::DrawCall dclear{};
@@ -1975,12 +1981,10 @@ extern "C" REX_FUNC(sub_8255B258) {
       if (s_logged.insert({depth.object, flags}).second &&
           s_logged.size() <= 24) {
         REXLOG_INFO("d3d9: DEPTH/STENCIL CLEAR target 0x{:08X} {}x{} z={:g} "
-                    "depth={} stencil={} s={} flags=0x{:X} (stencil clears "
-                    "skipped for the 0x40 variant: {})",
+                    "depth={} stencil={} s={} flags=0x{:X}",
                     depth.object, depth.width, depth.height,
                     double(dclear.clear_depth), want_depth, want_stencil,
-                    stencil_value & 0xFFu, flags,
-                    s_stencilSkipped40.load(std::memory_order_relaxed));
+                    stencil_value & 0xFFu, flags);
       }
     }
   }
