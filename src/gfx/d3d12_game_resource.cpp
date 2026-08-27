@@ -1589,12 +1589,20 @@ void D3D12Renderer::AddGameClear(uint32_t targetObject, uint32_t targetWidth,
 
 void D3D12Renderer::AddGameDepthClear(uint32_t depthObject, uint32_t width,
                                       uint32_t height, uint32_t edramBase,
-                                      float depth) {
+                                      float depth, bool clearDepthPlane,
+                                      bool clearStencilPlane,
+                                      uint8_t clearStencil) {
   if (!depthObject || !width || !height) return;
   if (m_gameDraws.size() >= kMaxGameDraws) return;
+  // Neither plane asked for is not a clear. Guarded rather than assumed: the
+  // caller gates on (depth || stencil) and a future caller might not.
+  if (!clearDepthPlane && !clearStencilPlane) return;
   GameDraw d;
   d.depthClear = true;
   d.clearDepth = depth;
+  d.clearDepthPlane = clearDepthPlane;
+  d.clearStencilPlane = clearStencilPlane;
+  d.clearStencil = clearStencil;
   d.depthObject = depthObject;
   d.depthWidth = width;
   d.depthHeight = height;

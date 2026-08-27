@@ -1884,9 +1884,49 @@ extern "C" REX_FUNC(sub_8255B258) {
   // Anything beyond bit 0 and bit 4 here is measurement, not documentation.
   {
     const auto& depth = DeviceState().depth_stencil;
-    if ((flags & 0x10u) && rect_count == 0 && rects == 0 && depth.valid) {
+    // 0x20 is D3DCLEAR_STENCIL. PROVEN, not extrapolated, from the guest's own
+    // clear emitter sub_8255A510 (default.xex.probe.i64, 2026-08-27):
+    //
+    //     if ( (Flags & 0x10) != 0 )  v41 |= 1u;          // depth
+    //     if ( (Flags & 0x20) != 0 ) {
+    //         v41 |= 4u;                                  // stencil
+    //         ...
+    //         *v44++ = 8461;                              // 8461 == 0x210D,
+    //         *v44 = 0x00FF0000 | (Stencil & 0xFF);       // RB_STENCILREFMASK
+    //     }
+    //
+    // so 0x20 is the bit that both enables the stencil half and publishes the
+    // caller's Stencil value as the ref with mask 0xFF. The caller-side decode
+    // agrees: sub_8255AAB0 loops bits 0..3 over the four render targets at
+    // device+12616 and masks off 0xF0 after the first one, so bits 0-3 are the
+    // MRT colour targets and 0x10/0x20/0x40/0x80 are the depth-stencil group.
+    //
+    // The observed flag distribution confirms it rather than merely permitting
+    // it: 0xF colours, 0x1F colours+depth, 0x20 stencil alone, 0x30
+    // depth+stencil, 0x3F all three, 0x60 stencil+EDRAM.
+    //
+    // D3DDevice_Clear's prototype is (pDevice, Count, pRects, Flags, Color, Z,
+    // Stencil, EDRAMClear), and r6/r7 are already read as Flags/Color above, so
+    // Stencil is r8 and EDRAMClear is r9.
+    const uint32_t stencil_value = ctx.r8.u32;
+    const bool edram_clear = ctx.r9.u32 != 0;
+    const bool want_depth = (flags & 0x10u) != 0;
+    // EDRAM clears are EXCLUDED, exactly as the depth gate above excludes them
+    // -- 0x60 carries 0x20 and would otherwise wipe the stencil mask on 16,139
+    // of 24,000 calls. It is a distinct operation (r9 set on every one), and
+    // erasing the mask each time would be worse than not clearing at all.
+    // Counted rather than silently dropped, so the exclusion is visible if it
+    // turns out to be wrong.
+    const bool want_stencil = (flags & 0x20u) != 0 && !edram_clear;
+    static std::atomic<uint64_t> s_stencilSkippedEdram{0};
+    if ((flags & 0x20u) && edram_clear)
+      s_stencilSkippedEdram.fetch_add(1, std::memory_order_relaxed);
+    if ((want_depth || want_stencil) && rect_count == 0 && rects == 0 &&
+        depth.valid) {
       mx::hle::DrawCall dclear{};
-      dclear.clear_depth_target = true;
+      dclear.clear_depth_target = want_depth;
+      dclear.clear_stencil_target = want_stencil;
+      dclear.clear_stencil = uint8_t(stencil_value & 0xFFu);
       // The guest's own Z, not a hardcoded 1.0. It is 1.0 in every call
       // measured, but reading it costs nothing and a reversed-depth pass would
       // otherwise be cleared to the wrong end.
@@ -1896,12 +1936,19 @@ extern "C" REX_FUNC(sub_8255B258) {
       dclear.depth_target_height = depth.height;
       dclear.depth_target_base = depth.color_info & 0xFFFu;
       mx::hle::HleFrameDraws().push_back(std::move(dclear));
-      static std::set<uint32_t> s_logged;
-      if (s_logged.insert(depth.object).second && s_logged.size() <= 16) {
-        REXLOG_INFO("d3d9: DEPTH CLEAR target 0x{:08X} {}x{} z={:g} "
-                    "flags=0x{:X}",
+      // Keyed on (target, flags), not on the target alone: a surface cleared
+      // depth-only and later depth+stencil is two different behaviours and
+      // deduping by object would log only whichever came first.
+      static std::set<std::pair<uint32_t, uint32_t>> s_logged;
+      if (s_logged.insert({depth.object, flags}).second &&
+          s_logged.size() <= 24) {
+        REXLOG_INFO("d3d9: DEPTH/STENCIL CLEAR target 0x{:08X} {}x{} z={:g} "
+                    "depth={} stencil={} s={} flags=0x{:X} (stencil clears "
+                    "skipped as EDRAM: {})",
                     depth.object, depth.width, depth.height,
-                    double(dclear.clear_depth), flags);
+                    double(dclear.clear_depth), want_depth, want_stencil,
+                    stencil_value & 0xFFu, flags,
+                    s_stencilSkippedEdram.load(std::memory_order_relaxed));
       }
     }
   }

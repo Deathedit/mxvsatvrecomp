@@ -815,8 +815,18 @@ void D3D12Renderer::RenderGameFrame() {
         }
         auto dsv = m_gameDepthDsvHeap->GetCPUDescriptorHandleForHeapStart();
         dsv.ptr += SIZE_T(dt->rtvIndex) * m_gameDsvDescriptorSize;
-        m_commandList->ClearDepthStencilView(dsv, kGameDepthClearFlags,
-                                             d.clearDepth, 0, 0, nullptr);
+        // The GUEST'S OWN flags, not kGameDepthClearFlags. That constant is
+        // right for our first-use clears, which initialise a fresh surface and
+        // should touch both planes, and wrong here: the guest issues depth-only
+        // (0x1F), stencil-only (0x20) and both (0x30), and clearing stencil
+        // alongside every depth clear would wipe a mask it deliberately kept.
+        // Harmless until something tests stencil, and the first thing to break
+        // when something does.
+        const D3D12_CLEAR_FLAGS clearFlags = D3D12_CLEAR_FLAGS(
+            (d.clearDepthPlane ? D3D12_CLEAR_FLAG_DEPTH : 0) |
+            (d.clearStencilPlane ? D3D12_CLEAR_FLAG_STENCIL : 0));
+        m_commandList->ClearDepthStencilView(dsv, clearFlags, d.clearDepth,
+                                             d.clearStencil, 0, nullptr);
         dt->usedThisFrame = true;
         dt->everDrawn = true;
         ++m_guestDepthClears;

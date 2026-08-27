@@ -267,7 +267,10 @@ void AddGameClear(uint32_t targetObject, uint32_t targetWidth,
 // for the same reason the colour one is: it has to land between the draws it
 // separates, and the renderer's own once-per-frame first-use clear cannot.
 void AddGameDepthClear(uint32_t depthObject, uint32_t width, uint32_t height,
-                       uint32_t edramBase, float depth);
+                       uint32_t edramBase, float depth,
+                       bool clearDepthPlane = true,
+                       bool clearStencilPlane = false,
+                       uint8_t clearStencil = 0);
 
 // Append a SURFACE BIND in order with draws, clears and resolves: the guest
 // named this surface as an attachment, so host storage for it must exist even
@@ -1245,8 +1248,15 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     uint32_t targetColorFormat = 0;
     // Ordered full-surface D3DDevice_Clear. Carries no geometry.
     bool colorClear = false;
+    // depthClear means "this draw is a guest depth/stencil clear". WHICH plane
+    // it clears is the pair below -- the guest issues depth-only, stencil-only
+    // and both, and clearing the stencil plane whenever depth is cleared would
+    // wipe a mask the guest meant to keep.
     bool depthClear = false;
     float clearDepth = 1.0f;
+    bool clearDepthPlane = true;
+    bool clearStencilPlane = false;
+    uint8_t clearStencil = 0;
     uint32_t clearColor = 0;  // D3DCOLOR A8R8G8B8.
     bool clearColorIsFloat = false;
     std::array<float, 4> clearColorFloat = {};

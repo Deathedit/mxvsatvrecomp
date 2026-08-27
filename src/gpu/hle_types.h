@@ -309,6 +309,18 @@ struct DrawCall {
   // 0.026) -- is discarded `depthTestFailed` against depth it never wrote.
   bool clear_depth_target = false;
   float clear_depth = 1.0f;
+  // Stencil is INDEPENDENT of depth, and that independence is the whole point.
+  // Proven from the guest's own clear emitter (sub_8255A510): Flags & 0x10 sets
+  // the depth bit, Flags & 0x20 sets the stencil bit AND writes
+  // RB_STENCILREFMASK (0x210D) with the caller's Stencil argument. The guest
+  // issues all three combinations -- 0x1F is colour+depth with NO stencil, 0x20
+  // is stencil alone, 0x30 is both.
+  //
+  // Clearing stencil whenever depth is cleared would wipe a mask the guest
+  // deliberately carried across a depth clear. Invisible today because nothing
+  // tests stencil; the first thing to break once something does.
+  bool clear_stencil_target = false;
+  uint8_t clear_stencil = 0;
   // Resolve flag 0x100 clears the source after copying and takes a float4
   // colour, unlike D3DDevice_Clear's packed D3DCOLOR. Keeping the two forms
   // distinct avoids quantizing HDR clear values.
