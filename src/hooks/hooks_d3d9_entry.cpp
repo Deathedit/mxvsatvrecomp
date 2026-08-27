@@ -1965,6 +1965,24 @@ extern "C" REX_FUNC(sub_8255CE98) {
             uint32_t wrote = 0;
             uint32_t skipped_unwritable = 0;
             bool matched = false;
+            // WHAT WE ACTUALLY DELIVER, over the exact byte the guest gates on.
+            //
+            // The guest's page-table update (sub_82AF5D38) walks this buffer
+            // and, for each texel, reads the LOW BYTE of the big-endian dword
+            // as a mip level:
+            //
+            //     v92 = (unsigned __int8)*v91;
+            //     if (v92 < v66) { ...refine this page... }
+            //
+            // v66 is the level count, so every texel whose low byte is >= that
+            // is skipped outright. If all 4096 are skipped the update runs to
+            // completion and refines nothing -- which is exactly what we
+            // observe: the latch moves every frame and the page table stays at
+            // its 0xF00A not-available fill.
+            //
+            // "wrote 4096 texels" could never distinguish that from a healthy
+            // feed. It counts stores, not content.
+            uint32_t low_hist[256] = {};
             {
               std::lock_guard<std::mutex> lk(mx::hle::g_surfaceReadbackMutex);
               const auto& rb = mx::hle::g_surfaceReadback;
@@ -2008,23 +2026,57 @@ extern "C" REX_FUNC(sub_8255CE98) {
                       std::swap(tmp[1], tmp[2]);
                     }
                     std::memcpy(REX_RAW_ADDR(at), tmp, bpb);
+                    // The low byte of the value the GUEST will load. tmp is
+                    // already in guest byte order, so for a 4-byte texel the
+                    // guest's (uint8)value is the last byte of tmp.
+                    ++low_hist[tmp[bpb - 1]];
                     ++wrote;
                   }
                 }
               }
             }
             if (matched) {
+              uint32_t distinct = 0, dominant = 0, dominant_n = 0, usable = 0;
+              for (uint32_t v = 0; v < 256; ++v) {
+                if (!low_hist[v]) continue;
+                ++distinct;
+                if (low_hist[v] > dominant_n) {
+                  dominant_n = low_hist[v];
+                  dominant = v;
+                }
+                // A mip level the guest would act on. 16 is generous: a
+                // 1024x1024 page table has 11 levels, so anything under 16 is
+                // at least plausible and everything above is certainly skipped.
+                if (v < 16) usable += low_hist[v];
+              }
               static uint32_t s_logged = 0;
+              static uint64_t s_writebacks = 0;
+              static uint64_t s_usableTotal = 0;
+              static uint64_t s_wroteTotal = 0;
+              ++s_writebacks;
+              s_usableTotal += usable;
+              s_wroteTotal += wrote;
               if (s_logged++ < 8) {
                 REXLOG_INFO(
                     "d3d9: SURFACE WRITEBACK dest 0x{:08X} addr 0x{:08X} "
                     "{}x{} bpb {} tiled {} pitch {} -- wrote {} texels, {} "
-                    "unwritable",
+                    "unwritable | GUEST-VISIBLE low byte: {} distinct, "
+                    "dominant 0x{:02X} x{}, {} of {} usable (< 16)",
                     dest_texture, dest_desc.address, dest_desc.width,
                     dest_desc.height, dest_desc.bytes_per_block,
                     dest_desc.tiled ? 1 : 0, dest_desc.pitch_blocks, wrote,
-                    skipped_unwritable);
+                    skipped_unwritable, distinct, dominant, dominant_n, usable,
+                    wrote);
               }
+              // The capped line above stops after 8 and this does not, so a
+              // feed that starts healthy and later goes flat is still visible.
+              if ((s_writebacks % 120) == 0)
+                REXLOG_INFO(
+                    "d3d9: FEEDBACK census: {} writebacks, {} of {} texels "
+                    "carry a mip the guest would act on (< 16) | this frame "
+                    "{} distinct low bytes, dominant 0x{:02X}",
+                    s_writebacks, s_usableTotal, s_wroteTotal, distinct,
+                    dominant);
             }
           }
         }
