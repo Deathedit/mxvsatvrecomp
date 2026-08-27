@@ -1818,11 +1818,25 @@ void NoteStencilCensusUnreadable() {
 // A restatement would be worthless -- if this read the registers itself it
 // would agree with the census by construction and say nothing about the
 // DrawCall. It reads dc only.
+//
+// CALLED FROM THE CONSUMER, not from the capture site. The first cut called it
+// two lines after the registers were read, on the same thread, from the same
+// device -- so it could only ever fail if the assignment itself was broken, and
+// it tested none of the trip that matters. Phase 2 reads these fields in the
+// RENDERER, after the draw has gone through the deferred queue, and that queue
+// is where a field gets dropped by a copy that predates it or read after the
+// device has moved on. So the check now runs where the value is used.
+//
+// What it still does NOT prove: the register OFFSETS. Both this and the census
+// trust the same two constants. Their correctness rests on the separate
+// distribution test the census documents -- a wrong offset reads a plausible
+// value rather than failing, and the tell is edram_mode taking a value other
+// than 4 or 5.
 std::mutex g_plumbedStencilMu;
 uint64_t g_plumbedSeen = 0, g_plumbedUnreadable = 0, g_plumbedEffective = 0;
 std::map<std::pair<uint32_t, uint32_t>, uint64_t> g_plumbedConfigs;
 
-void NotePlumbedStencil(const mx::hle::DrawCall& dc) {
+void NotePlumbedStencilImpl(const mx::hle::DrawCall& dc) {
   std::lock_guard<std::mutex> lk(g_plumbedStencilMu);
   ++g_plumbedSeen;
   // Either register unreadable is counted apart rather than folded into the
@@ -2620,7 +2634,6 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     if (HostPageReadable(REX_RAW_ADDR(device + kRbModeControl)))
       dc.edram_mode = REX_LOAD_U32(device + kRbModeControl) & 0x7u;
     NoteStencilCensus(dc.depth_control, device, base);
-    NotePlumbedStencil(dc);
   } else if (st.render_state.Seen(kRsZEnable)) {
     // Unreadable register only. Still the old approximation, because there is
     // nothing better to approximate from -- but it no longer hides the register
@@ -6486,6 +6499,13 @@ void ReportDrawCounts(uint8_t* base) {
 // because hooks_frame.cpp reads this and cannot include the internal header --
 // that header needs mx::hle types (HleStream, D3D9Element, LayoutError) which
 // hooks_frame.cpp does not pull in.
+// Declared in hooks_d3d9.h. Same free-function shape as GuestDrawCalls below,
+// and for the same reason: the app layer consumes DrawCalls and must not
+// include the internal header.
+void NotePlumbedStencil(const mx::hle::DrawCall& dc) {
+  mx::hooks::d3d9::NotePlumbedStencilImpl(dc);
+}
+
 uint64_t GuestDrawCalls() {
   return mx::hooks::d3d9::g_guestDrawCalls.load(std::memory_order_relaxed);
 }

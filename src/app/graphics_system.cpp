@@ -18,6 +18,7 @@
 #include "gpu/guard_census.h"
 #include "gpu/hle_types.h"
 #include "gpu/d3d9_layout.h"
+#include "hooks/hooks_d3d9.h"    // NotePlumbedStencil, the Phase 1 check
 #include "hooks/native_bridge.h"
 
 // The one vertex stride the game PSO's input layout actually describes —
@@ -451,6 +452,11 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                           n, partial, hist.empty() ? " (none)" : hist);
             }
           }
+          // PHASE 1 CHECK, at the point of CONSUMPTION. This is where Phase 2
+          // will read the stencil state, so this is where "did it survive the
+          // deferred queue" is a real question rather than a restatement of
+          // the assignment two lines after the register read.
+          NotePlumbedStencil(*d);
           m_renderer->AddGameDraw(d->vertices.data(),
                                   static_cast<uint32_t>(d->vertices.size()),
                                   d->vertex_stride, d->indices.data(),

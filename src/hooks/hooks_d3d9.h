@@ -2,6 +2,10 @@
 
 #include <cstdint>
 
+namespace mx::hle {
+struct DrawCall;
+}  // namespace mx::hle
+
 // Complete D3D9 HLE draws that had to wait for the current frame's PM4 shader
 // packets. Called by VdSwap after translating the frame range and before the
 // accumulated HLE draw list is published to the render thread.
@@ -71,6 +75,14 @@ uint64_t HleDrawsRefused();
 // prints only when a flush happens renders that case as silence. Call it on a
 // swap cadence so every one of these being zero is itself a readable result.
 void ReportGlyphCache();
+
+// PHASE 1 CHECK for the stencil plumbing. Call from the CONSUMER of a DrawCall,
+// not from where its fields are filled in: the point is to test that the state
+// survives the deferred-draw queue intact, which is the trip Phase 2 depends on
+// and the only place it can be lost. Declared out here for the same reason as
+// ReportGlyphCache -- the app layer needs it and must not include the internal
+// header.
+void NotePlumbedStencil(const mx::hle::DrawCall& dc);
 
 // Is [addr, addr+bytes) readable guest memory? Wraps HostPageReadable, which
 // lives in hooks_d3d9_internal.h -- declared out here for the same reason as
