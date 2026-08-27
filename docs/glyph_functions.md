@@ -2,9 +2,8 @@
 
 The XEX is stripped: **no function name in the IDB contains "glyph"**. This set was
 derived from the 8 format strings that mention glyphs, then expanded along calls.
-IDB: `assets/default.xex.probe.i64` — all 19 verified functions are now named
-`GFx_*` in the database. `0x829AAB18` is left as `sub_` on purpose: it calls the
-composition loop but was never decompiled, so any name would be a guess.
+IDB: `assets/default.xex.probe.i64` — all 20 functions here are decompiled and
+named `GFx_*` in the database.
 
 Trap noted while deriving this: the "data xrefs" at 0x821B4xxx/0x821B8xxx that look
 like vtables are `.pdata` unwind records (pairs of `BeginAddress, 0x4000xxxx`).
@@ -15,7 +14,7 @@ Do not read them as vtables.
 | Addr | IDB name | Role |
 |---|---|---|
 | `0x829A9838` | `GFx_TextLine_ComposeGlyphs` | **Line composition loop.** Per character: resolve font -> glyph index -> advance -> emit a record. Owner of the `Missing "%s" glyph '%c' (0x%x)` log. |
-| `0x829AAB18` | `sub_829AAB18` (deliberate) | Calls the loop above. NOT decompiled — 285 blocks, complexity 157, reached from 11 sites, so it is bigger than a driver. Left unnamed rather than guessed. |
+| `0x829AAB18` | `GFx_TextDoc_FormatLines` | **Whole-field reflow.** Builds the line array at `field+36` from the paragraph list, invoking the loop above per paragraph, then aligns, auto-fits, and updates extents and scroll. |
 | `0x829A3C00` | `GFx_Font_BuildTextureGlyphList` | Walks glyph indices 0..GetGlyphCount, builds the texture-glyph list for a font. |
 
 `0x829A9838` is the refusal point: `a1[323]` is the glyph index from vtable slot `+12`
@@ -26,6 +25,32 @@ downstream is skipped, so an absent letter leaves no trace in the render path.
 Font vtable slots used here: `+12` GetGlyphIndex, `+24` GetGlyphShape,
 `+28` GetTextureGlyphData, `+32` GetAdvance, `+36` GetKerningAdjustment,
 `+48` GetGlyphBounds, `+56` GetGlyphCount.
+
+### `GFx_TextDoc_FormatLines` — what actually drives composition
+
+Not a thin driver (285 blocks, reached from 11 sites). It owns the whole reflow:
+
+1. Builds a 1324-byte formatter state on the stack (`0x829A96E0` init,
+   `0x829A9790` teardown) and walks the paragraph list.
+2. Per paragraph it either **reuses** the existing lines — when only position
+   changed, it re-offsets them in place and never recomposes — or calls
+   `GFx_TextLine_ComposeGlyphs` to rebuild them. The reuse branch is gated on
+   `field+319 & 2`; that bit is what forces a real recomposition.
+3. Accumulates max width and total height into `field+256` / `field+260`.
+4. Applies alignment (`field+316` bits 2-3), then **auto-fit**: modes 1 and 2 in
+   `field+316` bits 4-5 compute a uniform scale to fit the bounds and apply it
+   with `0x829370A8`, clamped so the resulting font size stays >= 120 twips.
+   Separately, `field+317` bits 0-1 resize the *field* to the text.
+5. Recomputes scroll and fires the change callbacks on `field+16`
+   (vtable `+16` and `+20`) only if an extent actually moved.
+
+Because of step 2, a glyph problem can survive a reflow untouched: if the reuse
+branch is taken, `GFx_TextLine_ComposeGlyphs` never runs and no missing-glyph
+log appears even though the text is wrong on screen.
+
+**Decompiler artifact:** the string `"...Section of Take Lines"` (`0x8200FFE4`)
+shows up in this function's pseudocode via a `__SPAIR64__` register pun. It is
+not a real reference and means nothing here.
 
 ## Glyph cache — raster and vector
 
