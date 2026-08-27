@@ -345,12 +345,57 @@ extern "C" REX_FUNC(sub_82566B58) {
     //
     // Cheap by construction: one range test per Type0 packet, and only ALU
     // constants (0x4000..0x47FF) are stored. See mx::gpu::alu.
+    // RING vs HLE CENSUS, added to test one premise before building per-draw
+    // constant ordering on it: that a draw's position in the RING can be
+    // matched to a draw in the D3D9 HLE path. Ordering by index is only
+    // meaningful if the two counts track each other.
+    //
+    // Counted in the same walk that already runs every swap, so it costs one
+    // switch per packet and nothing else.
+    //
+    // The Type3 constant opcodes are counted for a separate reason. The ALU
+    // constant file is fed ONLY from Type0 writes (NoteType0Write below), but
+    // SET_CONSTANT, SET_SHADER_CONSTANTS and LOAD_ALU_CONSTANT are Type3 -- if
+    // the guest publishes constants through those, we never record them at all
+    // and the "finite zero we decline to fill" story has a second cause.
+    // MEASUREMENT ONLY: nothing here changes what is recorded or drawn.
+    uint32_t ring_draws = 0, t3_set_const = 0, t3_set_shader = 0, t3_load_alu = 0;
     for (const auto* list : {&frame_packets, &swap_packets}) {
       for (const auto& p : *list) {
+        if (p.type == mx::pm4::PacketType::Type3) {
+          switch (static_cast<mx::pm4::Pm4Opcode>(p.opcode)) {
+            case mx::pm4::Pm4Opcode::DRAW_INDX:
+            case mx::pm4::Pm4Opcode::DRAW_INDX_2:
+            case mx::pm4::Pm4Opcode::DRAW_INDX_BIN:
+            case mx::pm4::Pm4Opcode::DRAW_INDX_2_BIN:
+              ++ring_draws;
+              break;
+            case mx::pm4::Pm4Opcode::SET_CONSTANT:       ++t3_set_const; break;
+            case mx::pm4::Pm4Opcode::SET_SHADER_CONSTANTS: ++t3_set_shader; break;
+            case mx::pm4::Pm4Opcode::LOAD_ALU_CONSTANT:  ++t3_load_alu; break;
+            default: break;
+          }
+          continue;
+        }
         if (p.type != mx::pm4::PacketType::Type0 || p.body.empty()) continue;
         mx::gpu::alu::NoteType0Write(p.reg_base, p.body.data(),
                                      static_cast<uint32_t>(p.body.size()));
       }
+    }
+    {
+      // The HLE side of the comparison, as a per-frame delta on the same
+      // counter FRAME DRAWS reports, so the two lines can be read together.
+      static uint64_t s_prev_ring_guest = 0;
+      const uint64_t g = GuestDrawCalls();
+      const uint64_t hle_draws = g - s_prev_ring_guest;
+      s_prev_ring_guest = g;
+      REXLOG_INFO("{}: RING vs HLE #{} ring draws {} vs HLE draws {} "
+                  "(ordering by index is only usable if these track) | Type3 "
+                  "constant opcodes: SET_CONSTANT {}, SET_SHADER_CONSTANTS {}, "
+                  "LOAD_ALU_CONSTANT {} (non-zero means the ALU file, which is "
+                  "fed from Type0 only, is missing a publish path)",
+                  tag, swap_count, ring_draws, hle_draws, t3_set_const,
+                  t3_set_shader, t3_load_alu);
     }
 
     // Only write dump files for spot-check swaps — keeps the disk clean when
