@@ -88,12 +88,35 @@ REXCVAR_DEFINE_INT32(hle_strict, 0, "Debug",
 // PHASE 3 of docs/stencil_plan.md: honour the guest's stencil COMPARISON, not
 // just its writes.
 //
-// Default ON, because it is the correct behaviour and half the frame asks for
-// it. Switchable because this is the first stencil step that can change a
-// pixel, and its failure mode is geometry VANISHING rather than degrading -- so
-// an A/B has to be available without a rebuild. Off restores Phase 2 exactly:
-// stencil still writes, every comparison is ALWAYS, nothing can be rejected.
-REXCVAR_DEFINE_BOOL(d3d9_stencil_test, true, "Graphics",
+// DEFAULT OFF, 2026-08-27, and the reason is a measurement rather than caution:
+// with it ON the TERRAIN BREAKS, and with it off the frame is normal. Confirmed
+// by A/B, not inferred.
+//
+// The comparison itself is not the bug. Verified in terrain.rdc: at a ground
+// pixel the terrain draw PASSES, no stencilTestFailed appears anywhere in the
+// history, and the pipeline carries exactly the state the guest programmed. So
+// the test is reading a buffer that is not in the state the guest expects, and
+// two candidates are already identified:
+//
+//   OUR first-use clear (d3d12_game_frame.cpp:1262) wipes DEPTH AND STENCIL
+//   whenever a depth surface is first touched in a frame. That schedule is
+//   ours, not the guest's -- the guest clears stencil at specific points (0x20,
+//   0x30) and deliberately WITHHOLDS it at others (0x1F is depth with no
+//   stencil). Right for depth, wrong for stencil.
+//
+//   THE 0x60 EXCLUSION in the Clear hook drops 13,370 of 20,000 clear calls
+//   that carry 0x20, on the strength of the 0x40 bit meaning something we have
+//   not decoded.
+//
+// Off restores Phase 2 exactly: stencil still WRITES, every comparison is
+// ALWAYS, and ALWAYS cannot reject a fragment. Everything below the test is
+// verified and stays live.
+//
+// It is off rather than reverted because the mechanism is right and the cost of
+// being wrong is asymmetric: honouring stencil bought NOTHING visible even when
+// fully working, and breaks the ground when the buffer is wrong. Turn it back on
+// after the clear semantics are fixed, with the terrain as the test.
+REXCVAR_DEFINE_BOOL(d3d9_stencil_test, false, "Graphics",
                     "Honour the guest's stencil comparison. Off keeps stencil "
                     "writes but forces every test to ALWAYS, which cannot "
                     "reject a fragment.");
