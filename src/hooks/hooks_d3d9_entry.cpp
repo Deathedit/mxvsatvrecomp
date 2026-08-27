@@ -542,99 +542,16 @@ extern "C" REX_FUNC(sub_828AC620) {
 }
 
 //=============================================================================
-// FONT LOADERS - 0x82947418 and 0x82949E10.
-//
-// If a glyph index comes back -1 the font simply does not have that character,
-// and the place a character goes missing from a font is the load. Both loaders
-// have a SILENT truncation path (see docs/glyph_functions.md): a zero offset
-// part-way through the glyph offset table cuts the glyph list short, the loader
-// sets font+20 |= 0x1000 and carries on, and nothing is logged. Everything past
-// the cut is then unreachable by index -- which would leave a specific SUBSET
-// of characters missing, sharing nothing but their position in the table. That
-// fits the observed U, S, C far better than any shape-based pattern.
-//
-// The two loaders BOTH claim tags 48 and 75 and build different things
-// (0x82947418 a native font, 0x82949E10 GFxShape objects), so which one ran
-// matters and the tag is logged with each line.
-//
-// Fields after the call:
-//     font+20   flags; bit 0x1000 is the truncation latch, 0x2000 HasLayout,
-//               0x4000 wide codes
-//     font+36   glyph shapes actually stored (0x82949E10)
-//     font+104  declared glyph count (0x82947418)
-//     font+24   name, char* (0x82949E10 sets it; may be junk in the other)
-//
-// Fonts are few, so every load is logged rather than sampled -- the useful
-// output is the whole table at once, and a short count next to a healthy one is
-// the comparison that names the bad font.
-//=============================================================================
-namespace {
-
-void NoteFontLoad(uint8_t* base, const char* which, uint32_t font,
-                  uint32_t tag) {
-  g_fontLoads.fetch_add(1, std::memory_order_relaxed);
-  if (!font || !HostPageReadable(REX_RAW_ADDR(font + 104))) {
-    g_fontLoadsUnread.fetch_add(1, std::memory_order_relaxed);
-    return;
-  }
-  const uint32_t flags = REX_LOAD_U32(font + 20);
-  const uint32_t shapes = REX_LOAD_U32(font + 36);
-  const uint32_t declared = REX_LOAD_U32(font + 104);
-  const bool truncated = (flags & 0x1000u) != 0;
-  if (truncated) g_fontLoadsTruncated.fetch_add(1, std::memory_order_relaxed);
-
-  char name[96];
-  name[0] = 0;
-  const uint32_t name_ptr = REX_LOAD_U32(font + 24);
-  if (name_ptr && HostPageReadable(REX_RAW_ADDR(name_ptr)))
-    GfxGuestStr(base, name_ptr, name, sizeof name);
-
-  REXLOG_INFO("d3d9: FONT LOAD [{}] tag {} name '{}' -- declared {} glyphs, {} "
-              "shapes stored, flags 0x{:04X}{}",
-              which, tag, name[0] ? name : "(none)", declared, shapes, flags,
-              truncated ? "  <<< TRUNCATED: the glyph table was cut short and "
-                          "everything past the cut is unreachable by index"
-                        : "");
-}
-
-}  // namespace
-
-REX_IMPORT(__imp__sub_82947418, orig_LoadFontNative, void());
-extern "C" REX_FUNC(sub_82947418) {
-  const uint32_t font = ctx.r3.u32;
-  const uint32_t tag_ptr = ctx.r5.u32;
-  uint32_t tag = 0;
-  if (tag_ptr && HostPageReadable(REX_RAW_ADDR(tag_ptr)))
-    tag = REX_LOAD_U32(tag_ptr);
-
-  orig_LoadFontNative(ctx, base);
-
-  NoteFontLoad(base, "native", font, tag);
-}
-
-REX_IMPORT(__imp__sub_82949E10, orig_LoadFontShape, void());
-extern "C" REX_FUNC(sub_82949E10) {
-  const uint32_t font = ctx.r3.u32;
-  const uint32_t tag_ptr = ctx.r5.u32;
-  uint32_t tag = 0;
-  if (tag_ptr && HostPageReadable(REX_RAW_ADDR(tag_ptr)))
-    tag = REX_LOAD_U32(tag_ptr);
-
-  orig_LoadFontShape(ctx, base);
-
-  NoteFontLoad(base, "shape", font, tag);
-}
-
-//=============================================================================
 // 0x82945D20 - DefineCompactedFont. THE LOADER THIS GAME ACTUALLY USES.
 //
-// The two hooks above measured 0 loads across a whole process lifetime, and
-// that counter is cumulative, so log rotation cannot explain it: this title
-// does not load fonts through DefineFont/DefineFont2/DefineFont3 at all. It
-// ships .gfx (compacted) data, and fonts arrive as DefineCompactedFont --
-// a THIRD loader, with a completely different field layout. Hooking the first
-// two was my mistake; they are kept because their zero is now a documented
-// fact rather than an absence of evidence.
+// This title does NOT load fonts through DefineFont, DefineFont2 or
+// DefineFont3. Hooks on sub_82947418 and sub_82949E10 measured 0 loads across
+// a whole process lifetime, and that counter is cumulative, so log rotation
+// cannot explain it. Those two hooks have since been REMOVED -- they wrapped
+// guest functions this game never calls -- and the measurement is recorded
+// here so the experiment is not repeated. The game ships .gfx (compacted) data
+// and fonts arrive as DefineCompactedFont, a third loader with a completely
+// different field layout.
 //
 // This one has exactly the failure shape the truncation theory needs, and it
 // computes the answer itself rather than relying on the guest's logging (which
