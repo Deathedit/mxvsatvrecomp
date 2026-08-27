@@ -1872,7 +1872,8 @@ void D3D12Renderer::RenderGameFrame() {
     char message[512];
     std::snprintf(message, sizeof(message),
                   "game RT routing: offscreen %llu, main %llu, OVERPAINT %llu "
-                  "(refused: budget %llu, resized %llu); live targets %u/%u "
+                  "(refused: budget %llu, resized %llu of which fmt-changed "
+                  "%llu); live targets %u/%u "
                   "(evicted %llu, sweeps freeing nothing %llu), "
                   "srv %u/%u (cached %zu, free %zu, evicted %llu, "
                   "evict-blocked %llu)",
@@ -1881,6 +1882,12 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_rtDrawsOverpaint),
                   static_cast<unsigned long long>(m_rtRejectBudget),
                   static_cast<unsigned long long>(m_rtRejectResized),
+                  // Incremented since the format branch was written and never
+                  // printed anywhere -- grep found exactly one occurrence in
+                  // the tree. A counter nothing reads cannot answer a question,
+                  // and this is the one that says whether a snapshot's
+                  // accumulated content was thrown away.
+                  static_cast<unsigned long long>(m_snapshotFormatChanged),
                   uint32_t(m_gameRenderTargets.size()), kMaxGameRenderTargets,
                   static_cast<unsigned long long>(m_rtEvictions),
                   static_cast<unsigned long long>(m_rtEvictBlocked),

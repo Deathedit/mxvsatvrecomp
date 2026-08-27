@@ -1238,6 +1238,27 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameSnapshot(
     if (format_ok && it->second.width >= width && it->second.height >= height)
       return &it->second;
     ++m_rtRejectResized;
+    // WHICH destination, and WHICH of the two reasons. `resized` lumps "grew to
+    // cover another band" together with "destroyed on a format change" and
+    // names neither, so a snapshot being thrown away is indistinguishable from
+    // one being extended. That distinction is the whole question for an ATLAS:
+    // a band is rewritten every frame and survives either way, while the
+    // terrain atlas at 0x1A2E3000 accumulates over ~1900 frames from NINE
+    // resolves, so anything discarded is never rebuilt.
+    //
+    // One line per destination, capped -- this is per-resolve otherwise.
+    {
+      static std::set<uint32_t> s_seen;
+      if (s_seen.insert(destTexture).second && s_seen.size() <= 24) {
+        REXLOG_INFO(
+            "[D3D12Renderer] snapshot 0x{:08X} RECREATED: {}x{} fmt {} -> "
+            "{}x{} fmt {} ({}) -- content {}",
+            destTexture, it->second.width, it->second.height,
+            uint32_t(it->second.format), width, height, uint32_t(format),
+            format_ok ? "grew to cover" : "FORMAT CHANGED",
+            format_ok ? "carried forward" : "DISCARDED");
+      }
+    }
     reuseSrvIndex = it->second.srvIndex;
     // The union, so a later band cannot shrink away an earlier one.
     growWidth = it->second.width;
