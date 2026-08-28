@@ -570,20 +570,81 @@ extern "C" REX_FUNC(sub_8253CF80) {
 // the reason there is no menu.
 //=============================================================================
 
+// The script call's Nth argument, when it is a Lua string.
+//
+// Every script probe logged only `a1`, which is the lua_State -- the SAME
+// pointer for every call in the run, so `LoadUIAssetPackage #1..#4` could not
+// say WHICH packages were asked for. That mattered the moment the garage's bink
+// asset came back null: the movie exists in UIAnimations.xenon.package, and
+// whether that package is ever requested is the whole question.
+//
+// The layout is not guessed. `sub_82AA7638` (luaD_precall) is already decoded
+// at the bottom of this file and reads a StkId as `tt` at +8 and the GC pointer
+// at +0, so TValue is {Value(8), int tt} with the 4-byte pointer at the front
+// of the union -- big-endian, so offset 0 -- and a 16-byte stride. `L->base` is
+// lua_State+12 (see the lua-state-layout note). LUA_TSTRING is 4, and a Lua 5.1
+// TString on this target is next(4) tt(1) marked(1) reserved(1) pad(1) hash(4)
+// len(4) = 16 bytes of header with the characters immediately after.
+//
+// Every read is range-checked against the real mapping. A script argument is
+// guest data of whatever type the script happened to pass, and this file has
+// already paid once for treating a plausible-looking value as a pointer --
+// see the PlausibleGuestPtr note on the video probe.
+std::string ScriptArgString(uint8_t* base, uint32_t L, uint32_t index) {
+  constexpr uint32_t kTValueStride = 16;
+  constexpr uint32_t kTValueType = 8;
+  constexpr uint32_t kLuaTString = 4;
+  constexpr uint32_t kTStringLen = 12;
+  constexpr uint32_t kTStringChars = 16;
+  if (!L || !GuestRangeReadable(base, L + 12, 4)) return {};
+  const uint32_t stack = REX_LOAD_U32(L + 12);
+  const uint32_t slot = stack + index * kTValueStride;
+  if (!stack || !GuestRangeReadable(base, slot, kTValueStride)) return {};
+  if (REX_LOAD_U32(slot + kTValueType) != kLuaTString) return {};
+  const uint32_t ts = REX_LOAD_U32(slot);
+  if (!ts || !GuestRangeReadable(base, ts, kTStringChars)) return {};
+  uint32_t len = REX_LOAD_U32(ts + kTStringLen);
+  // A length is data too. Cap it before it is used as a size.
+  if (len > 256u) len = 256u;
+  if (!len || !GuestRangeReadable(base, ts + kTStringChars, len)) return {};
+  std::string out;
+  out.reserve(len);
+  for (uint32_t i = 0; i < len; ++i) {
+    const char c = char(REX_LOAD_U8(ts + kTStringChars + i));
+    if (!c) break;
+    out.push_back(c);
+  }
+  return out;
+}
+
 // Shared reporting: first few calls in full, then time-limited. A fixed budget
 // is what hid the UV measurements — it spends itself on the boot phase and goes
 // quiet exactly when the interesting work starts.
 void ReportScriptProbe(const char* name, uint32_t a1, uint32_t lr,
-                       uint64_t& count) {
+                       uint64_t& count, const std::string& arg) {
   static std::chrono::steady_clock::time_point s_last[8]{};
   const size_t slot = size_t(reinterpret_cast<uintptr_t>(name)) % 8;
   const auto now = std::chrono::steady_clock::now();
   const bool due = (now - s_last[slot]) >= std::chrono::seconds(5);
   if (++count <= 4 || due) {
     if (due) s_last[slot] = now;
-    REXLOG_INFO("{}: script {} #{} a1=0x{:08X} from lr=0x{:08X}",
+    REXLOG_INFO("{}: script {} #{} arg1=\"{}\" a1=0x{:08X} from lr=0x{:08X}",
                 mx::native::g_plugin_mode ? "plugin" : "native", name, count,
-                a1, lr);
+                arg, a1, lr);
+  }
+  // EVERY DISTINCT ARGUMENT, uncapped and independent of the rate limit above.
+  //
+  // The throttle exists so a per-frame binding cannot flood the log, and it is
+  // exactly wrong for this question: package loads happen in a burst during
+  // boot, so a 5-second window collapses them to one line and the rest are lost.
+  // A new name is new information and always prints; a repeat never does.
+  if (!arg.empty()) {
+    static std::mutex s_mu;
+    static std::set<std::string> s_seen;
+    std::lock_guard<std::mutex> lk(s_mu);
+    if (s_seen.size() < 256 && s_seen.insert(std::string(name) + "|" + arg).second)
+      REXLOG_INFO("{}: script {} FIRST SAW \"{}\"",
+                  mx::native::g_plugin_mode ? "plugin" : "native", name, arg);
   }
 }
 
@@ -593,7 +654,8 @@ void ReportScriptProbe(const char* name, uint32_t a1, uint32_t lr,
     static uint64_t s_count = 0;                                 \
     const uint32_t a1 = ctx.r3.u32;                              \
     const uint32_t lr = uint32_t(ctx.lr);                        \
-    ReportScriptProbe(label, a1, lr, s_count);                   \
+    ReportScriptProbe(label, a1, lr, s_count,                    \
+                      ScriptArgString(base, a1, 0));             \
     orig(ctx, base);                                             \
   }
 
