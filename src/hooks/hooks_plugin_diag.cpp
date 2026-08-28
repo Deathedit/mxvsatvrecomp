@@ -799,6 +799,160 @@ extern "C" REX_FUNC(sub_82BA8EE0) {
                            : "MISS -- the miss is the FIRST lookup");
 }
 
+//=============================================================================
+// 0x82BAB128 -- the DATABASE WORKER THREAD, the consumer for the ring that
+// LoadAssetPackage writes into.
+//
+// Found from the AssetDB constructor sub_82BAB700 (whose real size is 0x28c --
+// Hex-Rays renders it as a two-line __noreturn stub and truncates the rest, so
+// it has to be read as disassembly):
+//
+//     addi r6, r10, aDatabasethread    "DatabaseThreadEvent"
+//     bl   sub_82BFB788                 create the event
+//     stw  r3, 0x688(r31)               -> assetDb + 0x688
+//     ...
+//     addi r5, r5, sub_82BAB128@l       thread entry
+//     mr   r6, r31                      parameter = the AssetDB
+//     bl   sub_82BFC370                 create thread
+//
+// assetDb+0x688 is exactly the handle the producer signals: sub_82BA98B0 ends
+// in sub_82BFB748(a1[59].RecursionCount) = NtSetEvent, and 59 * 28 = 0x674 with
+// RecursionCount at +0x14 = 0x688.
+//
+// So: LoadAssetPackage writes a 408-byte record into a 1000-slot ring and
+// NtSetEvents "DatabaseThreadEvent"; THIS thread is what should wake, drain it
+// and register the assets. It does not -- the bink name never enters the map.
+//
+// The head of the thread gates everything on a global:
+//
+//     bl   0x82BE0B10               setjmp (mx_config.toml setjmp_address)
+//     bne  -> sub_82BA9B18          the restart path
+//     lwz  r11, dword_82D57950
+//     cmpwi r11, 0
+//     beq  loc_82BAB640             <- skips the whole body when zero
+//
+// so the first question is whether the thread runs at all, and the second is
+// what that global holds. Both are one line of log.
+//=============================================================================
+//=============================================================================
+// 0x8234CF80 -- BinkVideoComponent::InitAndOpen(this, propertySource).
+//
+// Resolves the component's properties, stores the looked-up bink asset at
+// this+0x94, and then calls AcquirePlayer UNCONDITIONALLY at 0x8234D16C --
+// which dereferences that asset at +0x58 with no null check. So this is where
+// the null is minted and where the 0x8234CE20 crash is decided.
+//
+// The movie name is copied to this+0x98 two steps BEFORE the lookup, so a
+// populated name with a zero asset is the exact signature of "the lookup ran
+// and missed" rather than "the property chain bailed out early to
+// loc_8234D150".
+//=============================================================================
+//=============================================================================
+// 0x8234CBB8 -- BinkVideoComponent property init. THE ONE THAT ACTUALLY RUNS.
+//
+// sub_8234CF80 (InitAndOpen) is NEVER CALLED in a run -- its probe below logs
+// nothing. This is its sibling: same property walk, same two lookups, but it
+// stops after storing them instead of calling AcquirePlayer. Which is exactly
+// why nothing faults here even when the bink asset comes back NULL:
+//
+//     v9 = sub_82AB8210("Bink Video Asset");
+//     sub_82AB4A68(a1 + 38, 259, v9);       // name -> +0x98
+//     if (v9) a1[37] = vt[0x78](mgr, name, 'bink', 1);   // +0x94 = asset
+//     a1[28] = 1;                            // +0x70
+//     a1[104] = 0;                           // +0x1A0
+//
+// The fault comes much later and from somewhere else: BeginVideoPlayback ->
+// Scene_AcquireVideoPlayer -> AcquirePlayer, which reads the +0x94 stored here
+// and writes through it at +0x58.
+//
+// Run 1672's ordering is the whole problem:
+//
+//     17:29:56  AssetFind bink "RiderUI_Final_C_350" -> MISS (lr=0x8234CD10)
+//     17:30:00  AssetDB_LoadPackage pkg="Rider" -> 1
+//     17:30:37  crash
+//
+// The component resolves its movie 4 seconds BEFORE the package holding it is
+// requested, caches the null, and nothing re-resolves it afterwards.
+//
+// What this probe adds: WHICH component, and whether any component is ever
+// initialised a SECOND time (which would mean the retry exists and is failing,
+// rather than there being no retry at all). Compare the pointer logged here
+// against r3 in the crash dump.
+//=============================================================================
+REX_IMPORT(__imp__sub_8234CBB8, orig_BinkInitProps, void());
+extern "C" REX_FUNC(sub_8234CBB8) {
+  const uint32_t self = ctx.r3.u32;
+  orig_BinkInitProps(ctx, base);
+  if (!PlausibleGuestPtr(self) || !GuestRangeReadable(base, self + 0x94u, 4))
+    return;
+  const uint32_t asset = REX_LOAD_U32(self + 0x94u);
+  const uint32_t tex = GuestRangeReadable(base, self + 0x90u, 4)
+                           ? REX_LOAD_U32(self + 0x90u)
+                           : 0;
+  std::string name;
+  if (GuestRangeReadable(base, self + 0x98u, 0x103u)) {
+    for (uint32_t i = 0; i < 0x102u; ++i) {
+      const char c = char(REX_LOAD_U8(self + 0x98u + i));
+      if (!c) break;
+      name.push_back(c);
+    }
+  }
+  static uint64_t s_n = 0;
+  REXLOG_INFO("{}: BinkInitProps #{} comp=0x{:08X} movie=\"{}\" bink=0x{:08X} "
+              "texOverride=0x{:08X}{}",
+              mx::native::g_plugin_mode ? "plugin" : "native", ++s_n, self,
+              name, asset, tex,
+              (!name.empty() && !asset)
+                  ? "  <-- NULL cached; AcquirePlayer will fault on this one"
+                  : "");
+}
+
+REX_IMPORT(__imp__sub_8234CF80, orig_BinkInitAndOpen, void());
+extern "C" REX_FUNC(sub_8234CF80) {
+  const uint32_t self = ctx.r3.u32;
+  orig_BinkInitAndOpen(ctx, base);
+  if (!PlausibleGuestPtr(self) || !GuestRangeReadable(base, self + 0x94u, 4))
+    return;
+  const uint32_t asset = REX_LOAD_U32(self + 0x94u);
+  const uint32_t open = GuestRangeReadable(base, self + 0x1A4u, 4)
+                            ? REX_LOAD_U32(self + 0x1A4u)
+                            : 0xFFFFFFFFu;
+  std::string name;
+  if (GuestRangeReadable(base, self + 0x98u, 0x103u)) {
+    for (uint32_t i = 0; i < 0x102u; ++i) {
+      const char c = char(REX_LOAD_U8(self + 0x98u + i));
+      if (!c) break;
+      name.push_back(c);
+    }
+  }
+  static uint64_t s_n = 0;
+  REXLOG_INFO("{}: BinkInitAndOpen #{} comp=0x{:08X} movie=\"{}\" asset=0x{:08X}"
+              " bOpen={}{}",
+              mx::native::g_plugin_mode ? "plugin" : "native", ++s_n, self,
+              name, asset, open,
+              asset ? "" : "  <-- NULL asset cached; AcquirePlayer will fault");
+}
+
+REX_IMPORT(__imp__sub_82BAB128, orig_DatabaseThread, void());
+extern "C" REX_FUNC(sub_82BAB128) {
+  const uint32_t assetdb = ctx.r3.u32;
+  const uint32_t gate = GuestRangeReadable(base, 0x82D57950u, 4)
+                            ? REX_LOAD_U32(0x82D57950u)
+                            : 0xFFFFFFFFu;
+  const uint32_t evt = (assetdb && GuestRangeReadable(base, assetdb + 0x688u, 4))
+                           ? REX_LOAD_U32(assetdb + 0x688u)
+                           : 0;
+  REXLOG_INFO("{}: DatabaseThread ENTER assetDb=0x{:08X} event(+0x688)=0x{:08X} "
+              "gate(0x82D57950)=0x{:08X}{}",
+              mx::native::g_plugin_mode ? "plugin" : "native", assetdb, evt,
+              gate,
+              gate == 0 ? "  <-- ZERO: the body is skipped entirely" : "");
+  orig_DatabaseThread(ctx, base);
+  // This is a loop that should never come back.
+  REXLOG_INFO("{}: DatabaseThread RETURNED -- the worker has exited",
+              mx::native::g_plugin_mode ? "plugin" : "native");
+}
+
 REX_IMPORT(__imp__sub_82BA91C0, orig_AssetFind, void());
 extern "C" REX_FUNC(sub_82BA91C0) {
   const uint32_t name_ptr = ctx.r4.u32;
@@ -832,8 +986,13 @@ extern "C" REX_FUNC(sub_82BA91C0) {
   // RiderUI_Final_C_350, and RiderCloth_60fms_FNL in NAT_Farm and ST_Farm), so
   // this is uncapped and unthrottled on purpose.
   if (std::strcmp(type, "bink") == 0) {
-    REXLOG_INFO("{}: AssetFind bink \"{}\" -> {}", tag, name,
-                found ? "FOUND" : "MISS");
+    // lr NAMES THE CALLER, which matters here: the only bink lookup in a run
+    // happens on the DATABASE WORKER thread 3.3s before the package is even
+    // requested, while the crash is on the script thread 14s after it. Whose
+    // lookup it is decides whether this is InitAndOpen caching a null or
+    // something else entirely.
+    REXLOG_INFO("{}: AssetFind bink \"{}\" -> {} (lr=0x{:08X})", tag, name,
+                found ? "FOUND" : "MISS", uint32_t(ctx.lr));
     if (found) return;
   }
   if (found) return;  // a hit of any other type says nothing
