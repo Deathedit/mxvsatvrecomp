@@ -25,6 +25,7 @@ namespace tu = rex::graphics::texture_util;
 #include <rex/cvar.h>
 
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <map>
 #include <mutex>
@@ -1835,6 +1836,13 @@ extern "C" REX_FUNC(sub_8255CE98) {
             // "wrote 4096 texels" could never distinguish that from a healthy
             // feed. It counts stores, not content.
             uint32_t low_hist[256] = {};
+            // Per-byte spread of the feedback texel, in GUEST byte order,
+            // over the whole run rather than one writeback -- the interesting
+            // frames are a minority and any single-frame view is dominated by
+            // whichever phase the log cap happened to land in.
+            static uint64_t s_byteSeen[4] = {}, s_byteHigh[4] = {};
+            static uint32_t s_byteMin[4] = {255, 255, 255, 255};
+            static uint32_t s_byteMax[4] = {};
             {
               std::lock_guard<std::mutex> lk(mx::hle::g_surfaceReadbackMutex);
               const auto& rb = mx::hle::g_surfaceReadback;
@@ -1874,6 +1882,53 @@ extern "C" REX_FUNC(sub_8255CE98) {
                     if (bpb == 2 && dest_desc.endian != 0) {
                       std::swap(tmp[0], tmp[1]);
                     } else if (bpb == 4 && dest_desc.endian != 0) {
+                      // R<->B FIRST, then the reversal.
+                      //
+                      // The endian reversal was right and it was being applied
+                      // to the wrong channel order. The host resource is
+                      // DXGI_FORMAT_R8G8B8A8_UNORM, so `rb.bytes` runs R,G,B,A;
+                      // the guest's k_8_8_8_8 surface is B,G,R,A. Reversing the
+                      // host order alone produced A,B,G,R where the guest reads
+                      // A,R,G,B -- red and blue transposed.
+                      //
+                      // Established from the guest's own feedback walk in
+                      // sub_82AF5D38 (0x82AF6054), which is unambiguous about
+                      // which byte is which:
+                      //
+                      //   lwzu   r10, 4(r5)          big-endian texel
+                      //   clrlwi r11, r10, 24        byte +3
+                      //   cmplw  r11, r22
+                      //   bge    -> skip             +3 is the LEVEL
+                      //   or     r8, ..., r6         ROW = (+0 hi)<<8 | +2
+                      //   or     r9, ..., r20        COL = (+0 lo)<<8 | +1
+                      //   srw    r8, r8, r11         both >>= level
+                      //   mullw  r7, r6, r8          index = width*ROW + COL
+                      //
+                      // ps_hft_fback writes o0 = (page X, page Y, LOD, index).
+                      // So the guest needs LEVEL <- o0.z (B) at byte +3, and
+                      // X's low bits <- o0.x (R) at +1. Before this it got the
+                      // page X as the level and the LOD as X's low bits.
+                      //
+                      // CONFIRMED QUANTITATIVELY, not just derived. Under the
+                      // wrong order the guest computes
+                      // X = (o0.w low nibble) << 8 | o0.z, and o0.z is a
+                      // constant 0x08 while o0.w only ever spans 0x22..0x33 --
+                      // so X could only ever land in 0x208..0x308 = 520..776.
+                      // Every resident page-table entry in ground-tiles-3/4.rdc
+                      // sits at x 512..531, 18-20 columns wide, against a Y
+                      // extent of ~283 rows. That strip, its width, and its
+                      // start at exactly the level midpoint all fall out of
+                      // this transposition.
+                      //
+                      // The strip is therefore the test: if it does not change
+                      // shape on the next run, this derivation is wrong.
+                      //
+                      // NOTE the LOD is a separate, still-open question -- it
+                      // is a constant 8 against a level count of 8, so the gate
+                      // may now reject everything. That is the NEXT
+                      // measurement, and it could not be taken at all while the
+                      // guest was reading a different field entirely.
+                      std::swap(tmp[0], tmp[2]);
                       std::swap(tmp[0], tmp[3]);
                       std::swap(tmp[1], tmp[2]);
                     }
@@ -1882,6 +1937,53 @@ extern "C" REX_FUNC(sub_8255CE98) {
                     // already in guest byte order, so for a 4-byte texel the
                     // guest's (uint8)value is the last byte of tmp.
                     ++low_hist[tmp[bpb - 1]];
+                    // EVERY byte, not just the one the mip gate reads.
+                    //
+                    // "usable 4881" says the mip byte is sane, and that was
+                    // enough to conclude the feed is ALIVE. It is not enough to
+                    // conclude it is CORRECT: the page x and y ride in the
+                    // other bytes of the same texel, and a wrong channel order
+                    // leaves the mip plausible while putting the page
+                    // coordinates somewhere else entirely.
+                    //
+                    // Why look now: in ground-tiles-3.rdc every resident
+                    // page-table entry sits at x >= half the level width --
+                    // x 512..530 of 1024 at mip 0, x 64..97 of 128 at mip 3 --
+                    // while the ground being rendered samples x ~401. Two
+                    // levels starting at exactly the midpoint is not a
+                    // camera-shaped region; it is the shape of a coordinate
+                    // with a high bit stuck on.
+                    //
+                    //   one byte always >= 0x80  -> the skew is in what WE
+                    //                               deliver, guest innocent
+                    //   all four span their range -> the addressing is the
+                    //                               guest's, and IDA is next
+                    //
+                    // All four counted rather than one guessed: which byte
+                    // carries x is not established.
+                    //
+                    // ONLY THE TEXELS THE GUEST ACTS ON, and cumulative across
+                    // writebacks. The first cut of this measured every texel of
+                    // every writeback and printed inside a cap of 8 -- so all
+                    // it ever reported was the MENU, where the surface is the
+                    // guest's own 0xFF clear and every byte reads FF..FF by
+                    // construction. `b0[FF..FF high 4096/4096]` on all four
+                    // bytes says nothing about page coordinates; it says the
+                    // terrain has not drawn yet. Same log-cap trap this file
+                    // already records, committed again in a new form.
+                    //
+                    // The guest's own gate is the right population: it skips
+                    // any texel whose low byte is >= the level count, so a
+                    // spread taken over the rest describes exactly the page
+                    // requests it consumes, and the menu drops out on its own.
+                    if (tmp[bpb - 1] < 16) {
+                      for (uint32_t b = 0; b + 1 < bpb && b < 4; ++b) {
+                        ++s_byteSeen[b];
+                        if (tmp[b] & 0x80u) ++s_byteHigh[b];
+                        if (tmp[b] < s_byteMin[b]) s_byteMin[b] = tmp[b];
+                        if (tmp[b] > s_byteMax[b]) s_byteMax[b] = tmp[b];
+                      }
+                    }
                     ++wrote;
                   }
                 }
@@ -1922,13 +2024,23 @@ extern "C" REX_FUNC(sub_8255CE98) {
               }
               // The capped line above stops after 8 and this does not, so a
               // feed that starts healthy and later goes flat is still visible.
-              if ((s_writebacks % 120) == 0)
+              if ((s_writebacks % 120) == 0) {
+                std::string spread;
+                for (uint32_t b = 0; b < 4; ++b) {
+                  if (!s_byteSeen[b]) continue;
+                  spread += fmt::format(" b{}[{:02X}..{:02X} high {}/{}]", b,
+                                        s_byteMin[b], s_byteMax[b],
+                                        s_byteHigh[b], s_byteSeen[b]);
+                }
                 REXLOG_INFO(
                     "d3d9: FEEDBACK census: {} writebacks, {} of {} texels "
                     "carry a mip the guest would act on (< 16) | this frame "
-                    "{} distinct low bytes, dominant 0x{:02X}",
+                    "{} distinct low bytes, dominant 0x{:02X} | ACTED-ON byte "
+                    "spread{}",
                     s_writebacks, s_usableTotal, s_wroteTotal, distinct,
-                    dominant);
+                    dominant,
+                    spread.empty() ? std::string(" (none yet)") : spread);
+              }
             }
           }
         }
@@ -2441,5 +2553,150 @@ MX_RENDER_STATE_HOOK(sub_8254A078, orig_RsColorWriteEnable,
 MX_RENDER_STATE_HOOK(sub_825497D8, orig_RsSeparateAlphaBlendEnable,
                      mx::hle::kRsSeparateAlphaBlendEnable)
 MX_RENDER_STATE_HOOK(sub_82549900, orig_RsBlendFactor, mx::hle::kRsBlendFactor)
+
+//=============================================================================
+// 0x82AD49A0 - HFTerrain: the per-frame deformation render (tyre ruts).
+//
+// PURE MEASUREMENT, and it exists because the draw-side census cannot answer
+// the question. `SQUARE TARGET` reports exactly ONE draw per frame into the
+// 512x512 deform surface, every frame of a level, and ground-tiles.rdc shows
+// that draw (event 15834, a 6-index quad = ps_hft_deform_copy) writing ZERO --
+// as do both halves of the ping-pong it feeds, all 512x512 texels. So the ruts
+// are missing because nothing ever seeds them, and "one draw" is consistent
+// with two completely different causes:
+//
+//   the guest has no track segments to splat        -> guest-side, not ours
+//   the guest HAS them and the splat draw is lost   -> ours
+//
+// The decompile of this function separates them, because the splat is behind
+// its own count and its own branch:
+//
+//     v39   = (obj[124] == 0)                 which ping-pong half is current
+//     v40   = obj + 7684 * v39
+//     if (*(u32*)(v40 + 8872))  { ... }       track POINTS -> tile list
+//     ...
+//     if (*(int*)(obj + 4 * (296 + v39)) > 0) {      = obj+1184 / obj+1188
+//       SetVertexShader(obj+17076)  vs_hft_deform
+//       SetPixelShader (obj+17080)  ps_hft_deform
+//       sub_82555B88(dev, 4, 3 * that count, v40 + 1192, stride)
+//     }
+//
+// Reading those two counts is the whole hook. A run where `splat-tris` is 0 on
+// every call says the guest never asks for a splat and the deform buffer is
+// CORRECTLY empty from our side; a run where it is non-zero while the draw
+// census still reports one draw a frame puts the loss on our path, and
+// sub_82555B88 is hooked so that would be a narrow search.
+//
+// `tiles` is printed beside them because it is the loop bound for the whole
+// pass: obj+16944 carries the tile list forward between frames, so a non-zero
+// tiles with a zero point count is the guest re-copying a tile it visited
+// earlier, which is exactly the one draw a frame we see.
+//
+// Costs two guarded loads and some arithmetic on a function that runs at most
+// once per frame.
+//=============================================================================
+REX_IMPORT(__imp__sub_82AD49A0, orig_TerrainDeformRender, void());
+extern "C" REX_FUNC(sub_82AD49A0) {
+  const uint32_t obj = ctx.r3.u32;
+  const uint32_t extent = ctx.r4.u32;
+  // obj+128 is the frame stamp the body writes on entry; if it does not change
+  // across the call the body was skipped (already run this frame, or the global
+  // enable is off) and this call carries no information about the counts.
+  const bool stamp_readable =
+      obj && HostPageReadable(REX_RAW_ADDR(obj + 128));
+  const uint32_t stamp_before = stamp_readable ? REX_LOAD_U32(obj + 128) : 0;
+
+  orig_TerrainDeformRender(ctx, base);
+
+  if (!stamp_readable) return;
+  if (REX_LOAD_U32(obj + 128) == stamp_before) return;
+
+  // PER OBJECT. Run 1599 printed one counter across TWO deformation objects --
+  // `extent 32` for the first 1800+ calls and `extent 2048` from 01:36:50, when
+  // the level came up -- so "1 of 2100 calls had splats" was a ratio between a
+  // numerator from one object and a denominator dominated by the other. The
+  // reading it invited (the guest almost never lays tracks) is not supported by
+  // it. See [[measure-the-right-population]]: a denominator drawn from a
+  // different population is worse than none.
+  //
+  // Fixed table, claimed by CAS, no allocation and no lock -- this runs on
+  // guest threads. Four is generous: two objects have ever been seen.
+  struct DeformCensus {
+    std::atomic<uint32_t> obj{0};
+    std::atomic<uint64_t> ran{0}, withPoints{0}, withSplats{0};
+    std::atomic<uint64_t> maxPoints{0}, maxSplats{0}, maxTiles{0};
+  };
+  static DeformCensus s_deform[4];
+  DeformCensus* census = nullptr;
+  for (auto& slot : s_deform) {
+    uint32_t owner = slot.obj.load(std::memory_order_acquire);
+    if (owner == obj) {
+      census = &slot;
+      break;
+    }
+    if (!owner && slot.obj.compare_exchange_strong(owner, obj)) {
+      census = &slot;
+      break;
+    }
+    if (owner == obj) {
+      census = &slot;
+      break;
+    }
+  }
+  // More objects than the table holds: counted nowhere rather than counted
+  // wrongly, and the line below simply never prints for them. Say so if it
+  // ever happens instead of silently folding them into a neighbour.
+  if (!census) {
+    static std::atomic<bool> s_toldOverflow{false};
+    if (!s_toldOverflow.exchange(true))
+      REXLOG_INFO(
+          "d3d9: TERRAIN DEFORM census full -- object 0x{:08X} is not counted",
+          obj);
+    return;
+  }
+  const uint64_t ran = census->ran.fetch_add(1, std::memory_order_relaxed) + 1;
+
+  const bool half = obj && HostPageReadable(REX_RAW_ADDR(obj + 124)) &&
+                    REX_LOAD_U32(obj + 124) == 0;
+  const uint32_t block = obj + (half ? 7684u : 0u);
+  const uint32_t splat_off = obj + (half ? 1188u : 1184u);
+  const uint32_t points =
+      HostPageReadable(REX_RAW_ADDR(block + 8872)) ? REX_LOAD_U32(block + 8872)
+                                                   : 0;
+  const uint32_t splats =
+      HostPageReadable(REX_RAW_ADDR(splat_off)) ? REX_LOAD_U32(splat_off) : 0;
+  // Read AFTER the original, so it is the list the pass just drew from rather
+  // than the one it inherited -- the body zeroes obj+16944 and rebuilds it.
+  const uint32_t tiles =
+      HostPageReadable(REX_RAW_ADDR(obj + 16944)) ? REX_LOAD_U32(obj + 16944)
+                                                  : 0;
+
+  if (points) census->withPoints.fetch_add(1, std::memory_order_relaxed);
+  if (int32_t(splats) > 0)
+    census->withSplats.fetch_add(1, std::memory_order_relaxed);
+  const auto bump = [](std::atomic<uint64_t>& hi, uint64_t v) {
+    uint64_t seen = hi.load(std::memory_order_relaxed);
+    while (v > seen && !hi.compare_exchange_weak(seen, v)) {
+    }
+  };
+  bump(census->maxPoints, points);
+  bump(census->maxSplats, splats);
+  bump(census->maxTiles, tiles);
+
+  // The denominator first, always, and it is THIS object's denominator, so
+  // "no splats" and "the pass never ran for this object" cannot render alike.
+  if (ran <= 4 || (ran % 300) == 0) {
+    REXLOG_INFO(
+        "d3d9: TERRAIN DEFORM obj 0x{:08X} extent {} -- ran {} times, {} with "
+        "track points, {} with SPLAT triangles; peak points {} splat-tris {} "
+        "tiles {} | this call: half {} points {} splat-tris {} tiles {}",
+        obj, extent, ran, census->withPoints.load(std::memory_order_relaxed),
+        census->withSplats.load(std::memory_order_relaxed),
+        census->maxPoints.load(std::memory_order_relaxed),
+        census->maxSplats.load(std::memory_order_relaxed),
+        census->maxTiles.load(std::memory_order_relaxed), half ? 1 : 0, points,
+        int32_t(splats), tiles);
+  }
+}
 
 #undef MX_RENDER_STATE_HOOK
