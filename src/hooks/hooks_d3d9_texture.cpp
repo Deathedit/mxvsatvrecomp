@@ -565,24 +565,58 @@ FlatScan ScanFlatness(const uint8_t* data, size_t bytes, uint32_t element_bytes)
 
   const size_t n = bytes / w;
   if (!n) return s;
-  auto at = [&](size_t i) {
-    uint64_t v = 0;
-    std::memcpy(&v, data + i * w, w);
-    return v;
+
+  // WIDTH-SPECIALISED, because the generic version could not vectorise.
+  //
+  // These two passes are NOT diagnostics -- `dominant` decides residency and
+  // the flat-retry backoff -- so neither can be sampled or dropped. What could
+  // go is the way they read: a `memcpy` of a RUNTIME width into a uint64 per
+  // element, which the compiler has to emit as a call-shaped load it cannot
+  // widen. At w=1 that is one such load per byte of a 2.7 MB texture, twice.
+  //
+  // Measured on the user's main PC, run mx_012, in a level:
+  //
+  //   TEXTURE COST 4832 slot calls -- decode 2ms, scan 9ms
+  //                | 4827 cache hits, 2 decodes over 2763 KB
+  //
+  // 9ms of scan for TWO decodes, on a 30ms frame. The histogram fixed earlier
+  // today was the first of three passes over the same bytes; these are the
+  // other two, and they were left in place because the count they produce is
+  // load-bearing while the histogram's was not.
+  //
+  // Hoisting the width into the type makes the element a plain aligned load of
+  // a fixed size, which vectorises. Same two passes, same arithmetic, same
+  // exact answer -- Boyer-Moore majority followed by an exact recount, which is
+  // still the only way to be exact when no element holds a majority.
+  // memcpy with a COMPILE-TIME size rather than a cast: well defined for any
+  // alignment and no aliasing assumption, and every compiler folds it to the
+  // single load a cast would have produced. The runtime-width memcpy this
+  // replaces is the one that could not be folded.
+  const auto scan_w = [&]<typename T>(T) {
+    const auto load = [data](size_t i) {
+      T v;
+      std::memcpy(&v, data + i * sizeof(T), sizeof(T));
+      return v;
+    };
+    T cand = 0;
+    size_t votes = 0;
+    for (size_t i = 0; i < n; ++i) {
+      const T v = load(i);
+      if (!votes) { cand = v; votes = 1; }
+      else if (v == cand) ++votes;
+      else --votes;
+    }
+    size_t count = 0;
+    for (size_t i = 0; i < n; ++i) count += (load(i) == cand);
+    s.dominant = uint64_t(cand);
+    s.dominant_count = count;
   };
-  uint64_t cand = 0;
-  size_t votes = 0;
-  for (size_t i = 0; i < n; ++i) {
-    const uint64_t v = at(i);
-    if (!votes) { cand = v; votes = 1; }
-    else if (v == cand) ++votes;
-    else --votes;
+  switch (w) {
+    case 8: scan_w(uint64_t{}); break;
+    case 4: scan_w(uint32_t{}); break;
+    case 2: scan_w(uint16_t{}); break;
+    default: scan_w(uint8_t{}); break;
   }
-  size_t count = 0;
-  for (size_t i = 0; i < n; ++i)
-    if (at(i) == cand) ++count;
-  s.dominant = cand;
-  s.dominant_count = count;
   s.total = n;
   return s;
 }
