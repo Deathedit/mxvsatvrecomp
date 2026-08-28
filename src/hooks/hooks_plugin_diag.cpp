@@ -1455,6 +1455,36 @@ extern "C" REX_FUNC(sub_8236EB30) {
   // nothing looks exactly like a probe whose subject never appears, and that
   // confusion has cost this project real time.
   if (!PlausibleGuestPtr(layer)) return;
+  // PLAUSIBLE IS NOT READABLE, and the gap between them was killing the game.
+  //
+  // PlausibleGuestPtr is `p >= 0x10000000 && (p & 3) == 0` -- a RANGE test, not
+  // a mapping test. The guard above was already written after one access
+  // violation here, and it does not do the job: runs 1594, 1618, 1625, 1629,
+  // 1630, 1632, 1638 and 1639 all died reading guest 0x4C69746C, which is the
+  // ASCII "Litl" -- a fragment of a STRING that satisfies both halves of the
+  // test and is then dereferenced. layer+664 is whatever the property loader
+  // left there, so on some UI layers it is text, not an object.
+  //
+  // GuestRangeReadable probes the real mapping at BOTH ends of the span, so a
+  // range straddling an unmapped page is not admitted on the strength of its
+  // first byte. This hook logs and calls NoteVideoComponent; it has no business
+  // taking the process down, whatever the guest left in that field.
+  //
+  // One span covers everything read off `layer`: the 48-byte name at +608
+  // through the player pointer ending at +672.
+  if (!GuestRangeReadable(base, layer + kLayerVideoName,
+                          (kLayerPlayer + 4u) - kLayerVideoName)) {
+    static std::atomic<uint64_t> s_badLayer{0};
+    const uint64_t n = s_badLayer.fetch_add(1, std::memory_order_relaxed) + 1;
+    // Counted, and said out loud the first few times: a probe that silently
+    // reads nothing looks exactly like a probe whose subject never appears.
+    if (n <= 4)
+      REXLOG_INFO(
+          "native: UIVideoLayer::SetTextureAsset layer 0x{:08X} -- +{}..+{} is "
+          "not readable guest memory, skipped ({} so far)",
+          layer, kLayerVideoName, kLayerPlayer + 4u, n);
+    return;
+  }
   const uint32_t texture = REX_LOAD_U32(layer + kLayerTexture);
   const uint32_t player = REX_LOAD_U32(layer + kLayerPlayer);
   std::string name;
@@ -1480,6 +1510,16 @@ extern "C" REX_FUNC(sub_8236EB30) {
                              "not dereferenced; {} so far)",
                              texture,
                              s_badTexture.fetch_add(1, std::memory_order_relaxed) + 1);
+  } else if (texture && !GuestRangeReadable(base, texture + 0x1Cu, 6u * 4u)) {
+    // The same distinction one level down. PlausibleGuestPtr passed this value
+    // -- that is exactly how "Litl" got dereferenced -- so the six fetch dwords
+    // need the mapping checked, not the range.
+    static std::atomic<uint64_t> s_unreadableTexture{0};
+    fetch_desc = fmt::format(
+        " (texture 0x{:08X} plausible but +0x1C..+0x34 is not readable, not "
+        "dereferenced; {} so far)",
+        texture,
+        s_unreadableTexture.fetch_add(1, std::memory_order_relaxed) + 1);
   } else if (texture) {
     uint32_t fetch[6] = {};
     for (uint32_t i = 0; i < 6; ++i)
