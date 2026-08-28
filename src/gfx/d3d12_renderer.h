@@ -971,6 +971,9 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // Writes xe_texsign for the VERTEX stage into the tail of its constant
   // buffer. Defaults to 1.0 rather than the surrounding memset's 0, which the
   // shader would apply as "sample becomes constant white".
+  // Not static: it resolves snapshot extents through m_gameSnapshots.
+  void FillVertexTexinv(const GameDraw& d, uint8_t* cb, uint32_t cbBytes,
+                        uint32_t constDwords);
   static void FillVertexTextureSigns(const GameDraw& d, uint8_t* cb,
                                      uint32_t cbBytes, uint32_t constDwords);
   // `vertex` fills from the VERTEX stage's slot arrays instead of the pixel
@@ -1890,21 +1893,70 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   //
   // 64x64x4 = 16 KB, rounded to the placement alignment.
   static constexpr uint32_t kSurfaceReadbackBytes = 64 * 1024;
-  static constexpr uint32_t kMaxSurfaceReadbackEdge = 64;
-  std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kFrameCount>
-      m_surfaceReadback;
-  std::array<uint32_t, kFrameCount> m_surfacePending = {};
-  std::array<uint32_t, kFrameCount> m_surfaceDestObject = {};
-  std::array<uint32_t, kFrameCount> m_surfaceWidth = {};
-  std::array<uint32_t, kFrameCount> m_surfaceHeight = {};
-  std::array<uint32_t, kFrameCount> m_surfaceRowPitch = {};
-  std::array<uint32_t, kFrameCount> m_surfaceTexelBytes = {};
-  std::array<uint32_t, kFrameCount> m_surfaceByteCount = {};
+  // One slot per readback in flight, per frame. These used to be eight parallel
+  // std::arrays indexed by m_frameIndex; a second index would have made that
+  // eight two-dimensional arrays kept in step by hand, so the fields moved into
+  // the thing they describe.
+  struct SurfaceSlot {
+    Microsoft::WRL::ComPtr<ID3D12Resource> buffer;
+    uint32_t pending = 0;
+    uint32_t destObject = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t rowPitch = 0;
+    uint32_t texelBytes = 0;
+    uint32_t byteCount = 0;
+    // Where in the DESTINATION the copied region belongs. Zero for every
+    // destination this path served before the terrain deformation: the feedback
+    // buffer resolves to (0,0), so the offset was never exercised and the
+    // writeback wrote at the origin unconditionally.
+    uint32_t destX = 0;
+    uint32_t destY = 0;
+    // The SOURCE's DXGI format, so the writeback can convert. A Xenos resolve
+    // converts on the way out -- the terrain deformation resolves an R32_FLOAT
+    // tile into an 8-bit destination -- and without this the writeback can only
+    // memcpy formats that already agree.
+    uint32_t srcFormat = 0;
+  };
+  // Kept in step with mx::hle::kSurfaceReadbackSlots by a static_assert in
+  // d3d12_game_resource.cpp -- this header does not pull in hle_types.h.
+  static constexpr uint32_t kSurfaceSlots = 4;
+  std::array<std::array<SurfaceSlot, kSurfaceSlots>, kFrameCount>
+      m_surfaceSlots;
+  // Monotonic and never zero once used, so a consumer can tell a slot it has
+  // already acted on from one that was refilled with the same destination.
+  uint32_t m_surfaceSeq = 0;
   uint64_t m_surfaceReadbacks = 0;
   uint64_t m_surfaceReadbackRefused = 0;
+  uint64_t m_surfaceReadbackTooBig = 0;
+  // PER-DESTINATION OUTCOMES.
+  //
+  // The census could only say "queued / refused-busy / refused-too-big", which
+  // cannot tell a destination that LOSES THE RACE for the single slot from one
+  // that is never eligible at all. Worse, one eligibility exit -- the footprint
+  // exceeding the GPU buffer -- returned without counting anything, so the
+  // terrain deformation was absent from every number this path printed and its
+  // silence read as "never called". Every exit now lands in exactly one of
+  // ineligible / lostBusy / won, with `seen` as the structural denominator.
+  struct SurfaceReadbackTally {
+    uint32_t destObject = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint64_t seen = 0;
+    uint64_t ineligible = 0;
+    uint64_t lostBusy = 0;
+    uint64_t won = 0;
+    uint32_t lastReason = 0;
+  };
+  static constexpr uint32_t kSurfaceTallySlots = 24;
+  std::array<SurfaceReadbackTally, kSurfaceTallySlots> m_surfaceTally = {};
+  uint64_t m_surfaceTallyOverflow = 0;
+  SurfaceReadbackTally* SurfaceTallyFor(uint32_t destObject);
   void DrainSurfaceReadback();
   void QueueSurfaceReadback(GameRenderTarget* snap, uint32_t destObject,
-                            uint32_t destWidth, uint32_t destHeight);
+                            uint32_t destWidth, uint32_t destHeight,
+                            uint32_t destX, uint32_t destY, uint32_t regionW,
+                            uint32_t regionH);
   struct GameRenderTarget {
     Microsoft::WRL::ComPtr<ID3D12Resource> resource;
     uint32_t width = 0;

@@ -1026,10 +1026,38 @@ struct SurfaceReadback {
   uint32_t rowPitch = 0;
   uint32_t bytesPerTexel = 0;
   uint32_t byteCount = 0;
+  // Where in the destination this region belongs. The resolve's destpoint --
+  // (0,0) for the VT feedback buffer, (768,224) and friends for the terrain
+  // deformation, which writes 128x32 tiles into a 2048x2048 accumulation.
+  uint32_t destX = 0;
+  uint32_t destY = 0;
+  // The source's DXGI format, for the conversion the guest's own resolve does.
+  uint32_t srcFormat = 0;
   uint8_t bytes[kMaxSurfaceReadbackBytes] = {};
+  // NON-ZERO AND MONOTONIC once this slot has ever been filled. A consumer
+  // remembers the seq it last acted on PER SLOT, which is what lets several
+  // destinations be delivered in the same frame: a single global "have I read
+  // the latest" flag let whichever destination matched first mark the frame
+  // consumed and silently skip the others.
+  uint32_t seq = 0;
 };
+// MORE THAN ONE READBACK IN FLIGHT.
+//
+// One was right while the VT feedback buffer was the only destination. With
+// the terrain deformation also landing, run 1636 measured the feedback buffer
+// frozen at 1,107 writebacks across three consecutive censuses while the deform
+// gained 122 in the same window -- not degraded, starved to nothing -- and the
+// renderer's own tally put 711 of its 1,922 opportunities in `lost-busy`.
+// Rotating one slot would have shared the starvation instead of ending it: the
+// feedback buffer is per-frame state that drives page streaming, while the
+// deformation ACCUMULATES and tolerates gaps, so they are not interchangeable
+// claimants on one slot.
+//
+// Four covers the three destinations seen (feedback + both deform halves) with
+// room for one more before the refusal is counted again.
+inline constexpr uint32_t kSurfaceReadbackSlots = 4;
 extern std::mutex g_surfaceReadbackMutex;
-extern SurfaceReadback g_surfaceReadback;
+extern SurfaceReadback g_surfaceReadback[kSurfaceReadbackSlots];
 // Bumped after the slot is filled, so a reader that checks it first can never
 // pair a new sequence with half-written bytes.
 extern std::atomic<uint32_t> g_surfaceReadbackSeq;

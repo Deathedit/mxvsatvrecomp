@@ -1071,28 +1071,75 @@ void D3D12Renderer::DrainLuminanceReadback() {
 // The snapshot is in PIXEL_SHADER_RESOURCE when this runs -- the resolve path
 // just put it there -- and is returned to it, because the composite samples it
 // later in the same frame.
-// Copy a freshly resolved SMALL destination into this frame's readback buffer,
-// so the D3D9 layer can put it back into guest memory where the guest reads it.
+// Which tally row belongs to a destination. Linear over a handful of slots --
+// the population is two or three destinations and a map would be ceremony.
+D3D12Renderer::SurfaceReadbackTally* D3D12Renderer::SurfaceTallyFor(
+    uint32_t destObject) {
+  SurfaceReadbackTally* dullest = nullptr;
+  for (auto& t : m_surfaceTally) {
+    if (t.destObject == destObject) return &t;
+    if (!t.destObject) {
+      t.destObject = destObject;
+      return &t;
+    }
+    // EVICT THE UNINFORMATIVE, never a row that carries an outcome. Boot fills
+    // this table with short-lived destinations that are ineligible every time,
+    // and first-come-first-served let them hold every slot: run 1633 overflowed
+    // 73,185 times and the deform destination -- the one the table exists to
+    // describe -- had no row at all while the census header was naming it.
+    //
+    // A row that has ever been served or has ever lost the slot is an outcome
+    // and stays. Among the rest the least-seen goes, so a destination that is
+    // merely frequent cannot displace one that is merely new.
+    if (t.won || t.lostBusy) continue;
+    if (!dullest || t.seen < dullest->seen) dullest = &t;
+  }
+  ++m_surfaceTallyOverflow;
+  if (!dullest) return nullptr;
+  *dullest = SurfaceReadbackTally{};
+  dullest->destObject = destObject;
+  return dullest;
+}
+
+// Copy a freshly resolved SMALL REGION back into this frame's readback buffer,
+// so the D3D9 layer can put it into guest memory where the guest reads it.
 //
-// One per frame, like the luminance path: the population is a single
-// destination (the terrain feedback buffer) and a rotating set would be
-// capacity nobody asked for. If a second ever appears, the refusal is counted.
+// THE REGION, NOT THE SNAPSHOT. `snap` is the DESTINATION snapshot and is sized
+// to the destination TEXTURE, so reading its extent describes the guest's whole
+// resource, not the rectangle this resolve moved. That was invisible while the
+// VT feedback buffer was the only caller -- it resolves 64x64 into a 64x64
+// destination, where the two are the same number -- and it is the entire reason
+// the terrain deformation never came back: its resolve puts a 128x32 tile into
+// a 2048x2048 accumulation, `sd` reported 2048x2048, the footprint came to
+// 16 MB, and the `totalBytes > kSurfaceReadbackBytes` line below returned
+// WITHOUT INCREMENTING ANY COUNTER. Every census this path printed therefore
+// showed the deform destination nowhere at all, which read as "never called"
+// and sent me looking for slot contention that does not exist.
+//
+// One readback per frame. If a second eligible destination ever appears the
+// tally now says so explicitly (lostBusy), instead of it having to be inferred
+// from a global refusal count that ineligible callers also increment.
 void D3D12Renderer::QueueSurfaceReadback(GameRenderTarget* snap,
                                          uint32_t destObject,
                                          uint32_t destWidth,
-                                         uint32_t destHeight) {
+                                         uint32_t destHeight, uint32_t destX,
+                                         uint32_t destY, uint32_t regionW,
+                                         uint32_t regionH) {
   if (!snap || !snap->resource || !destObject) return;
   if (!destWidth || !destHeight) return;
+  SurfaceReadbackTally* tally = SurfaceTallyFor(destObject);
+  if (tally) ++tally->seen;
+  // Every exit below is one of these three, so `seen` is a real denominator.
+  auto reject = [&](uint32_t reason) {
+    if (tally) {
+      ++tally->ineligible;
+      tally->lastReason = reason;
+    }
+  };
   // 1x1 belongs to the luminance path, which carries semantics this one must
-  // not duplicate. Anything larger than the cap is refused rather than
-  // truncated -- a partial feedback buffer is worse than a stale one.
-  if (destWidth * destHeight <= 1) return;
-  if (destWidth > kMaxSurfaceReadbackEdge ||
-      destHeight > kMaxSurfaceReadbackEdge) {
-    return;
-  }
-  if (m_surfacePending[m_frameIndex]) {
-    ++m_surfaceReadbackRefused;
+  // not duplicate.
+  if (destWidth * destHeight <= 1) {
+    reject(1);
     return;
   }
   const D3D12_RESOURCE_DESC sd = snap->resource->GetDesc();
@@ -1103,19 +1150,85 @@ void D3D12Renderer::QueueSurfaceReadback(GameRenderTarget* snap,
       sd.Format == DXGI_FORMAT_R24G8_TYPELESS ||
       sd.Format == DXGI_FORMAT_R32G8X24_TYPELESS ||
       sd.Format == DXGI_FORMAT_UNKNOWN) {
+    reject(2);
     return;
   }
-  // The snapshot GROWS and never shrinks, so it can be larger than the resolve
-  // that just wrote it. Copy the destination's extent, not the resource's.
-  if (sd.Width < destWidth || sd.Height < destHeight) return;
+  // The rectangle the resolve wrote, at the destpoint it wrote it to. A caller
+  // that does not know its region passes 0 and gets the whole surface, which is
+  // what every caller did before the deformation existed.
+  const uint32_t sx = std::min<uint32_t>(destX, uint32_t(sd.Width));
+  const uint32_t sy = std::min<uint32_t>(destY, sd.Height);
+  uint32_t copyW = regionW ? regionW : uint32_t(sd.Width);
+  uint32_t copyH = regionH ? regionH : sd.Height;
+  copyW = std::min<uint32_t>(copyW, uint32_t(sd.Width) - sx);
+  copyH = std::min<uint32_t>(copyH, sd.Height - sy);
+  if (!copyW || !copyH) {
+    reject(3);
+    return;
+  }
+  // A sanity bound against a pathological pitch only; the byte tests decide.
+  if (copyW > 4096u || copyH > 4096u) {
+    ++m_surfaceReadbackTooBig;
+    reject(4);
+    return;
+  }
+  // The footprint of the REGION, described as a texture of its own. Asking
+  // GetCopyableFootprints about a synthetic desc rather than computing a pitch
+  // by hand keeps the alignment rules and the per-format texel size where the
+  // runtime already knows them.
+  D3D12_RESOURCE_DESC rd = sd;
+  rd.Width = copyW;
+  rd.Height = copyH;
+  rd.DepthOrArraySize = 1;
+  rd.MipLevels = 1;
+  rd.SampleDesc.Count = 1;
+  rd.SampleDesc.Quality = 0;
   D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout = {};
   UINT numRows = 0;
   UINT64 rowSize = 0, totalBytes = 0;
-  m_device->GetCopyableFootprints(&sd, 0, 1, 0, &layout, &numRows, &rowSize,
+  m_device->GetCopyableFootprints(&rd, 0, 1, 0, &layout, &numRows, &rowSize,
                                   &totalBytes);
-  if (!totalBytes || totalBytes > kSurfaceReadbackBytes) return;
-  auto& rb = m_surfaceReadback[m_frameIndex];
-  if (!rb) return;
+  if (!totalBytes || totalBytes > kSurfaceReadbackBytes) {
+    ++m_surfaceReadbackTooBig;
+    reject(5);
+    return;
+  }
+  // AGAINST THE CPU BUFFER, not the GPU one. kSurfaceReadbackBytes is the
+  // 64 KB upload-heap resource; kMaxSurfaceReadbackBytes is the 16 KB array the
+  // bytes are memcpy'd into, and DrainSurfaceReadback CLAMPS to it. Gating on
+  // the larger of the two let a 16-64 KB readback through to be silently
+  // truncated on the way to the CPU -- a partial destination written as if it
+  // were whole. Nothing hit it while 64x64x4 was the only caller, because that
+  // is exactly 16 KB.
+  if (totalBytes > mx::hle::kMaxSurfaceReadbackBytes) {
+    ++m_surfaceReadbackTooBig;
+    reject(6);
+    return;
+  }
+  // LAST, so that `lostBusy` counts only callers that would otherwise have been
+  // served. With the busy test first, an ineligible caller arriving after the
+  // slot was taken was indistinguishable from a starved one.
+  auto& slots = m_surfaceSlots[m_frameIndex];
+  SurfaceSlot* claimed = nullptr;
+  bool anyBuffer = false;
+  for (auto& sl : slots) {
+    if (!sl.buffer) continue;
+    anyBuffer = true;
+    if (!sl.pending) {
+      claimed = &sl;
+      break;
+    }
+  }
+  if (!anyBuffer) {
+    reject(7);
+    return;
+  }
+  if (!claimed) {
+    ++m_surfaceReadbackRefused;
+    if (tally) ++tally->lostBusy;
+    return;
+  }
+  auto& rb = claimed->buffer;
   D3D12_RESOURCE_BARRIER pre = {};
   pre.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
   pre.Transition.pResource = snap->resource.Get();
@@ -1131,60 +1244,149 @@ void D3D12Renderer::QueueSurfaceReadback(GameRenderTarget* snap,
   dst.pResource = rb.Get();
   dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
   dst.PlacedFootprint = layout;
-  m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+  D3D12_BOX box = {};
+  box.left = sx;
+  box.top = sy;
+  box.front = 0;
+  box.right = sx + copyW;
+  box.bottom = sy + copyH;
+  box.back = 1;
+  m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
   D3D12_RESOURCE_BARRIER post = pre;
   post.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
   post.Transition.StateAfter = snap->state;
   m_commandList->ResourceBarrier(1, &post);
-  m_surfacePending[m_frameIndex] = 1;
-  m_surfaceDestObject[m_frameIndex] = destObject;
-  m_surfaceWidth[m_frameIndex] = destWidth;
-  m_surfaceHeight[m_frameIndex] = destHeight;
-  m_surfaceRowPitch[m_frameIndex] = layout.Footprint.RowPitch;
-  m_surfaceTexelBytes[m_frameIndex] =
-      layout.Footprint.RowPitch && layout.Footprint.Width
-          ? uint32_t(rowSize / layout.Footprint.Width)
-          : 0;
-  m_surfaceByteCount[m_frameIndex] = uint32_t(totalBytes);
+  claimed->pending = 1;
+  claimed->destObject = destObject;
+  // The COPIED region, not the destination's extent -- the writeback walks
+  // these and places them at the destpoint.
+  claimed->width = copyW;
+  claimed->height = copyH;
+  claimed->destX = sx;
+  claimed->destY = sy;
+  claimed->srcFormat = uint32_t(sd.Format);
+  claimed->rowPitch = layout.Footprint.RowPitch;
+  claimed->texelBytes = layout.Footprint.RowPitch && layout.Footprint.Width
+                            ? uint32_t(rowSize / layout.Footprint.Width)
+                            : 0;
+  claimed->byteCount = uint32_t(totalBytes);
+  if (tally) {
+    ++tally->won;
+    tally->width = copyW;
+    tally->height = copyH;
+  }
 }
 
 void D3D12Renderer::DrainSurfaceReadback() {
-  if (!m_surfacePending[m_frameIndex]) return;
-  m_surfacePending[m_frameIndex] = 0;
-  ID3D12Resource* rb = m_surfaceReadback[m_frameIndex].Get();
-  if (!rb) return;
-  const uint32_t bytes =
-      std::min(m_surfaceByteCount[m_frameIndex],
-               uint32_t(mx::hle::kMaxSurfaceReadbackBytes));
-  void* mapped = nullptr;
-  D3D12_RANGE readRange = {0, bytes};
-  if (FAILED(rb->Map(0, &readRange, &mapped)) || !mapped) return;
-  {
-    std::lock_guard<std::mutex> lk(mx::hle::g_surfaceReadbackMutex);
-    auto& s = mx::hle::g_surfaceReadback;
-    s.destObject = m_surfaceDestObject[m_frameIndex];
-    s.width = m_surfaceWidth[m_frameIndex];
-    s.height = m_surfaceHeight[m_frameIndex];
-    s.rowPitch = m_surfaceRowPitch[m_frameIndex];
-    s.bytesPerTexel = m_surfaceTexelBytes[m_frameIndex];
-    s.byteCount = bytes;
-    std::memcpy(s.bytes, mapped, bytes);
+  // Kept in step here rather than in the header, which does not pull in
+  // hle_types.h. A mismatch would silently publish into the wrong slot.
+  static_assert(kSurfaceSlots == mx::hle::kSurfaceReadbackSlots,
+                "renderer slot count must match the shared readback array");
+  auto& slots = m_surfaceSlots[m_frameIndex];
+  const SurfaceSlot* last = nullptr;
+  bool any = false;
+  for (uint32_t i = 0; i < kSurfaceSlots; ++i) {
+    auto& sl = slots[i];
+    if (!sl.pending) continue;
+    sl.pending = 0;
+    if (!sl.buffer) continue;
+    const uint32_t bytes =
+        std::min(sl.byteCount, uint32_t(mx::hle::kMaxSurfaceReadbackBytes));
+    void* mapped = nullptr;
+    D3D12_RANGE readRange = {0, bytes};
+    if (FAILED(sl.buffer->Map(0, &readRange, &mapped)) || !mapped) continue;
+    {
+      std::lock_guard<std::mutex> lk(mx::hle::g_surfaceReadbackMutex);
+      auto& s = mx::hle::g_surfaceReadback[i];
+      s.destObject = sl.destObject;
+      s.width = sl.width;
+      s.height = sl.height;
+      s.rowPitch = sl.rowPitch;
+      s.bytesPerTexel = sl.texelBytes;
+      s.byteCount = bytes;
+      s.destX = sl.destX;
+      s.destY = sl.destY;
+      s.srcFormat = sl.srcFormat;
+      std::memcpy(s.bytes, mapped, bytes);
+      // Non-zero and monotonic, and written LAST inside the lock: a consumer
+      // that has already acted on this seq skips the slot, which is how two
+      // destinations delivered in the same frame both get seen.
+      s.seq = ++m_surfaceSeq;
+      if (!s.seq) s.seq = ++m_surfaceSeq;
+    }
+    D3D12_RANGE noWrite = {0, 0};
+    sl.buffer->Unmap(0, &noWrite);
+    if (m_surfaceReadbacks < 8) {
+      char msg[192];
+      std::snprintf(msg, sizeof(msg),
+                    "SURFACE readback #%llu dest 0x%08X %ux%u pitch %u texel "
+                    "%uB %u bytes",
+                    static_cast<unsigned long long>(m_surfaceReadbacks),
+                    sl.destObject, sl.width, sl.height, sl.rowPitch,
+                    sl.texelBytes, bytes);
+      LogInfo(msg);
+    }
+    ++m_surfaceReadbacks;
+    last = &sl;
+    any = true;
   }
-  D3D12_RANGE noWrite = {0, 0};
-  rb->Unmap(0, &noWrite);
-  if (m_surfaceReadbacks < 8) {
-    char msg[192];
+  if (!any) return;
+  // UNCAPPED, and with the refusals beside the successes.
+  //
+  // The per-readback line above stops after 8, and this path has exactly the
+  // shape that makes a cap useless: destinations that queue every frame consume
+  // all eight before the interesting one ever appears. Worse, the two refusal
+  // counters were once incremented and PRINTED NOWHERE -- a counter that cannot
+  // report, added in the same change that needed it.
+  //
+  // `refused-busy` is now the count of callers that were ELIGIBLE and found
+  // every slot taken, because the busy test moved after the eligibility tests.
+  // A large number here is the case for more slots; run 1636 had it, with the
+  // feedback buffer frozen while the deformation kept being served.
+  if ((m_surfaceReadbacks % 240) < kSurfaceSlots && last) {
+    char msg[224];
     std::snprintf(msg, sizeof(msg),
-                  "SURFACE readback #%llu dest 0x%08X %ux%u pitch %u texel %uB "
-                  "%u bytes",
+                  "SURFACE readback census: %llu queued, %llu refused-busy, "
+                  "%llu refused-too-big; last dest 0x%08X %ux%u at (%u,%u) "
+                  "texel %uB",
                   static_cast<unsigned long long>(m_surfaceReadbacks),
-                  m_surfaceDestObject[m_frameIndex],
-                  m_surfaceWidth[m_frameIndex], m_surfaceHeight[m_frameIndex],
-                  m_surfaceRowPitch[m_frameIndex],
-                  m_surfaceTexelBytes[m_frameIndex], bytes);
+                  static_cast<unsigned long long>(m_surfaceReadbackRefused),
+                  static_cast<unsigned long long>(m_surfaceReadbackTooBig),
+                  last->destObject, last->width, last->height, last->destX,
+                  last->destY, last->texelBytes);
     LogInfo(msg);
+    // PER DESTINATION, because the totals above cannot answer the only
+    // question that matters: for a destination that is never written, is it
+    // losing a slot or is it ineligible -- and at which gate. `seen` is every
+    // call; ineligible + lostBusy + won accounts for all of it.
+    //
+    // reason: 1 destination is a single texel (luminance path's business)
+    //         2 source format cannot be a copy source
+    //         3 copied region empty after clamping to the snapshot
+    //         4 copied region edge implausible
+    //         5 footprint exceeds the 64 KB GPU readback buffer
+    //         6 footprint exceeds the 16 KB CPU buffer
+    //         7 no readback resource for this frame index
+    for (const auto& t : m_surfaceTally) {
+      if (!t.destObject) continue;
+      char row[192];
+      std::snprintf(row, sizeof(row),
+                    "  readback dest 0x%08X %ux%u | seen %llu = won %llu + "
+                    "ineligible %llu (last reason %u) + lost-busy %llu",
+                    t.destObject, t.width, t.height,
+                    static_cast<unsigned long long>(t.seen),
+                    static_cast<unsigned long long>(t.won),
+                    static_cast<unsigned long long>(t.ineligible), t.lastReason,
+                    static_cast<unsigned long long>(t.lostBusy));
+      LogInfo(row);
+    }
+    if (m_surfaceTallyOverflow) {
+      char row[96];
+      std::snprintf(row, sizeof(row), "  readback tally overflow %llu",
+                    static_cast<unsigned long long>(m_surfaceTallyOverflow));
+      LogInfo(row);
+    }
   }
-  ++m_surfaceReadbacks;
   // Bumped last, so a reader that checks the sequence first cannot pair a new
   // sequence with half-written bytes.
   mx::hle::g_surfaceReadbackSeq.fetch_add(1, std::memory_order_release);

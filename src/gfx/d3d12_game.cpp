@@ -382,7 +382,9 @@ bool D3D12Renderer::CreateGamePipeline() {
   }
   // The same, for small destinations the guest reads out of memory -- the
   // terrain feedback buffer. Up front for the same reason.
-  for (auto& rb : m_surfaceReadback) {
+  for (auto& frameSlots : m_surfaceSlots)
+    for (auto& slot : frameSlots) {
+    auto& rb = slot.buffer;
     D3D12_HEAP_PROPERTIES heap = {};
     heap.Type = D3D12_HEAP_TYPE_READBACK;
     D3D12_RESOURCE_DESC bd = {};

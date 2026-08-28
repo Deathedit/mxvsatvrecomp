@@ -778,11 +778,19 @@ void D3D12Renderer::RenderGameFrame() {
           (oneByOneSeen++ % kMaxLuminanceSlots) ==
               (m_gameFrame % kMaxLuminanceSlots))
         QueueLuminanceReadback(snap, d.resolveDest);
-      // And the same for a small destination that is bigger than 1x1: the
-      // terrain feedback buffer is 64x64 and read the same way. Gated on the
-      // RESOLVE's extent, not the snapshot's, because the snapshot grows.
+      // And the same for any destination whose COPIED REGION is small enough
+      // to travel, whatever the destination's own extent: the VT feedback
+      // buffer is 64x64 resolved to (0,0), and the terrain deformation is a
+      // 128x32 tile resolved into a 2048x2048 accumulation at a destpoint.
+      //
+      // The destpoint goes with it, AND the region's extent. Both were omitted
+      // while the feedback buffer was the only caller -- it resolves 64x64 to
+      // the origin of a 64x64 destination, so the destpoint was
+      // indistinguishable from (0,0) and the region from the whole snapshot.
+      // Without the extent the callee could only read the snapshot's own size,
+      // which for the deformation is the 2048x2048 accumulation, not the tile.
       QueueSurfaceReadback(snap, d.resolveDest, d.resolveDestWidth,
-                           d.resolveDestHeight);
+                           d.resolveDestHeight, dx, dy, copyW, copyH);
       continue;
     }
     // A full-surface D3D9 DEPTH clear, ordered among the draws.
@@ -3347,6 +3355,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
             vertexStage->constDwords * 4 + kTranslatedSamplerSlots * 16;
         std::memcpy(p + vfOffset, vertexStage->rawFetch,
                     vertexStage->rawFetchCount * 16);
+        FillVertexTexinv(d, p, vsConstBytes, vertexStage->constDwords);
         FillVertexTextureSigns(d, p, vsConstBytes, vertexStage->constDwords);
         d.vertexShaderHandle = vertexStage->handle;
         d.vertexShaderHlsl = vertexStage->hlsl;
@@ -3371,6 +3380,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
       std::memset(d.vscb.cpu, 0, vsConstBytes);
       std::memcpy(d.vscb.cpu, vertexStage->constants,
                   vertexStage->constDwords * 4);
+      FillVertexTexinv(d, d.vscb.cpu, vsConstBytes, vertexStage->constDwords);
       FillVertexTextureSigns(d, d.vscb.cpu, vsConstBytes,
                              vertexStage->constDwords);
       d.vertexShaderHandle = vertexStage->handle;

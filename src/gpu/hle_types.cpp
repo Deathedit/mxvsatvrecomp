@@ -102,7 +102,7 @@ std::atomic<uint32_t> g_luminanceReadbackSeq{0};
 // serves is a single destination and a rotating array would be capacity nobody
 // asked for.
 std::mutex g_surfaceReadbackMutex;
-SurfaceReadback g_surfaceReadback;
+SurfaceReadback g_surfaceReadback[kSurfaceReadbackSlots];
 std::atomic<uint32_t> g_surfaceReadbackSeq{0};
 
 uint32_t ExpandRectangleList(DrawCall& dc) {

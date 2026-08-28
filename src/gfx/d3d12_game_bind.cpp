@@ -50,6 +50,67 @@ void D3D12Renderer::FillVertexTextureSigns(const GameDraw& d, uint8_t* cb,
   }
 }
 
+// xe_texinv FOR THE VERTEX STAGE, which was never written at all.
+//
+// The emitter declares `float4 xe_texinv[kTranslatedSamplerSlots]` in BOTH
+// stages and the vertex path already sized the cbuffer for it, zeroed it, and
+// skipped over it to place xe_vf at the offset just past it. It simply never
+// filled it. Confirmed in floating.rdc at event 19719, the terrain draw:
+// every one of xe_texinv[0..15] read [0,0,0,0] in the vertex shader while the
+// pixel stage of the same frame had its slots populated.
+//
+// Two things ride in there and both were dead for every vertex fetch in the
+// game:
+//
+//   .xy  1/extent, which an unnormalized fetch multiplies its TEXEL coordinate
+//        by. Zero collapses any such fetch to texel 0 -- one texel's value
+//        spread flat across the primitive.
+//   .w   the guest's per-texture LOD bias in LOD units. The fetch-constant bias
+//        landed for the pixel stage only, so every VS sample_l has been taking
+//        its LOD from a zero.
+//
+//   .z   layer count, for a 3D fetch's slice index.
+//
+// The pixel path's equivalent lives in d3d12_game_frame.cpp and carries a
+// warning this must not repeat: resolve the bias ONLY on the non-snapshot
+// branch. A snapshot slot routinely has a shadowing payload describing a
+// DIFFERENT texture, and reading the bias from it is texinv-shadowed-by-payload
+// one field over. A snapshot has no fetch constant behind it, so no bias is
+// both correct and what it had before.
+void D3D12Renderer::FillVertexTexinv(const GameDraw& d, uint8_t* cb,
+                                     uint32_t cbBytes, uint32_t constDwords) {
+  const uint32_t at = constDwords * 4;
+  if (!cb || at + kTranslatedSamplerSlots * 16 > cbBytes) return;
+  for (uint32_t s = 0; s < kTranslatedSamplerSlots; ++s) {
+    uint32_t w = 0, h = 0, layers = 0;
+    float lodBias = 0.0f;
+    const uint32_t object =
+        s < d.vertexSampledObjects.size() ? d.vertexSampledObjects[s] : 0;
+    if (object) {
+      const auto snap = m_gameSnapshots.find(object);
+      if (snap != m_gameSnapshots.end()) {
+        w = snap->second.width;
+        h = snap->second.height;
+      }
+    } else {
+      const auto& tex =
+          s < d.vertexTextures.size() ? d.vertexTextures[s] : nullptr;
+      if (tex && tex->width && tex->height) {
+        w = tex->width;
+        h = tex->height;
+        layers = tex->array_size;
+        lodBias = tex->lod_bias;
+      }
+    }
+    // Left zero when there is no texture, deliberately: a fetch then reads
+    // texel 0 rather than the infinity a divide by a zero extent would give.
+    if (!w || !h) continue;
+    const float ts[4] = {1.0f / float(w), 1.0f / float(h), float(layers),
+                         lodBias};
+    std::memcpy(cb + at + s * 16, ts, sizeof(ts));
+  }
+}
+
 bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
                                            D3D12_GPU_DESCRIPTOR_HANDLE& out,
                                            bool vertex) {

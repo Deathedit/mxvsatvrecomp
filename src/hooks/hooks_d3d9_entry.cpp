@@ -1808,13 +1808,40 @@ extern "C" REX_FUNC(sub_8255CE98) {
         // resolve the guest just issued is the one it is about to read, and the
         // value is the previous frame's, which is the latency the console gives
         // it anyway.
+        //
+        // NOT GATED ON THE DESTINATION'S EXTENT. It used to require
+        // `width <= 64 && height <= 64`, the same assumption the renderer side
+        // carried and for the same reason: the feedback buffer is 64x64 into a
+        // 64x64 destination, so the region and the resource were never told
+        // apart. The terrain deformation resolves a 128x32 tile into a
+        // 2048x2048 accumulation and was refused here even after the readback
+        // had been copied, drained and matched -- a second copy of a bug I had
+        // just fixed one file over, still standing.
+        //
+        // Nothing is lost by dropping it. `rb.destObject == dest_texture`
+        // below is the real discriminator and it is exact: only a destination
+        // that actually won a readback slot can match, and the region's size is
+        // already bounded by the 16 KB CPU buffer it had to fit in. The seq
+        // test above means at most one readback's worth of resolves reach the
+        // lock per frame.
         if (dest_desc.width > 1 && dest_desc.height > 1 &&
-            dest_desc.width <= 64 && dest_desc.height <= 64 &&
             dest_desc.bytes_per_block && dest_desc.address) {
-          static uint32_t s_surfaceWroteSeq = 0;
-          const uint32_t seq =
-              mx::hle::g_surfaceReadbackSeq.load(std::memory_order_acquire);
-          if (seq != s_surfaceWroteSeq) {
+          //
+          // EVERY SLOT, not "has the global sequence moved". The old form kept
+          // one `s_surfaceWroteSeq`: the first destination to match stamped the
+          // frame consumed, and any other destination delivered in the same
+          // frame was skipped without being looked at. That was invisible while
+          // one readback was in flight at a time. Each slot now carries its own
+          // seq and is remembered separately, so several destinations can be
+          // written in one frame.
+          //
+          // The acquire load below is kept for its fence, not as a gate: it
+          // pairs with the release bump in DrainSurfaceReadback so the bytes a
+          // slot's seq advertises are visible before the seq is.
+          static uint32_t s_slotSeq[mx::hle::kSurfaceReadbackSlots] = {};
+          (void)mx::hle::g_surfaceReadbackSeq.load(std::memory_order_acquire);
+          for (uint32_t slot = 0; slot < mx::hle::kSurfaceReadbackSlots;
+               ++slot) {
             uint32_t wrote = 0;
             uint32_t skipped_unwritable = 0;
             bool matched = false;
@@ -1845,20 +1872,51 @@ extern "C" REX_FUNC(sub_8255CE98) {
             static uint32_t s_byteMax[4] = {};
             {
               std::lock_guard<std::mutex> lk(mx::hle::g_surfaceReadbackMutex);
-              const auto& rb = mx::hle::g_surfaceReadback;
-              matched = rb.destObject == dest_texture && rb.width &&
+              const auto& rb = mx::hle::g_surfaceReadback[slot];
+              // FORMAT CONVERSION, because a Xenos resolve converts.
+              //
+              // The old guard demanded `rb.bytesPerTexel ==
+              // dest_desc.bytes_per_block`, which only the VT feedback buffer
+              // satisfies (4 == 4). The terrain deformation resolves an
+              // R32_FLOAT tile into a destination the guest then fetches as
+              // FMT_8 -- 4 bytes against 1 -- so the pair was rejected before a
+              // byte moved.
+              //
+              // The mapping is not a guess: sub_82AF7240 memsets that buffer to
+              // 0x80, and the float accumulation's measured maximum is 0.5021 =
+              // 128/255. The float side already carries the unorm value, so
+              // round(saturate(f) * 255) is the conversion and 0x80 is its
+              // neutral in both representations.
+              const bool same_texel =
+                  rb.bytesPerTexel == dest_desc.bytes_per_block;
+              const bool float_to_unorm8 =
+                  rb.bytesPerTexel == 4 && dest_desc.bytes_per_block == 1 &&
+                  rb.srcFormat == uint32_t(DXGI_FORMAT_R32_FLOAT);
+              matched = rb.seq && rb.seq != s_slotSeq[slot] &&
+                        rb.destObject == dest_texture && rb.width &&
                         rb.height && rb.bytesPerTexel &&
-                        rb.bytesPerTexel == dest_desc.bytes_per_block;
+                        (same_texel || float_to_unorm8);
               if (matched) {
-                s_surfaceWroteSeq = seq;
+                s_slotSeq[slot] = rb.seq;
                 const uint32_t bpb = dest_desc.bytes_per_block;
                 const uint32_t bpb_log2 = uint32_t(std::bit_width(bpb)) - 1u;
                 const uint32_t w = std::min(rb.width, dest_desc.width);
                 const uint32_t h = std::min(rb.height, dest_desc.height);
                 for (uint32_t y = 0; y < h; ++y) {
                   for (uint32_t x = 0; x < w; ++x) {
-                    const size_t srcOff = size_t(y) * rb.rowPitch + size_t(x) * bpb;
-                    if (srcOff + bpb > rb.byteCount) continue;
+                    // The READBACK's texel size, which is not the
+                    // destination's once a conversion is in play.
+                    const size_t srcOff =
+                        size_t(y) * rb.rowPitch + size_t(x) * rb.bytesPerTexel;
+                    if (srcOff + rb.bytesPerTexel > rb.byteCount) continue;
+                    // AT THE DESTPOINT. The copied region is a sub-rect of the
+                    // destination; every caller before the terrain deformation
+                    // resolved to (0,0), so writing at the origin was right by
+                    // accident rather than by rule.
+                    const uint32_t dx = x + rb.destX;
+                    const uint32_t dy = y + rb.destY;
+                    if (dx >= dest_desc.width || dy >= dest_desc.height)
+                      continue;
                     // The guest's own layout, tiled or linear, exactly as the
                     // DECODER reads it -- the same tu::GetTiledOffset2D, run in
                     // the other direction. Two address rules that disagree is
@@ -1866,9 +1924,9 @@ extern "C" REX_FUNC(sub_8255CE98) {
                     const uint32_t dstOff =
                         dest_desc.tiled
                             ? uint32_t(tu::GetTiledOffset2D(
-                                  int32_t(x), int32_t(y),
+                                  int32_t(dx), int32_t(dy),
                                   dest_desc.pitch_blocks, bpb_log2))
-                            : (y * dest_desc.pitch_blocks + x) * bpb;
+                            : (dy * dest_desc.pitch_blocks + dx) * bpb;
                     const uint32_t at = dest_desc.address + dstOff;
                     if (!HostPageReadable(REX_RAW_ADDR(at)) ||
                         !HostPageReadable(REX_RAW_ADDR(at + bpb - 1))) {
@@ -1878,7 +1936,15 @@ extern "C" REX_FUNC(sub_8255CE98) {
                     // Byte-reversed for the guest's endian, the same swap the
                     // upload path applies coming the other way.
                     uint8_t tmp[16];
-                    std::memcpy(tmp, rb.bytes + srcOff, bpb);
+                    if (float_to_unorm8) {
+                      float f = 0.0f;
+                      std::memcpy(&f, rb.bytes + srcOff, sizeof(f));
+                      if (!(f > 0.0f)) f = 0.0f;  // also catches NaN
+                      if (f > 1.0f) f = 1.0f;
+                      tmp[0] = uint8_t(f * 255.0f + 0.5f);
+                    } else {
+                      std::memcpy(tmp, rb.bytes + srcOff, bpb);
+                    }
                     if (bpb == 2 && dest_desc.endian != 0) {
                       std::swap(tmp[0], tmp[1]);
                     } else if (bpb == 4 && dest_desc.endian != 0) {
@@ -1991,9 +2057,25 @@ extern "C" REX_FUNC(sub_8255CE98) {
             }
             if (matched) {
               uint32_t distinct = 0, dominant = 0, dominant_n = 0, usable = 0;
+              // THE ACTUAL DISTRIBUTION, not a borrowed gate.
+              //
+              // `usable` counts texels whose low byte is < 16, which is the
+              // guest's MIP-LEVEL test in the feedback walk. For the terrain
+              // deformation that byte is a HEIGHT, and the same test reads as
+              // "more than half the tile is near zero" -- true, and it says
+              // nothing about whether zero is right. The buffer's neutral is
+              // 0x80 (sub_82AF7240 memsets it, and the accumulation's measured
+              // max is 0.502 = 128/255), so min/max/mean over what we write is
+              // what separates a rut from a trench.
+              uint32_t vmin = 255, vmax = 0;
+              uint64_t vsum = 0, vcount = 0;
               for (uint32_t v = 0; v < 256; ++v) {
                 if (!low_hist[v]) continue;
                 ++distinct;
+                if (v < vmin) vmin = v;
+                if (v > vmax) vmax = v;
+                vsum += uint64_t(v) * low_hist[v];
+                vcount += low_hist[v];
                 if (low_hist[v] > dominant_n) {
                   dominant_n = low_hist[v];
                   dominant = v;
@@ -2005,11 +2087,7 @@ extern "C" REX_FUNC(sub_8255CE98) {
               }
               static uint32_t s_logged = 0;
               static uint64_t s_writebacks = 0;
-              static uint64_t s_usableTotal = 0;
-              static uint64_t s_wroteTotal = 0;
               ++s_writebacks;
-              s_usableTotal += usable;
-              s_wroteTotal += wrote;
               if (s_logged++ < 8) {
                 REXLOG_INFO(
                     "d3d9: SURFACE WRITEBACK dest 0x{:08X} addr 0x{:08X} "
@@ -2024,7 +2102,79 @@ extern "C" REX_FUNC(sub_8255CE98) {
               }
               // The capped line above stops after 8 and this does not, so a
               // feed that starts healthy and later goes flat is still visible.
+              // WHICH DESTINATIONS actually get written, uncapped.
+              //
+              // The `SURFACE WRITEBACK` line stops after 8, and two
+              // destinations that queue every frame consumed all eight long
+              // before the terrain deformation was ever eligible. So "the
+              // deform address never appears" was not evidence of anything.
+              // A tiny fixed table, printed with the census, says outright
+              // which addresses this path has ever written.
+              //
+              // PER DESTINATION, because `usable of wrote` is meaningless
+              // summed across them. It was a single running total while the
+              // feedback buffer was the only destination this path ever
+              // reached. The moment the terrain deformation started landing,
+              // its 1-byte texels -- which are ~0x00 almost everywhere, and so
+              // trivially satisfy the guest's `< 16` mip gate -- were counted
+              // under a heading that says "a mip the guest would act on". Run
+              // 1634 printed `2,842,930 of 6,881,280` and read like the
+              // feedback feed had come back from nothing; ~89% of that
+              // numerator was deform bytes. The feedback buffer's own share
+              // was ~7%, against 5.6% earlier in the SAME run before any
+              // deform writeback existed. Two populations under one name.
+              //
+              // The byte spread below is not affected: its loop is
+              // `b + 1 < bpb`, so a 1-byte texel contributes nothing to it.
+              struct WroteTo {
+                uint32_t addr;
+                uint64_t count;
+                uint64_t wrote;
+                uint64_t usable;
+                uint32_t bpb;
+                uint32_t bmin;
+                uint32_t bmax;
+                uint64_t bsum;
+                uint64_t bcount;
+              };
+              static WroteTo s_dests[8] = {};
+              static bool s_destsInit = false;
+              if (!s_destsInit) {
+                for (auto& wd : s_dests) wd.bmin = 255;
+                s_destsInit = true;
+              }
+              static uint64_t s_destOverflow = 0;
+              bool placed = false;
+              for (auto& wd : s_dests) {
+                if (wd.addr == dest_desc.address || !wd.addr) {
+                  wd.addr = dest_desc.address;
+                  wd.bpb = dest_desc.bytes_per_block;
+                  ++wd.count;
+                  wd.wrote += wrote;
+                  wd.usable += usable;
+                  if (vcount) {
+                    if (vmin < wd.bmin) wd.bmin = vmin;
+                    if (vmax > wd.bmax) wd.bmax = vmax;
+                    wd.bsum += vsum;
+                    wd.bcount += vcount;
+                  }
+                  placed = true;
+                  break;
+                }
+              }
+              if (!placed) ++s_destOverflow;
               if ((s_writebacks % 120) == 0) {
+                std::string dests;
+                for (const auto& wd : s_dests) {
+                  if (!wd.addr) continue;
+                  dests += fmt::format(
+                      " 0x{:08X} x{} bpb{} {}/{} usable, byte {:02X}..{:02X} "
+                      "mean {:02X}",
+                      wd.addr, wd.count, wd.bpb, wd.usable, wd.wrote, wd.bmin,
+                      wd.bmax, wd.bcount ? uint32_t(wd.bsum / wd.bcount) : 0u);
+                }
+                if (s_destOverflow)
+                  dests += fmt::format(" (+{} unplaced)", s_destOverflow);
                 std::string spread;
                 for (uint32_t b = 0; b < 4; ++b) {
                   if (!s_byteSeen[b]) continue;
@@ -2033,13 +2183,12 @@ extern "C" REX_FUNC(sub_8255CE98) {
                                         s_byteHigh[b], s_byteSeen[b]);
                 }
                 REXLOG_INFO(
-                    "d3d9: FEEDBACK census: {} writebacks, {} of {} texels "
-                    "carry a mip the guest would act on (< 16) | this frame "
-                    "{} distinct low bytes, dominant 0x{:02X} | ACTED-ON byte "
-                    "spread{}",
-                    s_writebacks, s_usableTotal, s_wroteTotal, distinct,
-                    dominant,
-                    spread.empty() ? std::string(" (none yet)") : spread);
+                    "d3d9: WRITEBACK census: {} writebacks | this frame {} "
+                    "distinct low bytes, dominant 0x{:02X} | ACTED-ON byte "
+                    "spread{} | destinations written{}",
+                    s_writebacks, distinct, dominant,
+                    spread.empty() ? std::string(" (none yet)") : spread,
+                    dests.empty() ? std::string(" (none)") : dests);
               }
             }
           }
@@ -2555,6 +2704,90 @@ MX_RENDER_STATE_HOOK(sub_825497D8, orig_RsSeparateAlphaBlendEnable,
 MX_RENDER_STATE_HOOK(sub_82549900, orig_RsBlendFactor, mx::hle::kRsBlendFactor)
 
 //=============================================================================
+// 0x82AD0FC8 - HFTerrain: APPEND ONE TRACK SEGMENT. The deform producer.
+//
+// The consumer side (sub_82AD49A0, below) says the guest splats exactly ONCE
+// per run -- 60 track points and 4 splat triangles on the first call, then zero
+// for 300+ frames of riding. This is the other end of that, found by searching
+// for stores to the point-count offset 0x22A8: every one of them is in this
+// function, and it is reached only through a method table (one DATA xref at
+// 0x821C1F30, no direct calls), so who invokes it cannot be read statically.
+//
+// What it does, from the decompile: takes two segment endpoints and appends
+// SIX vertices of five floats each to `obj + 7684*half + 1192`, bumping the
+// float count at `+8872` thirty times, then
+//
+//     *(int*)(obj + 4*(half + 296)) += 2;      // obj+1184 / obj+1188
+//
+// two triangles per call. So the census's "60 points, 4 splat-tris" is exactly
+// TWO calls to this function, ever. 30 floats x 2 = 60, 2 triangles x 2 = 4.
+//
+// AND IT IS GATED, on a different array from the one it fills:
+//
+//     if (*(uint*)(obj + 520*half + 656) < 0x40u) { ...append... }
+//
+// a second list (8 bytes per entry at obj + 520*half + 144, count at +656)
+// capped at 64. So "the guest stopped splatting" has two possible shapes and
+// the draw-side census cannot tell them apart:
+//
+//     never called          -> the track system is not running; guest-side,
+//                              upstream of anything we do
+//     called and REFUSED    -> the cap is full and nothing drains it, which is
+//                              a state we might be perturbing
+//
+// This counts both, with the gate value, so one run separates them. Reads only;
+// the original runs untouched.
+//=============================================================================
+REX_IMPORT(__imp__sub_82AD0FC8, orig_TerrainTrackAppend, void());
+extern "C" REX_FUNC(sub_82AD0FC8) {
+  const uint32_t obj = ctx.r3.u32;
+  uint32_t half = 0, gate = 0xFFFFFFFFu, points_before = 0, tris_before = 0;
+  const bool readable = obj && HostPageReadable(REX_RAW_ADDR(obj + 124));
+  if (readable) {
+    half = REX_LOAD_U32(obj + 124) ? 1u : 0u;
+    const uint32_t gate_at = obj + 520u * half + 656u;
+    const uint32_t points_at = obj + 7684u * half + 8872u;
+    const uint32_t tris_at = obj + 1184u + 4u * half;
+    if (HostPageReadable(REX_RAW_ADDR(gate_at))) gate = REX_LOAD_U32(gate_at);
+    if (HostPageReadable(REX_RAW_ADDR(points_at)))
+      points_before = REX_LOAD_U32(points_at);
+    if (HostPageReadable(REX_RAW_ADDR(tris_at)))
+      tris_before = REX_LOAD_U32(tris_at);
+  }
+
+  orig_TerrainTrackAppend(ctx, base);
+
+  static std::atomic<uint64_t> s_calls{0}, s_refused{0}, s_appended{0};
+  static std::atomic<uint64_t> s_maxGate{0};
+  const uint64_t calls = s_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+  bool appended = false;
+  if (readable) {
+    const uint32_t tris_at = obj + 1184u + 4u * half;
+    if (HostPageReadable(REX_RAW_ADDR(tris_at)))
+      appended = REX_LOAD_U32(tris_at) != tris_before;
+    if (appended) s_appended.fetch_add(1, std::memory_order_relaxed);
+    else s_refused.fetch_add(1, std::memory_order_relaxed);
+    uint64_t seen = s_maxGate.load(std::memory_order_relaxed);
+    while (gate != 0xFFFFFFFFu && gate > seen &&
+           !s_maxGate.compare_exchange_weak(seen, gate)) {
+    }
+  }
+  // Denominator first. "Refused" and "never called" are the whole question, so
+  // the line has to print even when nothing is appended -- which is why it is
+  // keyed on the CALL count and not on a successful append.
+  if (calls <= 4 || (calls % 200) == 0) {
+    REXLOG_INFO(
+        "d3d9: TERRAIN TRACK APPEND obj 0x{:08X} -- {} calls, {} appended, {} "
+        "REFUSED by the 64 cap; peak gate {} | this call: half {} gate {} "
+        "points {} tris {}",
+        obj, calls, s_appended.load(std::memory_order_relaxed),
+        s_refused.load(std::memory_order_relaxed),
+        s_maxGate.load(std::memory_order_relaxed), half,
+        gate == 0xFFFFFFFFu ? -1 : int32_t(gate), points_before, tris_before);
+  }
+}
+
+//=============================================================================
 // 0x82AD49A0 - HFTerrain: the per-frame deformation render (tyre ruts).
 //
 // PURE MEASUREMENT, and it exists because the draw-side census cannot answer
@@ -2606,6 +2839,34 @@ extern "C" REX_FUNC(sub_82AD49A0) {
       obj && HostPageReadable(REX_RAW_ADDR(obj + 128));
   const uint32_t stamp_before = stamp_readable ? REX_LOAD_U32(obj + 128) : 0;
 
+  // READ THE COUNTS BEFORE THE BODY RUNS. This was wrong and it may have been
+  // wrong from the first version of this hook.
+  //
+  // They are INPUTS: the body tests `if (splat count > 0)` and draws on that.
+  // The producer's own log proves they are reset every frame -- sub_82AD0FC8
+  // sees `tris 0` on the first append of every frame -- so reading them AFTER
+  // the body returns whatever survived the pass, and if the consumer is what
+  // clears them, that is a guaranteed zero no matter what the body did. A
+  // census that reads a consumed value after consumption reports "there was
+  // nothing" for both "there was nothing" and "there was something and it was
+  // used", which are opposite answers.
+  //
+  // That is the same shape as the UI defect on this branch: the draws were
+  // happening and the instrument could not see them. Here the instrument reads
+  // the wrong side of the call.
+  //
+  // TILES stay read AFTER, and that is not an inconsistency: the body zeroes
+  // obj+16944 and REBUILDS it, so the post-call value is the list it drew from.
+  uint32_t half_before = 0, points_before = 0, splats_before = 0;
+  if (obj && HostPageReadable(REX_RAW_ADDR(obj + 124))) {
+    half_before = REX_LOAD_U32(obj + 124) == 0 ? 1u : 0u;
+    const uint32_t blk = obj + (half_before ? 7684u : 0u);
+    const uint32_t spl = obj + (half_before ? 1188u : 1184u);
+    if (HostPageReadable(REX_RAW_ADDR(blk + 8872)))
+      points_before = REX_LOAD_U32(blk + 8872);
+    if (HostPageReadable(REX_RAW_ADDR(spl))) splats_before = REX_LOAD_U32(spl);
+  }
+
   orig_TerrainDeformRender(ctx, base);
 
   if (!stamp_readable) return;
@@ -2656,20 +2917,59 @@ extern "C" REX_FUNC(sub_82AD49A0) {
   }
   const uint64_t ran = census->ran.fetch_add(1, std::memory_order_relaxed) + 1;
 
-  const bool half = obj && HostPageReadable(REX_RAW_ADDR(obj + 124)) &&
-                    REX_LOAD_U32(obj + 124) == 0;
-  const uint32_t block = obj + (half ? 7684u : 0u);
-  const uint32_t splat_off = obj + (half ? 1188u : 1184u);
-  const uint32_t points =
-      HostPageReadable(REX_RAW_ADDR(block + 8872)) ? REX_LOAD_U32(block + 8872)
-                                                   : 0;
-  const uint32_t splats =
-      HostPageReadable(REX_RAW_ADDR(splat_off)) ? REX_LOAD_U32(splat_off) : 0;
+  const bool half = half_before != 0;
+  const uint32_t points = points_before;
+  const uint32_t splats = splats_before;
   // Read AFTER the original, so it is the list the pass just drew from rather
   // than the one it inherited -- the body zeroes obj+16944 and rebuilds it.
   const uint32_t tiles =
       HostPageReadable(REX_RAW_ADDR(obj + 16944)) ? REX_LOAD_U32(obj + 16944)
                                                   : 0;
+  // THE OTHER HALF, and it is the whole question now.
+  //
+  // The producer (sub_82AD0FC8) writes block `obj[124]`. This render reads
+  // block `!obj[124]` -- deliberately opposite, a double buffer. TERRAIN TRACK
+  // APPEND says the producer appends on every call (200 of 200, 0 refused) and
+  // reaches 60 points / 4 triangles every frame, while this side reads 0 every
+  // frame. Both hooks are on the SAME object, so the data is not missing: it is
+  // in a block nobody reads.
+  //
+  // Reading both halves says so outright instead of leaving it to be inferred
+  // from two logs with different `half` conventions -- the producer prints
+  // obj[124], this prints `obj[124] == 0`, and comparing them across two logs
+  // is exactly the kind of off-by-one-convention that has cost this thread
+  // whole sessions.
+  // THE TWO PLAIN ALLOCATIONS, obj+112 and obj+116.
+  //
+  // sub_82AF7240 creates them with sub_82AB7848 (a plain allocator, 4096
+  // alignment -- NOT a texture creation) and memsets both to 0x80. It then
+  // calls sub_82629998(obj+8, buf0) and sub_82629998(obj+60, buf1), which is
+  // D3D9's offset-the-resource-address helper: it ADDS the pointer into the
+  // resource header's address fields. So the D3D9 textures at obj+8 / obj+60
+  // are BACKED BY those allocations.
+  //
+  // And sub_82AC7850 -- the deform pass's resolve destination -- returns
+  // `obj + 8 + 52 * (obj[120] == 0)`, i.e. one of exactly those two textures.
+  //
+  // So the deform RESOLVE DESTINATION and a plain guest allocation the guest
+  // memsets to 0x80 are the same bytes. Logging the pointers ties the runtime
+  // address in the resolve log (0x10C2E000) to this field, which is the last
+  // inference in that chain.
+  const uint32_t buf0 = HostPageReadable(REX_RAW_ADDR(obj + 112))
+                            ? REX_LOAD_U32(obj + 112)
+                            : 0;
+  const uint32_t buf1 = HostPageReadable(REX_RAW_ADDR(obj + 116))
+                            ? REX_LOAD_U32(obj + 116)
+                            : 0;
+  const uint32_t other_block = obj + (half ? 0u : 7684u);
+  const uint32_t other_splat = obj + (half ? 1184u : 1188u);
+  const uint32_t other_points =
+      HostPageReadable(REX_RAW_ADDR(other_block + 8872))
+          ? REX_LOAD_U32(other_block + 8872)
+          : 0;
+  const uint32_t other_tris = HostPageReadable(REX_RAW_ADDR(other_splat))
+                                  ? REX_LOAD_U32(other_splat)
+                                  : 0;
 
   if (points) census->withPoints.fetch_add(1, std::memory_order_relaxed);
   if (int32_t(splats) > 0)
@@ -2683,19 +2983,36 @@ extern "C" REX_FUNC(sub_82AD49A0) {
   bump(census->maxSplats, splats);
   bump(census->maxTiles, tiles);
 
-  // The denominator first, always, and it is THIS object's denominator, so
-  // "no splats" and "the pass never ran for this object" cannot render alike.
-  if (ran <= 4 || (ran % 300) == 0) {
+  // POPULATION *AND* FIRES. Run 1621 printed at ran<=4 and every 300, and the
+  // deform body ran fewer than 300 times in a 46-second run -- so every sample
+  // came from the first three seconds, while the bike was STATIONARY. The
+  // producer does not run then: sub_82AD0FC8 made two calls at 12:48:48, none
+  // for the next eight seconds, and then ~11 a second once the bike moved. The
+  // whole riding window went unsampled and the line still read "1 with track
+  // points", which is true of the window it saw and says nothing about the one
+  // that matters.
+  //
+  // So: every call that HAS points or splats is printed (capped), the periodic
+  // sample is 60 rather than 300, and the cumulative counters carry the
+  // denominator as before. A schedule that can only sample the idle part of a
+  // run is not a sample of the run.
+  static std::atomic<uint64_t> s_firePrints{0};
+  const bool interesting = points || splats;
+  const bool fire_budget =
+      interesting && s_firePrints.fetch_add(1, std::memory_order_relaxed) < 40;
+  if (ran <= 4 || (ran % 60) == 0 || fire_budget) {
     REXLOG_INFO(
         "d3d9: TERRAIN DEFORM obj 0x{:08X} extent {} -- ran {} times, {} with "
         "track points, {} with SPLAT triangles; peak points {} splat-tris {} "
-        "tiles {} | this call: half {} points {} splat-tris {} tiles {}",
+        "tiles {} | this call: half {} points {} splat-tris {} tiles {} | OTHER "
+        "half: points {} splat-tris {} | buffers 0x{:08X} 0x{:08X} sel {}",
         obj, extent, ran, census->withPoints.load(std::memory_order_relaxed),
         census->withSplats.load(std::memory_order_relaxed),
         census->maxPoints.load(std::memory_order_relaxed),
         census->maxSplats.load(std::memory_order_relaxed),
         census->maxTiles.load(std::memory_order_relaxed), half ? 1 : 0, points,
-        int32_t(splats), tiles);
+        int32_t(splats), tiles, other_points, int32_t(other_tris), buf0, buf1,
+        HostPageReadable(REX_RAW_ADDR(obj + 120)) ? REX_LOAD_U32(obj + 120) : 0);
   }
 }
 
