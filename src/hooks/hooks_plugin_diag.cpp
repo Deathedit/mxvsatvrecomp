@@ -33,19 +33,18 @@ using namespace mx::hooks;
 #include <utility>
 #include <vector>
 
-// The loader reaches state 2 (IdleClearRenderBusy) and parks there — it is idle,
-// not stuck, and nothing in the game ever asks it for the next load.
+// force_load is GONE, 2026-08-28, cvar and implementation both. It named a
+// scene to request from the AssetDB once the loader went idle, by calling the
+// guest's own load-request API sub_82534980(AssetDB, name, flags) from the
+// LoadStateMachine hook below. It superseded an earlier force_launch that wrote
+// AssetDB+28 directly, which was the wrong lever.
 //
-// `sub_82534980(AssetDB, name, flags)` is the guest's own load-request API: it
-// copies up to 260 bytes of `name` into AssetDB+29540 and, if the selector is
-// sitting at 2, moves it to 3. Set `force_load = "<scene>"` in mx.toml (or pass
-// --force_load=<scene>) to make that call once from idle, so the content/entity/
-// draw path downstream of a load can be exercised at all. Empty means off.
-//
-// This supersedes the earlier force_launch, which wrote AssetDB+28 directly.
-// That was the wrong lever — see AGENTS.md — and is gone.
-REXCVAR_DEFINE_STRING(force_load, "", "Debug",
-                      "Scene name to request from the AssetDB loader once it goes idle");
+// The observation behind it still stands and is still unexplained: the loader
+// reaches state 2 (IdleClearRenderBusy) and parks, because nothing in the game
+// ever calls sub_82534980. That same idle AssetDB is why UI_World never loads,
+// and it is the root of the 0x8234CE20 crash -- a bink asset in the
+// never-requested UIAnimations package resolves NULL and the guest dereferences
+// it with no check. Neither lever ever explained WHY nothing asks.
 
 // Every string setting the guest reads comes from MXRegistry.bxml through one
 // function, sub_825487C8(registry, key, out, size, 0). `registry_override` takes
@@ -251,62 +250,6 @@ extern "C" REX_FUNC(sub_8253AA40) {
         REXLOG_INFO("{}: state6 gate — vt[0]=0x{:08X} vt[1]=0x{:08X} vt[2]=0x{:08X} vt[3]=0x{:08X}",
                     tag, REX_LOAD_U32(vt), REX_LOAD_U32(vt + 4),
                     REX_LOAD_U32(vt + 8), REX_LOAD_U32(vt + 12));
-      }
-    }
-  }
-
-  // --force_load=<scene>: make the load request the front end never makes, using
-  // the guest's own API rather than writing engine state.
-  //
-  // sub_82534980(AssetDB, name, flags) copies up to 260 bytes of `name` into
-  // AssetDB+29540 and, when the selector is at 2, sets it to 3 and notifies the
-  // listener at *(a1+110788). Everything downstream reads AssetDB+29540 as
-  // "is a load pending" (name[0] != 0), which is why an empty name parks at 2.
-  //
-  // Wait for 30 consecutive ticks in state 2 so this cannot race the 0->1->2
-  // boot sequence, and fire exactly once.
-  if (!mx::native::g_plugin_mode && a1) {
-    static int s_idle = 0;
-    static bool s_fired = false;
-    const std::string& scene = REXCVAR_GET(force_load);
-    if (!s_fired && !scene.empty()) {
-      s_idle = (state_out == 2) ? s_idle + 1 : 0;
-      if (s_idle >= 30) {
-        s_fired = true;
-        // sub_82352AE0 reads its AssetDB from dword_830577C0, the same global our
-        // hooks use — confirmed once the `lis r11,-31995` base was computed
-        // correctly (0x83050000, not 0x830A0000 as first recorded).
-        REXLOG_INFO("native: force_load \"{}\" at call #{} — a1=0x{:08X} "
-                    "*(0x830577C0)=0x{:08X} state={}",
-                    scene, sm, a1, REX_LOAD_U32(0x830577C0), state_out);
-
-        // Carve a scratch buffer out of the guest stack for the name. PPC frames
-        // grow down and callees do `stwu r1,-N(r1)`, so parking r1 below the
-        // buffer keeps the callee's frames clear of it and our caller's frame
-        // above it. Restore r1 and the argument registers afterwards.
-        const uint32_t saved_r1 = ctx.r1.u32;
-        const uint32_t saved_r3 = ctx.r3.u32;
-        const uint32_t saved_r4 = ctx.r4.u32;
-        const uint32_t saved_r5 = ctx.r5.u32;
-        const uint32_t buf = (saved_r1 - 1024) & ~15u;
-        const size_t n = std::min<size_t>(scene.size(), 259);
-        for (size_t i = 0; i < n; ++i)
-          REX_STORE_U8(buf + static_cast<uint32_t>(i),
-                       static_cast<uint8_t>(scene[i]));
-        REX_STORE_U8(buf + static_cast<uint32_t>(n), 0);
-
-        ctx.r1.u32 = buf - 256;
-        ctx.r3.u32 = a1;
-        ctx.r4.u32 = buf;
-        ctx.r5.u32 = 0;
-        REX_CALL_INDIRECT_FUNC(0x82534980);
-        ctx.r1.u32 = saved_r1;
-        ctx.r3.u32 = saved_r3;
-        ctx.r4.u32 = saved_r4;
-        ctx.r5.u32 = saved_r5;
-
-        REXLOG_INFO("native: force_load returned — state now {}, name[0]=0x{:02X}",
-                    REX_LOAD_U32(a1 + 28), REX_LOAD_U8(a1 + 29540));
       }
     }
   }

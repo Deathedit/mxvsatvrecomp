@@ -1,9 +1,19 @@
 // Loading-path hooks — SetupRenderer, Transition, LoaderTick.
 //
-// This is the part of the boot sequence mid-ASM hooks used to carve into. Only
-// hook #6 is left, and since 2026-08-02 it skips exactly one instruction — the
-// `bl sub_82B34998` renderer dispatch at 0x82B70EF4, which our D3D12 backend
-// replaces. Everything else in LoaderTick runs. See the hook table in AGENTS.md.
+// This is the part of the boot sequence mid-ASM hooks used to carve into.
+// **NO MID-ASM HOOK IS ACTIVE ANY MORE**, checked 2026-08-28: mx_asm.toml is
+// 107 of 116 lines commented with nothing live, and mx_config.toml has no
+// mid-ASM section at all. The stubs in midasm_stubs.cpp are referenced only
+// from commented mx_asm.toml lines.
+//
+// This header used to say "only hook #6 is left, and it skips exactly one
+// instruction — the `bl sub_82B34998` renderer dispatch at 0x82B70EF4". That is
+// no longer true and had not been for some time: nothing is skipped, the
+// dispatch RUNS, and it is observed by a plain function hook on sub_82B34998 in
+// hooks_plugin_diag.cpp which calls its original in both modes.
+//
+// Comments in this file below still describe hook #6's behaviour in the past
+// tense; read them as history, not as the current configuration.
 
 #include "hooks/hook_common.h"
 
@@ -171,9 +181,11 @@ extern "C" REX_FUNC(sub_82B710D0) {
 
     // --- Renderer-block probe -----------------------------------------------
     // Describes 0x82B70EC8..0x82B710BC. Hook #6 used to delete this band
-    // wholesale; since 2026-08-02 it skips only the `bl sub_82B34998` dispatch
-    // at 0x82B70EF4 and the rest runs. These reads established that the band's
-    // inputs were real before the narrowing; they stay as a regression check.
+    // wholesale, then narrowed to skipping only the `bl sub_82B34998` dispatch
+    // at 0x82B70EF4. It is disabled now along with every other mid-ASM hook, so
+    // the whole band runs including that dispatch. These reads established that
+    // the band's inputs were real before the narrowing; they stay as a
+    // regression check.
 
     // Lazy-init at 0x82B70EE8 is `bctrl` through dword_82D5648C. When #6 was
     // last disabled execution stalled right here (midasm_stubs.cpp:33) — but
