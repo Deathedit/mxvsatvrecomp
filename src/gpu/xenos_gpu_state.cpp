@@ -182,38 +182,48 @@ uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
   if (!bank || first_reg >= kAluConstants) return 0;
   const uint32_t regs = std::min(reg_count, kAluConstants - first_reg);
   uint32_t fixed = 0;
+  // Guard-census tallies, flushed once after the loop. See the note inside.
+  uint64_t n_seen = 0, n_fired = 0, n_bdSeen = 0, n_bdFired = 0;
   std::lock_guard<std::mutex> lk(g_mu);
+  // THE DENOMINATORS ARE STRUCTURAL, SO THEY ARE COUNTED STRUCTURALLY.
+  //
+  // The population is "every component examined", and this loop examines every
+  // component unconditionally -- so the count is `regs * 4` and does not depend
+  // on a single bank value. It used to be accumulated with a ++ inside the
+  // loop, alongside an unconditional g_have load and a range test, all of it
+  // ahead of the `if (!NonFinite(cur)) continue;` that discards ~all of it.
+  // That block was the cost: batching the atomics took this phase 8ms -> 3.5ms
+  // and the residue was the bookkeeping around them, ~1.1M dwords a frame in
+  // each of the two stages.
+  //
+  // Closed form here, fires inside the branch below. The census is IDENTICAL
+  // for the third time in a row -- same population, same fires, same rate --
+  // because a `fired` can only happen where NonFinite already holds, and every
+  // other component contributes exactly 1 to the denominator and 0 to the
+  // numerator whatever its value is.
+  n_seen = uint64_t(regs) * 4;
+  // Same closed form for the backdrop block: guest c392..c395 are the guest
+  // constants in [392, 396), this call covers [first_reg, first_reg + regs),
+  // and each constant is four components.
+  {
+    const uint32_t lo = std::max(first_reg, 392u);
+    const uint32_t hi = std::min(first_reg + regs, 396u);
+    n_bdSeen = hi > lo ? uint64_t(hi - lo) * 4 : 0;
+  }
   for (uint32_t i = 0; i < regs * 4; ++i) {
     const uint32_t cur = bank[i];
-    // Noted BEFORE the non-finite filter. Placed after it, the population was
-    // "non-finite components examined" and the rate came out 90.8% -- which
-    // sounds catastrophic and is unreadable, because it is a fraction of the
-    // NaNs rather than of the bank. The question is what share of the CONSTANTS
-    // we overwrite, so every component examined is an opportunity.
-    {
-      const uint32_t dd = first_reg * 4 + i;
-      const bool pub = (g_have[dd >> 5] & (1u << (dd & 31))) != 0;
-      // Fires only when we ACTUALLY substitute, so the census tracks the
-      // guard rather than the opportunity -- with strict on it should fall to
-      // zero, and a non-zero reading would mean the switch is not reaching
-      // here.
-      const bool would_repair =
-          NonFinite(cur) && !pub && (cur & 0x007FFFFFu) != 0 &&
-          !mx::gpu::guard::Strict(mx::gpu::guard::Guard::kConstantNanToZero);
-      mx::gpu::guard::Note(mx::gpu::guard::Guard::kConstantNanToZero,
-                           would_repair);
-      // The backdrop block on its own: guest c392..c395 = xe_c[136..139].
-      // Population is every component of those four constants examined, so the
-      // row reads "of the backdrop constants we looked at, how many were NaN we
-      // repaired" -- not diluted by the other 252 registers.
-      const uint32_t guest_const = dd >> 2;
-      if (guest_const >= 392 && guest_const < 396)
-        mx::gpu::guard::Note(mx::gpu::guard::Guard::kConstantNanBackdrop,
-                             would_repair);
-    }
     if (!NonFinite(cur)) continue;
     const uint32_t d = first_reg * 4 + i;
     const bool published = (g_have[d >> 5] & (1u << (d & 31))) != 0;
+    // Fires only when we ACTUALLY substitute, so the census tracks the guard
+    // rather than the opportunity -- with strict on it should fall to zero, and
+    // a non-zero reading would mean the switch is not reaching here.
+    if (!published && (cur & 0x007FFFFFu) != 0 &&
+        !mx::gpu::guard::Strict(mx::gpu::guard::Guard::kConstantNanToZero)) {
+      ++n_fired;
+      const uint32_t guest_const = d >> 2;
+      if (guest_const >= 392 && guest_const < 396) ++n_bdFired;
+    }
     if (published && !NonFinite(g_file[d])) {
       bank[i] = g_file[d];
       ++fixed;
@@ -305,9 +315,22 @@ uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
   // exactly what the menu "trying to do a shader it can't" looked like. 207
   // distinct constants, so this is not a range to narrow; the frame-global file
   // is simply the wrong authority for a mid-frame VERTEX draw.
+  // BLOCK SKIP. Every iteration ends at `if (!(g_have[...] & bit)) continue;`
+  // unless PM4 published that exact dword, and g_have is a bitmap 32 dwords to
+  // the word -- so a zero word means none of its 32 dwords can pass, and all 32
+  // can be stepped over without changing a single counter. Exact, not sampled:
+  // the iterations elided are precisely the ones that did nothing.
+  //
+  // Worth doing because this pass is a DRY RUN -- it mutates nothing, it only
+  // counts -- and it walks the full 1024-dword bank once per draw per stage,
+  // the same ~1.1M iterations that made the loop above expensive.
   for (uint32_t i = 0; count_finite_zeros && i < regs * 4; ++i) {
-    if (bank[i] != 0) continue;
     const uint32_t d = first_reg * 4 + i;
+    if ((d & 31) == 0 && g_have[d >> 5] == 0) {
+      i += 31;  // the ++i finishes the block
+      continue;
+    }
+    if (bank[i] != 0) continue;
     if (!(g_have[d >> 5] & (1u << (d & 31)))) continue;
     const uint32_t v = g_file[d];
     if (v == 0 || NonFinite(v)) continue;
@@ -374,6 +397,22 @@ uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
     // The frame-global risk is not gone, it is bounded: within this window the
     // worst case is a material gated OFF this frame being lit as though it were
     // ON. That is visible and reversible; a sprayed matrix palette was neither.
+  }
+  // The census, flushed once. Two calls reproduce exactly what 1024 per-dword
+  // calls produced: population = clean + fired, fires = fired.
+  if (n_seen) {
+    mx::gpu::guard::Note(mx::gpu::guard::Guard::kConstantNanToZero, false,
+                         n_seen - n_fired);
+    if (n_fired)
+      mx::gpu::guard::Note(mx::gpu::guard::Guard::kConstantNanToZero, true,
+                           n_fired);
+  }
+  if (n_bdSeen) {
+    mx::gpu::guard::Note(mx::gpu::guard::Guard::kConstantNanBackdrop, false,
+                         n_bdSeen - n_bdFired);
+    if (n_bdFired)
+      mx::gpu::guard::Note(mx::gpu::guard::Guard::kConstantNanBackdrop, true,
+                           n_bdFired);
   }
   g_repaired += fixed;
   return fixed;

@@ -296,17 +296,56 @@ uint32_t GuestTextureFingerprint(const mx::hle::HleTextureSource& source,
   h *= 1099511628211ull;
 
   bool ok = true;
+  // The readability probe is memoised PER PAGE. Every slice used to cost two
+  // HostPageReadable calls, and that function is not free: an atomic counter
+  // plus a linear scan of a 64-entry thread-local region cache. 32 slices x 2
+  // probes x ~2800 slot calls is ~180k calls a frame, several ms of it.
+  //
+  // Still probes every DISTINCT page, so it is not weaker than the per-slice
+  // version -- only the repeats within a page are elided, and readability
+  // cannot vary inside one. Consecutive slices share a page whenever the
+  // texture is under ~128 KB, which is most of them.
+  uint32_t last_ok_page = 0xFFFFFFFFu;
+  const auto page_ok = [&](uint32_t a) {
+    const uint32_t page = a & ~0xFFFu;
+    if (page == last_ok_page) return true;
+    if (!HostPageReadable(REX_RAW_ADDR(a))) return false;
+    last_ok_page = page;
+    return true;
+  };
   const auto eat = [&](uint32_t offset, uint32_t n) {
     if (!ok) return;
     // Checked per slice rather than once at each end: the pages between are
     // not guaranteed mapped, and a fingerprint is not worth a fault.
-    if (!HostPageReadable(REX_RAW_ADDR(addr + offset)) ||
-        !HostPageReadable(REX_RAW_ADDR(addr + offset + n - 1))) {
+    if (!page_ok(addr + offset) || !page_ok(addr + offset + n - 1)) {
       ok = false;
       return;
     }
     const auto* q = reinterpret_cast<const uint8_t*>(REX_RAW_ADDR(addr + offset));
-    for (uint32_t i = 0; i < n; ++i) {
+    // EIGHT BYTES PER MULTIPLY, not one.
+    //
+    // FNV-1a's multiply is a serial dependency: byte i+1 cannot start until
+    // byte i's imul retires, so a byte-at-a-time loop runs at the multiply's
+    // latency per byte no matter how wide the machine is. 2 KB per slot call
+    // over ~2800 calls is 5.7 MB a frame down that chain, which is what
+    // `stale-check 11ms` was almost entirely made of.
+    //
+    // Consuming a whole word per step keeps the same shape -- xor, multiply,
+    // in order -- with an eighth of the chain. It is a DIFFERENT hash value
+    // than before, which matters not at all: this is a change detector, its
+    // outputs live only in the in-memory cache, and nothing persists across
+    // runs. The tail is finished byte-wise so short slices still mix.
+    //
+    // Same class of defect as the one in `cpu-cost-is-fingerprint-and-histogram`
+    // (a byte-at-a-time FNV at 4.6ms/frame). This is the second instance.
+    uint32_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+      uint64_t w;
+      std::memcpy(&w, q + i, sizeof(w));
+      h ^= w;
+      h *= 1099511628211ull;
+    }
+    for (; i < n; ++i) {
       h ^= q[i];
       h *= 1099511628211ull;
     }
@@ -489,10 +528,40 @@ FlatScan ScanFlatness(const uint8_t* data, size_t bytes, uint32_t element_bytes)
   else w = 1;
   s.element_bytes = w;
 
-  size_t hist[256] = {};
-  for (size_t i = 0; i < bytes; ++i) ++hist[data[i]];
-  for (uint32_t v = 0; v < 256; ++v)
-    if (hist[v]) ++s.distinct_bytes;
+  // A 256-BIT SET, not a 256-ENTRY HISTOGRAM, and it stops once every value has
+  // been seen.
+  //
+  // `distinct_bytes` is used by exactly three log lines and nothing else, and
+  // the old form counted every byte of the decoded texture into a 2 KB array:
+  // 4 million dependent read-modify-writes for a 4 MB texture. Measured in
+  // freeroam, run 1687:
+  //
+  //   TEXTURE COST 2729 slot calls -- decode 51ms, scan 76ms
+  //                | 2723 cache hits, 3 decodes over 4112 KB
+  //
+  // 76ms of scan for THREE textures, and the frames where only one decoded read
+  // `decode 0ms, scan 1ms`. So a spike frame is 127ms of decode+scan, on a
+  // ~160ms frame, for a diagnostic count.
+  //
+  // The count is still EXACT. Only the mechanism changes: 32 bytes of state the
+  // compiler can keep in registers instead of a 2 KB table, and an early exit
+  // the moment all 256 values have appeared -- which any real texture reaches
+  // within a few KB. The pathological case (a nearly-uniform surface) is
+  // precisely the one that stays cheap anyway.
+  {
+    uint64_t seen[4] = {};
+    uint32_t found = 0;
+    for (size_t i = 0; i < bytes && found < 256; ++i) {
+      const uint8_t b = data[i];
+      const uint64_t bit = 1ull << (b & 63u);
+      uint64_t& word = seen[b >> 6];
+      if (!(word & bit)) {
+        word |= bit;
+        ++found;
+      }
+    }
+    s.distinct_bytes = found;
+  }
 
   const size_t n = bytes / w;
   if (!n) return s;
