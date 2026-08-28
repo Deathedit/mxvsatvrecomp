@@ -2286,7 +2286,22 @@ extern "C" REX_FUNC(sub_826295E8) {
     std::lock_guard<std::mutex> lk(s_mu);
     if (s_seen.size() >= 96 || !s_seen.insert(key).second) return;
   }
+  // RANGE-CHECKED. `dest` is a guest value that has only been tested for
+  // non-zero, and the six fetch dwords at +0x1C are read straight off it. That
+  // is the same shape as the "Litl" crash in the video probe: a field that is
+  // usually an object, occasionally not, dereferenced because it looked
+  // plausible. This one is diagnostics only and must never be the thing that
+  // takes the process down.
   uint32_t fetch[6] = {};
+  if (!GuestRangeReadable(base, dest + 0x1Cu, 6u * 4u)) {
+    static std::atomic<uint64_t> s_unreadable{0};
+    const uint64_t n = s_unreadable.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 4)
+      REXLOG_INFO("native: ENGINE TEX SHAPE {}x{}x{} -- header 0x{:08X} +0x1C is "
+                  "not readable, fetch constants not dumped ({} so far)",
+                  width, height, depth, dest, n);
+    return;
+  }
   for (uint32_t i = 0; i < 6; ++i) fetch[i] = REX_LOAD_U32(dest + 0x1C + i * 4);
   REXLOG_INFO("native: ENGINE TEX SHAPE {}x{}x{} levels {} usage {} format "
               "0x{:08X} restype {} -> header 0x{:08X}; fetch0=0x{:08X} type={} "
