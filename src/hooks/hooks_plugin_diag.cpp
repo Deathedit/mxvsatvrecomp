@@ -885,19 +885,130 @@ extern "C" REX_FUNC(sub_82B38558) {
 
 namespace {
 
-// The 228 (name, func) pairs at 0x8203F2E0 that sub_824F1C98 registers. There is
-// a second table of the same shape in .data around 0x82D1B21C, holding the
-// VariableCollection bindings, whose bounds have not been established — so a
-// miss here means "not in the table scanned", not "not a binding". Log the
-// address either way and resolve the rest in IDA.
-constexpr uint32_t kBindingTable = 0x8203F2E0;
-constexpr uint32_t kBindingCount = 228;
+// ---- Naming the C function -------------------------------------------------
+//
+// The script layer is SWIG, not a hand-rolled binding table: the module init
+// registers `swig_type` and `swig_equals`, and sub_824A8998 is
+// SWIG_Lua_set_immutable ("This variable is immutable"). So the 228-entry table
+// is one of five populations of lua_CFunction, and a miss in it never meant
+// "not a binding" — 0x824A8AC0 reached a census line as a bare address for
+// exactly that reason. Re-read in IDA 2026-08-28:
+//
+//   MXRavage_Xenon_00cb (0x824F1D80) is the module init. At 0x824F1E10 it calls
+//   sub_824A8BA0(L, "Engine"), which builds the global `Engine` table and hangs
+//   __index / __newindex / .get / .set off its metatable, and only then walks:
+//
+//     1. module functions    0x8203F2E0  {name, func}      via sub_824A8DC0
+//     2. module attributes   0x82D1C858  {name, get, set}  via sub_824A8CE0
+//     3. every class reachable through swig_types[], registered by sub_824A9580
+//        (SWIG_Lua_class_register) and its member pass sub_824A9358
+//
+//   Populations 4 and 5 are the metamethods. They are INSTALLED, so no table
+//   holds them and no scan can ever reach them: they are the fixed list below.
+//
+// Every SWIG array is NUL-terminated, never counted. The 228 is the measured
+// distance to the terminator at 0x8203FA00 — (0x8203FA00 - 0x8203F2E0) / 8 —
+// kept as a runaway bound rather than as the loop condition, so a table that
+// grows cannot silently truncate.
+//
+// Layouts taken field for field out of sub_824A9358 (members) and sub_824A9500
+// (bases), then checked against the live struct at 0x82D1B260: name
+// "VariableCollection", methods 0x82D1B208. That array is what
+// docs/guest_binary.md used to call "a second table around 0x82D1B21C" of
+// unestablished bounds. It is not a second module table — it is one class's
+// methods, and its bound is the terminator like every other SWIG array.
+//
+//   swig_type_info      +16 clientdata -> swig_lua_class*
+//   swig_lua_class      +0 name  +8 constructor  +16 methods  +20 attributes
+//                       +24 bases  +28 base_names
+//   swig_lua_method      8 bytes {name, func}
+//   swig_lua_attribute  12 bytes {name, getter, setter}
+constexpr uint32_t kBindingTable = 0x8203F2E0;  // module functions
+constexpr uint32_t kBindingCap = 228;           // terminator at 0x8203FA00
+constexpr uint32_t kModuleAttrs = 0x82D1C858;   // module attributes
+constexpr uint32_t kSwigTypes = 0x83016900;     // swig_type_info*[], .bss
 
+// Runaway bounds for the arrays whose length is not statically known. These are
+// NOT counts — the NUL entry ends every loop — they only stop a walk over
+// uninitialised memory from running away.
+constexpr uint32_t kScanCap = 512;
+constexpr uint32_t kTypeCap = 4096;
+
+struct SwigHelper {
+  uint32_t fn;
+  const char* name;
+};
+constexpr SwigHelper kSwigHelpers[] = {
+    {0x824A89E8, "Engine.__index"},
+    {0x824A8AC0, "Engine.__newindex"},
+    {0x824A9A98, "swig_type"},
+    {0x824A9AD8, "swig_equals"},
+    {0x824A8998, "SWIG_Lua_set_immutable"},
+    {0x824A8E18, "class.__index"},
+    {0x824A8FC8, "class.__newindex"},
+    {0x824A9120, "class.__gc"},
+};
+
+// {name, func} x 8 bytes. Both the module table and a class's `.fn` table.
+std::string SwigMethodName(uint8_t* base, uint32_t table, uint32_t fn,
+                           uint32_t cap) {
+  if (!table) return {};
+  for (uint32_t i = 0; i < cap; ++i) {
+    const uint32_t e = table + i * 8;
+    const uint32_t name = REX_LOAD_U32(e);
+    if (!name) break;
+    if (REX_LOAD_U32(e + 4) == fn) return GuestString(base, name, 64);
+  }
+  return {};
+}
+
+// {name, getter, setter} x 12 bytes. Which half ran is part of the name: the
+// two can be the same function, and SWIG_Lua_set_immutable is the setter of
+// every read-only variable in the module.
+std::string SwigAttributeName(uint8_t* base, uint32_t table, uint32_t fn,
+                              uint32_t cap) {
+  if (!table) return {};
+  for (uint32_t i = 0; i < cap; ++i) {
+    const uint32_t e = table + i * 12;
+    const uint32_t name = REX_LOAD_U32(e);
+    if (!name) break;
+    if (REX_LOAD_U32(e + 4) == fn) return GuestString(base, name, 64) + ".get";
+    if (REX_LOAD_U32(e + 8) == fn) return GuestString(base, name, 64) + ".set";
+  }
+  return {};
+}
+
+// One caveat the wider search makes worse rather than better: identical-code
+// folding means several trivial bindings share one address (0x829E8FA8 is a
+// bare `return 0` with hundreds of xrefs), and a first-match scan will hand
+// back whichever of them it reaches first. A name here is a name for the
+// ADDRESS, not proof of which binding ran — see the Traps section of
+// docs/guest_binary.md. Do not treat a folded hit as an identification.
 std::string BindingName(uint8_t* base, uint32_t fn) {
   if (!fn) return {};
-  for (uint32_t i = 0; i < kBindingCount; ++i) {
-    const uint32_t e = kBindingTable + i * 8;
-    if (REX_LOAD_U32(e + 4) == fn) return GuestString(base, REX_LOAD_U32(e), 64);
+  for (const SwigHelper& h : kSwigHelpers) {
+    if (h.fn == fn) return h.name;
+  }
+  std::string n = SwigMethodName(base, kBindingTable, fn, kBindingCap);
+  if (!n.empty()) return n;
+  n = SwigAttributeName(base, kModuleAttrs, fn, kScanCap);
+  if (!n.empty()) return n;
+  // The classes. swig_types[] lives in .bss and is filled by the module init,
+  // which runs before any script does — and if it has not, the zero first entry
+  // ends the walk rather than inventing a name.
+  for (uint32_t i = 0; i < kTypeCap; ++i) {
+    const uint32_t ti = REX_LOAD_U32(kSwigTypes + i * 4);
+    if (!ti) break;
+    const uint32_t cls = REX_LOAD_U32(ti + 16);  // clientdata
+    if (!cls) continue;
+    if (REX_LOAD_U32(cls + 8) == fn) {
+      return GuestString(base, REX_LOAD_U32(cls), 64) + ".new";
+    }
+    n = SwigMethodName(base, REX_LOAD_U32(cls + 16), fn, kScanCap);
+    if (n.empty()) {
+      n = SwigAttributeName(base, REX_LOAD_U32(cls + 20), fn, kScanCap);
+    }
+    if (!n.empty()) return GuestString(base, REX_LOAD_U32(cls), 64) + ":" + n;
   }
   return {};
 }
@@ -1059,8 +1170,12 @@ std::string LuaCallerSite(uint8_t* base, uint32_t L) {
 // roll-up is ordered and stable between runs.
 //
 // Cost: one map lookup per dispatch (~700/min in the front end). BindingName's
-// 228-entry linear scan runs only on a miss, so at most once per distinct
-// binding per run.
+// scan runs only on a miss, so at most once per distinct binding per run — it
+// now walks the class tables too, which is a few thousand guest loads on the
+// worst path (an unresolvable address) instead of 228. That is off the dispatch
+// path but NOT off the roll-up path: ReportBindingCensus names every distinct
+// binding again on each report. Bounded by how many bindings exist, so it stays
+// a log-time cost, but do not move BindingName onto the per-call path.
 //
 // The precall fires on at least three guest threads (t11624, t17392, t20020 in
 // mx_1196), so the map needs the lock. Do not "optimise" it away.
@@ -1104,7 +1219,7 @@ void ReportBindingCensus(uint8_t* base, const char* tag) {
   for (const auto& [fn, e] : snapshot) {
     const std::string name = BindingName(base, fn);
     REXLOG_INFO("{}:   0x{:08X} x{} {} <- {}", tag, fn, e.count,
-                name.empty() ? "(not in the 228-entry table)" : name,
+                name.empty() ? "(unresolved — no SWIG table names it)" : name,
                 e.first_caller.empty() ? "?" : e.first_caller);
   }
   // Every Lua chunk that has executed, collapsed by name. Compare against the
@@ -1251,7 +1366,7 @@ extern "C" REX_FUNC(sub_82AA7638) {
     }
     REXLOG_INFO(
         "{}: BINDING FIRST CALL 0x{:08X} {} at dispatch #{} from {} (lr=0x{:08X})",
-        tag, cfunc, name.empty() ? "(not in the 228-entry table)" : name, n,
+        tag, cfunc, name.empty() ? "(unresolved — no SWIG table names it)" : name, n,
         site.empty() ? "?" : site, from);
   }
 
