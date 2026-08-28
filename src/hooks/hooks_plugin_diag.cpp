@@ -664,6 +664,257 @@ MX_SCRIPT_PROBE(sub_824CBF90, orig_LoadUIAssetPackage, "LoadUIAssetPackage")
 MX_SCRIPT_PROBE(sub_824CC218, orig_LoadUIAssetDbPackage,
                 "LoadUIAssetDatabasePackage")
 MX_SCRIPT_PROBE(sub_824D0F18, orig_SwitchToUIWorld, "SwitchToUIWorld")
+
+//=============================================================================
+// Engine.LoadAssetDB / Engine.LoadAssetPackage -- the OTHER load bindings.
+//
+// These are NOT LoadUIAssetPackage. UI_Helper (extracted out of
+// MXUI.xenon.package) loads the front end with two different families:
+//
+//     function LoadFrontEndUIPackages( )
+//        local isUILoaded = g_UIVariables:GetVariableInt( "UILoaded" );
+//        if( isUILoaded == FALSE ) then
+//           Engine.LoadAssetDB( "UIAnimations" );
+//           Engine.LoadAssetPackage( "UIAnimations", "Rider" );
+//           ...
+//           Engine.LoadUIAssetPackage( "FrontEndShared" );
+//           Engine.LoadUIAssetPackage( "FrontEnd" );
+//
+// Only the LoadUIAssetPackage family was probed, so a whole run looked like
+// "UIAnimations is never requested" -- and it was concluded, wrongly, from an
+// instrument that could not see the call. FrontEndShared and FrontEnd DO appear
+// in the log and sit inside the same if-block, three lines below, which is the
+// proof the block runs and the UIAnimations lines with it.
+//
+// UIAnimations holds exactly three assets (Base_Rider_Posed_A,
+// SC_RU_HC_Anim_Gloves and RiderUI_Final_C_350), and RiderUI_Final_C_350 is the
+// movie whose null asset is the 0x8234CE20 crash. So the question is no longer
+// "is it asked for" but "what does asking return".
+//
+// Both args and the return value, because a load binding that fails quietly is
+// exactly what this looks like. LoadAssetPackage takes (db, package).
+//=============================================================================
+REX_IMPORT(__imp__sub_824AF3C0, orig_LoadAssetDB, void());
+extern "C" REX_FUNC(sub_824AF3C0) {
+  const uint32_t L = ctx.r3.u32;
+  const std::string db = ScriptArgString(base, L, 0);
+  orig_LoadAssetDB(ctx, base);
+  static uint64_t s_n = 0;
+  REXLOG_INFO("{}: script LoadAssetDB #{} db=\"{}\" -> r3=0x{:08X}",
+              mx::native::g_plugin_mode ? "plugin" : "native", ++s_n, db,
+              ctx.r3.u32);
+}
+
+//=============================================================================
+// sub_824F8E20 -- AssetDB_LoadPackage(dbName, packageName), the worker behind
+// Engine.LoadAssetPackage. THIS is where the answer is.
+//
+//     if (!assetMgr->vt[36](assetMgr, db))                        // DB loaded?
+//         assetMgr->vt[28](assetMgr, "Database\\", db, 1, 0,0,0);  // load it
+//     return assetMgr->vt[72](assetMgr, db, package, 0,0,0);      // load pkg
+//
+// The return value IS vt[72]'s, so hooking this one function reports whether
+// the package load succeeded without having to resolve a single vtable slot --
+// which matters, because deriving them statically already failed once: the
+// AssetDB ctor comment names "vtable off_8214518C", but off_8214518C+0x78 holds
+// an address in the MIDDLE of sub_82BA8D08, so that premise is wrong.
+//
+// Everything upstream of here is confirmed good. UI_Helper asks for
+// LoadAssetDB("UIAnimations") then LoadAssetPackage("UIAnimations", "Rider"),
+// both bindings fire with exactly those arguments, and
+// UIAnimations.xenon.database declares a package "Rider" holding
+// RiderUI_Final_C_350 (bink, LZX) -- the movie whose null asset is the
+// 0x8234CE20 crash. So either the DB open under "Database\" fails, or the
+// package lookup inside it does.
+//
+// Note the two load families use DIFFERENT asset-manager methods: the working
+// UI path (sub_824FB0F0 -> sub_823802D0) goes through vt[44], this one through
+// vt[36]/vt[28]/vt[72]. "The UI packages load fine" says nothing about this
+// path.
+//=============================================================================
+//=============================================================================
+// 0x82BA91C0 -- AssetManager::Find(type, name), resolved at RUNTIME.
+//
+// This is assetMgr->vt[0x78], the lookup BinkVideoComponent_InitAndOpen uses to
+// turn the movie name into an asset, and whose NULL return is stored to
+// this+0x94 and then dereferenced at +0x58 by AcquirePlayer -- the 0x8234CE20
+// crash.
+//
+// The address had to come from the running game. Reading the IDB at
+// off_8214518C+0x78 gave 0x82BA8D40, which is the middle of sub_82BA8D08; the
+// live vtable holds 0x82BA91C0 there, and that same value appears as `ctr` in
+// the crash register dump, which is the independent confirmation. Static reads
+// of that table are not to be trusted.
+//
+// The function has TWO failure exits and they mean different things:
+//
+//     if (!sub_82BA8EE0(this + 1504, &type, out)) return 0;   // no such TYPE
+//     RtlEnterCriticalSection(...);
+//     if (!sub_82B099C0(&bucket[1], &name, out)) { ... return 0; }  // no NAME
+//     return out[0];
+//
+// So a miss is either "the 'bink' type bucket does not exist" or "the bucket
+// exists and RiderUI_Final_C_350 is not in it". The first says the package's
+// contents were never registered; the second says they were registered under a
+// different key. AssetDB_LoadPackage already reports SUCCESS for
+// db="UIAnimations" package="Rider", so one of those two is happening anyway.
+//
+// ONLY FAILURES ARE LOGGED, deduped by (type, name). This runs for every asset
+// lookup in the game and a per-call line would be a flood; a miss is rare and
+// is the entire signal. The type is 8 chars packed into one 64-bit register,
+// big-endian, so "bink" sits in the HIGH half ("texture\0" fills both).
+//=============================================================================
+// Which of AssetManager::Find's two exits returns 0 for the bink lookup.
+//
+// Find does:
+//     if (!sub_82BA8EE0(this + 1504, ...)) return 0;      // FIRST  lookup
+//     RtlEnterCriticalSection(...);
+//     if (!sub_82B099C0(...))  { ... return 0; }          // SECOND lookup
+//     return out[0];
+//
+// One is the type bucket and one is the name within it. The decompiler's
+// argument mapping for this function is NOT reliable -- it renders the name and
+// the 64-bit type as a2/a13/a14 in a way that contradicts the call sites, and
+// only the runtime r4=name / r5=type reading is confirmed (the probe prints
+// "bink", "material", "uicmpnt" and sensible names from it). So rather than
+// argue about which inner call is which, watch the FIRST one and let the result
+// say: if it fails, the miss happens before the critical section and nothing
+// about the name matters; if it succeeds, the miss is in the second lookup.
+//
+// Scoped by a thread-local so this costs a bool test on every other asset
+// lookup in the game -- sub_82BA8EE0 is generic and runs constantly.
+namespace {
+thread_local bool t_inBinkFind = false;
+}
+
+REX_IMPORT(__imp__sub_82BA8EE0, orig_AssetFindFirst, void());
+extern "C" REX_FUNC(sub_82BA8EE0) {
+  orig_AssetFindFirst(ctx, base);
+  if (!t_inBinkFind) return;
+  static uint64_t s_n = 0;
+  if (++s_n <= 4)
+    REXLOG_INFO("{}: AssetFind[bink] first lookup (sub_82BA8EE0) -> {}",
+                mx::native::g_plugin_mode ? "plugin" : "native",
+                ctx.r3.u32 ? "HIT -- so the miss is the SECOND lookup"
+                           : "MISS -- the miss is the FIRST lookup");
+}
+
+REX_IMPORT(__imp__sub_82BA91C0, orig_AssetFind, void());
+extern "C" REX_FUNC(sub_82BA91C0) {
+  const uint32_t name_ptr = ctx.r4.u32;
+  const uint64_t type_bits = ctx.r5.u64;
+  // Big-endian: "bink" occupies the high half, low half zero.
+  const bool is_bink = (type_bits >> 32) == 0x62696E6Bull;
+  t_inBinkFind = is_bink;
+  orig_AssetFind(ctx, base);
+  t_inBinkFind = false;
+  const uint32_t found = ctx.r3.u32;
+
+  char type[9] = {};
+  for (int i = 0; i < 8; ++i) {
+    const char c = char((type_bits >> (56 - i * 8)) & 0xFF);
+    type[i] = (c >= 0x20 && c < 0x7F) ? c : '\0';
+  }
+  const std::string name = GuestString(base, name_ptr, 128);
+  const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
+
+  // EVERY 'bink' LOOKUP, hit or miss, because the two readings of a miss want
+  // opposite fixes and only the hits separate them:
+  //
+  //   no bink lookup EVER succeeds -> the 'bink' TYPE BUCKET is missing or
+  //     empty, so the package's contents were never registered under it, and
+  //     the first exit of AssetManager::Find is what returns 0;
+  //   some succeed and RiderUI_Final_C_350 does not -> the bucket is fine and
+  //     this one name is absent or keyed differently.
+  //
+  // Logging only misses cannot tell those apart -- it has no denominator. The
+  // population is tiny (three bink assets exist in the whole game:
+  // RiderUI_Final_C_350, and RiderCloth_60fms_FNL in NAT_Farm and ST_Farm), so
+  // this is uncapped and unthrottled on purpose.
+  if (std::strcmp(type, "bink") == 0) {
+    REXLOG_INFO("{}: AssetFind bink \"{}\" -> {}", tag, name,
+                found ? "FOUND" : "MISS");
+    if (found) return;
+  }
+  if (found) return;  // a hit of any other type says nothing
+
+  static std::mutex s_mu;
+  static std::set<std::string> s_seen;
+  const std::string key = std::string(type) + "|" + name;
+  {
+    std::lock_guard<std::mutex> lk(s_mu);
+    if (s_seen.size() >= 64 || !s_seen.insert(key).second) return;
+  }
+  REXLOG_INFO("{}: AssetFind MISS type=\"{}\" name=\"{}\" (raw type 0x{:016X})",
+              tag, type, name, type_bits);
+}
+
+REX_IMPORT(__imp__sub_824F8E20, orig_AssetDbLoadPackage, void());
+extern "C" REX_FUNC(sub_824F8E20) {
+  // Both args are plain char*, captured before the call in case it clobbers.
+  const std::string db = GuestString(base, ctx.r3.u32, 64);
+  const std::string pkg = GuestString(base, ctx.r4.u32, 64);
+  orig_AssetDbLoadPackage(ctx, base);
+  // ONE-TIME: the asset manager's vtable, so the slots this path uses can be
+  // hooked by ADDRESS next build. Deriving them from the AssetDB ctor comment
+  // ("vtable off_8214518C") gave a mid-function address for +0x78, so that
+  // premise is wrong and the object has to answer for itself.
+  //
+  // vt[0x1C] load-DB-from-"Database\\", vt[0x24] is-DB-loaded,
+  // vt[0x48] load-package, vt[0x78] the asset LOOKUP that returns NULL for
+  // RiderUI_Final_C_350. A real guest function lives in 0x82xxxxxx; anything
+  // else in a slot is data and must never be called.
+  {
+    static bool s_dumped = false;
+    if (!s_dumped) {
+      s_dumped = true;
+      // dword_830BE400 is a POINTER VARIABLE, not the object. IDA renders the
+      // engine as `dword_830BE400` and the manager as
+      // `*(dword_830BE400 + 8)`, which reads as an offset off the symbol's
+      // ADDRESS and is not: the engine is *(0x830BE400) and the manager is
+      // *(engine + 8). Reading 0x830BE408 directly gave 0, which is what the
+      // first version of this dump printed. SetupRenderer in hooks_loading.cpp
+      // already does it the right way.
+      const uint32_t eng = GuestRangeReadable(base, 0x830BE400u, 4)
+                               ? REX_LOAD_U32(0x830BE400u)
+                               : 0;
+      const uint32_t mgr =
+          (eng && GuestRangeReadable(base, eng + 8u, 4)) ? REX_LOAD_U32(eng + 8u)
+                                                        : 0;
+      const uint32_t vt =
+          (mgr && GuestRangeReadable(base, mgr, 4)) ? REX_LOAD_U32(mgr) : 0;
+      if (vt && GuestRangeReadable(base, vt, 0x7Cu)) {
+        REXLOG_INFO("native: AssetMgr 0x{:08X} vtable 0x{:08X} -- "
+                    "vt[0x1C]=0x{:08X} vt[0x24]=0x{:08X} vt[0x48]=0x{:08X} "
+                    "vt[0x78]=0x{:08X}",
+                    mgr, vt, REX_LOAD_U32(vt + 0x1C), REX_LOAD_U32(vt + 0x24),
+                    REX_LOAD_U32(vt + 0x48), REX_LOAD_U32(vt + 0x78));
+      } else {
+        REXLOG_INFO("native: AssetMgr eng=0x{:08X} mgr=0x{:08X} vtable=0x{:08X}"
+                    " -- not readable",
+                    eng, mgr, vt);
+      }
+    }
+  }
+  static uint64_t s_n = 0;
+  REXLOG_INFO("{}: AssetDB_LoadPackage #{} db=\"{}\" package=\"{}\" -> {} "
+              "(0 = the package did NOT load)",
+              mx::native::g_plugin_mode ? "plugin" : "native", ++s_n, db, pkg,
+              ctx.r3.u32);
+}
+
+REX_IMPORT(__imp__sub_824AF488, orig_LoadAssetPackage, void());
+extern "C" REX_FUNC(sub_824AF488) {
+  const uint32_t L = ctx.r3.u32;
+  const std::string db = ScriptArgString(base, L, 0);
+  const std::string pkg = ScriptArgString(base, L, 1);
+  orig_LoadAssetPackage(ctx, base);
+  static uint64_t s_n = 0;
+  REXLOG_INFO("{}: script LoadAssetPackage #{} db=\"{}\" package=\"{}\" -> "
+              "r3=0x{:08X}",
+              mx::native::g_plugin_mode ? "plugin" : "native", ++s_n, db, pkg,
+              ctx.r3.u32);
+}
 MX_SCRIPT_PROBE(sub_824CD280, orig_StartWorldLoad, "StartWorldLoad")
 MX_SCRIPT_PROBE(rex_MXRavage_Xenon_00cb, orig_ScriptBindingRegister, "BindingRegister")
 
@@ -2168,6 +2419,10 @@ GatedPlayer& GateEntryFor(uint32_t player) {
 
 REX_IMPORT(__imp__sub_8234D630, orig_BinkDecodeAndBlit, int());
 extern "C" REX_FUNC(sub_8234D630) {
+  // The gate was DISABLED as an experiment on 2026-08-28 and is restored: it
+  // is not implicated in the 0x8234CE20 crash. With it fully off (0 "BINK GATE"
+  // lines in run 1670) the 'bink' lookup for RiderUI_Final_C_350 still missed
+  // and the crash still fired, so it is cleared by measurement, not argument.
   const uint32_t player = ctx.r3.u32;
   if (!PlausibleGuestPtr(player)) {
     orig_BinkDecodeAndBlit(ctx, base);
