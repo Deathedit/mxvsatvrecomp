@@ -1868,6 +1868,47 @@ extern "C" REX_FUNC(sub_8255CE98) {
             // over the whole run rather than one writeback -- the interesting
             // frames are a minority and any single-frame view is dominated by
             // whichever phase the log cap happened to land in.
+            // ROW/COL HIGH NIBBLES AS A DISTRIBUTION, not a min and a max.
+            //
+            // The page table's coarse levels are exactly half resident, with a
+            // knife edge at the midpoint: at L7 the bottom four rows are all
+            // populated and the top four are all the 0xF00A sentinel, and that
+            // survived four minutes of driving across the map. The guest
+            // decodes ROW from the HIGH nibble of byte +0, so if it never sees
+            // rowHi 0 or 1, the top half can never go resident.
+            //
+            // The byte's RANGE said 0x21..0x33 on a short run and 0x00..0x33 on
+            // a long one, and I read the second as "requests reach the top half
+            // after all". A min is one texel. It cannot distinguish a handful
+            // of stray samples from a real share, and the page table did not
+            // move either way -- so the range was the wrong statistic and this
+            // is the right one. See `a-total-without-a-denominator`.
+            //
+            // Same gate and same population as the byte spread below it, so the
+            // two are directly comparable: rowHi[0..3] must sum to the same
+            // total as b0's `seen`.
+            // THE LEVEL BYTE, AFTER THE GATE.
+            //
+            // Byte +3 is the LOD, and the guest does far more with it than
+            // accept or reject: it shifts BOTH coordinates by it
+            // (ROW >>= LEVEL, COL >>= LEVEL) and indexes THAT level's table.
+            // So a LOD that is constant does not merely lose detail, it aims
+            // every request in the run at one level of the pyramid and leaves
+            // the rest to the propagation loops -- which is the shape of the
+            // half-populated pyramid we are chasing (L8 reads 8/16, and level
+            // 8's table is 4x4 = 16 entries).
+            //
+            // The comment beside the channel-order fix flagged this as "a
+            // constant 8 ... still-open" and it was never measured. Its raw
+            // range is known (00..FF, mean 0x87) and that is the WRONG
+            // population: the guest skips any texel whose level is >= the level
+            // count, so the only levels that matter are the ones that pass.
+            //
+            // Bucketed 0..15 because the gate is `< 16`; the 16th bucket can
+            // therefore never fill and a non-zero there would mean the gate
+            // moved.
+            static uint64_t s_lod[16] = {};
+            static uint64_t s_rowHi[4] = {}, s_colHi[4] = {};
             static uint64_t s_byteSeen[4] = {}, s_byteHigh[4] = {};
             static uint32_t s_byteMin[4] = {255, 255, 255, 255};
             static uint32_t s_byteMax[4] = {};
@@ -2078,6 +2119,13 @@ extern "C" REX_FUNC(sub_8255CE98) {
                         if (tmp[b] < s_byteMin[b]) s_byteMin[b] = tmp[b];
                         if (tmp[b] > s_byteMax[b]) s_byteMax[b] = tmp[b];
                       }
+                      // Byte +0 packs both high nibbles, exactly as the guest
+                      // reads them: ROW = (+0 hi) << 8 | +2, COL = (+0 lo) << 8
+                      // | +1. Bucketed to 4 each because a 1024-wide level
+                      // needs 10 bits and the nibble carries the top two.
+                      ++s_rowHi[(tmp[0] >> 4) & 3u];
+                      ++s_colHi[tmp[0] & 3u];
+                      ++s_lod[tmp[bpb - 1] & 15u];
                     }
                     ++wrote;
                   }
@@ -2235,12 +2283,32 @@ extern "C" REX_FUNC(sub_8255CE98) {
                                         s_byteMin[b], s_byteMax[b],
                                         s_byteHigh[b], s_byteSeen[b]);
                 }
+                // The share, not the extremes. rowHi 0 and 1 address the
+                // TOP HALF of the page table, which is exactly the half that
+                // never goes resident.
+                std::string lod;
+                for (uint32_t l = 0; l < 16; ++l) {
+                  if (!s_lod[l]) continue;
+                  lod += fmt::format(" L{}={}", l, s_lod[l]);
+                }
+                const uint64_t rowTot = s_rowHi[0] + s_rowHi[1] + s_rowHi[2] +
+                                        s_rowHi[3];
+                std::string nib;
+                if (rowTot) {
+                  nib = fmt::format(
+                      " | LOD{} | rowHi {}/{}/{}/{} ({:.3f}% in the TOP HALF)"
+                      " colHi {}/{}/{}/{}",
+                      lod.empty() ? std::string(" (none)") : lod,
+                      s_rowHi[0], s_rowHi[1], s_rowHi[2], s_rowHi[3],
+                      100.0 * double(s_rowHi[0] + s_rowHi[1]) / double(rowTot),
+                      s_colHi[0], s_colHi[1], s_colHi[2], s_colHi[3]);
+                }
                 REXLOG_INFO(
                     "d3d9: WRITEBACK census: {} writebacks | this frame {} "
                     "distinct low bytes, dominant 0x{:02X} | ACTED-ON byte "
-                    "spread{} | destinations written{}",
+                    "spread{}{} | destinations written{}",
                     s_writebacks, distinct, dominant,
-                    spread.empty() ? std::string(" (none yet)") : spread,
+                    spread.empty() ? std::string(" (none yet)") : spread, nib,
                     dests.empty() ? std::string(" (none)") : dests);
               }
             }

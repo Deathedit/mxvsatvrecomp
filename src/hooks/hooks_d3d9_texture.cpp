@@ -14,6 +14,7 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <iterator>
@@ -807,6 +808,37 @@ void SetPayloadUploadVersion(const mx::hle::HleTextureSource& source,
       }
       if (!total) continue;
       levels += fmt::format(" L{}:{}/{}", l, resident, total);
+
+      // THE SHAPE OF THE COARSE LEVELS, not just their ratio.
+      //
+      // L5, L6 and L7 all read EXACTLY 50% resident -- 512/1024, 128/256,
+      // 32/64. Three consecutive levels at precisely one half is not a
+      // streaming curve (the levels above it are ragged: 0.3%, 0.4%, 2.0%),
+      // it is a factor of two in how pages are marked or indexed. And it
+      // matters most here, because the coarse levels are the fallback: L7 is
+      // 64 pages and should be fully resident, since it is the "always have
+      // something to sample" level. Half of it missing is what blocky tiling
+      // looks like.
+      //
+      // A ratio cannot say WHICH half. Checkerboard, half-plane and
+      // alternating rows all read 50% and have completely different causes,
+      // so the smallest levels are printed verbatim -- 64 texels is one short
+      // line, and the pattern names the bug on sight.
+      if (total <= 64) {
+        std::string raw;
+        uint32_t col = 0;
+        const uint32_t side = uint32_t(std::lround(std::sqrt(double(total))));
+        for (size_t off = begin; off + width <= end; off += width) {
+          uint64_t v = 0;
+          std::memcpy(&v, payload.data.data() + off, width);
+          // Row breaks so a 2D pattern is visible as one, rather than having
+          // to be reconstructed from a flat run of 64 values.
+          if (side && col && (col % side) == 0) raw += " /";
+          raw += fmt::format(" {:0{}X}", v, width * 2);
+          ++col;
+        }
+        levels += fmt::format(" [L{} raw{}]", l, raw);
+      }
     }
   }
   REXLOG_INFO(
