@@ -3095,6 +3095,19 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
         // 1280x720 RGBA16F scene snapshot.
         for (uint32_t s = 0; s < kTranslatedSamplerSlots; ++s) {
           uint32_t w = 0, h = 0, layers = 0;
+          // .w of xe_texinv is the guest's per-texture LOD BIAS, in LOD units.
+          // It was 0.0 and read by nothing until now; see
+          // HleTexturePayload::lod_bias for why it matters.
+          //
+          // SET ONLY ON THE NON-SNAPSHOT PATH, and that is not a detail. The
+          // first cut of this resolved the bias from d.pixelTextures[s] for
+          // EVERY slot, including snapshot slots -- where a shadowing payload
+          // routinely exists and describes a DIFFERENT texture. That is exactly
+          // texinv-shadowed-by-payload, the defect fixed at the top of this same
+          // file (`texinv snapshot-shadowed slots`, 2,701 a run), reintroduced
+          // one field over. A snapshot has no fetch constant behind it, so 0.0
+          // -- no bias -- is both correct and what it had before.
+          float lodBias = 0.0f;
           const uint32_t object =
               s < d.pixelSampledObjects.size() ? d.pixelSampledObjects[s] : 0;
           if (object) {
@@ -3123,11 +3136,12 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
               w = tex->width;
               h = tex->height;
               layers = tex->array_size;
+              lodBias = tex->lod_bias;
             }
           }
           if (!w || !h) continue;
           const float ts[4] = {1.0f / float(w), 1.0f / float(h),
-                               float(layers), 0.0f};
+                               float(layers), lodBias};
           std::memcpy(static_cast<uint8_t*>(p) + bankBytes + s * 16, ts,
                       sizeof(ts));
         }

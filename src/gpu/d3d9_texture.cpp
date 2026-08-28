@@ -190,6 +190,7 @@ void DescribeHleMipChain(const xenos::xe_gpu_texture_fetch_t& fetch,
   out.mip_max_level = fetch.mip_max_level;
   out.mip_filter = uint8_t(fetch.mip_filter);
   out.packed_mips = fetch.packed_mips != 0;
+  out.lod_bias_raw = fetch.lod_bias;
   if (fetch.lod_bias) g_mipLodBias.fetch_add(1, std::memory_order_relaxed);
   if (fetch.mip_address)
     g_mipRawAddressSet.fetch_add(1, std::memory_order_relaxed);
@@ -905,6 +906,9 @@ bool DecodeHleTexture2D(const HleTextureSource& source,
   out.clamp_y = uint8_t(source.clamp_y);
   out.linear_filter = source.linear_filter;
   out.mip_filter = source.mip_filter;
+  // /32, per xenia sampler_info.cc:45. The INSTRUCTION's bias is /16 and the
+  // two are separate terms -- see HlslShader's SampleLodBias, which adds them.
+  out.lod_bias = float(source.lod_bias_raw) / 32.0f;
   out.data.resize(size_t(tight));
 
   const auto endian = static_cast<xenos::Endian>(source.endian);

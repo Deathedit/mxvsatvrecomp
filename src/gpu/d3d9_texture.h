@@ -119,6 +119,17 @@ struct HleTextureSource {
   uint32_t mip_address = 0;
   uint32_t mip_min_level = 0;
   uint32_t mip_max_level = 0;
+  // The fetch constant's LOD bias, RAW and signed -- the 10-bit field at bit
+  // 12 of dword 4, not yet scaled. The scale is 1/32, per the reference
+  // (xenia sampler_info.cc:45), NOT the 1/16 the INSTRUCTION's bias uses. This
+  // stays raw so the unit lives at exactly one call site instead of being
+  // baked into a field name that was wrong once already.
+  // COUNTED for a long time (MIP CHAIN's `lod_bias N`) and never carried, so
+  // there was no way to ask whether a PARTICULAR texture has one. Recorded now
+  // because which mip a texture samples is the live question for the terrain
+  // page table, and this is the one per-texture control over it that we do not
+  // implement -- D3D12_SAMPLER_DESC::MipLODBias appears nowhere in the tree.
+  int32_t lod_bias_raw = 0;
   // TextureFilter: kPoint(0), kLinear(1), kBaseMap(2). kBaseMap means the guest
   // never wants to minify past level 0, and we honour it by not building a
   // chain at all -- see the note in DescribeHleTexture2D.

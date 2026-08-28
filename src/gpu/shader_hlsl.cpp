@@ -263,8 +263,19 @@ class Emitter {
   bool ExplicitLod(const uc::TextureFetchInstruction& tf) const {
     return tf.use_register_lod() || !pixel();
   }
+  // kBaseMap means the shader never minifies past level 0, so there is no level
+  // to bias between. The reference skips the whole bias computation on it
+  // (dxbc_shader_translator_fetch.cc:1568) and so does this.
+  bool BiasedLod(const uc::TextureFetchInstruction& tf) const {
+    return !(tf.has_mip_filter() &&
+             tf.mip_filter() == rex::graphics::xenos::TextureFilter::kBaseMap);
+  }
   const char* SampleOp(const uc::TextureFetchInstruction& tf) const {
-    return ExplicitLod(tf) ? ".SampleLevel(" : ".Sample(";
+    if (ExplicitLod(tf)) return ".SampleLevel(";
+    // SampleBias rather than Sample so the guest's per-texture LOD bias can be
+    // applied. With a bias of 0.0 -- which is what all but a handful of this
+    // title's textures carry -- it is the same sample.
+    return BiasedLod(tf) ? ".SampleBias(" : ".Sample(";
   }
   // Paired with SampleOp: the extra argument SampleLevel takes and Sample does
   // not. Emitted immediately before the closing paren of the fetch.
@@ -279,13 +290,43 @@ class Emitter {
   //
   // lod_bias is a 7-bit signed field scaled by 1/16, so every value it can take
   // has at most four decimal places and std::to_string reproduces it exactly.
-  std::string SampleLod(const uc::TextureFetchInstruction& tf) {
-    if (!ExplicitLod(tf)) return "";
-    if (!tf.use_register_lod()) return ", 0";
-    uses_reg_lod = true;
-    const float bias = tf.lod_bias();
-    if (bias == 0.0f) return ", xe_lod";
-    return ", (xe_lod + " + std::to_string(bias) + ")";
+  // The FETCH CONSTANT's bias, per slot, in LOD units. Arrives in the spare .w
+  // of xe_texinv, which was written as 0.0 and read by nothing.
+  //
+  // This used to be the missing third term. The comment above SampleLod said
+  // outright that "the FETCH CONSTANT's bias is the third term there and is NOT
+  // applied: it is runtime state that would have to ride in a cbuffer, and no
+  // fetch constant reaches this emitter". A cbuffer slot was already there.
+  //
+  // It cost the terrain: the virtual-texture page tables carry +7.0, the guest
+  // populates only the levels that bias makes it read, and without it every
+  // lookup landed seven levels too fine and missed.
+  std::string ConstantLodBias(uint32_t slot) const {
+    return "xe_texinv[" + std::to_string(slot) + "].w";
+  }
+  std::string SampleLod(const uc::TextureFetchInstruction& tf, uint32_t slot) {
+    // The D3D11.3 accumulation order the reference uses: specified LOD, then
+    // the sampler (fetch constant) bias, then the instruction bias.
+    const float instr_bias = tf.lod_bias();
+    if (!ExplicitLod(tf)) {
+      // Implicit derivatives: the whole bias is SampleBias's argument.
+      if (!BiasedLod(tf)) return "";
+      std::string b = ConstantLodBias(slot);
+      if (instr_bias != 0.0f) b += " + " + std::to_string(instr_bias);
+      return ", (" + b + ")";
+    }
+    std::string base = "0";
+    if (tf.use_register_lod()) {
+      uses_reg_lod = true;
+      base = "xe_lod";
+    }
+    if (!BiasedLod(tf)) {
+      if (instr_bias == 0.0f) return ", " + base;
+      return ", (" + base + " + " + std::to_string(instr_bias) + ")";
+    }
+    std::string expr = base + " + " + ConstantLodBias(slot);
+    if (instr_bias != 0.0f) expr += " + " + std::to_string(instr_bias);
+    return ", (" + expr + ")";
   }
 
   // setTexLOD: store the level this shader wants its later fetches to sample at.
@@ -1191,7 +1232,7 @@ class Emitter {
       const std::string s3 = std::to_string(slot);
       Line("xe_v = xe_tex" + s3 + SampleOp(tf) + "xe_smp" + s3 + ", float3(" +
            src + "." + uv + " - 1.0, " + src + "." + face + ")" +
-           SampleLod(tf) + ");");
+           SampleLod(tf, slot) + ");");
       EmitFetchDestination(tf);
       return;
     }
@@ -1254,7 +1295,7 @@ class Emitter {
     }
     const std::string s = std::to_string(slot);
     Line("xe_v = xe_tex" + s + SampleOp(tf) + "xe_smp" + s + ", " + coord +
-         SampleLod(tf) + ");");
+         SampleLod(tf, slot) + ");");
     // TEX_FORMAT_COMP / GPUSIGN, applied here because it is per-BINDING state,
     // not per-texture: the same guest memory is bound with different sign modes
     // by different draws, so baking it into the decode would poison a cache

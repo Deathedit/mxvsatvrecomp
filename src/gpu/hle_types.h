@@ -112,6 +112,22 @@ struct HleTexturePayload {
   uint8_t clamp_x = 0;
   uint8_t clamp_y = 0;
   bool linear_filter = true;
+  // The guest's per-texture LOD bias, already scaled into LOD units.
+  //
+  // Reaches the shader through xe_texinv[slot].w, which was written as 0.0 and
+  // read by nothing. The reference applies this in the SHADER rather than on
+  // the sampler -- "LOD biasing is performed in shaders",
+  // xenia d3d12_texture_cache.cc:1043 -- and so do we. Xenia has to build it
+  // out of OpIBFE/OpIToF/OpMAd/OpExp because it assembles DXBC by hand; we emit
+  // HLSL text, so it is one extra argument on the sample.
+  //
+  // Not cosmetic. The terrain's virtual-texture page tables carry +7.0, which
+  // is how the guest looks its page table up SEVEN LEVELS COARSER than the raw
+  // derivative. It populates levels 5-9 to full coverage of the world and
+  // leaves 0-4 sparse, so a lookup without the bias lands in the sparse band,
+  // misses, and reads the not-available sentinel -- which decodes to one atlas
+  // tile repeated 1024x.
+  float lod_bias = 0.0f;
   // Bumped when the same guest texture is decoded again because its CONTENTS
   // changed underneath a stable fetch constant. The cache key hashes the six
   // fetch dwords -- address, size, format -- so a texture the guest rewrites in
