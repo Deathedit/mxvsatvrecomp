@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <system_error>
 
+#include "hooks/guest_coherency.h"
 #include "hooks/hook_common.h"
 
 // timeBeginPeriod. WIN32_LEAN_AND_MEAN keeps mmsystem.h out of windows.h,
@@ -457,6 +458,49 @@ extern "C" REX_FUNC(sub_82566B58) {
     // the guest publishes constants through those, we never record them at all
     // and the "finite zero we decline to fill" story has a second cause.
     // MEASUREMENT ONLY: nothing here changes what is recorded or drawn.
+    // COHERENCY REQUESTS -- the guest naming a guest-memory range and saying
+    // what it wants done with it. OBSERVATION ONLY; nothing branches on this
+    // yet.
+    //
+    // Xenia acts on these and we ignore them entirely
+    // (command_processor_resolve_readwatch.inc, NoteResolveCoherency). The
+    // guest writes COHER_SIZE_HOST/COHER_BASE_HOST/COHER_STATUS_HOST as Type0
+    // registers and then spins on a WAIT_REG_MEM polling COHER_STATUS_HOST
+    // (0x0A31) until the GPU clears it, so at the moment of that poll the three
+    // registers name one request:
+    //
+    //   vc_action_ena (bit 24)  the driver's post-resolve flush -- "make this
+    //                           range visible to me NOW". Xenia flushes the
+    //                           held resolve output for it.
+    //   tc_action_ena (bit 25)  alone, the OPPOSITE: the guest saying it wrote
+    //                           that memory itself, so writing our copy over it
+    //                           would destroy what the guest produced.
+    //
+    // Both are live in this title, counted over 48 dumped frames: status
+    // 0x01000000 x57, 0x02000000 x27, 0x03000000 x4, 0x00010000 x21
+    // (dest_base_7_ena). With real ranges -- 2 MB at 0x1EB90000, 8 KB at
+    // 0x1A2E1000, and others.
+    //
+    // Why this matters: our readback policy rations by a 64 KB size cap and a
+    // race between four slots, which refused the terrain height buffer 1880
+    // times a run and then starved the VT feedback buffer when the cap was
+    // lifted. The guest is telling us which ranges it wants and when, ~57 times
+    // per 48 frames, and that is a better basis than a guess.
+    //
+    // FIRST SAMPLE WAS MISLEADING and this is logged as a distribution because
+    // of it: the first WAIT_REG_MEM in the first frame polled with status
+    // 0x00010000, no action bits at all, which reads as "this title does not
+    // use the mechanism". The population says the opposite.
+    static uint64_t s_coherVc = 0, s_coherTc = 0, s_coherBoth = 0,
+                    s_coherOther = 0, s_coherPolls = 0;
+    struct CoherRange {
+      uint32_t base = 0, size = 0, status = 0;
+      uint64_t count = 0;
+    };
+    static CoherRange s_coherRanges[12] = {};
+    static uint64_t s_coherRangeOverflow = 0;
+    uint32_t coher_size = 0, coher_base = 0, coher_status = 0;
+
     uint32_t ring_draws = 0, t3_set_const = 0, t3_set_shader = 0, t3_load_alu = 0;
     // Cumulative, so a zero in APPLIED is readable against what we saw and why
     // each skip happened rather than being one undifferentiated number.
@@ -464,6 +508,48 @@ extern "C" REX_FUNC(sub_82566B58) {
                     s_alu_unreadable = 0, s_alu_range = 0, s_alu_short = 0;
     for (const auto* list : {&frame_packets, &swap_packets}) {
       for (const auto& p : *list) {
+        // Tracked in STREAM ORDER, so the values captured at the poll are the
+        // ones the guest set for that request rather than the frame's last.
+        if (p.type == mx::pm4::PacketType::Type0) {
+          for (uint32_t i = 0; i < p.body.size(); ++i) {
+            const uint32_t reg = p.reg_base + i;
+            if (reg == 0x0A2F) coher_size = p.body[i];
+            else if (reg == 0x0A30) coher_base = p.body[i];
+            else if (reg == 0x0A31) coher_status = p.body[i];
+          }
+        }
+        if (p.type == mx::pm4::PacketType::Type3 &&
+            p.opcode == uint8_t(mx::pm4::Pm4Opcode::WAIT_REG_MEM) &&
+            p.body.size() >= 2 && (p.body[0] & 0x10u) == 0 &&
+            p.body[1] == 0x0A31u && coher_status) {
+          // Poll type bit 4 clear = REGISTER poll, which is the only kind that
+          // can be naming the coherency register.
+          ++s_coherPolls;
+          const bool vc = (coher_status & (1u << 24)) != 0;
+          const bool tc = (coher_status & (1u << 25)) != 0;
+          if (vc && tc) ++s_coherBoth;
+          else if (vc) ++s_coherVc;
+          else if (tc) ++s_coherTc;
+          else ++s_coherOther;
+          // TC ALONE is the claim. With VC also set the guest is asking for a
+          // flush in the same breath, which is not the "keep off" case and must
+          // not suppress anything.
+          if (tc && !vc)
+            mx::coherency::NoteGuestWroteRange(coher_base, coher_size);
+          bool placed = false;
+          for (auto& r : s_coherRanges) {
+            if (r.count && (r.base != coher_base || r.size != coher_size ||
+                            r.status != coher_status))
+              continue;
+            r.base = coher_base;
+            r.size = coher_size;
+            r.status = coher_status;
+            ++r.count;
+            placed = true;
+            break;
+          }
+          if (!placed) ++s_coherRangeOverflow;
+        }
         if (p.type == mx::pm4::PacketType::Type3) {
           switch (static_cast<mx::pm4::Pm4Opcode>(p.opcode)) {
             case mx::pm4::Pm4Opcode::DRAW_INDX:
@@ -558,6 +644,29 @@ extern "C" REX_FUNC(sub_82566B58) {
                   "address, {} out of range, {} short body",
                   tag, s_alu_applied, s_alu_dwords, s_alu_nonalu,
                   s_alu_unreadable, s_alu_range, s_alu_short);
+      if (s_coherPolls) {
+        std::string ranges;
+        for (const auto& r : s_coherRanges) {
+          if (!r.count) continue;
+          ranges += fmt::format(" [base 0x{:08X} size 0x{:X} status 0x{:08X}{}{} x{}]",
+                                r.base, r.size, r.status,
+                                (r.status & (1u << 24)) ? " VC" : "",
+                                (r.status & (1u << 25)) ? " TC" : "", r.count);
+        }
+        if (s_coherRangeOverflow)
+          ranges += fmt::format(" (+{} unplaced)", s_coherRangeOverflow);
+        // VC is "flush this to me now"; TC alone is "I wrote this, keep off".
+        // Nothing acts on either yet -- this is the population, so a policy
+        // built on it is built on measured traffic and not on the first sample.
+        REXLOG_INFO("{}: COHERENCY {} polls of COHER_STATUS_HOST -- VC(flush) "
+                    "{}, TC(guest-wrote) {}, both {}, neither {} | writeback "
+                    "would-match {}/{} over {} claimed ranges |{}",
+                    tag, s_coherPolls, s_coherVc, s_coherTc, s_coherBoth,
+                    s_coherOther, mx::coherency::SuppressedWritebacks(),
+                    mx::coherency::ConsideredWritebacks(),
+                    mx::coherency::ClaimedRangeCount(),
+                    ranges.empty() ? std::string(" (no ranges)") : ranges);
+      }
     }
 
     // Only write dump files for spot-check swaps — keeps the disk clean when

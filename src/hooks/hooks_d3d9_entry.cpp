@@ -40,6 +40,7 @@ namespace tu = rex::graphics::texture_util;
 #include "gpu/hle_types.h"
 #include "gpu/shader_ucode.h"
 
+#include "hooks/guest_coherency.h"
 #include "hooks/guest_read_watch.h"
 #include "hooks/hooks_d3d9_internal.h"
 
@@ -1966,6 +1967,36 @@ extern "C" REX_FUNC(sub_8255CE98) {
                         rb.destObject == dest_texture && rb.width &&
                         rb.height && rb.bytesPerTexel &&
                         (same_texel || float_to_unorm8);
+              // A TC CLAIM IS A REASON TO COPY, NOT TO SKIP. Counted only.
+              //
+              // Suppressing the writeback where the guest's TC-only coherency
+              // request covered it was TRIED 2026-08-28 and REVERTED the same
+              // run: it fired 2087 of 2087, killing the VT feedback feed
+              // outright, and it was built on a misreading of Xenia.
+              //
+              // Xenia's comment -- "the guest saying it wrote this memory
+              // itself ... so only record the range as one it works with" --
+              // reads like "do not copy over it". It is not. The recorded key
+              // is consulted later as a POSITIVE signal:
+              //
+              //     bool coherency = resolve_coherency_keys_.count(key) != 0;
+              //     if (cpu_read || private_ring || coherency)
+              //       return ResolveHostCopyAction::kToGuestRam;
+              //
+              // So a range the guest works with is one Xenia makes SURE to copy
+              // to guest RAM, and our feedback destination being claimed every
+              // frame argues for keeping the write, not dropping it.
+              //
+              // Kept as a counter because the overlap is still worth knowing:
+              // our destination 0xFA2DC000 is physical 0x1A2DD000 size 0x4000
+              // and the guest names exactly that range, byte for byte.
+              if (matched) {
+                const uint32_t span = uint32_t(dest_desc.width) *
+                                      uint32_t(dest_desc.height) *
+                                      uint32_t(dest_desc.bytes_per_block);
+                mx::coherency::NoteSuppressedWriteback(
+                    mx::coherency::GuestOwnsRange(dest_desc.address, span));
+              }
               if (matched) {
                 s_slotSeq[slot] = rb.seq;
                 const uint32_t bpb = dest_desc.bytes_per_block;
