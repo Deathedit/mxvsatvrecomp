@@ -25,11 +25,18 @@
 #include <system_error>
 
 #include "hooks/hook_common.h"
+
+// timeBeginPeriod. WIN32_LEAN_AND_MEAN keeps mmsystem.h out of windows.h,
+// and timeapi.h is the narrow header for just the multimedia timer calls.
+#include <timeapi.h>
 #include "hooks/hooks_d3d9.h"
 
 #include <chrono>
 #include <mutex>
+#include <thread>
 #include <vector>
+
+#include <rex/cvar.h>
 
 #include "gpu/d3d9_draw.h"
 #include "gpu/d3d9_state.h"
@@ -110,12 +117,84 @@ struct SwapTimer {
     if (ms >= 50) REXLOG_INFO("native: {} #{} took {}ms", what, n, ms);
   }
 };
+
+}  // namespace
+
+// FRAME PACING -- the console's swap blocks on vsync and ours never did.
+//
+// On hardware sub_82566B58 calls VdSwap, which does not return until the
+// scanout flips. The whole title is written against that: its script threads,
+// UI transitions and timers all advance once per swap, and the fastest that
+// can ever happen on a 360 is 60 Hz. We present with sync interval 0, so the
+// guest free-runs at whatever the host can manage.
+//
+// MEASURED 2026-08-28 on the user's main PC: the legal screen runs at
+// **400+ fps**, against 100 fps in the dev VM and 60 on the console. So the
+// guest's frame-driven logic is advancing nearly SEVEN TIMES faster than any
+// hardware it was ever tested on, and it crashes there "randomly" while the
+// slower VM mostly survives. This project has already lost one crash to
+// exactly that shape -- 0x8234CE20 was a race the guest script thread lost by
+// 0.9s when our shader compilation stalled it, and the note on it warns the
+// race "will resurface on any machine or build whose startup timing shifts".
+// A 4x faster machine is a timing shift.
+//
+// So this is not a frame-rate limiter for comfort. It is the missing half of
+// the swap's semantics, and running without it puts the guest in a state the
+// title never had to work in.
+//
+// NOT VSYNC. Present's sync interval would pace to the MONITOR -- 144 Hz still
+// runs the guest 2.4x too fast, and the rate would depend on whose desktop it
+// is. This paces the guest's own swap to a fixed period instead, so the number
+// is the same everywhere.
+//
+// Set to 0 to restore the old free-running behaviour. 60 is the ceiling rather
+// than a target: a frame that takes longer is simply not delayed, and no
+// attempt is made to catch up by running a burst afterwards, because a burst
+// of uncapped frames is the exact condition being avoided.
+REXCVAR_DEFINE_INT32(frame_limit_fps, 60, "Debug",
+                     "Pace the guest's swap to at most this many frames per "
+                     "second, the way the console's vsync-blocking VdSwap did. "
+                     "0 lets the guest free-run");
+
+namespace {
+
+// Destructor-based so it covers the hook's several exits. Declared BEFORE
+// SwapTimer at the top of the hook, so it is destroyed AFTER it -- otherwise
+// the timer would report the pacing sleep as time the hook spent working.
+struct FramePacer {
+  ~FramePacer() {
+    const int fps = REXCVAR_GET(frame_limit_fps);
+    if (fps <= 0) return;
+    // Windows' default timer granularity is 15.6ms, which cannot express a
+    // 16.67ms period at all -- sleep_until alone would quantise 60 fps into an
+    // alternating 64/32. winmm is already linked; this asks for 1ms once and
+    // never gives it back, which is what a game does.
+    static const bool s_period = [] { return timeBeginPeriod(1) == TIMERR_NOERROR; }();
+    (void)s_period;
+    const auto period = std::chrono::nanoseconds(1000000000ll / fps);
+    static std::chrono::steady_clock::time_point s_next{};
+    const auto now = std::chrono::steady_clock::now();
+    // First swap, or a frame that overran its budget: re-base rather than try
+    // to make the time back. Catching up would mean running several frames
+    // uncapped, which is the condition this exists to prevent.
+    if (s_next.time_since_epoch().count() == 0 || now > s_next) {
+      s_next = now + period;
+      return;
+    }
+    std::this_thread::sleep_until(s_next);
+    s_next += period;
+  }
+};
+
 }  // namespace
 
 REX_IMPORT(__imp__sub_82566B58, orig_VdSwap, void());
 extern "C" REX_FUNC(sub_82566B58) {
   static int swap_count = 0;
   ++swap_count;
+  // Ordering matters: constructed first so it is destroyed LAST, after
+  // SwapTimer has already logged. See FramePacer's note.
+  FramePacer _frame_pacer;
   SwapTimer _swap_timer{"VdSwap hook total", swap_count};
   if (!mx::native::g_plugin_mode) ReportHostPageQueryStats();
 

@@ -149,11 +149,50 @@ extern "C" REX_FUNC(sub_8229BAF8) {
   const uint32_t valuePtr = ctx.r4.u32;
   const uint32_t caller = uint32_t(ctx.lr);
 
+  // WHICH VECTOR FIRST, DEREFERENCE SECOND.
+  //
+  // This used to read `vec + 4` and `*valuePtr` at the top, before anything had
+  // established that either pointer belongs to us. Both come straight out of
+  // guest registers, and this function serves 60+ unrelated call sites -- 173k
+  // pushes in 38 seconds of the main-PC log against 59k that are the UI list.
+  // A single caller whose r3/r4 is not a live object takes the process down.
+  //
+  // It did. Main PC, 2026-08-28, on the frame a HUD transition pushed entries
+  // the run had never seen before (50 -> 51 -> 52 distinct, then the fault):
+  //
+  //     script "AchievementRaceGoals"; registry "HudRoutingEvent" -> "Goto HUD"
+  //     UI ENQUEUE ... 52 distinct entries
+  //     Unhandled guest access violation: read of guest 0x4C69746C
+  //
+  // 0x4C69746C is ASCII "Litl" -- a fragment of a STRING being used as a
+  // pointer, the same value and the same failure as the crash recorded in
+  // `plausible-is-not-readable`, which had already cost this project eight runs
+  // at a different site. The rule from that one applies verbatim: a value about
+  // to be dereferenced needs GuestRangeReadable, which probes the real mapping,
+  // not a range test and not nothing at all.
+  //
+  // The DRAIN hook right below already had this shape correct -- it filters on
+  // `vec != list` and only then reads. This is that asymmetry removed.
+  //
+  // Resolving the root before the original is safe: it is a vector push, and it
+  // cannot construct or move the UIManager singleton it would have to write.
+  const uint32_t root = REX_LOAD_U32(kUiRootGlobal);
+  const uint32_t list = root ? root + kUiRenderListOff : 0;
+  const bool ours = root != 0 && vec == list;
+
   // Read BEFORE the original: the count is what says where this entry landed,
   // and the original increments it. Index 0 is how a drained list announces
   // itself, which is the only view of the DRAIN this probe gets for free.
-  const uint32_t index = vec ? REX_LOAD_U32(vec + 4) : 0;
-  const uint32_t value = valuePtr ? REX_LOAD_U32(valuePtr) : 0;
+  uint32_t index = 0, value = 0;
+  bool readable = false;
+  if (ours) {
+    readable = GuestRangeReadable(base, vec + 4, 4) && valuePtr &&
+               GuestRangeReadable(base, valuePtr, 4);
+    if (readable) {
+      index = REX_LOAD_U32(vec + 4);
+      value = REX_LOAD_U32(valuePtr);
+    }
+  }
 
   orig_VectorPush(ctx, base);
 
@@ -161,11 +200,26 @@ extern "C" REX_FUNC(sub_8229BAF8) {
   // when the filter never matches.
   g_enqAllPushes.fetch_add(1, std::memory_order_relaxed);
 
-  const uint32_t root = REX_LOAD_U32(kUiRootGlobal);
   if (!root) return;
-  const uint32_t list = root + kUiRenderListOff;
   g_uiRenderList.store(list, std::memory_order_relaxed);
-  if (vec != list) return;  // fast reject: some other vector
+  if (!ours) return;  // fast reject: some other vector
+
+  // REFUSALS ARE SAID OUT LOUD, not silently skipped -- and here that is more
+  // than hygiene. This line is the PROOF for the attribution above: the crash
+  // reporter calls its own guest-function attribution unreliable at this site,
+  // so "we were about to dereference 0x4C69746C and did not" is the only thing
+  // that turns a strong circumstantial case into a measured one. If it never
+  // prints, this hook was not the crash and the search moves elsewhere.
+  if (!readable) {
+    static std::atomic<uint64_t> s_refused{0};
+    const uint64_t n = s_refused.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 8)
+      REXLOG_INFO("native: UI ENQUEUE refused -- vec 0x{:08X} value ptr "
+                  "0x{:08X} is not readable guest memory, caller 0x{:08X} "
+                  "({} so far)",
+                  vec, valuePtr, caller, n);
+    return;
+  }
 
   std::lock_guard<std::mutex> lk(g_enqMu);
   ++g_enqUiPushes;

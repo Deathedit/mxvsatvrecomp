@@ -954,8 +954,19 @@ extern "C" REX_FUNC(sub_82BAB128) {
 }
 
 REX_IMPORT(__imp__sub_82BA91C0, orig_AssetFind, void());
+// The manager `this`, captured from a real call rather than re-derived.
+//
+// It IS derivable -- engine = *(0x830BE400), manager = *(engine + 8) -- but
+// that walk has already been got wrong once in this file (dword_830BE400 read
+// as an address instead of a pointer variable, printing zeros), and the
+// re-resolve below cannot afford a plausible-but-wrong `this`. Any call at all
+// hands us the correct value, and there are thousands before the one that
+// matters.
+std::atomic<uint32_t> g_assetManager{0};
+
 extern "C" REX_FUNC(sub_82BA91C0) {
   const uint32_t name_ptr = ctx.r4.u32;
+  if (ctx.r3.u32) g_assetManager.store(ctx.r3.u32, std::memory_order_relaxed);
   const uint64_t type_bits = ctx.r5.u64;
   // Big-endian: "bink" occupies the high half, low half zero.
   const bool is_bink = (type_bits >> 32) == 0x62696E6Bull;
@@ -1006,6 +1017,94 @@ extern "C" REX_FUNC(sub_82BA91C0) {
   }
   REXLOG_INFO("{}: AssetFind MISS type=\"{}\" name=\"{}\" (raw type 0x{:016X})",
               tag, type, name, type_bits);
+}
+
+//=============================================================================
+// UIVideoComponent::AcquirePlayer - sub_8234CE20
+//
+// THE 0x8234CE20 CRASH, FIXED AT THE POINT THE STALE NULL IS USED.
+//
+// The guest caches its bink asset at component+0x94 during BinkInitProps and
+// never re-resolves it. When the database worker constructs the component
+// before the script has asked for the package that holds the movie, the lookup
+// misses, a NULL is cached, and AcquirePlayer later writes through it at +0x58.
+// Main PC, run mx_010, every link in one log:
+//
+//   20:03:21.682 [worker] AssetFind bink "RiderUI_Final_C_350" -> MISS
+//   20:03:21.682 [worker] BinkInitProps #1 comp=0x21F9DB60 bink=0x00000000
+//   20:03:21.909 [script] LoadAssetDB "UIAnimations"        <- 0.227s LATER
+//   20:03:58.139          ACCESS VIOLATION write guest 0x58, r3=0x21F9DB60
+//
+// It is a RACE, and it has been "fixed" by winning it before: async shader
+// compilation bought the script 0.9s on this VM and the crash went away here.
+// It came straight back on a machine 4x faster. Any fix that works by being
+// early enough is a fix with an expiry date, so this one does not.
+//
+// THE KEY FACT: the crash is 36 SECONDS after the null was cached, and the
+// package loaded 0.2s after it. So at the moment of use the asset is present
+// and simply is not looked at again. Re-resolving here asks the same question
+// the guest asked, with the same manager, name and type, at a time when the
+// answer exists.
+//
+// WHY NOT SKIP THE CALL. That was tried (2026-08-28) and made things worse:
+// returning early left this->player null and the fault moved downstream to
+// RVA 0x10CDCFD, correlated 3-for-3. Nothing is skipped here. On the path
+// where the repair fails, the original runs exactly as it does today -- so
+// this hook can restore behaviour, never degrade it.
+//
+// Reads and writes ONE dword of guest state, the one the guest wrote itself.
+REX_IMPORT(__imp__sub_8234CE20, orig_AcquirePlayer, void());
+extern "C" REX_FUNC(sub_8234CE20) {
+  const uint32_t self = ctx.r3.u32;
+  static std::atomic<uint64_t> s_repaired{0}, s_stillNull{0}, s_seenNull{0};
+  // Offsets are BinkInitProps's, which reads the same two fields.
+  if (self && GuestRangeReadable(base, self + 0x94u, 4) &&
+      REX_LOAD_U32(self + 0x94u) == 0) {
+    const uint64_t seen = s_seenNull.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint32_t manager = g_assetManager.load(std::memory_order_relaxed);
+    // The movie name is stored INLINE at +0x98, so it is its own name pointer;
+    // no copy into guest memory is needed to make the call.
+    const bool have_name =
+        GuestRangeReadable(base, self + 0x98u, 2) && REX_LOAD_U8(self + 0x98u);
+    uint32_t found = 0;
+    if (manager && have_name) {
+      // An isolated register context, so the outer call's state is untouched.
+      // r1 is moved down by a frame the way the SDK's own auto-isolating path
+      // does -- the callee will use it.
+      rex::CallFrame frame(ctx);
+      frame.ctx.r1.u32 -= 0x70;
+      frame.ctx.r3.u64 = manager;
+      frame.ctx.r4.u64 = self + 0x98u;
+      // Type tag, big-endian in the HIGH half -- the layout the AssetFind
+      // probe above already decodes ("bink" << 32).
+      frame.ctx.r5.u64 = 0x62696E6Bull << 32;
+      orig_AssetFind(frame, base);
+      found = frame.ctx.r3.u32;
+    }
+    if (found) {
+      REX_STORE_U32(self + 0x94u, found);
+      const uint64_t n = s_repaired.fetch_add(1, std::memory_order_relaxed) + 1;
+      REXLOG_INFO("{}: AcquirePlayer REPAIRED comp=0x{:08X} movie=\"{}\" -- "
+                  "cached bink was NULL, re-resolved to 0x{:08X} ({} repaired, "
+                  "{} nulls seen)",
+                  mx::native::g_plugin_mode ? "plugin" : "native", self,
+                  GuestString(base, self + 0x98u, 128), found, n, seen);
+    } else {
+      // SAID OUT LOUD. This is the branch that still faults, and a silent one
+      // would look identical to a fix from the outside.
+      const uint64_t n = s_stillNull.fetch_add(1, std::memory_order_relaxed) + 1;
+      if (n <= 8)
+        REXLOG_ERROR("{}: AcquirePlayer comp=0x{:08X} movie=\"{}\" -- cached "
+                     "bink is NULL and re-resolve FAILED (manager 0x{:08X}, "
+                     "name {}); calling the original anyway, expect the "
+                     "0x8234CE20 fault ({} so far)",
+                     mx::native::g_plugin_mode ? "plugin" : "native", self,
+                     have_name ? GuestString(base, self + 0x98u, 128)
+                               : std::string("<unreadable>"),
+                     manager, have_name ? "ok" : "missing", n);
+    }
+  }
+  orig_AcquirePlayer(ctx, base);
 }
 
 REX_IMPORT(__imp__sub_824F8E20, orig_AssetDbLoadPackage, void());

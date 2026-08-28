@@ -18,6 +18,13 @@
 # VSync
 # vsync = false
 
+# Pace the guest's swap to at most this many frames per second, the way the
+# console's vsync-blocking VdSwap did. The 360 could never exceed 60, and the
+# title's script threads, UI transitions and timers all advance once per swap --
+# so running uncapped advances that logic faster than any hardware it was ever
+# tested on (measured: 400+ fps on the legal screen). 0 lets the guest free-run.
+# frame_limit_fps = 60
+
 # Resolution scale (1 = native 1280x720)
 # resolution_scale = 1
 
