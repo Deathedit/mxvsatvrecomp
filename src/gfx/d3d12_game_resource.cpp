@@ -1130,10 +1130,20 @@ void D3D12Renderer::QueueSurfaceReadback(GameRenderTarget* snap,
   SurfaceReadbackTally* tally = SurfaceTallyFor(destObject);
   if (tally) ++tally->seen;
   // Every exit below is one of these three, so `seen` is a real denominator.
-  auto reject = [&](uint32_t reason) {
+  //
+  // The EXTENT is recorded here too, not only on a win. It used to be set in
+  // the won branch alone, so every refused destination printed `0x0` and the
+  // census could not say WHAT was being refused -- which is the whole question
+  // when 55,702 rejects share one reason code. `attempted` carries the region
+  // as last seen, whether or not it was served.
+  auto reject = [&](uint32_t reason, uint32_t w = 0, uint32_t h = 0) {
     if (tally) {
       ++tally->ineligible;
       tally->lastReason = reason;
+      if (w && h) {
+        tally->attemptedW = w;
+        tally->attemptedH = h;
+      }
     }
   };
   // 1x1 belongs to the luminance path, which carries semantics this one must
@@ -1169,7 +1179,7 @@ void D3D12Renderer::QueueSurfaceReadback(GameRenderTarget* snap,
   // A sanity bound against a pathological pitch only; the byte tests decide.
   if (copyW > 4096u || copyH > 4096u) {
     ++m_surfaceReadbackTooBig;
-    reject(4);
+    reject(4, copyW, copyH);
     return;
   }
   // The footprint of the REGION, described as a texture of its own. Asking
@@ -1190,7 +1200,8 @@ void D3D12Renderer::QueueSurfaceReadback(GameRenderTarget* snap,
                                   &totalBytes);
   if (!totalBytes || totalBytes > kSurfaceReadbackBytes) {
     ++m_surfaceReadbackTooBig;
-    reject(5);
+    reject(5, copyW, copyH);
+    if (tally) tally->attemptedBytes = uint32_t(totalBytes);
     return;
   }
   // AGAINST THE CPU BUFFER, not the GPU one. kSurfaceReadbackBytes is the
@@ -1202,7 +1213,8 @@ void D3D12Renderer::QueueSurfaceReadback(GameRenderTarget* snap,
   // is exactly 16 KB.
   if (totalBytes > mx::hle::kMaxSurfaceReadbackBytes) {
     ++m_surfaceReadbackTooBig;
-    reject(6);
+    reject(6, copyW, copyH);
+    if (tally) tally->attemptedBytes = uint32_t(totalBytes);
     return;
   }
   // LAST, so that `lostBusy` counts only callers that would otherwise have been
@@ -1371,9 +1383,11 @@ void D3D12Renderer::DrainSurfaceReadback() {
       if (!t.destObject) continue;
       char row[192];
       std::snprintf(row, sizeof(row),
-                    "  readback dest 0x%08X %ux%u | seen %llu = won %llu + "
-                    "ineligible %llu (last reason %u) + lost-busy %llu",
-                    t.destObject, t.width, t.height,
+                    "  readback dest 0x%08X %ux%u (attempted %ux%u, %u B) | "
+                    "seen %llu = won %llu + ineligible %llu (last reason %u) + "
+                    "lost-busy %llu",
+                    t.destObject, t.width, t.height, t.attemptedW,
+                    t.attemptedH, t.attemptedBytes,
                     static_cast<unsigned long long>(t.seen),
                     static_cast<unsigned long long>(t.won),
                     static_cast<unsigned long long>(t.ineligible), t.lastReason,

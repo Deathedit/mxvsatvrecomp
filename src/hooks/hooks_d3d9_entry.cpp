@@ -40,6 +40,7 @@ namespace tu = rex::graphics::texture_util;
 #include "gpu/hle_types.h"
 #include "gpu/shader_ucode.h"
 
+#include "hooks/guest_read_watch.h"
 #include "hooks/hooks_d3d9_internal.h"
 
 REXCVAR_DECLARE(bool, hle_capture);
@@ -1889,7 +1890,35 @@ extern "C" REX_FUNC(sub_8255CE98) {
               // neutral in both representations.
               const bool same_texel =
                   rb.bytesPerTexel == dest_desc.bytes_per_block;
+              // DISABLED 2026-08-28 pending a correct mapping. Restore by
+              // deleting the `false &&`.
+              //
+              // The R32_FLOAT deform tile is written raw as round(f * 255) into
+              // a buffer the guest MEMSETS TO 0x80. That is defensible only if
+              // the tile carries the accumulated height, and in a real level it
+              // does not: run 1677 in freeroam wrote
+              //
+              //   0xF102E000 x42 bpb1 164667/172032 usable, byte 00..FF mean 07
+              //   0xF0C2D000 x39 bpb1 152713/159744 usable, byte 00..FF mean 06
+              //
+              // -- a mean of 6-7 against a neutral of 128, near-zero over ~96%
+              // of the surface. The user reports the bike jumping as if it
+              // cannot track the terrain, which is what a collapsed height
+              // field would look like if the guest reads this.
+              //
+              // An earlier menu run read `byte 7A..80 mean 7F` and I took that
+              // as proof the mapping was right. It was not: in the MENU the
+              // tile is neutral, so the raw write happened to land near 0x80 by
+              // accident. Menu data cannot validate a level-time mapping.
+              //
+              // Until it is known whether the tile is the accumulation or a
+              // DELTA to be combined with the previous half (the guest has an
+              // hft_deform_copy pass that has never been observed executing),
+              // writing it raw is worse than not writing it: the buffer keeps
+              // its 0x80 memset, which is the neutral the guest itself chose,
+              // and the ruts stay missing as they were before this session.
               const bool float_to_unorm8 =
+                  false &&
                   rb.bytesPerTexel == 4 && dest_desc.bytes_per_block == 1 &&
                   rb.srcFormat == uint32_t(DXGI_FORMAT_R32_FLOAT);
               matched = rb.seq && rb.seq != s_slotSeq[slot] &&
@@ -2137,6 +2166,30 @@ extern "C" REX_FUNC(sub_8255CE98) {
                 uint64_t bsum;
                 uint64_t bcount;
               };
+              // READ WATCH, armed AFTER the write so the next toucher is
+              // somebody else.
+              //
+              // Scoped to the 129x129 terrain HEIGHT buffer because that is the
+              // one whose reader is in doubt: raising the readback cap to
+              // deliver it (0 of 1880 -> 1562 of 1562) stopped the tile churn
+              // but did not put the bike down, and the only consumer we can see
+              // binds the host SNAPSHOT instead of decoding this memory. So
+              // "the guest reads these bytes" is an assumption the whole path
+              // rests on and has never been tested.
+              //
+              // A load leaves no trace unless the memory reports it -- see
+              // `guest-reads-resolves-from-memory`, where the exposure came back
+              // through a plain load with no call we hook.
+              if (dest_desc.width == 129 && dest_desc.height == 129 &&
+                  mx::watch::GuestReadWatchActive()) {
+                const size_t span = size_t(dest_desc.width) *
+                                    size_t(dest_desc.height) *
+                                    size_t(dest_desc.bytes_per_block);
+                mx::watch::ArmGuestReadWatch(
+                    reinterpret_cast<void*>(REX_RAW_ADDR(dest_desc.address)),
+                    span, dest_desc.address, "terrain height 129x129");
+              }
+
               static WroteTo s_dests[8] = {};
               static bool s_destsInit = false;
               if (!s_destsInit) {

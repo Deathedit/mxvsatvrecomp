@@ -1891,7 +1891,38 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // a zero, write every known 1x1 destination, one quantity sampled repeatedly)
   // and none of it is true of a page-ID buffer.
   //
-  // 64x64x4 = 16 KB, rounded to the placement alignment.
+  // 64 KB, and RAISING IT FOR THE TERRAIN HEIGHT BUFFER WAS TRIED AND REVERTED.
+  //
+  // 64 KB is the placement-aligned round-up of the 64x64x4 VT feedback buffer,
+  // which is the caller that actually has a reader.
+  //
+  // The 129x129 R32_FLOAT terrain HEIGHT snapshot is 99,072 bytes once D3D12
+  // aligns its rows, so it was refused (reason 5) on every one of ~1880
+  // attempts a run. That looked exactly like the floating bike's cause, and the
+  // cap was raised to 128 KB to deliver it. Both halves of what happened next
+  // are worth keeping:
+  //
+  //   IT DELIVERED. 1562 of 1562, and the terrain tile churn stopped.
+  //   NOTHING READ IT. A PAGE_GUARD on the destination logged 80 accesses from
+  //     ONE host site, r0 w80 -- our own writeback and nothing else, no guest
+  //     load and not even our texture fingerprint. The one GPU consumer binds
+  //     the host SNAPSHOT ("no guest-memory decode"), so the guest-memory copy
+  //     has no reader at all.
+  //   AND IT STARVED THE READBACK SLOTS. There are four; the height ping-pong
+  //     pair won both of two every frame, and the destinations that DO have
+  //     readers collapsed:
+  //
+  //       0x2175E1E0  64x64  seen 2162 = won    1 + lost-busy 2161
+  //       0x2175E7E0 160x90  seen 6486 = won    0 + lost-busy 6486
+  //       0x224AD820 129x129 seen 1562 = won 1562 + lost-busy    0
+  //
+  //     The 64x64 there is the VT feedback buffer that drives tile streaming.
+  //     The near ground went black in the same build, and that is the
+  //     mechanism -- not the bytes written, which nobody reads.
+  //
+  // So this is not a budget to raise. If a caller over 64 KB ever does need
+  // delivering, give it its own slot budget rather than widening this one, and
+  // prove it has a reader FIRST -- guest_read_watch.h exists for exactly that.
   static constexpr uint32_t kSurfaceReadbackBytes = 64 * 1024;
   // One slot per readback in flight, per frame. These used to be eight parallel
   // std::arrays indexed by m_frameIndex; a second index would have made that
@@ -1947,6 +1978,11 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     uint64_t lostBusy = 0;
     uint64_t won = 0;
     uint32_t lastReason = 0;
+    // The region as last ATTEMPTED, set whether or not it was served, so a
+    // refused destination says what shape it was rather than printing 0x0.
+    uint32_t attemptedW = 0;
+    uint32_t attemptedH = 0;
+    uint32_t attemptedBytes = 0;
   };
   static constexpr uint32_t kSurfaceTallySlots = 24;
   std::array<SurfaceReadbackTally, kSurfaceTallySlots> m_surfaceTally = {};

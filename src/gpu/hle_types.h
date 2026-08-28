@@ -1016,6 +1016,12 @@ extern std::atomic<uint32_t> g_luminanceReadbackSeq;
 // 64x64x4 is the cap. That covers the feedback buffer and excludes the only
 // other never-sampled destination in the census, a 1280x720 scene target that
 // reaches the screen by another path and would cost a megabyte a frame.
+//
+// Raised to 128 KB on 2026-08-28 to deliver the 129x129 terrain height snapshot
+// and REVERTED the same day: a PAGE_GUARD on that destination proved nothing
+// reads it (80 accesses, one host site, r0 w80), while delivering it starved
+// the four readback slots and took the 64x64 VT feedback buffer down to 1 win
+// in 2162. See the long note on kSurfaceReadbackBytes.
 inline constexpr uint32_t kMaxSurfaceReadbackBytes = 64 * 64 * 4;
 struct SurfaceReadback {
   uint32_t destObject = 0;

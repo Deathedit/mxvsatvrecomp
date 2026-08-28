@@ -5,6 +5,7 @@
 #include <rex/logging.h>
 #include <rex/ppc/context.h>
 
+#include "hooks/guest_read_watch.h"
 #include "hooks/native_bridge.h"
 #include "mx_init.h"
 
@@ -100,6 +101,64 @@ const PPCContext* GuestContextFrom(const CONTEXT* c, uint64_t gbase) {
 // process dies. Registered first (last arg 1) so it runs before anything else.
 LONG CALLBACK CrashReporter(EXCEPTION_POINTERS* info) {
   const auto* rec = info->ExceptionRecord;
+
+  // GUARD PAGE -- the guest read watch, NOT a crash. Handled first and returns
+  // CONTINUE_EXECUTION, because Windows has already cleared the guard bit for
+  // the faulting page and the instruction will now succeed.
+  //
+  // The discriminator that makes this probe worth anything is here: the faulting
+  // RIP is resolved against PPCFuncMappings, and the access only counts as the
+  // GUEST's when it lands inside recompiled code. Our own writeback writes this
+  // buffer and the texture fingerprint reads it, so without that test the watch
+  // would answer its own question with our own traffic.
+  if (rec->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) {
+    const uint64_t fault = static_cast<uint64_t>(rec->ExceptionInformation[1]);
+    const uint64_t modbase_watch =
+        reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+    uint32_t guest_addr = 0;
+    const char* what = "";
+    if (mx::watch::OnGuardPageHit(fault, &guest_addr, &what) ==
+        mx::watch::GuardHit::kOurs) {
+      const bool is_write = rec->ExceptionInformation[0] == 1;
+      const uint64_t rip = reinterpret_cast<uint64_t>(rec->ExceptionAddress);
+      const GuestFuncHit hit = ResolveGuestFunction(rip);
+      // THE FULL ATTRIBUTION RULE, not just containment.
+      //
+      // The first cut of this used `hit.guest && (!hit.next_host || rip <
+      // next_host)` and immediately reported our OWN writeback as "FROM GUEST
+      // CODE" -- at +0x9014E5C5C past a 0x60-byte function, i.e. 38 GB. When
+      // next_host is 0 (a RIP above every mapping, which is where host code
+      // lives) that test accepts anything.
+      //
+      // A probe that answers its own question with our own traffic is worse
+      // than no probe, and this file already documents the two signals that
+      // catch it -- see the crash report below: the host/guest size ratio, and
+      // the absence of a PPCContext in the argument registers, which every
+      // recompiled function has. Both are required here.
+      const uint64_t off = hit.guest ? rip - hit.host : 0;
+      const bool implausible =
+          !hit.guest_size || off > uint64_t(hit.guest_size) * 24ull;
+      const PPCContext* wctx = GuestContextFrom(info->ContextRecord,
+                                                reinterpret_cast<uint64_t>(
+          mx::native::NativeGraphics::Get().GetGuestMemory()));
+      const bool in_guest_code = hit.guest && hit.next_host &&
+                                 rip < hit.next_host && !implausible && wctx;
+      mx::watch::NoteGuestReadWatchAccess(in_guest_code, is_write,
+                                          rip - modbase_watch);
+      if (in_guest_code) {
+        REXLOG_INFO(
+            "native: READ WATCH {} of {} at guest 0x{:08X} -- FROM GUEST CODE, "
+            "recompiled 0x{:08X} +0x{:X} (guest size 0x{:X})",
+            is_write ? "WRITE" : "READ", what, guest_addr, hit.guest, off,
+            hit.guest_size);
+      }
+      return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    // Somebody else's guard page (a stack growth, most likely). Not ours to
+    // consume -- pass it along untouched.
+    return EXCEPTION_CONTINUE_SEARCH;
+  }
+
   if (rec->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
     const char* op = rec->ExceptionInformation[0] == 0   ? "read"
                      : rec->ExceptionInformation[0] == 1 ? "write"
