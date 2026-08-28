@@ -35,7 +35,10 @@
 #include <filesystem>
 #include <iterator>
 #include <map>
+#include <condition_variable>
+#include <deque>
 #include <mutex>
+#include <thread>
 #include <set>
 #include <string>
 #include <vector>
@@ -5370,14 +5373,117 @@ std::string HlslCoverageSummary(const HlslCoverage& c) {
 std::map<uint32_t, TranslatedShader> g_translatedPs;
 std::map<uint32_t, TranslatedShader> g_translatedVs;
 
+// ASYNC SHADER COMPILATION.
+//
+// First-use translation used to run entirely on the GUEST thread that submitted
+// the draw: emit (~0ms) + FXC (~143ms) + dump/disassembly (~26ms). A cold cache
+// means dozens of those back to back -- run 1673 took 56 cache misses, about
+// 8 seconds of guest-thread time -- and that stall is not merely slow, it
+// CORRUPTS GUEST STATE by changing which thread wins a race.
+//
+// The 0x8234CE20 crash is exactly that. The guest's script thread advances with
+// frames, the database worker drains its own ring regardless, and the front end
+// loads its packages from the script. Stall the renderer and the script arrives
+// late, so the worker constructs a BinkVideoComponent before the script has
+// asked for the package holding its movie; the asset lookup misses, the NULL is
+// cached at component+0x94 and dereferenced later with no null check. Measured
+// both ways, same build:
+//
+//     run 1673 CRASH  BinkInitProps 17:33:35.095 -> lookup MISS
+//                     LoadAssetPackage "Rider" 17:33:39.348
+//     run 1676 OK     LoadAssetPackage "Rider" 17:40:27.654
+//                     BinkInitProps 17:40:28.556 -> lookup FOUND
+//
+// The script wins by 0.9s when the cache is warm. So compilation has to come
+// off the guest thread.
+//
+// HOW: on a cache MISS the job is handed to the thread below and the function
+// returns WITHOUT installing. `TranslatedPixelShader` then keeps returning
+// nullptr for that handle, which every consumer already handles -- it is the
+// same state as a shader that failed to translate, and the draw takes the
+// stand-in path for a few frames until the real one lands. A cache HIT still
+// runs inline, because it costs nothing.
+//
+// The worker RE-ENTERS ReportHlslCoverage with t_shaderCompileWorker set, so
+// there is one translation path rather than two that can drift apart. The
+// `seen` early-out is skipped for it, and the enqueue is deduped for free by
+// that same map: a second first-use of the same handle before the job finishes
+// returns early and does not queue again.
+//
+// The maps were UNGUARDED and are read by every draw. A background writer makes
+// that a real race rather than a latent one, so they are locked now. The lock
+// is held only around find/insert; the returned pointer stays valid without it
+// because std::map nodes are stable and nothing is ever erased.
+std::mutex g_translatedMu;
+thread_local bool t_shaderCompileWorker = false;
+
 const TranslatedShader* TranslatedPixelShader(uint32_t handle) {
+  std::lock_guard<std::mutex> lk(g_translatedMu);
   const auto it = g_translatedPs.find(handle);
   return it == g_translatedPs.end() ? nullptr : &it->second;
 }
 
 const TranslatedShader* TranslatedVertexShader(uint32_t handle) {
+  std::lock_guard<std::mutex> lk(g_translatedMu);
   const auto it = g_translatedVs.find(handle);
   return it == g_translatedVs.end() ? nullptr : &it->second;
+}
+
+void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
+                        const uint32_t* code, uint32_t count);
+
+struct ShaderCompileJob {
+  mx::hle::HlslStage stage = mx::hle::HlslStage::kPixel;
+  uint32_t handle = 0;
+  std::vector<uint32_t> code;
+};
+
+std::mutex g_compileMu;
+std::condition_variable g_compileCv;
+std::deque<ShaderCompileJob> g_compileQueue;
+bool g_compileStop = false;
+std::thread g_compileThread;
+uint64_t g_compileQueued = 0;
+uint64_t g_compileDone = 0;
+
+void ShaderCompileWorker() {
+  for (;;) {
+    ShaderCompileJob job;
+    {
+      std::unique_lock<std::mutex> lk(g_compileMu);
+      g_compileCv.wait(lk, [] { return g_compileStop || !g_compileQueue.empty(); });
+      if (g_compileStop && g_compileQueue.empty()) return;
+      job = std::move(g_compileQueue.front());
+      g_compileQueue.pop_front();
+    }
+    t_shaderCompileWorker = true;
+    ReportHlslCoverage(job.stage, job.handle, job.code.data(),
+                       uint32_t(job.code.size()));
+    t_shaderCompileWorker = false;
+    std::lock_guard<std::mutex> lk(g_compileMu);
+    ++g_compileDone;
+  }
+}
+
+// Returns true when the job was taken, meaning the caller must NOT install and
+// must return. False keeps the caller on the old inline path -- which is what
+// the worker itself gets, and what happens if the thread could not start.
+bool EnqueueShaderCompile(mx::hle::HlslStage stage, uint32_t handle,
+                          const uint32_t* code, uint32_t count) {
+  if (!code || !count) return false;
+  std::lock_guard<std::mutex> lk(g_compileMu);
+  if (g_compileStop) return false;
+  if (!g_compileThread.joinable()) {
+    try {
+      g_compileThread = std::thread(ShaderCompileWorker);
+    } catch (...) {
+      return false;  // no thread: compile inline rather than never
+    }
+  }
+  g_compileQueue.push_back({stage, handle, std::vector<uint32_t>(code, code + count)});
+  ++g_compileQueued;
+  g_compileCv.notify_one();
+  return true;
 }
 
 void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
@@ -5390,10 +5496,15 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
     code_key ^= code[i];
     code_key *= 1099511628211ull;
   }
-  {
+  // Skipped on the compile worker: the guest thread already recorded this
+  // handle before handing the job over, so the worker would take the
+  // already-seen early-out and never compile anything.
+  if (!t_shaderCompileWorker) {
+    std::lock_guard<std::mutex> lk(g_translatedMu);
     const auto [it, inserted] = seen.emplace(handle, code_key);
     if (!inserted) {
-      // Same address, same code: already translated, nothing to do.
+      // Same address, same code: already translated OR a compile is in flight
+      // for it. Either way nothing to do -- and this is what dedupes the queue.
       if (it->second == code_key) return;
       // Same address, DIFFERENT code: the guest reused it for another shader.
       // Fall through and re-translate, overwriting g_translatedVs[handle].
@@ -5521,6 +5632,14 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
         std::memcpy(blob->GetBufferPointer(), dxbc_bytes->data(),
                     dxbc_bytes->size());
       compiled = blob != nullptr;
+    } else if (!t_shaderCompileWorker &&
+               EnqueueShaderCompile(stage, handle, code, count)) {
+      // OFF THE GUEST THREAD. Nothing is installed, so the draw that triggered
+      // this keeps seeing nullptr and takes the stand-in path until the worker
+      // finishes. Everything below -- coverage counters, the dump, the vertex
+      // fetch variant -- runs on the worker when it re-enters, so no accounting
+      // is lost, only deferred.
+      return;
     } else {
       const HRESULT hr = D3DCompile(
           out.source.data(), out.source.size(), nullptr, nullptr, nullptr,
@@ -5761,6 +5880,7 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
     // Retained only for shaders that both emitted and compiled. A source the
     // compiler rejects must never reach the renderer, which would only discover
     // the same failure later and with less context.
+    std::lock_guard<std::mutex> install_lk(g_translatedMu);
     TranslatedShader& kept = (stage == mx::hle::HlslStage::kPixel
                                   ? g_translatedPs
                                   : g_translatedVs)[handle];
