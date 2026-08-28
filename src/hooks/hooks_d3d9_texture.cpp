@@ -396,6 +396,7 @@ bool TextureContentStale(const mx::hle::HleTextureSource& source,
   return now != payload.content_version;
 }
 
+
 // The FULL-HASH PROBE that lived here is GONE, and its answer is why.
 //
 // It hashed whole atlases to ask one question: when a texture is served from
@@ -515,6 +516,165 @@ FlatScan ScanFlatness(const uint8_t* data, size_t bytes, uint32_t element_bytes)
   s.dominant_count = count;
   s.total = n;
   return s;
+}
+
+// The renderer's staleness key: a hash of the bytes we just decoded.
+//
+// Separate from content_version on purpose -- see the field's comment in
+// hle_types.h. The short version: content_version is a 2 KB SAMPLE of guest
+// memory and must stay one, so it cannot see a sparse write; the flat-retry
+// backoff re-decodes anyway, and without this the fresh bytes stopped at the
+// GPU boundary because EnsureGameTexture compared the sample and saw no change.
+//
+// Word-wise so the pass is memory-bound rather than byte-at-a-time: a 2 MB
+// index map hashes in well under the decode that produced it, and this runs
+// once per DECODE, not once per bind.
+// The snapshot slot's sampler word: clamp in bits 12-13, POINT in 14, and 15
+// saying the word was filled in at all.
+//
+// The low 12 bits are the guest swizzle, which a snapshot slot deliberately
+// does NOT apply (BindTranslatedTextures keeps identity -- applying it turned
+// the rider cyan). They are carried anyway so SLOT MAP can print them and so
+// the two producers of this word agree on its layout.
+//
+// TWO producers, and that is the point of this function. The full-snapshot
+// branch reads the fetch dwords directly; the PARTIAL-snapshot binds have no
+// fetch dwords in hand but do have `source`, which was decoded from the same
+// constant. Before this, only the first wrote the word, so every partially
+// resolved snapshot -- the terrain tile ATLAS among them, which fails the
+// coverage gate by design because an atlas is sparse -- reached the sampler
+// with a zero word and took the hardcoded clamped POINT.
+uint16_t PackSnapshotSamplerWord(uint32_t swizzle, uint32_t clamp_x,
+                                 uint32_t clamp_y, bool linear_filter) {
+  uint16_t packed = uint16_t(swizzle & 0xFFFu);
+  // SamplerVariantFor's rule: kRepeat (0) and kMirroredRepeat (1) wrap,
+  // everything at or above 2 clamps. Applied here so no site can drift on it.
+  if (clamp_x >= 2u) packed |= uint16_t(1u << 12);
+  if (clamp_y >= 2u) packed |= uint16_t(1u << 13);
+  if (!linear_filter) packed |= uint16_t(1u << 14);
+  packed |= uint16_t(1u << 15);
+  return packed;
+}
+
+// The PARTIAL-snapshot binds: carry the guest's FILTER and deliberately NOT
+// its clamp. Two different answers to two questions that happen to travel in
+// one word, and the asymmetry is measured rather than tidy.
+//
+// The terrain tile atlas at 0x1A2E3000 binds through here -- an atlas is sparse
+// by design, so it fails the coverage gate on every bind and is never a "full"
+// snapshot. Its fetch constant says `clamp 2/2 -> CLAMP/CLAMP`, and the atlas
+// is sampled at U = 1.34: clamped that pins to the right edge and reads an
+// empty tile, which is the BLACK GROUND this whole chain was dug out of.
+// Wrapped it is tile 2, which holds sand. The wrap it gets today comes from
+// this word being zero, so honouring the stated clamp here would walk the
+// ground straight back to black.
+//
+// Why the guest can say clamp and mean wrap is not settled -- the Xenos sampler
+// has more modes than the two this maps onto, and the shader's own address
+// arithmetic may already fold the wrap in. Until that IS settled, the clamp
+// stays at the default that renders correctly, and only the filter moves.
+uint16_t PartialSnapshotSamplerWord(const mx::hle::HleTextureSource& source) {
+  return PackSnapshotSamplerWord(source.swizzle, /*clamp_x=*/0, /*clamp_y=*/0,
+                                 source.linear_filter);
+}
+
+
+uint32_t PayloadUploadVersion(const mx::hle::HleTexturePayload& payload) {
+  uint64_t h = 1469598103934665603ull;
+  const uint8_t* p = payload.data.data();
+  size_t n = payload.data.size();
+  while (n >= 8) {
+    uint64_t word;
+    std::memcpy(&word, p, 8);
+    h = (h ^ word) * 1099511628211ull;
+    p += 8;
+    n -= 8;
+  }
+  while (n--) h = (h ^ *p++) * 1099511628211ull;
+  const uint32_t folded = uint32_t(h ^ (h >> 32));
+  // 0 is reserved for "never computed", which is what a blank or Bink payload
+  // carries and what makes those upload once and stay put.
+  return folded ? folded : 1u;
+}
+
+// Computes it, stores it, and says out loud the first time a re-decode of one
+// address produces DIFFERENT bytes.
+//
+// That line is the measurement the last three runs could not make. `TEXTURE
+// REPEATS ... 98stale` cannot answer it: the miss reason is set to kStaleEvicted
+// both when the fingerprint changed AND when the flat-retry backoff forced a
+// re-read, so a texture the guest never touches and one it rewrites constantly
+// print the same number. This compares the decoded bytes themselves, so a
+// CONTENT CHANGE line means the guest really did write, and its absence over a
+// run means it really did not.
+void SetPayloadUploadVersion(const mx::hle::HleTextureSource& source,
+                             mx::hle::HleTexturePayload& payload) {
+  uint32_t previous = 0;
+  {
+    PhaseTimer t(g_tex.scanUs);
+    payload.upload_version = PayloadUploadVersion(payload);
+  }
+  {
+    // Its own lock rather than g_flatMutex, which is declared further down for
+    // the flat census. The rule it obeys is the same one and it is not
+    // negotiable: this runs on GUEST THREADS from every decode site, and an
+    // unguarded container insert from several of them corrupted the heap once
+    // already -- the fault surfaced as a bad pointer in recompiled guest code
+    // nowhere near here. A diagnostic is not exempt.
+    static std::mutex s_uploadMutex;
+    std::lock_guard<std::mutex> upload_lock(s_uploadMutex);
+    static std::map<uint32_t, uint32_t> s_lastUpload;
+    static std::map<uint32_t, uint32_t> s_printed;
+    auto& slot = s_lastUpload[source.address];
+    previous = slot;
+    slot = payload.upload_version;
+    if (!previous || previous == payload.upload_version) return;
+    // EIGHT per address, not one. "The bytes changed" is not the question --
+    // the question is WHAT THEY NOW HOLD, and a single first-change line
+    // cannot distinguish a virtual-texture map that has come alive from one
+    // constant word being replaced by another. I reported the first version of
+    // this as a fix on the strength of one such line and it was not one.
+    auto& printed = s_printed[source.address];
+    if (printed >= 8 || s_printed.size() > 48) return;
+    ++printed;
+  }
+  // The CONTENT itself, on the base level, in the two readings that separate
+  // "alive" from "still one word": the dominant element's share, and three
+  // spread texels. A virtual-texture index map that is doing its job has a
+  // LOW dominant share and three different texels.
+  FlatScan scan{};
+  std::string probe;
+  {
+    PhaseTimer t(g_tex.scanUs);
+    const size_t base_bytes =
+        payload.level_count > 1
+            ? std::min<size_t>(payload.levels[1].offset, payload.data.size())
+            : payload.data.size();
+    scan = ScanFlatness(payload.data.data(), base_bytes, source.bytes_per_block);
+    const uint32_t bpp =
+        payload.width ? uint32_t(payload.row_pitch / payload.width) : 0;
+    if (bpp && bpp <= 16) {
+      const uint32_t pts[3][2] = {{payload.width / 2, payload.height / 2},
+                                  {payload.width / 4, payload.height / 4},
+                                  {0, 0}};
+      for (const auto& pt : pts) {
+        const size_t off =
+            size_t(pt[1]) * payload.row_pitch + size_t(pt[0]) * bpp;
+        if (off + bpp > base_bytes) continue;
+        probe += fmt::format(" ({},{})=", pt[0], pt[1]);
+        for (uint32_t b = 0; b < bpp; ++b)
+          probe += fmt::format("{:02X}", payload.data[off + b]);
+      }
+    }
+  }
+  REXLOG_INFO(
+      "d3d9: TEXTURE CONTENT CHANGE addr 0x{:08X} {}x{} fmt {} -- decoded bytes "
+      "differ from the previous decode (upload version 0x{:08X} -> 0x{:08X}); "
+      "base level dominant 0x{:X} share {:.5f} of {} elems, {} distinct bytes |"
+      " probe{}",
+      source.address, source.width, source.height, source.guest_format,
+      previous, payload.upload_version, scan.dominant, scan.share(), scan.total,
+      scan.distinct_bytes, probe.empty() ? std::string(" (none)") : probe);
 }
 
 // Fires AND population, printed on every line the probe emits, so the rate
@@ -2348,17 +2508,24 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
         // wrap) is the thing worth checking, not the enum value.
         const uint32_t cx = have_swz ? ((sfetch[0] >> 10) & 7u) : 0u;
         const uint32_t cy = have_swz ? ((sfetch[0] >> 13) & 7u) : 0u;
+        const uint32_t mag = have_swz ? ((sfetch[3] >> 19) & 3u) : 0u;
+        const uint32_t min = have_swz ? ((sfetch[3] >> 21) & 3u) : 0u;
         REXLOG_INFO(
             "d3d9: SLOT MAP {} 0x{:08X} slot {} (guest sampler {}): object "
             "0x{:08X} -> SNAPSHOT of a resolve destination (no guest-memory "
-            "decode); guest swizzle {} clamp {}/{} -> {}/{}",
+            "decode); guest swizzle {} clamp {}/{} -> {}/{} filter mag {} "
+            "min {} -> {}",
             vertex ? "vs" : "ps", stage_handle, slot, guest_sampler,
             texture_state.object,
             have_swz ? fmt::format("{:#o}", swz) : std::string("unreadable"),
             have_swz ? fmt::format("{}", cx) : std::string("?"),
             have_swz ? fmt::format("{}", cy) : std::string("?"),
             have_swz ? (cx >= 2 ? "CLAMP" : "wrap") : "CLAMP(fallback)",
-            have_swz ? (cy >= 2 ? "CLAMP" : "wrap") : "CLAMP(fallback)");
+            have_swz ? (cy >= 2 ? "CLAMP" : "wrap") : "CLAMP(fallback)",
+            have_swz ? fmt::format("{}", mag) : std::string("?"),
+            have_swz ? fmt::format("{}", min) : std::string("?"),
+            have_swz ? ((mag == 0u || min == 0u) ? "POINT" : "LINEAR")
+                     : "POINT(fallback)");
       }
       out_objects[slot] = texture_state.object;
       // The renderer has no fetch constant of its own for a snapshot slot; this
@@ -2383,15 +2550,28 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
       // clamp_x:3 at bit 10 and clamp_y:3 at bit 13. SamplerVariantFor's rule
       // is `>= 2 means clamp` (kRepeat 0 / kMirroredRepeat 1 wrap), applied
       // here so both sites cannot drift apart on it.
-      uint16_t packed = have_swz ? uint16_t(swz) : uint16_t(0);
-      if (have_swz) {
-        if (((sfetch[0] >> 10) & 7u) >= 2u) packed |= uint16_t(1u << 12);
-        if (((sfetch[0] >> 13) & 7u) >= 2u) packed |= uint16_t(1u << 13);
-      } else {
-        // Unreadable fetch: keep the old behaviour rather than guessing wrap.
-        packed |= uint16_t((1u << 12) | (1u << 13));
-      }
-      out_swizzles[slot] = packed;
+      //
+      // AND THE FILTER, bit 14, for exactly the same reason the clamp is here.
+      // BindTranslatedSamplers also hardcoded POINT for every snapshot slot,
+      // and "a snapshot is sampled 1:1" makes point and linear the same thing
+      // for a full-screen copy -- so the hardcode was invisible until an ATLAS
+      // came through it. ground-tiles-2.rdc: the terrain samples its 2048x2048
+      // tile atlas with computed, minifying UVs and gets nearest-neighbour,
+      // which is the hard corduroy aliasing on every dune in the mid-distance.
+      //
+      // dword 3: num_format:1, swizzle:12, exp_adjust:6, then mag_filter:2 at
+      // bit 19 and min_filter:2 at bit 21 (rex/graphics/xenos.h:1236-1242).
+      // kPoint is 0. The rule is d3d9_texture.cpp's, applied here so the two
+      // sites cannot drift: POINT only if EITHER filter asks for it.
+      // Unreadable fetch keeps the old hardcode -- clamped POINT -- rather than
+      // guessing; kPoint is 0, so `mag == 0 || min == 0` is "either asks for
+      // point", matching DescribeHleTexture2D's own rule.
+      out_swizzles[slot] =
+          have_swz ? PackSnapshotSamplerWord(
+                         swz, (sfetch[0] >> 10) & 7u, (sfetch[0] >> 13) & 7u,
+                         ((sfetch[3] >> 19) & 3u) != 0u &&
+                             ((sfetch[3] >> 21) & 3u) != 0u)
+                   : PackSnapshotSamplerWord(0, 2, 2, false);
       return true;
     }
     if (resolve_entry) ++resolve_entry->slot_partial;
@@ -2662,6 +2842,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     // OBJECT and does not read one.
     if (partial_snapshot_object && g_hleEmptyTextures.count(key)) {
       out_objects[slot] = partial_snapshot_object;
+      out_swizzles[slot] = PartialSnapshotSamplerWord(source);
       return true;
     }
     if (auto payload = g_hleBlankPayloads.find(key);
@@ -2795,6 +2976,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     // the retry keeps looking.
     if (partial_snapshot_object) {
       out_objects[slot] = partial_snapshot_object;
+      out_swizzles[slot] = PartialSnapshotSamplerWord(source);
       return true;
     }
     ++g_slotBoundZero;
@@ -2823,6 +3005,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   payload->key = key;
   payload->content_version =
       TextureContentVersion(source, base, payload->format);
+  SetPayloadUploadVersion(source, *payload);
   mx::diag::DumpDecodedTexture(source, *payload, "slot", guest_sampler);
   out_textures[slot] = payload;
   // A FLAT DECODE IS CACHED, AND MARKED FOR PERIODIC RE-READ.
@@ -3861,6 +4044,7 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
   payload->key = key;
   payload->content_version =
       TextureContentVersion(source, base, payload->format);
+  SetPayloadUploadVersion(source, *payload);
   mx::diag::DumpDecodedTexture(source, *payload, "prepare", binding.sampler);
   dc.texture = payload;
   g_hleCpuTextures.emplace(key, std::move(payload));

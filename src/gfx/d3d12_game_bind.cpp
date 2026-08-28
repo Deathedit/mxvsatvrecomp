@@ -465,24 +465,36 @@ bool D3D12Renderer::BindTranslatedSamplers(const GameDraw& d,
   for (uint32_t i = 0; i < kSamplerBlockSlots; ++i) {
     const uint32_t slot = i < stageSamplerCount ? i : 0;
     uint32_t variant = 0;
-    // A resolve snapshot is a host render target sampled 1:1, so it keeps the
-    // POINT filter. It used to take a hardcoded CLAMP as well, on the reasoning
-    // that there is "no fetch constant to read a mode off" -- and there is one:
-    // ResolvePixelSlotTexture reads it for the swizzle and now packs the guest
-    // clamp into bits 12-13 of the same word.
+    // A resolve snapshot used to get a HARDCODED clamped POINT sampler, on the
+    // reasoning that it "is a host render target sampled 1:1" and that there is
+    // "no fetch constant to read a mode off". The second half was simply wrong
+    // -- ResolvePixelSlotTexture reads that fetch constant for the swizzle --
+    // and the first half is true only for a full-screen post-process copy.
     //
-    // Hardcoding clamp is right for a full-screen post-process copy and wrong
-    // for the terrain ATLAS, which is sampled with computed UVs. Tile index 10
-    // gives U = 1.283; clamped it pins to the right edge and reads an empty
-    // tile, which is the black ground. Wrapped it is tile 2, which is one of
-    // the three the tile pass fills.
+    // The terrain ATLAS comes through here too, and it is sampled with computed
+    // UVs that both wrap and MINIFY, so both halves of the hardcode hurt it:
+    //
+    //   clamp   tile index 10 gives U = 1.283, pinned to the right edge, which
+    //           read an empty tile -- the black ground.
+    //   point   nearest-neighbour on a minified 2048x2048 atlas -- the hard
+    //           corduroy aliasing across every dune in ground-tiles-2.rdc.
+    //
+    // Both now come from the guest's own fetch constant, packed into the top
+    // bits of the swizzle word: 12 clamp U, 13 clamp V, 14 point filter. For a
+    // 1:1 copy point and linear are the same sample, so nothing that motivated
+    // the hardcode changes.
     if (slot < stageSampledObjects.size() && stageSampledObjects[slot]) {
-      variant = kSamplerPoint;
       const uint16_t packed = slot < stageSampledSwizzles.size()
                                   ? stageSampledSwizzles[slot]
                                   : uint16_t(0);
       if (packed & (1u << 12)) variant |= kSamplerClampU;
       if (packed & (1u << 13)) variant |= kSamplerClampV;
+      // Bit 15 says the word came from a fetch constant. Without it this slot
+      // was bound by one of the partial-snapshot paths, which never write the
+      // word -- so there is no filter to honour and it keeps the POINT it has
+      // always had. A zero word must not read as "the guest asked for linear".
+      if (!(packed & (1u << 15)) || (packed & (1u << 14)))
+        variant |= kSamplerPoint;
     } else if (slot < stageTextures.size() && stageTextures[slot]) {
       variant = SamplerVariantFor(*stageTextures[slot]);
     }

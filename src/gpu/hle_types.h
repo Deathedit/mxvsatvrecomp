@@ -121,6 +121,33 @@ struct HleTexturePayload {
   // and go, which froze the menu text as whatever the atlas held when it was
   // first sampled. Zero means never rewritten.
   uint32_t content_version = 0;
+  // What the RENDERER compares to decide whether its uploaded copy is stale,
+  // and it is deliberately NOT content_version.
+  //
+  // content_version is a SAMPLE of guest memory (GuestTextureFingerprint reads
+  // 2 KB however large the texture is), and it has to stay one: the cache-hit
+  // path compares a freshly sampled fingerprint against it, so storing anything
+  // else there would report "changed" on every bind and re-decode forever.
+  //
+  // The consequence is that a SPARSE guest write -- one that lands between the
+  // fingerprint's sample points -- leaves content_version identical. The CPU
+  // side already handles that with the flat-retry backoff, which re-decodes a
+  // watched texture every N frames regardless of the fingerprint. But the
+  // renderer was still gated on content_version, so those re-decodes were
+  // computed, cached, and then DISCARDED at the GPU boundary: the resource kept
+  // the bytes of the very first decode.
+  //
+  // Measured on the terrain's virtual-texture index map in ground-tiles.rdc:
+  // 137 decodes of guest 0x10374000 over one run, one live host resource, and
+  // that resource 100% the constant word the FIRST decode read -- 1,048,576
+  // texels of 0x0AF0, so every world position selected the same atlas tile.
+  //
+  // This is a hash of the DECODED BYTES, so it changes exactly when the
+  // uploaded copy would differ, and it costs one pass over a payload that was
+  // just built rather than one per bind. Zero means "not computed" -- blank and
+  // Bink payloads never set it, and they are uploaded once and never refilled,
+  // which is what they did before this field existed.
+  uint32_t upload_version = 0;
   // The guest's mip chain, decoded from its own allocation. 1 means the base
   // level only, which is what every payload held before the chain was read and
   // what a texture with no chain still holds.

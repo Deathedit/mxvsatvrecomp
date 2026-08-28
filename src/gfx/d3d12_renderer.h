@@ -1048,9 +1048,11 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // out of their own buffer, so they cannot share one.
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kFrameCount> upload;
     uint32_t descriptorIndex = 0;
-    // The payload content_version this resource was last filled from. A
-    // mismatch means the guest repacked the texture under a stable key and the
-    // resource is showing stale bytes -- see HleTexturePayload::content_version.
+    // The payload upload_version this resource was last filled from -- a hash
+    // of the decoded bytes, not the guest-memory sample content_version holds.
+    // A mismatch means the guest rewrote the texture under a stable key and the
+    // resource is showing stale bytes -- see HleTexturePayload::upload_version
+    // for why the two cannot be the same field.
     uint32_t uploadedVersion = 0;
     // m_fenceValue when this texture was last bound. The LRU stamp for
     // eviction, and the guard that stops a texture in use by the frame being

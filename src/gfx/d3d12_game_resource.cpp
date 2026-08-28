@@ -340,7 +340,7 @@ bool D3D12Renderer::UploadGameTexture(GameTexture& entry,
   std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
   m_commandList->ResourceBarrier(1, &barrier);
 
-  entry.uploadedVersion = src.content_version;
+  entry.uploadedVersion = src.upload_version;
   return true;
 }
 
@@ -353,11 +353,20 @@ bool D3D12Renderer::EnsureGameTexture(
     // The LRU stamp. Also what makes this entry un-evictable for the rest of
     // the frame being recorded, which is the point: it is about to be sampled.
     it->second.lastUsedFence = m_fenceValue;
-    // The guest repacked this texture under a stable key -- a Scaleform glyph
-    // atlas. Refill the existing resource rather than making a new one: the
-    // key does not change, so a new resource would leak one per repack, and
-    // the descriptor already published in the heap points here.
-    if (it->second.uploadedVersion != texture->content_version)
+    // The guest rewrote this texture under a stable key -- a Scaleform glyph
+    // atlas repack, or the terrain's virtual-texture index map being repaged.
+    // Refill the existing resource rather than making a new one: the key does
+    // not change, so a new resource would leak one per rewrite, and the
+    // descriptor already published in the heap points here.
+    //
+    // Compared on upload_version, a hash of the DECODED BYTES, NOT on
+    // content_version. content_version is a 2 KB sample of guest memory, which
+    // is right for deciding whether to re-decode and blind to a sparse write;
+    // gating the refill on it meant every re-decode the flat-retry backoff
+    // forced was computed, cached and then thrown away here. The terrain index
+    // map was decoded 137 times in one run and this resource still held the
+    // first decode's bytes. See HleTexturePayload::upload_version.
+    if (it->second.uploadedVersion != texture->upload_version)
       UploadGameTexture(it->second, *texture);
     return true;
   }
