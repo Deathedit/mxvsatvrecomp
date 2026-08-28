@@ -635,7 +635,11 @@ void SetPayloadUploadVersion(const mx::hle::HleTextureSource& source,
     // constant word being replaced by another. I reported the first version of
     // this as a fix on the strength of one such line and it was not one.
     auto& printed = s_printed[source.address];
-    if (printed >= 8 || s_printed.size() > 48) return;
+    // 40 rather than 8: the per-LEVEL coverage below is a TIME SERIES, and the
+    // question it answers -- does the guest's page-table coverage climb toward
+    // full or plateau -- cannot be read from a handful of samples. Changes
+    // arrive about once a second, so 40 is roughly the first minute in a level.
+    if (printed >= 40 || s_printed.size() > 48) return;
     ++printed;
   }
   // The CONTENT itself, on the base level, in the two readings that separate
@@ -667,14 +671,50 @@ void SetPayloadUploadVersion(const mx::hle::HleTextureSource& source,
       }
     }
   }
+  // PER-LEVEL COVERAGE, for a texture that carries a mip chain.
+  //
+  // The terrain's virtual-texture page table is a pyramid, and "resident" for
+  // it means "not the 0xF00A not-available sentinel". A single base-level share
+  // cannot say what is actually wrong with it: in ground-tiles-7.rdc mip 0 was
+  // 0.2% resident, mip 4 was 21.5% and mip 6 was 50%, and the visible defect --
+  // the aliased mesh on distant slopes -- came from the composite sampling a
+  // COARSE level at a texel that happened to be unwritten. One number per level
+  // is the shape of that question.
+  //
+  // Counted against the BASE level's dominant element, which for this texture
+  // is the sentinel. For any other texture it is whatever value dominates, and
+  // the row is then just "how uniform is each level" -- harmless and still
+  // readable.
+  std::string levels;
+  if (payload.level_count > 1 && scan.element_bytes) {
+    PhaseTimer t(g_tex.scanUs);
+    for (uint32_t l = 0; l < payload.level_count && l < 14; ++l) {
+      const size_t begin = payload.levels[l].offset;
+      const size_t end = (l + 1 < payload.level_count)
+                             ? payload.levels[l + 1].offset
+                             : payload.data.size();
+      if (begin >= end || end > payload.data.size()) continue;
+      const size_t width = scan.element_bytes;
+      size_t total = 0, resident = 0;
+      for (size_t off = begin; off + width <= end; off += width) {
+        uint64_t v = 0;
+        std::memcpy(&v, payload.data.data() + off, width);
+        ++total;
+        if (v != scan.dominant) ++resident;
+      }
+      if (!total) continue;
+      levels += fmt::format(" L{}:{}/{}", l, resident, total);
+    }
+  }
   REXLOG_INFO(
       "d3d9: TEXTURE CONTENT CHANGE addr 0x{:08X} {}x{} fmt {} -- decoded bytes "
       "differ from the previous decode (upload version 0x{:08X} -> 0x{:08X}); "
       "base level dominant 0x{:X} share {:.5f} of {} elems, {} distinct bytes |"
-      " probe{}",
+      " probe{} | resident per level{}",
       source.address, source.width, source.height, source.guest_format,
       previous, payload.upload_version, scan.dominant, scan.share(), scan.total,
-      scan.distinct_bytes, probe.empty() ? std::string(" (none)") : probe);
+      scan.distinct_bytes, probe.empty() ? std::string(" (none)") : probe,
+      levels.empty() ? std::string(" (no chain)") : levels);
 }
 
 // Fires AND population, printed on every line the probe emits, so the rate
@@ -2703,7 +2743,8 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
           "d3d9: SLOT MAP {} 0x{:08X} slot {} (guest sampler {}): object "
           "0x{:08X} resolved={} mostly_written={} addr_match={} (dest 0x{:08X})"
           " | fetch addr 0x{:08X} {}x{} fmt {} bytes {} swizzle {:#o} signs"
-          " {:#x} clamp {}/{} -> {}/{}",
+          " {:#x} clamp {}/{} -> {}/{} | levels {} mip_filter {} lod_bias"
+          " {:+.4f} (raw {}) | fetch dword4 0x{:08X} dword5 0x{:08X}",
           vertex ? "vs" : "ps", stage_handle, slot, guest_sampler,
           texture_state.object,
           texture_state.object &&
@@ -2715,7 +2756,9 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
           source.width, source.height, source.guest_format,
           source.source_bytes, source.swizzle, source.signs, source.clamp_x,
           source.clamp_y, source.clamp_x >= 2 ? "CLAMP" : "wrap",
-          source.clamp_y >= 2 ? "CLAMP" : "wrap");
+          source.clamp_y >= 2 ? "CLAMP" : "wrap", source.level_count,
+          source.mip_filter, double(source.lod_bias_raw) / 32.0,
+          source.lod_bias_raw, fetch[4], fetch[5]);
     }
   }
   // Permuted into host component order here, at the bind, because this is
