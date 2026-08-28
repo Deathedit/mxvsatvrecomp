@@ -295,6 +295,62 @@ class Emitter {
   // not the component-relative ALU form. The reference is
   // dxbc_shader_translator_fetch.cc:608-616, which moves
   // `LoadOperand(operands[0], 0b0001).SelectFromSwizzled(0)` into the LOD slot.
+  // getGradients (kGetTextureGradients): the screen-space derivatives of a
+  // 2-component coordinate.
+  //
+  // THIS WAS THE VIRTUAL-TEXTURE FEEDBACK PASS. It sat in the not-implemented
+  // bucket below with "skipped, destination left holding whatever it had", and
+  // the comment in the header even named its one caller as harmless -- "the one
+  // pixel shader that uses getGradients and compiles fine without it". It
+  // compiles, and it computes a constant.
+  //
+  // ps_hft_fback is the terrain's VT feedback shader. Its whole job is
+  //
+  //     getGradients r1, r0.wz, tf8
+  //     mul r1, r1.zxyw, c196.yxxy      scale by the feedback/screen ratio
+  //     mul r1, r1.xywz, r1.xywz        square
+  //     add r0.__zw, r1.yyyx, r1.wwwz   two squared lengths
+  //     sqrt / max / log                -> the LOD it is asking for
+  //
+  // With the op skipped, r1 kept the INTERPOLATOR it happened to hold, whose
+  // zw are the constant 2048, so the log fed on constants and every pixel
+  // requested LOD 8. The guest then populated only mips 6-8 of its page table
+  // and the composite, which samples the fine levels, read the not-available
+  // sentinel everywhere. That is the terrain banding.
+  //
+  // LAYOUT IS THE REFERENCE'S, NOT INFERRED. rex/graphics/format/ucode.h:634 --
+  // "Source is 2-component. XZ = ddx(source.xy), YW = ddy(source.xy)." Reading
+  // the guest's own use of the result suggested xy=ddx / zw=ddy instead, and
+  // that reading is self-consistent too, which is exactly why it is not
+  // evidence. See [[sdk-is-the-reference]].
+  //
+  // ddx/ddy rather than the _coarse forms: the same header notes the texture
+  // unit computes this per quad and that FXC lowers ddx/ddy to
+  // deriv_rtx/rty_coarse at SM5 anyway, so the plain form is both what the
+  // reference implies and what the compiler emits.
+  //
+  // Pixel stage only -- a derivative has no meaning in a vertex shader, and
+  // HLSL rejects it there. A vertex shader carrying one keeps the old skip and
+  // stays counted.
+  void EmitGetGradients(const uc::TextureFetchInstruction& tf) {
+    if (!pixel()) {
+      ++unhonoured_fetch_ops;
+      return;
+    }
+    // The fetch source swizzle is ABSOLUTE, two bits per component, the same
+    // encoding a tfetch coordinate uses -- not the component-relative ALU form.
+    const uint32_t swiz = tf.src_swizzle();
+    const std::string src = Temp(tf.src());
+    std::string uv;
+    uv += kComponent[swiz & 3];
+    uv += kComponent[(swiz >> 2) & 3];
+    Line("xe_v.xz = ddx(" + src + "." + uv + ");");
+    Line("xe_v.yw = ddy(" + src + "." + uv + ");");
+    // Through the same destination path every fetch uses, so the dest swizzle's
+    // keep/0/1 encodings behave identically here.
+    EmitFetchDestination(tf);
+  }
+
   void EmitSetTextureLod(const uc::TextureFetchInstruction& tf) {
     uses_reg_lod = true;
     Line("xe_lod = " + Temp(tf.src()) + "." +
@@ -1735,12 +1791,22 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
             uc::TextureFetchInstruction tf{};
             std::memcpy(&tf, dwords + at, sizeof(tf));
             em.EmitSetTextureLod(tf);
+          } else if (fetch_op ==
+                     uint32_t(uc::FetchOpcode::kGetTextureGradients)) {
+            // Emitted in the pixel stage; EmitGetGradients counts it as
+            // unhonoured in a vertex shader, where a derivative is meaningless.
+            uc::TextureFetchInstruction tf{};
+            std::memcpy(&tf, dwords + at, sizeof(tf));
+            em.EmitGetGradients(tf);
           } else {
-            // getCompTexLOD / getGradients / getWeights / getBCF and the two
-            // setGradients. Not implemented; skipped with the destination left
-            // holding whatever it had, which is what already happened to these
-            // in a pixel shader. Counted so the population stays visible rather
+            // getCompTexLOD / getWeights / getBCF and the two setGradients.
+            // Not implemented; skipped with the destination left holding
+            // whatever it had, which is what already happened to these in a
+            // pixel shader. Counted so the population stays visible rather
             // than being silently approximated.
+            //
+            // getGradients WAS in this list and is now honoured above -- it
+            // was not harmless, see EmitGetGradients.
             ++em.unhonoured_fetch_ops;
           }
         } else {

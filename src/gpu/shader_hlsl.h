@@ -350,10 +350,15 @@ struct HlslShader {
   // into the VERTEX fetch branch, where a pixel shader dropped it on
   // `!emit_vertex_fetch` and a vertex shader read its bits as a
   // VertexFetchInstruction and refused the whole shader on the garbage that
-  // landed in exp_adjust. Refusing them outright now would newly break the one
-  // pixel shader that uses getGradients and compiles fine without it, so the
-  // status quo is preserved for the ops we cannot honour and only the misread
-  // is fixed.
+  // landed in exp_adjust.
+  //
+  // getGradients IS NOW HONOURED and is no longer in this bucket. The sentence
+  // that used to stand here -- "the one pixel shader that uses getGradients and
+  // compiles fine without it" -- was true about compiling and wrong about
+  // everything else: that shader is ps_hft_fback, the terrain's virtual-texture
+  // feedback pass, and skipping the op left it computing a CONSTANT LOD from a
+  // stale interpolator. See Emitter::EmitGetGradients for the chain from there
+  // to the banded ground. "Compiles fine without it" is not a test.
   uint32_t unhonoured_fetch_ops = 0;
 
   // --- vertex fetch, only when the caller asked for it ----------------------
