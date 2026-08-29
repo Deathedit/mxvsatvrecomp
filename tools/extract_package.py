@@ -148,7 +148,17 @@ def extract_package(pkg_path, out_root, name_filter, types, jobs, want_xml,
         jobs_list.append((pkg_path, name, a['type'], a['offset'], a['size']))
 
     if not jobs_list:
-        return stem, ['  nothing matched'], 0, 0
+        # An EMPTY package and a filter that excluded everything are different
+        # facts and must not print the same line. Four of the 130 packages ship
+        # as 0 bytes with a database listing no assets -- HR_ATV_brakes,
+        # HR_ATV_frame, HR_MX_brakes, RiderSharedData -- and reporting those as
+        # "nothing matched" invites someone to go looking for the filter bug
+        # that is not there.
+        if not assets:
+            return stem, ['  EMPTY package: %d bytes, database lists no assets'
+                          % os.path.getsize(pkg_path)], 0, 0
+        return stem, ['  nothing matched (%d assets, all filtered out)'
+                      % len(assets)], 0, 0
 
     out_dir = os.path.join(out_root, stem)
     os.makedirs(out_dir, exist_ok=True)
