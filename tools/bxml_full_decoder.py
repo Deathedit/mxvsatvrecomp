@@ -145,8 +145,8 @@ def parse_strings(bin_d, strings_size):
 TYPE_STRIDES = {
     1: 0,    # string reference (no binary data)
     3: 4,    # i32
-    4: 4,    # i32
-    5: 4,    # i32
+    4: 4,    # i32 -- UNCLASSIFIED, see below
+    5: 4,    # f32
     6: 8,    # u64
     7: 16,   # vec4
     8: 64,   # m4x4
@@ -156,13 +156,53 @@ TYPE_STRIDES = {
     0xC: 16, # vec4
 }
 
+def fmt_f32(x):
+    """Shortest decimal that round-trips through a 32-bit float.
+
+    '%.6f' would print 40 as "40.000000" and silently truncate anything needing
+    more digits; repr() prints the f64 widening of an f32, which is wrong the
+    other way ("0.009999999776482582"). This walks precision up until the value
+    reads back bit-identical, so what is printed is exactly what is stored.
+
+    Integral values are handled first because %g reaches for the exponent far
+    too early -- it renders 40 as "4e+01", which round-trips perfectly and is
+    unreadable in a file whose whole point is being greppable.
+    """
+    if x == int(x) and abs(x) < 1e9:
+        return str(int(x))
+    for p in range(1, 10):
+        s = '%.*g' % (p, x)
+        if struct.unpack('<f', struct.pack('<f', float(s)))[0] == x:
+            return s
+    return repr(x)
+
+
 def read_typed_value(bin_data, offset, type_code):
     """Read a value from binary data at the given offset, interpreting by type code."""
     stride = TYPE_STRIDES.get(type_code, 4)
     if stride == 0:
         return None  # string reference, handled by caller
     raw = bin_data[offset:offset+stride]
-    if type_code in (3, 4, 5, 0xB):  # int or bool
+    # TYPE 5 IS f32, not i32.
+    #
+    # It was read as an integer and printed the bit pattern: CollisionMaterials
+    # came out with ImpulseThreshold="1109393408" where the value is 40.0. Every
+    # consumer of that XML would have read a physics threshold off by nine
+    # orders of magnitude.
+    #
+    # Determined by census over 482 BXML assets rather than by guessing which of
+    # 3/4/5 was the float, because all three were labelled i32 and only one is:
+    #
+    #     type 3   2757 values   1.5% float-plausible   100% int-plausible
+    #     type 5    632 values   100% float-plausible   4.3% int-plausible
+    #
+    # and type 5's values are unmistakable once read correctly -- 40, 0.01, 60,
+    # 250, 0.75. TYPE 4 NEVER OCCURS in those 482 files, so it is unclassified
+    # and left as i32: an untested guess about it would be the same mistake in a
+    # new place.
+    if type_code == 5:
+        return fmt_f32(struct.unpack('<f', raw[:4])[0])
+    if type_code in (3, 4, 0xB):  # int or bool
         val = struct.unpack('<i', raw[:4])[0]
         return str(val) if type_code != 0xB else ('true' if val else 'false')
     elif type_code in (6, 9):  # u64
