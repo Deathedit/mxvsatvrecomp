@@ -57,9 +57,9 @@ THE FORMAT WORD is only partly understood, and this file says which parts:
 LAYOUT, checked by PREDICTING each file's data size and comparing -- run it
 yourself with `--verify`. Over all 6896 extracted textures:
 
-    exact                     6868   99.59%
+    exact                     6871   99.64%
     trailing extra (<256 B)     19    0.28%
-    MISMATCH                     9    0.13%
+    MISMATCH                     6    0.09%
 
 predict_data_size carries the rules and how each was fitted. Level 0 always
 starts at the data offset, so --png depends on NONE of it; the model exists
@@ -70,9 +70,14 @@ past the last level -- GL_FR_Sky_DU_Chrom carries 201, and the amount varies
 per file -- which the model cannot predict and should not pretend to. Folding
 those into either column would misreport them.
 
-The 9 that MISMATCH are all NON-POWER-OF-TWO heights (512x257, 640x360,
-4095x511). What the extra bytes ARE is now settled; the rule that sizes them is
-not.
+The 6 that MISMATCH are TWO DISTINCT ASSETS -- Ve_EuroTeamTruck_FMF_Side
+(512x257) duplicated across five packages, and Vignetting (640x360). Counting
+files overstates the evidence; there are two shapes here, not six.
+
+A non-power-of-two height is NOT the trigger on its own: 1280x430 and 1280x720
+have one and predict exactly. Those are single-level, so they never exercise the
+mip chain. The trigger is a LINEAR texture with MIPS and a dimension that is not
+a power of two.
 
 FOUND EMPIRICALLY, by decoding candidate offsets and scoring each against level
 0 box-filtered to half size. On Ve_EuroTeamTruck_FMF_Side (512x257, 8_8_8_8):
@@ -98,21 +103,24 @@ The pitch is ALIGNED UP to 256, not floored at it -- 4095 texels of 8_8_8_8 is
 16380 bytes, which floors to itself and aligns to 16384. Those 4 bytes times 512
 rows were the whole discrepancy on the 4095x511 assets.
 
-THE LATER LEVELS ARE NOT SOLVED, and the shapes disagree, which is why no single
-formula ever fitted:
+4095x511 IS NOW EXACT under the same rule applied to every level -- no special
+case, no align64K. What had looked like a separate rule for later levels was the
+floor-vs-align bug above, in the rows.
 
-    file       L1 content   L1 span    matches
-    4095x511      2087940   2097152    align64K
-    640x360         49152     65536    align64K
-    512x257        131072    262144    NEITHER -- align64K predicts no padding
+THE TWO REMAINING SHAPES ARE STILL UNSOLVED, and they need opposite corrections,
+which is why nothing fits both:
 
-512x257's levels sit at 589824, 851968, 917504 (9, 13, 14 x 64 KB) and each one
-occupies exactly twice its content: 131072 in 262144, 32768 in 65536, 8192 in
-16384, all confirmed zero-filled. The other two do not do that.
+    512x257   predicted 770048, actual 950272.  Its levels sit at 589824,
+              851968, 917504 and each one after level 0 occupies exactly TWICE
+              what this model computes -- 131072 in 262144, 32768 in 65536,
+              8192 in 16384, all confirmed zero-filled.
+    640x360   predicted 212992, actual 229376, short by exactly 16384 -- two
+              more levels' worth. Its packed-mip tail evidently starts later
+              than the `dimension <= 16` rule says.
 
-So predict_data_size still under-counts these nine, deliberately. Two shapes
-agreeing and a third disagreeing is not enough to generalise from, and the whole
-point of this model is to be checkable rather than plausible.
+Both are under-counted deliberately. One asset wanting doubled rows and another
+wanting more levels are not the same correction, and two shapes are not enough
+to tell which of them is the special case.
 
 METHOD NOTE, because the first attempt failed and looked like it worked:
 Vignetting was the obvious test file and is useless for this -- it is a smooth
@@ -292,16 +300,17 @@ def predict_data_size(t):
             # Gated on the texture's OWN level count, not the per-face one: a
             # 1x1 cube has six levels and IS padded, while a 1x1 2D texture has
             # one and is not.
-            rows = hb if t['levels'] == 1 else max(32, hb)
-            # ALIGNED UP to min_row, not merely floored at it. The two differ
-            # only for a pitch that is not already a multiple: 4095 texels of
-            # 8_8_8_8 is 16380 bytes, which floors to itself and aligns to
-            # 16384. That 4-byte difference times 512 rows is the whole 18428
-            # this model was missing on the 4095x511 assets, and the padding
-            # boundary confirms it -- level 0's zeros run to exactly
-            # 16384 x 512 = 8388608.
-            pitch = wb * bpb
-            pitch = (pitch + min_row - 1) // min_row * min_row
+            # BOTH are ALIGNED UP, not floored. `max(32, hb)` and `max(256,
+            # pitch)` are the same mistake twice: they only differ from an
+            # alignment when the value is already above the minimum but not a
+            # multiple of it, which is exactly the non-power-of-two case this
+            # model kept missing. 511 rows floors to 511 and aligns to 512;
+            # 4095 texels of 8_8_8_8 is 16380 bytes, which floors to itself and
+            # aligns to 16384. Together they account for the entire 30720-byte
+            # shortfall on GL_TO_TNB_NW, and the padding boundaries confirm both
+            # -- level 0's zeros end at exactly 16384 x 512 = 8388608.
+            rows = hb if t['levels'] == 1 else (hb + 31) // 32 * 32
+            pitch = (wb * bpb + min_row - 1) // min_row * min_row
             total += pitch * rows
         n += 1
         if w <= 16 or h <= 16:
