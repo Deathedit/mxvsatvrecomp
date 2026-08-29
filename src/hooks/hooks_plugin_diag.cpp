@@ -24,6 +24,7 @@ using namespace mx::hooks;
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -1147,6 +1148,8 @@ extern "C" REX_FUNC(sub_82550320) {
   const uint32_t count = ctx.r6.u32;
   const uint32_t src = ctx.r5.u32;
   const uint32_t lr = uint32_t(ctx.lr);
+  // BEFORE the original, which is free to clobber r3.
+  const uint32_t device = ctx.r3.u32;
   orig_SetVertexShaderConstantF(ctx, base);
   // Register 85 is the first row of bone 0. One compare, and it rejects the
   // overwhelming majority of calls.
@@ -1169,6 +1172,74 @@ extern "C" REX_FUNC(sub_82550320) {
       const uint32_t bits = REX_LOAD_U32(at + r * 16u + c * 4u);
       std::memcpy(&row[r][c], &bits, 4);
     }
+
+  // THE BIKE'S HEIGHT OVER TIME, identified by being the thing the camera is
+  // following rather than by guessing at an object.
+  //
+  // The float is INTERMITTENT and random between runs, which kills the reading
+  // it had before: a wheel-radius or suspension-rest-length constant would
+  // float every time. Something is sampled once and sometimes gets a wrong
+  // value, so what matters is WHEN the bike's Y goes wrong -- wrong from the
+  // first frame is spawn placement, drifting into wrongness while riding is
+  // the per-frame ground query. A capture cannot show that; a trace can.
+  //
+  // xe_c[8] is the camera in world space and lives at vertex constant register
+  // 8, so it is readable from the device shadow at the moment of this write.
+  // The bone translation is the `.w` of each row -- confirmed live at
+  // (290.4, 558.3, 1332.5), a world-scale position. The camera sits ~7.8 units
+  // above the ground and ~17 from the wheel, so a skinned object within 40
+  // units is the bike or its rider and everything else in the level is not.
+  {
+    const uint32_t cam_at = device + 0x780u + 8u * 16u;
+    if (GuestRangeReadable(base, cam_at, 16u)) {
+      float cam[4];
+      for (uint32_t c = 0; c < 4; ++c) {
+        const uint32_t bits = REX_LOAD_U32(cam_at + c * 4u);
+        std::memcpy(&cam[c], &bits, 4);
+      }
+      const float tx = row[0][3], ty = row[1][3], tz = row[2][3];
+      const float dx = tx - cam[0], dy = ty - cam[1], dz = tz - cam[2];
+      const float d2 = dx * dx + dy * dy + dz * dz;
+      if (d2 < 40.0f * 40.0f && d2 > 0.0f) {
+        static std::atomic<uint64_t> s_near{0};
+        const uint64_t n = s_near.fetch_add(1, std::memory_order_relaxed) + 1;
+        // A DENSE BURST, because the sparse trace could measure the amplitude
+        // and not the shape.
+        //
+        // At ~1 s apart the bike's Y read 558.26..560.10 -- a 1.84-unit swing
+        // against a camera pinned to 0.23 -- which is within noise of the
+        // 1.9-unit float measured by unprojection. So the "float" is very
+        // likely an OSCILLATION caught at a phase, not a constant offset. But
+        // 1 s samples of a per-frame signal are aliased: amplitude survives,
+        // frequency and shape do not, and those are what name the cause.
+        //
+        //   alternating frame to frame  a double-buffer / ping-pong read of
+        //                               the ground height (the terrain height
+        //                               buffers ARE a ping-pong pair)
+        //   a smooth sustained wave     a suspension resonance in the guest's
+        //                               integration
+        //   irregular, tracking terrain it is dunes and this is normal riding,
+        //                               and the signal was never a defect
+        //
+        // So: every write for a bounded window, then back to the sparse trace.
+        // The window is capped rather than timed because it has to cover a
+        // stretch of RIDING, and when that starts is the user's business, not
+        // this probe's -- 4000 samples is ~30 s at two near objects a frame.
+        static std::atomic<uint64_t> s_burst{0};
+        bool dense = false;
+        if (d2 < 30.0f * 30.0f) {
+          const uint64_t b = s_burst.fetch_add(1, std::memory_order_relaxed) + 1;
+          dense = b <= 4000;
+        }
+        if (dense || n <= 8 || (n % 120) == 0)
+          REXLOG_INFO(
+              "native: BIKE TRACE #{} world ({:.3f}, {:.3f}, {:.3f}) | camera "
+              "({:.3f}, {:.3f}, {:.3f}) | camera is {:.3f} above it, {:.3f} away",
+              n, tx, ty, tz, cam[0], cam[1], cam[2], cam[1] - ty,
+              std::sqrt(d2));
+      }
+    }
+  }
 
   std::lock_guard<std::mutex> lk(s_mu);
   bool report = true;
