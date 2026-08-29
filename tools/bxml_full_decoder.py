@@ -36,6 +36,51 @@ from typing import Optional, List
 MARKER = 0x00010000
 NO_TEXT = 0xFFFFFFFF
 
+XML_ESCAPES = ((chr(38), '&amp;'), ('<', '&lt;'), ('>', '&gt;'),
+               ('"', '&quot;'))
+
+
+def xml_escape(v):
+    """Escape a value for an attribute or text node.
+
+    The game's own strings contain both -- FR_DunesFreeRide0 has a cause named
+    `Reset: Clear Out Effects and "Tuning In"`, whose quotes closed the
+    attribute early and made the file unparseable. That was never a decode
+    error: the string is exactly right, it was simply written out raw.
+    """
+    v = str(v)
+    for ch, ent in XML_ESCAPES:
+        v = v.replace(ch, ent)
+    return v
+
+
+def xml_name(name):
+    """(tag, original_or_None) -- a usable tag, and the real name if it differs.
+
+    Element names in this data are game identifiers and some are not legal XML
+    names: a particle emitter is called `Pig Pen`, and a tag cannot contain a
+    space. Renamed rather than emitted raw, with the original kept in a
+    bxml_name attribute, because the alternative is a file no parser will read.
+
+    Worth stating plainly: `<Pig Pen>` was a CORRECTLY decoded name. Before the
+    string table was fixed, the index shift happened to place a space-free
+    string there, so those files parsed while being wrong. XML-parseability is
+    not a proxy for a correct decode, in either direction.
+    """
+    # Substitute only characters that are invalid ANYWHERE, then fix a bad
+    # first character by PREFIXING. Doing both in one pass replaced the leading
+    # digit instead of prefixing it, so the timeline node named `30` became
+    # `_0` -- a different number, which is worse than an escaped one.
+    ok = []
+    for i, ch in enumerate(name):
+        ok.append(ch if (ch.isalnum() or ch in '_.-' or (ch == ':' and i))
+                  else '_')
+    tag = ''.join(ok) or '_'
+    if tag[0].isdigit() or tag[0] in '.-':
+        tag = '_' + tag
+    return tag, (name if tag != name else None)
+
+
 @dataclass
 class BxmlNode:
     name: str = ""
@@ -51,22 +96,30 @@ class BxmlNode:
         while stack:
             node, ind, is_close = stack.pop()
             pad = "   " * ind
-            attr_str = "".join(f' {k}="{v}"' for k, v in node.attrs)
+            tag, alias = xml_name(node.name)
+            attrs = list(node.attrs)
+            if alias:
+                # The real name could not be a tag, so it is preserved as an
+                # attribute rather than silently rewritten. Prepended so it
+                # reads first and cannot be mistaken for game data.
+                attrs.insert(0, ('bxml_name', alias))
+            attr_str = "".join(f' {k}="{xml_escape(v)}"' for k, v in attrs)
             if is_close:
-                out.append(f"{pad}</{node.name}>")
+                out.append(f"{pad}</{tag}>")
                 continue
             if node.children:
-                out.append(f"{pad}<{node.name}{attr_str}>")
+                out.append(f"{pad}<{tag}{attr_str}>")
                 if node.text and node.text.strip():
-                    out.append(f"{pad}   {node.text.strip()}")
+                    out.append(f"{pad}   {xml_escape(node.text.strip())}")
                 # Push children in reverse so they emit in original order, with closing tag at end.
                 stack.append((node, ind, True))  # closing tag at same indent
                 for child in reversed(node.children):
                     stack.append((child, ind + 1, False))
             elif node.text is not None and node.text.strip():
-                out.append(f"{pad}<{node.name}{attr_str}>{node.text.strip()}</{node.name}>")
+                out.append(f"{pad}<{tag}{attr_str}>"
+                           f"{xml_escape(node.text.strip())}</{tag}>")
             else:
-                out.append(f"{pad}<{node.name}{attr_str}/>")
+                out.append(f"{pad}<{tag}{attr_str}/>")
         return out
 
     def walk(self):
@@ -132,12 +185,26 @@ def read_bxml_bytes(raw):
     return bin_d, string_count, strings_size, streaming_flag, aux_count, node_count
 
 def parse_strings(bin_d, strings_size):
+    """The string table, INCLUDING empty strings.
+
+    An empty entry -- a lone NUL -- used to be skipped rather than appended, and
+    that single omission shifted every later index down by one. Attributes then
+    took their names and values from the wrong strings, which is how 223 of the
+    decoded timeline and activity files came out as things like
+    `<Rider_Audio/Vocal/Rider_Victory string="2">`: real strings from the real
+    table, every one in the wrong role.
+
+    It went unnoticed because the asset types decoded first happen to have no
+    empty entry. Materials, uicmpnt and perfdat matched their header count
+    exactly; timeline and activity came up one short every time. The empty
+    string IS an index and has to occupy one.
+    """
     strings = []
     i = 0
     while i < strings_size:
         end = bin_d.find(b'\x00', i)
-        if end < 0 or end >= strings_size: break
-        if end == i: i += 1; continue
+        if end < 0 or end >= strings_size:
+            break
         strings.append(bin_d[i:end].decode('ascii', errors='replace'))
         i = end + 1
     return strings
@@ -230,6 +297,23 @@ def decode_bxml_bytes(raw):
     """decode_bxml over a buffer. See read_bxml_bytes for why this exists."""
     bin_d, str_count, str_size, stream_flag, aux_count, node_count = read_bxml_bytes(raw)
     strings = parse_strings(bin_d, str_size)
+    # THE HEADER STATES HOW MANY STRINGS THERE ARE. Check it.
+    #
+    # Every attribute name and every string value is an INDEX into this table,
+    # so a table off by one does not fail -- it produces a complete, plausible
+    # document with each string one place from where it belongs. That is what
+    # 223 timeline and activity files were, and the only reason it was ever
+    # noticed is that the shifted strings happened to contain characters XML
+    # cannot put in a tag name. A shift that stayed inside the alphabet would
+    # have been silent for good.
+    #
+    # 6666 of 6666 BXML assets match after the empty-string fix, so a mismatch
+    # now means the table has been misread, and refusing is right: an index into
+    # a table of the wrong length cannot be trusted for anything.
+    if len(strings) != str_count:
+        raise ValueError('string table has %d entries, header says %d -- every '
+                         'index would be misattributed'
+                         % (len(strings), str_count))
 
     # Post-strings layout: [binary_data | attr_descriptors | node_records]
     pos = str_size
