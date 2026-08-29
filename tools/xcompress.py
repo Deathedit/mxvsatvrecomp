@@ -113,7 +113,22 @@ def split_chunks(data, offset, length):
                              % (i, comp, end - i))
         out.append((data[i:i + comp], unc))
         i += comp
-    raise ValueError('stream at %d ended without a terminator' % offset)
+    # A stream that runs out EXACTLY on a chunk boundary, with no terminator.
+    #
+    # CollisionMaterials.xenon.package is written this way: all 334 assets, every
+    # one landing with zero bytes left over. Nothing else about the framing
+    # differs -- heap_len is size-4, the tag is 0x00010000, the chunk header
+    # parses and its sizes add up -- so demanding a terminator rejected the whole
+    # package rather than one malformed asset.
+    #
+    # Accepted only on an EXACT landing, which is what keeps this from
+    # re-opening the trap this decoder was built to close. A desynchronised walk
+    # does not arrive here: it either overruns (caught above) or leaves a
+    # non-zero remainder, and both still raise. `i == end` is unambiguous.
+    if i == end:
+        return out
+    raise ValueError('stream at %d ended %d bytes past its length'
+                     % (offset, i - end))
 
 
 def decompress_heap(data, offset, size, window_bits=WINDOW_BITS):
