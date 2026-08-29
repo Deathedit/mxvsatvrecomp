@@ -83,15 +83,30 @@ FOUND EMPIRICALLY, by decoding candidate offsets and scoring each against level
     2      128x64     851968     65536    err 0.00
     3      64x32      917504     -        err 0.00
 
-Level 0 spans exactly what the model predicts, so the model is right about it.
-Each LATER level then occupies twice its content: level 1 holds 131072 bytes of
-image inside a 262144 span. **The remainder is ZERO -- 0 of 131072 bytes
-non-zero -- so it is padding, not a second slice and not data we are failing to
-account for.** Every level offset is also a multiple of 65536.
+The slack after each level's content is ZERO -- 0 of 131072 bytes non-zero
+after level 1 -- so it is padding, not a second slice and not data being missed.
 
-Three spans (589824, 262144, 65536) are not enough to fit a padding rule to
-without inventing one, so predict_data_size still under-counts these and says
-so, rather than carrying a formula that matches nine files by luck.
+LEVEL 0 IS align64K(pitch x height), and that holds for BOTH mismatching
+shapes. No row padding is involved; the 32-row rule this model uses elsewhere
+just happens to give the same answer for 512x257:
+
+    512x257     2048 x 257 =  526336 -> align64K ->   589824   observed
+    4095x511   16380 x 511 = 8370180 -> align64K ->  8388608   observed
+
+THE LATER LEVELS DIFFER BETWEEN THE TWO SHAPES, which is why one formula never
+fitted. On 4095x511 the same align64K rule continues:
+
+    L1  8188 x 255 = 2087940 -> align64K -> 2097152   observed 2097152
+    L2 (at 10485760 = 160 x 64K, err 2.6 against a median of 55)
+
+On 512x257 it does not. Level 1 holds 131072 bytes at pitch 1024 (err 0.00) in
+a 262144 span, where align64K(131072) is 131072 -- the rule predicts NO padding
+and half the span is zero. Its levels sit at 589824, 851968 and 917504: 9, 13
+and 14 times 64 KB.
+
+So predict_data_size still under-counts these nine, deliberately. Two shapes
+following two different rules is not enough to generalise from, and the whole
+point of this model is to be checkable rather than plausible.
 
 METHOD NOTE, because the first attempt failed and looked like it worked:
 Vignetting was the obvious test file and is useless for this -- it is a smooth
