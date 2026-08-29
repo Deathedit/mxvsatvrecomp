@@ -71,8 +71,33 @@ per file -- which the model cannot predict and should not pretend to. Folding
 those into either column would misreport them.
 
 The 9 that MISMATCH are all NON-POWER-OF-TWO heights (512x257, 640x360,
-4095x511) and are not explained. Named rather than hidden, because 0.13% of a
-model is exactly the size of gap that gets rounded to "it works".
+4095x511). What the extra bytes ARE is now settled; the rule that sizes them is
+not.
+
+FOUND EMPIRICALLY, by decoding candidate offsets and scoring each against level
+0 box-filtered to half size. On Ve_EuroTeamTruck_FMF_Side (512x257, 8_8_8_8):
+
+    level  dims       offset    span      match
+    0      512x257         0    589824    -        = pitch 2048 x align32(257)
+    1      256x128    589824    262144    err 0.00
+    2      128x64     851968     65536    err 0.00
+    3      64x32      917504     -        err 0.00
+
+Level 0 spans exactly what the model predicts, so the model is right about it.
+Each LATER level then occupies twice its content: level 1 holds 131072 bytes of
+image inside a 262144 span. **The remainder is ZERO -- 0 of 131072 bytes
+non-zero -- so it is padding, not a second slice and not data we are failing to
+account for.** Every level offset is also a multiple of 65536.
+
+Three spans (589824, 262144, 65536) are not enough to fit a padding rule to
+without inventing one, so predict_data_size still under-counts these and says
+so, rather than carrying a formula that matches nine files by luck.
+
+METHOD NOTE, because the first attempt failed and looked like it worked:
+Vignetting was the obvious test file and is useless for this -- it is a smooth
+gradient, so every candidate offset matches about as well as every other, and
+the scan's "best" hit was inside level 0 itself. A search like this needs an
+image with STRUCTURE; the FMF logo gives err 0.00 against a next-best of 11.24.
 
 WHAT --png DECODES, and how each was checked. DXT1, DXT4_5, DXN, 8_8_8_8, 8,
 16 and 16_16_16_16_EXPAND. Sampled across all ten (format, tiled) combinations
