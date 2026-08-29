@@ -93,6 +93,14 @@ std::string WouldFillValues(const uint32_t* consts, size_t n);
 // one after the file has changed underneath it.
 std::string FileValues(const uint32_t* consts, size_t n);
 
+// One constant as floats, for callers that need the VALUE rather than a line of
+// text. Returns false unless PM4 has published all four components, so an
+// unpublished register cannot be mistaken for a published zero -- the same
+// distinction FileValues draws with its `unpub:` marker, in a form arithmetic
+// can use. Parsing FileValues' string instead would silently swallow that
+// marker, which is how a probe ends up dividing by an imaginary zero.
+bool FileFloat4(uint32_t c, float* out4);
+
 // Substitutions APPLIED in the narrow material-gate window (pixel c84..c87).
 // Distinct from the dry-run zero-fill count: a zero here means the window never
 // fired, which is a different outcome from firing and changing nothing.

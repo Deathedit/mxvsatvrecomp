@@ -575,6 +575,17 @@ std::string FileValues(const uint32_t* consts, size_t n) {
   return out;
 }
 
+bool FileFloat4(uint32_t c, float* out4) {
+  if (c >= kAluConstants || !out4) return false;
+  std::lock_guard<std::mutex> lk(g_mu);
+  for (uint32_t i = 0; i < 4; ++i) {
+    const uint32_t d = c * 4 + i;
+    if ((g_have[d >> 5] & (1u << (d & 31))) == 0) return false;
+    std::memcpy(&out4[i], &g_file[d], sizeof(float));
+  }
+  return true;
+}
+
 std::string WouldFillValues(const uint32_t* consts, size_t n) {
   std::lock_guard<std::mutex> lk(g_mu);
   std::string out;

@@ -9,6 +9,7 @@
 #include "hooks/hook_common.h"
 #include "hooks/hooks_ui_probe.h"
 #include "hooks/hooks_d3d9.h"  // GuestDrawCalls
+#include "gpu/xenos_gpu_state.h"  // mx::gpu::alu -- the PM4 ALU constant file
 
 #include <rex/cvar.h>
 
@@ -1399,7 +1400,77 @@ void ScanObjectForPosition(uint8_t* base, uint32_t obj, float x, float y,
   if (!any) ++g_fieldMisses;
 }
 
-void NoteBikeSample(uint8_t* base, uint32_t src, uint32_t lr, float x, float y,
+// GROUND TRUTH FOR THE FLOATING BIKE -- the terrain clipmap constants.
+//
+// The bike is 1.9 +/- 0.3 units above the terrain, measured by unprojecting
+// pixels. What has been missing is the TERRAIN's own height at the bike's XZ,
+// from the same data the GPU draws: without it, "the bike is too high" and "the
+// ground is too low" cannot be told apart.
+//
+// The mapping is not guessed. It is stated in the terrain mesh vertex shader
+// (HFT_Helper, instruction 12), read out of the asset by tools/shader_code.py:
+//
+//     mad r0.xz, r1.yzzz, c204.xxxx, c201.xyyy
+//     max/min r0.xz, -+c201.zwww
+//
+//   world.x = grid.x * gMeshResolution.x + gVertexOffset.x
+//   world.z = grid.z * gMeshResolution.x + gVertexOffset.y   clamped +-c201.zw
+//
+// So grid = (world - gVertexOffset.xy) / gMeshResolution.x, exactly, with no
+// inference on my part. That is the half of the problem that was blocking:
+// [[floating-bike-is-two-units]] records considering this measurement and
+// dropping it for want of the clipmap origin and scale.
+//
+// THIS STAGE CAPTURES AND REPORTS, IT DOES NOT YET SAMPLE. The height lookup
+// itself depends on where the terrain height actually lives -- HFB_1tex's
+// vertex shader has 2 vfetch and NO height sampler, so the block meshes carry
+// height in their VERTEX DATA rather than in a texture, and which buffer that
+// is cannot be known until these constants say where the bike sits in the grid.
+// Writing the sampler before that is exactly the guess-first pattern that has
+// cost this investigation three retractions.
+//
+// READ FROM THE PM4 ALU CONSTANT FILE, NOT THE DEVICE SHADOW. The first cut
+// read the shadow the way the camera at c8 is read, and got 0.000 for all seven
+// registers. That was not a bug in the read: a probe placed before the
+// register-85 early-out counted the calls to D3DDevice_SetVertexShaderConstantF
+// covering c204 and saw ZERO across a whole run, while the same segments logged
+// 2256 bike samples -- so the terrain simply never sets these through that API,
+// and the shadow could not have held them.
+//
+// They arrive by Type-0 PM4 instead, which is exactly the case
+// `mx::gpu::alu` exists for. FileValues reports the LIVE file and marks
+// components the stream never published, which matters here: it is explicitly
+// the accessor that CAN report a zero, where WouldFillValues cannot.
+std::string TerrainConstReport() {
+  // Vertex bank: guest cN is index N. Two controls ride along on purpose --
+  // gWaterModifiers (c220) from the same terrain shader set, and c252..c255,
+  // which xenos_gpu_state documents as the screen-space scale/bias the D3D9
+  // load table carries. If those come back looking like (0.5 -0.5 0 0) the
+  // file is sane and a zero elsewhere is a real zero; if they are garbage,
+  // NOTHING here should be acted on.
+  static const uint32_t kRegs[] = {200, 201, 202, 203, 204, 214, 217, 218,
+                                   220, 252, 253};
+  return mx::gpu::alu::FileValues(kRegs, sizeof(kRegs) / sizeof(kRegs[0]));
+}
+
+// gMeshResolution.x and gVertexOffset.xy, or false when PM4 has not published
+// them. Separated from the report so the grid maths cannot quietly run on
+// zeros, and typed rather than parsed out of the report string -- that string
+// marks unpublished components with `unpub:`, and a parser that ignored the
+// marker would read an unwritten register as a published 0.
+bool TerrainGrid(float* mesh_res_x, float* off_x, float* off_z) {
+  float m[4], o[4];
+  if (!mx::gpu::alu::FileFloat4(204, m)) return false;
+  if (!mx::gpu::alu::FileFloat4(201, o)) return false;
+  if (m[0] == 0.0f) return false;
+  *mesh_res_x = m[0];
+  *off_x = o[0];
+  *off_z = o[1];
+  return true;
+}
+
+void NoteBikeSample(uint8_t* base, uint32_t device, uint32_t src,
+                    uint32_t lr, float x, float y,
                     float z, const float cam[4], float dist,
                     const uint32_t* nv) {
   const uint32_t tid = BikeThreadIndex();
@@ -1526,6 +1597,16 @@ void NoteBikeSample(uint8_t* base, uint32_t src, uint32_t lr, float x, float y,
       }
       if (g_fieldOverflow)
         census += fmt::format(" (+{} dropped, table full)", g_fieldOverflow);
+      // GROUND TRUTH, stage 1: the clipmap constants, from the PM4 file.
+      census += " || TERRAIN " + TerrainConstReport();
+      float mres = 0.f, ox = 0.f, oz = 0.f;
+      if (TerrainGrid(&mres, &ox, &oz))
+        census += fmt::format(
+            " || BIKE GRID ({:.3f}, {:.3f}) from world ({:.3f}, {:.3f})",
+            (x - ox) / mres, (z - oz) / mres, x, z);
+      else
+        census += " || BIKE GRID -- gMeshResolution unpublished, terrain has"
+                  " not drawn";
       if (thin) census += fmt::format(" (+{} series under 4 samples)", thin);
       if (g_bikeTrackOverflow)
         census += fmt::format(" (+{} samples dropped, table full)",
@@ -1595,6 +1676,41 @@ extern "C" REX_FUNC(sub_82550320) {
       ctx.r24.u32, ctx.r25.u32, ctx.r26.u32, ctx.r27.u32, ctx.r28.u32,
       ctx.r29.u32, ctx.r30.u32, ctx.r31.u32};
   orig_SetVertexShaderConstantF(ctx, base);
+  // DOES ANYTHING SET THE TERRAIN CONSTANTS THROUGH THIS API AT ALL?
+  //
+  // Reading c200..c218 out of the device shadow returned 0.000 for all seven
+  // registers while the camera at c8 reads correctly from the same shadow, so
+  // the shadow is fine and these are simply not in it. Two known mechanisms
+  // would do that -- shaders DMA their own ALU constants, and constants
+  // published only by Type-0 PM4 never reach the shadow -- and both mean the
+  // value has to be sourced somewhere else entirely.
+  //
+  // Before chasing either, establish whether this API carries them. A count of
+  // ZERO here says the terrain never sets them this way and the shadow was
+  // never going to work; a non-zero count with a device pointer different from
+  // the bike's says the value is real but on another device, which is a much
+  // easier fix (device state is per-device here).
+  //
+  // Placed BEFORE the register-85 early-out, which would otherwise reject every
+  // one of these calls unseen.
+  if (count && start <= 204u && 204u < start + count) {
+    static std::atomic<uint64_t> s_hits{0};
+    const uint64_t n = s_hits.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 4 || (n % 2048) == 0) {
+      const uint32_t at = src + (204u - start) * 16u;
+      float v[4] = {0, 0, 0, 0};
+      if (GuestRangeReadable(base, at, 16u))
+        for (uint32_t c = 0; c < 4; ++c) {
+          const uint32_t bits = REX_LOAD_U32(at + c * 4u);
+          std::memcpy(&v[c], &bits, 4);
+        }
+      REXLOG_INFO(
+          "native: TERRAIN CONST SET #{} c204 = ({:.3f} {:.3f} {:.3f} {:.3f}) "
+          "by lr=0x{:08X} device=0x{:08X} (start {} count {})",
+          n, v[0], v[1], v[2], v[3], lr, device, start, count);
+    }
+  }
+
   // Register 85 is the first row of bone 0. One compare, and it rejects the
   // overwhelming majority of calls.
   if (!count || start > 85u || 85u >= start + count) return;
@@ -1651,7 +1767,8 @@ extern "C" REX_FUNC(sub_82550320) {
       // integration, and irregular motion tracking the terrain is just riding
       // over dunes and was never a defect.
       if (d2 < 40.0f * 40.0f && d2 > 0.0f)
-        NoteBikeSample(base, src, lr, row[0][3], row[1][3], row[2][3], cam,
+        NoteBikeSample(base, device, src, lr, row[0][3], row[1][3], row[2][3],
+                       cam,
                        std::sqrt(d2), nv);
     }
   }
