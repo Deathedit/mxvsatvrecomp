@@ -2034,6 +2034,19 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     uint32_t srvIndex = 0;
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     bool usedThisFrame = false;
+    // EDRAM BAND at a row offset inside another surface. A band whose base sits
+    // ABOVE its owner's cannot simply share the owner's resource the way a
+    // base-aligned one can: its rows start partway down, while the guest gives
+    // it a 0-based viewport and its own colour target at origin. Offsetting the
+    // viewport would move colour too, off the end of that target.
+    //
+    // So the band keeps its own surface and we COPY the owner's rows into it,
+    // depth plane only, once per frame before its first draw. The light pass
+    // does not write depth (Z_WRITE off), so a copy is as good as sharing.
+    // Zero owner means "not a band", which is every other surface.
+    uint32_t bandDepthOwner = 0;
+    uint32_t bandDepthRow = 0;
+    bool bandDepthSynced = false;
     // Whether anything has EVER been drawn into this target. A resolve whose
     // source has never been drawn into is copying a surface that holds only its
     // creation clear — the snapshot is then blank, and a compositor quad paints
@@ -2100,9 +2113,15 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // fresh surface instead of a dangling pointer.
   std::unordered_map<uint32_t, uint32_t> m_gameDepthAliases;
   uint64_t m_depthAliasHits = 0;
-  // Bands at a NON-ZERO row offset into their owner, which would need the
-  // offset threaded through the viewport. Counted, not handled.
-  uint64_t m_depthAliasOffsetUnhandled = 0;
+  // Bands at a NON-ZERO row offset into their owner, which take a per-frame
+  // copy of the owner's rows instead of sharing its surface.
+  uint64_t m_depthBandDepthCopies = 0;
+  // A band that wanted its owner's rows and could not have them -- owner gone,
+  // never drawn into, or no longer tall enough. Counted apart from the copies
+  // because "band handled" and "band handled CORRECTLY" are different claims:
+  // a skipped copy leaves the band on its own creation clear, which is the
+  // exact failure this whole path exists to remove.
+  uint64_t m_depthBandCopySkipped = 0;
   GameRenderTarget* EnsureGameDepthTarget(uint32_t object, uint32_t width,
                                           uint32_t height, uint32_t edramBase);
   // Descriptor 0 stays the main-target depth created by CreateGameRenderTargets;

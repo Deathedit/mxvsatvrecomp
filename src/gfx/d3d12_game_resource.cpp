@@ -985,6 +985,7 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameDepthTarget(
   // The viewport comes from the COLOUR target, not this one, so handing back a
   // TALLER surface does not disturb the band's rasterisation: band 1 is 1280x640
   // at origin, which is rows 0-639 of the 720 -- exactly the region it aliases.
+  uint32_t bandOwner = 0, bandRow = 0;
   if (auto ait = m_gameDepthAliases.find(object);
       ait != m_gameDepthAliases.end()) {
     auto oit = m_gameDepthTargets.find(ait->second);
@@ -1012,23 +1013,16 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameDepthTarget(
       LogInfo(m);
       return &owner;
     }
-    // A band ABOVE the owner's base. Its rows live at a Y offset inside the
-    // same surface and the guest gives it a 0-based viewport, so aliasing it
-    // would need that offset threaded through the bind. NOT DONE -- counted,
-    // so the remaining gap is visible instead of silently rendering into the
-    // wrong rows. One EDRAM tile is 80x16 samples, hence the row arithmetic.
+    // A band ABOVE the owner's base. Its rows start partway down the owner, so
+    // it cannot share the resource the way a base-aligned band can -- see
+    // GameRenderTarget::bandDepthOwner. It keeps its own surface and takes a
+    // per-frame copy of the owner's rows instead. One EDRAM tile is 80x16
+    // samples, hence the row arithmetic.
     if (owner.edramBase < edramBase && owner.height > height) {
       const uint32_t rows = (edramBase - owner.edramBase) * 80u * 16u / width;
       if (rows + height <= owner.height) {
-        ++m_depthAliasOffsetUnhandled;
-        if (m_depthAliasOffsetUnhandled == 1) {
-          char m[192];
-          std::snprintf(m, sizeof(m),
-                        "depth EDRAM alias UNHANDLED: 0x%08X %ux%u base 0x%X "
-                        "is row %u of owner 0x%08X -- needs a viewport offset",
-                        object, width, height, edramBase, rows, ownerObject);
-          LogInfo(m);
-        }
+        bandOwner = ownerObject;
+        bandRow = rows;
       }
     }
   }
@@ -1070,8 +1064,19 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameDepthTarget(
   handle.ptr += SIZE_T(entry.rtvIndex) * m_gameDsvDescriptorSize;
   m_device->CreateDepthStencilView(entry.resource.Get(), &dsv, handle);
 
+  entry.bandDepthOwner = bandOwner;
+  entry.bandDepthRow = bandRow;
+
   auto [it, inserted] = m_gameDepthTargets.emplace(object, std::move(entry));
   if (!inserted) return nullptr;
+  if (bandOwner) {
+    char b[192];
+    std::snprintf(b, sizeof(b),
+                  "depth EDRAM band: 0x%08X %ux%u base 0x%X is row %u of owner "
+                  "0x%08X -- depth copied per frame",
+                  object, width, height, edramBase, bandRow, bandOwner);
+    LogInfo(b);
+  }
   char message[192];
   std::snprintf(message, sizeof(message),
                 "game depth target: object 0x%08X %ux%u cache %zu", object,

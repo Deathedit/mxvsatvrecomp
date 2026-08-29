@@ -78,8 +78,12 @@ void D3D12Renderer::RenderGameFrame() {
   m_translatedBlockLimit = m_translatedBlockNext + m_translatedBlocksPerFrame;
   for (auto& [object, target] : m_gameRenderTargets)
     target.usedThisFrame = false;
-  for (auto& [object, target] : m_gameDepthTargets)
+  for (auto& [object, target] : m_gameDepthTargets) {
     target.usedThisFrame = false;
+    // The owner's depth is rewritten every frame, so a band's copy is only
+    // good for the frame it was taken in.
+    target.bandDepthSynced = false;
+  }
 
   // Which 1x1 resolve of this frame we are looking at, for the rotation in
   // QueueLuminanceReadback.
@@ -1045,6 +1049,76 @@ void D3D12Renderer::RenderGameFrame() {
                         ? EnsureGameDepthTarget(d.depthObject, d.depthWidth,
                                                 d.depthHeight, d.depthBase)
                         : nullptr;
+      // EDRAM BAND DEPTH. A band sitting at a row offset inside another
+      // surface takes a copy of the owner's rows before its first draw of the
+      // frame -- see GameRenderTarget::bandDepthOwner for why it copies rather
+      // than sharing. Without this the band tests against its own creation
+      // clear, which for the menu's second light band meant a far plane and,
+      // through the depth-driven volume count, every light in those rows
+      // discarded. Depth plane only (subresource 0): the stencil plane belongs
+      // to the guest's own per-light clears.
+      if (depthTarget && depthTarget->bandDepthOwner &&
+          !depthTarget->bandDepthSynced) {
+        depthTarget->bandDepthSynced = true;
+        auto oit = m_gameDepthTargets.find(depthTarget->bandDepthOwner);
+        if (oit != m_gameDepthTargets.end() && oit->second.resource &&
+            oit->second.everDrawn &&
+            depthTarget->bandDepthRow + depthTarget->height <=
+                oit->second.height) {
+          GameRenderTarget& owner = oit->second;
+          D3D12_RESOURCE_BARRIER toCopy[2] = {};
+          for (auto& b : toCopy)
+            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+          toCopy[0].Transition.pResource = owner.resource.Get();
+          toCopy[0].Transition.StateBefore = owner.state;
+          toCopy[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+          toCopy[0].Transition.Subresource =
+              D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+          toCopy[1].Transition.pResource = depthTarget->resource.Get();
+          toCopy[1].Transition.StateBefore = depthTarget->state;
+          toCopy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+          toCopy[1].Transition.Subresource =
+              D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+          m_commandList->ResourceBarrier(2, toCopy);
+
+          D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+          dstLoc.pResource = depthTarget->resource.Get();
+          dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+          dstLoc.SubresourceIndex = 0;
+          D3D12_TEXTURE_COPY_LOCATION srcLoc = dstLoc;
+          srcLoc.pResource = owner.resource.Get();
+          D3D12_BOX box = {};
+          box.top = depthTarget->bandDepthRow;
+          box.bottom = depthTarget->bandDepthRow + depthTarget->height;
+          box.right = depthTarget->width;
+          box.back = 1;
+          m_commandList->CopyTextureRegion(&dstLoc, 0, 0, 0, &srcLoc, &box);
+
+          // Both back to DEPTH_WRITE: the band is about to be rendered into and
+          // the owner is still the scene's depth buffer.
+          D3D12_RESOURCE_BARRIER back[2] = {toCopy[0], toCopy[1]};
+          back[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+          back[0].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+          back[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+          back[1].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+          m_commandList->ResourceBarrier(2, back);
+          owner.state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+          depthTarget->state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+          // The band now holds real geometry, so NEITHER clear may wipe it back
+          // to the far plane. usedThisFrame is the one that matters and setting
+          // only needsInitialClear was not enough: the per-frame clear below is
+          // gated on usedThisFrame alone, so it fired straight after this copy
+          // and put the far plane back. Measured -- the band's depth still read
+          // 1.0 at a geometry pixel with 869 copies reported as done. The guest
+          // clear path sets both for the same reason; see its note.
+          depthTarget->needsInitialClear = false;
+          depthTarget->usedThisFrame = true;
+          depthTarget->everDrawn = true;
+          ++m_depthBandDepthCopies;
+        } else {
+          ++m_depthBandCopySkipped;
+        }
+      }
       if (depthTarget && depthTarget->state !=
                              D3D12_RESOURCE_STATE_DEPTH_WRITE) {
         D3D12_RESOURCE_BARRIER toDepth = {};
@@ -2200,11 +2274,13 @@ void D3D12Renderer::RenderGameFrame() {
     // discards every stencil light volume.
     std::snprintf(message, sizeof(message),
                   "depth EDRAM aliasing: %llu binds served from an aliased "
-                  "surface, %llu row-offset bands NOT handled, %zu distinct "
-                  "aliases",
+                  "surface, %zu distinct aliases; row-offset bands: %llu depth "
+                  "copies, %llu SKIPPED (a skip leaves the band on its creation "
+                  "clear)",
                   static_cast<unsigned long long>(m_depthAliasHits),
-                  static_cast<unsigned long long>(m_depthAliasOffsetUnhandled),
-                  m_gameDepthAliases.size());
+                  m_gameDepthAliases.size(),
+                  static_cast<unsigned long long>(m_depthBandDepthCopies),
+                  static_cast<unsigned long long>(m_depthBandCopySkipped));
     LogInfo(message);
 
     // PER-SLOT TEXINV BRANCH. Only slots that were used at all are printed, and
