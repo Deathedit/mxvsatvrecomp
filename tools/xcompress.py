@@ -148,6 +148,36 @@ def decompress_heap(data, offset, size, window_bits=WINDOW_BITS):
     return blocks
 
 
+def is_heap(data, offset, size):
+    """Whether this asset is LZX-heap-framed at all, or STORED verbatim.
+
+    Not every asset in a package is compressed. Across all 130 packages the
+    exceptions are `activity` assets, which are raw BXML ('BXML' + version
+    0x03EA), and `anim` assets, which begin FF FF FF F7 and carry legible bone
+    names a few bytes in ('FingersL', 'HawkRedTail_'). Running the heap decoder
+    over those produced "heap at 0 declares 1280137286" -- which is not a length
+    at all, it is 'FXML'/'BXML' read as a little-endian u32.
+
+    Decided POSITIVELY on the framing, not by catching the decoder's failure. A
+    try/except fallback would hand back raw bytes for a genuinely CORRUPT heap
+    too, and silently returning plausible bytes instead of raising is how a
+    decoder starts inventing assets. A real heap always declares size - 4; a
+    stored asset's first four bytes are its own magic and will not.
+
+    The remaining ambiguity is a stored asset whose first dword happens to equal
+    size - 4. That one is then parsed as a heap and fails on the stream tag, so
+    it raises rather than yielding garbage.
+    """
+    if offset + 12 > len(data) or offset + size > len(data) or size < 4:
+        return False
+    return struct.unpack_from('<I', data, offset)[0] == size - 4
+
+
 def decompress_asset(data, offset, size, window_bits=WINDOW_BITS):
-    """decompress_heap flattened, for callers that want one buffer."""
+    """decompress_heap flattened, for callers that want one buffer.
+
+    Stored assets come back verbatim -- see is_heap.
+    """
+    if not is_heap(data, offset, size):
+        return bytes(data[offset:offset + size])
     return b''.join(decompress_heap(data, offset, size, window_bits))
