@@ -1310,13 +1310,45 @@ class Emitter {
     // is (1, 0) and kUnsignedBiased is (2, -1).
     //
     // kSigned needs the texture's bits reinterpreted and so is a host-side
-    // decode, not this; kGamma is a curve and cannot ride a scale. Both are
-    // refused upstream rather than silently approximated by a mad.
+    // decode, not this -- it is applied by picking a SNORM host view, and
+    // arrives here as an identity scale.
+    //
+    // kGamma cannot ride a scale, so 3.0 is a SELECTOR rather than a scale: the
+    // decode below turns it back into an identity scale and applies the
+    // piecewise-linear curve instead. Encoded in the existing value rather than
+    // in a new cbuffer region because the modes are mutually exclusive per
+    // component, so one float already carries all four.
+    //
+    // THE BRANCH DOES NOT ACTUALLY SKIP THE CURVE, and this is measured, not
+    // assumed. `any(xe_gam)` reads a constant buffer, so it is uniform across
+    // the wave and should be a real branch -- but fxc flattens it and computes
+    // the curve unconditionally. `[branch]` does not change that: over the 81
+    // shaders in logs/hlsldump it altered the output of ZERO of them, so it is
+    // not written here rather than being written and believed.
+    //
+    // What that costs, compiled with fxc /O3 and counting only instructions
+    // outside any branch (what a draw with NO gamma bound still executes):
+    //
+    //     51 of 81 shaders   no change at all
+    //     aggregate          6194 -> 6977 slots, +12.6%
+    //     worst, ps_215F0020    41 ->  284, +243   (19 fetch sites, tiny base)
+    //
+    // So it is ~13 slots per fetch SITE, paid whether or not gamma is bound.
+    // Worth knowing before this is blamed for a frame time: the alternative is
+    // a shader permutation keyed on the sign modes, which the cache-by-handle
+    // design deliberately avoids.
+    //
     // Both stages. xe_texsign is declared for the vertex stage too (at the end
     // of its cbuffer, past xe_vf), so a sampling vertex shader gets the same
     // correction rather than silently reading a biased texture as unsigned.
-    Line("xe_v = xe_v * xe_texsign[" + s + "] + (1.0 - xe_texsign[" + s +
-         "]);");
+    Line("{");
+    Line("  float4 xe_sgn = xe_texsign[" + s + "];");
+    Line("  float4 xe_gam = saturate(xe_sgn - 2.0);");
+    Line("  float4 xe_scl = xe_sgn - xe_gam * 2.0;");
+    Line("  xe_v = xe_v * xe_scl + (1.0 - xe_scl);");
+    Line("  if (any(xe_gam))");
+    Line("    xe_v = lerp(xe_v, XePWLGammaToLinear(xe_v), xe_gam);");
+    Line("}");
     EmitFetchDestination(tf);
   }
 
@@ -1988,6 +2020,38 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
       "}\n"
       "float XeClampNegInf(float v) {\n"
       "  return asuint(v) == 0xFF800000u ? -3.402823466e+38 : v;\n"
+      "}\n";
+  // TextureSign::kGamma. Xenos gamma is a FOUR-PIECE PIECEWISE LINEAR curve,
+  // NOT sRGB, so a *_UNORM_SRGB host view is the wrong curve and not merely a
+  // cheaper one. Transcribed from the reference's PWLGammaToLinear -- the
+  // scalar form in xenos.cc:23 and the shader form in
+  // dxbc_shader_translator.cc:225, which agree.
+  //
+  // step() rather than a ternary chain because step(edge, x) is exactly
+  // `x >= edge` and yields a float4 mask directly, and because a NaN input
+  // compares false everywhere and so selects the lowest piece -- which is what
+  // the reference documents it relies on, the value being saturated to 0
+  // afterwards anyway.
+  //
+  // The pieces nest (top implies mid implies low), which is what lets the
+  // selection be a lerp chain instead of four compares.
+  //
+  // Emitted unconditionally, like XeFlushInf above and for the same reason: the
+  // sign mode is per-BINDING, so it is not known when the shader is translated,
+  // and gating on it is a way for the two to drift apart.
+  src +=
+      "float4 XePWLGammaToLinear(float4 g) {\n"
+      "  float4 low = step(64.0 / 255.0, g);\n"
+      "  float4 mid = step(96.0 / 255.0, g);\n"
+      "  float4 top = step(192.0 / 255.0, g);\n"
+      "  float4 scale = lerp(lerp(lerp(1.0 / 1024.0, 2.0 / 1024.0, low),\n"
+      "                           4.0 / 1024.0, mid), 8.0 / 1024.0, top);\n"
+      "  float4 offset = lerp(lerp(lerp(0.0, -64.0, low), -256.0, mid),\n"
+      "                       -1024.0, top);\n"
+      "  float4 v = saturate(g) * (255.0 * 1024.0);\n"
+      "  v = v * scale + offset;\n"
+      "  v += trunc(v * scale);\n"
+      "  return v * (1.0 / 1023.0);\n"
       "}\n";
   // Direct3D 9 "legacy" multiply, which is what every multiplying operation on
   // this hardware does -- mul, mad, the dot products, and their scalar forms.

@@ -3392,11 +3392,10 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
         // "unsigned", it means the fetch becomes v*0 + 1 -- every texture
         // sampling as solid white. There is no slot this may be skipped for.
         for (uint32_t s = 0; s < kTranslatedSamplerSlots; ++s) {
-          const uint8_t biased = d.pixelSamplerSigns[s];
-          const float sc[4] = {(biased & 1) ? 2.0f : 1.0f,
-                               (biased & 2) ? 2.0f : 1.0f,
-                               (biased & 4) ? 2.0f : 1.0f,
-                               (biased & 8) ? 2.0f : 1.0f};
+          const uint8_t signs = d.pixelSamplerSigns[s];
+          const float sc[4] = {
+              TextureSignScale(signs, 0), TextureSignScale(signs, 1),
+              TextureSignScale(signs, 2), TextureSignScale(signs, 3)};
           std::memcpy(
               static_cast<uint8_t*>(p) + bankBytes + texInvBytes + s * 16, sc,
               sizeof(sc));

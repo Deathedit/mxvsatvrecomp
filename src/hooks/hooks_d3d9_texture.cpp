@@ -2948,19 +2948,29 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // an sRGB curve we do not apply) and kSigned on k_4_4_4_4 (x40000, no signed
   // BGRA4 host view exists).
   {
+    // Stored as the RAW 2-bit-per-component modes, which is what
+    // TextureSignScale decodes and what FillVertexTextureSigns always expected.
+    // This used to be a 1-bit-per-component "is biased" mask, which the vertex
+    // stage then misread as modes -- see the note on TextureSignScale.
+    static_assert(uint32_t(xn::TextureSign::kUnsignedBiased) == 2u &&
+                      uint32_t(xn::TextureSign::kGamma) == 3u,
+                  "TextureSignScale spells these numerically");
     const uint8_t swizzled =
         mx::hle::SwizzleTextureSigns(source.signs, source.swizzle);
-    uint8_t biased = 0;
     for (uint32_t c = 0; c < 4; ++c) {
       const uint32_t mode = (swizzled >> (c * 2)) & 3u;
-      if (mode == uint32_t(xn::TextureSign::kUnsignedBiased))
-        biased |= uint8_t(1u << c);
-      else if (mode != uint32_t(xn::TextureSign::kUnsigned) &&
-               !IsFloatGuestFormat(source.guest_format) &&
-               !GuestFormatTakesSignedHostView(source.guest_format))
+      // Both of these are applied in the shader out of xe_texsign, so neither
+      // is unhandled: kUnsignedBiased as a scale, kGamma as the piecewise
+      // linear curve the hardware uses.
+      if (mode == uint32_t(xn::TextureSign::kUnsignedBiased) ||
+          mode == uint32_t(xn::TextureSign::kGamma))
+        continue;
+      if (mode != uint32_t(xn::TextureSign::kUnsigned) &&
+          !IsFloatGuestFormat(source.guest_format) &&
+          !GuestFormatTakesSignedHostView(source.guest_format))
         NoteUnhandledSign(source.guest_format, mode);
     }
-    out_signs[slot] = biased;
+    out_signs[slot] = swizzled;
   }
 
   // The same memory a resolve wrote into, reached through a different texture

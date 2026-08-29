@@ -34,6 +34,35 @@ namespace mx::hle { struct HleTexturePayload; }
 // two agree.
 inline constexpr uint32_t kMaxDrawPlanes = 4;
 
+// One component of xe_texsign, decoded from the packed TextureSign modes that
+// BindPixelTextures stores in {pixel,vertex}SamplerSigns.
+//
+// SHARED because it was not, and the two stages disagreed. The pixel path used
+// to write a 1-BIT-PER-COMPONENT "is biased" mask while FillVertexTextureSigns
+// read the same byte as 2 BITS PER COMPONENT -- so a vertex fetch of a biased
+// texture either missed the correction or applied it to the wrong component
+// (mask 0b0010 reads as mode 2 in component 0). Both now go through here.
+//
+// The value is what the shader multiplies by, with the offset implied as
+// 1-scale, EXCEPT for gamma which cannot ride a scale and uses 3.0 purely as a
+// selector -- see the decode in EmitShaderHlsl, which turns it back into an
+// identity scale and applies the piecewise-linear curve instead.
+inline float TextureSignScale(uint8_t signs, uint32_t component) {
+  // xenos::TextureSign: 0 unsigned, 1 signed, 2 unsigned-biased, 3 gamma.
+  // Spelled numerically because this header deliberately does not include the
+  // GPU enums; hooks_d3d9_texture.cpp static_asserts the two agree.
+  switch ((signs >> (component * 2)) & 3u) {
+    case 2u:
+      return 2.0f;  // v*2 - 1
+    case 3u:
+      return 3.0f;  // selector only: the shader applies PWLGammaToLinear
+    default:
+      // 1 (signed) included: that one is applied by picking a SNORM host view
+      // in DescribeHleTexture2D, so the shader must leave the sample alone.
+      return 1.0f;
+  }
+}
+
 class D3D12Renderer {
  public:
   D3D12Renderer() = default;

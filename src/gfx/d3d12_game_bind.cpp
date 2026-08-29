@@ -41,12 +41,14 @@ void D3D12Renderer::FillVertexTextureSigns(const GameDraw& d, uint8_t* cb,
   if (!cb || at + kTranslatedSamplerSlots * 16 > cbBytes) return;
   auto* sign = reinterpret_cast<float*>(cb + at);
   for (uint32_t s = 0; s < kTranslatedSamplerSlots; ++s) {
-    // Two bits per component, host order, exactly as the pixel path decodes it:
-    // 0 is plain unsigned (scale 1) and kUnsignedBiased is 2*c-1 (scale 2).
+    // Two bits per component, host order. This comment used to say "exactly as
+    // the pixel path decodes it" and that was false -- the pixel path wrote a
+    // 1-bit-per-component mask, so this loop had never once decoded a real
+    // sign mode. Both stages now share TextureSignScale.
     const uint8_t signs =
         s < d.vertexSamplerCount ? d.vertexSamplerSigns[s] : 0u;
     for (uint32_t c = 0; c < 4; ++c)
-      sign[s * 4 + c] = ((signs >> (c * 2)) & 3u) == 2u ? 2.0f : 1.0f;
+      sign[s * 4 + c] = TextureSignScale(signs, c);
   }
 }
 
