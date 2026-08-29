@@ -148,6 +148,53 @@ void SwapBlock(uint8_t* p, uint32_t bytes, xenos::Endian endian) {
   }
 }
 
+// Channel order the HOST format needs but the guest bytes do not already have.
+// Runs after SwapBlock, so it sees a correctly-endianed value.
+//
+// k_4_4_4_4 ONLY, and only because the guest and host disagree about which
+// nibble is red:
+//
+//     bits      0-3    4-7   8-11   12-15
+//     guest      R      G      B       A     (k_4_4_4_4 is R4G4B4A4)
+//     host       B      G      R       A     (DXGI B4G4R4A4)
+//
+// so a correct load swaps nibble 0 with nibble 2. This is exactly the
+// reference's XeR4G4B4A4ToB4G4R4A4 (xenia-edge shaders/pixel_formats.xesli:461,
+// reached from texture_load_r4g4b4a4_b4g4r4a4.cs.slang), transcribed rather
+// than re-derived.
+//
+// THE NIBBLE ORDER IS PINNED, not assumed. The sibling transform
+// XeR4G4B4A4ToA4R4G4B4 -- `((t & 0x0FFF) << 4) | ((t & 0xF000) >> 12)` -- only
+// maps source to destination self-consistently if these names read LSB->MSB,
+// i.e. R4G4B4A4 really does put R in the low nibble.
+//
+// WHY THIS WAS PREVIOUSLY DECLINED, and why that reasoning does not hold. The
+// note above k_4_4_4_4 argued the guest is ARGB4444 from two observations:
+//
+//   * "host word 0xF00A reads as (R=0, G=0, B=0xA, A=0xF)". That describes the
+//     host layout after a verbatim copy and is true either way -- it cannot
+//     distinguish the two hypotheses. Read correctly it is evidence FOR the
+//     swap: the guest's red nibble 0xA is arriving in blue.
+//   * "UI texture 6933 decodes to a clean greyscale mask, every value R==G==B".
+//     A greyscale texture CANNOT detect a red<->blue swap. That check was
+//     vacuous for the question it was asked, and it passes identically before
+//     and after this change.
+//
+// What made it visible is a texture that is not greyscale and whose channels
+// are read as numbers rather than looked at: the terrain page table
+// (0x10444000, 1024x1024, fetch swizzle 03012, so the shader's .z is guest
+// component 0). It was being handed guest BLUE where the lookup wanted guest
+// RED, which sends the atlas UV to the wrong page.
+void ConvertBlockChannels(uint8_t* p, uint32_t guest_format, uint32_t bytes) {
+  if (bytes != 2 ||
+      guest_format != uint32_t(xenos::TextureFormat::k_4_4_4_4))
+    return;
+  uint16_t t;
+  std::memcpy(&t, p, 2);
+  t = uint16_t((t & 0xF0F0u) | ((t & 0x000Fu) << 8) | ((t & 0x0F00u) >> 8));
+  std::memcpy(p, &t, 2);
+}
+
 std::atomic<uint64_t> g_mipDescribed{0};
 std::atomic<uint64_t> g_mipWithChain{0};
 std::atomic<uint64_t> g_mipLevelsPlanned{0};
@@ -585,7 +632,12 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
     case xenos::TextureFormat::k_16_16_16_16_FLOAT:
       out.host_format = HostTextureFormat::kRgba16Float;
       break;
-    // NO CHANNEL CONVERSION, and this is now measured rather than asserted.
+    // RED AND BLUE ARE SWAPPED IN THE LOAD -- see ConvertBlockChannels, which
+    // carries the nibble table and how the order was pinned. The paragraphs
+    // below are the argument for NOT swapping, kept because it stood for three
+    // days and should not be re-derived: both of its observations are
+    // compatible with the swap, and its decisive check used a greyscale
+    // texture, which cannot see a red<->blue swap at all.
     //
     // The reference appears to disagree: xenia-edge d3d12_texture_cache.h:303
     // pairs DXGI_FORMAT_B4G4R4A4_UNORM with kLoadShaderIndexRGBA4ToBGRA4 --
@@ -982,6 +1034,11 @@ bool DecodeHleTexture2D(const HleTextureSource& source,
             std::memcpy(out.probe_raw, guest + src, source.bytes_per_block);
           }
           SwapBlock(dst, source.bytes_per_block, endian);
+          // After the endian swap, so it operates on a correct 16-bit value,
+          // and before the probe below, so the probe reports the bytes the GPU
+          // is actually given rather than an intermediate.
+          ConvertBlockChannels(dst, source.guest_format,
+                               source.bytes_per_block);
           if (out.probe_bytes && l == 0 && slice == 0 &&
               x == (lv.width_blocks >> 1) && y == (lv.height_blocks >> 1))
             std::memcpy(out.probe_swapped, dst, source.bytes_per_block);
