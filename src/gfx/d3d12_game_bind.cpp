@@ -552,6 +552,14 @@ bool D3D12Renderer::BindTranslatedSamplers(const GameDraw& d,
                                   : uint16_t(0);
       if (packed & (1u << 12)) variant |= kSamplerClampU;
       if (packed & (1u << 13)) variant |= kSamplerClampV;
+      // Counted before the decision below, so the denominator is every
+      // snapshot slot that got here and not just the ones that went wrong.
+      ++m_snapSlotBinds;
+      if (packed & (1u << 15)) ++m_snapSlotWordFilled;
+      if (!(packed & (1u << 15)))
+        ++m_snapSlotPointNoWord;
+      else if (packed & (1u << 14))
+        ++m_snapSlotPointGuest;
       // Bit 15 says the word came from a fetch constant. Without it this slot
       // was bound by one of the partial-snapshot paths, which never write the
       // word -- so there is no filter to honour and it keeps the POINT it has

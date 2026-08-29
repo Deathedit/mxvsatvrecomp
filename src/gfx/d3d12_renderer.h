@@ -1038,6 +1038,23 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   std::map<std::array<uint8_t, kSamplerBlockSlots>, uint32_t> m_samplerBlocks;
   uint32_t m_samplerBlockNext = 0;
   uint64_t m_samplerBlockExhausted = 0;
+
+  // SNAPSHOT SLOT FILTERING, counted because the code path that decides it has
+  // a documented failure mode and no measurement of whether it fires.
+  //
+  // BindTranslatedSamplers takes POINT for a snapshot slot in two very
+  // different cases: the guest asked for it (bit 14), or the sampler word was
+  // never written at all (bit 15 clear), which is what the PARTIAL-snapshot
+  // binds used to do. The second is a silent defect -- the terrain tile atlas
+  // is sampled minified, and nearest-neighbour on a 2048x2048 atlas is the
+  // "hard corduroy aliasing across every dune" the comment there describes.
+  //
+  // Counted on EVERY snapshot slot bind so the denominator is structural
+  // ([[guard-census-api]]): `no-word 0` and `never asked` must not look alike.
+  uint64_t m_snapSlotBinds = 0;        // snapshot slots that reached the decision
+  uint64_t m_snapSlotWordFilled = 0;   // ... of which had bit 15 set
+  uint64_t m_snapSlotPointNoWord = 0;  // ... took POINT because the word was 0
+  uint64_t m_snapSlotPointGuest = 0;   // ... took POINT because the guest said so
   static D3D12_SAMPLER_DESC SamplerVariantDesc(uint32_t variant);
   static uint32_t SamplerVariantFor(const mx::hle::HleTexturePayload& tex);
   // The fallback transform: an identity matrix, used by any translated draw

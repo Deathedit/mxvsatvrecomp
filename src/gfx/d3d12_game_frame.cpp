@@ -2233,6 +2233,28 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_samplerBlockExhausted),
                   m_translatedBlockHighWater, m_translatedBlocksPerFrame);
     LogInfo(message);
+    // SNAPSHOT SLOT FILTERING. Its own line because "how many snapshot slots
+    // are silently POINT-sampled" is a question no existing counter answers,
+    // and the terrain tile atlas is the one it is asked about: it binds through
+    // the PARTIAL-snapshot path by design (an atlas is sparse, so it fails the
+    // coverage gate), and a partial bind that leaves the sampler word zero
+    // keeps the POINT filter that path has always had.
+    //
+    // no-word is the DEFECT column; guest-asked is correct behaviour. Printed
+    // even when both are zero, because "never fired" and "never measured" are
+    // the distinction this line exists to make.
+    std::snprintf(message, sizeof(message),
+                  "snapshot slot filtering: %llu binds, %llu with a sampler "
+                  "word (%.1f%%) | POINT taken: %llu NO-WORD (silent), %llu "
+                  "guest-asked",
+                  static_cast<unsigned long long>(m_snapSlotBinds),
+                  static_cast<unsigned long long>(m_snapSlotWordFilled),
+                  m_snapSlotBinds
+                      ? 100.0 * double(m_snapSlotWordFilled) / double(m_snapSlotBinds)
+                      : 0.0,
+                  static_cast<unsigned long long>(m_snapSlotPointNoWord),
+                  static_cast<unsigned long long>(m_snapSlotPointGuest));
+    LogInfo(message);
     // Separate line rather than a longer format: the snapshot numbers answer a
     // different question (which resolve result a draw sampled) from the routing
     // ones (where a draw landed), and fallbacks are the figure to watch.
