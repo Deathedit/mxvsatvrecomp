@@ -2279,6 +2279,27 @@ bool IsFloatGuestFormat(uint32_t guest_format) {
   }
 }
 
+// Formats whose HOST VIEW is already chosen by signedness, in
+// DescribeHleTexture2D: each is `any_component_signed ? *Snorm : *Unorm`
+// (d3d9_texture.cpp:663, :719, :723). For these, kSigned IS applied -- by
+// picking a SNORM view rather than by converting anything -- so counting them
+// as unhandled reports a defect that does not exist.
+//
+// Safe because swizzled-signed implies raw-signed: SwizzleTextureSigns only
+// routes existing guest components to host channels, or substitutes literal
+// 0/1 which it calls unsigned. So a host channel can only come out signed if
+// some guest component was, which is exactly what any_component_signed tests.
+bool GuestFormatTakesSignedHostView(uint32_t guest_format) {
+  switch (xn::TextureFormat(guest_format)) {
+    case xn::TextureFormat::k_16:
+    case xn::TextureFormat::k_16_16:
+    case xn::TextureFormat::k_16_16_16_16:
+      return true;
+    default:
+      return false;
+  }
+}
+
 void NoteSignedBind(const mx::hle::HleTextureSource& source) {
   if (!source.signs || IsFloatGuestFormat(source.guest_format)) return;
   static std::map<uint32_t, uint64_t> s_binds;
@@ -2911,7 +2932,21 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // measure-with-a-level-loaded is always wrong: with a LEVEL up the counter
   // reads `guest format 24 mode signed x20000`, and guest format 24 is k_16 --
   // the terrain heightmap. k_16 now picks an SNORM host view the way k_16_16
-  // already did, so it no longer arrives here.
+  // already did.
+  //
+  // "so it no longer arrives here" ALSO stood here, and was also wrong --
+  // corrected 2026-08-29 from the logs, which is the only thing that can
+  // settle it. Picking the SNORM view happens in DescribeHleTexture2D and this
+  // gate never learned about it, so fmt24 kept arriving and kept being counted:
+  // today's mx_1761 still reads `guest format 24 mode signed x160000`, the
+  // LARGEST row in the census, for a mode that is correctly applied. A counter
+  // that reports a fixed defect is worse than no counter -- it is the whole of
+  // [[counter-that-cannot-fire]] pointed the other way -- so the gate now
+  // excludes formats whose host view is chosen by signedness.
+  //
+  // What remains in that census after this is REAL: kGamma on DXT4_5 (x140000,
+  // an sRGB curve we do not apply) and kSigned on k_4_4_4_4 (x40000, no signed
+  // BGRA4 host view exists).
   {
     const uint8_t swizzled =
         mx::hle::SwizzleTextureSigns(source.signs, source.swizzle);
@@ -2921,7 +2956,8 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
       if (mode == uint32_t(xn::TextureSign::kUnsignedBiased))
         biased |= uint8_t(1u << c);
       else if (mode != uint32_t(xn::TextureSign::kUnsigned) &&
-               !IsFloatGuestFormat(source.guest_format))
+               !IsFloatGuestFormat(source.guest_format) &&
+               !GuestFormatTakesSignedHostView(source.guest_format))
         NoteUnhandledSign(source.guest_format, mode);
     }
     out_signs[slot] = biased;
