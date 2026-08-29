@@ -54,26 +54,31 @@ THE FORMAT WORD is only partly understood, and this file says which parts:
                would produce a plausible-looking column that is wrong, which is
                worse than a blank one.
 
-LAYOUT, checked by PREDICTING each file's data size and comparing: 246 of 264
-match exactly with "each level aligned to 32x32 BLOCKS, stopping once a
-dimension reaches 16 because the remaining levels share that level's padding as
-a packed tail" ([[packed-mip-tail]]). The 18 that miss are three named classes,
-not noise:
+LAYOUT, checked by PREDICTING each file's data size and comparing -- run it
+yourself with `--verify`. Over all 6896 extracted textures:
 
-  * UNTILED assets align the row pitch to 256 BYTES instead (1x64 -> 16384 =
-    256 x 64, 1x1 -> 256), which is why they over-predicted.
-  * FR_DU_ReflectionMap is a CUBE: levels 48 = 6 faces x 8, and its size is
-    exactly 6.0x the single-face prediction.
-  * GL_FR_Sky_DU_Chrom carries 201 bytes past the end of its last level.
+    exact                     6868   99.59%
+    trailing extra (<256 B)     19    0.28%
+    MISMATCH                     9    0.13%
 
-Level 0 always starts at the data offset, so --png does not depend on any of
-that; the size model is here because a reader that cannot predict its own
-input is a reader that has not been checked.
+predict_data_size carries the rules and how each was fitted. Level 0 always
+starts at the data offset, so --png depends on NONE of it; the model exists
+because a reader that cannot predict its own input has not been checked.
 
-WHAT --png DECODES, and how each was checked. DXT1, DXT4_5, DXN, 8_8_8_8, 8
-and 16. On FR_Dunes: 112 of 116 assets, and the four misses are all
-16_16_16_16_EXPAND -- an HDR format that would want tonemapping to look at --
-which are REFUSED with a reason rather than decoded by guesswork.
+The three outcomes are kept apart on purpose. "Trailing extra" is real bytes
+past the last level -- GL_FR_Sky_DU_Chrom carries 201, and the amount varies
+per file -- which the model cannot predict and should not pretend to. Folding
+those into either column would misreport them.
+
+The 9 that MISMATCH are all NON-POWER-OF-TWO heights (512x257, 640x360,
+4095x511) and are not explained. Named rather than hidden, because 0.13% of a
+model is exactly the size of gap that gets rounded to "it works".
+
+WHAT --png DECODES, and how each was checked. DXT1, DXT4_5, DXN, 8_8_8_8, 8,
+16 and 16_16_16_16_EXPAND. Sampled across all ten (format, tiled) combinations
+-- every format-29 asset plus a spread of the rest, 330 textures -- 330 decoded,
+0 exceptions. A format with no entry in BLOCKS is still REFUSED with a reason
+rather than decoded by guesswork.
 
   DXT4_5   Corona is white in every texel (one distinct R) with a radial alpha
            whose mean falls monotonically 98.5 -> 9.3 from centre to rim. A
@@ -87,14 +92,23 @@ which are REFUSED with a reason rather than decoded by guesswork.
            immediately.
   16       FR_DU_Disp is a coherent dune heightfield.
 
-Cube assets store 6 faces and count them in `levels` (FR_DU_ReflectionMap is
-128x128 with levels 48 = 6 x 8, and its payload is exactly 6.0x a single
-face). Only face 0 would be decoded; nothing here splits faces yet.
+  16_16_16_16_EXPAND is HALF-FLOAT despite the name. Alpha reads exactly 1.0
+           across all 16384 texels of FR_DU_ReflectionMap (0x3C00 is fp16 1.0
+           and nothing else), RGB spans 0..1.77, neighbouring texels vary
+           smoothly, and the decoded image is a dunes reflection cubemap -- sand,
+           horizon, sky. HDR above 1.0 is CLIPPED for the 8-bit PNG: fine to look
+           at, wrong to measure from.
+
+Cube assets store 6 faces and count them in `levels` -- see face_count, which
+derives the mip count from the DIMENSIONS because `levels % 6 == 0` misreads a
+32x32 texture as a cube. Only face 0 is decoded; nothing here splits faces.
 """
 
 import argparse
 import binascii
+import collections
 import glob
+import math
 import os
 import struct
 import sys
@@ -178,6 +192,68 @@ def read_header(path):
         'unknown14': g(0x14), 'table': table, 'data_offset': data_off,
         'data_size': len(buf) - data_off,
     }
+
+
+def face_count(t):
+    """6 for a cube, 1 otherwise.
+
+    A cube stores `levels` = 6 x its mip count, so the mip count has to come
+    from the DIMENSIONS to tell it apart from a 2D texture whose level count
+    merely divides by six. Testing `levels % 6 == 0` instead reads a 32x32
+    texture -- which has exactly 6 mips -- as six faces and overstates its size
+    threefold.
+    """
+    m = max(t['width'], t['height'])
+    mips = int(math.log2(m)) + 1 if m > 0 else 1
+    return 6 if t['levels'] == 6 * mips and t['width'] == t['height'] else 1
+
+
+def predict_data_size(t):
+    """What the payload SHOULD measure, from the geometry alone.
+
+    Nothing in the reader needs this -- level 0 sits at the data offset the
+    header states. It exists to be CHECKED against the real size, because a
+    layout model that is never tested is a guess, and the packed-mip-tail rule
+    below was wrong twice before it was right. `--verify` runs it over a whole
+    directory.
+
+    The rules, each fitted to the 6896 extracted textures rather than assumed:
+
+      tiled   each level padded to 32x32 BLOCKS.
+      linear  each row padded to 256 bytes, and rows padded to 32 -- EXCEPT for
+              a single-level texture, which is stored tight: a 1x1 8_8_8_8 is
+              256 bytes, not 8192.
+      DXN     linear rows pad to 512, not 256. BC5 is two BC4 planes and each
+              appears to take the minimum separately; every DXN linear texture
+              came out at exactly twice the 256 prediction.
+      tail    levels stop once a dimension reaches 16; the rest share that
+              level's padding ([[packed-mip-tail]]).
+      cube    all of the above per face, times six.
+    """
+    if t['format'] not in BLOCKS:
+        return None
+    bw, bh, bpb = BLOCKS[t['format']]
+    faces = face_count(t)
+    levels = max(1, t['levels'] // faces)
+    min_row = 512 if t['format'] == 49 else 256
+    w, h, total, n = t['width'], t['height'], 0, 0
+    while n < levels:
+        wb = (w + bw - 1) // bw
+        hb = (h + bh - 1) // bh
+        if t['tiled']:
+            total += ((wb + 31) & ~31) * ((hb + 31) & ~31) * bpb
+        else:
+            # Gated on the texture's OWN level count, not the per-face one: a
+            # 1x1 cube has six levels and IS padded, while a 1x1 2D texture has
+            # one and is not.
+            rows = hb if t['levels'] == 1 else max(32, hb)
+            total += max(min_row, wb * bpb) * rows
+        n += 1
+        if w <= 16 or h <= 16:
+            break
+        w = max(1, w // 2)
+        h = max(1, h // 2)
+    return total * faces
 
 
 def untile_level0(t):
@@ -426,6 +502,8 @@ def main():
                     help='decode level 0 of each match into this directory')
     ap.add_argument('--words', action='store_true',
                     help='census of the format word, to study its unknown bits')
+    ap.add_argument('--verify', action='store_true',
+                    help='check each payload against predict_data_size')
     args = ap.parse_args()
 
     paths = collect(args.target)
@@ -436,6 +514,8 @@ def main():
         os.makedirs(args.png, exist_ok=True)
 
     words = {}
+    verify = collections.Counter()
+    verify_bad = set()
     ok = failed = wrote = 0
     for p in paths:
         try:
@@ -447,6 +527,21 @@ def main():
         ok += 1
         words.setdefault(t['word'], [0, t['format_name'],
                                      os.path.basename(p)])[0] += 1
+        if args.verify:
+            want = predict_data_size(t)
+            got = t['data_size']
+            if want is None:
+                verify['no geometry'] += 1
+            elif got == want:
+                verify['exact'] += 1
+            elif 0 < got - want < 256:
+                verify['trailing extra (<256 B)'] += 1
+            else:
+                verify['MISMATCH'] += 1
+                verify_bad.add((t['width'], t['height'], t['levels'],
+                                t['format_name'],
+                                'tiled' if t['tiled'] else 'linear',
+                                got, want))
         if not (args.summary or args.words):
             print(describe(t))
         if args.png:
@@ -458,6 +553,20 @@ def main():
                 print('  -> %s  %dx%d' % (dst, w, h))
             except Exception as exc:  # noqa: BLE001
                 print('  -- no PNG (%s)' % exc)
+
+    if args.verify:
+        # Three outcomes, not two. "actual exceeds predicted by under 256 bytes"
+        # is trailing data past the last level -- real bytes the model cannot
+        # predict and should not pretend to -- and folding it into either
+        # `exact` or `MISMATCH` would misreport it.
+        print('%-24s %6s' % ('layout prediction', 'count'))
+        for k in ('exact', 'trailing extra (<256 B)', 'MISMATCH', 'no geometry'):
+            if verify[k]:
+                print('  %-22s %6d  (%.2f%%)'
+                      % (k, verify[k], 100.0 * verify[k] / max(1, ok)))
+        for row in sorted(verify_bad)[:12]:
+            print('    %5d x %-5d lv%-3d %-20s %-6s actual %9d predicted %9d'
+                  % row)
 
     if args.words:
         print('%-10s %5s  %-24s %s' % ('word', 'n', 'format (bits 0-5)',
