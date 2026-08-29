@@ -86,26 +86,32 @@ FOUND EMPIRICALLY, by decoding candidate offsets and scoring each against level
 The slack after each level's content is ZERO -- 0 of 131072 bytes non-zero
 after level 1 -- so it is padding, not a second slice and not data being missed.
 
-LEVEL 0 IS align64K(pitch x height), and that holds for BOTH mismatching
-shapes. No row padding is involved; the 32-row rule this model uses elsewhere
-just happens to give the same answer for 512x257:
+LEVEL 0 IS SOLVED: align256(pitch) x align32(rows), for all three shapes. Read
+straight off the padding boundaries, since the slack is zero-filled and a run of
+zeros therefore marks exactly where a level's content stops:
 
-    512x257     2048 x 257 =  526336 -> align64K ->   589824   observed
-    4095x511   16380 x 511 = 8370180 -> align64K ->  8388608   observed
+    640x360    content ends  115200, zeros to  122880  =  1280 x 96
+    512x257    content ends  526336, zeros to  589824  =  2048 x 288
+    4095x511   content ends 8372220, zeros to 8388608  = 16384 x 512
 
-THE LATER LEVELS DIFFER BETWEEN THE TWO SHAPES, which is why one formula never
-fitted. On 4095x511 the same align64K rule continues:
+The pitch is ALIGNED UP to 256, not floored at it -- 4095 texels of 8_8_8_8 is
+16380 bytes, which floors to itself and aligns to 16384. Those 4 bytes times 512
+rows were the whole discrepancy on the 4095x511 assets.
 
-    L1  8188 x 255 = 2087940 -> align64K -> 2097152   observed 2097152
-    L2 (at 10485760 = 160 x 64K, err 2.6 against a median of 55)
+THE LATER LEVELS ARE NOT SOLVED, and the shapes disagree, which is why no single
+formula ever fitted:
 
-On 512x257 it does not. Level 1 holds 131072 bytes at pitch 1024 (err 0.00) in
-a 262144 span, where align64K(131072) is 131072 -- the rule predicts NO padding
-and half the span is zero. Its levels sit at 589824, 851968 and 917504: 9, 13
-and 14 times 64 KB.
+    file       L1 content   L1 span    matches
+    4095x511      2087940   2097152    align64K
+    640x360         49152     65536    align64K
+    512x257        131072    262144    NEITHER -- align64K predicts no padding
+
+512x257's levels sit at 589824, 851968, 917504 (9, 13, 14 x 64 KB) and each one
+occupies exactly twice its content: 131072 in 262144, 32768 in 65536, 8192 in
+16384, all confirmed zero-filled. The other two do not do that.
 
 So predict_data_size still under-counts these nine, deliberately. Two shapes
-following two different rules is not enough to generalise from, and the whole
+agreeing and a third disagreeing is not enough to generalise from, and the whole
 point of this model is to be checkable rather than plausible.
 
 METHOD NOTE, because the first attempt failed and looked like it worked:
@@ -287,7 +293,16 @@ def predict_data_size(t):
             # 1x1 cube has six levels and IS padded, while a 1x1 2D texture has
             # one and is not.
             rows = hb if t['levels'] == 1 else max(32, hb)
-            total += max(min_row, wb * bpb) * rows
+            # ALIGNED UP to min_row, not merely floored at it. The two differ
+            # only for a pitch that is not already a multiple: 4095 texels of
+            # 8_8_8_8 is 16380 bytes, which floors to itself and aligns to
+            # 16384. That 4-byte difference times 512 rows is the whole 18428
+            # this model was missing on the 4095x511 assets, and the padding
+            # boundary confirms it -- level 0's zeros run to exactly
+            # 16384 x 512 = 8388608.
+            pitch = wb * bpb
+            pitch = (pitch + min_row - 1) // min_row * min_row
+            total += pitch * rows
         n += 1
         if w <= 16 or h <= 16:
             break
