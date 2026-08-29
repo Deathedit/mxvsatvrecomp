@@ -1966,9 +1966,57 @@ void NotePlumbedStencilImpl(const mx::hle::DrawCall& dc) {
   ++g_plumbedConfigs[{dc.depth_control, dc.stencil_ref_mask}];
 }
 
+// WHERE IS RB_STENCILREFMASK_BF (0x210E)? We have never read it.
+//
+// Under two-sided stencil the BACK face carries its own ref and read/write
+// masks, and the deferred light volumes are exactly that case -- their marking
+// pass increments through the BACK face's stencil FAIL op. We apply the FRONT
+// ref (0x210D) to both faces, so if the guest's back-face ref is not the same
+// value, our marks differ from the console's. That is the leading explanation
+// for the light pass rejecting a contribution it should keep; see
+// [[menu-frame-graph]].
+//
+// The offset is NOT derivable. This shadow is not a flat register file --
+// 0x2200 sits at 0x2934 and 0x210D at 0x2900, which are not the same mapping --
+// and [[half-pixel-offset-not-applied]] records PA_SU_VTX_CNTL being
+// "unlocatable by extrapolation" after exactly this kind of guess. 0x2904 is
+// the obvious candidate and guessing it is how that mistake gets made twice.
+//
+// So: DUMP A WINDOW and let the data name the offset. Restricted to two-sided
+// draws, which is the only case where a back-face register means anything and
+// is precisely the light volumes -- so the values printed belong to the draws
+// under investigation rather than to the whole frame. What to look for is an
+// offset whose value is refmask-SHAPED (top byte zero, 0x00rrwwss) and which
+// is not simply a copy of 0x2900's.
+constexpr uint32_t kBfWindowBase = 0x2900;
+constexpr uint32_t kBfWindowDwords = 8;
+std::mutex g_bfWindowMu;
+// offset -> value -> how many two-sided draws saw it.
+std::map<uint32_t, std::map<uint32_t, uint64_t>> g_bfWindow;
+uint64_t g_bfWindowDraws = 0;
+
+void NoteBackFaceWindow(uint32_t depth_control, uint32_t device,
+                        uint8_t* base) {
+  // Bit 7 is BACKFACE_ENABLE. With it clear the guest means the front state for
+  // both faces and there is no back-face register to find, so sampling those
+  // draws would bury the signal under the other 95% of the frame.
+  if (!device || !((depth_control >> 7) & 1u)) return;
+  uint32_t vals[kBfWindowDwords];
+  for (uint32_t i = 0; i < kBfWindowDwords; ++i) {
+    const uint32_t off = kBfWindowBase + i * 4;
+    if (!HostPageReadable(REX_RAW_ADDR(device + off))) return;
+    vals[i] = REX_LOAD_U32(device + off);
+  }
+  std::lock_guard<std::mutex> lk(g_bfWindowMu);
+  ++g_bfWindowDraws;
+  for (uint32_t i = 0; i < kBfWindowDwords; ++i)
+    ++g_bfWindow[kBfWindowBase + i * 4][vals[i]];
+}
+
 void NoteStencilCensus(uint32_t depth_control, uint32_t device, uint8_t* base) {
   constexpr uint32_t kRbModeControl = 0x2954;      // RB_MODECONTROL   0x2208
   constexpr uint32_t kRbStencilRefMask = 0x2900;   // RB_STENCILREFMASK 0x210D
+  NoteBackFaceWindow(depth_control, device, base);
   // 0xFFFFFFFF distinguishes "could not read" from any real register value;
   // edram_mode is 3 bits so no genuine reading can collide with it.
   uint32_t edram_mode = 0xFFFFFFFFu;
@@ -6807,6 +6855,34 @@ void ReportDrawCounts(uint8_t* base) {
                 g_plumbedSeen, g_plumbedUnreadable, g_plumbedEffective,
                 g_plumbedConfigs.size(), seen_gap, eff_gap,
                 cfgs.empty() ? " none" : cfgs);
+  }
+  // The back-face register window. See NoteBackFaceWindow for why this is a
+  // scan and not a read of one guessed offset.
+  {
+    std::lock_guard<std::mutex> lk(g_bfWindowMu);
+    if (g_bfWindowDraws) {
+      std::string w;
+      for (const auto& [off, vals] : g_bfWindow) {
+        w += fmt::format(" [+{:04X}", off);
+        // At most four values per offset: a register that takes many values is
+        // not the one being looked for, and printing them all would bury the
+        // one that does.
+        uint32_t shown = 0;
+        for (const auto& [v, n] : vals) {
+          if (shown++ == 4) {
+            w += fmt::format(" +{}more", vals.size() - 4);
+            break;
+          }
+          w += fmt::format(" {:08X}x{}", v, n);
+        }
+        w += "]";
+      }
+      REXLOG_INFO("d3d9: BACKFACE STENCIL WINDOW -- {} two-sided draws sampled "
+                  "(0x2900 is RB_STENCILREFMASK 0x210D; looking for 0x210E, "
+                  "which should be refmask-shaped 0x00rrwwss and NOT a copy of "
+                  "+2900):{}",
+                  g_bfWindowDraws, w.empty() ? " none" : w);
+    }
   }
   // The ALU constant file. `repaired 0` is only meaningful next to a non-zero
   // `constants seen` -- with zero seen, the PM4 feed is not reaching the file and

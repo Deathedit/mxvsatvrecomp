@@ -958,6 +958,81 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameDepthTarget(
     RetireResource(std::move(it->second.resource));
     m_gameDepthTargets.erase(it);
   }
+  // EDRAM ALIASING -- two guest objects at the SAME EDRAM BASE are the same
+  // memory and must be the same host surface.
+  //
+  // This is not a corner case, it is the deferred lighting. The menu's scene
+  // depth and its light-accumulation depth are different guest objects at
+  // different sizes but identical registers:
+  //
+  //   0x2123C208  1280x720  surface=0x14000500  base=0x000   G-buffer depth
+  //   0x2123CAF4  1280x640  surface=0x14000500  base=0x000   light band 1
+  //   0x2123CB24  1280x80   surface=0x14000500  base=0x280   light band 2
+  //
+  // 640 + 80 = 720: one EDRAM surface the guest views as two bands. Keyed by
+  // OBJECT we handed the light pass a fresh, empty depth buffer and then
+  // cleared it to 1.0 ourselves, so every light-volume fragment passed LEqual
+  // against the far plane. The volume count is entirely depth-driven --
+  // increment on back faces, decrement on front -- so both fired everywhere and
+  // cancelled exactly, leaving stencil at its cleared 128. The light quad tests
+  // Greater(128), so EVERY deferred light was discarded. Measured in menu2.rdc:
+  // stencil goes 0x80 -> 0x7F -> 0x80 across the two volume draws and the light
+  // at 8886 computes a real contribution that is then thrown away.
+  //
+  // [[edram-aliasing-unmodelled]] recorded this as "measurably harmless". It
+  // was not; it was the whole light pass.
+  //
+  // The viewport comes from the COLOUR target, not this one, so handing back a
+  // TALLER surface does not disturb the band's rasterisation: band 1 is 1280x640
+  // at origin, which is rows 0-639 of the 720 -- exactly the region it aliases.
+  if (auto ait = m_gameDepthAliases.find(object);
+      ait != m_gameDepthAliases.end()) {
+    auto oit = m_gameDepthTargets.find(ait->second);
+    // Revalidated rather than trusted: the owner can be retired or resized out
+    // from under an alias, and a stale pointer here would be a use-after-free
+    // rather than a wrong picture.
+    if (oit != m_gameDepthTargets.end() && oit->second.edramBase == edramBase &&
+        oit->second.width == width && oit->second.height >= height) {
+      ++m_depthAliasHits;
+      return &oit->second;
+    }
+    m_gameDepthAliases.erase(ait);
+  }
+  for (auto& [ownerObject, owner] : m_gameDepthTargets) {
+    if (ownerObject == object || owner.width != width) continue;
+    if (owner.edramBase == edramBase && owner.height >= height) {
+      m_gameDepthAliases[object] = ownerObject;
+      ++m_depthAliasHits;
+      char m[192];
+      std::snprintf(m, sizeof(m),
+                    "depth EDRAM alias: 0x%08X %ux%u base 0x%X -> owner "
+                    "0x%08X %ux%u",
+                    object, width, height, edramBase, ownerObject, owner.width,
+                    owner.height);
+      LogInfo(m);
+      return &owner;
+    }
+    // A band ABOVE the owner's base. Its rows live at a Y offset inside the
+    // same surface and the guest gives it a 0-based viewport, so aliasing it
+    // would need that offset threaded through the bind. NOT DONE -- counted,
+    // so the remaining gap is visible instead of silently rendering into the
+    // wrong rows. One EDRAM tile is 80x16 samples, hence the row arithmetic.
+    if (owner.edramBase < edramBase && owner.height > height) {
+      const uint32_t rows = (edramBase - owner.edramBase) * 80u * 16u / width;
+      if (rows + height <= owner.height) {
+        ++m_depthAliasOffsetUnhandled;
+        if (m_depthAliasOffsetUnhandled == 1) {
+          char m[192];
+          std::snprintf(m, sizeof(m),
+                        "depth EDRAM alias UNHANDLED: 0x%08X %ux%u base 0x%X "
+                        "is row %u of owner 0x%08X -- needs a viewport offset",
+                        object, width, height, edramBase, rows, ownerObject);
+          LogInfo(m);
+        }
+      }
+    }
+  }
+
   if (reuseSrvIndex == UINT32_MAX &&
       (m_gameDepthTargets.size() >= kMaxGameDepthTargets ||
        m_nextGameSrvDescriptor >= kMaxGameTextures)) {

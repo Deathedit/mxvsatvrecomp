@@ -2091,6 +2091,18 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // and an R32_FLOAT SRV for the depth resolve; a D32_FLOAT resource can do
   // only the first, which is why depth was unresolvable.
   std::unordered_map<uint32_t, GameRenderTarget> m_gameDepthTargets;
+  // Guest object -> the object whose surface it aliases, for depth targets that
+  // share an EDRAM base. See the block comment in EnsureGameDepthTarget: the
+  // menu's light pass views the SAME EDRAM as the G-buffer depth through a
+  // differently sized object, and keying by object alone handed it an empty
+  // buffer that broke every stencil light volume. Entries are revalidated on
+  // use rather than invalidated on retire, so an owner going away degrades to a
+  // fresh surface instead of a dangling pointer.
+  std::unordered_map<uint32_t, uint32_t> m_gameDepthAliases;
+  uint64_t m_depthAliasHits = 0;
+  // Bands at a NON-ZERO row offset into their owner, which would need the
+  // offset threaded through the viewport. Counted, not handled.
+  uint64_t m_depthAliasOffsetUnhandled = 0;
   GameRenderTarget* EnsureGameDepthTarget(uint32_t object, uint32_t width,
                                           uint32_t height, uint32_t edramBase);
   // Descriptor 0 stays the main-target depth created by CreateGameRenderTargets;

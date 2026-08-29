@@ -2193,6 +2193,20 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_msaaPartnerResolves));
     LogInfo(message);
 
+    // EDRAM depth aliasing. Its own line because it answers a question the
+    // routing counters cannot: whether two guest objects that ARE the same
+    // memory were given the same host surface. `hits 0` on a menu frame means
+    // the light pass is back to testing an empty depth buffer, which silently
+    // discards every stencil light volume.
+    std::snprintf(message, sizeof(message),
+                  "depth EDRAM aliasing: %llu binds served from an aliased "
+                  "surface, %llu row-offset bands NOT handled, %zu distinct "
+                  "aliases",
+                  static_cast<unsigned long long>(m_depthAliasHits),
+                  static_cast<unsigned long long>(m_depthAliasOffsetUnhandled),
+                  m_gameDepthAliases.size());
+    LogInfo(message);
+
     // PER-SLOT TEXINV BRANCH. Only slots that were used at all are printed, and
     // a slot with a non-zero "no-map" column is called out: that is the slot
     // sampling black, and for the terrain height tile it costs exactly 2.008
