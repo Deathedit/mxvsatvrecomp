@@ -1107,6 +1107,101 @@ extern "C" REX_FUNC(sub_8234CE20) {
   orig_AcquirePlayer(ctx, base);
 }
 
+//=============================================================================
+// D3DDevice_SetVertexShaderConstantF - sub_82550320
+//
+// MAKE THE CALLER NAME ITSELF, for the bike's world transform.
+//
+// The floating bike is 1.9 +/- 0.3 world units above the terrain, measured by
+// unprojecting the wheel's lowest pixel and the ground through the real
+// view-projection. The graphics path is exonerated: the terrain height reaching
+// the renderer is correct, the props are correctly seated on that same terrain,
+// and the bike's own transform reads out sane. What is left is a ~2-unit
+// constant in the bike's RESTING HEIGHT, which is guest logic.
+//
+// IDA could not reach it. There are no named terrain/height/suspension
+// functions in the IDB, the terrain manager's xrefs are all the virtual-texture
+// streaming code, and a constant search for the 3000.0 height range landed in
+// the save-game string pool. Hunting it by guessing at constants is what the
+// rest of that session did.
+//
+// So do what worked for the UI render list, where static hunting produced 40+
+// candidates and none of them right: make the caller name itself. The skinned
+// vehicle shader indexes its bone palette as cb0[bone + 85/86/87], so the root
+// bone lands in vertex constant registers 85..87, and whoever writes them is
+// the vehicle's render path. From there the vehicle object and its position
+// field are one structure walk away.
+//
+// NOT HOOKED BEFORE, DELIBERATELY, and that reasoning still stands for its own
+// purpose -- hooks_d3d9.cpp reads device+0x780 rather than hooking this setter,
+// because the device holds the live value whichever path wrote it, including a
+// state-block path that bypasses every hook. That is about READING STATE. This
+// wants the CALLER, which the device field cannot give at any price. If the
+// bike's transform turns out to arrive by the state-block path, this probe sees
+// nothing -- and a silent probe here means "not this path", not "no writes".
+//
+// Cheap on the hot path: one range compare before anything else happens.
+REX_IMPORT(__imp__sub_82550320, orig_SetVertexShaderConstantF, void());
+extern "C" REX_FUNC(sub_82550320) {
+  const uint32_t start = ctx.r4.u32;
+  const uint32_t count = ctx.r6.u32;
+  const uint32_t src = ctx.r5.u32;
+  const uint32_t lr = uint32_t(ctx.lr);
+  orig_SetVertexShaderConstantF(ctx, base);
+  // Register 85 is the first row of bone 0. One compare, and it rejects the
+  // overwhelming majority of calls.
+  if (!count || start > 85u || 85u >= start + count) return;
+
+  static std::mutex s_mu;
+  struct Site { uint32_t lr = 0; uint64_t calls = 0; float ty = 0; };
+  static Site s_sites[12];
+  static uint32_t s_siteCount = 0;
+  static uint64_t s_overflow = 0;
+
+  // The three rows of bone 0, read from the SOURCE buffer rather than the
+  // device file: the source is what this caller supplied, which is the thing
+  // being attributed. Guest floats are big-endian.
+  const uint32_t at = src + (85u - start) * 16u;
+  if (!GuestRangeReadable(base, at, 48u)) return;
+  float row[3][4];
+  for (uint32_t r = 0; r < 3; ++r)
+    for (uint32_t c = 0; c < 4; ++c) {
+      const uint32_t bits = REX_LOAD_U32(at + r * 16u + c * 4u);
+      std::memcpy(&row[r][c], &bits, 4);
+    }
+
+  std::lock_guard<std::mutex> lk(s_mu);
+  bool report = true;
+  uint32_t idx = 0;
+  for (; idx < s_siteCount; ++idx) {
+    if (s_sites[idx].lr != lr) continue;
+    // RE-REPORTED PERIODICALLY, not once. First-sighting only is what the
+    // first cut did, and every line it produced came from the menu at startup:
+    // translations near 97.8 while the bike in a level sits at world Y ~611.6.
+    // A caller that writes every frame needs sampling over the run, or the one
+    // value it prints is the least interesting one it ever wrote.
+    report = (++s_sites[idx].calls % 4096u) == 0;
+    break;
+  }
+  if (idx == s_siteCount) {
+    if (s_siteCount >= 12) { ++s_overflow; return; }
+    Site& e = s_sites[s_siteCount++];
+    e.lr = lr;
+    e.calls = 1;
+  }
+  if (!report) return;
+  // Printed in full the first time each caller appears. Which component is the
+  // translation is not assumed -- the shader reads these swizzled (.wzxy) -- so
+  // all twelve floats go out and the one near the bike's world Y names itself.
+  REXLOG_INFO(
+      "native: VS CONST c85..c87 by lr=0x{:08X} (start {} count {}) -- "
+      "[{:.3f} {:.3f} {:.3f} {:.3f}] [{:.3f} {:.3f} {:.3f} {:.3f}] "
+      "[{:.3f} {:.3f} {:.3f} {:.3f}] (call {})",
+      lr, start, count, row[0][0], row[0][1], row[0][2], row[0][3], row[1][0],
+      row[1][1], row[1][2], row[1][3], row[2][0], row[2][1], row[2][2],
+      row[2][3], s_sites[idx < s_siteCount ? idx : 0].calls);
+}
+
 REX_IMPORT(__imp__sub_824F8E20, orig_AssetDbLoadPackage, void());
 extern "C" REX_FUNC(sub_824F8E20) {
   // Both args are plain char*, captured before the call in case it clobbers.
