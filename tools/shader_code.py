@@ -49,8 +49,22 @@ from xenos_shader_disasm import decode_shader, disassemble  # noqa: E402
 ENTRY_MAGIC = b'\x10\x2a\x11'
 
 # How far past slot 0 the literal block can run before we give up. The largest
-# seen is well under this; it is a bound on wasted work, not a claim.
+# seen is well under this; it is a bound on wasted work, not a claim. Proven not
+# to be the limiting factor: raising it to 512 changed the corpus result by
+# exactly zero entry points.
 MAX_LITERAL_DWORDS = 128
+
+# AND HOW FAR BEFORE IT. Slot 0 does not always point at the literal block --
+# for hft_deform_copy it points one dword INTO the microcode, so the code starts
+# at slot0 - 4 and a forward-only search can never see it. That cost the
+# deform_copy pass, which matters: it is a terrain pass already on record as
+# never executing, and "we cannot even read its code" was an artefact of this
+# search, not a fact about the asset.
+#
+# Kept small. Searching far backwards would eventually wander into the previous
+# section and the first thing that decodes would win, which is how a locator
+# starts inventing shaders.
+MAX_BACK_DWORDS = 8
 
 
 def entry_headers(buf):
@@ -71,8 +85,10 @@ def find_microcode(buf, start, end):
     structurally wrong, so "it decoded" is the acceptance test -- no heuristic
     about what microcode looks like enters into it.
     """
-    for k in range(MAX_LITERAL_DWORDS):
+    for k in range(-MAX_BACK_DWORDS, MAX_LITERAL_DWORDS):
         off = start + k * 4
+        if off < 0:
+            continue
         if off >= end:
             break
         dwords = to_dwords(buf[off:end])
