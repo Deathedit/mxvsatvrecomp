@@ -2986,6 +2986,26 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // contradicts.
   if (addr_match) {
     out_objects[slot] = addr_match->dest_object;
+    // The sampler word, which this path did not write. It was the ONLY one of
+    // the four object-binding sites that set an object and returned without a
+    // word -- the other three each pair with a PackSnapshotSamplerWord or
+    // PartialSnapshotSamplerWord on the next line -- so every bind through here
+    // reached BindTranslatedSamplers with a zero word, and a zero word has bit
+    // 15 clear, which that function reads as "no filter to honour" and answers
+    // with the clamped POINT the snapshot path has always defaulted to.
+    //
+    // Found by counting rather than by reading: the census added alongside this
+    // reports 43,343 of 1,302,535 snapshot slot binds (3.3%) taking POINT with
+    // NO WORD, at a dead-steady 300 per report, which is the shape of a fixed
+    // set of slots and not of noise.
+    //
+    // PartialSnapshotSamplerWord, not PackSnapshotSamplerWord, for the same
+    // reason the other two snapshot binds use it: it carries the guest's FILTER
+    // and deliberately NOT its clamp. This is a resolve snapshot reached by
+    // address, which is the same kind of binding, and honouring the stated
+    // clamp on an atlas sampled past U=1 is what walks the ground back to black
+    // -- see the note above PartialSnapshotSamplerWord.
+    out_swizzles[slot] = PartialSnapshotSamplerWord(source);
     ++g_resolveAddr.matches;
     return true;
   }
