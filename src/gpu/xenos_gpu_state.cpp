@@ -1,6 +1,7 @@
 #include "gpu/xenos_gpu_state.h"
 
 #include <cstdio>
+#include <cmath>
 #include <cstring>
 #include <algorithm>
 #include <array>
@@ -69,6 +70,32 @@ constexpr uint32_t kFileDwords = kAluConstants * 4;
 
 std::mutex g_mu;
 uint32_t g_file[kFileDwords] = {};
+
+// The terrain clipmap block, captured at the moment the terrain's own Type-0
+// packet writes it. c200..c220 covers gOffsetAndScale through gWaterModifiers.
+constexpr uint32_t kTerrainFirst = 200;
+constexpr uint32_t kTerrainLast = 220;
+constexpr uint32_t kTerrainDwords = (kTerrainLast - kTerrainFirst + 1) * 4;
+uint32_t g_terrain[kTerrainDwords] = {};
+uint8_t g_terrainHave[kTerrainDwords] = {};
+uint64_t g_terrainSnaps = 0;
+
+// THE CLIPMAP LADDER. gMeshResolution read 32 in one run and 256 in the next,
+// with different origins: the terrain draws SEVERAL rings per frame, each with
+// its own resolution and origin, and a snapshot that keeps only the last packet
+// keeps the coarsest one. A height sampled at 256 units per cell says nothing
+// useful about a bike, so the ring matters and the ladder has to be visible
+// before anything can pick from it.
+struct TerrainRing {
+  float mesh_res = 0.f;
+  float origin_x = 0.f, origin_z = 0.f;
+  float extent_x = 0.f, extent_z = 0.f;
+  uint64_t packets = 0;
+};
+constexpr uint32_t kMaxRings = 12;
+TerrainRing g_rings[kMaxRings];
+uint32_t g_ringCount = 0;
+uint64_t g_ringOverflow = 0;
 // One bit per dword. Without it "never written" and "written as 0.0" are the
 // same value, and repairing a register nobody published would be inventing one.
 uint32_t g_have[kFileDwords / 32] = {};
@@ -175,6 +202,158 @@ void NoteType0Write(uint32_t reg_base, const uint32_t* data, uint32_t count) {
     g_have[d >> 5] |= 1u << (d & 31);
     ++g_written;
   }
+
+  // THE TERRAIN SNAPSHOT.
+  //
+  // The ALU file is GLOBAL: a read at an arbitrary moment returns whatever
+  // shader wrote last, which is not a theory -- c217, labelled g_HFMapSize,
+  // was measured reading [0.133 0.149 0.180 1], a colour with alpha 1.
+  // So the terrain's clipmap constants have to be captured while the TERRAIN's
+  // write is happening, not sampled later.
+  //
+  // Keyed on c204 (gMeshResolution). No other shader in the corpus declares
+  // that register, so a Type-0 packet covering it is the terrain's, and the
+  // whole c200..c220 block is copied out at that instant. That is draw-scoped
+  // by construction and needs no shader identification at all -- which is the
+  // point, because identifying the draw by hashing its microcode against the
+  // static assets does NOT currently work: runtime blobs carry trailing padding
+  // the static decoder excludes, and only 1 of 72 runtime dumps matched.
+  const uint32_t c204_reg = kAluRegBase + 204 * 4;
+  if (reg_base <= c204_reg && c204_reg < reg_base + count) {
+    for (uint32_t c = kTerrainFirst; c <= kTerrainLast; ++c) {
+      for (uint32_t i = 0; i < 4; ++i) {
+        const uint32_t d = c * 4 + i;
+        g_terrain[(c - kTerrainFirst) * 4 + i] = g_file[d];
+        // Published state is carried across too. A register the terrain packet
+        // did not cover keeps whatever the file had, and the caller must be
+        // able to tell that from a value the terrain actually set.
+        const bool pub = (g_have[d >> 5] & (1u << (d & 31))) != 0;
+        g_terrainHave[(c - kTerrainFirst) * 4 + i] = pub ? 1 : 0;
+      }
+    }
+    ++g_terrainSnaps;
+
+    // Record this packet's ring. Keyed on gMeshResolution, which is what
+    // distinguishes the rings; the origin travels with the viewer so it is
+    // stored as the latest value rather than as part of the key.
+    float mres, voff[4];
+    std::memcpy(&mres, &g_file[204 * 4], sizeof(mres));
+    for (uint32_t i = 0; i < 4; ++i)
+      std::memcpy(&voff[i], &g_file[201 * 4 + i], sizeof(float));
+    uint32_t r = 0;
+    for (; r < g_ringCount; ++r)
+      if (g_rings[r].mesh_res == mres) break;
+    if (r == g_ringCount && g_ringCount < kMaxRings) {
+      g_rings[g_ringCount++] = TerrainRing{};
+      g_rings[r].mesh_res = mres;
+    }
+    if (r < g_ringCount) {
+      g_rings[r].origin_x = voff[0];
+      g_rings[r].origin_z = voff[1];
+      g_rings[r].extent_x = voff[2];
+      g_rings[r].extent_z = voff[3];
+      ++g_rings[r].packets;
+    } else {
+      ++g_ringOverflow;
+    }
+  }
+}
+
+// A REAL ring, not a stray packet. The measured ladder is res 1,2,4,8,16,32,
+// 64,128,256 with 386-706 packets each in one run; alongside it were three
+// entries with 1, 3 and 8 packets and values like 3.66e-42 and -2.03 -- Type-0
+// packets that covered c204 without being the terrain's.
+//
+// Both tests are needed and neither is arbitrary. The count separates hundreds
+// from single digits, a two-orders-of-magnitude gap rather than a tuned
+// threshold. The value test is the stronger one: a clipmap resolution is a
+// positive power of two, so anything else is not a ring whatever its count.
+bool RealRing(const TerrainRing& e) {
+  if (!(e.mesh_res > 0.f) || e.packets < 16) return false;
+  const float r = e.mesh_res;
+  if (r != std::floor(r) || r > 4096.f) return false;
+  const uint32_t i = static_cast<uint32_t>(r);
+  return (i & (i - 1)) == 0;  // power of two
+}
+
+bool TerrainFinestRing(float bike_x, float bike_z, float* mesh_res,
+                       float* origin_x, float* origin_z) {
+  std::lock_guard<std::mutex> lk(g_mu);
+  // The FINEST ring whose extent covers the point. Extent is gVertexOffset.zw,
+  // the clamp the terrain vertex shader applies to world XZ, so "covers" is the
+  // shader's own test rather than a guess about ring size.
+  const TerrainRing* best = nullptr;
+  for (uint32_t r = 0; r < g_ringCount; ++r) {
+    const TerrainRing& e = g_rings[r];
+    if (!RealRing(e)) continue;
+    if (std::fabs(bike_x - e.origin_x) > e.extent_x) continue;
+    if (std::fabs(bike_z - e.origin_z) > e.extent_z) continue;
+    if (!best || e.mesh_res < best->mesh_res) best = &e;
+  }
+  if (!best) return false;
+  *mesh_res = best->mesh_res;
+  *origin_x = best->origin_x;
+  *origin_z = best->origin_z;
+  return true;
+}
+
+std::string TerrainRings() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  if (!g_ringCount) return std::string(" (no terrain packet seen)");
+  std::string out;
+  for (uint32_t r = 0; r < g_ringCount; ++r) {
+    const TerrainRing& e = g_rings[r];
+    if (!RealRing(e)) {
+      // Counted, not hidden: a rejected ring is evidence about the keying, and
+      // if the count ever climbs it means c204 is not terrain-exclusive after
+      // all and the whole snapshot is built on sand.
+      out += fmt::format(" [REJECTED res {:g} x{}]", e.mesh_res, e.packets);
+      continue;
+    }
+    out += fmt::format(" [res {:g} origin ({:g}, {:g}) extent ({:g}, {:g}) x{}]",
+                       e.mesh_res, e.origin_x, e.origin_z, e.extent_x,
+                       e.extent_z, e.packets);
+  }
+  if (g_ringOverflow) out += fmt::format(" (+{} rings dropped)", g_ringOverflow);
+  return out;
+}
+
+bool TerrainFloat4(uint32_t c, float* out4) {
+  if (c < kTerrainFirst || c > kTerrainLast || !out4) return false;
+  std::lock_guard<std::mutex> lk(g_mu);
+  if (!g_terrainSnaps) return false;
+  const uint32_t base = (c - kTerrainFirst) * 4;
+  for (uint32_t i = 0; i < 4; ++i) {
+    if (!g_terrainHave[base + i]) return false;
+    std::memcpy(&out4[i], &g_terrain[base + i], sizeof(float));
+  }
+  return true;
+}
+
+uint64_t TerrainSnapshots() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  return g_terrainSnaps;
+}
+
+std::string TerrainValues() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  if (!g_terrainSnaps) return std::string(" (no terrain packet seen)");
+  std::string out = fmt::format(" (from {} terrain packets)", g_terrainSnaps);
+  for (uint32_t c = kTerrainFirst; c <= kTerrainLast; ++c) {
+    const uint32_t b = (c - kTerrainFirst) * 4;
+    bool any = false;
+    for (uint32_t i = 0; i < 4; ++i) any = any || g_terrainHave[b + i];
+    if (!any) continue;
+    out += fmt::format(" c{}=[", c);
+    for (uint32_t i = 0; i < 4; ++i) {
+      float f;
+      std::memcpy(&f, &g_terrain[b + i], sizeof(f));
+      out += fmt::format("{}{}{:g}", i ? " " : "",
+                         g_terrainHave[b + i] ? "" : "unpub:", f);
+    }
+    out += "]";
+  }
+  return out;
 }
 
 uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,

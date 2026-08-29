@@ -1448,9 +1448,10 @@ std::string TerrainConstReport() {
   // load table carries. If those come back looking like (0.5 -0.5 0 0) the
   // file is sane and a zero elsewhere is a real zero; if they are garbage,
   // NOTHING here should be acted on.
-  static const uint32_t kRegs[] = {200, 201, 202, 203, 204, 214, 217, 218,
-                                   220, 252, 253};
-  return mx::gpu::alu::FileValues(kRegs, sizeof(kRegs) / sizeof(kRegs[0]));
+  // The DRAW-SCOPED snapshot, not the live file. The live file is global and
+  // returns whatever shader wrote last -- c217 read back as a colour, which is
+  // what made the census-time read untrustworthy in the first place.
+  return mx::gpu::alu::TerrainValues();
 }
 
 // gMeshResolution.x and gVertexOffset.xy, or false when PM4 has not published
@@ -1458,15 +1459,12 @@ std::string TerrainConstReport() {
 // zeros, and typed rather than parsed out of the report string -- that string
 // marks unpublished components with `unpub:`, and a parser that ignored the
 // marker would read an unwritten register as a published 0.
-bool TerrainGrid(float* mesh_res_x, float* off_x, float* off_z) {
-  float m[4], o[4];
-  if (!mx::gpu::alu::FileFloat4(204, m)) return false;
-  if (!mx::gpu::alu::FileFloat4(201, o)) return false;
-  if (m[0] == 0.0f) return false;
-  *mesh_res_x = m[0];
-  *off_x = o[0];
-  *off_z = o[1];
-  return true;
+// The FINEST ring covering the bike, not the last packet's. A ring is chosen
+// per position because the clipmap is a ladder and the coarsest ring is the one
+// that happens to be written last.
+bool TerrainGrid(float bx, float bz, float* mesh_res_x, float* off_x,
+                 float* off_z) {
+  return mx::gpu::alu::TerrainFinestRing(bx, bz, mesh_res_x, off_x, off_z);
 }
 
 void NoteBikeSample(uint8_t* base, uint32_t device, uint32_t src,
@@ -1599,14 +1597,16 @@ void NoteBikeSample(uint8_t* base, uint32_t device, uint32_t src,
         census += fmt::format(" (+{} dropped, table full)", g_fieldOverflow);
       // GROUND TRUTH, stage 1: the clipmap constants, from the PM4 file.
       census += " || TERRAIN " + TerrainConstReport();
+      census += " || RINGS" + mx::gpu::alu::TerrainRings();
       float mres = 0.f, ox = 0.f, oz = 0.f;
-      if (TerrainGrid(&mres, &ox, &oz))
+      if (TerrainGrid(x, z, &mres, &ox, &oz))
         census += fmt::format(
-            " || BIKE GRID ({:.3f}, {:.3f}) from world ({:.3f}, {:.3f})",
-            (x - ox) / mres, (z - oz) / mres, x, z);
+            " || BIKE in ring res {:g}: grid ({:.3f}, {:.3f}) from world "
+            "({:.3f}, {:.3f})",
+            mres, (x - ox) / mres, (z - oz) / mres, x, z);
       else
-        census += " || BIKE GRID -- gMeshResolution unpublished, terrain has"
-                  " not drawn";
+        census += " || BIKE GRID -- no ring covers the bike (or the terrain has"
+                  " not drawn)";
       if (thin) census += fmt::format(" (+{} series under 4 samples)", thin);
       if (g_bikeTrackOverflow)
         census += fmt::format(" (+{} samples dropped, table full)",

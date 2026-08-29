@@ -101,6 +101,31 @@ std::string FileValues(const uint32_t* consts, size_t n);
 // marker, which is how a probe ends up dividing by an imaginary zero.
 bool FileFloat4(uint32_t c, float* out4);
 
+// THE SAME, BUT DRAW-SCOPED TO THE TERRAIN. The ALU file is global, so
+// FileFloat4 returns whatever shader wrote a register last -- measured, not
+// feared: c217 (g_HFMapSize) read back as a colour. These read a snapshot of
+// c200..c220 taken at the instant a Type-0 packet covering c204
+// (gMeshResolution, declared by no other shader in the corpus) writes it.
+//
+// TerrainFloat4 returns false unless that register was published at snapshot
+// time; TerrainSnapshots is 0 until the terrain has drawn, which is a different
+// fact from a zero value and must not read the same.
+bool TerrainFloat4(uint32_t c, float* out4);
+uint64_t TerrainSnapshots();
+std::string TerrainValues();
+
+// The clipmap is a LADDER of rings, one gMeshResolution each, all drawn per
+// frame -- measured at 32 in one run and 256 in the next. A height read at 256
+// units per cell says nothing about a bike, so the ring must be chosen, not
+// taken as whichever packet happened to be last.
+//
+// TerrainFinestRing picks the finest ring whose extent covers the point, where
+// "extent" is gVertexOffset.zw -- the clamp the terrain vertex shader itself
+// applies to world XZ, so the coverage test is the shader's, not a guess.
+bool TerrainFinestRing(float bike_x, float bike_z, float* mesh_res,
+                       float* origin_x, float* origin_z);
+std::string TerrainRings();
+
 // Substitutions APPLIED in the narrow material-gate window (pixel c84..c87).
 // Distinct from the dry-run zero-fill count: a zero here means the window never
 // fired, which is a different outcome from firing and changing nothing.
