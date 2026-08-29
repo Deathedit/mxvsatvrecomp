@@ -660,9 +660,9 @@ extern "C" REX_FUNC(sub_82566B58) {
         // built on it is built on measured traffic and not on the first sample.
         REXLOG_INFO("{}: COHERENCY {} polls of COHER_STATUS_HOST -- VC(flush) "
                     "{}, TC(guest-wrote) {}, both {}, neither {} | writeback "
-                    "would-match {}/{} over {} claimed ranges |{}",
+                    "claimed {}/{} over {} claimed ranges (COUNTED ONLY, nothing suppressed) |{}",
                     tag, s_coherPolls, s_coherVc, s_coherTc, s_coherBoth,
-                    s_coherOther, mx::coherency::SuppressedWritebacks(),
+                    s_coherOther, mx::coherency::ClaimedWritebacks(),
                     mx::coherency::ConsideredWritebacks(),
                     mx::coherency::ClaimedRangeCount(),
                     ranges.empty() ? std::string(" (no ranges)") : ranges);

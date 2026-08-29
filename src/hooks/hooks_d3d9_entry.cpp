@@ -2001,7 +2001,7 @@ extern "C" REX_FUNC(sub_8255CE98) {
                 const uint32_t span = uint32_t(dest_desc.width) *
                                       uint32_t(dest_desc.height) *
                                       uint32_t(dest_desc.bytes_per_block);
-                mx::coherency::NoteSuppressedWriteback(
+                mx::coherency::NoteClaimedWriteback(
                     mx::coherency::GuestOwnsRange(dest_desc.address, span));
               }
               if (matched) {

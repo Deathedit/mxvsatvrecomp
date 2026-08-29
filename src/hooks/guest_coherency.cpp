@@ -65,12 +65,12 @@ bool GuestOwnsRange(uint32_t addr, uint32_t bytes) {
   return false;
 }
 
-void NoteSuppressedWriteback(bool suppressed) {
+void NoteClaimedWriteback(bool claimed) {
   g_considered.fetch_add(1, std::memory_order_relaxed);
-  if (suppressed) g_suppressed.fetch_add(1, std::memory_order_relaxed);
+  if (claimed) g_suppressed.fetch_add(1, std::memory_order_relaxed);
 }
 
-uint64_t SuppressedWritebacks() {
+uint64_t ClaimedWritebacks() {
   return g_suppressed.load(std::memory_order_relaxed);
 }
 
