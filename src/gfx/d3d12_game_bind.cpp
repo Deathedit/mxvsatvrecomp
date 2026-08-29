@@ -302,6 +302,32 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
     slots[i].useSwizzle = true;
   }
 
+  // PER-CHUNK CLIPMAP LEVEL, counted per DRAW rather than per shader.
+  //
+  // A terrain chunk's vertex slot 0 is a 129x129 R32_FLOAT height snapshot, and
+  // WHICH snapshot it is names the clipmap level. The census below cannot see
+  // this: it is deduped on the shader handle, and every chunk shares one vertex
+  // shader, so it reports the first chunk and is silent about the rest.
+  //
+  // Filtered on the resource being 129x129 rather than on a shader name or a
+  // draw index, so it cannot drift when either changes. `useSwizzle` is false
+  // exactly for the snapshot branch, which is the one that carries an object.
+  if (vertex && stageSamplerCount && slots[0].resource && !slots[0].useSwizzle &&
+      !stageSampledObjects.empty()) {
+    const D3D12_RESOURCE_DESC rd0 = slots[0].resource->GetDesc();
+    if (rd0.Width == 129 && rd0.Height == 129) {
+      ++m_clipmapDraws;
+      const uint32_t level = stageSampledObjects[0];
+      auto it = m_clipmapLevelDraws.find(level);
+      if (it != m_clipmapLevelDraws.end())
+        ++it->second;
+      else if (m_clipmapLevelDraws.size() < kClipmapCensusCap)
+        m_clipmapLevelDraws.emplace(level, 1);
+      else
+        ++m_clipmapCensusOverflow;
+    }
+  }
+
   // SLOT CENSUS. The menu's deferred lighting shader declares three textures
   // and its third sample returns (0,0,0,1) -- the exact pattern of a
   // single-channel read of zero, or of a null descriptor. Which one it is

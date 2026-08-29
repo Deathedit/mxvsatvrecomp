@@ -2233,6 +2233,33 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_samplerBlockExhausted),
                   m_translatedBlockHighWater, m_translatedBlocksPerFrame);
     LogInfo(message);
+    // PER-CHUNK CLIPMAP LEVEL. How many distinct 129x129 height snapshots the
+    // terrain chunks bound, and how the draws divide between them. One level
+    // for every chunk means the seams in the terrain normal buffer are NOT a
+    // LOD boundary and that theory dies; several means adjacent chunks really
+    // are on different levels and the seam has a cause.
+    //
+    // Draws-per-level is printed, not just the count, because "8 levels, 7 of
+    // them with one draw" and "8 levels evenly used" are different situations
+    // and only one of them is a clipmap working as intended.
+    {
+      std::string levels;
+      uint32_t shown = 0;
+      for (const auto& [object, draws] : m_clipmapLevelDraws) {
+        if (shown++ >= 12) break;
+        levels += fmt::format(" 0x{:08X}={}", object, draws);
+      }
+      std::snprintf(message, sizeof(message),
+                    "terrain clipmap levels: %llu chunk draws over %zu distinct "
+                    "levels%s |%s",
+                    static_cast<unsigned long long>(m_clipmapDraws),
+                    m_clipmapLevelDraws.size(),
+                    m_clipmapCensusOverflow
+                        ? " (census full, some levels unlisted)"
+                        : "",
+                    levels.empty() ? " (none)" : levels.c_str());
+      LogInfo(message);
+    }
     // SNAPSHOT SLOT FILTERING. Its own line because "how many snapshot slots
     // are silently POINT-sampled" is a question no existing counter answers,
     // and the terrain tile atlas is the one it is asked about: it binds through

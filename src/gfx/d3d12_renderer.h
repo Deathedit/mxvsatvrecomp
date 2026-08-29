@@ -1051,6 +1051,23 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   //
   // Counted on EVERY snapshot slot bind so the denominator is structural
   // ([[guard-census-api]]): `no-word 0` and `never asked` must not look alike.
+  // PER-CHUNK CLIPMAP LEVEL. Which 129x129 height snapshot each terrain chunk
+  // binds at vertex slot 0 -- that object IS the clipmap level, and adjacent
+  // chunks landing on different levels is the standing explanation for the
+  // seams in the terrain normal buffer.
+  //
+  // The SLOT CENSUS cannot answer this and never could: it fires ONCE PER
+  // SHADER HANDLE, and every terrain chunk runs the same vertex shader,
+  // differing only in the snapshot it binds. So it reports the first chunk and
+  // is silent about the other thirteen. Counted per DRAW here instead.
+  //
+  // Capped: the objects are per-frame allocations, so an uncapped map would
+  // grow without bound over a run.
+  static constexpr size_t kClipmapCensusCap = 64;
+  std::map<uint32_t, uint64_t> m_clipmapLevelDraws;
+  uint64_t m_clipmapDraws = 0;
+  uint64_t m_clipmapCensusOverflow = 0;
+
   uint64_t m_snapSlotBinds = 0;        // snapshot slots that reached the decision
   uint64_t m_snapSlotWordFilled = 0;   // ... of which had bit 15 set
   uint64_t m_snapSlotPointNoWord = 0;  // ... took POINT because the word was 0
