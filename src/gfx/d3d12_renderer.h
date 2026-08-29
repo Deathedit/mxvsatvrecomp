@@ -1756,6 +1756,39 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // the d.texture fallback: a version of this that looked only at
   // d.pixelTextures[s] read a structural zero and got a working fix reverted.
   uint64_t m_texinvSlotMismatch = 0;
+  // Per sampler slot, which branch the xe_texinv fill took:
+  //   [0] snapshot WITH a resource   [1] snapshot object with NO map entry
+  //   [2] payload texture
+  //
+  // Index [1] is the one that matters. That slot keeps a stale texinv and the
+  // descriptor behind it samples black -- and the terrain height-tile shader
+  // computes sample*4-2, so a black slot 3 writes every height 2.008 units low.
+  // That is the whole floating-bike defect, proven by a capture A/B.
+  //
+  // Per slot, not totalled: the signal is one slot FLIPPING between columns
+  // across runs while the other fifteen sit still, and a total cannot show it.
+  uint64_t m_texSlotPath[16][3] = {};
+  // The same, restricted to draws targeting a 129x129 surface -- the terrain
+  // height tile, and nothing else in the frame is that size. Per-slot totals
+  // over all draws cannot answer this: 37 NO-MAP out of 198k draws is noise,
+  // the same 37 out of ~40 height tiles is the whole defect.
+  uint64_t m_texSlotPathTile[16][3] = {};
+  // WHICH OBJECT slot 3 resolves to on a 129x129 height-tile draw, and whether
+  // the snapshot map had an entry for it. 800 of 16507 tile draws took the
+  // object path and their sample measured 0.0 -- naming the object is what
+  // turns "a snapshot is black" into something fixable, because the object
+  // address is greppable against the resolve and texture logs.
+  //
+  // Small and fixed: the expectation is ONE object, and seeing two would itself
+  // be the finding.
+  struct TileSlotObject {
+    uint32_t object = 0;
+    uint32_t width = 0, height = 0;
+    uint64_t withEntry = 0, withoutEntry = 0;
+  };
+  TileSlotObject m_tileSlot3[8] = {};
+  uint32_t m_tileSlot3Count = 0;
+  uint64_t m_tileSlot3Overflow = 0;
   // DIAG: WHITE-SKIPPED draws grouped by target extent.
   struct SkipTargetInfo {
     uint64_t count = 0;

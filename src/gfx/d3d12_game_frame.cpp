@@ -2192,6 +2192,80 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_containedSourceResolves),
                   static_cast<unsigned long long>(m_msaaPartnerResolves));
     LogInfo(message);
+
+    // PER-SLOT TEXINV BRANCH. Only slots that were used at all are printed, and
+    // a slot with a non-zero "no-map" column is called out: that is the slot
+    // sampling black, and for the terrain height tile it costs exactly 2.008
+    // units of world height.
+    {
+      std::string slots;
+      for (uint32_t s = 0; s < 16; ++s) {
+        const uint64_t snap = m_texSlotPath[s][0];
+        const uint64_t none = m_texSlotPath[s][1];
+        const uint64_t pay = m_texSlotPath[s][2];
+        if (!snap && !none && !pay) continue;
+        char one[160];
+        std::snprintf(one, sizeof(one), " [s%u snap %llu, NO-MAP %llu%s, payload %llu]",
+                      s, static_cast<unsigned long long>(snap),
+                      static_cast<unsigned long long>(none),
+                      none ? " <<<" : "",
+                      static_cast<unsigned long long>(pay));
+        slots += one;
+      }
+      const std::string line =
+          std::string("texinv slot paths, ALL draws:") +
+          (slots.empty() ? std::string(" none") : slots);
+      LogInfo(line.c_str());
+
+      // The 129x129 height tile alone. This is the population the floating
+      // bike lives in; any NO-MAP here is -2.008 world units of terrain.
+      std::string tile;
+      for (uint32_t s = 0; s < 16; ++s) {
+        const uint64_t sn = m_texSlotPathTile[s][0];
+        const uint64_t nm = m_texSlotPathTile[s][1];
+        const uint64_t pl = m_texSlotPathTile[s][2];
+        if (!sn && !nm && !pl) continue;
+        char one[160];
+        std::snprintf(one, sizeof(one),
+                      " [s%u snap %llu, NO-MAP %llu%s, payload %llu]", s,
+                      static_cast<unsigned long long>(sn),
+                      static_cast<unsigned long long>(nm),
+                      nm ? " <<< BLACK, -2.008 units" : "",
+                      static_cast<unsigned long long>(pl));
+        tile += one;
+      }
+      const std::string tline =
+          std::string("texinv slot paths, 129x129 HEIGHT TILE only:") +
+          (tile.empty() ? std::string(" no height tile drawn this run") : tile);
+      LogInfo(tline.c_str());
+
+      // The object behind slot 3 on those tile draws.
+      std::string objs;
+      for (uint32_t k = 0; k < m_tileSlot3Count; ++k) {
+        char one[192];
+        std::snprintf(one, sizeof(one),
+                      " [obj 0x%08X %ux%u: with-entry %llu, NO-ENTRY %llu]",
+                      m_tileSlot3[k].object, m_tileSlot3[k].width,
+                      m_tileSlot3[k].height,
+                      static_cast<unsigned long long>(m_tileSlot3[k].withEntry),
+                      static_cast<unsigned long long>(
+                          m_tileSlot3[k].withoutEntry));
+        objs += one;
+      }
+      if (m_tileSlot3Overflow) {
+        char one[64];
+        std::snprintf(one, sizeof(one), " (+%llu dropped, table full)",
+                      static_cast<unsigned long long>(m_tileSlot3Overflow));
+        objs += one;
+      }
+      const std::string oline =
+          std::string("height-tile slot 3 objects (these sample BLACK and cost"
+                      " -2.008 world units):") +
+          (objs.empty() ? std::string(" none -- slot 3 was always a payload")
+                        : objs);
+      LogInfo(oline.c_str());
+    }
+
     // The guest alpha test. STAND-IN is the figure to watch: those draws have
     // an enabled test and took a path with no shader to discard in, so they are
     // still painting the pixels the guest masks away.
@@ -3145,6 +3219,71 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
               h = tex->height;
               layers = tex->array_size;
               lodBias = tex->lod_bias;
+            }
+          }
+          // WHICH BRANCH EACH SLOT TOOK, per slot, for the life of the run.
+          //
+          // The floating-bike defect is here. A capture A/B proved the terrain
+          // height-tile shader computes sample(tex3) * 4 - 2, so a slot that
+          // samples BLACK subtracts exactly 2.008 from every height in the tile
+          // and the ground renders ~2 units low -- which is what "the bike
+          // floats" has been all along.
+          //
+          // The two captures differ in exactly one thing: xe_texinv[3].z, which
+          // is 1 in the good run and 0 in the bad one. Only the payload branch
+          // below sets .z, so .z == 0 means the slot took the SNAPSHOT branch.
+          // Same 2048x2048 texture (texinv.xy is 1/2048 in both), resolved two
+          // different ways -- object in one run, payload in the other, and they
+          // are mutually exclusive by construction.
+          //
+          // So this counts, per slot: snapshot-with-a-resource, snapshot whose
+          // object has NO entry in the map (w and h stay 0 and the slot keeps
+          // whatever texinv it had -- the case that samples black), and payload.
+          // A slot that flips between columns run to run is the defect; a slot
+          // that sits in one is fine. Per slot rather than totalled, because a
+          // total cannot show a flip in slot 3 against 15 stable slots.
+          {
+            const uint32_t kind = !object ? 2u : (w && h ? 0u : 1u);
+            const uint32_t si = s < kTranslatedSamplerSlots ? s : 0;
+            ++m_texSlotPath[si][kind];
+            // SPLIT OUT THE HEIGHT TILE. The first cut counted per slot across
+            // ALL draws and produced "slot 3: snap 3926, NO-MAP 37, payload
+            // 194649" -- which cannot say whether those 37 were the draws that
+            // matter. The terrain height tile is a 129x129 target and nothing
+            // else in the frame is, so that extent identifies it exactly.
+            //
+            // This is the denominator that makes the number mean something: 37
+            // NO-MAP out of 198k draws is noise, 37 out of ~40 height tiles is
+            // the entire defect.
+            if (d.targetWidth == 129 && d.targetHeight == 129) {
+              ++m_texSlotPathTile[si][kind];
+              // Name the object on the slot that matters. Recorded for BOTH
+              // object outcomes -- with a snapshot entry and without -- because
+              // the dominant case turned out to be "has a resource and it is
+              // black", not "no entry", and a probe that only logged the
+              // missing case would have reported nothing at all.
+              if (si == 3 && object) {
+                uint32_t k = 0;
+                for (; k < m_tileSlot3Count; ++k)
+                  if (m_tileSlot3[k].object == object) break;
+                if (k == m_tileSlot3Count && m_tileSlot3Count < 8) {
+                  m_tileSlot3[m_tileSlot3Count].object = object;
+                  m_tileSlot3[m_tileSlot3Count].width = w;
+                  m_tileSlot3[m_tileSlot3Count].height = h;
+                  ++m_tileSlot3Count;
+                }
+                if (k < m_tileSlot3Count) {
+                  if (w && h) {
+                    ++m_tileSlot3[k].withEntry;
+                    m_tileSlot3[k].width = w;
+                    m_tileSlot3[k].height = h;
+                  } else {
+                    ++m_tileSlot3[k].withoutEntry;
+                  }
+                } else {
+                  ++m_tileSlot3Overflow;
+                }
+              }
             }
           }
           if (!w || !h) continue;
