@@ -94,12 +94,41 @@ def read_bxml_bytes(raw):
     """
     if raw[:4] != b'BXML':
         raise ValueError(f'Not BXML: {raw[:4]}')
-    bin_d = zlib.decompressobj().decompress(raw[raw.find(b'\x78\x9C'):])
     string_count = struct.unpack('<I', raw[8:12])[0]
     strings_size = struct.unpack('<I', raw[12:16])[0]
     streaming_flag = struct.unpack('<I', raw[16:20])[0]
     aux_count = struct.unpack('<I', raw[20:24])[0]
     node_count = struct.unpack('<I', raw[24:28])[0]
+    need = strings_size + streaming_flag + aux_count * 12 + node_count * 32
+
+    # NOT EVERY BXML IS COMPRESSED. The word at +4 is version 0x03EA in the low
+    # half and a COMPRESSED FLAG in the high half:
+    #
+    #   0x000103EA   zlib, preceded by a u32 length at 0x20, stream at 0x24
+    #   0x000003EA   raw payload, starting at 0x20 with no length word
+    #
+    # This used to search for a 78 9C signature unconditionally. On an
+    # uncompressed file that finds a byte pair somewhere in the DATA and
+    # inflates garbage, which is why every `material` asset failed with
+    # "unpack requires a buffer of 4 bytes" -- 10 of them in MX_tire alone.
+    # The config .bxml files are all compressed, so nothing noticed for as long
+    # as only those were decoded.
+    #
+    # CONFIRMED, not inferred: MX_Rim.material is 2395 bytes, its header sums to
+    # a 2363-byte payload, and 2395 - 0x20 is exactly 2363.
+    compressed = (struct.unpack('<I', raw[4:8])[0] >> 16) & 0xFFFF
+    if compressed:
+        # The stream is at 0x24 by the layout above. Falling back to a search
+        # keeps any file whose header we have mis-read from becoming a hard
+        # failure, since that was the previous behaviour for all of them.
+        start = 0x24 if raw[0x24:0x26] == b'\x78\x9c' else raw.find(b'\x78\x9c')
+        bin_d = zlib.decompressobj().decompress(raw[start:])
+    else:
+        bin_d = raw[0x20:0x20 + need]
+
+    if len(bin_d) < need:
+        raise ValueError('BXML payload short: %d bytes, header needs %d'
+                         % (len(bin_d), need))
     return bin_d, string_count, strings_size, streaming_flag, aux_count, node_count
 
 def parse_strings(bin_d, strings_size):
