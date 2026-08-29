@@ -3495,104 +3495,6 @@ void ApplyShaderFetchPatchTable(uint32_t shader, uint32_t table_at,
 // The fetch patches are gathered from BOTH shader objects because both binding
 // calls write the same device constants block. They are keyed by the PIXEL
 // shader handle because that is the identity the draw's texture resolver owns.
-// Print a shader's constant-load table verbatim, so a register that reaches the
-// shader with a suspicious value can be checked against what the table actually
-// claims to write. Mirrors ApplyShaderLoadTable's walk exactly rather than
-// sharing it, so removing this again cannot disturb the working path.
-//
-// Recovered by hash from 1078e5f, where it was deleted as dead code once the
-// c100 NaN question closed. It is the tool the red-screen question asks for.
-void DumpShaderLoadTable(uint32_t shader, uint32_t table_at, uint32_t data_at,
-                         uint8_t* base, const char* tag) {
-  if (!shader) return;
-  const uint32_t table = shader + table_at;
-  if (!HostPageReadable(REX_RAW_ADDR(table + 0x14)) ||
-      !HostPageReadable(REX_RAW_ADDR(shader + data_at))) {
-    REXLOG_INFO("d3d9:   {} table 0x{:08X}: unreadable", tag, shader);
-    return;
-  }
-  const uint32_t rel = REX_LOAD_U32(table + 0x14);
-  if (!rel || rel >= 0x10000) {
-    REXLOG_INFO("d3d9:   {} table 0x{:08X}: rel=0x{:X} rejected", tag, shader,
-                rel);
-    return;
-  }
-  const uint32_t block = table + rel;
-  if (!HostPageReadable(REX_RAW_ADDR(block + 0x10))) return;
-  const uint32_t bytes = REX_LOAD_U32(block + 0x10);
-  const uint32_t data_base = REX_LOAD_U32(shader + data_at);
-  std::string entries;
-  uint32_t at = block + 0x14;
-  const uint32_t end = at + bytes;
-  uint32_t n = 0;
-  while (at + 8 <= end && HostPageReadable(REX_RAW_ADDR(at + 4))) {
-    const uint32_t hdr = REX_LOAD_U32(at);
-    const uint32_t reg = hdr >> 16;
-    const uint32_t dwords = hdr & 0xFFFF;
-    if (!dwords) break;
-    const uint32_t data_off = REX_LOAD_U32(at + 4);
-    at += 8;
-    if (++n <= 24)
-      entries += fmt::format(" c{}+{}dw@0x{:X}", reg, dwords,
-                             data_base + data_off);
-  }
-  REXLOG_INFO("d3d9:   {} 0x{:08X} bytes={} data=0x{:08X} {} entries:{}", tag,
-              shader, bytes, data_base, n, entries);
-}
-
-// THE RED SCREEN. A 256x256 warm radial gradient is multiplied 45.5x into the
-// HDR scene target by two scalar broadcasts, and its alpha falloff is killed by
-// a third constant reading zero:
-//
-//   mul r0.xyz, r0.xyz, xe_c[255].xxxx   -> x 3.0          guest c511
-//   mul r0.xyz, r0.xyz, xe_c[43].xxxx    -> x 15.178571     guest c299
-//   o0.w = r0.w * xe_c[9].x              -> x 0             guest c265
-//
-// The pixel bank is rebased -- xe_c[N] is guest ALU constant 256+N -- and large
-// runs of it read exactly zero, which is the known shape of a constant we
-// failed to publish ([[shader-embedded-constants]]: shaders DMA their own ALU
-// constants and the device shadow is only half the bank).
-//
-// So the question is not "is 45.5 too big" but "is 45.5 what the guest asked
-// for". A shader's own load table answers it: if the table claims one of these
-// registers and the bank disagrees, we are landing in the wrong slot; if it
-// does not claim them, these are genuinely the guest's values and the
-// over-brightness is downstream, in the tonemap.
-//
-// Once per distinct pixel shader, because a handle is an address and this is
-// looking for a shader it cannot name in advance
-// ([[shader-handles-are-not-stable]]).
-void NoteRedScreenConstants(uint32_t shader, uint32_t device, uint8_t* base,
-                            const std::vector<uint32_t>& bank) {
-  if (!shader) return;
-  static std::mutex s_mu;
-  static std::set<uint32_t> s_seen;
-  {
-    std::lock_guard<std::mutex> lock(s_mu);
-    if (s_seen.size() >= 256 || !s_seen.insert(shader).second) return;
-  }
-  // Guest register -> index in the bank, and what we ended up with. The bank is
-  // REBASED: it holds the pixel half only, 256 registers, so guest c511 lives
-  // at index 255 -- the same rebasing ApplyShaderLoadTable applies at its
-  // `(abs_reg - 256) * 4`. Indexing it by raw guest register reads off the end.
-  const auto at = [&](uint32_t guest_reg) {
-    if (guest_reg < 256) return std::string("not-a-pixel-reg");
-    const size_t i = size_t(guest_reg - 256) * 4;
-    if (i + 3 >= bank.size()) return std::string("out-of-range");
-    float v[4];
-    for (uint32_t c = 0; c < 4; ++c) std::memcpy(&v[c], &bank[i + c], 4);
-    return fmt::format("({:g},{:g},{:g},{:g})", v[0], v[1], v[2], v[3]);
-  };
-  REXLOG_INFO("d3d9: RED SCREEN constants ps 0x{:08X}: c265={} c299={} c511={}",
-              shader, at(265), at(299), at(511));
-  DumpShaderLoadTable(shader, 0x28, 0x18, base, "ps");
-  constexpr uint32_t kDeviceVertexShaderAt = 0x3248;
-  if (device && HostPageReadable(REX_RAW_ADDR(device + kDeviceVertexShaderAt))) {
-    const uint32_t vs = REX_LOAD_U32(device + kDeviceVertexShaderAt);
-    if (vs) DumpShaderLoadTable(vs, 0x368, 0x20, base, "vs");
-  }
-}
-
 void ApplyPixelShaderLoadTable(
     uint32_t shader, uint32_t device, uint8_t* base,
     std::vector<uint32_t>& bank) {
@@ -3627,9 +3529,6 @@ void ApplyPixelShaderLoadTable(
       ApplyShaderFetchPatchTable(vs, 0x368, base, fetch);
     }
   }
-  // After both tables have been applied, so the bank it reports is the one the
-  // shader will actually see.
-  NoteRedScreenConstants(shader, device, base, bank);
   if (!shader || !fetch.complete_mask) return;
   bool first = false;
   {
