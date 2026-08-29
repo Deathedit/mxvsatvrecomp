@@ -57,9 +57,9 @@ THE FORMAT WORD is only partly understood, and this file says which parts:
 LAYOUT, checked by PREDICTING each file's data size and comparing -- run it
 yourself with `--verify`. Over all 6896 extracted textures:
 
-    exact                     6872   99.65%
+    exact                     6877   99.72%
     trailing extra (<256 B)     19    0.28%
-    MISMATCH                     5    0.07%
+    MISMATCH                     0
 
 predict_data_size carries the rules and how each was fitted. Level 0 always
 starts at the data offset, so --png depends on NONE of it; the model exists
@@ -70,30 +70,42 @@ past the last level -- GL_FR_Sky_DU_Chrom carries 201, and the amount varies
 per file -- which the model cannot predict and should not pretend to. Folding
 those into either column would misreport them.
 
-The 5 that MISMATCH are ONE ASSET -- Ve_EuroTeamTruck_FMF_Side (512x257),
-duplicated across five packages. Counting files overstates the evidence: there
-is one unexplained shape, not five.
+MISMATCH is now empty. It was ONE ASSET -- Ve_EuroTeamTruck_FMF_Side (512x257),
+duplicated across five packages, so counting files overstated the evidence:
+there was one unexplained shape, not five.
 
 A non-power-of-two height is NOT the trigger on its own: 1280x430 and 1280x720
 have one and predict exactly. Those are single-level, so they never exercise the
 mip chain. The trigger is a LINEAR texture with MIPS and a dimension that is not
 a power of two.
 
-FOUND EMPIRICALLY, by decoding candidate offsets and scoring each against level
-0 box-filtered to half size. On Ve_EuroTeamTruck_FMF_Side (512x257, 8_8_8_8):
+THE MIP CHAIN runs over BOTH dimensions ROUNDED UP TO A POWER OF TWO, halved
+from there; level 0 alone uses the texture's real dimensions. That is one rule,
+not two, and it applies to width and height alike.
 
-    level  dims       offset    span      match
-    0      512x257         0    589824    -        = pitch 2048 x align32(257)
-    1      256x128    589824    262144    err 0.00
-    2      128x64     851968     65536    err 0.00
-    3      64x32      917504     -        err 0.00
+It is pow2 ONCE and then halved -- NOT pow2 of each halved dimension. For
+512x257 the two differ, and the difference was the whole defect: 257 halves to
+128, whose pow2 is 128, but the chain the data follows is 512 -> 256 -> 128.
+Every level after 0 therefore occupied exactly TWICE what the old model
+computed, which is what 950272 against 770048 was.
 
-The slack after each level's content is ZERO -- 0 of 131072 bytes non-zero
-after level 1 -- so it is padding, not a second slice and not data being missed.
+Levels, offsets and spans, all confirmed by decoding and scoring each candidate
+against the previous level box-filtered to half size:
 
-LEVEL 0 IS SOLVED: align256(pitch) x align32(rows), for all three shapes. Read
-straight off the padding boundaries, since the slack is zero-filled and a run of
-zeros therefore marks exactly where a level's content stops:
+    level  dims       offset     span     match
+    0      512x257         0   589824     -       = align256(2048) x align32(257)
+    1      256x256    589824   262144     err 0.00
+    2      128x128    851968    65536     err 0.00
+    3      64x64      917504    16384     err 0.00
+    4      32x32      933888     8192     err 0.00   <-- OUT OF SAMPLE
+    5      16x16      942080     8192     packed tail, see below
+
+The slack after each level's content is ZERO -- 0 of 131072 bytes non-zero after
+level 1 -- so it is padding, not a second slice and not data being missed.
+
+LEVEL 0 IS SEPARATE: align256(pitch) x align32(rows), for all three NPOT shapes.
+Read straight off the padding boundaries, since the slack is zero-filled and a
+run of zeros therefore marks exactly where a level's content stops:
 
     640x360    content ends  115200, zeros to  122880  =  1280 x 96
     512x257    content ends  526336, zeros to  589824  =  2048 x 288
@@ -101,32 +113,43 @@ zeros therefore marks exactly where a level's content stops:
 
 The pitch is ALIGNED UP to 256, not floored at it -- 4095 texels of 8_8_8_8 is
 16380 bytes, which floors to itself and aligns to 16384. Those 4 bytes times 512
-rows were the whole discrepancy on the 4095x511 assets.
+rows were the whole discrepancy on the 4095x511 assets. `max(32, hb)` and
+`max(256, pitch)` are the same mistake twice: a floor only differs from an
+alignment when the value is already above the minimum but not a multiple of it,
+which is exactly the non-power-of-two case this model kept missing.
 
-4095x511 IS NOW EXACT under the same rule applied to every level -- no special
-case, no align64K. What had looked like a separate rule for later levels was the
-floor-vs-align bug above, in the rows.
+ONLY ONE ASSET IN THE CORPUS CAN SEE THE HEIGHT HALF OF THE RULE. Of the 23
+linear shapes with mips, 22 are BLIND to it: at every level, align32 of the real
+halved height already equals align32 of the pow2-chain height, so the two rules
+predict identical bytes and the asset cannot corroborate either.
 
-640x360 IS NOW EXACT TOO. Its levels were never mis-counted -- the packed tail
-starts exactly where the `dimension <= 16` rule says. What was wrong is the mip
-PITCH, and measuring it settled it:
+    4095x511  511 -> 255, 127, 63, which align UP to 256, 128, 64 -- the pow2
+              chain exactly. Blind despite being NPOT.
+    640x360   360 -> 45, 23, 12, 6, 3 blocks, aligning to 64, 32, 32, 32, 32,
+              as does the pow2 chain. Blind despite being NPOT.
+    512x257   257 -> 128, 64, 32, ALREADY multiples of 32, so align32 is a
+              no-op and the difference shows through. The only witness.
 
-    level  dims      pitch measured   err vs next-best
-    0      640x360   1280             (from the padding boundary, 1280 x 96)
-    1      320x180   1024              0.782 vs 82.6
-    2      160x90     512              1.635 vs 84.1
+So "check it against another linear texture with mips" has the answer that there
+is not one, and the size check cannot corroborate this from a second asset. The
+corroboration is CONTENT instead, and it is out of sample: the rule places level
+4 at 933888, an offset nothing was fitted to, and decoding there scores err
+0.000 against level 3 box-filtered, with the next-best candidate at 11.84.
 
-1024 is the pitch of a 512-wide level and 512 that of a 256-wide one. MIP LEVELS
-USE THE WIDTH ROUNDED UP TO A POWER OF TWO; level 0 uses its own. For a
-power-of-two texture the two are identical, which is why this never showed until
-a 640-wide asset with mips turned up.
+Each component is load-bearing -- removing one puts assets back in MISMATCH:
 
-ONE SHAPE REMAINS: 512x257, predicted 770048, actual 950272. Every one of its
-widths is ALREADY a power of two, so the pitch rule cannot be what it needs. Its
-levels sit at 589824, 851968, 917504 and each one after level 0 occupies exactly
-TWICE what this model computes -- 131072 in 262144, 32768 in 65536, 8192 in
-16384, all confirmed zero-filled. Its anomaly is in the ROWS, and one asset is
-not enough to tell what rule produces it.
+    as shipped                            exact 6877   MISMATCH 0
+    height not pow2-chained (the old rule) exact 6872   MISMATCH 5
+    width  not pow2-chained               exact 6876   MISMATCH 1
+    break on real dims, not the chain     exact 6872   MISMATCH 5
+
+THE PACKED TAIL'S INTERIOR is nested. The size model does not need this, but a
+decoder that walks mips does. Levels from 16 down share one span
+([[packed-mip-tail]]), and within it each level of dimension s sits at x = s on
+a 64-texel-wide strip at pitch 256: 16x16 at x=16, 8x8 at x=8, 4x4 at x=4, each
+err 0.000 against the previous box-filtered. Reading the tail as a plain 16x16
+at x=0 instead gives err 47.9. The 2x2 and 1x1 slots read all-zero in this
+asset, so they neither confirm nor refute the placement and are not claimed.
 
 METHOD NOTE, because the first attempt failed and looked like it worked:
 Vignetting was the obvious test file and is useless for this -- it is a smooth
@@ -268,6 +291,11 @@ def face_count(t):
     return 6 if t['levels'] == 6 * mips and t['width'] == t['height'] else 1
 
 
+def _pow2(v):
+    """v rounded UP to a power of two."""
+    return 1 if v <= 1 else 1 << ((v - 1).bit_length())
+
+
 def predict_data_size(t):
     """What the payload SHOULD measure, from the geometry alone.
 
@@ -279,6 +307,9 @@ def predict_data_size(t):
 
     The rules, each fitted to the 6896 extracted textures rather than assumed:
 
+      chain   mip dimensions come from BOTH of the texture's dimensions
+              rounded up to a power of two, halved from there; level 0 uses its
+              own. pow2 ONCE then halved, not pow2 of each halved dimension.
       tiled   each level padded to 32x32 BLOCKS.
       linear  each row padded to 256 bytes, and rows padded to 32 -- EXCEPT for
               a single-level texture, which is stored tight: a 1x1 8_8_8_8 is
@@ -286,8 +317,9 @@ def predict_data_size(t):
       DXN     linear rows pad to 512, not 256. BC5 is two BC4 planes and each
               appears to take the minimum separately; every DXN linear texture
               came out at exactly twice the 256 prediction.
-      tail    levels stop once a dimension reaches 16; the rest share that
-              level's padding ([[packed-mip-tail]]).
+      tail    levels stop once a CHAIN dimension reaches 16; the rest share
+              that level's padding ([[packed-mip-tail]]). Gating this on the
+              real halved dimensions instead stops 512x257 a level early.
       cube    all of the above per face, times six.
     """
     if t['format'] not in BLOCKS:
@@ -296,17 +328,24 @@ def predict_data_size(t):
     faces = face_count(t)
     levels = max(1, t['levels'] // faces)
     min_row = 512 if t['format'] == 49 else 256
-    w, h, total, n = t['width'], t['height'], 0, 0
+    # The mip chain runs over BOTH dimensions rounded up to a power of two,
+    # halved from there; level 0 alone uses the texture's real dimensions.
+    #
+    # The width half was measured on Vignetting (640x360 DXT1) by decoding each
+    # level at candidate pitches: level 1 is 320 wide but its pitch is 1024, a
+    # 512-wide level's (err 0.782 against 82 for the next best), and level 2 is
+    # 160 wide at pitch 512, a 256-wide level's (err 1.635 against 84).
+    #
+    # The HEIGHT half behaves the same way, and only one asset in the corpus can
+    # show it -- see the module docstring. Note this is pow2 ONCE and then
+    # halved, NOT pow2 of each halved dimension: 257 halves to 128, whose pow2
+    # is 128, but the chain the data follows is 512 -> 256.
+    cw, ch = _pow2(t['width']), _pow2(t['height'])
+    total, n = 0, 0
     while n < levels:
-        # Mip levels use the width ROUNDED UP TO A POWER OF TWO; level 0 uses
-        # its own. Measured on Vignetting (640x360 DXT1) by decoding each level
-        # at candidate pitches: level 1 is 320 wide but its pitch is 1024, the
-        # pitch of a 512-wide level (err 0.782 against 82 for the next best),
-        # and level 2 is 160 wide at pitch 512, a 256-wide level's (err 1.635
-        # against 84).
-        ww = w if n == 0 else (1 if w <= 1 else 1 << ((w - 1).bit_length()))
+        ww, hh = (t['width'], t['height']) if n == 0 else (cw, ch)
         wb = (ww + bw - 1) // bw
-        hb = (h + bh - 1) // bh
+        hb = (hh + bh - 1) // bh
         if t['tiled']:
             total += ((wb + 31) & ~31) * ((hb + 31) & ~31) * bpb
         else:
@@ -326,10 +365,12 @@ def predict_data_size(t):
             pitch = (wb * bpb + min_row - 1) // min_row * min_row
             total += pitch * rows
         n += 1
-        if w <= 16 or h <= 16:
+        # Gated on the CHAIN, not the real halved dimensions: for 512x257 the
+        # real chain reaches 16 one level sooner and stops a level early.
+        if cw <= 16 or ch <= 16:
             break
-        w = max(1, w // 2)
-        h = max(1, h // 2)
+        cw = max(1, cw // 2)
+        ch = max(1, ch // 2)
     return total * faces
 
 
