@@ -324,6 +324,22 @@ def decode_linear(fmt, data, wb, hb):
         elif fmt == 24:   # 16
             v = struct.unpack('>H', data[i * 2:i * 2 + 2])[0] >> 8
             px[o:o + 4] = bytes((v, v, v, 255))
+        elif fmt == 29:   # 16_16_16_16_EXPAND -- HALF-FLOAT, despite the name
+            # Named EXPAND in the Xenos enum, which suggests fixed point, but the
+            # DATA is IEEE fp16 and says so four ways. On FR_DU_ReflectionMap:
+            # alpha is exactly 1.0 across all 16384 texels (0x3C00 is fp16 1.0
+            # and nothing else); RGB spans 0..1.77, an HDR range; adjacent texels
+            # vary smoothly (0.244, 0.245, 0.246, 0.248) as a sky gradient does;
+            # and every value is finite. Read as u16 these are 15360 and ~40000,
+            # which is meaningless.
+            #
+            # HDR above 1.0 is CLIPPED here, because the destination is an 8-bit
+            # PNG. That loses the top of the range -- fine for looking at, wrong
+            # for measuring, and the reason to read the halves directly if a
+            # number matters.
+            h = struct.unpack('>4e', data[i * 8:i * 8 + 8])
+            px[o:o + 4] = bytes(
+                max(0, min(255, int(c * 255.0 + 0.5))) for c in h)
         else:
             raise ValueError('no decoder for format %d' % fmt)
     return bytes(px), wb, hb
