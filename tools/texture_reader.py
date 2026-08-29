@@ -57,9 +57,9 @@ THE FORMAT WORD is only partly understood, and this file says which parts:
 LAYOUT, checked by PREDICTING each file's data size and comparing -- run it
 yourself with `--verify`. Over all 6896 extracted textures:
 
-    exact                     6871   99.64%
+    exact                     6872   99.65%
     trailing extra (<256 B)     19    0.28%
-    MISMATCH                     6    0.09%
+    MISMATCH                     5    0.07%
 
 predict_data_size carries the rules and how each was fitted. Level 0 always
 starts at the data offset, so --png depends on NONE of it; the model exists
@@ -70,9 +70,9 @@ past the last level -- GL_FR_Sky_DU_Chrom carries 201, and the amount varies
 per file -- which the model cannot predict and should not pretend to. Folding
 those into either column would misreport them.
 
-The 6 that MISMATCH are TWO DISTINCT ASSETS -- Ve_EuroTeamTruck_FMF_Side
-(512x257) duplicated across five packages, and Vignetting (640x360). Counting
-files overstates the evidence; there are two shapes here, not six.
+The 5 that MISMATCH are ONE ASSET -- Ve_EuroTeamTruck_FMF_Side (512x257),
+duplicated across five packages. Counting files overstates the evidence: there
+is one unexplained shape, not five.
 
 A non-power-of-two height is NOT the trigger on its own: 1280x430 and 1280x720
 have one and predict exactly. Those are single-level, so they never exercise the
@@ -107,20 +107,26 @@ rows were the whole discrepancy on the 4095x511 assets.
 case, no align64K. What had looked like a separate rule for later levels was the
 floor-vs-align bug above, in the rows.
 
-THE TWO REMAINING SHAPES ARE STILL UNSOLVED, and they need opposite corrections,
-which is why nothing fits both:
+640x360 IS NOW EXACT TOO. Its levels were never mis-counted -- the packed tail
+starts exactly where the `dimension <= 16` rule says. What was wrong is the mip
+PITCH, and measuring it settled it:
 
-    512x257   predicted 770048, actual 950272.  Its levels sit at 589824,
-              851968, 917504 and each one after level 0 occupies exactly TWICE
-              what this model computes -- 131072 in 262144, 32768 in 65536,
-              8192 in 16384, all confirmed zero-filled.
-    640x360   predicted 212992, actual 229376, short by exactly 16384 -- two
-              more levels' worth. Its packed-mip tail evidently starts later
-              than the `dimension <= 16` rule says.
+    level  dims      pitch measured   err vs next-best
+    0      640x360   1280             (from the padding boundary, 1280 x 96)
+    1      320x180   1024              0.782 vs 82.6
+    2      160x90     512              1.635 vs 84.1
 
-Both are under-counted deliberately. One asset wanting doubled rows and another
-wanting more levels are not the same correction, and two shapes are not enough
-to tell which of them is the special case.
+1024 is the pitch of a 512-wide level and 512 that of a 256-wide one. MIP LEVELS
+USE THE WIDTH ROUNDED UP TO A POWER OF TWO; level 0 uses its own. For a
+power-of-two texture the two are identical, which is why this never showed until
+a 640-wide asset with mips turned up.
+
+ONE SHAPE REMAINS: 512x257, predicted 770048, actual 950272. Every one of its
+widths is ALREADY a power of two, so the pitch rule cannot be what it needs. Its
+levels sit at 589824, 851968, 917504 and each one after level 0 occupies exactly
+TWICE what this model computes -- 131072 in 262144, 32768 in 65536, 8192 in
+16384, all confirmed zero-filled. Its anomaly is in the ROWS, and one asset is
+not enough to tell what rule produces it.
 
 METHOD NOTE, because the first attempt failed and looked like it worked:
 Vignetting was the obvious test file and is useless for this -- it is a smooth
@@ -292,7 +298,14 @@ def predict_data_size(t):
     min_row = 512 if t['format'] == 49 else 256
     w, h, total, n = t['width'], t['height'], 0, 0
     while n < levels:
-        wb = (w + bw - 1) // bw
+        # Mip levels use the width ROUNDED UP TO A POWER OF TWO; level 0 uses
+        # its own. Measured on Vignetting (640x360 DXT1) by decoding each level
+        # at candidate pitches: level 1 is 320 wide but its pitch is 1024, the
+        # pitch of a 512-wide level (err 0.782 against 82 for the next best),
+        # and level 2 is 160 wide at pitch 512, a 256-wide level's (err 1.635
+        # against 84).
+        ww = w if n == 0 else (1 if w <= 1 else 1 << ((w - 1).bit_length()))
+        wb = (ww + bw - 1) // bw
         hb = (h + bh - 1) // bh
         if t['tiled']:
             total += ((wb + 31) & ~31) * ((hb + 31) & ~31) * bpb
