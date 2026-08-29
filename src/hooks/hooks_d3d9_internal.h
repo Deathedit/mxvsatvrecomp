@@ -103,6 +103,98 @@ struct ResolvedTargetByAddress {
   uint32_t reached_x = 0;
   uint32_t reached_y = 0;
   uint32_t resolves = 0;
+
+  // REAL COVERAGE, because `reached` is a BOUNDING BOX and a bounding box is
+  // not coverage.
+  //
+  // reached_x/reached_y are max(dx+w) and max(dy+h). That was chosen so that
+  // repeated full-surface resolves cannot sum past 100%, and so that a corner
+  // blit repeated often is not mistaken for coverage -- both correct. What it
+  // cannot survive is resolves SCATTERED across the surface: the terrain
+  // deformation buffer at phys 0x1102F000 takes 39 blits of 128x32, which is
+  // 3.8% of its 2048x2048, and their bounding box is 1152x1056 = 29.0%. It
+  // cleared the 25% threshold, was claimed, and the 96% of the surface no
+  // resolve ever touched then sampled 0 where the guest had written the
+  // NEUTRAL 0x80 -- dropping the whole terrain by 512/255 = 2.008 world units.
+  // That is the floating bike. See [[floating-bike-is-two-units]].
+  //
+  // A bitmask answers both questions at once: overlap saturates instead of
+  // summing, and a scatter reports the area it actually covers.
+  //
+  // 64x64 cells, one bit each: 512 bytes per destination, ~25 KB for a level's
+  // worth. Sized so a cell is 32x32 texels on a 2048 surface -- fine enough
+  // that the 128x32 deform blits register their true area instead of rounding
+  // away to nothing.
+  static constexpr uint32_t kCoverageGrid = 64;
+  static constexpr uint32_t kCoverageWords = kCoverageGrid * kCoverageGrid / 64;
+  uint64_t coverage[kCoverageWords] = {};
+  // Maintained alongside the bits so the saturation early-out is O(1). Without
+  // it a full-surface target pays 4096 cell tests on every one of the ~2000
+  // resolves it takes per frame.
+  uint32_t covered_cells = 0;
+
+  // Cells per axis and the texel size of one cell, DERIVED rather than stored:
+  // width/height are reassigned on every resolve, and a cached grid would be
+  // free to drift out of step with them.
+  uint32_t cell_w() const {
+    return width ? (width + kCoverageGrid - 1) / kCoverageGrid : 0;
+  }
+  uint32_t cell_h() const {
+    return height ? (height + kCoverageGrid - 1) / kCoverageGrid : 0;
+  }
+  uint32_t cells_x() const {
+    const uint32_t c = cell_w();
+    return c ? (width + c - 1) / c : 0;
+  }
+  uint32_t cells_y() const {
+    const uint32_t c = cell_h();
+    return c ? (height + c - 1) / c : 0;
+  }
+  uint32_t total_cells() const { return cells_x() * cells_y(); }
+
+  // Mark every cell the rect [x0,x1) x [y0,y1) covers FULLY.
+  //
+  // Fully, not "touches". Rounding outward is what produced this bug in the
+  // first place, and a threshold deciding whether to trust a snapshot must not
+  // round in favour of trusting it. Rounding inward would normally cost the far
+  // edge, but the clamps below give the last cell back to a resolve that
+  // reaches the surface edge, so a full-surface resolve still reads exactly
+  // 100% and a band that spans the width still reads its full rows.
+  void MarkCoverage(uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1) {
+    const uint32_t nx = cells_x(), ny = cells_y();
+    if (!nx || !ny) return;
+    if (covered_cells >= nx * ny) return;  // saturated; nothing left to mark
+    const uint32_t cw = cell_w(), ch = cell_h();
+    if (x1 > width) x1 = width;
+    if (y1 > height) y1 = height;
+    if (x0 >= x1 || y0 >= y1) return;
+    uint32_t cx0 = (x0 + cw - 1) / cw;
+    uint32_t cx1 = (x1 >= width) ? nx : x1 / cw;
+    uint32_t cy0 = (y0 + ch - 1) / ch;
+    uint32_t cy1 = (y1 >= height) ? ny : y1 / ch;
+    if (cx1 > nx) cx1 = nx;
+    if (cy1 > ny) cy1 = ny;
+    for (uint32_t cy = cy0; cy < cy1; ++cy) {
+      for (uint32_t cx = cx0; cx < cx1; ++cx) {
+        const uint32_t bit = cy * kCoverageGrid + cx;
+        uint64_t& word = coverage[bit >> 6];
+        const uint64_t mask = 1ull << (bit & 63);
+        if (!(word & mask)) {
+          word |= mask;
+          ++covered_cells;
+        }
+      }
+    }
+  }
+
+  // Covered fraction in percent, 0..100. A zero total means the extent was
+  // never learned, and the caller must treat that as UNKNOWN rather than as
+  // empty -- refusing on absent evidence is the mistake the old rule's
+  // "unknown coverage allows the claim" early-return exists to avoid.
+  uint32_t coverage_percent() const {
+    const uint32_t total = total_cells();
+    return total ? uint32_t(uint64_t(covered_cells) * 100u / total) : 0u;
+  }
   // How many times the guest handed this destination BACK to SetTexture.
   //
   // The question this exists to answer is the one the backdrop turns on: a

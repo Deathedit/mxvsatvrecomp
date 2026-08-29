@@ -1792,6 +1792,13 @@ extern "C" REX_FUNC(sub_8255CE98) {
                            : source->height;
           entry.reached_x = std::max(entry.reached_x, dx + w);
           entry.reached_y = std::max(entry.reached_y, dy + h);
+          // The bounding box stays -- it is still worth SEEING in the
+          // census, and it is what makes a scattered destination legible
+          // once printed next to the real coverage. It is no longer what
+          // the claim decision reads; MarkCoverage is. Marked AFTER
+          // width/height are assigned above, because the grid is derived
+          // from them.
+          entry.MarkCoverage(dx, dy, dx + w, dy + h);
           ++entry.resolves;
           g_resolveDestObjectPhys[dest_texture] = physical;
         }

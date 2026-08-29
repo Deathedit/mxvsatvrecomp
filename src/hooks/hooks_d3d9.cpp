@@ -1176,6 +1176,22 @@ ResolveAddressCensus g_resolveAddr;
 // phys 0x1A2E3000 reaches 768x256 of 2048x2048, 4.7%, and is the case the
 // fallback exists for.
 //
+// AREA, NOT A BOUNDING BOX, since 2026-08-29. This used to compare
+// reached_x * reached_y against the extent, and for every destination above
+// that is the same number -- a whole-surface resolve and a full-width band
+// both have a box equal to their coverage. It is only wrong for a SCATTER,
+// and the terrain deformation buffer is one: 39 resolves of 128x32 over
+// 2048x2048 is 3.8% covered with a 1152x1056 box, 29.0%. It passed, the
+// snapshot was claimed, and the untouched 96% sampled 0 in place of the
+// neutral 0x80 the guest had written -- every terrain tile 512/255 = 2.008
+// world units low, which is the floating bike.
+//
+// The box also only ever GROWS, so the destination was refused early in a
+// run and claimed permanently once enough scattered blits had stretched it
+// past a quarter. That is why the defect looked intermittent, and it is
+// observable: in mx_1750 phys 0x1A2E3000 froze at part1007 while snap ran
+// 225 -> 750, mid-run, without the guest changing anything.
+//
 // Unknown coverage allows the claim: a destination whose fetch constant could
 // not be read has no entry, and refusing on absent evidence would undo the
 // Phase 2 rescue for every surface this measurement missed.
@@ -1184,17 +1200,26 @@ bool ResolvedDestinationIsMostlyWritten(uint32_t dest_object) {
   if (po == g_resolveDestObjectPhys.end()) return true;
   const auto it = g_resolvedTargetsByAddress.find(po->second);
   if (it == g_resolvedTargetsByAddress.end()) return true;
-  const uint64_t reached =
-      uint64_t(it->second.reached_x) * it->second.reached_y;
-  const uint64_t full = uint64_t(it->second.width) * it->second.height;
-  if (!full || reached * 4 >= full) return true;
+  // REAL coverage, not the bounding box. See the MarkCoverage note on
+  // ResolvedTargetByAddress for why the box had to go: a scatter of small
+  // blits stretches it across most of the surface while covering almost none
+  // of it, and that is what claimed the terrain deformation buffer and sank
+  // the ground 2.008 units.
+  const uint32_t total = it->second.total_cells();
+  if (!total) return true;  // extent never learned -- unknown, not empty
+  if (it->second.covered_cells * 4 >= total) return true;
   ++g_resolveAddr.partial;
   static std::set<uint32_t> s_logged;
   if (s_logged.insert(dest_object).second && s_logged.size() <= 8) {
-    REXLOG_INFO("d3d9: resolve dest 0x{:08X} phys 0x{:08X} {}x{} reached only "
-                "{}x{} over {} resolves -- not claimed, CPU decode keeps it",
+    // Both numbers, always. The bounding box alone is what made this
+    // decision unreadable for a session: 1152x1056 of 2048x2048 looks like a
+    // surface that is a third written, and it was 3.8% written.
+    REXLOG_INFO("d3d9: resolve dest 0x{:08X} phys 0x{:08X} {}x{} covered only "
+                "{}% ({} of {} cells, box {}x{}) over {} resolves -- not "
+                "claimed, CPU decode keeps it",
                 dest_object, po->second, it->second.width, it->second.height,
-                it->second.reached_x, it->second.reached_y,
+                it->second.coverage_percent(), it->second.covered_cells,
+                total, it->second.reached_x, it->second.reached_y,
                 it->second.resolves);
   }
   return false;
@@ -5098,9 +5123,19 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
           std::string rows;
           for (const auto& [addr, e] : g_resolvedTargetsByAddress) {
             rows += fmt::format(
-                " [0x{:08X} {}x{} {}res bind{} seen{} snap{} part{} smp{:#x} "
+                // REACHED, printed next to the extent it is judged
+                // against. Without it this row cannot say WHY a
+                // destination was claimed: the 2048x2048 ping-pong pair
+                // reads `part0` here, and whether that means "the GPU
+                // wrote all of it" or "the coverage entry was never
+                // consulted" is the whole difference between a healthy
+                // snapshot and one that samples black.
+                " [0x{:08X} {}x{} cov{}% reach{}x{} {}res bind{} seen{} "
+                "snap{} part{} smp{:#x} "
                 "draws{} untrans{} declared{:#x} bt{} span{}/{}win]",
-                addr, e.width, e.height, e.resolves, e.set_texture_binds,
+                addr, e.width, e.height, e.coverage_percent(),
+                e.reached_x, e.reached_y,
+                e.resolves, e.set_texture_binds,
                 e.slot_seen, e.slot_snapshot, e.slot_partial,
                 e.bind_sampler_mask, e.draws_while_bound,
                 e.draws_no_translation, e.declared_sampler_mask,
