@@ -83,6 +83,21 @@ THE MIP CHAIN runs over BOTH dimensions ROUNDED UP TO A POWER OF TWO, halved
 from there; level 0 alone uses the texture's real dimensions. That is one rule,
 not two, and it applies to width and height alike.
 
+THE SDK STATES THIS OUTRIGHT and is the authority for it --
+rex/graphics/pipeline/texture/util.h, the notes above GetGuestTextureLayout:
+
+    - The mip levels use `max(next_pow2(width or height in texels) >> level, 1)`
+      aligned to 32 blocks for the same purpose, likely disregarding the pitch
+      from the fetch constant.
+
+with the base level described separately as using the fetch constant's pitch and
+"height aligned to 32 blocks". Everything below was derived the slow way, from
+the bytes of one asset, before that line was read ([[sdk-is-the-reference]]).
+The derivation is kept because it is the evidence that these files really follow
+the documented rule -- but the rule itself should have been looked up, not
+fitted. The RUNTIME was never wrong here: it calls GetGuestTextureLayout, so
+only this offline model had the defect.
+
 It is pow2 ONCE and then halved -- NOT pow2 of each halved dimension. For
 512x257 the two differ, and the difference was the whole defect: 257 halves to
 128, whose pow2 is 128, but the chain the data follows is 512 -> 256 -> 128.
@@ -144,12 +159,18 @@ Each component is load-bearing -- removing one puts assets back in MISMATCH:
     break on real dims, not the chain     exact 6872   MISMATCH 5
 
 THE PACKED TAIL'S INTERIOR is nested. The size model does not need this, but a
-decoder that walks mips does. Levels from 16 down share one span
+decoder that walks mips does, and --png only touches level 0 so nothing here
+depends on it yet. Levels with a dimension of 16 or smaller share one span
 ([[packed-mip-tail]]), and within it each level of dimension s sits at x = s on
 a 64-texel-wide strip at pitch 256: 16x16 at x=16, 8x8 at x=8, 4x4 at x=4, each
 err 0.000 against the previous box-filtered. Reading the tail as a plain 16x16
 at x=0 instead gives err 47.9. The 2x2 and 1x1 slots read all-zero in this
 asset, so they neither confirm nor refute the placement and are not claimed.
+
+The SDK owns this too -- GetPackedMipOffset in the header above returns the
+offset directly, and its own note that "the offset is always within the
+dimensions of the image rounded to 32" is the same nesting. Anything that needs
+tail offsets should call that rather than re-measure them.
 
 METHOD NOTE, because the first attempt failed and looked like it worked:
 Vignetting was the obvious test file and is useless for this -- it is a smooth
