@@ -1142,6 +1142,441 @@ extern "C" REX_FUNC(sub_8234CE20) {
 // nothing -- and a silent probe here means "not this path", not "no writes".
 //
 // Cheap on the hot path: one range compare before anything else happens.
+namespace {
+
+// ONE SERIES PER OBJECT, because the first cut of this trace did not have one.
+//
+// It printed a single interleaved stream and I read an oscillation out of it
+// that was never there. Within 40 units of the camera there are SEVERAL skinned
+// objects -- the bike, its rider, and whatever else the level parks nearby --
+// written from four guest threads in an order that is not stable run to run.
+// Consecutive samples were different OBJECTS, so the "1.84-unit swing" was the
+// distance between two of them, not one thing moving. The amplitude agreed with
+// the 1.9-unit float measured by unprojection, which is what made it credible
+// and is a coincidence.
+//
+// TAGGED BY THE SOURCE BUFFER the caller supplied (r5), not by position.
+// Position cannot be the tag: the bike and its rider sit about a unit apart,
+// which is exactly where nearest-previous-position matching swaps them, and a
+// tag that swaps is WORSE than no tag -- the swap reads as motion, which is the
+// very thing being measured.
+//
+// AND THE TAG CHECKS ITSELF, which is the part that matters. If r5 is
+// per-object storage it is an exact identity; if it is a scratch or ring buffer
+// the engine reuses across objects, it is not. Those two cases are told apart
+// by the STEP between consecutive samples of one series -- a real object moves
+// a little per frame, a reused buffer teleports between unrelated objects -- so
+// every series reports its mean and max step and its thread. The log says
+// whether the tag held instead of leaving me to assume it did.
+struct BikeTrack {
+  uint32_t obj = 0;         // r27, the tag the hunt picked
+  uint32_t src = 0;         // r5, the per-thread scratch arena it came through
+  uint32_t lr = 0;
+  uint32_t tid = 0;
+  bool multi_lr = false;
+  bool multi_tid = false;
+  uint64_t samples = 0;
+  uint64_t reported = 0;
+  float x = 0.f, y = 0.f, z = 0.f;
+  float y_min = 0.f, y_max = 0.f;
+  float step_max = 0.f;
+  double step_sum = 0.0;
+};
+
+// 48: the hunt says more than 8 objects pass through the 40-unit radius, and a
+// table that drops the bike because it arrived ninth would fail silently.
+constexpr uint32_t kMaxBikeTracks = 48;
+std::mutex g_bikeMu;
+BikeTrack g_bikeTracks[kMaxBikeTracks];
+uint32_t g_bikeTrackCount = 0;
+uint64_t g_bikeTrackOverflow = 0;
+uint64_t g_bikeSamples = 0;
+
+// THE TAG HUNT -- let the run pick the object identity instead of me guessing
+// a third time.
+//
+// r5 was the second guess and the census killed it: three addresses 0x60000
+// apart, one per thread, and positions that CYCLE within one of them (sample
+// #209 repeats #205 exactly while the camera stands still). It tags the
+// per-thread scratch arena, and six objects round-robin through it.
+//
+// But the immediate caller is sub_82596620, a 0x50-byte thunk that computes a
+// dirty-register mask and tail-calls the setter. It touches r11 and r12 and
+// NOTHING ELSE -- so every non-volatile register still holds the SUBMITTER's
+// live values when we are entered, and a skinned draw almost certainly has its
+// object in one of them.
+//
+// Which one is not worth guessing, so this scores all eighteen at once, with
+// the same self-check the src tag failed: group positions by that register's
+// value and measure the step between consecutive samples of a group. The
+// object pointer is the register whose groups move CONTINUOUSLY -- a few
+// distinct values, each tracing a smooth path. Everything else scores badly in
+// one of two ways, and the report keeps them apart:
+//
+//   too few values, big steps   not an identity (a device, a flag, a constant
+//                               shared by every object)
+//   more values than the table  a counter, a scratch pointer, or a per-call
+//                               temporary -- marked "+" and disqualified, and
+//                               that mark is what stops a register that scores
+//                               a perfect 0.000 step by giving every sample
+//                               its own group from winning.
+constexpr uint32_t kTagRegs = 18;  // r14..r31
+// 64, NOT 8. The first hunt (run 1722) capped at 8 and every plausible
+// candidate came back "8+", including the winner: r27 scored a step of 0.097
+// against 2.5-8.1 for everything else. Eight was simply fewer than the number
+// of skinned objects within 40 units, so the cap disqualified the answer.
+//
+// Note WHY r27 is not the degenerate case this table's "+" mark exists to
+// reject. A register that is unique per call puts every sample in its own
+// group, no group ever gets a second sample, and the score comes back "--"
+// rather than a small number. 0.097 means those groups were revisited AND
+// moved smoothly between visits, which is the definition of an object.
+constexpr uint32_t kTagValues = 64;
+
+struct TagSeries {
+  uint32_t value = 0;
+  float x = 0.f, y = 0.f, z = 0.f;
+  uint64_t n = 0;
+  double step_sum = 0.0;
+};
+
+struct TagCandidate {
+  TagSeries s[kTagValues];
+  uint32_t count = 0;
+  uint64_t overflow = 0;
+};
+
+TagCandidate g_tagCands[kTagRegs];
+
+void NoteTagCandidates(const uint32_t* nv, float x, float y, float z) {
+  for (uint32_t i = 0; i < kTagRegs; ++i) {
+    TagCandidate& c = g_tagCands[i];
+    uint32_t k = 0;
+    for (; k < c.count; ++k)
+      if (c.s[k].value == nv[i]) break;
+    if (k == c.count) {
+      if (c.count >= kTagValues) {
+        ++c.overflow;
+        continue;
+      }
+      TagSeries& fresh = c.s[c.count++];
+      fresh.value = nv[i];
+      fresh.x = x;
+      fresh.y = y;
+      fresh.z = z;
+      fresh.n = 1;
+      continue;
+    }
+    TagSeries& s = c.s[k];
+    const float dx = x - s.x, dy = y - s.y, dz = z - s.z;
+    s.step_sum += std::sqrt(dx * dx + dy * dy + dz * dz);
+    s.x = x;
+    s.y = y;
+    s.z = z;
+    ++s.n;
+  }
+}
+
+// A dense-numbered thread index rather than the OS id: the question is only
+// "does one series come from one thread", and 0..3 answers it without dragging
+// windows.h into this file. The log prefix still carries the real tid.
+uint32_t BikeThreadIndex() {
+  static std::atomic<uint32_t> s_next{0};
+  static thread_local uint32_t s_idx =
+      s_next.fetch_add(1, std::memory_order_relaxed);
+  return s_idx;
+}
+
+// WHERE THE POSITION LIVES INSIDE THE OBJECT.
+//
+// r27 is a stable guest object pointer, so the transform we read out of the
+// scratch palette must also exist somewhere in the object itself. Finding that
+// offset is the step that turns a render-side observation into a handle on the
+// PHYSICS: a field address can be write-watched, and whoever writes it is the
+// code that decides the bike's height.
+//
+// Searched rather than assumed, because the layout is not knowable from here.
+// Two candidate layouts are tested at every 4-byte offset:
+//
+//   packed    [o]=x [o+4]=y [o+8]=z        a plain vec3 or a matrix's 4th row
+//   strided   [o]=x [o+16]=y [o+32]=z      translation in the .w of three rows,
+//                                          which is how the palette carries it
+//
+// All three components must match, which is what keeps this from firing on any
+// float that happens to equal y. The report is a census over offsets: a field
+// recurs at ONE offset across objects and frames, and a coincidence does not.
+struct FieldHit {
+  uint32_t off = 0;      // kVia packs the outer offset low, the inner high
+  uint8_t mode = 0;
+  uint64_t hits = 0;
+};
+constexpr uint32_t kMaxFieldHits = 64;
+FieldHit g_fieldHits[kMaxFieldHits];
+uint32_t g_fieldHitCount = 0;
+uint64_t g_fieldScans = 0;
+uint64_t g_fieldMisses = 0;
+uint64_t g_fieldOverflow = 0;
+
+// 0x600 IN EITHER LAYOUT FOUND NOTHING -- 90 scans, 90 misses, run 1724. That
+// is a real negative and it narrows the search rather than ending it. Three
+// things produce it, and this pass separates them instead of picking one:
+//
+//   the span was too small        a vehicle object is not 1.5 KB; widened to
+//                                 0x2000.
+//   the layout was not guessed    both guesses required x FIRST. A component
+//                                 order we did not think of (x, z, y), or a
+//                                 matrix whose translation is not where we
+//                                 assumed, defeats both. Mode 2 matches Y
+//                                 ALONE and lets recurrence do the proving.
+//   the object points AT it       a component or owner holding the transform
+//                                 out of line. One level of pointer follow.
+//
+// WHY Y-ALONE IS NOT A LOOSE MATCH. In any single scan it will hit several
+// offsets by chance. It cannot hit the SAME offset scan after scan while y
+// changes, unless that offset holds y. So the census counts hits per offset
+// against the scan total, and the field is the one whose rate approaches 1.0 --
+// the coincidences scatter and stay at one or two.
+enum FieldMode : uint8_t { kPacked = 0, kStrided = 1, kYOnly = 2, kVia = 3 };
+
+void ScanObjectForPosition(uint8_t* base, uint32_t obj, float x, float y,
+                           float z) {
+  constexpr uint32_t kSpan = 0x2000;
+  if (!GuestRangeReadable(base, obj, kSpan + 0x24u)) return;
+  ++g_fieldScans;
+  const auto at = [&](uint32_t a) {
+    const uint32_t bits = REX_LOAD_U32(a);
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+  };
+  // Tight, because the palette value and the object field should be the SAME
+  // float, not merely close. A loose epsilon here would let the bike's six
+  // parts match each other's fields and turn one offset into six.
+  const auto same = [](float a, float b) { return std::fabs(a - b) < 1e-4f; };
+  bool any = false;
+  const auto note = [&](uint32_t off, FieldMode mode) {
+    any = true;
+    uint32_t i = 0;
+    for (; i < g_fieldHitCount; ++i)
+      if (g_fieldHits[i].off == off && g_fieldHits[i].mode == mode) break;
+    if (i == g_fieldHitCount) {
+      if (g_fieldHitCount >= kMaxFieldHits) {
+        ++g_fieldOverflow;
+        return;
+      }
+      g_fieldHits[g_fieldHitCount++] = {off, mode, 1};
+    } else {
+      ++g_fieldHits[i].hits;
+    }
+  };
+
+  for (uint32_t o = 0; o <= kSpan; o += 4) {
+    const float f = at(obj + o);
+    if (same(f, x)) {
+      if (same(at(obj + o + 4), y) && same(at(obj + o + 8), z))
+        note(o, kPacked);
+      if (same(at(obj + o + 16), y) && same(at(obj + o + 32), z))
+        note(o, kStrided);
+    }
+    if (same(f, y)) note(o, kYOnly);
+  }
+
+  // ONE LEVEL OF POINTER FOLLOW, over the first 0x100 only. A component or
+  // owner pointer sits near the head of an object; chasing every plausible
+  // pointer in 8 KB would be thousands of scans per sample and would find a
+  // match somewhere by sheer volume, which is the opposite of evidence.
+  for (uint32_t o = 0; o <= 0x100u; o += 4) {
+    const uint32_t p = REX_LOAD_U32(obj + o);
+    if (p < 0x20000000u || p >= 0x40000000u) continue;  // the guest heap band
+    if (!GuestRangeReadable(base, p, 0x200u + 0x24u)) continue;
+    for (uint32_t q = 0; q <= 0x200u; q += 4)
+      if (same(at(p + q), y)) note(o | (q << 16), kVia);
+  }
+
+  // A scan that matched NOTHING is the interesting negative: it means the
+  // object does not hold this transform at all and the render path was handed
+  // it from somewhere else. Counted so that case cannot look like "no scans".
+  if (!any) ++g_fieldMisses;
+}
+
+void NoteBikeSample(uint8_t* base, uint32_t src, uint32_t lr, float x, float y,
+                    float z, const float cam[4], float dist,
+                    const uint32_t* nv) {
+  const uint32_t tid = BikeThreadIndex();
+  // THE TAG IS r27, chosen by the hunt rather than by me: step 0.097 against
+  // 2.5-8.1 for every other non-volatile register. r5 stays in the row as
+  // `src` because it identifies the per-thread scratch arena, which is worth
+  // seeing next to the object -- but it is no longer what a series means.
+  const uint32_t obj = nv[27 - 14];
+  std::string line, census;
+  {
+    std::lock_guard<std::mutex> lk(g_bikeMu);
+    uint32_t slot = 0;
+    for (; slot < g_bikeTrackCount; ++slot)
+      if (g_bikeTracks[slot].obj == obj) break;
+    bool fresh = false;
+    if (slot == g_bikeTrackCount) {
+      if (g_bikeTrackCount >= kMaxBikeTracks) {
+        ++g_bikeTrackOverflow;
+        return;
+      }
+      ++g_bikeTrackCount;
+      g_bikeTracks[slot] = BikeTrack{};
+      fresh = true;
+    }
+    BikeTrack& t = g_bikeTracks[slot];
+    float step = 0.f;
+    if (fresh) {
+      t.obj = obj;
+      t.src = src;
+      t.lr = lr;
+      t.tid = tid;
+      t.y_min = t.y_max = y;
+    } else {
+      const float dx = x - t.x, dy = y - t.y, dz = z - t.z;
+      step = std::sqrt(dx * dx + dy * dy + dz * dz);
+      t.step_sum += step;
+      if (step > t.step_max) t.step_max = step;
+      if (y < t.y_min) t.y_min = y;
+      if (y > t.y_max) t.y_max = y;
+      if (lr != t.lr) t.multi_lr = true;
+      if (tid != t.tid) t.multi_tid = true;
+    }
+    t.x = x;
+    t.y = y;
+    t.z = z;
+    ++t.samples;
+    ++g_bikeSamples;
+    NoteTagCandidates(nv, x, y, z);
+    // Throttled: the answer is one offset, and 1-in-40 finds it in seconds
+    // while keeping a 1.5 KB scan off every skinned draw.
+    if ((g_bikeSamples % 40) == 0) ScanObjectForPosition(base, obj, x, y, z);
+
+    // PER SERIES, not global: a budget shared across series is spent by
+    // whichever object is drawn most and the one being chased goes unsampled.
+    // 200 per series rather than 600: with up to 48 series the old budget is
+    // 29k lines, which drowns the census that has to be read.
+    const bool dense = t.reported < 200;
+    if (dense || (t.samples % 120) == 0) {
+      ++t.reported;
+      line = fmt::format(
+          "native: BIKE TRACE S{} obj=0x{:08X} #{} world ({:.3f}, {:.3f}, "
+          "{:.3f}) step {:.3f} | camera ({:.3f}, {:.3f}, {:.3f}) is {:.3f} "
+          "above it, {:.3f} away (arena 0x{:08X})",
+          slot, obj, t.samples, x, y, z, step, cam[0], cam[1], cam[2],
+          cam[1] - y, dist, src);
+    }
+
+    // THE CENSUS IS THE POINT. One line that shows every series side by side is
+    // what the interleaved stream could never give, and its step column is the
+    // verdict on the tag itself.
+    if ((g_bikeSamples % 600) == 0) {
+      census = fmt::format("native: BIKE TRACE CENSUS after {} samples -- {} "
+                           "series:",
+                           g_bikeSamples, g_bikeTrackCount);
+      uint32_t thin = 0;
+      for (uint32_t i = 0; i < g_bikeTrackCount; ++i) {
+        const BikeTrack& e = g_bikeTracks[i];
+        // A series with almost no samples cannot say anything about motion and
+        // would push the ones that can off the end of the line. Counted, not
+        // dropped silently.
+        if (e.samples < 4) { ++thin; continue; }
+        const double avg =
+            e.samples > 1 ? e.step_sum / double(e.samples - 1) : 0.0;
+        census += fmt::format(
+            " [S{} obj=0x{:08X} n={} y {:.2f}..{:.2f} (span {:.2f}) step avg "
+            "{:.3f} max {:.3f} lr=0x{:08X}{} t{}{}]",
+            i, e.obj, e.samples, e.y_min, e.y_max, e.y_max - e.y_min, avg,
+            e.step_max, e.lr, e.multi_lr ? "+" : "", e.tid,
+            e.multi_tid ? "+" : "");
+      }
+      census += fmt::format(
+          " || FIELD SCAN {} scans, {} matched nothing, {} distinct "
+          "(offset, layout):",
+          g_fieldScans, g_fieldMisses, g_fieldHitCount);
+      // Ranked by HIT RATE against the scan total, best first, and only the
+      // top eight: a field sits near 1.0 and the coincidences sit near 0.
+      // Printing all 64 unsorted is how a 1.0 gets lost in a wall of 0.01.
+      {
+        uint32_t ord[kMaxFieldHits];
+        for (uint32_t i = 0; i < g_fieldHitCount; ++i) ord[i] = i;
+        for (uint32_t a = 0; a < g_fieldHitCount; ++a)
+          for (uint32_t b = a + 1; b < g_fieldHitCount; ++b)
+            if (g_fieldHits[ord[b]].hits > g_fieldHits[ord[a]].hits)
+              std::swap(ord[a], ord[b]);
+        const uint32_t show = g_fieldHitCount < 8 ? g_fieldHitCount : 8;
+        for (uint32_t k = 0; k < show; ++k) {
+          const FieldHit& h = g_fieldHits[ord[k]];
+          const char* mode = h.mode == 0   ? "packed"
+                             : h.mode == 1 ? "strided"
+                             : h.mode == 2 ? "y-only"
+                                           : "via";
+          const double rate =
+              g_fieldScans ? double(h.hits) / double(g_fieldScans) : 0.0;
+          if (h.mode == 3)
+            census += fmt::format(" [+0x{:X}->+0x{:X} via x{} rate {:.2f}]",
+                                  h.off & 0xFFFFu, h.off >> 16, h.hits, rate);
+          else
+            census += fmt::format(" [+0x{:X} {} x{} rate {:.2f}]", h.off, mode,
+                                  h.hits, rate);
+        }
+        if (g_fieldHitCount > show)
+          census += fmt::format(" (+{} lower-rate offsets)",
+                                g_fieldHitCount - show);
+      }
+      if (g_fieldOverflow)
+        census += fmt::format(" (+{} dropped, table full)", g_fieldOverflow);
+      if (thin) census += fmt::format(" (+{} series under 4 samples)", thin);
+      if (g_bikeTrackOverflow)
+        census += fmt::format(" (+{} samples dropped, table full)",
+                              g_bikeTrackOverflow);
+
+      // The tag hunt, ordered worst step LAST so the candidate to read is the
+      // one at the front. "values" is how many distinct values that register
+      // took; "+" means it took more than the table holds, which disqualifies
+      // it however good its step looks.
+      census += "\nnative: BIKE TAG HUNT (object = few values, small step):";
+      uint32_t order[kTagRegs];
+      for (uint32_t i = 0; i < kTagRegs; ++i) order[i] = i;
+      const auto score = [](const TagCandidate& c) {
+        double sum = 0.0;
+        uint64_t n = 0;
+        for (uint32_t k = 0; k < c.count; ++k) {
+          sum += c.s[k].step_sum;
+          n += c.s[k].n > 1 ? c.s[k].n - 1 : 0;
+        }
+        // No movement measured at all sorts LAST, not first: a register that
+        // never grouped anything is the absence of evidence, and letting it
+        // score 0.000 would put it at the top of the very list meant to name
+        // the winner.
+        return n ? sum / double(n) : 1e30;
+      };
+      for (uint32_t a = 0; a < kTagRegs; ++a)
+        for (uint32_t b = a + 1; b < kTagRegs; ++b) {
+          const bool a_bad = g_tagCands[order[a]].overflow != 0;
+          const bool b_bad = g_tagCands[order[b]].overflow != 0;
+          const bool swap = (a_bad && !b_bad) ||
+                            (a_bad == b_bad && score(g_tagCands[order[b]]) <
+                                                   score(g_tagCands[order[a]]));
+          if (swap) std::swap(order[a], order[b]);
+        }
+      for (uint32_t o = 0; o < kTagRegs; ++o) {
+        const uint32_t i = order[o];
+        const TagCandidate& c = g_tagCands[i];
+        const double s = score(c);
+        census += fmt::format(" [r{} {}{} values step {}]", 14 + i, c.count,
+                              c.overflow ? "+" : "",
+                              s >= 1e29 ? std::string("--")
+                                        : fmt::format("{:.3f}", s));
+      }
+    }
+  }
+  if (!line.empty()) REXLOG_INFO("{}", line);
+  if (!census.empty()) REXLOG_INFO("{}", census);
+}
+
+}  // namespace
+
 REX_IMPORT(__imp__sub_82550320, orig_SetVertexShaderConstantF, void());
 extern "C" REX_FUNC(sub_82550320) {
   const uint32_t start = ctx.r4.u32;
@@ -1150,6 +1585,15 @@ extern "C" REX_FUNC(sub_82550320) {
   const uint32_t lr = uint32_t(ctx.lr);
   // BEFORE the original, which is free to clobber r3.
   const uint32_t device = ctx.r3.u32;
+  // r14..r31 as the caller left them -- the tag hunt's candidates. Captured
+  // before the original for the same reason as r3, though the ABI says these
+  // survive it: a probe that depends on a callee honouring the ABI is a probe
+  // that fails silently the day one does not.
+  const uint32_t nv[18] = {
+      ctx.r14.u32, ctx.r15.u32, ctx.r16.u32, ctx.r17.u32, ctx.r18.u32,
+      ctx.r19.u32, ctx.r20.u32, ctx.r21.u32, ctx.r22.u32, ctx.r23.u32,
+      ctx.r24.u32, ctx.r25.u32, ctx.r26.u32, ctx.r27.u32, ctx.r28.u32,
+      ctx.r29.u32, ctx.r30.u32, ctx.r31.u32};
   orig_SetVertexShaderConstantF(ctx, base);
   // Register 85 is the first row of bone 0. One compare, and it rejects the
   // overwhelming majority of calls.
@@ -1173,8 +1617,7 @@ extern "C" REX_FUNC(sub_82550320) {
       std::memcpy(&row[r][c], &bits, 4);
     }
 
-  // THE BIKE'S HEIGHT OVER TIME, identified by being the thing the camera is
-  // following rather than by guessing at an object.
+  // THE BIKE'S HEIGHT OVER TIME, one series per object (see NoteBikeSample).
   //
   // The float is INTERMITTENT and random between runs, which kills the reading
   // it had before: a wheel-radius or suspension-rest-length constant would
@@ -1200,44 +1643,16 @@ extern "C" REX_FUNC(sub_82550320) {
       const float tx = row[0][3], ty = row[1][3], tz = row[2][3];
       const float dx = tx - cam[0], dy = ty - cam[1], dz = tz - cam[2];
       const float d2 = dx * dx + dy * dy + dz * dz;
-      if (d2 < 40.0f * 40.0f && d2 > 0.0f) {
-        static std::atomic<uint64_t> s_near{0};
-        const uint64_t n = s_near.fetch_add(1, std::memory_order_relaxed) + 1;
-        // A DENSE BURST, because the sparse trace could measure the amplitude
-        // and not the shape.
-        //
-        // At ~1 s apart the bike's Y read 558.26..560.10 -- a 1.84-unit swing
-        // against a camera pinned to 0.23 -- which is within noise of the
-        // 1.9-unit float measured by unprojection. So the "float" is very
-        // likely an OSCILLATION caught at a phase, not a constant offset. But
-        // 1 s samples of a per-frame signal are aliased: amplitude survives,
-        // frequency and shape do not, and those are what name the cause.
-        //
-        //   alternating frame to frame  a double-buffer / ping-pong read of
-        //                               the ground height (the terrain height
-        //                               buffers ARE a ping-pong pair)
-        //   a smooth sustained wave     a suspension resonance in the guest's
-        //                               integration
-        //   irregular, tracking terrain it is dunes and this is normal riding,
-        //                               and the signal was never a defect
-        //
-        // So: every write for a bounded window, then back to the sparse trace.
-        // The window is capped rather than timed because it has to cover a
-        // stretch of RIDING, and when that starts is the user's business, not
-        // this probe's -- 4000 samples is ~30 s at two near objects a frame.
-        static std::atomic<uint64_t> s_burst{0};
-        bool dense = false;
-        if (d2 < 30.0f * 30.0f) {
-          const uint64_t b = s_burst.fetch_add(1, std::memory_order_relaxed) + 1;
-          dense = b <= 4000;
-        }
-        if (dense || n <= 8 || (n % 120) == 0)
-          REXLOG_INFO(
-              "native: BIKE TRACE #{} world ({:.3f}, {:.3f}, {:.3f}) | camera "
-              "({:.3f}, {:.3f}, {:.3f}) | camera is {:.3f} above it, {:.3f} away",
-              n, tx, ty, tz, cam[0], cam[1], cam[2], cam[1] - ty,
-              std::sqrt(d2));
-      }
+      // The 40-unit gate stays: it is what keeps the level's other skinned
+      // objects out, and the tag sorts out what is left inside it. The shape
+      // being looked for is per-series -- alternating frame to frame is a
+      // ping-pong read of the ground height (the terrain height buffers ARE a
+      // ping-pong pair), a smooth wave is suspension resonance in the guest's
+      // integration, and irregular motion tracking the terrain is just riding
+      // over dunes and was never a defect.
+      if (d2 < 40.0f * 40.0f && d2 > 0.0f)
+        NoteBikeSample(base, src, lr, row[0][3], row[1][3], row[2][3], cam,
+                       std::sqrt(d2), nv);
     }
   }
 
