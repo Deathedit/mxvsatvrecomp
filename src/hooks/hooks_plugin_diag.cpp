@@ -45,6 +45,55 @@
 // as it is read, which is what shipping a different MXRegistry.bxml would do —
 // tools/ has bxml decoders but no encoder, so this is the only way to change one.
 // Empty means off. Diagnostic only. See AGENTS.md "the registry chokepoint".
+// DEFINE_BuildConfig -- the guest's own debug gate, flipped at its single
+// source.
+//
+// sub_82500760 registers the engine's Lua globals. In disassembly (Hex-Rays
+// renders this function as a __noreturn stub and truncates the rest, so it has
+// to be read as asm):
+//
+//     addi r4, r10, aRelease@l          ; "RELEASE"
+//     bl   sub_82A9F468                 ; lua_pushstring(L, "RELEASE")
+//     li   r4, -0x2712                  ; -10002 = LUA_GLOBALSINDEX
+//     addi r5, r9, aDefineBuildcon@l    ; "DEFINE_BuildConfig"
+//     bl   sub_82A9FA18                 ; lua_setfield(L, GLOBALS, name)
+//
+// The shipped UI scripts gate the developer build on it and nothing else:
+//
+//     function AllowDebugMenu()                       -- MXUI/UI_Helper.lua
+//        if( DEFINE_BuildConfig ~= "RELEASE" ) then return TRUE else return FALSE end
+//
+// FE_Title.lua enables the dev menu on the same test, and RSLibrary.lua
+// installs DebugPrintTable on it. The assets are all still in the packages:
+// MXUI has DB_Menu (.lua/.layer.xml/.swfx), DB_UnitTests.lua and
+// DB_GraphicsTest.swfx, EngineDependencies has DebugOverlay and DebugGraphics.
+//
+// SWAPPED AT THE PUSH, not by rewriting the global afterwards. "RELEASE"
+// (0x820468E0) has exactly ONE xref in the binary -- this push -- so an
+// equality test on the pointer cannot touch anything else, and it lands before
+// the setfield rather than racing whatever reads the global first. "DEBUG"
+// (0x8204E1E4) is an existing guest string, so no memory has to be written
+// into the guest to supply the value. The scripts test for inequality against
+// "RELEASE", so any other value would do.
+REXCVAR_DEFINE_BOOL(debug_menu, false, "Debug",
+                    "Set the guest's DEFINE_BuildConfig Lua global to DEBUG "
+                    "instead of RELEASE, which is what its own scripts gate "
+                    "the developer menu and debug printing on");
+
+REX_IMPORT(__imp__sub_82A9F468, orig_LuaPushString, void());
+extern "C" REX_FUNC(sub_82A9F468) {
+  if (REXCVAR_GET(debug_menu) && ctx.r4.u32 == 0x820468E0u) {
+    ctx.r4.u64 = 0x8204E1E4u;  // "DEBUG"
+    static std::atomic<bool> s_said{false};
+    bool expected = false;
+    if (s_said.compare_exchange_strong(expected, true))
+      REXLOG_INFO("{}: DEFINE_BuildConfig pushed as \"DEBUG\" instead of "
+                  "\"RELEASE\" -- AllowDebugMenu() will now return TRUE",
+                  mx::native::g_plugin_mode ? "plugin" : "native");
+  }
+  orig_LuaPushString(ctx, base);
+}
+
 REXCVAR_DEFINE_STRING(registry_override, "", "Debug",
                       "Comma-separated key=value overrides for guest registry string reads");
 
