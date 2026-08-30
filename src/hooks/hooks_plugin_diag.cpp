@@ -45,6 +45,97 @@
 // as it is read, which is what shipping a different MXRegistry.bxml would do —
 // tools/ has bxml decoders but no encoder, so this is the only way to change one.
 // Empty means off. Diagnostic only. See AGENTS.md "the registry chokepoint".
+// debug_native -- the engine's own "is this a debug build" predicate, which
+// ships compiled to a constant false.
+//
+//     int sub_829E8FA8() { return 0; }
+//
+// It has 40+ call sites across asset loading, UI, render and audio, and it is
+// the NATIVE counterpart of the Lua DEFINE_BuildConfig that debug_menu flips.
+// The two are unrelated: debug_menu only reaches Lua and the UI scripts, so it
+// cannot switch on anything the C++ gates -- which is why the dev menu appears
+// but the debug camera does not.
+//
+// Two known consumers, both found while chasing the debug overlay:
+//
+//   sub_82AB6300  the DebugOverlay constructor. It loads the
+//                 EngineDependencies database and package, resolves the
+//                 DebugOverlay material, lays out seven HUD cells, and then
+//                 sets its enabled field from this predicate:
+//                     a1[217] = sub_829E8FA8();
+//                 so the overlay builds itself and then marks itself off.
+//   sub_82AB58F8  a screen/state poller, whose second branch is
+//                     if (sub_829E8FA8() && sub_82B6F070(&unk_830C1140, 1, i))
+//
+// PER CALL SITE, NOT GLOBAL. Answering true everywhere was tried and SEGFAULTS
+// within two seconds -- 40 call sites means 40 paths the retail build never
+// executes, last exercised on a dev kit in 2011. So the lever selects sites by
+// the RETURN ADDRESS, and "census" reports which sites actually ask without
+// changing a single answer. Discover first, then enable the one you want.
+//
+//   debug_native=census                 answer FALSE, report distinct callers
+//   debug_native=0x82AB63C4,0x82AB63D0  answer TRUE only for those lr values
+//   debug_native=all                    answer TRUE everywhere (it crashes)
+REXCVAR_DEFINE_STRING(debug_native, "", "Debug",
+                      "The engine's is-debug-build predicate, per call site. "
+                      "'census' lists the callers without changing anything; a "
+                      "comma-separated list of hex return addresses answers "
+                      "true for just those; 'all' answers true everywhere and "
+                      "crashes");
+
+namespace {
+std::mutex g_dbgNativeMu;
+std::map<uint32_t, uint64_t> g_dbgNativeAsks;   // lr -> times asked
+uint64_t g_dbgNativeTrue = 0;
+std::chrono::steady_clock::time_point g_dbgNativeLast{};
+}  // namespace
+
+REX_IMPORT(__imp__sub_829E8FA8, orig_IsDebugBuild, void());
+extern "C" REX_FUNC(sub_829E8FA8) {
+  const uint32_t lr = uint32_t(ctx.lr);
+  orig_IsDebugBuild(ctx, base);
+  const std::string spec = REXCVAR_GET(debug_native);
+  if (spec.empty()) return;
+
+  bool want = false;
+  if (spec == "all") {
+    want = true;
+  } else if (spec != "census") {
+    // Exact return addresses, comma separated. Matching on lr rather than on
+    // the enclosing function keeps this to the one call the log named.
+    size_t pos = 0;
+    while (pos < spec.size() && !want) {
+      size_t comma = spec.find(',', pos);
+      if (comma == std::string::npos) comma = spec.size();
+      const std::string one = spec.substr(pos, comma - pos);
+      pos = comma + 1;
+      if (one.empty()) continue;
+      const uint32_t v = uint32_t(std::strtoul(one.c_str(), nullptr, 0));
+      if (v && v == lr) want = true;
+    }
+  }
+  if (want) ctx.r3.u64 = 1;
+
+  std::lock_guard<std::mutex> lk(g_dbgNativeMu);
+  ++g_dbgNativeAsks[lr];
+  if (want) ++g_dbgNativeTrue;
+  // Census on a timer, not per call: the render and asset paths ask constantly
+  // and a line each would drown the log.
+  const auto now = std::chrono::steady_clock::now();
+  if (g_dbgNativeLast.time_since_epoch().count() != 0 &&
+      now - g_dbgNativeLast < std::chrono::seconds(10))
+    return;
+  g_dbgNativeLast = now;
+  std::string rows;
+  for (const auto& [site, n] : g_dbgNativeAsks)
+    rows += fmt::format(" [lr=0x{:08X} x{}]", site, n);
+  REXLOG_INFO("{}: debug_native CALLERS ({}) -- {} distinct site(s), {} answer(s) "
+              "flipped to true:{}",
+              mx::native::g_plugin_mode ? "plugin" : "native", spec,
+              g_dbgNativeAsks.size(), g_dbgNativeTrue,
+              rows.empty() ? " (none)" : rows);
+}
+
 // debug_binds -- put the engine's debug actions on the buttons its own shipped
 // presets leave empty.
 //

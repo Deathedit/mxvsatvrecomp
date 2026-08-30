@@ -210,6 +210,7 @@ so they describe what a plain run already does, not what you can turn on.
 | `d3d9_diag_frame_every` | 30 | Frames between the per-swap lines (`FRAME DRAWS`, `UNBUILT *`, `RING vs HLE`, `ALU LOAD`). Per-frame deltas accumulate across the gap rather than being dropped, and the first five swaps always print; `0`/`1` = every swap |
 | `debug_menu` | off | Set the guest's `DEFINE_BuildConfig` Lua global to `DEBUG` instead of `RELEASE`. The shipped scripts gate the developer menu on exactly this (`UI_Helper.lua: AllowDebugMenu`), so it puts the dev menu on the title screen — level select, activity types, vehicle lists |
 | `debug_binds` | — | Comma-separated `button=action` pairs added to every controller preset, e.g. `Button7=DebugCameraForward`. The engine registers a full debug action set that the shipped presets bind to nothing; eight inputs (Button7/14/15/16 and the four Sensor axes) are free in all six presets. Only empty slots are written, and the table layout is verified first |
+| `debug_native` | — | The engine's own is-debug-build predicate (`sub_829E8FA8`, shipped as `return 0`), **per call site**. `census` lists the callers and changes nothing; a comma-separated list of hex return addresses answers true for just those; `all` answers true everywhere and segfaults in ~2s. `0x82AB6638` is the DebugOverlay's enable check |
 | `registry_override` | — | Force a registry key, e.g. `ReadyToLaunch=1`. A diagnostic lever, not a fix |
 
 **Seven were retired on 2026-08-12**, by the same test that retired four on
