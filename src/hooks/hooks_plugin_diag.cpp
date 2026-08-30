@@ -94,6 +94,15 @@ std::atomic<uint64_t> g_vblankHandler{0};   // sub_825663B0, the flip pass
 // Counted per frame: total steps, and how many DISTINCT entities they landed
 // on. calls == distinct is healthy. calls == 2 x distinct is the bug, and the
 // duplicate's address names the entity.
+struct StepVt {
+  uint32_t vt = 0, f24 = 0, f28 = 0;
+  uint64_t hits = 0;
+};
+constexpr size_t kMaxStepVts = 16;
+StepVt g_stepVts[kMaxStepVts];
+uint32_t g_stepVtCount = 0;
+uint64_t g_stepVtOverflow = 0;
+
 std::mutex g_stepMu;
 std::vector<uint32_t> g_stepSeen;      // entities stepped this frame, in order
 uint64_t g_stepCalls = 0;
@@ -531,6 +540,14 @@ extern "C" REX_FUNC(sub_82B70370) {
   if (tm <= 5 || (tm % 250) == 0) {
     const float total = std::bit_cast<float>(REX_LOAD_U32(a1 + kTotal));
     const float max_frame = std::bit_cast<float>(REX_LOAD_U32(a1 + kMaxFrame));
+    // THE TIMING STRUCT'S OWN SCALE, never read until now. The guest computes
+    //     *(a1+64) = *(a1+68) * *(a1+60)
+    // so +68 multiplies accumulated time into a second, scaled clock at +64 --
+    // a time-dilation factor by construction, and exactly the "something sets
+    // game speed" shape. Assumed to be 1.0 for this whole hunt and never
+    // checked, which is how the last nine hypotheses went wrong.
+    const float tscale = std::bit_cast<float>(REX_LOAD_U32(a1 + kScale));
+    const float scaled = std::bit_cast<float>(REX_LOAD_U32(a1 + kScaled));
     // GAME SPEED, as one number. Guest seconds per host second over the whole
     // run: 1.00 is correct, and it is frame-rate independent by construction,
     // so it is comparable between machines and between runs.
@@ -546,6 +563,13 @@ extern "C" REX_FUNC(sub_82B70370) {
                     : "",
                 max_frame,
                 REXCVAR_GET(guest_dt_from_host) ? " [dt forced from host]" : "");
+    REXLOG_INFO("{}: TIME SCALE +68 = {:.4f}, scaled clock +64 = {:.3f} against "
+                "total {:.3f} (ratio {:.4f}){}",
+                mx::native::g_plugin_mode ? "plugin" : "native", tscale, scaled,
+                total, total > 0.0f ? double(scaled) / double(total) : 0.0,
+                (tscale > 1.01f || tscale < 0.99f)
+                    ? "  <-- NOT 1.0, this is a time dilation factor"
+                    : "");
     // THE COUNT THAT MATTERS. Anything other than 1.00 advances per frame is
     // the world being stepped more than once for one tick of the clock, and
     // that is a speed multiplier no frame cap can reach. The dt each consumer
@@ -613,6 +637,21 @@ extern "C" REX_FUNC(sub_82B70370) {
       std::lock_guard<std::mutex> lk(g_stepMu);
       const double per = g_stepFrames ? double(g_stepCallsTotal) / double(g_stepFrames) : 0.0;
       const double dist = g_stepFrames ? double(g_stepDistinctTotal) / double(g_stepFrames) : 0.0;
+      {
+        std::string vts;
+        for (uint32_t i = 0; i < g_stepVtCount; ++i)
+          vts += fmt::format(" [vt0x{:08X} -> vt24=0x{:08X} vt28=0x{:08X} x{}]",
+                             g_stepVts[i].vt, g_stepVts[i].f24, g_stepVts[i].f28,
+                             g_stepVts[i].hits);
+        REXLOG_INFO("{}: ENTITY STEP TARGETS -- {} distinct entity vtable(s){}:{}",
+                    mx::native::g_plugin_mode ? "plugin" : "native",
+                    g_stepVtCount,
+                    g_stepVtOverflow
+                        ? fmt::format(" (+{} past the {}-slot cap)",
+                                      g_stepVtOverflow, kMaxStepVts)
+                        : std::string(),
+                    vts.empty() ? " (none)" : vts);
+      }
       REXLOG_INFO("{}: ENTITY STEPS over {} frames -- {} steps on {} distinct "
                   "entities ({:.1f} vs {:.1f} per frame) | {} steps hit an "
                   "entity ALREADY STEPPED this frame{}{}",
@@ -706,12 +745,47 @@ extern "C" REX_FUNC(sub_82BFC370) {
 
 // sub_82B6A448(entity, dt) — one entity's step, from the vector sub_82B6D230
 // walks. See the note at g_stepSeen.
+//
+// It dispatches each of four slots to vt[24] or vt[28] with (this, slot, dt):
+//
+//     if (*v5) { if (v2[2]) vt[28](v2, slot, dt); else vt[24](v2, slot, dt); }
+//
+// THOSE are where a fixed-timestep accumulator would live -- the
+// `while (accum >= STEP) { step(STEP); accum -= STEP; }` every physics engine
+// is written around. A wrong STEP or a doubly-fed accumulator there produces
+// exactly the evidence this hunt has: the outer call stays at 1.000/frame with
+// the correct dt, every clock reads 1.00, and the world still moves twice as
+// far. Nothing counted so far can see inside that call.
+//
+// Resolved rather than guessed, because they are virtual. Distinct vtables are
+// collected with their two targets so the population is visible instead of one
+// lucky sample.
 REX_IMPORT(__imp__sub_82B6A448, orig_EntityStep, void());
 extern "C" REX_FUNC(sub_82B6A448) {
   const uint32_t self = ctx.r3.u32;
   {
     std::lock_guard<std::mutex> lk(g_stepMu);
     ++g_stepCalls;
+    // The entity's vtable and its two step targets. Read under the lock that
+    // already guards this hook rather than adding a second one.
+    if (self && GuestRangeReadable(base, self, 4)) {
+      const uint32_t vt = REX_LOAD_U32(self);
+      if (vt && GuestRangeReadable(base, vt + 24u, 8)) {
+        uint32_t i = 0;
+        for (; i < g_stepVtCount; ++i)
+          if (g_stepVts[i].vt == vt) break;
+        if (i == g_stepVtCount) {
+          if (g_stepVtCount < kMaxStepVts) {
+            g_stepVts[g_stepVtCount++] = {vt, REX_LOAD_U32(vt + 24u),
+                                          REX_LOAD_U32(vt + 28u), 1};
+          } else {
+            ++g_stepVtOverflow;
+          }
+        } else {
+          ++g_stepVts[i].hits;
+        }
+      }
+    }
     // Linear: the list is small and this replaces a per-entity hash that would
     // cost more than it measures. If it ever is not small the counts still hold.
     bool seen = false;
