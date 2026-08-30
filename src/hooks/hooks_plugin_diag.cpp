@@ -741,73 +741,6 @@ extern "C" REX_FUNC(sub_824AF3C0) {
 // path.
 //=============================================================================
 //=============================================================================
-// 0x82BA91C0 -- AssetManager::Find(type, name), resolved at RUNTIME.
-//
-// This is assetMgr->vt[0x78], the lookup BinkVideoComponent_InitAndOpen uses to
-// turn the movie name into an asset, and whose NULL return is stored to
-// this+0x94 and then dereferenced at +0x58 by AcquirePlayer -- the 0x8234CE20
-// crash.
-//
-// The address had to come from the running game. Reading the IDB at
-// off_8214518C+0x78 gave 0x82BA8D40, which is the middle of sub_82BA8D08; the
-// live vtable holds 0x82BA91C0 there, and that same value appears as `ctr` in
-// the crash register dump, which is the independent confirmation. Static reads
-// of that table are not to be trusted.
-//
-// The function has TWO failure exits and they mean different things:
-//
-//     if (!sub_82BA8EE0(this + 1504, &type, out)) return 0;   // no such TYPE
-//     RtlEnterCriticalSection(...);
-//     if (!sub_82B099C0(&bucket[1], &name, out)) { ... return 0; }  // no NAME
-//     return out[0];
-//
-// So a miss is either "the 'bink' type bucket does not exist" or "the bucket
-// exists and RiderUI_Final_C_350 is not in it". The first says the package's
-// contents were never registered; the second says they were registered under a
-// different key. AssetDB_LoadPackage already reports SUCCESS for
-// db="UIAnimations" package="Rider", so one of those two is happening anyway.
-//
-// ONLY FAILURES ARE LOGGED, deduped by (type, name). This runs for every asset
-// lookup in the game and a per-call line would be a flood; a miss is rare and
-// is the entire signal. The type is 8 chars packed into one 64-bit register,
-// big-endian, so "bink" sits in the HIGH half ("texture\0" fills both).
-//=============================================================================
-// Which of AssetManager::Find's two exits returns 0 for the bink lookup.
-//
-// Find does:
-//     if (!sub_82BA8EE0(this + 1504, ...)) return 0;      // FIRST  lookup
-//     RtlEnterCriticalSection(...);
-//     if (!sub_82B099C0(...))  { ... return 0; }          // SECOND lookup
-//     return out[0];
-//
-// One is the type bucket and one is the name within it. The decompiler's
-// argument mapping for this function is NOT reliable -- it renders the name and
-// the 64-bit type as a2/a13/a14 in a way that contradicts the call sites, and
-// only the runtime r4=name / r5=type reading is confirmed (the probe prints
-// "bink", "material", "uicmpnt" and sensible names from it). So rather than
-// argue about which inner call is which, watch the FIRST one and let the result
-// say: if it fails, the miss happens before the critical section and nothing
-// about the name matters; if it succeeds, the miss is in the second lookup.
-//
-// Scoped by a thread-local so this costs a bool test on every other asset
-// lookup in the game -- sub_82BA8EE0 is generic and runs constantly.
-namespace {
-thread_local bool t_inBinkFind = false;
-}
-
-REX_IMPORT(__imp__sub_82BA8EE0, orig_AssetFindFirst, void());
-extern "C" REX_FUNC(sub_82BA8EE0) {
-  orig_AssetFindFirst(ctx, base);
-  if (!t_inBinkFind) return;
-  static uint64_t s_n = 0;
-  if (++s_n <= 4)
-    REXLOG_INFO("{}: AssetFind[bink] first lookup (sub_82BA8EE0) -> {}",
-                mx::native::g_plugin_mode ? "plugin" : "native",
-                ctx.r3.u32 ? "HIT -- so the miss is the SECOND lookup"
-                           : "MISS -- the miss is the FIRST lookup");
-}
-
-//=============================================================================
 // 0x82BAB128 -- the DATABASE WORKER THREAD, the consumer for the ring that
 // LoadAssetPackage writes into.
 //
@@ -842,105 +775,6 @@ extern "C" REX_FUNC(sub_82BA8EE0) {
 // so the first question is whether the thread runs at all, and the second is
 // what that global holds. Both are one line of log.
 //=============================================================================
-//=============================================================================
-// 0x8234CF80 -- BinkVideoComponent::InitAndOpen(this, propertySource).
-//
-// Resolves the component's properties, stores the looked-up bink asset at
-// this+0x94, and then calls AcquirePlayer UNCONDITIONALLY at 0x8234D16C --
-// which dereferences that asset at +0x58 with no null check. So this is where
-// the null is minted and where the 0x8234CE20 crash is decided.
-//
-// The movie name is copied to this+0x98 two steps BEFORE the lookup, so a
-// populated name with a zero asset is the exact signature of "the lookup ran
-// and missed" rather than "the property chain bailed out early to
-// loc_8234D150".
-//=============================================================================
-//=============================================================================
-// 0x8234CBB8 -- BinkVideoComponent property init. THE ONE THAT ACTUALLY RUNS.
-//
-// sub_8234CF80 (InitAndOpen) is NEVER CALLED in a run -- its probe below logs
-// nothing. This is its sibling: same property walk, same two lookups, but it
-// stops after storing them instead of calling AcquirePlayer. Which is exactly
-// why nothing faults here even when the bink asset comes back NULL:
-//
-//     v9 = sub_82AB8210("Bink Video Asset");
-//     sub_82AB4A68(a1 + 38, 259, v9);       // name -> +0x98
-//     if (v9) a1[37] = vt[0x78](mgr, name, 'bink', 1);   // +0x94 = asset
-//     a1[28] = 1;                            // +0x70
-//     a1[104] = 0;                           // +0x1A0
-//
-// The fault comes much later and from somewhere else: BeginVideoPlayback ->
-// Scene_AcquireVideoPlayer -> AcquirePlayer, which reads the +0x94 stored here
-// and writes through it at +0x58.
-//
-// Run 1672's ordering is the whole problem:
-//
-//     17:29:56  AssetFind bink "RiderUI_Final_C_350" -> MISS (lr=0x8234CD10)
-//     17:30:00  AssetDB_LoadPackage pkg="Rider" -> 1
-//     17:30:37  crash
-//
-// The component resolves its movie 4 seconds BEFORE the package holding it is
-// requested, caches the null, and nothing re-resolves it afterwards.
-//
-// What this probe adds: WHICH component, and whether any component is ever
-// initialised a SECOND time (which would mean the retry exists and is failing,
-// rather than there being no retry at all). Compare the pointer logged here
-// against r3 in the crash dump.
-//=============================================================================
-REX_IMPORT(__imp__sub_8234CBB8, orig_BinkInitProps, void());
-extern "C" REX_FUNC(sub_8234CBB8) {
-  const uint32_t self = ctx.r3.u32;
-  orig_BinkInitProps(ctx, base);
-  if (!PlausibleGuestPtr(self) || !GuestRangeReadable(base, self + 0x94u, 4))
-    return;
-  const uint32_t asset = REX_LOAD_U32(self + 0x94u);
-  const uint32_t tex = GuestRangeReadable(base, self + 0x90u, 4)
-                           ? REX_LOAD_U32(self + 0x90u)
-                           : 0;
-  std::string name;
-  if (GuestRangeReadable(base, self + 0x98u, 0x103u)) {
-    for (uint32_t i = 0; i < 0x102u; ++i) {
-      const char c = char(REX_LOAD_U8(self + 0x98u + i));
-      if (!c) break;
-      name.push_back(c);
-    }
-  }
-  static uint64_t s_n = 0;
-  REXLOG_INFO("{}: BinkInitProps #{} comp=0x{:08X} movie=\"{}\" bink=0x{:08X} "
-              "texOverride=0x{:08X}{}",
-              mx::native::g_plugin_mode ? "plugin" : "native", ++s_n, self,
-              name, asset, tex,
-              (!name.empty() && !asset)
-                  ? "  <-- NULL cached; AcquirePlayer will fault on this one"
-                  : "");
-}
-
-REX_IMPORT(__imp__sub_8234CF80, orig_BinkInitAndOpen, void());
-extern "C" REX_FUNC(sub_8234CF80) {
-  const uint32_t self = ctx.r3.u32;
-  orig_BinkInitAndOpen(ctx, base);
-  if (!PlausibleGuestPtr(self) || !GuestRangeReadable(base, self + 0x94u, 4))
-    return;
-  const uint32_t asset = REX_LOAD_U32(self + 0x94u);
-  const uint32_t open = GuestRangeReadable(base, self + 0x1A4u, 4)
-                            ? REX_LOAD_U32(self + 0x1A4u)
-                            : 0xFFFFFFFFu;
-  std::string name;
-  if (GuestRangeReadable(base, self + 0x98u, 0x103u)) {
-    for (uint32_t i = 0; i < 0x102u; ++i) {
-      const char c = char(REX_LOAD_U8(self + 0x98u + i));
-      if (!c) break;
-      name.push_back(c);
-    }
-  }
-  static uint64_t s_n = 0;
-  REXLOG_INFO("{}: BinkInitAndOpen #{} comp=0x{:08X} movie=\"{}\" asset=0x{:08X}"
-              " bOpen={}{}",
-              mx::native::g_plugin_mode ? "plugin" : "native", ++s_n, self,
-              name, asset, open,
-              asset ? "" : "  <-- NULL asset cached; AcquirePlayer will fault");
-}
-
 REX_IMPORT(__imp__sub_82BAB128, orig_DatabaseThread, void());
 extern "C" REX_FUNC(sub_82BAB128) {
   const uint32_t assetdb = ctx.r3.u32;
@@ -961,70 +795,27 @@ extern "C" REX_FUNC(sub_82BAB128) {
               mx::native::g_plugin_mode ? "plugin" : "native");
 }
 
-REX_IMPORT(__imp__sub_82BA91C0, orig_AssetFind, void());
-// The manager `this`, captured from a real call rather than re-derived.
+// 0x82BA91C0 -- AssetManager::Find(type, name), assetMgr->vt[0x78].
+//
+// Hooked for ONE reason: to capture the manager `this`. AcquirePlayer's
+// re-resolve below needs it and cannot afford a plausible-but-wrong value.
 //
 // It IS derivable -- engine = *(0x830BE400), manager = *(engine + 8) -- but
 // that walk has already been got wrong once in this file (dword_830BE400 read
-// as an address instead of a pointer variable, printing zeros), and the
-// re-resolve below cannot afford a plausible-but-wrong `this`. Any call at all
+// as an address instead of a pointer variable, printing zeros). Any call at all
 // hands us the correct value, and there are thousands before the one that
 // matters.
+//
+// The address had to come from the running game. Reading the IDB at
+// off_8214518C+0x78 gave 0x82BA8D40, which is the middle of sub_82BA8D08; the
+// live vtable holds 0x82BA91C0 there, and that same value appears as `ctr` in
+// the crash register dump. Static reads of that table are not to be trusted.
+REX_IMPORT(__imp__sub_82BA91C0, orig_AssetFind, void());
 std::atomic<uint32_t> g_assetManager{0};
 
 extern "C" REX_FUNC(sub_82BA91C0) {
-  const uint32_t name_ptr = ctx.r4.u32;
   if (ctx.r3.u32) g_assetManager.store(ctx.r3.u32, std::memory_order_relaxed);
-  const uint64_t type_bits = ctx.r5.u64;
-  // Big-endian: "bink" occupies the high half, low half zero.
-  const bool is_bink = (type_bits >> 32) == 0x62696E6Bull;
-  t_inBinkFind = is_bink;
   orig_AssetFind(ctx, base);
-  t_inBinkFind = false;
-  const uint32_t found = ctx.r3.u32;
-
-  char type[9] = {};
-  for (int i = 0; i < 8; ++i) {
-    const char c = char((type_bits >> (56 - i * 8)) & 0xFF);
-    type[i] = (c >= 0x20 && c < 0x7F) ? c : '\0';
-  }
-  const std::string name = GuestString(base, name_ptr, 128);
-  const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
-
-  // EVERY 'bink' LOOKUP, hit or miss, because the two readings of a miss want
-  // opposite fixes and only the hits separate them:
-  //
-  //   no bink lookup EVER succeeds -> the 'bink' TYPE BUCKET is missing or
-  //     empty, so the package's contents were never registered under it, and
-  //     the first exit of AssetManager::Find is what returns 0;
-  //   some succeed and RiderUI_Final_C_350 does not -> the bucket is fine and
-  //     this one name is absent or keyed differently.
-  //
-  // Logging only misses cannot tell those apart -- it has no denominator. The
-  // population is tiny (three bink assets exist in the whole game:
-  // RiderUI_Final_C_350, and RiderCloth_60fms_FNL in NAT_Farm and ST_Farm), so
-  // this is uncapped and unthrottled on purpose.
-  if (std::strcmp(type, "bink") == 0) {
-    // lr NAMES THE CALLER, which matters here: the only bink lookup in a run
-    // happens on the DATABASE WORKER thread 3.3s before the package is even
-    // requested, while the crash is on the script thread 14s after it. Whose
-    // lookup it is decides whether this is InitAndOpen caching a null or
-    // something else entirely.
-    REXLOG_INFO("{}: AssetFind bink \"{}\" -> {} (lr=0x{:08X})", tag, name,
-                found ? "FOUND" : "MISS", uint32_t(ctx.lr));
-    if (found) return;
-  }
-  if (found) return;  // a hit of any other type says nothing
-
-  static std::mutex s_mu;
-  static std::set<std::string> s_seen;
-  const std::string key = std::string(type) + "|" + name;
-  {
-    std::lock_guard<std::mutex> lk(s_mu);
-    if (s_seen.size() >= 64 || !s_seen.insert(key).second) return;
-  }
-  REXLOG_INFO("{}: AssetFind MISS type=\"{}\" name=\"{}\" (raw type 0x{:016X})",
-              tag, type, name, type_bits);
 }
 
 //=============================================================================
@@ -1032,16 +823,15 @@ extern "C" REX_FUNC(sub_82BA91C0) {
 //
 // THE 0x8234CE20 CRASH, FIXED AT THE POINT THE STALE NULL IS USED.
 //
-// The guest caches its bink asset at component+0x94 during BinkInitProps and
-// never re-resolves it. When the database worker constructs the component
-// before the script has asked for the package that holds the movie, the lookup
-// misses, a NULL is cached, and AcquirePlayer later writes through it at +0x58.
-// Main PC, run mx_010, every link in one log:
-//
-//   20:03:21.682 [worker] AssetFind bink "RiderUI_Final_C_350" -> MISS
-//   20:03:21.682 [worker] BinkInitProps #1 comp=0x21F9DB60 bink=0x00000000
-//   20:03:21.909 [script] LoadAssetDB "UIAnimations"        <- 0.227s LATER
-//   20:03:58.139          ACCESS VIOLATION write guest 0x58, r3=0x21F9DB60
+// The guest caches its bink asset at component+0x94 in BinkVideoComponent's
+// property init (sub_8234CBB8) and never re-resolves it. When the database
+// worker constructs the component before the script has asked for the package
+// that holds the movie, the lookup misses, a NULL is cached, and AcquirePlayer
+// later writes through it at +0x58. Main PC, run mx_010, every link traced in
+// one log: the worker resolved "RiderUI_Final_C_350" and missed at 20:03:21.682,
+// the script asked for the UIAnimations database 0.227s LATER, and the access
+// violation writing guest 0x58 with r3=0x21F9DB60 -- the same component --
+// landed at 20:03:58.139.
 //
 // It is a RACE, and it has been "fixed" by winning it before: async shader
 // compilation bought the script 0.9s on this VM and the crash went away here.
@@ -1065,7 +855,7 @@ REX_IMPORT(__imp__sub_8234CE20, orig_AcquirePlayer, void());
 extern "C" REX_FUNC(sub_8234CE20) {
   const uint32_t self = ctx.r3.u32;
   static std::atomic<uint64_t> s_repaired{0}, s_stillNull{0}, s_seenNull{0};
-  // Offsets are BinkInitProps's, which reads the same two fields.
+  // Offsets are sub_8234CBB8's, which writes the same two fields.
   if (self && GuestRangeReadable(base, self + 0x94u, 4) &&
       REX_LOAD_U32(self + 0x94u) == 0) {
     const uint64_t seen = s_seenNull.fetch_add(1, std::memory_order_relaxed) + 1;
