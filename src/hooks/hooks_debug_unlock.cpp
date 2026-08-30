@@ -36,7 +36,10 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <filesystem>
+#include <fstream>
 #include <string>
+#include <vector>
 
 // debug_native -- the engine's own "is this a debug build" predicate, which
 // ships compiled to a constant false.
@@ -99,12 +102,64 @@
 //   debug_native=census        answer FALSE, report the distinct callers
 //   debug_native=0x82AB6638    answer TRUE for that site only (verified)
 //   debug_native=all           answer TRUE everywhere; crashes, see above
-REXCVAR_DEFINE_STRING(debug_native, "", "Debug",
-                      "The engine's is-debug-build predicate, per call site. "
-                      "'census' lists the callers without changing anything; a "
-                      "comma-separated list of hex return addresses answers "
-                      "true for just those; 'all' answers true everywhere and "
-                      "crashes");
+// ONE SWITCH FOR ALL OF IT.
+//
+// These started as four cvars because they were found one at a time. They are
+// one feature -- "turn on the developer build" -- and four flags to spell that
+// is worse than one, so `dev` takes comma-separated tokens:
+//
+//   menu                     the Lua gate: DEFINE_BuildConfig -> "DEBUG"
+//   print                    capture the guest print() to logs/guest_print.log
+//   native:census            report the stub callers, change nothing
+//   native:<hex>             answer 1 for that ONE return address. REPEATABLE
+//   native:all               answer 1 everywhere. Crashes; see the note below
+//   bind:<Button>=<Action>   add one debug binding. REPEATABLE, and OFF unless
+//                            asked for -- the debug camera has no way to be
+//                            entered yet, so the bindings do nothing useful
+//
+//   --dev=menu,print,native:0x82AB6638
+//
+// native: and bind: are repeatable rather than comma-lists of their own,
+// because the token separator is already a comma and nesting one inside a
+// value is how a config format becomes unparseable.
+REXCVAR_DEFINE_STRING(dev, "", "Debug",
+                      "Developer switches, comma separated: menu, print, "
+                      "native:census|<hex>|all. See hooks_debug_unlock.cpp");
+
+namespace {
+
+// Split `dev` per call. It is read on cold paths only -- a Lua global
+// registration, a preset parse, a stub call -- so it never needs caching.
+bool DevFlag(const char* name) {
+  const std::string spec = REXCVAR_GET(dev);
+  size_t pos = 0;
+  while (pos < spec.size()) {
+    size_t comma = spec.find(',', pos);
+    if (comma == std::string::npos) comma = spec.size();
+    if (spec.compare(pos, comma - pos, name) == 0) return true;
+    pos = comma + 1;
+  }
+  return false;
+}
+
+// Every value given as `name:value`, in order.
+std::vector<std::string> DevOptions(const char* name) {
+  std::vector<std::string> out;
+  const std::string spec = REXCVAR_GET(dev);
+  const std::string prefix = std::string(name) + ":";
+  size_t pos = 0;
+  while (pos < spec.size()) {
+    size_t comma = spec.find(',', pos);
+    if (comma == std::string::npos) comma = spec.size();
+    const std::string tok = spec.substr(pos, comma - pos);
+    if (tok.rfind(prefix, 0) == 0) out.push_back(tok.substr(prefix.size()));
+    pos = comma + 1;
+  }
+  return out;
+}
+
+}  // namespace
+
 
 namespace {
 std::mutex g_dbgNativeMu;
@@ -113,29 +168,65 @@ uint64_t g_dbgNativeTrue = 0;
 std::chrono::steady_clock::time_point g_dbgNativeLast{};
 }  // namespace
 
+void NoteGuestPrint(const std::string& text);
+
+// A Lua string argument, read straight off the stack.
+//
+// Deliberately a local copy of the reader in hooks_plugin_diag.cpp rather than
+// a shared symbol: it is twenty guarded lines, and the alternative is this
+// file depending on the internals of the diagnostics file it was just split
+// out of. Every field is range-checked, because the argument is guest data of
+// whatever type the script happened to pass -- this project has already killed
+// the process once by dereferencing a plausible-looking value.
+std::string LuaArgString(uint8_t* base, uint32_t L, uint32_t index) {
+  constexpr uint32_t kTValueStride = 16, kTValueType = 8, kLuaTString = 4;
+  constexpr uint32_t kTStringLen = 12, kTStringChars = 16;
+  if (!L || !GuestRangeReadable(base, L + 12, 4)) return {};
+  const uint32_t stack = REX_LOAD_U32(L + 12);
+  const uint32_t slot = stack + index * kTValueStride;
+  if (!stack || !GuestRangeReadable(base, slot, kTValueStride)) return {};
+  if (REX_LOAD_U32(slot + kTValueType) != kLuaTString) return {};
+  const uint32_t ts = REX_LOAD_U32(slot);
+  if (!ts || !GuestRangeReadable(base, ts, kTStringChars)) return {};
+  uint32_t len = REX_LOAD_U32(ts + kTStringLen);
+  if (len > 512u) len = 512u;
+  if (!len || !GuestRangeReadable(base, ts + kTStringChars, len)) return {};
+  std::string out;
+  out.reserve(len);
+  for (uint32_t i = 0; i < len; ++i) {
+    const char c = char(REX_LOAD_U8(ts + kTStringChars + i));
+    if (!c) break;
+    out.push_back(c);
+  }
+  return out;
+}
+
 REX_IMPORT(__imp__sub_829E8FA8, orig_IsDebugBuild, void());
 extern "C" REX_FUNC(sub_829E8FA8) {
   const uint32_t lr = uint32_t(ctx.lr);
+  // THE GUEST'S print(), CAUGHT HERE. Lua binds print to this same folded stub
+  // (sub_82500760 pushes "print", then this address as the C closure), and Lua
+  // calls a C function with r3 = lua_State -- so this is the one call site
+  // where the argument list is reachable. The dispatcher is not: its r3 is its
+  // own first parameter, not the state, which is what the first attempt got
+  // wrong and why the capture came back empty.
+  //
+  // Every other caller of this stub passes something that is not a lua_State,
+  // and LuaArgString range-checks its way to an empty string on all of them.
+  // A non-empty result is a string argument on a real Lua stack.
+  NoteGuestPrint(LuaArgString(base, ctx.r3.u32, 0));
   orig_IsDebugBuild(ctx, base);
-  const std::string spec = REXCVAR_GET(debug_native);
-  if (spec.empty()) return;
+  const std::vector<std::string> sites = DevOptions("native");
+  if (sites.empty()) return;
 
   bool want = false;
-  if (spec == "all") {
-    want = true;
-  } else if (spec != "census") {
-    // Exact return addresses, comma separated. Matching on lr rather than on
-    // the enclosing function keeps this to the one call the log named.
-    size_t pos = 0;
-    while (pos < spec.size() && !want) {
-      size_t comma = spec.find(',', pos);
-      if (comma == std::string::npos) comma = spec.size();
-      const std::string one = spec.substr(pos, comma - pos);
-      pos = comma + 1;
-      if (one.empty()) continue;
-      const uint32_t v = uint32_t(std::strtoul(one.c_str(), nullptr, 0));
-      if (v && v == lr) want = true;
-    }
+  for (const std::string& one : sites) {
+    if (one == "all") { want = true; break; }
+    if (one == "census") continue;
+    // Exact return address. Matching on lr rather than on the enclosing
+    // function keeps this to the one call the log named.
+    const uint32_t v = uint32_t(std::strtoul(one.c_str(), nullptr, 0));
+    if (v && v == lr) { want = true; break; }
   }
   if (want) ctx.r3.u64 = 1;
 
@@ -152,9 +243,9 @@ extern "C" REX_FUNC(sub_829E8FA8) {
   std::string rows;
   for (const auto& [site, n] : g_dbgNativeAsks)
     rows += fmt::format(" [lr=0x{:08X} x{}]", site, n);
-  REXLOG_INFO("{}: debug_native CALLERS ({}) -- {} distinct site(s), {} answer(s) "
+  REXLOG_INFO("{}: dev native CALLERS ({}) -- {} distinct site(s), {} answer(s) "
               "flipped to true:{}",
-              mx::native::g_plugin_mode ? "plugin" : "native", spec,
+              mx::native::g_plugin_mode ? "plugin" : "native", REXCVAR_GET(dev),
               g_dbgNativeAsks.size(), g_dbgNativeTrue,
               rows.empty() ? " (none)" : rows);
 }
@@ -196,12 +287,6 @@ extern "C" REX_FUNC(sub_829E8FA8) {
 // write: a known shipped binding is read back and must match, or nothing is
 // written and the log says so. Getting 780/25/260 wrong would otherwise
 // scribble over the input table.
-REXCVAR_DEFINE_STRING(debug_binds, "", "Debug",
-                      "Comma-separated button=action pairs to add to every "
-                      "controller preset, e.g. "
-                      "Button7=DebugCameraForward,Button14=DebugCameraBackward. "
-                      "Only slots the shipped presets leave empty are written");
-
 namespace {
 
 constexpr uint32_t kPresetTable = 0x82DAA740u;
@@ -246,8 +331,8 @@ extern "C" REX_FUNC(sub_82B69BA8) {
 REX_IMPORT(__imp__sub_82308300, orig_ParsePresets, void());
 extern "C" REX_FUNC(sub_82308300) {
   orig_ParsePresets(ctx, base);
-  const std::string spec = REXCVAR_GET(debug_binds);
-  if (spec.empty()) return;
+  const std::vector<std::string> pairs = DevOptions("bind");
+  if (pairs.empty()) return;
   const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
 
   std::lock_guard<std::mutex> lk(g_bindMu);
@@ -270,12 +355,8 @@ extern "C" REX_FUNC(sub_82308300) {
   }
 
   uint32_t applied = 0, skipped_taken = 0, unknown = 0;
-  size_t pos = 0;
-  while (pos < spec.size()) {
-    size_t comma = spec.find(',', pos);
-    if (comma == std::string::npos) comma = spec.size();
-    std::string pair = spec.substr(pos, comma - pos);
-    pos = comma + 1;
+  for (const std::string& pair_in : pairs) {
+    std::string pair = pair_in;
     const size_t eq = pair.find('=');
     if (eq == std::string::npos) continue;
     std::string btn = pair.substr(0, eq);
@@ -300,7 +381,7 @@ extern "C" REX_FUNC(sub_82308300) {
       ++applied;
     }
   }
-  REXLOG_INFO("{}: debug_binds applied {} binding(s) across {} presets, {} slot(s) "
+  REXLOG_INFO("{}: dev bind applied {} binding(s) across {} presets, {} slot(s) "
               "left alone because the guest already bound them, {} unknown "
               "button name(s); {} button names learned",
               tag, applied, kPresetCount, skipped_taken, unknown,
@@ -337,14 +418,9 @@ extern "C" REX_FUNC(sub_82308300) {
 // (0x8204E1E4) is an existing guest string, so no memory has to be written
 // into the guest to supply the value. The scripts test for inequality against
 // "RELEASE", so any other value would do.
-REXCVAR_DEFINE_BOOL(debug_menu, false, "Debug",
-                    "Set the guest's DEFINE_BuildConfig Lua global to DEBUG "
-                    "instead of RELEASE, which is what its own scripts gate "
-                    "the developer menu and debug printing on");
-
 REX_IMPORT(__imp__sub_82A9F468, orig_LuaPushString, void());
 extern "C" REX_FUNC(sub_82A9F468) {
-  if (REXCVAR_GET(debug_menu) && ctx.r4.u32 == 0x820468E0u) {
+  if (DevFlag("menu") && ctx.r4.u32 == 0x820468E0u) {
     ctx.r4.u64 = 0x8204E1E4u;  // "DEBUG"
     static std::atomic<bool> s_said{false};
     bool expected = false;
@@ -354,4 +430,53 @@ extern "C" REX_FUNC(sub_82A9F468) {
                   mx::native::g_plugin_mode ? "plugin" : "native");
   }
   orig_LuaPushString(ctx, base);
+}
+
+// guest_print_log -- the guest's own print() output, which the retail build
+// throws away.
+//
+// Lua's `print` is registered in sub_82500760 as a C closure whose function is
+// sub_829E8FA8 -- the folded `return 0;` body. So every print() in the shipped
+// scripts formats nothing and returns, and there is no TTY channel to capture:
+// the output was never produced. The scripts print a lot (chunk load banners,
+// "FE_Title:OnMovieStart - <state>", routing decisions in
+// SH_FrontEndLoading:Route), and all of it is lost.
+//
+// Captured at the SCRIPT DISPATCHER rather than at the stub, because the
+// dispatcher is where the lua_State and the argument list are both in hand.
+// The stub itself is folded and shared, so a hook there would have neither.
+//
+// The cfunc match is on that folded address, so a call to any OTHER stubbed
+// binding lands here too. That is why only calls with a non-empty STRING first
+// argument are written: a stub that is not print does not take one, and a
+// print with nothing to say is not worth a line. The file is self-evidencing
+// either way -- if the contents read like the game's own log messages, it is
+// print; if they read like nothing, the heuristic is wrong and it is visible
+// immediately.
+//
+// Its own file, so the main log stays readable and the guest's voice is not
+// interleaved with ours.
+namespace {
+std::mutex g_printMu;
+std::ofstream g_printFile;
+uint64_t g_printLines = 0;
+}  // namespace
+
+void NoteGuestPrint(const std::string& text) {
+  if (text.empty() || !DevFlag("print")) return;
+  std::lock_guard<std::mutex> lk(g_printMu);
+  if (!g_printFile.is_open()) {
+    std::error_code ec;
+    std::filesystem::create_directories("logs", ec);
+    g_printFile.open("logs/guest_print.log", std::ios::out | std::ios::trunc);
+    if (!g_printFile.is_open()) return;
+    g_printFile << "# guest Lua print() output. The retail build binds print to\n"
+                   "# sub_829E8FA8, a folded `return 0;`, so none of this is\n"
+                   "# printed by the game itself.\n";
+  }
+  g_printFile << text << '\n';
+  // Flushed every line on purpose: this exists to survive a crash, and the
+  // volume is a few hundred lines a run rather than a few hundred thousand.
+  g_printFile.flush();
+  ++g_printLines;
 }
