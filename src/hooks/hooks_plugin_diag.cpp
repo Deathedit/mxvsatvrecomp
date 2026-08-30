@@ -2817,92 +2817,33 @@ constexpr uint32_t kCompTextureAsset = 664;
 // exactly the observed symptom: every gate passes, the item is queued, and
 // no draw comes out.
 constexpr uint32_t kItemLayerIndex = 248;
-constexpr uint32_t kLayerPriorityTable = 0x830C0000;
-// A layer index is a small enum. Anything larger is a misread, and reading
-// the table at a wild offset would be a wild guest load - so it is bounded
-// and the out-of-range case is COUNTED rather than silently clamped.
-constexpr uint32_t kMaxSaneLayerIndex = 256;
-constexpr uint32_t kCompSubmitter = 192;
-constexpr uint32_t kCompPendingItem = 240;
-constexpr uint32_t kCompPlayerObj = 668;
+// kLayerPriorityTable, kMaxSaneLayerIndex, kCompSubmitter, kCompPendingItem and
+// kCompPlayerObj went with the VIDEO COMPONENT RENDER report (2026-08-30). They
+// were read only to fill its row, and a constant nothing uses is the kind of
+// thing a later reader takes for live structure.
 
+// What the BINK GATE needs, and nothing else.
+//
+// This was a ~25-field probe feeding a VIDEO COMPONENT RENDER line, built for
+// the Bink/video-composite investigations. Those are closed --
+// [[bink-gate-fe-smoke]] LANDED, [[intro-logo-is-orphaned-video-target]] and
+// [[menu-backdrop-is-post-composite]] solved -- and bink and the UI work, so
+// the reporting went with them (2026-08-30).
+//
+// The STRUCT stays because it is not diagnostics: sub_8234D630's gate decides
+// whether to skip a Bink decode entirely, and it decides it from these three
+// fields. Deleting them would silently revert that optimisation and put
+// FE_Smoke.bik back to decoding, compositing and resolving every frame into a
+// texture nothing samples.
 struct VideoComponentProbe {
   uint32_t component = 0;
+  // Only so the gate's log line can name the movie it is skipping.
   std::string video;
+  // The gate matches players to components on this.
   uint32_t texture_asset = 0;
-  uint32_t player = 0;
-  uint64_t render_calls = 0;
-  uint32_t last_material = 0;
-  uint32_t last_draw_item = 0;
-  // Who called the render prepare. Slot 15 is reached through a virtual call
-  // and static hunting for it failed: the `lwz rD, 0x3C(rA)` encodings produce
-  // 40+ candidate sites and not one of them is in the UI range, so the caller
-  // is not findable by pattern. The link register names it outright.
-  uint32_t first_caller = 0;
-  uint32_t last_caller = 0;
-  // The per-frame step that decides whether the quad rebuilds and draws.
-  //
-  //   sub_8236DB10(this)   if (this[+176] & 0xC0000000) -> slot 15 rebuild
-  //   sub_8236DCA8(this)   return (this[+172] >> 4) & 1  -> then submit
-  //
-  // Two INDEPENDENT gates, so `slot 15 never ran` has three causes and these
-  // separate them:
-  //   visit_calls == 0     the component is never traversed at all -- it is
-  //                        not in the active layer, and the question moves up
-  //                        to whoever walks the tree.
-  //   dirty_seen == 0      it is traversed but never marked dirty, so the
-  //                        quad is never (re)built.
-  //   visible_seen == 0    it is traversed but bit 4 of +172 is clear, so
-  //                        nothing is ever submitted.
+  // THE decision input: "has any component using this asset ever been
+  // traversed". Zero means the target is dead and the decode is skippable.
   uint64_t visit_calls = 0;
-  uint64_t dirty_seen = 0;
-  uint64_t visible_seen = 0;
-  uint32_t last_flags172 = 0;
-  uint32_t last_flags176 = 0;
-  // Sampled in the per-frame visit. That hook runs at the TOP of the draw
-  // step (sub_8237A6D0 / sub_8237B1D0), which sub_8237AB78 tail-calls right
-  // after allocating the frame's draw item into +240 -- so at this point
-  // +240 is freshly allocated and slot 13 has not yet consumed it. Both
-  // ends of its lifetime are therefore visible here.
-  //
-  // Each carries a non-null COUNT, not just the last value: a single
-  // last-seen pointer cannot distinguish "always null" from "null on the
-  // frame we happened to sample", and that distinction is the whole point.
-  uint32_t last_submitter = 0;     // +192
-  uint32_t last_pending_item = 0;  // +240
-  uint32_t last_player_obj = 0;    // +668
-  uint64_t submitter_nonnull = 0;
-  uint64_t pending_nonnull = 0;
-  uint64_t player_nonnull = 0;
-  uint64_t draw_item_nonnull = 0;  // +236, set by slot 15
-  // The submit in slot 13 is a VIRTUAL call on the object at +192:
-  //
-  //     (*(v3->vtbl + 12))(v3, this[240], 0);   // slot 3 -- the submit
-  //     (*(v3->vtbl +  4))(v3, *(UIManager+560));// slot 1 -- the context
-  //
-  // Its target cannot be read off the vtable statically because the object
-  // is chosen at run time, but it is two guest loads once the pointer is in
-  // hand. Resolving it here is the same move that named the drain from the
-  // link register after a static hunt failed -- let it name itself.
-  uint32_t last_submitter_vtbl = 0;
-  uint32_t last_submit_fn = 0;   // vtbl + 12
-  uint32_t last_slot1_fn = 0;    // vtbl + 4
-  // THE LAST GATE. Slot 1 (sub_82B268A8) emits a draw only for an item whose
-  // +212 has a non-zero TOP BYTE:
-  //
-  //     v4 = *(this + 104);                      // the installed item
-  //     if ((*(v4 + 212) & 0xFF000000) != 0) { ... emit ... }
-  //     return;                                  // otherwise silently nothing
-  //
-  // Read off the PERSISTENT item at +236, not the per-frame one at +240: the
-  // image draw step (sub_8237A6D0) copies +236 into +240 via the item's own
-  // vtable slot 2, and that copy happens AFTER this hook runs. +236 is the
-  // stable source and is already populated by slot 15.
-  uint32_t last_item212 = 0;
-  uint64_t item212_top_nonzero = 0;
-  uint32_t last_layer248 = 0;       // *(uint16*)(item236 + 248)
-  uint32_t last_layer_prio = 0;     // raw bits of table[last_layer248]
-  uint64_t layer_out_of_range = 0;
 };
 
 std::mutex g_videoProbeMu;
@@ -2932,52 +2873,6 @@ std::string MaterialLabel(uint32_t handle) {
   return it == g_materialNames.end()
              ? fmt::format("0x{:08X} <unnamed>", handle)
              : fmt::format("0x{:08X} \"{}\"", handle, it->second);
-}
-
-// The whole population, every time. Caller holds g_videoProbeMu.
-//
-// Throttled on TIME and on the population changing -- NOT on a render count.
-// The first cut fired only at `total == 1 || total % 600 == 0`, which printed
-// exactly once, at a moment when two of the six components had registered and
-// FE_Smoke had not. Its row never appeared at all, and an absent row is
-// indistinguishable from `renders 0`, which is the entire question. A counter
-// whose reporting condition can be skipped over is the same defect as one that
-// cannot fire.
-void ReportVideoComponents(bool force) {
-  static std::chrono::steady_clock::time_point s_last{};
-  static size_t s_lastCount = 0;
-  const auto now = std::chrono::steady_clock::now();
-  const bool grew = g_videoProbes.size() != s_lastCount;
-  if (!force && !grew &&
-      now - s_last < std::chrono::seconds(3))
-    return;
-  s_last = now;
-  s_lastCount = g_videoProbes.size();
-  uint64_t total = 0;
-  std::string rows;
-  for (const auto& q : g_videoProbes) {
-    total += q.render_calls;
-    rows += fmt::format(
-        " [\"{}\" comp0x{:08X} renders{} visits{} dirty{} visible{} "
-        "f172=0x{:08X} f176=0x{:08X} material={} item0x{:08X} "
-        "texasset0x{:08X} caller0x{:08X} submitter192=0x{:08X}(n{}) "
-        "pend240=0x{:08X}(n{}) player668=0x{:08X}(n{}) item236n{} "
-        "subvt=0x{:08X} submitFn=0x{:08X} slot1Fn=0x{:08X} "
-        "item212=0x{:08X}(topNZ n{}) layer248={} prio=0x{:08X}({:g}) oor{}]",
-        q.video, q.component, q.render_calls, q.visit_calls, q.dirty_seen,
-        q.visible_seen, q.last_flags172, q.last_flags176,
-        MaterialLabel(q.last_material), q.last_draw_item, q.texture_asset,
-        q.last_caller, q.last_submitter, q.submitter_nonnull,
-        q.last_pending_item, q.pending_nonnull, q.last_player_obj,
-        q.player_nonnull, q.draw_item_nonnull, q.last_submitter_vtbl,
-        q.last_submit_fn, q.last_slot1_fn, q.last_item212,
-        q.item212_top_nonzero, q.last_layer248, q.last_layer_prio,
-        std::bit_cast<float>(q.last_layer_prio), q.layer_out_of_range);
-  }
-  REXLOG_INFO("native: VIDEO COMPONENT RENDER {} components, {} renders "
-              "total, {} material resolves --{}",
-              g_videoProbes.size(), total, g_materialResolves.load(),
-              rows.empty() ? " (none)" : rows);
 }
 
 // ---- The full UI inventory -------------------------------------------------
@@ -3118,17 +3013,12 @@ void NoteVideoComponent(uint32_t component, const std::string& video,
   if (VideoComponentProbe* p = FindProbe(component)) {
     p->video = video;
     p->texture_asset = texture_asset;
-    p->player = player;
     return;
   }
   if (g_videoProbes.size() >= 16) return;
   g_videoCompFast[g_videoProbes.size()].store(component,
                                               std::memory_order_release);
-  g_videoProbes.push_back({component, video, texture_asset, player});
-  // Report on registration too, so a component that NEVER renders still gets a
-  // row. Without this the only reporter is the render hook, and a component
-  // that never renders is exactly the one that would never be printed.
-  ReportVideoComponents(true);
+  g_videoProbes.push_back({component, video, texture_asset, 0});
 }
 
 // sub_82388560(slot, name) — the material-name resolver.
@@ -3248,42 +3138,11 @@ extern "C" REX_FUNC(sub_8236DB10) {
   std::lock_guard<std::mutex> lk(g_videoProbeMu);
   VideoComponentProbe* p = FindProbe(self);
   if (!p) return;
+  // visit_calls ONLY. Everything else this hook sampled -- dirty/visible
+  // counts, the flag words, the submitter/pending/player pointers, the draw
+  // item's layer index and priority -- existed to fill a report that is gone.
+  // The gate reads this counter and nothing else.
   ++p->visit_calls;
-  if (flags176 & 0xC0000000u) ++p->dirty_seen;
-  if ((flags172 >> 4) & 1u) ++p->visible_seen;
-  p->last_flags172 = flags172;
-  p->last_flags176 = flags176;
-  // The slot-13 branch fields. Read after the original: it only touches the
-  // +176 flag group and the slot-15 rebuild, neither of which owns these.
-  p->last_submitter = REX_LOAD_U32(self + kCompSubmitter);
-  p->last_pending_item = REX_LOAD_U32(self + kCompPendingItem);
-  p->last_player_obj = REX_LOAD_U32(self + kCompPlayerObj);
-  const uint32_t item236 = REX_LOAD_U32(self + kCompDrawItem);
-  if (p->last_submitter) ++p->submitter_nonnull;
-  // Resolve the submit target. Two indirections, both guarded, and only for
-  // the handful of watched video components -- not on the UI hot path.
-  if (PlausibleGuestPtr(p->last_submitter)) {
-    const uint32_t vtbl = REX_LOAD_U32(p->last_submitter);
-    p->last_submitter_vtbl = vtbl;
-    if (PlausibleGuestPtr(vtbl)) {
-      p->last_submit_fn = REX_LOAD_U32(vtbl + 12);
-      p->last_slot1_fn = REX_LOAD_U32(vtbl + 4);
-    }
-  }
-  if (p->last_pending_item) ++p->pending_nonnull;
-  if (p->last_player_obj) ++p->player_nonnull;
-  if (item236) ++p->draw_item_nonnull;
-  if (PlausibleGuestPtr(item236)) {
-    p->last_item212 = REX_LOAD_U32(item236 + 212);
-    if (p->last_item212 & 0xFF000000u) ++p->item212_top_nonzero;
-    p->last_layer248 = REX_LOAD_U16(item236 + kItemLayerIndex);
-    if (p->last_layer248 < kMaxSaneLayerIndex)
-      p->last_layer_prio =
-          REX_LOAD_U32(kLayerPriorityTable + p->last_layer248 * 4);
-    else
-      ++p->layer_out_of_range;
-  }
-  ReportVideoComponents(false);
 }
 
 //-----------------------------------------------------------------------------
@@ -3457,15 +3316,9 @@ extern "C" REX_FUNC(sub_8237ABA8) {
 
   // Read AFTER the original: it is what assigns the draw item's material, and
   // the whole question is what it ended up holding.
-  std::lock_guard<std::mutex> lk(g_videoProbeMu);
-  VideoComponentProbe* p = FindProbe(self);
-  if (!p) return;  // some other image component; not this probe's population
-  ++p->render_calls;
-  p->last_material = REX_LOAD_U32(self + kCompMaterialSlot);
-  p->last_draw_item = REX_LOAD_U32(self + kCompDrawItem);
-  if (!p->first_caller) p->first_caller = caller;
-  p->last_caller = caller;
-  ReportVideoComponents(false);
+  // Nothing left to record here: render_calls, the material, the draw item
+  // and the caller were all report-only. The gate never read any of them.
+  (void)caller;
 }
 
 //-----------------------------------------------------------------------------
