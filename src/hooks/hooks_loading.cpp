@@ -296,6 +296,8 @@ namespace {
 
 using mx::hooks::d3d9::HostPageReadable;
 
+std::atomic<uint64_t> g_forestDrawCalls{0};
+std::atomic<uint64_t> g_forestBatches{0};
 std::atomic<uint64_t> g_guestThreads{0};
 std::atomic<uint64_t> g_forestThreadBody{0};
 std::atomic<uint64_t> g_forestInit{0};
@@ -320,9 +322,12 @@ void ReportForest(const char* why) {
               g_forestKickGateOpen.load(std::memory_order_relaxed),
               g_forestTreeAdded.load(std::memory_order_relaxed),
               g_forestAsset.load(std::memory_order_relaxed));
-  REXLOG_INFO("forest:   guest threads created {}, cull-thread body entered {}",
+  REXLOG_INFO("forest:   guest threads created {}, cull-thread body entered {} "
+              "| DRAW consumer called {}, batches emitted {}",
               g_guestThreads.load(std::memory_order_relaxed),
-              g_forestThreadBody.load(std::memory_order_relaxed));
+              g_forestThreadBody.load(std::memory_order_relaxed),
+              g_forestDrawCalls.load(std::memory_order_relaxed),
+              g_forestBatches.load(std::memory_order_relaxed));
 }
 
 }  // namespace
@@ -426,4 +431,38 @@ REX_HOOK_RAW(sub_823F9260) {
               "scheduled; anything after this is the wait on ForestSystemStart",
               ctx.r3.u32);
   __imp__sub_823F9260(ctx, base);
+}
+
+//=============================================================================
+// THE DRAW SIDE. The cull works -- 2337 trees added in mx_1773 -- so whatever
+// is wrong is downstream of it.
+//
+// sub_823F9808 is the consumer, read out of the IDB:
+//
+//     WaitForSingleObject(this[3974], INFINITE)
+//     for each tree TYPE t, for each entry i:
+//         sub_823F82D0(renderer, t, i, this[...], this[...])
+//     (*(renderer_vtable + 16))(renderer)          <- the flush
+//     SetEvent(this[3974])
+//
+// so there are exactly two ways for 2337 culled trees to produce no draw: the
+// consumer never runs, or it runs and its loop bound is zero -- the cull fills
+// one set of lists and the draw reads another, or reads them after something
+// has cleared them.
+//
+// Counting both distinguishes those without another IDA session, and the ratio
+// is the interesting part: batches per consumer call against trees added.
+//=============================================================================
+
+REX_EXTERN(__imp__sub_823F9808);
+REX_HOOK_RAW(sub_823F9808) {
+  g_forestDrawCalls.fetch_add(1, std::memory_order_relaxed);
+  __imp__sub_823F9808(ctx, base);
+}
+
+// One call per batch the draw loop actually emits.
+REX_EXTERN(__imp__sub_823F82D0);
+REX_HOOK_RAW(sub_823F82D0) {
+  g_forestBatches.fetch_add(1, std::memory_order_relaxed);
+  __imp__sub_823F82D0(ctx, base);
 }
