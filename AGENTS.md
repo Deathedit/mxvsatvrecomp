@@ -209,6 +209,7 @@ so they describe what a plain run already does, not what you can turn on.
 | `d3d9_diag_row_heartbeat` | 16 | Draw reports an unchanged population may pass before `UP CALLERS`, the per-config stencil rows and the per-declaration `decl-draws` rows dump anyway. A new call site or config still prints immediately; `0` = only on change, `1` = every report |
 | `d3d9_diag_frame_every` | 30 | Frames between the per-swap lines (`FRAME DRAWS`, `UNBUILT *`, `RING vs HLE`, `ALU LOAD`). Per-frame deltas accumulate across the gap rather than being dropped, and the first five swaps always print; `0`/`1` = every swap |
 | `guest_dt_from_host` | off | Replace the guest's computed frame dt with true host elapsed time, keeping its own max-frame clamp. Forces game speed to real time at any frame rate |
+| `guest_vblank_hz` | 60 | Pace the guest's vblank interrupt to this many per second, as the console's fixed 60 Hz did. Our source is the host display, so a 175 Hz monitor otherwise gives the guest 2.9x the rate every timer in the title was written against. `0` passes the host rate through (the A/B control) |
 | `registry_override` | — | Force a registry key, e.g. `ReadyToLaunch=1`. A diagnostic lever, not a fix |
 
 **Seven were retired on 2026-08-12**, by the same test that retired four on

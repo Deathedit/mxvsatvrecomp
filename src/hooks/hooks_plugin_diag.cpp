@@ -98,6 +98,38 @@ std::atomic<uint64_t> g_vblankHandler{0};   // sub_825663B0, the flip pass
 // monitor is exactly 2x -- and it would be machine-dependent, which nothing
 // else measured so far is.
 constexpr double kConsoleVblankHz = 60.0;
+std::atomic<uint64_t> g_gpuIntDropped{0};
+
+}  // namespace
+
+// THE VBLANK RATE IS THE HOST'S, AND THE CONSOLE'S WAS 60.
+//
+// The Xbox 360 delivered 60 vblanks a second, full stop, and the title's frame
+// cadence counts them (sub_825663B0: ++a1[4190], retire any queued swap whose
+// target vblank has arrived). Our source is the host display, so the guest sees
+// whatever the monitor runs at -- 175 Hz on the user's main rig, which is 2.9x
+// the rate every timer in this title was written against, and 0 on the dev VM,
+// which has no real display and therefore no vsync source at all.
+//
+// That asymmetry is why this bug is machine-dependent and why nothing else in
+// this hunt reproduced it: dt, GUEST CLOCK, world steps per frame and dispatch
+// executions all measured identical on both machines, because all of them ride
+// on QPC rather than on vblanks.
+//
+// This paces the guest's vblank to a fixed period the way the hardware did.
+// Excess interrupts are DROPPED rather than coalesced -- the guest counts
+// edges, so delivering one edge per period is exactly what the console did,
+// and delivering a "catch-up" burst afterwards would be the thing being
+// avoided. Same reasoning as the swap pacer in hooks_frame.cpp.
+//
+// Set to 0 to pass every host interrupt through, which is the old behaviour and
+// the A/B control. Dropped counts are logged, so this can never be silent.
+REXCVAR_DEFINE_INT32(guest_vblank_hz, 60, "Debug",
+                     "Pace the guest's vblank interrupt to this many per "
+                     "second, the way the console's fixed 60Hz did. 0 passes "
+                     "the host's rate straight through");
+
+namespace {
 
 // A CALL IS NOT AN EXECUTION, and RendererDispatch is the case that proves it.
 //
@@ -393,7 +425,19 @@ extern "C" REX_FUNC(sub_82B70370) {
                     ? double(vbl) / s_hostElapsed / kConsoleVblankHz
                     : 0.0,
                 swp, oth, flips,
-                vbl == 0 ? "  <-- NO VBLANKS DELIVERED AT ALL" : "");
+                vbl == 0
+                    ? "  <-- NO VBLANKS DELIVERED AT ALL"
+                    : "");
+    REXLOG_INFO("{}: VBLANK PACING guest_vblank_hz={} -- {} host vblanks seen, "
+                "{} dropped, {} delivered ({:.1f}/s to the guest)",
+                mx::native::g_plugin_mode ? "plugin" : "native",
+                REXCVAR_GET(guest_vblank_hz), vbl,
+                g_gpuIntDropped.load(std::memory_order_relaxed),
+                vbl - g_gpuIntDropped.load(std::memory_order_relaxed),
+                s_hostElapsed > 0.0
+                    ? double(vbl - g_gpuIntDropped.load(std::memory_order_relaxed)) /
+                          s_hostElapsed
+                    : 0.0);
     REXLOG_INFO("{}: FIXED-60 STEPS over {} frames -- {} entity passes at the "
                 "hardcoded 1/60 ({:.3f}/frame), sub_82AB58F8 ran {} times "
                 "({:.3f}/frame). Implied world advance {:.3f}x real",
@@ -433,9 +477,46 @@ extern "C" REX_FUNC(sub_82B6D230) {
 REX_IMPORT(__imp__sub_825582E0, orig_GpuInterrupt, void());
 extern "C" REX_FUNC(sub_825582E0) {
   const uint32_t source = ctx.r3.u32;
-  if (source == 0) g_gpuIntVblank.fetch_add(1, std::memory_order_relaxed);
-  else if (source == 1) g_gpuIntSwap.fetch_add(1, std::memory_order_relaxed);
-  else g_gpuIntOther.fetch_add(1, std::memory_order_relaxed);
+  if (source == 1) {
+    g_gpuIntSwap.fetch_add(1, std::memory_order_relaxed);
+    orig_GpuInterrupt(ctx, base);
+    return;
+  }
+  if (source != 0) {
+    g_gpuIntOther.fetch_add(1, std::memory_order_relaxed);
+    orig_GpuInterrupt(ctx, base);
+    return;
+  }
+  // Vblank. Counted BEFORE the pacing decision, so the line always reports the
+  // rate the host is actually producing rather than the rate we let through --
+  // otherwise the measurement would be tautological once the lever is on, which
+  // is a mistake already made once in this file with GAME SPEED.
+  g_gpuIntVblank.fetch_add(1, std::memory_order_relaxed);
+  const int hz = REXCVAR_GET(guest_vblank_hz);
+  if (hz > 0) {
+    static std::mutex s_mu;
+    static std::chrono::steady_clock::time_point s_next{};
+    const auto period = std::chrono::nanoseconds(1000000000ll / hz);
+    const auto now = std::chrono::steady_clock::now();
+    bool deliver;
+    {
+      std::lock_guard<std::mutex> lk(s_mu);
+      if (s_next.time_since_epoch().count() == 0 || now >= s_next) {
+        // Re-base rather than accumulate: a long stall must not be repaid as a
+        // burst of edges the console could never have produced.
+        s_next = (s_next.time_since_epoch().count() == 0 || now - s_next > period)
+                     ? now + period
+                     : s_next + period;
+        deliver = true;
+      } else {
+        deliver = false;
+      }
+    }
+    if (!deliver) {
+      g_gpuIntDropped.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+  }
   orig_GpuInterrupt(ctx, base);
 }
 
