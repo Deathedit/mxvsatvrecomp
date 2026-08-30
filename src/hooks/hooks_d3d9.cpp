@@ -946,6 +946,52 @@ void ReadIndexConditioning(uint32_t device, uint8_t* base,
   if (in.index_min > in.index_max) in.index_min = 0;
   ++g_indexCondRead;
   if (in.index_reset_enabled) ++g_indexCondResetOn;
+  // IS TESSELLATION USED AT ALL? Read from the registers, not from hooks.
+  //
+  // I concluded "no tessellation in this title" from DrawTessellatedVertices
+  // and DrawIndexedTessellatedVertices being absent from the XEX. That is one
+  // half of the question: state.obj also exports
+  // SetRenderState_{Min,Max}TessellationLevel and _TessellationMode, and those
+  // leaves are 20-56 bytes with no relocations, so a byte match on them would
+  // not be an identification and only 8 of ~90 leaves are hooked. The
+  // registers they write are readable regardless of which entry point wrote
+  // them, which is why this asks the device instead.
+  //
+  // VGT_HOS_CNTL 0x2285 (tess_mode bits 0-1: 0 discrete, 1 continuous,
+  // 2 adaptive), VGT_HOS_MAX_TESS_LEVEL 0x2286 and MIN 0x2287, both floats
+  // (register_table.inc:1318-1320). A max level of 1.0 with mode 0 is the
+  // reset state and means the feature is untouched.
+  // THE 0x2200 BLOCK, not the 0x2100 one. The register file is not a flat
+  // array: 0x2100 lives at device+0x28CC and 0x2200 at device+0x2934, two
+  // separate packets. Reading 0x2285 through kDeviceVgt landed 0x395 dwords
+  // past the wrong base and printed guest ADDRESSES as HOS_CNTL (0x1B34B408)
+  // and -nan as the max level.
+  const uint32_t kHosCntl = kDeviceRegBlock2200 + (0x2285u - 0x2200u) * 4;
+  if (HostPageReadable(REX_RAW_ADDR(device + kHosCntl + 8))) {
+    const uint32_t cntl = REX_LOAD_U32(device + kHosCntl);
+    const uint32_t maxr = REX_LOAD_U32(device + kHosCntl + 4);
+    const uint32_t minr = REX_LOAD_U32(device + kHosCntl + 8);
+    static std::map<uint64_t, uint64_t> s_seen;
+    const uint64_t key = (uint64_t(cntl) << 40) ^ (uint64_t(maxr) << 20) ^ minr;
+    if (s_seen.size() < 8 && s_seen[key]++ == 0) {
+      float fmax, fmin;
+      std::memcpy(&fmax, &maxr, 4);
+      std::memcpy(&fmin, &minr, 4);
+      // PLAUSIBILITY, stated rather than assumed. Only 2 bits of HOS_CNTL are
+      // defined and the levels are small positive floats, so anything else
+      // means the offset is wrong -- which is exactly what the first cut did,
+      // and it read as a confident "mode 0, tessellation unused". An
+      // instrument that cannot report its own failure is worse than none.
+      const bool sane = (cntl & ~3u) == 0 && std::isfinite(fmax) &&
+                        std::isfinite(fmin) && fmax >= 0.0f &&
+                        fmax <= 4096.0f && fmin >= 0.0f && fmin <= 4096.0f;
+      REXLOG_INFO("d3d9: TESSELLATION regs{}: HOS_CNTL 0x{:08X} (mode {}) "
+                  "max {:.3f} min {:.3f}",
+                  sane ? "" : " IMPLAUSIBLE -- offset wrong, do not read as "
+                              "'tessellation unused'",
+                  cntl, cntl & 3u, fmax, fmin);
+    }
+  }
   // The values themselves, not just that they were read. Clamping to a bound
   // nobody has looked at is how the terrain got erased a second time: a small
   // max_indx squashes an entire draw onto one vertex and the frame goes blank

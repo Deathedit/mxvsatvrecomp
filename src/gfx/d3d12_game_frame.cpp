@@ -281,11 +281,43 @@ void D3D12Renderer::RenderGameFrame() {
       std::vector<GameRenderTarget*> depthBands;
       bool depthBandsDrawn = false;
       if (d.resolveSourceIsDepth && d.resolveDestWidth && d.resolveDestHeight) {
+        // EVERY candidate considered, and why each was rejected.
+        //
+        // The refusal counters say the stitch failed and with what totals, but
+        // not which surfaces were looked at. The 768x1024 shadow resolve finds
+        // "1 candidate summing 384" -- it sees the 384 band at base 0x710 and
+        // not the 640 band at 0x580, which has the right width, the right base
+        // and is demonstrably drawn into. Four things can drop it and they need
+        // different repairs: it is the resolve source object, it has no
+        // resource yet, its width differs, or its base is below the resolve.
+        // Guessing between those is what cost a wrong fix already.
         for (auto& [obj, t] : m_gameDepthTargets) {
-          if (obj == d.resolveSource) continue;
-          if (t.resource && t.width == d.resolveDestWidth &&
-              t.edramBase >= d.resolveSourceBase)
-            depthBands.push_back(&t);
+          const char* why = nullptr;
+          if (obj == d.resolveSource) why = "is-resolve-source";
+          else if (!t.resource) why = "no-resource";
+          else if (t.width != d.resolveDestWidth) why = "width";
+          else if (t.edramBase < d.resolveSourceBase) why = "base-below";
+          if (d.resolveSourceIsDepth && d.resolveDestHeight > 720) {
+            static std::map<uint64_t, uint64_t> s_seen;
+            const uint64_t key = (uint64_t(obj) << 20) ^
+                                 (uint64_t(t.width) << 8) ^ t.height;
+            if (s_seen.size() < 24 && s_seen[key]++ == 0) {
+              char m[224];
+              std::snprintf(m, sizeof(m),
+                            "band candidate 0x%08X %ux%u base 0x%X drawn %d"
+                            " dsc %d -> %s (resolve src 0x%08X base 0x%X"
+                            " dest %ux%u, writebacks %llu)",
+                            obj, t.width, t.height, t.edramBase,
+                            t.everDrawn ? 1 : 0,
+                            t.drawnSinceClear ? 1 : 0,
+                            why ? why : "ACCEPTED", d.resolveSource,
+                            d.resolveSourceBase, d.resolveDestWidth,
+                            d.resolveDestHeight,
+                            (unsigned long long)m_depthBandWriteBacks);
+              LogInfo(m);
+            }
+          }
+          if (!why) depthBands.push_back(&t);
         }
         std::sort(depthBands.begin(), depthBands.end(),
                   [](const GameRenderTarget* a, const GameRenderTarget* b) {
@@ -333,6 +365,89 @@ void D3D12Renderer::RenderGameFrame() {
             r.source = d.resolveSource;
           }
           ++r.count;
+        }
+      }
+      // BAND WRITE-BACK, before the source is read.
+      //
+      // The band copy at the draw site runs OWNER -> BAND, so a band can depth
+      // test against content already in the surface. That is the whole story
+      // for the deferred light bands, which only READ. The shadow map band is
+      // WRITTEN: measured in shadows4.rdc, 553 (768x1024) is cleared, copied
+      // into 554 (768x384), the casters put 38 draws into 554, and then the
+      // resolve reads 553 -- which still holds nothing but the clear. That is
+      // why the shadow map resolved min = max = 1.0 and every lookup said
+      // "unshadowed".
+      //
+      // Nothing ever carried the band back. This does, for bands of THIS
+      // resolve source that have actually been drawn into, so the owner holds
+      // the union of its bands at the moment it is copied out.
+      if (d.resolveSourceIsDepth) {
+        auto oit = m_gameDepthTargets.find(d.resolveSource);
+        if (oit != m_gameDepthTargets.end() && oit->second.resource &&
+            !oit->second.drawnSinceClear) {
+          // ONLY into an owner nothing has drawn into.
+          //
+          // Without this the write-back also fires for the deferred LIGHT
+          // bands, which are bands of the 1280x720 scene depth -- and the
+          // 1280x80 band at base 0x280 is its bottom 80 rows, so copying it
+          // back overwrote the bottom of the scene depth buffer. That is a
+          // regression at the bottom of the screen, and it is exactly what the
+          // first cut of this shipped.
+          //
+          // The case this exists for is the opposite one: an owner that holds
+          // NOTHING but its clear while the real content sits in a band, which
+          // is the shadow map. An owner that has been drawn into already has
+          // its own content and must not be overwritten by a band that only
+          // ever READ from it.
+          GameRenderTarget& owner = oit->second;
+          for (auto& [bobj, band] : m_gameDepthTargets) {
+            if (bobj == d.resolveSource) continue;
+            if (band.bandDepthOwner != d.resolveSource) continue;
+            if (!band.resource || !band.drawnSinceClear) continue;
+            if (band.width != owner.width) continue;
+            if (band.bandDepthRow + band.height > owner.height) continue;
+            D3D12_RESOURCE_BARRIER toCopy[2] = {};
+            for (auto& b : toCopy)
+              b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            toCopy[0].Transition.pResource = band.resource.Get();
+            toCopy[0].Transition.StateBefore = band.state;
+            toCopy[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            toCopy[0].Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            toCopy[1].Transition.pResource = owner.resource.Get();
+            toCopy[1].Transition.StateBefore = owner.state;
+            toCopy[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            toCopy[1].Transition.Subresource =
+                D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            m_commandList->ResourceBarrier(2, toCopy);
+
+            D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+            dstLoc.pResource = owner.resource.Get();
+            dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dstLoc.SubresourceIndex = 0;  // depth plane only, as on the way in
+            D3D12_TEXTURE_COPY_LOCATION srcLoc = dstLoc;
+            srcLoc.pResource = band.resource.Get();
+            D3D12_BOX box = {};
+            box.right = band.width;
+            box.bottom = band.height;
+            box.back = 1;
+            m_commandList->CopyTextureRegion(&dstLoc, 0, band.bandDepthRow, 0,
+                                             &srcLoc, &box);
+
+            D3D12_RESOURCE_BARRIER back[2] = {toCopy[0], toCopy[1]};
+            back[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            back[0].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            back[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            back[1].Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            m_commandList->ResourceBarrier(2, back);
+            band.state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            owner.state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            // NOT owner.everDrawn = true. That was self-referential: it made
+            // the owner look drawn to the stitcher and to the guard above, so
+            // the second write-back of a frame saw a "drawn" owner it had
+            // marked itself.
+            ++m_depthBandWriteBacks;
+          }
         }
       }
       if (auto it = m_gameRenderTargets.find(d.resolveSource);
@@ -896,6 +1011,11 @@ void D3D12Renderer::RenderGameFrame() {
       if (clearTarget) {
         clearTarget->usedThisFrame = true;
         clearTarget->everDrawn = true;
+        // The clear is where this becomes false: whatever the surface held
+        // before, it now holds only the clear value. everDrawn does NOT
+        // reset here, which is why it cannot answer "does this surface have
+        // real content".
+        clearTarget->drawnSinceClear = false;
       }
       // Clear does not bind through the normal draw path. Force the following
       // draw to restore its RTV/DSV and viewport.
@@ -1114,6 +1234,7 @@ void D3D12Renderer::RenderGameFrame() {
           depthTarget->needsInitialClear = false;
           depthTarget->usedThisFrame = true;
           depthTarget->everDrawn = true;
+          depthTarget->drawnSinceClear = true;
           ++m_depthBandDepthCopies;
         } else {
           ++m_depthBandCopySkipped;
@@ -1360,6 +1481,7 @@ void D3D12Renderer::RenderGameFrame() {
                                              1.0f, 0, 0, nullptr);
         depthTarget->usedThisFrame = true;
         depthTarget->everDrawn = true;
+        depthTarget->drawnSinceClear = true;
       }
     } else if (boundTargetObject != 0) {
       auto rtv = m_gameRtvHeap->GetCPUDescriptorHandleForHeapStart();

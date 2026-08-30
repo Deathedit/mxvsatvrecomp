@@ -2115,6 +2115,11 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // creation clear — the snapshot is then blank, and a compositor quad paints
     // that blank over the frame.
     bool everDrawn = false;
+    // Rendered into since its last CLEAR, which is not what everDrawn means:
+    // a clear sets everDrawn too (see the ClearRenderTargetView path), so a
+    // surface that has only ever been cleared still reads "drawn". Reading it
+    // that way blocked the shadow band write-back and put the shadows back.
+    bool drawnSinceClear = false;
     // Set on create and on resize, cleared once the surface has actually been
     // cleared on the GPU. Pooled surfaces are RECYCLED, so a fresh entry's
     // contents are whatever the previous tenant left behind -- which is why the
@@ -2179,6 +2184,10 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // Bands at a NON-ZERO row offset into their owner, which take a per-frame
   // copy of the owner's rows instead of sharing its surface.
   uint64_t m_depthBandDepthCopies = 0;
+  // Band rows carried BACK into their owner before the owner is resolved. The
+  // copy at the draw site only runs owner -> band; a band that is WRITTEN --
+  // the shadow map -- needs the reverse or the resolve reads the clear value.
+  uint64_t m_depthBandWriteBacks = 0;
   // A band that wanted its owner's rows and could not have them -- owner gone,
   // never drawn into, or no longer tall enough. Counted apart from the copies
   // because "band handled" and "band handled CORRECTLY" are different claims:

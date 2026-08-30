@@ -1019,7 +1019,21 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameDepthTarget(
     // per-frame copy of the owner's rows instead. One EDRAM tile is 80x16
     // samples, hence the row arithmetic.
     if (owner.edramBase < edramBase && owner.height > height) {
-      const uint32_t rows = (edramBase - owner.edramBase) * 80u * 16u / width;
+      // TILES PER ROW, ROUNDED UP. A tile is 80x16 samples, so a surface 768
+      // wide occupies ceil(768/80) = 10 tiles per row and 400 tiles is 40 tile
+      // rows = 640 pixel rows.
+      //
+      // The old form -- delta * 80 * 16 / width -- divides by the width rather
+      // than by whole tiles, so it is only right when the width is a multiple
+      // of 80. It is for the 1280-wide light bands this was written against
+      // (16 tiles exactly) and it is NOT for 768: it produced 666 instead of
+      // 640, and 666 + 384 > 1024 rejected the band. That is why the shadow
+      // map kept resolving as its clear value -- its two halves (rows 0-639 at
+      // base 0x580, rows 640-1023 at 0x710) were never recognised as one
+      // surface.
+      const uint32_t tilesPerRow = (width + 79u) / 80u;
+      const uint32_t rows =
+          tilesPerRow ? (edramBase - owner.edramBase) / tilesPerRow * 16u : 0u;
       if (rows + height <= owner.height) {
         bandOwner = ownerObject;
         bandRow = rows;
