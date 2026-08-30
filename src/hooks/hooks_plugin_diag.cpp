@@ -67,8 +67,31 @@ REXCVAR_DEFINE_STRING(registry_override, "", "Debug",
 namespace {
 std::atomic<uint32_t> g_updEntity{0};     // sub_82B6D230, the entity pass
 std::atomic<uint32_t> g_updRenderer{0};   // sub_82B34998, RendererDispatch
+std::atomic<uint32_t> g_updFixed60{0};    // entity-pass calls at a hardcoded 1/60
+std::atomic<uint32_t> g_updAltPath{0};    // sub_82AB58F8, which supplies that 1/60
 std::atomic<uint64_t> g_updEntityDtBits{0};
 std::atomic<uint64_t> g_updRendererDtBits{0};
+
+// THE SUSPECT, found in IDA 2026-08-30.
+//
+// sub_82AB58F8 advances the world through the SAME two calls the real tick
+// (sub_82B70DE8) uses -- the engine update at vtable slot 128, then the entity
+// pass sub_82B6D230 -- but with a HARDCODED 0.016666668, which is 1/60, in
+// place of the measured frame dt:
+//
+//     v3 = (*(...)(*v2 + 128))(v2, 0.016666668);
+//     v4 = sub_82373660(v3);
+//     sub_82B6D230(v4, 0.016666668);
+//
+// If it runs alongside the tick, the world advances by real_dt + 1/60 each
+// frame: 2.0x at 60 fps and 1.5x at 30, which is exactly the shape of the
+// report -- clearly double at first, still fast after --frame_limit_fps=30 --
+// and it is invisible to every clock measurement because the TIMER only ever
+// accumulates its own dt. GUEST CLOCK stays at 1.00 while the world runs fast.
+//
+// It has no code xref: it is reached through a function-pointer table, so the
+// caller cannot be named statically. Hence counted here rather than argued.
+constexpr double kFixed60 = 0.016666668;
 }  // namespace
 
 // sub_82B34998 — RendererDispatchBlock, called from LoaderTick on the Transition
@@ -260,6 +283,11 @@ extern "C" REX_FUNC(sub_82B70370) {
       std::bit_cast<double>(g_updEntityDtBits.load(std::memory_order_relaxed));
   const double ren_dt = std::bit_cast<double>(
       g_updRendererDtBits.load(std::memory_order_relaxed));
+  const uint32_t fixed60 = g_updFixed60.exchange(0, std::memory_order_relaxed);
+  const uint32_t alt = g_updAltPath.exchange(0, std::memory_order_relaxed);
+  static uint64_t s_fixed60Total = 0, s_altTotal = 0;
+  s_fixed60Total += fixed60;
+  s_altTotal += alt;
   static uint64_t s_entTotal = 0, s_renTotal = 0, s_frames = 0;
   s_entTotal += ent;
   s_renTotal += ren;
@@ -295,6 +323,20 @@ extern "C" REX_FUNC(sub_82B70370) {
                 s_entTotal, double(s_entTotal) / double(s_frames), ent_dt,
                 s_renTotal, double(s_renTotal) / double(s_frames), ren_dt,
                 guest_dt);
+    // Which of those entity passes carried the hardcoded 1/60 rather than the
+    // measured dt, and how often the path that supplies it ran. A non-zero
+    // pair here IS the speed multiplier: the world advances by
+    // real_dt + 1/60 per frame, and no frame cap can reach the second term.
+    REXLOG_INFO("{}: FIXED-60 STEPS over {} frames -- {} entity passes at the "
+                "hardcoded 1/60 ({:.3f}/frame), sub_82AB58F8 ran {} times "
+                "({:.3f}/frame). Implied world advance {:.3f}x real",
+                mx::native::g_plugin_mode ? "plugin" : "native", s_frames,
+                s_fixed60Total, double(s_fixed60Total) / double(s_frames),
+                s_altTotal, double(s_altTotal) / double(s_frames),
+                guest_dt > 0.0f
+                    ? 1.0 + (double(s_fixed60Total) / double(s_frames)) *
+                                kFixed60 / double(guest_dt)
+                    : 0.0);
   }
 }
 
@@ -308,10 +350,25 @@ extern "C" REX_FUNC(sub_82B70370) {
 // mx_473, mx_477 and mx_479. Corrected 2026-08-06.
 REX_IMPORT(__imp__sub_82B6D230, orig_EntityDt, void());
 extern "C" REX_FUNC(sub_82B6D230) {
+  const double dt = ctx.f1.f64;
   g_updEntity.fetch_add(1, std::memory_order_relaxed);
-  g_updEntityDtBits.store(std::bit_cast<uint64_t>(ctx.f1.f64),
-                          std::memory_order_relaxed);
+  // Exactly the constant the guest compiles in, so the test is an equality on
+  // the value the alternate path passes and not a guess at a range.
+  if (std::abs(dt - kFixed60) < 1e-9)
+    g_updFixed60.fetch_add(1, std::memory_order_relaxed);
+  g_updEntityDtBits.store(std::bit_cast<uint64_t>(dt), std::memory_order_relaxed);
   orig_EntityDt(ctx, base);
+}
+
+// sub_82AB58F8 — the fixed-1/60 world advance. See the note at kFixed60.
+//
+// Counted, not altered. Whether the right fix is to stop it running, to pass
+// it the real dt, or to leave it alone because some screen legitimately wants
+// a fixed step, depends on WHEN it runs -- and that is what this measures.
+REX_IMPORT(__imp__sub_82AB58F8, orig_FixedStepAdvance, void());
+extern "C" REX_FUNC(sub_82AB58F8) {
+  g_updAltPath.fetch_add(1, std::memory_order_relaxed);
+  orig_FixedStepAdvance(ctx, base);
 }
 
 // sub_8253AA40 — AssetDB_LoadStateMachine (LoaderTick's gate, 12-state)
