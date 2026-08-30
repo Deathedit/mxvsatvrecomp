@@ -294,6 +294,11 @@ REX_HOOK_RAW(sub_82B70DE8) {
 namespace mx::hooks::d3d9 {
 bool HostPageReadable(const void* p);
 }  // namespace mx::hooks::d3d9
+// Cumulative accepted guest draws. GLOBAL SCOPE, not mx::hle: hooks_d3d9.h
+// closes that namespace before declaring it, and hooks_frame.cpp calls it
+// unqualified. Declared rather than including the header, which would pull
+// the whole D3D9 surface into a loading TU.
+uint64_t HleDrawsAccepted();
 
 namespace {
 
@@ -314,6 +319,7 @@ using mx::hooks::d3d9::HostPageReadable;
 // I said it fixed, and rotation was never involved.
 std::mutex g_forestBatchMu;
 std::set<uint64_t> g_forestBatchSites;   // (renderer << 32) | caller
+std::atomic<uint64_t> g_forestDrawsProduced{0};
 std::atomic<uint64_t> g_forestDrawCalls{0};
 std::atomic<uint64_t> g_forestBatches{0};
 std::atomic<uint64_t> g_guestThreads{0};
@@ -348,11 +354,12 @@ void ReportForest(const char* why) {
                            uint32_t(k));
   }
   REXLOG_INFO("forest:   guest threads created {}, cull-thread body entered {} "
-              "| DRAW consumer called {}, batches emitted {} | batch sites{}",
+              "| DRAW consumer called {}, batches emitted {}, GUEST DRAWS PRODUCED {} | batch sites{}",
               g_guestThreads.load(std::memory_order_relaxed),
               g_forestThreadBody.load(std::memory_order_relaxed),
               g_forestDrawCalls.load(std::memory_order_relaxed),
               g_forestBatches.load(std::memory_order_relaxed),
+              g_forestDrawsProduced.load(std::memory_order_relaxed),
               sites.empty() ? " (none)" : sites);
 }
 
@@ -480,10 +487,30 @@ REX_HOOK_RAW(sub_823F9260) {
 // is the interesting part: batches per consumer call against trees added.
 //=============================================================================
 
+// THE DECISIVE MEASUREMENT. sub_823F82D0 only APPENDS -- the draws come out of
+// the `(*(renderer_vtable + 16))(renderer)` flush at the end of this function.
+// So counting batches says the guest built tree geometry; it does not say a
+// single draw reached D3D.
+//
+// Bracketing the whole consumer with our own accepted-draw counter does. The
+// delta is exactly the guest draws this forest pass produced:
+//
+//   0        the forest builds 2652 batches a run and issues NO draw. The bug
+//            is inside the flush, upstream of anything we hook.
+//   ~12/frame the trees ARE drawn and we lose them somewhere after -- but
+//            FRAME DRAWS says refused 0, so they would be draws we accept and
+//            then fail to make visible.
+//
+// HleDrawsAccepted is a plain uint64_t written without a lock, which is fine
+// here: this is a per-call delta on one thread, not a precise total.
 REX_EXTERN(__imp__sub_823F9808);
 REX_HOOK_RAW(sub_823F9808) {
   g_forestDrawCalls.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t before = HleDrawsAccepted();
   __imp__sub_823F9808(ctx, base);
+  const uint64_t after = HleDrawsAccepted();
+  if (after > before)
+    g_forestDrawsProduced.fetch_add(after - before, std::memory_order_relaxed);
 }
 
 // One call per batch the draw loop actually emits.
