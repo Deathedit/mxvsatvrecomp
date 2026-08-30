@@ -296,23 +296,41 @@ namespace {
 
 using mx::hooks::d3d9::HostPageReadable;
 
+std::atomic<uint64_t> g_guestThreads{0};
+std::atomic<uint64_t> g_forestThreadBody{0};
 std::atomic<uint64_t> g_forestInit{0};
-std::atomic<uint64_t> g_forestKick{0};
+std::atomic<uint64_t> g_forestKickEnter{0};
+std::atomic<uint64_t> g_forestKickReturn{0};
 std::atomic<uint64_t> g_forestKickGateOpen{0};
 std::atomic<uint64_t> g_forestTreeAdded{0};
 std::atomic<uint32_t> g_forestAsset{0};
 
+// ENTERED and RETURNED are separate on purpose, and the first cut of this got
+// it wrong. It reported from inside the kick AFTER calling the original, so a
+// kick that blocks -- which this one can, it does
+// WaitForSingleObject(ForestSystemEnd, INFINITE) before releasing the cull
+// thread -- produced no line at all and read as "the kick stopped happening".
+// entered > returned is a STALL and has to be visible as one.
 void ReportForest(const char* why) {
-  REXLOG_INFO("forest: {} -- init {}, per-frame kicks {} (gate OPEN {}), trees "
-              "added {}; ForestAsset handle 0x{:08X}",
+  REXLOG_INFO("forest: {} -- init {}, kicks entered {} returned {} (gate OPEN "
+              "{}), trees added {}; ForestAsset handle 0x{:08X}",
               why, g_forestInit.load(std::memory_order_relaxed),
-              g_forestKick.load(std::memory_order_relaxed),
+              g_forestKickEnter.load(std::memory_order_relaxed),
+              g_forestKickReturn.load(std::memory_order_relaxed),
               g_forestKickGateOpen.load(std::memory_order_relaxed),
               g_forestTreeAdded.load(std::memory_order_relaxed),
               g_forestAsset.load(std::memory_order_relaxed));
+  REXLOG_INFO("forest:   guest threads created {}, cull-thread body entered {}",
+              g_guestThreads.load(std::memory_order_relaxed),
+              g_forestThreadBody.load(std::memory_order_relaxed));
 }
 
 }  // namespace
+
+namespace mx::hooks {
+// Called from the frame census, which runs whether or not the forest is stuck.
+void ReportForestCensus() { ReportForest("census"); }
+}  // namespace mx::hooks
 
 // ForestSystem::Init -- the only writer of the gate.
 REX_EXTERN(__imp__sub_823E6EA8);
@@ -332,17 +350,16 @@ REX_HOOK_RAW(sub_823E6EA8) {
 REX_EXTERN(__imp__sub_823F9798);
 REX_HOOK_RAW(sub_823F9798) {
   const uint32_t renderable = ctx.r3.u32;
-  const uint64_t n = g_forestKick.fetch_add(1, std::memory_order_relaxed) + 1;
+  const uint64_t n = g_forestKickEnter.fetch_add(1, std::memory_order_relaxed) + 1;
   bool open = false;
   if (renderable && HostPageReadable(REX_RAW_ADDR(renderable + 15880))) {
     open = REX_LOAD_U32(renderable + 15880) != 0;
     if (open) g_forestKickGateOpen.fetch_add(1, std::memory_order_relaxed);
   }
+  if (n == 1) ReportForest(open ? "first kick, gate OPEN"
+                                : "first kick, GATE CLOSED");
   __imp__sub_823F9798(ctx, base);
-  // First sighting and then rarely: this runs every frame, and the answer does
-  // not change once the gate has settled.
-  if (n == 1 || (n % 600) == 0) ReportForest(open ? "kick, gate OPEN"
-                                                  : "kick, GATE CLOSED");
+  g_forestKickReturn.fetch_add(1, std::memory_order_relaxed);
 }
 
 // One call per tree that survived the frustum and both distance tests.
@@ -350,4 +367,48 @@ REX_EXTERN(__imp__sub_823EDF00);
 REX_HOOK_RAW(sub_823EDF00) {
   g_forestTreeAdded.fetch_add(1, std::memory_order_relaxed);
   __imp__sub_823EDF00(ctx, base);
+}
+
+//=============================================================================
+// GUEST THREAD CREATION, and whether each thread's body ever starts.
+//
+// sub_82BFC370 is the guest's create-thread. Two systems whose worker "does not
+// appear to run" are created through it -- the AssetDB DatabaseThread
+// (hooks_plugin_diag.cpp, "the first question is whether the thread runs at
+// all", never answered) and the ForestSystem cull thread -- and nothing in the
+// tree logged a single thread creation. One line each answers it for both, and
+// for every other guest thread at the same time.
+//
+// The ENTRY POINT is the identity worth printing: thread handles vary per run
+// but the entry is a fixed guest address, so a line here can be matched against
+// the IDB directly.
+//=============================================================================
+
+REX_EXTERN(__imp__sub_82BFC370);
+REX_HOOK_RAW(sub_82BFC370) {
+  // r5 is the entry point, r6 the parameter -- the argument order the AssetDB
+  // constructor's disassembly shows (`addi r5, r5, entry@l` then `mr r6, r31`).
+  const uint32_t entry = ctx.r5.u32;
+  const uint32_t param = ctx.r6.u32;
+  const uint64_t n = g_guestThreads.fetch_add(1, std::memory_order_relaxed) + 1;
+  __imp__sub_82BFC370(ctx, base);
+  // Logged AFTER, so the handle in r3 is the real one. Bounded: a run creates a
+  // handful, and an unbounded line here would be a log flood if that changed.
+  if (n <= 32)
+    REXLOG_INFO("guest thread #{}: entry 0x{:08X} param 0x{:08X} -> handle {}",
+                n, entry, param, ctx.r3.u32);
+}
+
+// The ForestSystem cull thread's BODY. An infinite loop, so this fires exactly
+// once if the thread is ever scheduled and never if it is not -- which is the
+// difference between "created" and "running" and is the whole question.
+//
+// Logged BEFORE calling the original, because the original does not return.
+REX_EXTERN(__imp__sub_823F9260);
+REX_HOOK_RAW(sub_823F9260) {
+  g_forestThreadBody.fetch_add(1, std::memory_order_relaxed);
+  REXLOG_INFO("forest: CULL THREAD BODY entered (this 0x{:08X}) -- it is "
+              "scheduled; anything after this is the wait on ForestSystemStart",
+              ctx.r3.u32);
+  __imp__sub_823F9260(ctx, base);
 }
