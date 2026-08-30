@@ -127,6 +127,33 @@ extern "C" REX_FUNC(sub_82B3C7D0) {
 //     5-entry ring at a1+36..a1+52, guarded by `if (*(a1+28))`.
 //
 // No cvar to restore the stub. It was wrong, not a trade-off; git has it.
+// GAME SPEED IS THIS FUNCTION'S dt, and nothing else.
+//
+// The guest is already frame-rate independent by construction: it computes
+// dt = (int32)(QPC_now - QPC_prev) / KeQueryPerformanceFrequency(), smooths it
+// over a 5-entry ring, and clamps it to a maximum at a1+72. Physics and script
+// then advance by that dt. So a game running at the WRONG SPEED at any frame
+// rate is a dt that does not equal real elapsed time, and there are exactly two
+// ways to get one:
+//
+//   the CLAMP at a1+72, which is a deliberate slow-motion floor. A frame longer
+//     than the clamp advances the world by the clamp, so on a machine too slow
+//     to hold it the whole game runs slow -- measured on the dev VM at 39.0s of
+//     game time over 48s of wall clock, 81%. That is the guest's own design and
+//     is not a defect.
+//   a WRONG dt SCALE, if QPC and QPF disagree about their units. That is a
+//     constant multiplier, independent of frame rate, and is what a steady "2x
+//     speed" looks like.
+//
+// The two are told apart by the ratio below and by nothing else, so it is
+// printed on every report: guest seconds elapsed against host seconds elapsed
+// over the same span. 1.00 is correct. Below 1.00 with dt pinned at the clamp
+// is the first case. Anything else, at any frame rate, is the second.
+REXCVAR_DEFINE_BOOL(guest_dt_from_host, false, "Debug",
+                    "Replace the guest's computed frame dt with true host "
+                    "elapsed time, keeping its own maximum-frame-time clamp. "
+                    "Forces game speed to real time at any frame rate");
+
 REX_IMPORT(__imp__sub_82B70370, orig_Timing, void());
 extern "C" REX_FUNC(sub_82B70370) {
   static int tm = 0;
@@ -140,12 +167,57 @@ extern "C" REX_FUNC(sub_82B70370) {
                 REX_LOAD_U32(a1 + 20) == 0x7F7FFFFFu, REX_LOAD_U32(a1 + 28),
                 REX_LOAD_U32(a1 + 32));
   }
+  const auto host_now = std::chrono::steady_clock::now();
   orig_Timing(ctx, base);
-  if ((tm <= 5 || (tm % 1000) == 0) && a1) {
-    REXLOG_INFO("{}: Timing #{} dt={:.6f} total={:.3f} a1=0x{:08X}",
-                mx::native::g_plugin_mode ? "plugin" : "native", tm,
-                std::bit_cast<float>(REX_LOAD_U32(a1 + 24)),
-                std::bit_cast<float>(REX_LOAD_U32(a1 + 60)), a1);
+  if (!a1) return;
+
+  // Offsets are the guest's own, from the decompilation above:
+  //   +24 dt   +60 total elapsed   +64 total * +68   +72 maximum frame time
+  constexpr uint32_t kDt = 24, kTotal = 60, kScaled = 64, kScale = 68,
+                     kMaxFrame = 72;
+  static std::chrono::steady_clock::time_point s_hostPrev{};
+  static double s_hostElapsed = 0.0;
+  const float guest_dt = std::bit_cast<float>(REX_LOAD_U32(a1 + kDt));
+  double host_dt = 0.0;
+  if (s_hostPrev.time_since_epoch().count() != 0)
+    host_dt = std::chrono::duration<double>(host_now - s_hostPrev).count();
+  s_hostPrev = host_now;
+  s_hostElapsed += host_dt;
+
+  // THE LEVER. Rewriting dt alone would leave the two derived fields the guest
+  // just computed from the old value inconsistent, so all three move together:
+  // +60 is a running total the guest advanced by the old dt, and +64 is +68
+  // times that total. The guest's OWN clamp is re-applied rather than dropped
+  // -- it exists so a hitch cannot teleport the world, and that is as true of
+  // a host-measured hitch as of a guest-measured one.
+  if (REXCVAR_GET(guest_dt_from_host) && host_dt > 0.0) {
+    const float max_frame = std::bit_cast<float>(REX_LOAD_U32(a1 + kMaxFrame));
+    float dt = float(host_dt);
+    if (max_frame > 0.0f && dt > max_frame) dt = max_frame;
+    const float total =
+        std::bit_cast<float>(REX_LOAD_U32(a1 + kTotal)) - guest_dt + dt;
+    const float scale = std::bit_cast<float>(REX_LOAD_U32(a1 + kScale));
+    REX_STORE_U32(a1 + kDt, std::bit_cast<uint32_t>(dt));
+    REX_STORE_U32(a1 + kTotal, std::bit_cast<uint32_t>(total));
+    REX_STORE_U32(a1 + kScaled, std::bit_cast<uint32_t>(scale * total));
+  }
+
+  if (tm <= 5 || (tm % 1000) == 0) {
+    const float total = std::bit_cast<float>(REX_LOAD_U32(a1 + kTotal));
+    const float max_frame = std::bit_cast<float>(REX_LOAD_U32(a1 + kMaxFrame));
+    // GAME SPEED, as one number. Guest seconds per host second over the whole
+    // run: 1.00 is correct, and it is frame-rate independent by construction,
+    // so it is comparable between machines and between runs.
+    REXLOG_INFO("{}: Timing #{} dt={:.6f} host_dt={:.6f} total={:.3f} "
+                "host={:.3f} GAME SPEED {:.3f}x{} (clamp {:.4f}){}",
+                mx::native::g_plugin_mode ? "plugin" : "native", tm, guest_dt,
+                host_dt, total, s_hostElapsed,
+                s_hostElapsed > 0.0 ? double(total) / s_hostElapsed : 0.0,
+                guest_dt >= max_frame && max_frame > 0.0f
+                    ? " <-- dt PINNED AT THE CLAMP, the world is in slow motion"
+                    : "",
+                max_frame,
+                REXCVAR_GET(guest_dt_from_host) ? " [dt forced from host]" : "");
   }
 }
 

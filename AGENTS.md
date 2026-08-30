@@ -208,6 +208,7 @@ so they describe what a plain run already does, not what you can turn on.
 | `d3d9_hooks_passthrough` | off | Pass the D3D9 hooks through in native mode. **Breaks rendering by design** — an A/B instrument, not a mode |
 | `d3d9_diag_row_heartbeat` | 16 | Draw reports an unchanged population may pass before `UP CALLERS`, the per-config stencil rows and the per-declaration `decl-draws` rows dump anyway. A new call site or config still prints immediately; `0` = only on change, `1` = every report |
 | `d3d9_diag_frame_every` | 30 | Frames between the per-swap lines (`FRAME DRAWS`, `UNBUILT *`, `RING vs HLE`, `ALU LOAD`). Per-frame deltas accumulate across the gap rather than being dropped, and the first five swaps always print; `0`/`1` = every swap |
+| `guest_dt_from_host` | off | Replace the guest's computed frame dt with true host elapsed time, keeping its own max-frame clamp. Forces game speed to real time at any frame rate |
 | `registry_override` | — | Force a registry key, e.g. `ReadyToLaunch=1`. A diagnostic lever, not a fix |
 
 **Seven were retired on 2026-08-12**, by the same test that retired four on
