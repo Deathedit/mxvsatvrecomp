@@ -1433,11 +1433,17 @@ class Emitter {
     // addressed that table at 8984..15443 instead of 0..6777, which is
     // what every dropped fetch region in a run actually was.
     //
-    // Xenos keeps the index in a float register, so convert here;
-    // is_index_rounded picks round-to-nearest over truncation, the same
-    // choice the CPU decoder makes.
+    // Xenos keeps the index in a float register, so convert here.
+    //
+    // FLOOR, both ways -- matching Xenia (dxbc_shader_translator_fetch.cc:74):
+    // OpRoundNI on the index, and OpAdd 0.5 first when is_index_rounded. NOT
+    // trunc and NOT HLSL round(): round() is half-to-even, which the SDK calls
+    // out as meaningless for addressing since 1.5 and 2.5 would both give 2.
+    // trunc and floor agree for the non-negative indices this title produces,
+    // so this changes nothing measurable today -- it is conformance, not a
+    // fix, and is recorded as such.
     Line("uint xe_vfi = (uint)" +
-         std::string(rounded ? "round(" : "trunc(") + "r[" +
+         std::string(rounded ? "floor(0.5 + " : "floor(") + "r[" +
          std::to_string(src_reg) + "]." +
          std::string(1, "xyzw"[src_swizzle & 3]) + ");");
     Line("uint xe_vfa = " + base + ".x + xe_vfi * " + base + ".y + " +
