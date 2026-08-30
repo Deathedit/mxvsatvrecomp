@@ -1752,7 +1752,24 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   // and the streams a non-r0.x index makes unknowable to the CPU path.
   uint32_t last_full_src = 0, last_full_src_swz = 0;
   bool last_full_rounded = false;
-  uint32_t computed_index_streams = 0;
+  uint32_t computed_index_streams = 0, computed_index_fetches = 0;
+  // Which register COMPONENTS the shader has written before the current
+  // instruction. 32 registers x 4 components.
+  //
+  // r0.x holds the vertex index at ENTRY and nothing else does -- but a
+  // shader is free to overwrite it, and the billboard shaders do:
+  //
+  //   r0.x = vid % 4        corner index, fetched from a 4-entry table
+  //   r0.x = floor(vid / 4) instance index, into a 6778-entry table
+  //
+  // Both fetches then read `src r0.x`, so testing the register NUMBER
+  // classifies them as vertex-indexed, windows their streams at
+  // first_vertex, and drops every region -- which collapsed 3360 billboard
+  // quads to the origin and is why the vegetation was invisible.
+  //
+  // What actually matters is whether the value is still the vertex index,
+  // i.e. whether that component is unwritten at the point of the fetch.
+  uint32_t written_comp[32] = {};
 
   for (uint32_t i = 0; i + 2 < max_cf_dword; i += 3) {
     uc::ControlFlowInstruction cf[2];
@@ -1893,12 +1910,26 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
             em.EmitVertexFetch(vf, vfetch_ordinal, last_full_src,
                                last_full_src_swz, last_full_rounded);
             fetch_slot_of[vfetch_ordinal] = last_full_slot;
-            // r0.x, and only r0.x, is the vertex index. Anything else is a
-            // value the shader computed, which the declaration-driven CPU
-            // path has no way to reproduce.
-            if ((last_full_src != 0 || last_full_src_swz != 0) &&
-                last_full_slot <= 95 && (95u - last_full_slot) < 32)
-              computed_index_streams |= 1u << (95u - last_full_slot);
+            // The index is the vertex index only if it is r0.x AND that
+            // component is still untouched. Once the shader has written
+            // it, the value is computed and absolute, so the stream cannot
+            // be windowed by the draw's vertex range.
+            const bool src_written =
+                last_full_src < 32 &&
+                // Bit 0 is x, per MaskSwizzle: `mask & (1u << c)` with
+                // kComponent[c] = "xyzw". Writing this inverted would
+                // misclassify silently, which is why it is taken from the
+                // emitter rather than assumed.
+                (written_comp[last_full_src] &
+                 (1u << (last_full_src_swz & 3))) != 0;
+            const bool by_vertex = last_full_src == 0 &&
+                                   last_full_src_swz == 0 && !src_written;
+            if (!by_vertex) {
+              if (vfetch_ordinal < 32)
+                computed_index_fetches |= 1u << vfetch_ordinal;
+              if (last_full_slot <= 95 && (95u - last_full_slot) < 32)
+                computed_index_streams |= 1u << (95u - last_full_slot);
+            }
             ++vfetch_ordinal;
           } else if (fetch_op == uint32_t(uc::FetchOpcode::kTextureFetch)) {
             uc::TextureFetchInstruction tf{};
@@ -1934,6 +1965,17 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
           uc::AluInstruction alu{};
           std::memcpy(&alu, dwords + at, sizeof(alu));
           em.EmitAlu(alu);
+          // Relative addressing can land anywhere, so treat it as writing
+          // everything rather than guessing which register it hit.
+          if (alu.is_vector_dest_relative() ||
+              alu.is_scalar_dest_relative()) {
+            for (auto& w : written_comp) w = 0xF;
+          } else {
+            if (alu.vector_dest() < 32)
+              written_comp[alu.vector_dest()] |= alu.vector_write_mask();
+            if (alu.scalar_dest() < 32)
+              written_comp[alu.scalar_dest()] |= alu.scalar_write_mask();
+          }
         }
         if (em.status != HlslStatus::kOk) {
           out.status = em.status;
@@ -2550,6 +2592,7 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   for (uint32_t i = 0; i < em.vertex_fetch_count; ++i)
     out.vertex_fetch_slot[i] = fetch_slot_of[i];
   out.computed_index_streams = computed_index_streams;
+  out.computed_index_fetches = computed_index_fetches;
   return true;
 }
 

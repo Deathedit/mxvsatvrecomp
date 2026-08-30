@@ -141,6 +141,8 @@ struct TranslatedShader {
   // indices at all, so it zero-fills them instead of reading an unrelated
   // row. See HlslShader::computed_index_streams.
   uint32_t computed_index_streams = 0;
+  // Per fetch ordinal; see HlslShader::computed_index_fetches.
+  uint32_t computed_index_fetches = 0;
   // The fetch variant's compiled DXBC, same contract as `dxbc`.
   std::shared_ptr<const std::vector<uint8_t>> fetch_dxbc;
 };

@@ -388,6 +388,12 @@ struct HlslShader {
   // exists so it can say so instead of reading vertex N and producing
   // confident nonsense.
   uint32_t computed_index_streams = 0;
+
+  // The same fact per FETCH ORDINAL rather than per stream, because the
+  // consumer needs it per fetch: a stream can carry both a computed-index
+  // fetch and a vertex-indexed one, and they need different bases into the
+  // merged buffer. Bit i is set when fetch ordinal i is computed-indexed.
+  uint32_t computed_index_fetches = 0;
 };
 
 // Emit HLSL for one shader blob.

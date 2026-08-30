@@ -4383,13 +4383,18 @@ ShaderApplyResult ApplyShaderOutputs(
     // it lands. That is done here only for the streams that need it, because
     // the whole-stream copy is 325KB for the foliage against 7KB for a window,
     // and the census says exactly one fetch form in this title is affected.
+    // Taken from the TRANSLATOR, which tracked ALU writes while walking the
+    // instruction stream. Recomputing it here from attrs[] was the bug:
+    // DecodeVertexShaderFetches records the index REGISTER, and testing
+    // `src_reg == 0 && swizzle == 0` calls a fetch vertex-indexed whenever
+    // it reads r0.x -- true at shader entry, false once the shader has
+    // written it. The billboard shaders compute BOTH their indices into
+    // r0.x (corner = vid % 4, instance = vid / 4), so every one of their
+    // fetches was misclassified, windowed at first_vertex, and dropped.
     bool whole_stream[kMaxStreams] = {};
-    for (size_t a = 0; a < attrs.size(); ++a) {
-      // r0.x, and only r0.x, is the vertex index (Xenia writes it to GPR 0
-      // with mask 0b0001 and nothing else).
-      const bool by_vertex = attrs[a].src_reg == 0 && attrs[a].src_swizzle == 0;
-      if (!by_vertex) whole_stream[attr_stream[a]] = true;
-    }
+    for (size_t a = 0; a < attrs.size(); ++a)
+      if (a < 32 && ((vs_translated->computed_index_fetches >> a) & 1u))
+        whole_stream[attr_stream[a]] = true;
     dc.raw_vertex_bytes.clear();
     dc.raw_fetch_count = 0;
     for (size_t a = 0; a < attrs.size() && gpu_fetch; ++a) {
@@ -4523,7 +4528,8 @@ ShaderApplyResult ApplyShaderOutputs(
       // that IS indexed by the vertex has to skip forward to where its window
       // would have begun -- the shader still rebases its index to 0. A fetch
       // indexed by a computed register addresses from the origin directly.
-      const bool by_vertex = attrs[a].src_reg == 0 && attrs[a].src_swizzle == 0;
+      const bool by_vertex =
+          a >= 32 || !((vs_translated->computed_index_fetches >> a) & 1u);
       rf.base = region_of_stream[si];
       if (whole_stream[si] && by_vertex)
         rf.base += uint32_t(uint64_t(dc.first_vertex) * s.stride);
@@ -6454,6 +6460,7 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
           for (uint32_t i = 0; i < fetched.vertex_fetch_count; ++i)
             kept.vertex_fetch_slot[i] = fetched.vertex_fetch_slot[i];
           kept.computed_index_streams = fetched.computed_index_streams;
+          kept.computed_index_fetches = fetched.computed_index_fetches;
           ++g_vfetchCompiled;
         } else {
           ++g_vfetchRefused["FXC rejected"];
