@@ -48,6 +48,29 @@
 REXCVAR_DEFINE_STRING(registry_override, "", "Debug",
                       "Comma-separated key=value overrides for guest registry string reads");
 
+// HOW MANY TIMES THE WORLD IS ADVANCED PER FRAME, and by what dt.
+//
+// Measured on the user's main rig: the guest's own clock tracks real time to
+// 0.1% (GUEST CLOCK 0.9987x), dt equals host elapsed, the timer fires 1.005
+// times per swap, and capping the frame rate at 30 changes nothing -- yet the
+// game runs visibly fast. Every one of those rules out a timing error.
+//
+// What survives is an update that runs MORE THAN ONCE per frame. World time
+// would still be correct, because the timer advances once; entities would
+// advance twice. That is frame-rate independent, which is precisely why the
+// 30 fps cap made no difference.
+//
+// So this counts the dt consumers per frame rather than inferring them. dt is
+// read as ctx.f1.f64 -- a PPCRegister's value member is a double, and the
+// existing `*(float*)&ctx.f1` in sub_82B34998 reads the low four bytes of one,
+// which is why that probe has printed 0.00/-0.00 in every run ever taken.
+namespace {
+std::atomic<uint32_t> g_updEntity{0};     // sub_82B6D230, the entity pass
+std::atomic<uint32_t> g_updRenderer{0};   // sub_82B34998, RendererDispatch
+std::atomic<uint64_t> g_updEntityDtBits{0};
+std::atomic<uint64_t> g_updRendererDtBits{0};
+}  // namespace
+
 // sub_82B34998 — RendererDispatchBlock, called from LoaderTick on the Transition
 // thread.
 //
@@ -66,11 +89,20 @@ extern "C" REX_FUNC(sub_82B34998) {
   ++rd;
   const bool loud = rd <= 20 || (rd % 500) == 0;
   const uint32_t a1 = ctx.r3.u32;
-  const float dt = *(float*)&ctx.f1;
+  // ctx.f1.f64, NOT *(float*)&ctx.f1. PPCRegister's value member is a double,
+  // so the old read took the low four bytes of one and printed a denormal --
+  // 0.00 or -0.00 in every run this project has ever taken. The comment below
+  // cites "f1 arriving here was exactly 0.00 in native" as evidence; that
+  // reading was an artefact of this bug, though the dispatch-count measurements
+  // beside it stand on their own.
+  const double dt = ctx.f1.f64;
+  g_updRenderer.fetch_add(1, std::memory_order_relaxed);
+  g_updRendererDtBits.store(std::bit_cast<uint64_t>(dt),
+                            std::memory_order_relaxed);
   orig_RendererDispatch(ctx, base);
   if (loud) {
-    REXLOG_INFO("{}: RendererDispatch #{} a1=0x{:08X} f1={:.2f} -> r3=0x{:08X}", tag,
-                rd, a1, dt, ctx.r3.u32);
+    REXLOG_INFO("{}: RendererDispatch #{} a1=0x{:08X} f1={:.6f} -> r3=0x{:08X}",
+                tag, rd, a1, dt, ctx.r3.u32);
   }
 }
 
@@ -220,6 +252,19 @@ extern "C" REX_FUNC(sub_82B70370) {
     REX_STORE_U32(a1 + kScaled, std::bit_cast<uint32_t>(scale * total));
   }
 
+  // Taken every frame and reported on the same cadence as the rest: these are
+  // per-frame counts, so a sampled read of a live counter would be meaningless.
+  const uint32_t ent = g_updEntity.exchange(0, std::memory_order_relaxed);
+  const uint32_t ren = g_updRenderer.exchange(0, std::memory_order_relaxed);
+  const double ent_dt =
+      std::bit_cast<double>(g_updEntityDtBits.load(std::memory_order_relaxed));
+  const double ren_dt = std::bit_cast<double>(
+      g_updRendererDtBits.load(std::memory_order_relaxed));
+  static uint64_t s_entTotal = 0, s_renTotal = 0, s_frames = 0;
+  s_entTotal += ent;
+  s_renTotal += ren;
+  ++s_frames;
+
   if (tm <= 5 || (tm % 1000) == 0) {
     const float total = std::bit_cast<float>(REX_LOAD_U32(a1 + kTotal));
     const float max_frame = std::bit_cast<float>(REX_LOAD_U32(a1 + kMaxFrame));
@@ -238,6 +283,18 @@ extern "C" REX_FUNC(sub_82B70370) {
                     : "",
                 max_frame,
                 REXCVAR_GET(guest_dt_from_host) ? " [dt forced from host]" : "");
+    // THE COUNT THAT MATTERS. Anything other than 1.00 advances per frame is
+    // the world being stepped more than once for one tick of the clock, and
+    // that is a speed multiplier no frame cap can reach. The dt each consumer
+    // actually received is printed beside it: equal to the timer's dt means
+    // the step is duplicated, double it means the step is scaled.
+    REXLOG_INFO("{}: WORLD STEPS over {} frames -- entity pass {} ({:.3f}/frame,"
+                " last dt {:.6f}), RendererDispatch {} ({:.3f}/frame, last dt "
+                "{:.6f}); timer dt {:.6f}",
+                mx::native::g_plugin_mode ? "plugin" : "native", s_frames,
+                s_entTotal, double(s_entTotal) / double(s_frames), ent_dt,
+                s_renTotal, double(s_renTotal) / double(s_frames), ren_dt,
+                guest_dt);
   }
 }
 
@@ -251,12 +308,10 @@ extern "C" REX_FUNC(sub_82B70370) {
 // mx_473, mx_477 and mx_479. Corrected 2026-08-06.
 REX_IMPORT(__imp__sub_82B6D230, orig_EntityDt, void());
 extern "C" REX_FUNC(sub_82B6D230) {
-  static int ed = 0;
-  ++ed;
-  bool loud = ed <= 5;
-  if (loud) REXLOG_INFO("native: sub_82B6D230 #{} ENTER", ed);
+  g_updEntity.fetch_add(1, std::memory_order_relaxed);
+  g_updEntityDtBits.store(std::bit_cast<uint64_t>(ctx.f1.f64),
+                          std::memory_order_relaxed);
   orig_EntityDt(ctx, base);
-  if (loud) REXLOG_INFO("native: sub_82B6D230 #{} RETURNED", ed);
 }
 
 // sub_8253AA40 — AssetDB_LoadStateMachine (LoaderTick's gate, 12-state)
