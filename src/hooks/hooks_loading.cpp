@@ -372,12 +372,27 @@ REX_HOOK_RAW(sub_823EDF00) {
 //=============================================================================
 // GUEST THREAD CREATION, and whether each thread's body ever starts.
 //
-// sub_82BFC370 is the guest's create-thread. Two systems whose worker "does not
-// appear to run" are created through it -- the AssetDB DatabaseThread
-// (hooks_plugin_diag.cpp, "the first question is whether the thread runs at
-// all", never answered) and the ForestSystem cull thread -- and nothing in the
-// tree logged a single thread creation. One line each answers it for both, and
-// for every other guest thread at the same time.
+// sub_82BFC370 is the guest's create-thread, and nothing logged a CREATION --
+// only two thread BODIES were instrumented.
+//
+// CORRECTION, and the reason this comment is worth reading: an earlier version
+// of it said the AssetDB DatabaseThread "does not appear to run" and that
+// whether it runs was "never answered". Both are false, and the log had said so
+// all along:
+//
+//     DatabaseThread ENTER assetDb=0x212B28E0 event(+0x688)=0xF800011C
+//                          gate(0x82D57950)=0x00000001
+//
+// That thread is already hooked in hooks_plugin_diag.cpp, it enters, and the
+// gate it was suspected of failing reads ONE, so its body runs. The level loads
+// 403 assets and they render -- which on its own refutes "the worker never
+// registers the assets" ([[asset-load-is-an-async-queue]] states that too
+// broadly; whatever failed for the garage bink, it was not the worker being
+// dead). Do not go looking for a dead AssetDB thread again.
+//
+// What is genuinely missing is creation-side coverage: which threads exist at
+// all, and their ENTRY POINTS. That is what this adds, for every guest thread
+// rather than the two that happened to be suspected.
 //
 // The ENTRY POINT is the identity worth printing: thread handles vary per run
 // but the entry is a fixed guest address, so a line here can be matched against
