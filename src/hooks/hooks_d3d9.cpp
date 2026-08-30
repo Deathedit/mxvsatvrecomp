@@ -395,6 +395,34 @@ REXCVAR_DEFINE_INT32(d3d9_diag_row_heartbeat, 16, "Debug",
                      "population before UP CALLERS and the per-config stencil "
                      "rows dump anyway (0 = only on change, 1 = every report)");
 
+namespace {
+
+// Change-or-heartbeat, shared by every row dump in this file:
+// UP CALLERS' per-site rows, the per-config stencil lines, the
+// per-declaration decl-draws rows, STENCIL PLUMBED's key set, TEXTURE
+// REPEATS' worst-offender list and the BACKFACE STENCIL WINDOW scan.
+//
+// `population` is whatever number grows when something NEW appears -- the
+// distinct-site count, the distinct-config count, the declaration count. All
+// are all add-only, so a change in the count is a faithful "there is
+// something here you have not seen"; none can shrink and hide a replacement.
+//
+// The caller keeps its own `last` and `since`. Returns true when the rows
+// should print, and leaves `since` counting reports that were held back so the
+// summary line can say how many.
+bool RowDumpDue(uint64_t population, uint64_t& last, uint32_t& since) {
+  const int heartbeat = REXCVAR_GET(d3d9_diag_row_heartbeat);
+  ++since;
+  const bool changed = population != last;
+  last = population;
+  // heartbeat <= 0 disables the drift dump entirely, but never the change one.
+  const bool due = changed || (heartbeat > 0 && since >= uint32_t(heartbeat));
+  if (due) since = 0;
+  return due;
+}
+
+}  // namespace
+
 REXCVAR_DEFINE_BOOL(d3d9_page_cache_verify, false, "Debug",
                     "Verify every page-readability cache hit against a fresh "
                     "VirtualQuery and log mismatches. Slow; correctness check "
@@ -5103,18 +5131,35 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
       std::sort(worst.begin(), worst.end(), [](const auto& a, const auto& b) {
         return a.second->bytes > b.second->bytes;
       });
-      std::string top;
-      for (size_t i = 0; i < worst.size() && i < 5; ++i) {
-        const TexDecodeSite& s = *worst[i].second;
-        top += fmt::format(
-            " [0x{:08X} {}x{} fmt{} {}x={}MB keys={} miss:{}nocache/{}stale/"
-            "{}blank]",
-            worst[i].first, s.width, s.height, s.format, s.decodes,
-            s.bytes / (1024 * 1024), s.distinct_keys, s.by_reason[0],
-            s.by_reason[1], s.by_reason[2]);
+      // The population is the site count AND the identity of the top five,
+      // because a new address entering the list is the event worth a line even
+      // when no address was added. Byte totals climbing behind a stable top
+      // five is drift and belongs to the heartbeat.
+      uint64_t pop = uint64_t(g_texIndex.sites.size());
+      for (size_t i = 0; i < worst.size() && i < 5; ++i)
+        pop = pop * 1000003ull + worst[i].first;
+      static uint64_t s_lastTexPop = 0;
+      static uint32_t s_sinceTex = 0;
+      if (!RowDumpDue(pop, s_lastTexPop, s_sinceTex)) {
+        REXLOG_INFO("d3d9: TEXTURE REPEATS {} addresses -- rows held, same "
+                    "worst five ({} report(s) so far; "
+                    "d3d9_diag_row_heartbeat={})",
+                    g_texIndex.sites.size(), s_sinceTex,
+                    REXCVAR_GET(d3d9_diag_row_heartbeat));
+      } else {
+        std::string top;
+        for (size_t i = 0; i < worst.size() && i < 5; ++i) {
+          const TexDecodeSite& s = *worst[i].second;
+          top += fmt::format(
+              " [0x{:08X} {}x{} fmt{} {}x={}MB keys={} miss:{}nocache/{}stale/"
+              "{}blank]",
+              worst[i].first, s.width, s.height, s.format, s.decodes,
+              s.bytes / (1024 * 1024), s.distinct_keys, s.by_reason[0],
+              s.by_reason[1], s.by_reason[2]);
+        }
+        REXLOG_INFO("d3d9: TEXTURE REPEATS {} addresses:{}",
+                    g_texIndex.sites.size(), top.empty() ? " (none)" : top);
       }
-      REXLOG_INFO("d3d9: TEXTURE REPEATS {} addresses:{}",
-                  g_texIndex.sites.size(), top.empty() ? " (none)" : top);
     }
     // RESOLVE CONSUMPTION. Every destination the guest has resolved into, and
     // whether it ever asked for it back through SetTexture.
@@ -6692,32 +6737,6 @@ void DumpHleDraw(bool indexed, uint64_t n, uint32_t prim, int32_t base_vertex,
   f.flush();
 }
 
-namespace {
-
-// Change-or-heartbeat, shared by the three row dumps: UP CALLERS' per-site
-// rows, the per-config stencil lines, and the per-declaration decl-draws rows.
-//
-// `population` is whatever number grows when something NEW appears -- the
-// distinct-site count, the distinct-config count, the declaration count. All
-// three are add-only, so a change in the count is a faithful "there is
-// something here you have not seen"; none can shrink and hide a replacement.
-//
-// The caller keeps its own `last` and `since`. Returns true when the rows
-// should print, and leaves `since` counting reports that were held back so the
-// summary line can say how many.
-bool RowDumpDue(uint64_t population, uint64_t& last, uint32_t& since) {
-  const int heartbeat = REXCVAR_GET(d3d9_diag_row_heartbeat);
-  ++since;
-  const bool changed = population != last;
-  last = population;
-  // heartbeat <= 0 disables the drift dump entirely, but never the change one.
-  const bool due = changed || (heartbeat > 0 && since >= uint32_t(heartbeat));
-  if (due) since = 0;
-  return due;
-}
-
-}  // namespace
-
 // The two histograms the round exists to produce.
 void ReportDeclHistogram() {
   uint64_t with = 0, without = 0;
@@ -6956,9 +6975,24 @@ void ReportDrawCounts(uint8_t* base) {
   // expects equality will otherwise read a correct result as a failure.
   {
     std::lock_guard<std::mutex> lk(g_plumbedStencilMu);
+    // The KEY SET is the payload and it is add-only, so its size is a faithful
+    // "a configuration you have not seen has reached the consumer". The counts
+    // and the gaps are cumulative and stay on the line either way, because the
+    // gap is the number a reader comes here for.
+    static uint64_t s_lastPlumbed = 0;
+    static uint32_t s_sincePlumbed = 0;
+    const bool dump_keys =
+        RowDumpDue(g_plumbedConfigs.size(), s_lastPlumbed, s_sincePlumbed);
     std::string cfgs;
-    for (const auto& [key, n] : g_plumbedConfigs)
-      cfgs += fmt::format(" [{:08X}/{:08X} x{}]", key.first, key.second, n);
+    if (dump_keys) {
+      for (const auto& [key, n] : g_plumbedConfigs)
+        cfgs += fmt::format(" [{:08X}/{:08X} x{}]", key.first, key.second, n);
+    } else {
+      cfgs = fmt::format(" held, key set unchanged ({} report(s) so far; "
+                         "d3d9_diag_row_heartbeat={})",
+                         s_sincePlumbed,
+                         REXCVAR_GET(d3d9_diag_row_heartbeat));
+    }
     // Signed: the consumer cannot legitimately see MORE than the census, so a
     // negative gap is itself a finding rather than an impossible number.
     const int64_t seen_gap =
@@ -6980,27 +7014,42 @@ void ReportDrawCounts(uint8_t* base) {
   {
     std::lock_guard<std::mutex> lk(g_bfWindowMu);
     if (g_bfWindowDraws) {
-      std::string w;
-      for (const auto& [off, vals] : g_bfWindow) {
-        w += fmt::format(" [+{:04X}", off);
-        // At most four values per offset: a register that takes many values is
-        // not the one being looked for, and printing them all would bury the
-        // one that does.
-        uint32_t shown = 0;
-        for (const auto& [v, n] : vals) {
-          if (shown++ == 4) {
-            w += fmt::format(" +{}more", vals.size() - 4);
-            break;
+      // Every distinct (offset, value) pair the scan has ever seen. Both map
+      // levels are add-only, so this grows exactly when the window shows
+      // something new -- which is the entire question the scan asks.
+      uint64_t pairs = 0;
+      for (const auto& [off, vals] : g_bfWindow) pairs += 1 + vals.size();
+      static uint64_t s_lastBf = 0;
+      static uint32_t s_sinceBf = 0;
+      if (!RowDumpDue(pairs, s_lastBf, s_sinceBf)) {
+        REXLOG_INFO("d3d9: BACKFACE STENCIL WINDOW -- {} two-sided draws "
+                    "sampled, scan held, no new offset or value ({} report(s) "
+                    "so far; d3d9_diag_row_heartbeat={})",
+                    g_bfWindowDraws, s_sinceBf,
+                    REXCVAR_GET(d3d9_diag_row_heartbeat));
+      } else {
+        std::string w;
+        for (const auto& [off, vals] : g_bfWindow) {
+          w += fmt::format(" [+{:04X}", off);
+          // At most four values per offset: a register that takes many values is
+          // not the one being looked for, and printing them all would bury the
+          // one that does.
+          uint32_t shown = 0;
+          for (const auto& [v, n] : vals) {
+            if (shown++ == 4) {
+              w += fmt::format(" +{}more", vals.size() - 4);
+              break;
+            }
+            w += fmt::format(" {:08X}x{}", v, n);
           }
-          w += fmt::format(" {:08X}x{}", v, n);
+          w += "]";
         }
-        w += "]";
+        REXLOG_INFO("d3d9: BACKFACE STENCIL WINDOW -- {} two-sided draws sampled "
+                    "(0x2900 is RB_STENCILREFMASK 0x210D; looking for 0x210E, "
+                    "which should be refmask-shaped 0x00rrwwss and NOT a copy of "
+                    "+2900):{}",
+                    g_bfWindowDraws, w.empty() ? " none" : w);
       }
-      REXLOG_INFO("d3d9: BACKFACE STENCIL WINDOW -- {} two-sided draws sampled "
-                  "(0x2900 is RB_STENCILREFMASK 0x210D; looking for 0x210E, "
-                  "which should be refmask-shaped 0x00rrwwss and NOT a copy of "
-                  "+2900):{}",
-                  g_bfWindowDraws, w.empty() ? " none" : w);
     }
   }
   // The ALU constant file. `repaired 0` is only meaningful next to a non-zero
