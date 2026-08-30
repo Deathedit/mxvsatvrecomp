@@ -6,9 +6,11 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 
+#include <algorithm>
 #include <chrono>
 #include <iterator>
 #include <map>
+#include <mutex>
 #include <atomic>
 #include <string>
 #include <vector>
@@ -513,6 +515,92 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                           "(neither 0 nor 0xF -- these are the ones we widen "
                           "to RGBA) --{}",
                           n, partial, hist.empty() ? " (none)" : hist);
+            }
+          }
+          // DEPTH / CULL census, keyed by RENDER TARGET EXTENT as well as
+          // state.
+          //
+          // The extent is in the key because tree.rdc showed the vegetation
+          // atlases being sampled only by 256x256 billboard-BAKE passes and a
+          // 129x129 clipmap pass, never by the 1280x720 scene. A state
+          // histogram pooled over every pass would average those together and
+          // could not answer "what state does the SCENE draw vegetation with",
+          // which is the question. One row per (extent, state) keeps them
+          // apart.
+          //
+          // zfunc is the reason this is worth logging at all: all four PSO
+          // builders hardcode DepthFunc = LESS_EQUAL, so the guest's zfunc is
+          // carried through hle_types and then dropped on the floor. Xenos
+          // numbering is 0 NEVER, 1 LESS, 2 EQUAL, 3 LEQUAL, 4 GREATER,
+          // 5 NOTEQUAL, 6 GEQUAL, 7 ALWAYS -- so 3 is the only value we
+          // actually honour and every other value is a draw we depth-test
+          // differently from the console. The line reports that count directly
+          // rather than leaving it to be totted up by eye.
+          //
+          // `seen` is carried, not filtered on: a draw whose RB_DEPTHCONTROL
+          // was never read decodes as z_enable 0, which is indistinguishable
+          // from a draw that genuinely disabled the test unless the flag says
+          // which it was.
+          {
+            static std::mutex s_dcMutex;
+            static std::map<uint64_t, uint64_t> s_dcHist;
+            static uint64_t s_dcDraws = 0;
+            const uint32_t dc = d->depth_control;
+            const uint32_t pa = d->pa_su_sc_mode_cntl;
+            const uint32_t seen = (d->om_seen >> 1) & 1u;
+            const uint32_t ztest = (dc >> 1) & 1u;
+            const uint32_t zwrite = (dc >> 2) & 1u;
+            const uint32_t zfunc = (dc >> 4) & 7u;
+            const uint32_t cullf = pa & 1u;
+            const uint32_t cullb = (pa >> 1) & 1u;
+            const uint32_t face = (pa >> 2) & 1u;
+            const uint64_t key =
+                (uint64_t(d->render_target_width & 0xFFFFu) << 32) |
+                (uint64_t(d->render_target_height & 0xFFFFu) << 16) |
+                (uint64_t(seen) << 9) | (uint64_t(ztest) << 8) |
+                (uint64_t(zwrite) << 7) | (uint64_t(zfunc) << 4) |
+                (uint64_t(cullf) << 2) | (uint64_t(cullb) << 1) |
+                uint64_t(face);
+            std::lock_guard<std::mutex> lock(s_dcMutex);
+            ++s_dcHist[key];
+            if ((++s_dcDraws % 20000) == 0) {
+              static const char* kFunc[8] = {"never", "less", "equal", "lequal",
+                                             "greater", "notequal", "gequal",
+                                             "always"};
+              std::vector<std::pair<uint64_t, uint64_t>> rows(s_dcHist.begin(),
+                                                              s_dcHist.end());
+              std::sort(rows.begin(), rows.end(),
+                        [](const auto& a, const auto& b) {
+                          return a.second > b.second;
+                        });
+              // EVERY row, not a top-N: the draws this is meant to find are a
+              // handful of vegetation draws among tens of thousands, so any
+              // cut removes exactly the evidence.
+              std::string out;
+              uint64_t unhonoured = 0;
+              for (const auto& [k, n2] : rows) {
+                const uint32_t zf = uint32_t((k >> 4) & 7u);
+                const bool test = ((k >> 8) & 1u) != 0;
+                if (test && zf != 3u) unhonoured += n2;
+                const uint32_t cf = uint32_t((k >> 2) & 1u);
+                const uint32_t cb = uint32_t((k >> 1) & 1u);
+                // The winding bit is part of the key, so it MUST be printed:
+                // without it two rows differing only in front-face order render
+                // identically and the census reads as if it were double-counting.
+                out += fmt::format(
+                    " [{}x{} {}z{} w{} {} cull{}{} {} n={}]",
+                    uint32_t(k >> 32) & 0xFFFFu, uint32_t(k >> 16) & 0xFFFFu,
+                    ((k >> 9) & 1u) ? "" : "UNSEEN ", test ? 1 : 0,
+                    ((k >> 7) & 1u) ? 1 : 0, kFunc[zf],
+                    cf ? "F" : "", cb ? "B" : (cf ? "" : "-"),
+                    (k & 1u) ? "cw" : "ccw", n2);
+              }
+              REXLOG_INFO(
+                  "gfx: DEPTH/CULL census {} draws, {} distinct states, {} "
+                  "draws depth-test with a zfunc we do NOT honour (every PSO "
+                  "hardcodes lequal) --{}",
+                  s_dcDraws, rows.size(), unhonoured,
+                  out.empty() ? " (none)" : out);
             }
           }
           // PHASE 1 CHECK, at the point of CONSUMPTION. This is where Phase 2
