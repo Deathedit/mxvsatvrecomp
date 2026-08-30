@@ -59,8 +59,6 @@
 // state we need. Only the name was wrong.
 //=============================================================================
 
-namespace mx::hooks { void ReportForestCensus(); }
-
 namespace {
 
 // logs/pm4dump, emptied once per process before the first dump of the run.
@@ -646,12 +644,6 @@ extern "C" REX_FUNC(sub_82566B58) {
                   "address, {} out of range, {} short body",
                   tag, s_alu_applied, s_alu_dwords, s_alu_nonalu,
                   s_alu_unreadable, s_alu_range, s_alu_short);
-      // The forest census. Emitted from HERE, not from the forest hooks, so it
-      // still appears when the per-frame kick is STUCK -- that kick waits on
-      // ForestSystemEnd with an infinite timeout, so a cull thread that never
-      // signals leaves it blocked, and a report that lives inside it would go
-      // silent exactly when it matters most.
-      mx::hooks::ReportForestCensus();
       if (s_coherPolls) {
         std::string ranges;
         for (const auto& r : s_coherRanges) {
