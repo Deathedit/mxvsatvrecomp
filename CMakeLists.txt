@@ -50,6 +50,7 @@ set(MX_SOURCES
     src/hooks/hooks_loading.cpp
     src/hooks/hooks_boot.cpp
     src/hooks/hooks_plugin_diag.cpp
+    src/hooks/hooks_debug_unlock.cpp
     src/hooks/guest_read_watch.cpp
     src/hooks/hooks_d3d9.cpp
     src/hooks/hooks_d3d9_texture.cpp
