@@ -240,3 +240,114 @@ REX_HOOK_RAW(sub_82B70DE8) {
   if (lt <= 5 || lt % 500 == 0)
     REXLOG_INFO("native: LoaderTick #{} r3={}", lt, ctx.r3.u32);
 }
+
+//=============================================================================
+// WHY NO TREES DRAW — a three-way probe on the guest's own ForestSystem.
+//
+// The renderer is not dropping them: FRAME DRAWS reads `guest N accepted N
+// refused 0` every frame, and the palm's leaf atlas, bark and the FR_DU_Eco
+// billboard atlas are never bound in a capture. The guest is not SUBMITTING
+// tree draws, so the question is which link of its own chain is cold.
+//
+// The chain, read out of the IDB (ForestSystem, ctor at 0x823FB5B8, which
+// spawns the cull thread sub_823F9260 and creates the ForestSystemStart/End/
+// Kill events):
+//
+//   sub_823E70C8   asset callback: looks "ForestAsset" up by type name,
+//                  stores it at this+156, then calls ->
+//   sub_823E6EA8   init: sets THE GATE at this+16024 to 1, reads the tree-type
+//                  count from the asset and computes the two LOD distance
+//                  thresholds at this+12404 / this+12408.
+//   sub_823F9798   per frame: `if (*(this+15880))` -- the same gate, reached
+//                  through the IRenderable subobject at this+144, so +15880
+//                  here IS +16024 there -- then builds the frustum and SetEvents
+//                  ForestSystemStart, releasing the cull thread.
+//   sub_823EDF00   called once per tree that survives the frustum and both
+//                  distance tests.
+//
+// The gate is written in exactly ONE place in the whole image (0x823E6EE0,
+// inside the init), and the constructor does NOT initialise it. So if the asset
+// callback never fires, the gate is whatever the allocation left behind, the
+// cull thread blocks on ForestSystemStart forever, and no tree is ever
+// submitted -- with no error anywhere, which is what we see.
+//
+// THREE OUTCOMES, and they point at different code:
+//   init 0                  -> the ForestAsset callback never fires. An asset
+//                              registration problem, the shape of
+//                              [[asset-load-is-an-async-queue]].
+//   init > 0, gate-open 0   -> it initialised and the gate is still closed.
+//   gate-open > 0, added 0  -> the cull runs and rejects every tree; the
+//                              thresholds or the frustum are wrong.
+//
+// Counted on EVERY call, not sampled, so a zero means "never happened" and not
+// "not caught" ([[guard-census-api]]). Reported off the init/kick hooks
+// themselves so the line cannot appear before the system exists.
+//=============================================================================
+
+// Declared rather than including hooks_d3d9_internal.h, which would drag the
+// whole D3D9 hook surface into a loading-path translation unit for one
+// predicate. This is the RIGHT guard: PlausibleGuestPtr is only a range test
+// and ASCII passes it ([[plausible-is-not-readable]]).
+namespace mx::hooks::d3d9 {
+bool HostPageReadable(const void* p);
+}  // namespace mx::hooks::d3d9
+
+namespace {
+
+using mx::hooks::d3d9::HostPageReadable;
+
+std::atomic<uint64_t> g_forestInit{0};
+std::atomic<uint64_t> g_forestKick{0};
+std::atomic<uint64_t> g_forestKickGateOpen{0};
+std::atomic<uint64_t> g_forestTreeAdded{0};
+std::atomic<uint32_t> g_forestAsset{0};
+
+void ReportForest(const char* why) {
+  REXLOG_INFO("forest: {} -- init {}, per-frame kicks {} (gate OPEN {}), trees "
+              "added {}; ForestAsset handle 0x{:08X}",
+              why, g_forestInit.load(std::memory_order_relaxed),
+              g_forestKick.load(std::memory_order_relaxed),
+              g_forestKickGateOpen.load(std::memory_order_relaxed),
+              g_forestTreeAdded.load(std::memory_order_relaxed),
+              g_forestAsset.load(std::memory_order_relaxed));
+}
+
+}  // namespace
+
+// ForestSystem::Init -- the only writer of the gate.
+REX_EXTERN(__imp__sub_823E6EA8);
+REX_HOOK_RAW(sub_823E6EA8) {
+  const uint32_t self = ctx.r3.u32;
+  // The asset the callback just stored, read BEFORE the original runs so a
+  // zero here is what init was handed rather than what it left behind.
+  if (self && HostPageReadable(REX_RAW_ADDR(self + 156)))
+    g_forestAsset.store(REX_LOAD_U32(self + 156), std::memory_order_relaxed);
+  g_forestInit.fetch_add(1, std::memory_order_relaxed);
+  __imp__sub_823E6EA8(ctx, base);
+  ReportForest("init ran");
+}
+
+// The per-frame kick. r3 is the IRenderable subobject (this+144), so the gate
+// is at +15880 from it -- the same dword init writes as this+16024.
+REX_EXTERN(__imp__sub_823F9798);
+REX_HOOK_RAW(sub_823F9798) {
+  const uint32_t renderable = ctx.r3.u32;
+  const uint64_t n = g_forestKick.fetch_add(1, std::memory_order_relaxed) + 1;
+  bool open = false;
+  if (renderable && HostPageReadable(REX_RAW_ADDR(renderable + 15880))) {
+    open = REX_LOAD_U32(renderable + 15880) != 0;
+    if (open) g_forestKickGateOpen.fetch_add(1, std::memory_order_relaxed);
+  }
+  __imp__sub_823F9798(ctx, base);
+  // First sighting and then rarely: this runs every frame, and the answer does
+  // not change once the gate has settled.
+  if (n == 1 || (n % 600) == 0) ReportForest(open ? "kick, gate OPEN"
+                                                  : "kick, GATE CLOSED");
+}
+
+// One call per tree that survived the frustum and both distance tests.
+REX_EXTERN(__imp__sub_823EDF00);
+REX_HOOK_RAW(sub_823EDF00) {
+  g_forestTreeAdded.fetch_add(1, std::memory_order_relaxed);
+  __imp__sub_823EDF00(ctx, base);
+}
