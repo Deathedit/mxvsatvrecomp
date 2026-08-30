@@ -2464,28 +2464,6 @@ extern "C" REX_FUNC(sub_8255CE98) {
     resolve.resolve_source_object = source->object;
     resolve.resolve_source_is_depth = (source_slot == 4);
     resolve.resolve_source_base = source->color_info & 0xFFFu;
-    // WHICH depth surface a depth resolve actually names, by EDRAM base.
-    //
-    // The shadow map resolves as uniform 1.0 -- the clear value -- while the
-    // casters demonstrably render into a 768x384 depth surface. I assumed the
-    // resolve named a differently-sized descriptor of the SAME base and built
-    // an aliasing fix on it without checking; the base-keyed alias log then
-    // showed the 768x1024 surface belongs to base 0x580 and the casters to
-    // 0x710, which would make them different memory entirely. This prints the
-    // pairing instead of inferring it: one line per distinct
-    // (base, size, dest), so a resolve reading a surface nothing drew into is
-    // visible as a base that never appears in DEPTH SURFACES BY EDRAM BASE.
-    if (source_slot == 4) {
-      static std::map<uint64_t, uint64_t> s_seen;
-      const uint64_t key = (uint64_t(resolve.resolve_source_base) << 40) ^
-                           (uint64_t(source->width) << 20) ^ source->height;
-      if (s_seen.size() < 16 && s_seen[key]++ == 0)
-        REXLOG_INFO(
-            "d3d9: DEPTH RESOLVE source obj 0x{:08X} {}x{} base 0x{:03X} -> "
-            "dest 0x{:08X}",
-            source->object, source->width, source->height,
-            resolve.resolve_source_base, dest_texture);
-    }
     resolve.resolve_source_width = source->width;
     resolve.resolve_source_height = source->height;
     resolve.resolve_dest_width = dest_extent_width;
