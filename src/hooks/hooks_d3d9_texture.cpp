@@ -924,15 +924,43 @@ std::mutex g_flatMutex;
 // Keyed on {guest format, width, height} rather than address, because the
 // question is about a kind of texture, and one shape can live at many
 // addresses.
-std::map<std::array<uint32_t, 3>, std::pair<uint64_t, uint64_t>> g_flatShapes;
+//
+// The SITE is carried too, and it is not decoration. A shape that decodes with
+// real content proves the bytes are right and says nothing about who wanted
+// them: `slot` is a translated draw binding it, `standin` is the fallback
+// route, `bink` is video. Without the site, "FMT_DXT1 256x1024 n=1 flat=0" --
+// the FanPalm bark in FR_Dunes, the only 256x1024 pair in that level -- cannot
+// distinguish a real textured draw from the stand-in path picking it up, and
+// those two have opposite consequences for whether the tree renders.
+struct DecodeShape {
+  uint64_t decodes = 0;
+  uint64_t flat = 0;
+  uint32_t site_mask = 0;  // bit per kSiteNames index
+};
+constexpr const char* kSiteNames[] = {"slot", "standin", "bink"};
+
+uint32_t DecodeSiteBit(const char* site) {
+  for (uint32_t i = 0; i < std::size(kSiteNames); ++i)
+    if (std::strcmp(site, kSiteNames[i]) == 0) return 1u << i;
+  return 1u << 31;  // unknown site, still visible in the line
+}
+
+std::string DecodeSiteNames(uint32_t mask) {
+  std::string out;
+  for (uint32_t i = 0; i < std::size(kSiteNames); ++i)
+    if (mask & (1u << i)) out += (out.empty() ? "" : "+") + std::string(kSiteNames[i]);
+  if (mask & (1u << 31)) out += (out.empty() ? "" : "+") + std::string("?");
+  return out.empty() ? "none" : out;
+}
+
+std::map<std::array<uint32_t, 3>, DecodeShape> g_flatShapes;
 
 void ReportDecodeShapes() {
-  std::vector<std::pair<std::array<uint32_t, 3>, std::pair<uint64_t, uint64_t>>>
-      ranked(g_flatShapes.begin(), g_flatShapes.end());
+  std::vector<std::pair<std::array<uint32_t, 3>, DecodeShape>> ranked(
+      g_flatShapes.begin(), g_flatShapes.end());
   std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
-    if (a.second.second != b.second.second)
-      return a.second.second > b.second.second;
-    return a.second.first > b.second.first;
+    if (a.second.flat != b.second.flat) return a.second.flat > b.second.flat;
+    return a.second.decodes > b.second.decodes;
   });
   // EVERY shape, not a top-N. The top-20 cut was the THIRD truncation in this
   // one instrument to hide the case it was built for: a 1024x1024 FMT_4_4_4_4
@@ -943,10 +971,12 @@ void ReportDecodeShapes() {
   // entries; print it.
   std::string top;
   for (size_t i = 0; i < ranked.size(); ++i) {
-    top += fmt::format(" [fmt{}({}) {}x{} n={} flat={}]", ranked[i].first[0],
+    top += fmt::format(" [fmt{}({}) {}x{} n={} flat={} via {}]",
+                       ranked[i].first[0],
                        mx::hle::GuestTextureFormatName(ranked[i].first[0]),
                        ranked[i].first[1], ranked[i].first[2],
-                       ranked[i].second.first, ranked[i].second.second);
+                       ranked[i].second.decodes, ranked[i].second.flat,
+                       DecodeSiteNames(ranked[i].second.site_mask));
   }
   REXLOG_INFO("d3d9: DECODE SHAPES {} distinct over {} decodes, {} flat:{}",
               g_flatShapes.size(), g_flatProbe.decodes, g_flatProbe.flat,
@@ -985,13 +1015,14 @@ void NoteDecodedTexture(const mx::hle::HleTextureSource& source,
   ++g_flatProbe.decodes;
   auto& shape = g_flatShapes[{source.guest_format, source.width,
                               source.height}];
-  ++shape.first;
+  ++shape.decodes;
+  shape.site_mask |= DecodeSiteBit(site);
   // Every 500 rather than every 100: the line now carries every shape, and the
   // Bink planes decode each frame, so 4100 decodes a run would otherwise be 41
   // copies of a 3 KB line.
   if (g_flatProbe.decodes % 500 == 0) ReportDecodeShapes();
   if (decoded_flat.total && decoded_flat.share() >= 0.999) {
-    ++shape.second;
+    ++shape.flat;
     ++g_flatProbe.flat;
     // THE CAP WAS 24 AND IT HID THE CASE THIS EXISTS FOR. Run 1466 reached
     // 24 addresses at decode 236 and then went on to render 1860 frames of a
