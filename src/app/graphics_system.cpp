@@ -445,7 +445,6 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
             vertexStage.rawBytes = d->raw_vertex_bytes.data();
             vertexStage.rawByteCount =
                 static_cast<uint32_t>(d->raw_vertex_bytes.size());
-            vertexStage.rawKey = d->raw_vertex_key;
             vertexStage.rawFetch =
                 reinterpret_cast<const uint32_t*>(d->raw_fetch.data());
             vertexStage.rawFetchCount = d->raw_fetch_count;

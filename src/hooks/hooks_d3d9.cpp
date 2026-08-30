@@ -4397,22 +4397,6 @@ ShaderApplyResult ApplyShaderOutputs(
         whole_stream[attr_stream[a]] = true;
     dc.raw_vertex_bytes.clear();
     dc.raw_fetch_count = 0;
-    // CONTENT KEY for the merged buffer, so the renderer can reuse one
-    // upload allocation across draws that build identical bytes.
-    //
-    // Only whole-stream regions are keyed. A windowed region depends on
-    // first_vertex, which differs per draw, so its bytes are not shared and
-    // a key would be a lie; any windowed region sets the key to 0, meaning
-    // "do not reuse". That is the conservative direction: a missed reuse
-    // costs a copy, a wrong reuse draws stale geometry.
-    //
-    // The generation is part of the key, so a guest Unlock on any of these
-    // buffers changes it and the next draw copies afresh.
-    uint64_t raw_key = 1469598103934665603ull;
-    bool raw_key_valid = true;
-    auto mix = [&raw_key](uint64_t v) {
-      raw_key = (raw_key ^ v) * 1099511628211ull;
-    };
     for (size_t a = 0; a < attrs.size() && gpu_fetch; ++a) {
       if (attrs[a].fetch_slot != vs_translated->vertex_fetch_slot[a]) {
         gpu_fetch = false;
@@ -4538,13 +4522,6 @@ ShaderApplyResult ApplyShaderOutputs(
         dc.raw_vertex_bytes.insert(dc.raw_vertex_bytes.end(),
                                    s.host + start, s.host + start + bytes);
         limit_of_stream[si] = uint32_t(dc.raw_vertex_bytes.size());
-        if (whole_stream[si]) {
-          mix(s.buffer_obj);
-          mix(uint64_t(start) << 32 | bytes);
-          mix(VbGeneration(s.buffer_obj));
-        } else {
-          raw_key_valid = false;
-        }
       }
       auto& rf = dc.raw_fetch[dc.raw_fetch_count++];
       // A whole-stream region starts at the buffer's own origin, so a fetch
@@ -4564,10 +4541,6 @@ ShaderApplyResult ApplyShaderOutputs(
       dc.raw_vertex_bytes.clear();
       dc.raw_fetch_count = 0;
     }
-    dc.raw_vertex_key =
-        (gpu_fetch && raw_key_valid && !dc.raw_vertex_bytes.empty())
-            ? raw_key
-            : 0;
 
     // Self-check on the ADDRESSING, bounded to the first draws of a run.
     //

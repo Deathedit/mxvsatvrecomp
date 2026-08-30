@@ -42,9 +42,6 @@ namespace tu = rex::graphics::texture_util;
 
 #include "hooks/guest_read_watch.h"
 #include "hooks/hooks_d3d9_internal.h"
-// After internal, per the ORDER MATTERS note at the top of this header:
-// internal names mx::hle types it does not include itself.
-#include "hooks/hooks_d3d9_shared.h"
 
 REXCVAR_DECLARE(bool, hle_capture);
 REXCVAR_DECLARE(bool, hle_diag);
@@ -3148,41 +3145,3 @@ extern "C" REX_FUNC(sub_82AD49A0) {
 }
 
 #undef MX_RENDER_STATE_HOOK
-
-//-----------------------------------------------------------------------------
-// 0x82557F28 / 0x82556F10 -- D3DVertexBuffer_Lock / _Unlock
-//
-// The guest's only route to modifying a vertex buffer: AsyncLock is not linked
-// into this XEX (byte-matched against resource.obj, with the SetStreamSource
-// control proving the matcher finds positives), and Lock/Unlock have 34 and 32
-// callers, paired from the same functions.
-//
-// Unhooked until now, and the gap has already cost a theory: "is our snapshot
-// stale?" could only be answered by re-reading the buffer object, never by
-// knowing when the guest wrote it. The generation these bump is what lets the
-// merged raw vertex buffer be reused across draws without risking stale bytes.
-//
-// Bumped on UNLOCK, not on Lock. A lock that has not been released has not
-// necessarily written anything yet, and the draw cannot legally read the
-// buffer while it is held -- so the release is the edge that matters. Bumping
-// on Lock as well would only cost cache misses, but it would also hide a
-// mismatch between the two counts, which is worth being able to see.
-// QUALIFIED: this file is outside the namespace and reaches in with a
-// using-directive, which affects lookup but not definitions -- unqualified
-// here would quietly define a SECOND array at file scope and leave the real
-// one undefined at link time.
-std::atomic<uint32_t> mx::hooks::d3d9::g_vbGeneration[kVbGenSlots] = {};
-uint64_t g_vbLocks = 0, g_vbUnlocks = 0;
-
-REX_IMPORT(__imp__sub_82557F28, orig_VertexBufferLock, void());
-extern "C" REX_FUNC(sub_82557F28) {
-  ++g_vbLocks;
-  orig_VertexBufferLock(ctx, base);
-}
-
-REX_IMPORT(__imp__sub_82556F10, orig_VertexBufferUnlock, void());
-extern "C" REX_FUNC(sub_82556F10) {
-  ++g_vbUnlocks;
-  NoteVbWritten(ctx.r3.u32);
-  orig_VertexBufferUnlock(ctx, base);
-}
