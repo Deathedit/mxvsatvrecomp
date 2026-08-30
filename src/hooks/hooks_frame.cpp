@@ -151,6 +151,45 @@ struct SwapTimer {
 // than a target: a frame that takes longer is simply not delayed, and no
 // attempt is made to catch up by running a burst afterwards, because a burst
 // of uncapped frames is the exact condition being avoided.
+// Frames between the per-swap diagnostic lines -- FRAME DRAWS, UNBUILT WHY,
+// UNBUILT SKIPS BY REASON, RING vs HLE and ALU LOAD.
+//
+// Measured over run mx_1784: 0.894 KB a frame between them, printed once per
+// swap, 15% of the log. They are the last unthrottled reports of their size.
+//
+// NOTHING IS LOST TO THE SAMPLING, and that is the whole design. FRAME DRAWS
+// and RING vs HLE carry PER-FRAME DELTAS, so a plain modulus would silently
+// drop the draws in every skipped frame. Instead the deltas ACCUMULATE across
+// the interval and the line reports the sum with the frame span it covers: 30
+// frames' worth on one line rather than one frame's worth on every thirtieth.
+// The cumulative reports (UNBUILT, ALU LOAD) are totals and lose nothing to
+// cadence by construction.
+//
+// READ THIS BEFORE LOWERING IT TO A PLAIN MODULUS. FRAME DRAWS has been gated
+// or modulus-sampled before and gave a WRONG ANSWER every time: a native run
+// ending at 424 swaps logged only #1..#3 while a plugin run reaching 760
+// logged #600, which reads as a divergence in the guest's frame lifecycle and
+// was purely the modulus. Two things keep that from returning -- the first
+// five swaps always print, so the start of a run is never a gap, and every
+// throttled line NAMES its interval and frame span, so a reader can never
+// mistake sampling for stopping.
+//
+// 0 or 1 = every swap, the old behaviour.
+REXCVAR_DEFINE_INT32(d3d9_diag_frame_every, 30, "Debug",
+                     "Frames between the per-swap diagnostic lines. Per-frame "
+                     "deltas accumulate across the gap rather than being "
+                     "dropped; the first five swaps always print (0 or 1 = "
+                     "every swap)");
+
+// True on a swap whose per-frame diagnostics should print. The first five
+// always do -- a run that dies early must not look like a run that printed
+// nothing.
+static bool FrameDiagDue(uint64_t swap_count) {
+  const int every = REXCVAR_GET(d3d9_diag_frame_every);
+  if (every <= 1 || swap_count <= 5) return true;
+  return (swap_count % uint64_t(every)) == 0;
+}
+
 REXCVAR_DEFINE_INT32(frame_limit_fps, 60, "Debug",
                      "Pace the guest's swap to at most this many frames per "
                      "second, the way the console's vsync-blocking VdSwap did. "
@@ -244,24 +283,36 @@ extern "C" REX_FUNC(sub_82566B58) {
   // The tag is `native`/`plugin`, so the two runs are told apart by the line
   // itself rather than by remembering which log is which.
   {
+    // The deltas are taken EVERY swap and held; only the printing is sampled.
+    // Summing them across the interval is what makes the cadence lossless --
+    // dropping the line on a skipped frame would drop that frame's draws from
+    // the accounting entirely, which is the failure this line's history is
+    // made of.
     static uint64_t s_prev_guest = 0, s_prev_accepted = 0, s_prev_refused = 0;
+    static uint64_t s_accGuest = 0, s_accAccepted = 0, s_accRefused = 0;
+    static uint64_t s_spanFrom = 1;
     const uint64_t guest = GuestDrawCalls();
     const uint64_t accepted = HleDrawsAccepted();
     const uint64_t refused = HleDrawsRefused();
-    const uint64_t d_guest = guest - s_prev_guest;
-    const uint64_t d_accepted = accepted - s_prev_accepted;
-    const uint64_t d_refused = refused - s_prev_refused;
+    s_accGuest += guest - s_prev_guest;
+    s_accAccepted += accepted - s_prev_accepted;
+    s_accRefused += refused - s_prev_refused;
     s_prev_guest = guest;
     s_prev_accepted = accepted;
     s_prev_refused = refused;
-    REXLOG_INFO("{}: FRAME DRAWS #{} guest {} accepted {} refused {} "
-                "(unbuilt {}); cumulative guest {} accepted {} refused {}",
-                mx::native::g_plugin_mode ? "plugin" : "native", swap_count,
-                d_guest, d_accepted, d_refused,
-                d_guest > d_accepted + d_refused
-                    ? d_guest - d_accepted - d_refused
-                    : 0,
-                guest, accepted, refused);
+    if (FrameDiagDue(swap_count)) {
+      const uint64_t frames = swap_count - s_spanFrom + 1;
+      REXLOG_INFO("{}: FRAME DRAWS #{} over {} frame(s) from #{}: guest {} "
+                  "accepted {} refused {} (unbuilt {}); cumulative guest {} "
+                  "accepted {} refused {}",
+                  mx::native::g_plugin_mode ? "plugin" : "native", swap_count,
+                  frames, s_spanFrom, s_accGuest, s_accAccepted, s_accRefused,
+                  s_accGuest > s_accAccepted + s_accRefused
+                      ? s_accGuest - s_accAccepted - s_accRefused
+                      : 0,
+                  guest, accepted, refused);
+      s_accGuest = s_accAccepted = s_accRefused = 0;
+      s_spanFrom = swap_count + 1;
     // The gap, attributed. Printed on the same cadence so the two are read
     // together: `unbuilt` above is a subtraction between populations, and these
     // are the actual exits that produce it. They should sum to it.
@@ -280,6 +331,7 @@ extern "C" REX_FUNC(sub_82566B58) {
     REXLOG_INFO("{}: UNBUILT SKIPS BY REASON:{}",
                 mx::native::g_plugin_mode ? "plugin" : "native",
                 UnbuiltSkipBreakdown());
+    }
   }
 
   // Glyph cache, on a fixed swap cadence. Deliberately NOT printed from inside
@@ -543,22 +595,38 @@ extern "C" REX_FUNC(sub_82566B58) {
     {
       // The HLE side of the comparison, as a per-frame delta on the same
       // counter FRAME DRAWS reports, so the two lines can be read together.
+      //
+      // Both sides ACCUMULATE across the reporting interval. The whole point of
+      // the line is whether the two counts track each other, and a modulus that
+      // sampled one frame in thirty would compare two numbers drawn from a
+      // single frame while the other twenty-nine went unexamined -- the counts
+      // could diverge for a whole second and the line would never say so.
+      // Summed over the span they still track if and only if they track.
       static uint64_t s_prev_ring_guest = 0;
+      static uint64_t s_accRing = 0, s_accHle = 0;
+      static uint64_t s_ringSpanFrom = 1;
       const uint64_t g = GuestDrawCalls();
-      const uint64_t hle_draws = g - s_prev_ring_guest;
+      s_accHle += g - s_prev_ring_guest;
+      s_accRing += ring_draws;
       s_prev_ring_guest = g;
-      REXLOG_INFO("{}: RING vs HLE #{} ring draws {} vs HLE draws {} "
-                  "(ordering by index is only usable if these track) | Type3 "
-                  "constant opcodes: SET_CONSTANT {}, SET_SHADER_CONSTANTS {}, "
-                  "LOAD_ALU_CONSTANT {} (non-zero means the ALU file, which is "
-                  "fed from Type0 only, is missing a publish path)",
-                  tag, swap_count, ring_draws, hle_draws, t3_set_const,
-                  t3_set_shader, t3_load_alu);
-      REXLOG_INFO("{}: ALU LOAD applied {} packets / {} dwords into the "
-                  "constant file | skipped: {} non-ALU type, {} unreadable "
-                  "address, {} out of range, {} short body",
-                  tag, s_alu_applied, s_alu_dwords, s_alu_nonalu,
-                  s_alu_unreadable, s_alu_range, s_alu_short);
+      if (FrameDiagDue(swap_count)) {
+        const uint64_t frames = swap_count - s_ringSpanFrom + 1;
+        REXLOG_INFO("{}: RING vs HLE #{} over {} frame(s) from #{}: ring draws "
+                    "{} vs HLE draws {} (ordering by index is only usable if "
+                    "these track) | Type3 constant opcodes: SET_CONSTANT {}, "
+                    "SET_SHADER_CONSTANTS {}, LOAD_ALU_CONSTANT {} (non-zero "
+                    "means the ALU file, which is fed from Type0 only, is "
+                    "missing a publish path)",
+                    tag, swap_count, frames, s_ringSpanFrom, s_accRing,
+                    s_accHle, t3_set_const, t3_set_shader, t3_load_alu);
+        s_accRing = s_accHle = 0;
+        s_ringSpanFrom = swap_count + 1;
+        REXLOG_INFO("{}: ALU LOAD applied {} packets / {} dwords into the "
+                    "constant file | skipped: {} non-ALU type, {} unreadable "
+                    "address, {} out of range, {} short body",
+                    tag, s_alu_applied, s_alu_dwords, s_alu_nonalu,
+                    s_alu_unreadable, s_alu_range, s_alu_short);
+      }
     }
 
     // Only write dump files for spot-check swaps — keeps the disk clean when
