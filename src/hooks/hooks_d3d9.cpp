@@ -364,14 +364,15 @@ constexpr uint32_t kDeviceScanDwords = kDeviceScanBytes / 4;
 // frame. That matters in one direction specifically: a stale *positive* on a
 // decommitted page is a crash, and avoiding exactly that is why this function
 // exists. Guest allocations cluster at load, so per-frame is ample.
-// How many draw reports may pass with NOTHING NEW before the two row-level
-// dumps -- UP CALLERS' per-site rows and the per-config stencil lines -- print
-// anyway.
+// How many draw reports may pass with NOTHING NEW before the three row-level
+// dumps -- UP CALLERS' per-site rows, the per-config stencil lines and the
+// per-declaration decl-draws rows -- print anyway.
 //
 // Measured over run mx_1781, 357 draw reports in 14.46 MB of log: UP CALLERS is
 // 357 lines and 0.67 MB, averaging 1955 BYTES A LINE, and the per-config
-// stencil rows are 5973 lines and 1.30 MB. Together 13.6% of the run, in a log
-// whose segments rotate every ~30 seconds. Both are cumulative whole-population
+// stencil rows are 5973 lines and 1.30 MB; decl-draws is 17,987 rows and
+// 0.88 MB. Together 19.7% of the run, in a log whose segments rotate every
+// ~30 seconds. Both are cumulative whole-population
 // snapshots, so consecutive prints are identical apart from counter drift, and
 // drift is not worth a log segment.
 //
@@ -6691,6 +6692,32 @@ void DumpHleDraw(bool indexed, uint64_t n, uint32_t prim, int32_t base_vertex,
   f.flush();
 }
 
+namespace {
+
+// Change-or-heartbeat, shared by the three row dumps: UP CALLERS' per-site
+// rows, the per-config stencil lines, and the per-declaration decl-draws rows.
+//
+// `population` is whatever number grows when something NEW appears -- the
+// distinct-site count, the distinct-config count, the declaration count. All
+// three are add-only, so a change in the count is a faithful "there is
+// something here you have not seen"; none can shrink and hide a replacement.
+//
+// The caller keeps its own `last` and `since`. Returns true when the rows
+// should print, and leaves `since` counting reports that were held back so the
+// summary line can say how many.
+bool RowDumpDue(uint64_t population, uint64_t& last, uint32_t& since) {
+  const int heartbeat = REXCVAR_GET(d3d9_diag_row_heartbeat);
+  ++since;
+  const bool changed = population != last;
+  last = population;
+  // heartbeat <= 0 disables the drift dump entirely, but never the change one.
+  const bool due = changed || (heartbeat > 0 && since >= uint32_t(heartbeat));
+  if (due) since = 0;
+  return due;
+}
+
+}  // namespace
+
 // The two histograms the round exists to produce.
 void ReportDeclHistogram() {
   uint64_t with = 0, without = 0;
@@ -6709,6 +6736,20 @@ void ReportDeclHistogram() {
       "d3d9: decl-source -- from device+0x2ED8: null={} unknown={} | vs the "
       "patch hook: same={} stale={}",
       g_declDeviceNull, g_declDeviceUnknown, g_declAgree, g_declDisagree);
+  // One row per declaration, held back while no NEW declaration has appeared.
+  // 17,987 rows over 783 reports in run mx_1782 -- ~23 a report, and the only
+  // thing moving between prints is each row's draw count. The two summary
+  // lines above always print and already carry g_declCount, so the held case
+  // is never silent.
+  static uint64_t s_lastDecls = 0;
+  static uint32_t s_sinceDecls = 0;
+  if (!RowDumpDue(uint64_t(g_declCount), s_lastDecls, s_sinceDecls)) {
+    REXLOG_INFO("d3d9: decl-draws   rows held -- declaration set unchanged at "
+                "{} ({} report(s) so far; d3d9_diag_row_heartbeat={})",
+                g_declCount, s_sinceDecls,
+                REXCVAR_GET(d3d9_diag_row_heartbeat));
+    return;
+  }
   for (int i = 0; i < g_declCount; ++i) {
     REXLOG_INFO("d3d9: decl-draws   id={} ptr=0x{:08X} elems={} colour={} x{}",
                 i, g_declPtr[i], g_declElems[i],
@@ -6757,27 +6798,6 @@ std::mutex g_upCallerMu;
 std::array<UpCaller, kMaxUpCallers> g_upCallers{};
 size_t g_upCallerCount = 0;
 uint64_t g_upCallerOverflow = 0;
-
-// Change-or-heartbeat, shared by the two row dumps.
-//
-// `population` is whatever number grows when something NEW appears -- the
-// distinct-site count, the distinct-config count. Both are add-only, so a
-// change in the count is a faithful "there is something here you have not
-// seen"; neither can shrink and hide a replacement.
-//
-// The caller keeps its own `last` and `since`. Returns true when the rows
-// should print, and leaves `since` counting reports that were held back so the
-// summary line can say how many.
-bool RowDumpDue(uint64_t population, uint64_t& last, uint32_t& since) {
-  const int heartbeat = REXCVAR_GET(d3d9_diag_row_heartbeat);
-  ++since;
-  const bool changed = population != last;
-  last = population;
-  // heartbeat <= 0 disables the drift dump entirely, but never the change one.
-  const bool due = changed || (heartbeat > 0 && since >= uint32_t(heartbeat));
-  if (due) since = 0;
-  return due;
-}
 
 }  // namespace
 
