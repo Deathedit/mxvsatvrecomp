@@ -22,3 +22,4 @@ gpu_state_diff_*.txt
 launch.bat
 renderdoc_*
 .claude
+mx.map
