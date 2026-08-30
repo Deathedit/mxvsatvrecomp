@@ -299,12 +299,19 @@ namespace {
 
 using mx::hooks::d3d9::HostPageReadable;
 
-// The distinct (renderer, caller) pairs the batches came from. Printed as part
-// of the REPEATING census, not once on first sighting: mx_1775 emitted 2952
-// batches and not one BATCH line survived, because a once-per-pair line lands
-// early and the log keeps only the last two segments
-// ([[logs-rotate-under-you]]). A fact that only exists in a rotated segment is
-// a fact you do not have.
+// The distinct (renderer, caller) pairs the batches came from, printed as part
+// of the REPEATING census rather than once on first sighting.
+//
+// The reason recorded here first was WRONG and is worth keeping straight. I
+// read "2952 batches emitted, zero BATCH lines" as the log having rotated the
+// lines away ([[logs-rotate-under-you]]) and rewrote the probe for it. The
+// actual cause was a STALE BINARY: the game runs mx.exe from the REPO ROOT, the
+// build writes out/build/win-amd64-release/mx.exe, and nothing copies it. Runs
+// 1775 and 1776 executed a 02:42 binary that predated the BATCH line entirely.
+//
+// Reporting from the repeating census is still the better shape -- it is the
+// same lesson the two probes before this one taught -- but it did not fix what
+// I said it fixed, and rotation was never involved.
 std::mutex g_forestBatchMu;
 std::set<uint64_t> g_forestBatchSites;   // (renderer << 32) | caller
 std::atomic<uint64_t> g_forestDrawCalls{0};
