@@ -3715,10 +3715,19 @@ ShaderApplyResult ApplyShaderOutputs(
       //
       //   STATIC in a healthy run:  every no-code/decode/stream/constants/
       //     vertex refusal (0), VTE unreadable (0), all four live-shader
-      //     outcomes (0), undeclared reg (0), no-VS (0), VS-samplers (frozen
-      //     at 4), too-many-inputs (0), GPU FETCH no-variant / ordinal-mismatch
-      //     / unaligned (0), CPU zero-filled (0), attribute-past-stride (0),
+      //     outcomes (0), no-VS (0), VS-samplers (frozen at 4-5),
+      //     too-many-inputs (0), GPU FETCH no-variant / ordinal-mismatch /
+      //     unaligned (0), CPU zero-filled (0), attribute-past-stride (0),
       //     rect arrangement and degenerate.
+      //
+      //   NOT STATIC, and this list said it was: undeclared reg. Measured over
+      //     run mx_1781 it climbs 2051 -> 3921. It is in the sum as a PRESENCE
+      //     BIT for that reason -- see the note at the sum itself.
+      //
+      // How to check a member before adding one, since reading the body is what
+      // failed both times: pull every occurrence of this line out of a real
+      // log, extract the integers in format-string order, and diff consecutive
+      // rows. A member that moves on most lines cannot be in the sum.
       //
       // The second group is the diagnostic payload: each one is zero or frozen
       // while things are working, and each one moving is genuine news. So the
@@ -3742,14 +3751,29 @@ ShaderApplyResult ApplyShaderOutputs(
           g_hleShaderNoCode + g_hleShaderBadDecode + g_hleShaderBadStream +
           g_hleShaderBadConstants + g_hleShaderBadVertex + g_vteSeen[0] +
           g_liveVertexResolved + g_liveVertexNoMatch + g_liveVertexAmbiguous +
-          g_liveVertexUnreadable + g_gpuVertexUndeclared + g_gpuVertexNoVs +
+          g_liveVertexUnreadable +
+          // PRESENCE, NOT MAGNITUDE -- and this is the second time this sum has
+          // been broken by one climbing member. g_gpuVertexUndeclared went
+          // 2051 -> 3921 across run mx_1781 and moved on 3922 of the 3943 lines
+          // it printed, so the predicate was true on essentially every attempt
+          // and the line cost 2.59 MB, 18% of the log. It is genuine news the
+          // FIRST time an undeclared register appears and nothing after that,
+          // which is exactly what a boolean says and a running total does not.
+          // Its real value is still printed below; only the trigger changes.
+          (g_gpuVertexUndeclared ? 1u : 0u) + g_gpuVertexNoVs +
           g_gpuVertexVsSamplers + g_gpuVertexTooManyInputs +
           g_gpuFetchNoVariant + g_gpuFetchOrdinalMismatch + g_gpuFetchUnaligned +
           g_hleShaderBadAttribute + g_hleShaderZeroFilledVertex +
           mx::hle::g_rectDegenerate.load();
       const auto now = std::chrono::steady_clock::now();
+      // d3d9_diag_row_heartbeat is counted in DRAW REPORTS at its other two
+      // sites and this one is per-attempt, so it is not a period here -- only
+      // the 0 case carries over, meaning "drift never prints, changes always
+      // do". The 10s heartbeat is the right unit for a per-attempt site and is
+      // worth ~11 lines in a two-minute run.
+      const bool drift_ok = REXCVAR_GET(d3d9_diag_row_heartbeat) > 0;
       if (attempt > 10 && failures == s_lastFailures &&
-          now - s_lastReport < std::chrono::seconds(10))
+          (!drift_ok || now - s_lastReport < std::chrono::seconds(10)))
         return;
       s_lastFailures = failures;
       s_lastReport = now;
