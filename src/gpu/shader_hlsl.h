@@ -245,6 +245,13 @@ struct HlslShader {
   // (0x4400 = 0x4000 + 1024 dwords = constant 256). Applying that base is the
   // caller's job at upload time, so this index is never above 255.
   uint32_t max_const_index = 0;
+  // Bitmask of the xe_c[] slots the shader actually reads, one bit per slot.
+  // Identity by CONSTANT USE: the SpeedTree 3D vegetation shaders
+  // (T_EcoLeaves/T_EcoBark) read g_TreeLerps c69, g_TreeFade c70 and
+  // gTreeLODParams3 c82, while the billboard shader reads g_BBTreeTypes at
+  // c80-c94. That distinguishes the two paths exactly, where geometry shape
+  // could not -- the guest repacks .tree data into its own stride.
+  uint64_t const_mask[4] = {};
   bool reads_constants = false;
 
   // Count of setp_* instructions — the ops that WRITE p0.

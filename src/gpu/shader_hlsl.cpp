@@ -177,6 +177,7 @@ class Emitter {
   bool writes_position = false;
   bool writes_depth = false;
   uint32_t max_const_index = 0;
+  uint64_t const_mask[4] = {};   // which xe_c[] slots this shader reads
   bool reads_constants = false;
   // setp_* instructions emitted with their value semantics but whose p0 result
   // nothing acts on, because predicated issue is not implemented. Non-zero means
@@ -423,11 +424,15 @@ class Emitter {
   std::string Const(uint32_t index) {
     reads_constants = true;
     if (index > max_const_index) max_const_index = index;
+    const_mask[(index & 255u) >> 6] |= 1ull << (index & 63u);
     return "xe_c[" + std::to_string(index) + "]";
   }
   std::string ConstRelative(uint32_t index) {
     reads_constants = true;
     max_const_index = 255;  // any slot is reachable once a0 is involved
+    // Every slot really is reachable, so the mask says so rather than naming
+    // the one literal index -- a mask that under-reports is worse than none.
+    for (auto& w : const_mask) w = ~0ull;
     return "xe_c[(" + std::to_string(index) + " + xe_a0) & 255]";
   }
 
@@ -2583,6 +2588,7 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   out.writes_position = em.writes_position;
   out.writes_depth = em.writes_depth;
   out.max_const_index = em.max_const_index;
+  for (int i = 0; i < 4; ++i) out.const_mask[i] = em.const_mask[i];
   out.reads_constants = em.reads_constants;
   out.unhonoured_predicate_ops = em.unhonoured_predicate_ops;
   out.predicated_alu_ops = em.predicated_alu_ops;

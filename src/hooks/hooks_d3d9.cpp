@@ -4395,6 +4395,78 @@ ShaderApplyResult ApplyShaderOutputs(
       REXLOG_INFO("d3d9: prim_type histogram over {} draws:{}", s_primTotal, h);
     }
   }
+  // SPEEDTREE PATH census -- which vegetation shader each draw runs, by the
+  // CONSTANTS it reads.
+  //
+  // This replaces a (stride, size_bytes) census that could not work: it keyed
+  // on the .tree assets' own vertex-buffer sizes, and the guest repacks that
+  // data into a stride-28 runtime layout, so the asset sizes never reach the
+  // fetch descriptor. Measured, run 1877: no s36/sz1512 or s36/sz8136 row
+  // exists; `s28 sz1512` does, which is 54 vertices, not the trunk's 42. The
+  // sizes matched by coincidence and the fingerprint was worthless.
+  //
+  // Constant use IS exact. From the shader assets (tools/shader_code.py):
+  //
+  //   T_EcoLeaves / T_EcoBark   3D geometry, read c69 g_TreeLerps,
+  //                             c70 g_TreeFade, c82 gTreeLODParams3
+  //   TreeShader BBVertexShader billboards, read g_BBTreeTypes at c80..c94
+  //
+  // c70 is the sharpest: exactly one asset in FR_Dunes declares g_TreeFade, and
+  // the billboard shader does not read it at all.
+  //
+  // The question: driving up to a palm, does the guest ever submit a draw whose
+  // VS reads c70? If yes, the 3D LOD is submitted and we lose it downstream. If
+  // no, the guest never selects it and the defect is upstream of the renderer.
+  //
+  // NOT behind g_diag -- the neighbouring prim_type histogram is, and it printed
+  // zero times in run 1875. A census nobody can read answers nothing, and this
+  // has to be answered from a log because the failure cannot be captured.
+  // SPEEDTREE path census. THE SAME REGISTER MEANS DIFFERENT THINGS IN
+  // DIFFERENT SHADERS, which is what makes this awkward and is worth stating
+  // once, from the shader assets themselves:
+  //
+  //   T_EcoLeaves (3D)   c69 g_TreeLerps  c70 g_TreeFade  c82 gTreeLODParams3
+  //   TreeShader   (BB)  c69 g_BBWorldX   c70 g_BBWorldY  c71 g_BBWorldZ
+  //                      c72 g_AngleDot   c80 g_BBTreeTypes x60  -> c80..c139
+  //
+  // So c69/c70 alias, and c82 falls INSIDE g_BBTreeTypes. Two earlier cuts of
+  // this census died on that: a compound predicate put every draw in "both"
+  // (37320/37320), and per-constant counts came back flat at ~40,29x because
+  // one shader reads all of them. Neither was measuring what it claimed.
+  //
+  // g_BBTreeTypes is the separator. The billboard shader ALWAYS reads c80; the
+  // 3D vegetation shaders never do. So:
+  //
+  //   reads c70 and NOT c80  ->  T_EcoLeaves 3D geometry
+  //   reads c80              ->  billboard
+  //
+  // If the 3D count is ~0 while driving into a tree, the guest is only ever
+  // submitting billboards and the LOD selector never picks the close-range
+  // mesh -- upstream of the renderer, and nothing here can be at fault.
+  if (vs_translated) {
+    static std::mutex s_stMutex;
+    static uint64_t s_stDraws = 0, s_st3d = 0, s_stBb = 0, s_stBark = 0;
+    const auto reads = [&](uint32_t c) {
+      return ((vs_translated->const_mask[(c & 255u) >> 6] >> (c & 63u)) &
+              1ull) != 0;
+    };
+    const bool bb = reads(80);
+    const bool leaf3d = reads(70) && !bb;          // T_EcoLeaves
+    const bool bark3d = reads(69) && reads(82) && !reads(70) && !bb;  // T_EcoBark
+    std::lock_guard<std::mutex> st_lock(s_stMutex);
+    ++s_stDraws;
+    if (bb) ++s_stBb;
+    if (leaf3d) ++s_st3d;
+    if (bark3d) ++s_stBark;
+    if ((s_stDraws % 20000) == 0) {
+      REXLOG_INFO(
+          "d3d9: SPEEDTREE path census over {} draws: billboard (reads c80 "
+          "g_BBTreeTypes) {}, 3D leaf (c70 g_TreeFade, no c80) {}, 3D bark "
+          "(c69+c82, no c70/c80) {}. Near-zero 3D means the guest never "
+          "submits a close-range LOD.",
+          s_stDraws, s_stBb, s_st3d, s_stBark);
+    }
+  }
   if (gpu_fetch && attrs.size() != vs_translated->vertex_fetch_count) {
     // The emitter and DecodeVertexShaderFetches walk the same instruction
     // stream, so these must agree. If they ever do not, the xe_vf[] entries
@@ -6571,6 +6643,8 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
           for (uint32_t i = 0; i < fetched.vertex_fetch_count; ++i)
             kept.vertex_fetch_slot[i] = fetched.vertex_fetch_slot[i];
           kept.computed_index_streams = fetched.computed_index_streams;
+          for (int ci = 0; ci < 4; ++ci)
+            kept.const_mask[ci] = fetched.const_mask[ci];
           kept.computed_index_fetches = fetched.computed_index_fetches;
           ++g_vfetchCompiled;
         } else {
