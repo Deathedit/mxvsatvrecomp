@@ -2533,7 +2533,10 @@ void NoteMipCensus() {
       "d3d9: MIP CHAIN over {} binds: {} carry one ({} levels total, mean"
       " {:.1f}); mip_address set {}; declared but no address {}; suppressed"
       " base-map {} min-level {}; layout empty {}; truncated at decode {};"
-      " chain copy failed {}; deferred: mip_filter=point {} lod_bias {};"
+      " chain copy failed {}; guest asks for mip_filter=point {} lod_bias {}"
+      " (both APPLIED -- these were labelled `deferred` until 2026-08-30, long"
+      " after they landed: mip_filter drives the kSamplerMipPoint/kSamplerBaseMap"
+      " variants in d3d12_game.cpp and the bias rides in xe_texinv[slot].w);"
       " raw mip_max_level:{}",
       c.described, c.with_chain, c.levels_planned,
       c.with_chain ? double(c.levels_planned) / double(c.with_chain) : 0.0,
