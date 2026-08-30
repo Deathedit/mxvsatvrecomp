@@ -299,6 +299,14 @@ namespace {
 
 using mx::hooks::d3d9::HostPageReadable;
 
+// The distinct (renderer, caller) pairs the batches came from. Printed as part
+// of the REPEATING census, not once on first sighting: mx_1775 emitted 2952
+// batches and not one BATCH line survived, because a once-per-pair line lands
+// early and the log keeps only the last two segments
+// ([[logs-rotate-under-you]]). A fact that only exists in a rotated segment is
+// a fact you do not have.
+std::mutex g_forestBatchMu;
+std::set<uint64_t> g_forestBatchSites;   // (renderer << 32) | caller
 std::atomic<uint64_t> g_forestDrawCalls{0};
 std::atomic<uint64_t> g_forestBatches{0};
 std::atomic<uint64_t> g_guestThreads{0};
@@ -325,12 +333,20 @@ void ReportForest(const char* why) {
               g_forestKickGateOpen.load(std::memory_order_relaxed),
               g_forestTreeAdded.load(std::memory_order_relaxed),
               g_forestAsset.load(std::memory_order_relaxed));
+  std::string sites;
+  {
+    std::lock_guard<std::mutex> lk(g_forestBatchMu);
+    for (uint64_t k : g_forestBatchSites)
+      sites += fmt::format(" r0x{:08X}/lr0x{:08X}", uint32_t(k >> 32),
+                           uint32_t(k));
+  }
   REXLOG_INFO("forest:   guest threads created {}, cull-thread body entered {} "
-              "| DRAW consumer called {}, batches emitted {}",
+              "| DRAW consumer called {}, batches emitted {} | batch sites{}",
               g_guestThreads.load(std::memory_order_relaxed),
               g_forestThreadBody.load(std::memory_order_relaxed),
               g_forestDrawCalls.load(std::memory_order_relaxed),
-              g_forestBatches.load(std::memory_order_relaxed));
+              g_forestBatches.load(std::memory_order_relaxed),
+              sites.empty() ? " (none)" : sites);
 }
 
 }  // namespace
@@ -484,17 +500,11 @@ REX_HOOK_RAW(sub_823F82D0) {
   const uint32_t type = ctx.r4.u32;
   const uint32_t caller = uint32_t(ctx.lr);
   {
-    static std::mutex s_mu;
-    static std::set<uint64_t> s_seen;
-    std::lock_guard<std::mutex> lk(s_mu);
-    // Deduped on (renderer, caller), not sampled by count: the interesting
-    // event is a SECOND distinct renderer appearing, and a "first 16 calls"
-    // rule would miss one that only shows up later in a level.
-    const uint64_t key = (uint64_t(renderer) << 32) | caller;
-    if (s_seen.size() < 32 && s_seen.insert(key).second)
-      REXLOG_INFO("forest: BATCH renderer 0x{:08X} type {} caller 0x{:08X} "
-                  "(batch #{}, {} distinct renderer/caller pairs so far)",
-                  renderer, type, caller, n, s_seen.size());
+    std::lock_guard<std::mutex> lk(g_forestBatchMu);
+    if (g_forestBatchSites.size() < 32)
+      g_forestBatchSites.insert((uint64_t(renderer) << 32) | caller);
   }
+  (void)n;
+  (void)type;
   __imp__sub_823F82D0(ctx, base);
 }
