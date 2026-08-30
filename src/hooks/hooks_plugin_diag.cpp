@@ -70,6 +70,34 @@ std::atomic<uint32_t> g_updRenderer{0};   // sub_82B34998, RendererDispatch
 std::atomic<uint32_t> g_updFixed60{0};    // entity-pass calls at a hardcoded 1/60
 std::atomic<uint32_t> g_updAltPath{0};    // sub_82AB58F8, which supplies that 1/60
 std::atomic<uint32_t> g_updRendererExec{0};  // sub_82B33EC0, dispatches EXECUTED
+std::atomic<uint64_t> g_gpuIntVblank{0};    // graphics interrupt, source 0
+std::atomic<uint64_t> g_gpuIntSwap{0};      // graphics interrupt, source 1
+std::atomic<uint64_t> g_gpuIntOther{0};
+std::atomic<uint64_t> g_vblankHandler{0};   // sub_825663B0, the flip pass
+
+// THE GUEST'S FRAME CADENCE IS VBLANK-COUNTED, and we have never measured the
+// rate we deliver it at.
+//
+// D3D9 registers sub_825582E0 through VdSetGraphicsInterruptCallback
+// (sub_82569A50). Its first argument is the interrupt SOURCE -- 0 vblank,
+// 1 swap-complete -- and on a vblank it runs sub_825663B0, which is the flip:
+//
+//     ++a1[4190];                                  // THE VBLANK COUNTER
+//     if (pending[i].target_vblank > a1[4190]) break;   // not due yet
+//     MEMORY[0x7FC86110] = front_buffer;           // flip
+//     ++a1[4196];                                  // swaps completed
+//
+// So a queued swap waits until the vblank counter reaches its target, which is
+// how the present interval is expressed on this hardware. Everything the title
+// paces off that counter runs at whatever rate we deliver vblanks -- and that
+// rate is independent of our swap rate, of frame_limit_fps, and of the QPC dt
+// the Timing hook measures, which is why every clock measurement so far has
+// come back at 1.00 while the game runs fast.
+//
+// The console delivers 60 vblanks a second. If we deliver the HOST's, a 120 Hz
+// monitor is exactly 2x -- and it would be machine-dependent, which nothing
+// else measured so far is.
+constexpr double kConsoleVblankHz = 60.0;
 
 // A CALL IS NOT AN EXECUTION, and RendererDispatch is the case that proves it.
 //
@@ -305,6 +333,10 @@ extern "C" REX_FUNC(sub_82B70370) {
   static uint64_t s_execTotal = 0;
   s_execTotal += exec;
   const uint32_t fixed60 = g_updFixed60.exchange(0, std::memory_order_relaxed);
+  const uint64_t vbl = g_gpuIntVblank.load(std::memory_order_relaxed);
+  const uint64_t swp = g_gpuIntSwap.load(std::memory_order_relaxed);
+  const uint64_t oth = g_gpuIntOther.load(std::memory_order_relaxed);
+  const uint64_t flips = g_vblankHandler.load(std::memory_order_relaxed);
   const uint32_t alt = g_updAltPath.exchange(0, std::memory_order_relaxed);
   static uint64_t s_fixed60Total = 0, s_altTotal = 0;
   s_fixed60Total += fixed60;
@@ -349,6 +381,19 @@ extern "C" REX_FUNC(sub_82B70370) {
     // measured dt, and how often the path that supplies it ran. A non-zero
     // pair here IS the speed multiplier: the world advances by
     // real_dt + 1/60 per frame, and no frame cap can reach the second term.
+    // The rate we deliver the guest's frame heartbeat at, against the 60 Hz the
+    // console delivered. A ratio of 2.00 here is a 2x game, and unlike every
+    // other number in this file it can differ between machines.
+    REXLOG_INFO("{}: GPU INTERRUPTS over {:.1f}s -- vblank {} ({:.1f}/s = "
+                "{:.2f}x the console's 60Hz), swap-done {}, other {}; flip pass "
+                "ran {} times{}",
+                mx::native::g_plugin_mode ? "plugin" : "native", s_hostElapsed,
+                vbl, s_hostElapsed > 0.0 ? double(vbl) / s_hostElapsed : 0.0,
+                s_hostElapsed > 0.0
+                    ? double(vbl) / s_hostElapsed / kConsoleVblankHz
+                    : 0.0,
+                swp, oth, flips,
+                vbl == 0 ? "  <-- NO VBLANKS DELIVERED AT ALL" : "");
     REXLOG_INFO("{}: FIXED-60 STEPS over {} frames -- {} entity passes at the "
                 "hardcoded 1/60 ({:.3f}/frame), sub_82AB58F8 ran {} times "
                 "({:.3f}/frame). Implied world advance {:.3f}x real",
@@ -380,6 +425,26 @@ extern "C" REX_FUNC(sub_82B6D230) {
     g_updFixed60.fetch_add(1, std::memory_order_relaxed);
   g_updEntityDtBits.store(std::bit_cast<uint64_t>(dt), std::memory_order_relaxed);
   orig_EntityDt(ctx, base);
+}
+
+// sub_825582E0(source, device) — D3D9's graphics interrupt callback, registered
+// through VdSetGraphicsInterruptCallback in sub_82569A50. source 0 is vblank,
+// 1 is swap-complete. See the note at kConsoleVblankHz.
+REX_IMPORT(__imp__sub_825582E0, orig_GpuInterrupt, void());
+extern "C" REX_FUNC(sub_825582E0) {
+  const uint32_t source = ctx.r3.u32;
+  if (source == 0) g_gpuIntVblank.fetch_add(1, std::memory_order_relaxed);
+  else if (source == 1) g_gpuIntSwap.fetch_add(1, std::memory_order_relaxed);
+  else g_gpuIntOther.fetch_add(1, std::memory_order_relaxed);
+  orig_GpuInterrupt(ctx, base);
+}
+
+// sub_825663B0 — the vblank flip pass: bumps the vblank counter and retires any
+// queued swap whose target vblank has arrived.
+REX_IMPORT(__imp__sub_825663B0, orig_VblankFlip, void());
+extern "C" REX_FUNC(sub_825663B0) {
+  g_vblankHandler.fetch_add(1, std::memory_order_relaxed);
+  orig_VblankFlip(ctx, base);
 }
 
 // sub_82B33EC0 — the first thing RendererDispatch does once it is past its
