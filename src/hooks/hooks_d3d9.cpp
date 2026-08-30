@@ -2516,6 +2516,12 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     // reads them as if indexed by the vertex, which is an unrelated row rather
     // than an approximation, so it zero-fills them instead.
     if (vst) in.computed_index_streams = vst->computed_index_streams;
+    // Any computed fetch index makes the WHOLE draw absolute: the shader
+    // does arithmetic on the vertex id, so it must see the guest's own
+    // number. Every stream is then addressed from its origin -- mixing a
+    // rebased window with an absolute id is what made all 42 foliage draws
+    // render the same billboards.
+    if (vst) in.absolute_indices = vst->computed_index_fetches != 0;
     // The DENOMINATOR for the skip counter below. "0 attributes left
     // default" reads as "never happens" and as "the flag never arrived",
     // and those are opposite conclusions -- the same ambiguity that made an
@@ -4391,9 +4397,12 @@ ShaderApplyResult ApplyShaderOutputs(
     // written it. The billboard shaders compute BOTH their indices into
     // r0.x (corner = vid % 4, instance = vid / 4), so every one of their
     // fetches was misclassified, windowed at first_vertex, and dropped.
+    // ALL of them, not just the computed ones. Indices are absolute for
+    // this draw (see HleDrawInputs::absolute_indices), so a vertex-indexed
+    // fetch in the same shader is absolute too and cannot read a window.
     bool whole_stream[kMaxStreams] = {};
-    for (size_t a = 0; a < attrs.size(); ++a)
-      if (a < 32 && ((vs_translated->computed_index_fetches >> a) & 1u))
+    if (vs_translated->computed_index_fetches != 0)
+      for (size_t a = 0; a < attrs.size(); ++a)
         whole_stream[attr_stream[a]] = true;
     dc.raw_vertex_bytes.clear();
     dc.raw_fetch_count = 0;
@@ -4524,15 +4533,10 @@ ShaderApplyResult ApplyShaderOutputs(
         limit_of_stream[si] = uint32_t(dc.raw_vertex_bytes.size());
       }
       auto& rf = dc.raw_fetch[dc.raw_fetch_count++];
-      // A whole-stream region starts at the buffer's own origin, so a fetch
-      // that IS indexed by the vertex has to skip forward to where its window
-      // would have begun -- the shader still rebases its index to 0. A fetch
-      // indexed by a computed register addresses from the origin directly.
-      const bool by_vertex =
-          a >= 32 || !((vs_translated->computed_index_fetches >> a) & 1u);
+      // No first_vertex adjustment: in absolute mode the index the shader
+      // forms already carries it, and outside absolute mode the region is
+      // windowed so its origin already is first_vertex.
       rf.base = region_of_stream[si];
-      if (whole_stream[si] && by_vertex)
-        rf.base += uint32_t(uint64_t(dc.first_vertex) * s.stride);
       rf.stride = s.stride;
       rf.endian = s.endian;
       rf.limit = limit_of_stream[si];

@@ -279,9 +279,15 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
       skip = HleSkip::kTooManyVertices;
       return false;
     }
+    // Absolute indices are not rebased, so it is the TOP of the range that
+    // must fit the 16-bit index view, not its width.
+    if (in.absolute_indices && hi > 0xFFFFu) {
+      skip = HleSkip::kTooManyVertices;
+      return false;
+    }
     indices.reserve(size_t(in.count) * 2);
     auto emit = [&](uint32_t v) {
-      const uint32_t r = v - lo;
+      const uint32_t r = in.absolute_indices ? v : (v - lo);
       indices.push_back(uint8_t(r & 0xFF));
       indices.push_back(uint8_t(r >> 8));
     };
@@ -365,11 +371,18 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
     // trivial identity index buffer is generated rather than adding a second
     // submission route.
     indices.resize(size_t(in.count) * 2);
+    // The non-indexed twin of `emit` above, and it has to agree with it or a
+    // DrawVertices call lands on the wrong instances.
+    const uint32_t id_base = in.absolute_indices ? in.first : 0;
     for (uint32_t i = 0; i < in.count; ++i) {
-      indices[i * 2 + 0] = uint8_t(i & 0xFF);
-      indices[i * 2 + 1] = uint8_t(i >> 8);
+      const uint32_t v = id_base + i;
+      indices[i * 2 + 0] = uint8_t(v & 0xFF);
+      indices[i * 2 + 1] = uint8_t(v >> 8);
     }
-    if (in.count > 0xFFFF) { skip = HleSkip::kTooManyVertices; return false; }
+    if (id_base + in.count > 0xFFFF) {
+      skip = HleSkip::kTooManyVertices;
+      return false;
+    }
     out.index_16bit = true;
     out.index_count = in.count;
   }

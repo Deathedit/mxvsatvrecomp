@@ -72,6 +72,23 @@ struct HleDrawInputs {
   // instead, which is what an out-of-range fetch already yields here.
   uint32_t computed_index_streams = 0;
 
+  // The shader derives a fetch index FROM the vertex index, so SV_VertexID
+  // must be the guest's absolute index, not one rebased onto this draw's
+  // window.
+  //
+  // Rebasing (`v - lo`) is right when the vertex index only addresses a
+  // stream we windowed to match. It is wrong the moment the shader does
+  // arithmetic on it: the billboard shaders compute `instance = vid / 4`, so
+  // with a rebased id every draw addressed instances 0..N instead of its own
+  // range and all 42 foliage draws rendered the SAME billboards. Measured in
+  // the mesh: draw B's 16 live vertices were 16-for-16 identical to draw
+  // A's.
+  //
+  // Xenia solves it from the other side, adding a vertex index offset system
+  // constant in RemapAndConvertVertexIndices. Not rebasing needs no constant
+  // and no shader change.
+  bool absolute_indices = false;
+
   // How the hardware conditions an index before it reaches the vertex fetch.
   // Ignoring these is what lost the ground: one 0xFFFF primitive-restart index
   // made vmax 65535, the vertex window exploded to 65536, and the draw was
