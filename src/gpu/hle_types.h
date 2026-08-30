@@ -669,6 +669,12 @@ struct DrawCall {
   // vertex buffer before the render thread submits this draw — the same hazard
   // `content_version` documents for textures above.
   std::vector<uint8_t> raw_vertex_bytes;
+  // Content key for the bytes above, or 0 for "do not reuse". Two draws with
+  // the same non-zero key build byte-identical buffers, so the renderer can
+  // share one upload allocation between them. Covers the guest buffer, the
+  // copied range, and the buffer GENERATION bumped by D3DVertexBuffer_Unlock,
+  // so a guest write invalidates it.
+  uint64_t raw_vertex_key = 0;
 
   // Per emitted vfetch, in the shader's program order, matching
   // HlslShader::vertex_fetch_slot. Uploaded verbatim as the shader's xe_vf[].

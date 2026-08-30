@@ -2860,6 +2860,24 @@ void D3D12Renderer::ClearGameDraws() {
   // them; leaving those marked would retire them from the ring permanently.
   for (auto& p : m_uploadPages) p.live = false;
   m_uploadBytesThisFrame = 0;
+  // MUST be cleared here, with the pages. A page is recycled once its fence
+  // completes and `used` is reset to 0, so an allocation remembered across
+  // this point can be handed back after its bytes have been overwritten by
+  // something else -- and the content key would still match, because the key
+  // describes the GUEST buffer, which has not changed. Clearing at the frame
+  // boundary keeps every reuse inside the window where the page stays live.
+  m_lastRawKey = 0;
+  m_lastRawAlloc = {};
+  // Reported, because a cache believed without a hit rate is just a hazard
+  // with a comment. `misses` includes every draw whose key was 0 -- windowed
+  // regions, non-fetch draws -- so a low ratio is normal and only the ABSOLUTE
+  // hit count says whether the foliage runs are being collapsed.
+  if (m_rawReuseHits + m_rawReuseMisses >= 200000) {
+    REXLOG_INFO("d3d12: raw vertex buffer reuse {} hits / {} draws",
+                m_rawReuseHits, m_rawReuseHits + m_rawReuseMisses);
+    m_rawReuseHits = 0;
+    m_rawReuseMisses = 0;
+  }
 
   if (m_gameDraws.empty()) return;
   m_gameDraws.clear();
@@ -3616,12 +3634,33 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
     if (vertexStage->rawBytes) {
       // The fetch path: one raw buffer, no vertex buffer view, and xe_vf[]
       // written into the cbuffer tail immediately after xe_texinv.
-      if (createBuffer(d.rawvb, vertexStage->rawByteCount) &&
+      // Reuse the previous draw's allocation when the bytes are provably the
+      // same. The foliage passes are ~45 consecutive draws over one 325KB
+      // instance table, so without this the frame copies and uploads the same
+      // megabytes dozens of times -- the whole-stream copy that correctness
+      // required cost 4-6ms/frame, and this is where most of it went.
+      //
+      // Keyed on CONTENT (see DrawCall::raw_vertex_key), which includes the
+      // buffer generation bumped by D3DVertexBuffer_Unlock, so a guest write
+      // between draws breaks the match. Only the immediately preceding draw is
+      // remembered: the repeats are consecutive, and a one-entry memo cannot
+      // hand back an allocation from an earlier frame because it is cleared
+      // when the frame's upload arena is reset.
+      const bool reuse_raw = vertexStage->rawKey != 0 &&
+                             vertexStage->rawKey == m_lastRawKey &&
+                             m_lastRawAlloc.size >= vertexStage->rawByteCount;
+      if (reuse_raw) ++m_rawReuseHits; else ++m_rawReuseMisses;
+      if (reuse_raw) d.rawvb = m_lastRawAlloc;
+      if ((reuse_raw || createBuffer(d.rawvb, vertexStage->rawByteCount)) &&
           createBuffer(d.vscb, vsConstBytes)) {
         // Both ranges are already mapped, so the pair of Map calls this used to
         // guard on is gone and with it the only way these writes could fail.
-        std::memcpy(d.rawvb.cpu, vertexStage->rawBytes,
-                    vertexStage->rawByteCount);
+        if (!reuse_raw) {
+          std::memcpy(d.rawvb.cpu, vertexStage->rawBytes,
+                      vertexStage->rawByteCount);
+          m_lastRawKey = vertexStage->rawKey;
+          m_lastRawAlloc = d.rawvb;
+        }
         uint8_t* p = d.vscb.cpu;
         std::memset(p, 0, vsConstBytes);
         std::memcpy(p, vertexStage->constants, vertexStage->constDwords * 4);

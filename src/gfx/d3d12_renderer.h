@@ -129,6 +129,10 @@ struct GpuVertexStage {
   // xe_vf[]. 4 dwords each, matching DrawCall::RawFetch.
   const uint32_t* rawFetch = nullptr;
   uint32_t rawFetchCount = 0;
+  // Non-zero when `rawBytes` is byte-identical to any other draw carrying the
+  // same value, so one upload allocation can serve both. See
+  // DrawCall::raw_vertex_key.
+  uint64_t rawKey = 0;
 
   // --- textures this stage samples -----------------------------------------
   //
@@ -1349,6 +1353,13 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // Suballocate `bytes` from the ring. The returned range is already mapped:
   // there is no Map/Unmap pair, which is the other per-draw cost this removes.
   bool AllocUpload(UploadAlloc& out, uint32_t bytes);
+
+  // One-entry memo over the merged raw vertex buffer, so a run of draws that
+  // build identical bytes shares one upload allocation. Cleared every frame
+  // with the upload pages -- see the note there, a stale hit is silent.
+  uint64_t m_lastRawKey = 0;
+  UploadAlloc m_lastRawAlloc{};
+  uint64_t m_rawReuseHits = 0, m_rawReuseMisses = 0;
 
   // One translated draw. The CB is per-draw rather than one shared buffer so it
   // is not rewritten while the GPU may still be reading the previous frame's

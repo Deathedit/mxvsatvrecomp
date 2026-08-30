@@ -18,6 +18,8 @@
 // their headers itself -- in the original single TU it was included near the
 // BOTTOM of a long include block, after all of these. Including it first here
 // fails with a page of "no member named ... in namespace mx::hle".
+#include <atomic>
+
 #include <rex/cvar.h>
 #include <rex/graphics/format/ucode.h>
 
@@ -294,5 +296,33 @@ ResolveRangeProbe ProbeResolveRange(uint32_t address, uint32_t bytes);
 
 const ResolvedTargetByAddress* ResolvedTargetForAddress(
     const mx::hle::HleTextureSource& described);
+
+// GUEST VERTEX BUFFER WRITES.
+//
+// D3DVertexBuffer_Lock (0x82557F28) and _Unlock (0x82556F10) are the guest's
+// only route to modifying a vertex buffer -- AsyncLock is not linked into this
+// XEX, and both have ~33 callers each, paired from the same functions. Nothing
+// hooked them before, so we had no signal at all for "these bytes changed",
+// which is exactly what a cache over the merged raw vertex buffer needs.
+//
+// A GENERATION rather than a dirty flag: a flag has to be cleared by someone,
+// and there is no natural point to do that. A counter that only ever rises
+// makes a stale key compare unequal forever, which fails safe.
+//
+// Direct-mapped by address and NOT a map: this is read once per stream per
+// draw and written from the guest's own threads, so a lock here would sit on
+// the hot path. A collision makes two buffers share a generation, which only
+// costs a needless cache miss -- never a stale hit.
+constexpr uint32_t kVbGenSlots = 256;
+extern std::atomic<uint32_t> g_vbGeneration[kVbGenSlots];
+inline uint32_t VbGenSlot(uint32_t buffer_obj) {
+  return (buffer_obj >> 4) & (kVbGenSlots - 1);
+}
+inline uint32_t VbGeneration(uint32_t buffer_obj) {
+  return g_vbGeneration[VbGenSlot(buffer_obj)].load(std::memory_order_relaxed);
+}
+inline void NoteVbWritten(uint32_t buffer_obj) {
+  g_vbGeneration[VbGenSlot(buffer_obj)].fetch_add(1, std::memory_order_relaxed);
+}
 
 }  // namespace mx::hooks::d3d9
