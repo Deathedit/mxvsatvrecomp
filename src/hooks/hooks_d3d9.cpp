@@ -364,6 +364,36 @@ constexpr uint32_t kDeviceScanDwords = kDeviceScanBytes / 4;
 // frame. That matters in one direction specifically: a stale *positive* on a
 // decommitted page is a crash, and avoiding exactly that is why this function
 // exists. Guest allocations cluster at load, so per-frame is ample.
+// How many draw reports may pass with NOTHING NEW before the two row-level
+// dumps -- UP CALLERS' per-site rows and the per-config stencil lines -- print
+// anyway.
+//
+// Measured over run mx_1781, 357 draw reports in 14.46 MB of log: UP CALLERS is
+// 357 lines and 0.67 MB, averaging 1955 BYTES A LINE, and the per-config
+// stencil rows are 5973 lines and 1.30 MB. Together 13.6% of the run, in a log
+// whose segments rotate every ~30 seconds. Both are cumulative whole-population
+// snapshots, so consecutive prints are identical apart from counter drift, and
+// drift is not worth a log segment.
+//
+// (The first cut of this comment said 267 lines and 6.4%. It was wrong: the
+// census key was truncated at 44 characters, so "52 distinct call sites" and
+// "51 distinct call sites" landed in different buckets and only the largest was
+// read. Normalise the digits out before counting line kinds.)
+//
+// NOT A BLIND MODULO, which would throw away the thing they are for. A new UP
+// call site or a new stencil configuration prints IMMEDIATELY at any setting --
+// the appearance of one is the entire diagnostic -- and the heartbeat covers
+// only the case where the population has not moved. Neither report ever goes
+// silent: when the rows are held back a one-line summary still prints, so
+// "nothing new" and "not running" stay distinguishable. See the same
+// change-or-heartbeat rule on RESOLVE CONSUMPTION below.
+//
+// 0 = only ever print rows on a change. 1 = every report, the old behaviour.
+REXCVAR_DEFINE_INT32(d3d9_diag_row_heartbeat, 16, "Debug",
+                     "Draw reports allowed to pass with an unchanged "
+                     "population before UP CALLERS and the per-config stencil "
+                     "rows dump anyway (0 = only on change, 1 = every report)");
+
 REXCVAR_DEFINE_BOOL(d3d9_page_cache_verify, false, "Debug",
                     "Verify every page-readability cache hit against a fresh "
                     "VirtualQuery and log mismatches. Slow; correctness check "
@@ -6704,6 +6734,27 @@ std::array<UpCaller, kMaxUpCallers> g_upCallers{};
 size_t g_upCallerCount = 0;
 uint64_t g_upCallerOverflow = 0;
 
+// Change-or-heartbeat, shared by the two row dumps.
+//
+// `population` is whatever number grows when something NEW appears -- the
+// distinct-site count, the distinct-config count. Both are add-only, so a
+// change in the count is a faithful "there is something here you have not
+// seen"; neither can shrink and hide a replacement.
+//
+// The caller keeps its own `last` and `since`. Returns true when the rows
+// should print, and leaves `since` counting reports that were held back so the
+// summary line can say how many.
+bool RowDumpDue(uint64_t population, uint64_t& last, uint32_t& since) {
+  const int heartbeat = REXCVAR_GET(d3d9_diag_row_heartbeat);
+  ++since;
+  const bool changed = population != last;
+  last = population;
+  // heartbeat <= 0 disables the drift dump entirely, but never the change one.
+  const bool due = changed || (heartbeat > 0 && since >= uint32_t(heartbeat));
+  if (due) since = 0;
+  return due;
+}
+
 }  // namespace
 
 void NoteUpDrawCaller(uint32_t lr, uint32_t verts, uint32_t kind) {
@@ -6740,6 +6791,21 @@ void ReportUpDrawCallers() {
     n = g_upCallerCount;
     overflow = g_upCallerOverflow;
   }
+  const std::string cap =
+      overflow ? fmt::format(", {} DROPPED past the {}-site cap (the rows are "
+                             "then not the whole set)",
+                             overflow, kMaxUpCallers)
+               : std::string();
+  // A new call site moves `n`; a first overflow moves the other half. Either is
+  // something unseen, so fold both into the population the heartbeat watches.
+  static uint64_t s_last = 0;
+  static uint32_t s_since = 0;
+  if (!RowDumpDue((uint64_t(n) << 1) | (overflow ? 1u : 0u), s_last, s_since)) {
+    REXLOG_INFO("d3d9: UP CALLERS {} distinct call sites{} -- unchanged, rows "
+                "held ({} report(s) so far; d3d9_diag_row_heartbeat={})",
+                n, cap, s_since, REXCVAR_GET(d3d9_diag_row_heartbeat));
+    return;
+  }
   std::sort(snap.begin(), snap.begin() + n,
             [](const UpCaller& a, const UpCaller& b) { return a.calls > b.calls; });
   std::string rows;
@@ -6752,11 +6818,7 @@ void ReportUpDrawCallers() {
                         snap[i].calls, snap[i].min_verts, snap[i].max_verts,
                         snap[i].calls ? snap[i].verts / snap[i].calls : 0);
   }
-  REXLOG_INFO("d3d9: UP CALLERS {} distinct call sites{} --{}", n,
-              overflow ? fmt::format(", {} DROPPED past the {}-site cap (the "
-                                     "rows below are then not the whole set)",
-                                     overflow, kMaxUpCallers)
-                       : std::string(),
+  REXLOG_INFO("d3d9: UP CALLERS {} distinct call sites{} --{}", n, cap,
               rows.empty() ? " (none)" : rows);
 }
 
@@ -6790,20 +6852,33 @@ void ReportDrawCounts(uint8_t* base) {
                 g_stencilDrawsSeen, g_stencilDrawsUnreadable, g_stencilBitSet,
                 g_stencilEffective, g_stencilConfigs.size(), modes);
     // One line per distinct configuration, so the translation work is a
-    // countable list rather than an impression.
-    for (const auto& [key, n] : g_stencilConfigs) {
-      const uint32_t dc_bits = key.first;
-      const uint32_t rm = key.second;
-      REXLOG_INFO("d3d9:   stencil cfg depthcontrol=0x{:08X} refmask=0x{:08X}"
-                  " x{} -- func {} fail {} zpass {} zfail {} backface {}"
-                  " (bf func {} fail {} zpass {} zfail {});"
-                  " ref {} mask 0x{:02X} writemask 0x{:02X}",
-                  dc_bits, rm, n, (dc_bits >> 8) & 7u, (dc_bits >> 11) & 7u,
-                  (dc_bits >> 14) & 7u, (dc_bits >> 17) & 7u,
-                  (dc_bits >> 7) & 1u, (dc_bits >> 20) & 7u,
-                  (dc_bits >> 23) & 7u, (dc_bits >> 26) & 7u,
-                  (dc_bits >> 29) & 7u, rm & 0xFFu, (rm >> 8) & 0xFFu,
-                  (rm >> 16) & 0xFFu);
+    // countable list rather than an impression. Held back while the config set
+    // is unchanged -- the census line above already carries the count, so the
+    // suppressed case is never silent.
+    static uint64_t s_lastCfgs = 0;
+    static uint32_t s_sinceCfgs = 0;
+    const bool dump_cfgs =
+        RowDumpDue(g_stencilConfigs.size(), s_lastCfgs, s_sinceCfgs);
+    if (!dump_cfgs) {
+      REXLOG_INFO("d3d9:   stencil cfg rows held -- config set unchanged at {} "
+                  "({} report(s) so far; d3d9_diag_row_heartbeat={})",
+                  g_stencilConfigs.size(), s_sinceCfgs,
+                  REXCVAR_GET(d3d9_diag_row_heartbeat));
+    } else {
+      for (const auto& [key, n] : g_stencilConfigs) {
+        const uint32_t dc_bits = key.first;
+        const uint32_t rm = key.second;
+        REXLOG_INFO("d3d9:   stencil cfg depthcontrol=0x{:08X} refmask=0x{:08X}"
+                    " x{} -- func {} fail {} zpass {} zfail {} backface {}"
+                    " (bf func {} fail {} zpass {} zfail {});"
+                    " ref {} mask 0x{:02X} writemask 0x{:02X}",
+                    dc_bits, rm, n, (dc_bits >> 8) & 7u, (dc_bits >> 11) & 7u,
+                    (dc_bits >> 14) & 7u, (dc_bits >> 17) & 7u,
+                    (dc_bits >> 7) & 1u, (dc_bits >> 20) & 7u,
+                    (dc_bits >> 23) & 7u, (dc_bits >> 26) & 7u,
+                    (dc_bits >> 29) & 7u, rm & 0xFFu, (rm >> 8) & 0xFFu,
+                    (rm >> 16) & 0xFFu);
+      }
     }
   }
   // DEPTH SURFACES BY EDRAM BASE. More than one owner on a base means two

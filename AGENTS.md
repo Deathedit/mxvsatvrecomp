@@ -206,8 +206,8 @@ so they describe what a plain run already does, not what you can turn on.
 | `hle_shader_verts` | 8 | How many vertices per executed draw. Only with `hle_shader_exec` |
 | `d3d9_page_cache_verify` | off | Re-query the OS on every cache hit and log mismatches. Slow; correctness check |
 | `d3d9_hooks_passthrough` | off | Pass the D3D9 hooks through in native mode. **Breaks rendering by design** — an A/B instrument, not a mode |
-| `force_load` | — | Load a scene directly. A diagnostic lever, not a fix — see "Why there is no menu" |
-| `registry_override` | — | Force a registry key, e.g. `ReadyToLaunch=1`. Same caveat |
+| `d3d9_diag_row_heartbeat` | 16 | Draw reports an unchanged population may pass before `UP CALLERS` and the per-config stencil rows dump anyway. A new call site or config still prints immediately; `0` = only on change, `1` = every report |
+| `registry_override` | — | Force a registry key, e.g. `ReadyToLaunch=1`. A diagnostic lever, not a fix |
 
 **Seven were retired on 2026-08-12**, by the same test that retired four on
 2026-08-07: none had ever been flipped, so the other branch was dead weight that
