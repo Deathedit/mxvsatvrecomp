@@ -3743,6 +3743,25 @@ uint64_t g_hleShaderVertices = 0;
 uint64_t g_hleShaderNoCode = 0, g_hleShaderBadDecode = 0;
 uint64_t g_hleShaderBadStream = 0, g_hleShaderBadConstants = 0;
 uint64_t g_hleShaderBadVertex = 0;
+// The three reasons that ONE counter was pooling, and they are not the same
+// defect. `vertex 63305` sat within 0.4% of `computed-index draws 63551` in
+// run 1873, which is either the whole answer or a coincidence, and the pooled
+// counter could not tell them apart:
+//
+//   short      the index buffer is smaller than index_count says
+//   range      an index >= the draw's vertex_count
+//   nonfinite  the transformed position is NaN/Inf
+//
+// `range` is the one that matters. A COMPUTED-INDEX draw addresses its stream
+// absolutely and unrebased by design (see the vfetch work), so its indices are
+// SUPPOSED to exceed this draw's local vertex_count -- testing them against it
+// asks the wrong question and rejects the draw. The concrete case is printed
+// once because a count alone cannot show whether the index is a strip-cut
+// marker (0xFFFF), an absolute stream offset, or genuine corruption.
+uint64_t g_hleShaderBadVertexShort = 0;
+uint64_t g_hleShaderBadVertexRange = 0;
+uint64_t g_hleShaderBadVertexNonFinite = 0;
+uint64_t g_hleShaderBadVertexRangeComputed = 0;  // of those, index == 0xFFFF
 uint64_t g_hleShaderIdentityMvp = 0, g_hleShaderViewportMvp = 0;
 
 // How many draws qualify for the GPU vertex path. This is the migration's
@@ -3992,7 +4011,8 @@ ShaderApplyResult ApplyShaderOutputs(
       REXLOG_INFO(
           "d3d9: HLE shader output attempts {}: applied {} draws / {} "
           "vertices; skipped no-code {} decode {} stream {} constants {} "
-          "vertex {}; output transform identity {} viewport {} (VTE scale-on "
+          "vertex {} (short {} range {} of-which-0xFFFF {} nonfinite {}); "
+          "output transform identity {} viewport {} (VTE scale-on "
           "{} off {} unreadable {}, disagrees with old tie-break {}); live "
           "shader resolved {} no-match {} ambiguous {} unreadable {}; GPU "
           "vertex path {} draws qualify, {} skipped ({} undeclared reg, "
@@ -4007,6 +4027,8 @@ ShaderApplyResult ApplyShaderOutputs(
           g_hleShaderAttempts, g_hleShaderDraws, g_hleShaderVertices,
           g_hleShaderNoCode, g_hleShaderBadDecode, g_hleShaderBadStream,
           g_hleShaderBadConstants, g_hleShaderBadVertex,
+          g_hleShaderBadVertexShort, g_hleShaderBadVertexRange,
+          g_hleShaderBadVertexRangeComputed, g_hleShaderBadVertexNonFinite,
           g_hleShaderIdentityMvp, g_hleShaderViewportMvp, g_vteSeen[2],
           g_vteSeen[1], g_vteSeen[0], g_hleShaderMvpDisagree,
           g_liveVertexResolved, g_liveVertexNoMatch, g_liveVertexAmbiguous,
@@ -4239,6 +4261,7 @@ ShaderApplyResult ApplyShaderOutputs(
     const uint32_t iw = dc.index_16bit ? 2u : 4u;
     if (dc.indices.size() < uint64_t(dc.index_count) * iw) {
       ++g_hleShaderBadVertex;
+      ++g_hleShaderBadVertexShort;
       return ShaderApplyResult::kFailed;
     }
     for (uint32_t i = 0; i < dc.index_count; ++i) {
@@ -4252,6 +4275,22 @@ ShaderApplyResult ApplyShaderOutputs(
       }
       if (index >= dc.vertex_count) {
         ++g_hleShaderBadVertex;
+        ++g_hleShaderBadVertexRange;
+        if (index == 0xFFFFu) ++g_hleShaderBadVertexRangeComputed;
+        static bool s_shown = false;
+        if (!s_shown) {
+          s_shown = true;
+          // The INDEX VALUE separates the two candidates on its own: exactly
+          // 0xFFFF is a strip cut being read as a vertex number, anything else
+          // above vertex_count is a stream addressed absolutely.
+          REXLOG_INFO(
+              "d3d9: BAD VERTEX range (first case) index {} of vertex_count {} "
+              "at i {} of {}; index_16bit {} stride {} vertices {} B; "
+              "0xFFFF here would be a strip cut read as a vertex",
+              index, dc.vertex_count, i, dc.index_count,
+              dc.index_16bit ? 1 : 0, dc.vertex_stride,
+              uint32_t(dc.vertices.size()));
+        }
         return ShaderApplyResult::kFailed;
       }
       referenced[index] = 1;
@@ -4896,6 +4935,7 @@ ShaderApplyResult ApplyShaderOutputs(
         !std::isfinite(r.position[1]) || !std::isfinite(r.position[2]) ||
         !std::isfinite(w)) {
       ++g_hleShaderBadVertex;
+      ++g_hleShaderBadVertexNonFinite;
       return ShaderApplyResult::kFailed;
     }
 
