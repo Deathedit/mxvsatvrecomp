@@ -177,12 +177,30 @@ extern "C" REX_FUNC(sub_82B70370) {
                      kMaxFrame = 72;
   static std::chrono::steady_clock::time_point s_hostPrev{};
   static double s_hostElapsed = 0.0;
+  // The guest's OWN dt, accumulated separately and BEFORE any correction.
+  //
+  // The first cut of this reported total/host as GAME SPEED, and with
+  // guest_dt_from_host=1 that is TAUTOLOGICAL: the lever forces dt to the host
+  // delta, so the total tracks the host by construction and the ratio reads
+  // 1.00 whatever the guest's clock was doing. A measurement that cannot fail
+  // while the fix is engaged is not a measurement -- the same trap as a
+  // throttle predicate that is always true. This accumulator is the guest's
+  // unmodified answer and is honest with the lever either way.
+  static double s_guestElapsed = 0.0;
+  static uint32_t s_lastA1 = 0;
+  static uint64_t s_a1Changes = 0;
   const float guest_dt = std::bit_cast<float>(REX_LOAD_U32(a1 + kDt));
   double host_dt = 0.0;
   if (s_hostPrev.time_since_epoch().count() != 0)
     host_dt = std::chrono::duration<double>(host_now - s_hostPrev).count();
   s_hostPrev = host_now;
   s_hostElapsed += host_dt;
+  s_guestElapsed += guest_dt;
+  // One timing object, or several? The host delta is a single static, so if
+  // this function serves more than one timer the deltas interleave and both
+  // the measurement and the lever are wrong. Counted rather than assumed.
+  if (s_lastA1 && a1 != s_lastA1) ++s_a1Changes;
+  s_lastA1 = a1;
 
   // THE LEVER. Rewriting dt alone would leave the two derived fields the guest
   // just computed from the old value inconsistent, so all three move together:
@@ -208,11 +226,13 @@ extern "C" REX_FUNC(sub_82B70370) {
     // GAME SPEED, as one number. Guest seconds per host second over the whole
     // run: 1.00 is correct, and it is frame-rate independent by construction,
     // so it is comparable between machines and between runs.
-    REXLOG_INFO("{}: Timing #{} dt={:.6f} host_dt={:.6f} total={:.3f} "
-                "host={:.3f} GAME SPEED {:.3f}x{} (clamp {:.4f}){}",
+    REXLOG_INFO("{}: Timing #{} dt={:.6f} host_dt={:.6f} | GUEST CLOCK {:.4f}x "
+                "({:.3f}s guest / {:.3f}s host, unmodified) | applied total "
+                "{:.3f} | a1=0x{:08X} ({} object changes){} (clamp {:.4f}){}",
                 mx::native::g_plugin_mode ? "plugin" : "native", tm, guest_dt,
-                host_dt, total, s_hostElapsed,
-                s_hostElapsed > 0.0 ? double(total) / s_hostElapsed : 0.0,
+                host_dt,
+                s_hostElapsed > 0.0 ? s_guestElapsed / s_hostElapsed : 0.0,
+                s_guestElapsed, s_hostElapsed, total, a1, s_a1Changes,
                 guest_dt >= max_frame && max_frame > 0.0f
                     ? " <-- dt PINNED AT THE CLAMP, the world is in slow motion"
                     : "",
