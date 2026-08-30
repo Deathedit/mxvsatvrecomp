@@ -45,6 +45,9 @@
 // as it is read, which is what shipping a different MXRegistry.bxml would do —
 // tools/ has bxml decoders but no encoder, so this is the only way to change one.
 // Empty means off. Diagnostic only. See AGENTS.md "the registry chokepoint".
+// Defined in hooks_wait.cpp, beside the wait hook that fills it.
+std::string GuestWaitReport(double seconds);
+
 REXCVAR_DEFINE_STRING(registry_override, "", "Debug",
                       "Comma-separated key=value overrides for guest registry string reads");
 
@@ -122,6 +125,39 @@ uint64_t g_stepCallsTotal = 0, g_stepDistinctTotal = 0;
 // monitor is exactly 2x -- and it would be machine-dependent, which nothing
 // else measured so far is.
 constexpr double kConsoleVblankHz = 60.0;
+
+// A SECOND WORLD CLOCK, AND AN EXPLICIT TIME SCALE.
+//
+// sub_82B09FF8 is a __noreturn guest worker with its own pacing and its own
+// notion of time -- neither of which the tick's timing struct knows about, so
+// every measurement taken so far has been blind to it:
+//
+//     while (1) {
+//       Wait(a1+12768, INFINITE);
+//       v6 = *(float*)(engine[16] + 64);    // THE CLOCK -- not 0x830EC248
+//       v7 = *(float*)(engine[16] + 72);    // max delta
+//       for each obj:
+//           v11 = v6 - obj[9];              // elapsed since its last update
+//           if (v11 >= obj[8]) {            // its own update interval
+//               if (v11 > v7) v11 = v7;
+//               obj[9] = v6;
+//               obj->vt[84](obj, *(float*)(a1+12884) * v11);   // dt x SCALE
+//           }
+//       SetEvent(a1+12772);
+//     }
+//
+// So objects on this thread advance by (their own elapsed) x (a scale), and
+// both terms are unmeasured. GUEST CLOCK tracks 0x830EC248+60 and would read
+// 1.00 no matter what this clock does, which is exactly the shape of the
+// evidence: correct time, wrong speed.
+//
+// Read from the Timing hook rather than from inside the worker, because the
+// worker never returns -- a hook there can log on entry and nothing after.
+constexpr uint32_t kEngineSubSlot = 16;   // dword_830BE400 + 16
+constexpr uint32_t kSubClock = 64;        // float, the clock
+constexpr uint32_t kSubMaxDelta = 72;     // float
+constexpr uint32_t kWorkerScale = 12884;  // float, on the worker's own object
+std::atomic<uint32_t> g_physWorker{0};    // sub_82B09FF8's a1, captured at entry
 std::atomic<uint64_t> g_gpuIntDropped{0};
 
 }  // namespace
@@ -459,6 +495,26 @@ extern "C" REX_FUNC(sub_82B70370) {
     g_stepCalls = 0;
     g_stepSeen.clear();
   }
+  // The second clock, against real time. Sampled every frame so the rate is a
+  // true average rather than two points that might straddle a stall.
+  static double s_physFirst = -1.0, s_physLast = 0.0;
+  double phys_clock = 0.0, phys_max = 0.0, phys_scale = 0.0;
+  {
+    const uint32_t engine = GuestRangeReadable(base, 0x830BE400u, 4)
+                                ? REX_LOAD_U32(0x830BE400u) : 0;
+    const uint32_t sub =
+        (engine && GuestRangeReadable(base, engine + kEngineSubSlot, 4))
+            ? REX_LOAD_U32(engine + kEngineSubSlot) : 0;
+    if (sub && GuestRangeReadable(base, sub + kSubClock, 12)) {
+      phys_clock = std::bit_cast<float>(REX_LOAD_U32(sub + kSubClock));
+      phys_max = std::bit_cast<float>(REX_LOAD_U32(sub + kSubMaxDelta));
+      if (s_physFirst < 0.0) s_physFirst = phys_clock;
+      s_physLast = phys_clock;
+    }
+    const uint32_t w = g_physWorker.load(std::memory_order_relaxed);
+    if (w && GuestRangeReadable(base, w + kWorkerScale, 4))
+      phys_scale = std::bit_cast<float>(REX_LOAD_U32(w + kWorkerScale));
+  }
   const uint64_t vbl = g_gpuIntVblank.load(std::memory_order_relaxed);
   const uint64_t swp = g_gpuIntSwap.load(std::memory_order_relaxed);
   const uint64_t oth = g_gpuIntOther.load(std::memory_order_relaxed);
@@ -472,7 +528,7 @@ extern "C" REX_FUNC(sub_82B70370) {
   s_renTotal += ren;
   ++s_frames;
 
-  if (tm <= 5 || (tm % 1000) == 0) {
+  if (tm <= 5 || (tm % 250) == 0) {
     const float total = std::bit_cast<float>(REX_LOAD_U32(a1 + kTotal));
     const float max_frame = std::bit_cast<float>(REX_LOAD_U32(a1 + kMaxFrame));
     // GAME SPEED, as one number. Guest seconds per host second over the whole
@@ -510,6 +566,19 @@ extern "C" REX_FUNC(sub_82B70370) {
     // The rate we deliver the guest's frame heartbeat at, against the 60 Hz the
     // console delivered. A ratio of 2.00 here is a 2x game, and unlike every
     // other number in this file it can differ between machines.
+    {
+      const double adv = (s_physFirst >= 0.0) ? (s_physLast - s_physFirst) : 0.0;
+      REXLOG_INFO("{}: PHYSICS CLOCK engine[16]+64 = {:.3f} (advanced {:.3f}s "
+                  "over {:.3f}s host = {:.4f}x) | max delta {:.4f} | worker "
+                  "0x{:08X} time scale {:.4f}{}",
+                  mx::native::g_plugin_mode ? "plugin" : "native", phys_clock,
+                  adv, s_hostElapsed,
+                  s_hostElapsed > 0.0 ? adv / s_hostElapsed : 0.0, phys_max,
+                  g_physWorker.load(std::memory_order_relaxed), phys_scale,
+                  (s_hostElapsed > 1.0 && adv / s_hostElapsed > 1.5)
+                      ? "  <-- THIS CLOCK RUNS FAST"
+                      : (phys_scale > 1.5 ? "  <-- SCALE IS NOT 1.0" : ""));
+    }
     REXLOG_INFO("{}: GPU INTERRUPTS over {:.1f}s -- vblank {} ({:.1f}/s = "
                 "{:.2f}x the console's 60Hz), swap-done {}, other {}; flip pass "
                 "ran {} times{}",
@@ -532,6 +601,14 @@ extern "C" REX_FUNC(sub_82B70370) {
                     ? double(vbl - g_gpuIntDropped.load(std::memory_order_relaxed)) /
                           s_hostElapsed
                     : 0.0);
+    {
+      // Waits per thread per second. A guest loop that paces itself blocks
+      // every iteration and shows a rate near the frame rate; one that
+      // free-runs shows none at all while still consuming the machine.
+      REXLOG_INFO("{}: GUEST WAITS over {:.1f}s --{}",
+                  mx::native::g_plugin_mode ? "plugin" : "native", s_hostElapsed,
+                  GuestWaitReport(s_hostElapsed));
+    }
     {
       std::lock_guard<std::mutex> lk(g_stepMu);
       const double per = g_stepFrames ? double(g_stepCallsTotal) / double(g_stepFrames) : 0.0;
@@ -579,6 +656,52 @@ extern "C" REX_FUNC(sub_82B6D230) {
     g_updFixed60.fetch_add(1, std::memory_order_relaxed);
   g_updEntityDtBits.store(std::bit_cast<uint64_t>(dt), std::memory_order_relaxed);
   orig_EntityDt(ctx, base);
+}
+
+// WHICH GUEST THREADS EXIST, AND HOW FAST DOES EACH ONE SPIN?
+//
+// Every counter in this file is per TICK FRAME, so a second guest thread
+// running its own update loop is structurally invisible to all of them --
+// which is exactly the gap left after the whole tick chain measured correct
+// during riding (entity steps 1:1, dispatch 1.000 executed, GUEST CLOCK 1.00).
+//
+// Two halves, because "which threads exist" and "what are they doing" are
+// different questions and the log's own thread ids only ever show the threads
+// that happen to call something we already hook.
+//
+//   sub_82BFC370   the guest's thread create. Logs each new thread's ENTRY
+//                  POINT, which is what makes it identifiable in IDA.
+//   sub_82BFB740   NtWaitForSingleObjectEx, the guest's block -- counted in
+//                  hooks_wait.cpp, which already hooks it. A loop that
+//                  paces itself passes through here every iteration; one that
+//                  free-runs does not, so waits-per-second separates a paced
+//                  thread from an unpaced one without having to find its loop.
+// sub_82B09FF8 — the interval-driven update worker. __noreturn, so this can
+// only record its `this` on the way in; everything else is read from the
+// Timing hook. See the note at kWorkerScale.
+REX_IMPORT(__imp__sub_82B09FF8, orig_PhysWorker, void());
+extern "C" REX_FUNC(sub_82B09FF8) {
+  g_physWorker.store(ctx.r3.u32, std::memory_order_relaxed);
+  REXLOG_INFO("{}: PHYSICS WORKER entered, this=0x{:08X}",
+              mx::native::g_plugin_mode ? "plugin" : "native", ctx.r3.u32);
+  orig_PhysWorker(ctx, base);
+}
+
+REX_IMPORT(__imp__sub_82BFC370, orig_GuestCreateThread, void());
+extern "C" REX_FUNC(sub_82BFC370) {
+  // r5 is the entry point and r6 the parameter at the two call sites read so
+  // far (the AssetDB worker in sub_82BAB700). Captured before the original in
+  // case it clobbers them.
+  const uint32_t entry = ctx.r5.u32;
+  const uint32_t param = ctx.r6.u32;
+  orig_GuestCreateThread(ctx, base);
+  static std::atomic<uint32_t> s_n{0};
+  const uint32_t n = s_n.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n <= 32)
+    REXLOG_INFO("{}: GUEST THREAD #{} created, entry=0x{:08X} param=0x{:08X} "
+                "-> r3=0x{:08X}",
+                mx::native::g_plugin_mode ? "plugin" : "native", n, entry,
+                param, ctx.r3.u32);
 }
 
 // sub_82B6A448(entity, dt) — one entity's step, from the vector sub_82B6D230
