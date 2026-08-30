@@ -69,6 +69,24 @@ std::atomic<uint32_t> g_updEntity{0};     // sub_82B6D230, the entity pass
 std::atomic<uint32_t> g_updRenderer{0};   // sub_82B34998, RendererDispatch
 std::atomic<uint32_t> g_updFixed60{0};    // entity-pass calls at a hardcoded 1/60
 std::atomic<uint32_t> g_updAltPath{0};    // sub_82AB58F8, which supplies that 1/60
+std::atomic<uint32_t> g_updRendererExec{0};  // sub_82B33EC0, dispatches EXECUTED
+
+// A CALL IS NOT AN EXECUTION, and RendererDispatch is the case that proves it.
+//
+// sub_82B34998 opens with a queue-or-execute gate:
+//
+//     if (!sub_82B2C9D0()) return sub_82B36298(a1, 2, &dt, 0, 0, 0);   // ENQUEUE
+//     sub_82B33EC0(a1, dt); vt[32](a1, dt); sub_82B307D8(a1, dt); vt[28](a1, dt);
+//
+// sub_82B36298 pushes command 2 carrying dt, and sub_82B34A68 -- a command
+// dispatcher, a switch over ~26 ids -- pulls it back out at `case 2` and calls
+// sub_82B34998 AGAIN. So one frame's dispatch is TWO calls and ONE execution,
+// and the 1.999 calls/frame first measured here is the normal idiom rather
+// than the world advancing twice. sub_82B2C9D0 has 25+ xrefs, every one the
+// same shape; this is how the whole subsystem defers work off-thread.
+//
+// sub_82B33EC0 has exactly ONE code xref, from inside sub_82B34998 past the
+// gate, so counting it counts executions exactly.
 std::atomic<uint64_t> g_updEntityDtBits{0};
 std::atomic<uint64_t> g_updRendererDtBits{0};
 
@@ -283,6 +301,9 @@ extern "C" REX_FUNC(sub_82B70370) {
       std::bit_cast<double>(g_updEntityDtBits.load(std::memory_order_relaxed));
   const double ren_dt = std::bit_cast<double>(
       g_updRendererDtBits.load(std::memory_order_relaxed));
+  const uint32_t exec = g_updRendererExec.exchange(0, std::memory_order_relaxed);
+  static uint64_t s_execTotal = 0;
+  s_execTotal += exec;
   const uint32_t fixed60 = g_updFixed60.exchange(0, std::memory_order_relaxed);
   const uint32_t alt = g_updAltPath.exchange(0, std::memory_order_relaxed);
   static uint64_t s_fixed60Total = 0, s_altTotal = 0;
@@ -318,11 +339,12 @@ extern "C" REX_FUNC(sub_82B70370) {
     // the step is duplicated, double it means the step is scaled.
     REXLOG_INFO("{}: WORLD STEPS over {} frames -- entity pass {} ({:.3f}/frame,"
                 " last dt {:.6f}), RendererDispatch {} ({:.3f}/frame, last dt "
-                "{:.6f}); timer dt {:.6f}",
+                "{:.6f}, of which {} EXECUTED = {:.3f}/frame, the rest "
+                "enqueued); timer dt {:.6f}",
                 mx::native::g_plugin_mode ? "plugin" : "native", s_frames,
                 s_entTotal, double(s_entTotal) / double(s_frames), ent_dt,
                 s_renTotal, double(s_renTotal) / double(s_frames), ren_dt,
-                guest_dt);
+                s_execTotal, double(s_execTotal) / double(s_frames), guest_dt);
     // Which of those entity passes carried the hardcoded 1/60 rather than the
     // measured dt, and how often the path that supplies it ran. A non-zero
     // pair here IS the speed multiplier: the world advances by
@@ -358,6 +380,14 @@ extern "C" REX_FUNC(sub_82B6D230) {
     g_updFixed60.fetch_add(1, std::memory_order_relaxed);
   g_updEntityDtBits.store(std::bit_cast<uint64_t>(dt), std::memory_order_relaxed);
   orig_EntityDt(ctx, base);
+}
+
+// sub_82B33EC0 — the first thing RendererDispatch does once it is past its
+// queue-or-execute gate. One code xref, so this counts executions exactly.
+REX_IMPORT(__imp__sub_82B33EC0, orig_RendererExec, void());
+extern "C" REX_FUNC(sub_82B33EC0) {
+  g_updRendererExec.fetch_add(1, std::memory_order_relaxed);
+  orig_RendererExec(ctx, base);
 }
 
 // sub_82AB58F8 — the fixed-1/60 world advance. See the note at kFixed60.
