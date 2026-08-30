@@ -209,6 +209,7 @@ so they describe what a plain run already does, not what you can turn on.
 | `d3d9_diag_row_heartbeat` | 16 | Draw reports an unchanged population may pass before `UP CALLERS`, the per-config stencil rows and the per-declaration `decl-draws` rows dump anyway. A new call site or config still prints immediately; `0` = only on change, `1` = every report |
 | `d3d9_diag_frame_every` | 30 | Frames between the per-swap lines (`FRAME DRAWS`, `UNBUILT *`, `RING vs HLE`, `ALU LOAD`). Per-frame deltas accumulate across the gap rather than being dropped, and the first five swaps always print; `0`/`1` = every swap |
 | `debug_menu` | off | Set the guest's `DEFINE_BuildConfig` Lua global to `DEBUG` instead of `RELEASE`. The shipped scripts gate the developer menu on exactly this (`UI_Helper.lua: AllowDebugMenu`), so it puts the dev menu on the title screen — level select, activity types, vehicle lists |
+| `debug_binds` | — | Comma-separated `button=action` pairs added to every controller preset, e.g. `Button7=DebugCameraForward`. The engine registers a full debug action set that the shipped presets bind to nothing; eight inputs (Button7/14/15/16 and the four Sensor axes) are free in all six presets. Only empty slots are written, and the table layout is verified first |
 | `registry_override` | — | Force a registry key, e.g. `ReadyToLaunch=1`. A diagnostic lever, not a fix |
 
 **Seven were retired on 2026-08-12**, by the same test that retired four on

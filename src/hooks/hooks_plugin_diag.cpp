@@ -45,6 +45,154 @@
 // as it is read, which is what shipping a different MXRegistry.bxml would do —
 // tools/ has bxml decoders but no encoder, so this is the only way to change one.
 // Empty means off. Diagnostic only. See AGENTS.md "the registry chokepoint".
+// debug_binds -- put the engine's debug actions on the buttons its own shipped
+// presets leave empty.
+//
+// sub_8230EB48 registers a full set of debug input ACTIONS by name --
+// DebugCamera{Forward,Backward,Up,Down,ZoomIn,ZoomOut,EnableAccel,
+// EnableTracking,EnableWorldAlignedMovement}, DebugEject{Active,
+// AirGroundToggle}, DebugBarBangModifier1-4, DebugWreckAvoidanceModifier1-3,
+// plus Spec{Next,Prev}Player, SwapToyVehicle, PreviewPerformance,
+// QuitUIActivity, Replay{PlayPause,Rewind,FastForward} and
+// UserCamQuick{Back,Right}.
+//
+// NONE of them is bound. assets/ControllerPresets.bxml ships six presets that
+// between them reference only 20 gameplay actions, and eight inputs are empty
+// in ALL six: Button7, Button14, Button15, Button16 and the four Sensor axes.
+// The actions survived in code; the bindings were stripped from the data.
+//
+// THE TABLE, from the parser at sub_82308300:
+//
+//     v6 = sub_82B69BA8(buttonName);                       // button index
+//     v9 = &unk_82DAA740 + 780 * (25 * presetIndex + v6);  // the entry
+//     ... copy the action string to v9 + 260 * slot
+//
+// so entry(preset, button) = 0x82DAA740 + 780*(25*preset + button), holding
+// three 260-byte action strings. Written AFTER the parse rather than by
+// intercepting it, because the table is the parser's whole output and a
+// post-pass cannot get the element walk wrong.
+//
+// Button indices are LEARNED, not assumed: sub_82B69BA8 maps a button name to
+// its index and the parser calls it for every Input element, so hooking it
+// records the real mapping. Guessing indices from XML order would be an
+// assumption about a table this file cannot see.
+//
+// Two safety properties. A slot is written ONLY if the guest left it empty, so
+// a real binding can never be clobbered. And the layout is VERIFIED before any
+// write: a known shipped binding is read back and must match, or nothing is
+// written and the log says so. Getting 780/25/260 wrong would otherwise
+// scribble over the input table.
+REXCVAR_DEFINE_STRING(debug_binds, "", "Debug",
+                      "Comma-separated button=action pairs to add to every "
+                      "controller preset, e.g. "
+                      "Button7=DebugCameraForward,Button14=DebugCameraBackward. "
+                      "Only slots the shipped presets leave empty are written");
+
+namespace {
+
+constexpr uint32_t kPresetTable = 0x82DAA740u;
+constexpr uint32_t kEntryStride = 780u;    // three action slots
+constexpr uint32_t kButtonsPerPreset = 25u;
+constexpr uint32_t kActionStride = 260u;
+constexpr uint32_t kPresetCount = 6u;      // Regular1-3, Advanced1-3
+
+std::mutex g_bindMu;
+std::map<std::string, uint32_t> g_buttonIndex;  // learned from sub_82B69BA8
+
+uint32_t PresetEntry(uint32_t preset, uint32_t button) {
+  return kPresetTable + kEntryStride * (kButtonsPerPreset * preset + button);
+}
+
+std::string ReadGuestCString(uint8_t* base, uint32_t addr, uint32_t max) {
+  std::string out;
+  for (uint32_t i = 0; i < max; ++i) {
+    const uint8_t c = REX_LOAD_U8(addr + i);
+    if (!c) break;
+    out.push_back(char(c));
+  }
+  return out;
+}
+
+}  // namespace
+
+// sub_82B69BA8(name) -- button name to index. Hooked to learn the mapping the
+// preset parser itself uses.
+REX_IMPORT(__imp__sub_82B69BA8, orig_ButtonIndex, void());
+extern "C" REX_FUNC(sub_82B69BA8) {
+  const uint32_t name_ptr = ctx.r3.u32;
+  orig_ButtonIndex(ctx, base);
+  if (!name_ptr || !GuestRangeReadable(base, name_ptr, 4)) return;
+  const std::string name = ReadGuestCString(base, name_ptr, 64);
+  if (name.empty()) return;
+  std::lock_guard<std::mutex> lk(g_bindMu);
+  g_buttonIndex[name] = ctx.r3.u32;
+}
+
+// sub_82308300() -- parses ControllerPresets.bxml into the table above.
+REX_IMPORT(__imp__sub_82308300, orig_ParsePresets, void());
+extern "C" REX_FUNC(sub_82308300) {
+  orig_ParsePresets(ctx, base);
+  const std::string spec = REXCVAR_GET(debug_binds);
+  if (spec.empty()) return;
+  const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
+
+  std::lock_guard<std::mutex> lk(g_bindMu);
+
+  // PROVE THE LAYOUT BEFORE WRITING. Throttle is on Button12 in every shipped
+  // preset, so if the arithmetic is right that entry reads back as "Throttle".
+  // If it does not, the stride or base is wrong and writing would corrupt the
+  // input table.
+  const auto it_probe = g_buttonIndex.find("VIJoystick_Button12");
+  std::string probe;
+  if (it_probe != g_buttonIndex.end() &&
+      GuestRangeReadable(base, PresetEntry(0, it_probe->second), kActionStride))
+    probe = ReadGuestCString(base, PresetEntry(0, it_probe->second), 64);
+  if (probe != "Throttle") {
+    REXLOG_ERROR("{}: debug_binds REFUSED -- preset table layout check failed. "
+                 "Expected Button12 of preset 0 to read \"Throttle\", got "
+                 "\"{}\" ({} button names learned). Nothing written.",
+                 tag, probe, g_buttonIndex.size());
+    return;
+  }
+
+  uint32_t applied = 0, skipped_taken = 0, unknown = 0;
+  size_t pos = 0;
+  while (pos < spec.size()) {
+    size_t comma = spec.find(',', pos);
+    if (comma == std::string::npos) comma = spec.size();
+    std::string pair = spec.substr(pos, comma - pos);
+    pos = comma + 1;
+    const size_t eq = pair.find('=');
+    if (eq == std::string::npos) continue;
+    std::string btn = pair.substr(0, eq);
+    const std::string action = pair.substr(eq + 1);
+    if (btn.empty() || action.empty() || action.size() >= kActionStride) continue;
+    // Accept the short form as well as the name the data file uses.
+    if (btn.rfind("VIJoystick_", 0) != 0) btn = "VIJoystick_" + btn;
+    const auto it = g_buttonIndex.find(btn);
+    if (it == g_buttonIndex.end()) {
+      ++unknown;
+      REXLOG_ERROR("{}: debug_binds unknown button \"{}\"", tag, btn);
+      continue;
+    }
+    for (uint32_t preset = 0; preset < kPresetCount; ++preset) {
+      const uint32_t at = PresetEntry(preset, it->second);
+      if (!GuestRangeReadable(base, at, kActionStride)) continue;
+      // Empty slots only: never overwrite a binding the guest made.
+      if (REX_LOAD_U8(at) != 0) { ++skipped_taken; continue; }
+      for (size_t i = 0; i < action.size(); ++i)
+        REX_STORE_U8(at + uint32_t(i), uint8_t(action[i]));
+      REX_STORE_U8(at + uint32_t(action.size()), 0);
+      ++applied;
+    }
+  }
+  REXLOG_INFO("{}: debug_binds applied {} binding(s) across {} presets, {} slot(s) "
+              "left alone because the guest already bound them, {} unknown "
+              "button name(s); {} button names learned",
+              tag, applied, kPresetCount, skipped_taken, unknown,
+              g_buttonIndex.size());
+}
+
 // DEFINE_BuildConfig -- the guest's own debug gate, flipped at its single
 // source.
 //
