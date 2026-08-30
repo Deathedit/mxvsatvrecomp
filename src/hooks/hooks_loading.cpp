@@ -17,6 +17,9 @@
 
 #include "hooks/hook_common.h"
 
+#include <mutex>
+#include <set>
+
 //=============================================================================
 // GPU renderer shim (Path 2) — DIAGNOSTIC HOOKS DISABLED.
 //
@@ -461,8 +464,37 @@ REX_HOOK_RAW(sub_823F9808) {
 }
 
 // One call per batch the draw loop actually emits.
+//
+// The batches EXIST -- 2508 of them in mx_1774 against 2419 culled trees -- so
+// the remaining question is which pass they belong to. Tree geometry is visible
+// in a capture ONLY inside the eight 129x129 terrain clipmap bakes, and the
+// FR_DU_Eco billboard atlas is never uploaded at all, so "the forest draws, but
+// only into the clipmap" and "the forest draws into the scene and we lose it"
+// are both still live and they need different fixes.
+//
+// The RENDERER OBJECT (r3) separates them: the clipmap bake and the main scene
+// are different render targets driven through different renderer instances, so
+// a batch's r3 says which one it fed. The caller (lr) names the loop it came
+// from. Both are logged for the first few and then the distinct set is counted,
+// which is what matters -- one renderer means one pass.
 REX_EXTERN(__imp__sub_823F82D0);
 REX_HOOK_RAW(sub_823F82D0) {
-  g_forestBatches.fetch_add(1, std::memory_order_relaxed);
+  const uint64_t n = g_forestBatches.fetch_add(1, std::memory_order_relaxed) + 1;
+  const uint32_t renderer = ctx.r3.u32;
+  const uint32_t type = ctx.r4.u32;
+  const uint32_t caller = uint32_t(ctx.lr);
+  {
+    static std::mutex s_mu;
+    static std::set<uint64_t> s_seen;
+    std::lock_guard<std::mutex> lk(s_mu);
+    // Deduped on (renderer, caller), not sampled by count: the interesting
+    // event is a SECOND distinct renderer appearing, and a "first 16 calls"
+    // rule would miss one that only shows up later in a level.
+    const uint64_t key = (uint64_t(renderer) << 32) | caller;
+    if (s_seen.size() < 32 && s_seen.insert(key).second)
+      REXLOG_INFO("forest: BATCH renderer 0x{:08X} type {} caller 0x{:08X} "
+                  "(batch #{}, {} distinct renderer/caller pairs so far)",
+                  renderer, type, caller, n, s_seen.size());
+  }
   __imp__sub_823F82D0(ctx, base);
 }
