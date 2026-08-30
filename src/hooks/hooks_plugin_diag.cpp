@@ -75,6 +75,30 @@ std::atomic<uint64_t> g_gpuIntSwap{0};      // graphics interrupt, source 1
 std::atomic<uint64_t> g_gpuIntOther{0};
 std::atomic<uint64_t> g_vblankHandler{0};   // sub_825663B0, the flip pass
 
+// IS ANY ENTITY STEPPED TWICE IN ONE FRAME?
+//
+// The only shape left that fits every measurement. sub_82B6D230 walks a vector
+// of pointers calling sub_82B6A448(entity, dt) on each; the vector runs once a
+// frame with the correct dt, so the world CLOCK is right whatever it contains.
+// But if an entity is present twice, it is integrated twice per frame -- and
+// motion doubles while every clock, call count and execution count stays at
+// 1.000/frame. That is exactly the evidence: correct time, wrong speed.
+//
+// vt[128] is ruled out as the world update -- it resolved to sub_82B6E298,
+// which walks four controller ports through XamInputGetCapabilities. Input,
+// not physics.
+//
+// Counted per frame: total steps, and how many DISTINCT entities they landed
+// on. calls == distinct is healthy. calls == 2 x distinct is the bug, and the
+// duplicate's address names the entity.
+std::mutex g_stepMu;
+std::vector<uint32_t> g_stepSeen;      // entities stepped this frame, in order
+uint64_t g_stepCalls = 0;
+uint64_t g_stepDup = 0;                // steps that hit an already-stepped entity
+uint32_t g_stepDupExample = 0;
+uint64_t g_stepFrames = 0;
+uint64_t g_stepCallsTotal = 0, g_stepDistinctTotal = 0;
+
 // THE GUEST'S FRAME CADENCE IS VBLANK-COUNTED, and we have never measured the
 // rate we deliver it at.
 //
@@ -300,6 +324,64 @@ extern "C" REX_FUNC(sub_82B70370) {
                 REX_LOAD_U32(a1 + 20) == 0x7F7FFFFFu, REX_LOAD_U32(a1 + 28),
                 REX_LOAD_U32(a1 + 32));
   }
+  // WHAT IS AT vt[128]? The last unmeasured consumer of dt.
+  //
+  // The tick (sub_82B70DE8) runs, in order:
+  //
+  //     sub_82B70370(a1);                          // this hook -- dt
+  //     v2 = (*(*engine + 8))(engine);             // a subsystem getter
+  //     v3 = (*(*v2 + 128))(v2, dt);               // <-- NEVER COUNTED
+  //     sub_82B6D230(&unk_82DD8088, dt);           // entity pass, 1.000/frame
+  //     sub_82B34998(..., dt);                     // dispatch, 1.000 exec/frame
+  //
+  // Both counted consumers are clean and every clock reads 1.00, so this is the
+  // only call left that could be stepping the world more than once. It is a
+  // virtual call, so the target cannot be named statically -- resolved here
+  // instead, once, from the live vtables.
+  //
+  // The getter is re-called through an isolated CallFrame the way the
+  // AcquirePlayer repair does. It is safe to call twice: the tick itself calls
+  // it every frame immediately after this hook returns, so any lazy init it
+  // performs has either already happened or is about to.
+  if (a1) {
+    static std::atomic<bool> s_resolved{false};
+    bool expected = false;
+    if (s_resolved.compare_exchange_strong(expected, true)) {
+      const uint32_t engine = GuestRangeReadable(base, 0x830BE400u, 4)
+                                  ? REX_LOAD_U32(0x830BE400u) : 0;
+      const uint32_t engine_vt =
+          (engine && GuestRangeReadable(base, engine, 4)) ? REX_LOAD_U32(engine) : 0;
+      const uint32_t getter = (engine_vt && GuestRangeReadable(base, engine_vt + 8u, 4))
+                                  ? REX_LOAD_U32(engine_vt + 8u) : 0;
+      uint32_t sub = 0, sub_vt = 0, target = 0;
+      // Guest address -> recompiled function, through the table the crash
+      // reporter already resolves RIP with. Linear because PPCFuncMappings is
+      // sorted by guest address and this runs exactly once.
+      PPCFunc* getter_fn = nullptr;
+      if (getter) {
+        for (const PPCFuncMapping* m = PPCFuncMappings; m->guest; ++m) {
+          if (uint32_t(m->guest) == getter) { getter_fn = m->host; break; }
+        }
+      }
+      if (getter_fn) {
+        rex::CallFrame frame(ctx);
+        frame.ctx.r1.u32 -= 0x70;
+        frame.ctx.r3.u64 = engine;
+        getter_fn(frame.ctx, base);
+        sub = frame.ctx.r3.u32;
+      }
+      if (sub && GuestRangeReadable(base, sub, 4)) sub_vt = REX_LOAD_U32(sub);
+      if (sub_vt && GuestRangeReadable(base, sub_vt + 128u, 4))
+        target = REX_LOAD_U32(sub_vt + 128u);
+      REXLOG_INFO("{}: TICK vt[128] RESOLVE engine=0x{:08X} vt=0x{:08X} "
+                  "getter=0x{:08X} -> subsystem=0x{:08X} vt=0x{:08X} | "
+                  "vt[128] = 0x{:08X}{}  <-- the unmeasured world update",
+                  mx::native::g_plugin_mode ? "plugin" : "native", engine,
+                  engine_vt, getter, sub, sub_vt, target,
+                  getter_fn ? "" : " (getter NOT in PPCFuncMappings)");
+    }
+  }
+
   const auto host_now = std::chrono::steady_clock::now();
   orig_Timing(ctx, base);
   if (!a1) return;
@@ -365,6 +447,18 @@ extern "C" REX_FUNC(sub_82B70370) {
   static uint64_t s_execTotal = 0;
   s_execTotal += exec;
   const uint32_t fixed60 = g_updFixed60.exchange(0, std::memory_order_relaxed);
+  {
+    // Close the frame's step census here: the Timing hook is the tick's first
+    // call, so everything since the previous one is exactly one frame's steps.
+    std::lock_guard<std::mutex> lk(g_stepMu);
+    if (g_stepCalls) {
+      ++g_stepFrames;
+      g_stepCallsTotal += g_stepCalls;
+      g_stepDistinctTotal += g_stepSeen.size();
+    }
+    g_stepCalls = 0;
+    g_stepSeen.clear();
+  }
   const uint64_t vbl = g_gpuIntVblank.load(std::memory_order_relaxed);
   const uint64_t swp = g_gpuIntSwap.load(std::memory_order_relaxed);
   const uint64_t oth = g_gpuIntOther.load(std::memory_order_relaxed);
@@ -438,6 +532,22 @@ extern "C" REX_FUNC(sub_82B70370) {
                     ? double(vbl - g_gpuIntDropped.load(std::memory_order_relaxed)) /
                           s_hostElapsed
                     : 0.0);
+    {
+      std::lock_guard<std::mutex> lk(g_stepMu);
+      const double per = g_stepFrames ? double(g_stepCallsTotal) / double(g_stepFrames) : 0.0;
+      const double dist = g_stepFrames ? double(g_stepDistinctTotal) / double(g_stepFrames) : 0.0;
+      REXLOG_INFO("{}: ENTITY STEPS over {} frames -- {} steps on {} distinct "
+                  "entities ({:.1f} vs {:.1f} per frame) | {} steps hit an "
+                  "entity ALREADY STEPPED this frame{}{}",
+                  mx::native::g_plugin_mode ? "plugin" : "native", g_stepFrames,
+                  g_stepCallsTotal, g_stepDistinctTotal, per, dist, g_stepDup,
+                  g_stepDupExample
+                      ? fmt::format(", e.g. 0x{:08X}", g_stepDupExample)
+                      : std::string(),
+                  (dist > 0.0 && per / dist > 1.5)
+                      ? "  <-- THE WORLD IS BEING STEPPED TWICE"
+                      : "");
+    }
     REXLOG_INFO("{}: FIXED-60 STEPS over {} frames -- {} entity passes at the "
                 "hardcoded 1/60 ({:.3f}/frame), sub_82AB58F8 ran {} times "
                 "({:.3f}/frame). Implied world advance {:.3f}x real",
@@ -469,6 +579,29 @@ extern "C" REX_FUNC(sub_82B6D230) {
     g_updFixed60.fetch_add(1, std::memory_order_relaxed);
   g_updEntityDtBits.store(std::bit_cast<uint64_t>(dt), std::memory_order_relaxed);
   orig_EntityDt(ctx, base);
+}
+
+// sub_82B6A448(entity, dt) — one entity's step, from the vector sub_82B6D230
+// walks. See the note at g_stepSeen.
+REX_IMPORT(__imp__sub_82B6A448, orig_EntityStep, void());
+extern "C" REX_FUNC(sub_82B6A448) {
+  const uint32_t self = ctx.r3.u32;
+  {
+    std::lock_guard<std::mutex> lk(g_stepMu);
+    ++g_stepCalls;
+    // Linear: the list is small and this replaces a per-entity hash that would
+    // cost more than it measures. If it ever is not small the counts still hold.
+    bool seen = false;
+    for (uint32_t e : g_stepSeen)
+      if (e == self) { seen = true; break; }
+    if (seen) {
+      ++g_stepDup;
+      if (!g_stepDupExample) g_stepDupExample = self;
+    } else if (g_stepSeen.size() < 4096) {
+      g_stepSeen.push_back(self);
+    }
+  }
+  orig_EntityStep(ctx, base);
 }
 
 // sub_825582E0(source, device) — D3D9's graphics interrupt callback, registered
