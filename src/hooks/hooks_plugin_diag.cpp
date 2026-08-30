@@ -7,16 +7,22 @@
 // means its call site is jumped, not that the mode is wrong.
 
 #include "hooks/hook_common.h"
-#include "hooks/hooks_ui_probe.h"
 #include "hooks/hooks_d3d9.h"  // GuestDrawCalls
 #include "gpu/xenos_gpu_state.h"  // mx::gpu::alu -- the PM4 ALU constant file
 
 #include <rex/cvar.h>
 
-// Defined here, declared in hooks_ui_probe.h: NoteVideoComponent below
-// writes it and the probe file reads it.
 namespace mx::hooks {
-std::atomic<uint32_t> g_videoCompFast[16] = {};
+
+// A guest pointer worth dereferencing. NO UPPER BOUND: heap objects sit at
+// 0x2xxx_xxxx, but vtables live in the module image at 0x82xx_xxxx, and a bound
+// below that makes the guard fabricate the same zero its caller is testing for.
+// This is a RANGE test and not a mapping test, so pair it with
+// GuestRangeReadable before reading through the pointer.
+inline bool PlausibleGuestPtr(uint32_t p) {
+  return p >= 0x10000000u && (p & 3u) == 0u;
+}
+
 }  // namespace mx::hooks
 
 using namespace mx::hooks;
@@ -2618,223 +2624,52 @@ extern "C" REX_FUNC(sub_82AA7638) {
 }
 
 //-----------------------------------------------------------------------------
-// Defined with the render probes below; declared here because the
-// SetTextureAsset hook is what discovers the video components in the first
-// place, and it comes first in the file.
+// Defined below; declared here because SetTextureAsset is what discovers the
+// video components the Bink gate matches against, and it comes first.
 void NoteVideoComponent(uint32_t component, const std::string& video,
-                        uint32_t texture_asset, uint32_t player);
+                        uint32_t texture_asset);
 
 // UIVideoLayer::SetTextureAsset — sub_8236EB30
 //
-// The missing link in the menu backdrop. A UIVideoLayer with a `TextureAsset`
-// property does NOT draw to the screen: it renders into a named texture and
-// something else samples that texture. This function is where that texture is
-// created and attached, from the property loader at sub_823911C8:
+// Where a UIVideoLayer's output texture is created and attached, and therefore
+// where the Bink gate learns that a component exists at all. A layer with a
+// TextureAsset property does not draw: it renders into that texture and
+// something else samples it, so the gate needs the (component, texture) pair.
 //
-//     layer+664  <- renderer_vtable[120](asset, 0x756B6500, 1)   the texture
-//     player+140 <- layer+664                                    render target
-//
-// Both player-creation sites in sub_8237F320 pass layer+664 into the factory,
-// so that object IS the video's output surface — the one a consumer draw would
-// bind. Our resolve tracking keys on the RESOLVE's destination object instead.
-// If the two are different objects we track one and the guest binds the other,
-// which is precisely the shape of the defect: FE_Smoke is produced every frame,
-// resolved to a 1280x430 texture, and that texture is sampled by nothing.
-//
-// Mode-neutral on purpose. A plugin-only probe here would be a one-sided
-// measurement, and this project has read the resulting silence as evidence
-// before.
+// Mode-neutral on purpose: a plugin-only registration would leave the gate
+// blind in native mode.
 REX_IMPORT(__imp__sub_8236EB30, orig_UIVideoSetTextureAsset, void());
 extern "C" REX_FUNC(sub_8236EB30) {
   const uint32_t layer = ctx.r3.u32;
-  const uint32_t asset = ctx.r4.u32;
   orig_UIVideoSetTextureAsset(ctx, base);
 
-  // Read AFTER the original runs: layer+664 is assigned inside it, and the
-  // whole point is which object it ended up holding.
+  // Read AFTER the original: +664 is assigned inside it.
   constexpr uint32_t kLayerVideoName = 608;  // the "Video" property, 48 bytes
   constexpr uint32_t kLayerTexture = 664;    // <- the output surface
-  constexpr uint32_t kLayerPlayer = 668;
-  // GUARDED, after an access violation here on 2026-08-19: reading at guest
-  // 0x3E4F96FC, which is exactly the `texture + 0x1C` below for a texture of
-  // 0x3E4F96E0. That run reached further into the menu than any before it
-  // (FE_RiderSelect, FE_SplitscreenSetup, POP_ProfileSelection) and found a
-  // UIVideoLayer whose +664 is not a live object. `layer` is a guest `this` and
-  // has always been sound; +664 is whatever the property loader left there, and
-  // this probe reads six dwords off it, so it needs checking before the read.
-  //
-  // Refusals are COUNTED, not silently skipped: a probe that quietly reads
-  // nothing looks exactly like a probe whose subject never appears, and that
-  // confusion has cost this project real time.
   if (!PlausibleGuestPtr(layer)) return;
-  // PLAUSIBLE IS NOT READABLE, and the gap between them was killing the game.
-  //
-  // PlausibleGuestPtr is `p >= 0x10000000 && (p & 3) == 0` -- a RANGE test, not
-  // a mapping test. The guard above was already written after one access
-  // violation here, and it does not do the job: runs 1594, 1618, 1625, 1629,
-  // 1630, 1632, 1638 and 1639 all died reading guest 0x4C69746C, which is the
-  // ASCII "Litl" -- a fragment of a STRING that satisfies both halves of the
-  // test and is then dereferenced. layer+664 is whatever the property loader
-  // left there, so on some UI layers it is text, not an object.
-  //
-  // GuestRangeReadable probes the real mapping at BOTH ends of the span, so a
-  // range straddling an unmapped page is not admitted on the strength of its
-  // first byte. This hook logs and calls NoteVideoComponent; it has no business
-  // taking the process down, whatever the guest left in that field.
-  //
-  // One span covers everything read off `layer`: the 48-byte name at +608
-  // through the player pointer ending at +672.
+  // PLAUSIBLE IS NOT READABLE. +664 is whatever the property loader left there,
+  // and on some layers that is text: runs 1594 through 1639 all died here
+  // dereferencing guest 0x4C69746C, the ASCII "Litl", which passes both halves
+  // of the range test. GuestRangeReadable probes the real mapping at BOTH ends
+  // of the span, so a range straddling an unmapped page is not admitted on the
+  // strength of its first byte.
   if (!GuestRangeReadable(base, layer + kLayerVideoName,
-                          (kLayerPlayer + 4u) - kLayerVideoName)) {
-    static std::atomic<uint64_t> s_badLayer{0};
-    const uint64_t n = s_badLayer.fetch_add(1, std::memory_order_relaxed) + 1;
-    // Counted, and said out loud the first few times: a probe that silently
-    // reads nothing looks exactly like a probe whose subject never appears.
-    if (n <= 4)
-      REXLOG_INFO(
-          "native: UIVideoLayer::SetTextureAsset layer 0x{:08X} -- +{}..+{} is "
-          "not readable guest memory, skipped ({} so far)",
-          layer, kLayerVideoName, kLayerPlayer + 4u, n);
+                          (kLayerTexture + 4u) - kLayerVideoName))
     return;
-  }
-  const uint32_t texture = REX_LOAD_U32(layer + kLayerTexture);
-  const uint32_t player = REX_LOAD_U32(layer + kLayerPlayer);
   std::string name;
   for (uint32_t i = 0; i < 48; ++i) {
     const char c = char(REX_LOAD_U8(layer + kLayerVideoName + i));
     if (!c) break;
     name.push_back(c);
   }
-  // Is layer+664 a D3D9 TEXTURE, or an asset wrapper holding one?
-  //
-  // Settled here rather than by decompiling renderer_vtable[120]: that call is
-  // resolved at runtime through dword_830BE400+8 and the global has 40+ xrefs,
-  // so the static route would be a guess about which store feeds slot 8. A
-  // texture object carries its six hardware fetch dwords at +0x1C -- the offsets
-  // D3DDevice_SetTexture copies from -- and word 0 has type in bits [1:0]
-  // (2 = texture) with base_address in [31:12]. So the object answers for
-  // itself, and if it IS a texture its guest address can be compared directly
-  // against the 0xFBE94000 the FE_Smoke resolve lands on.
-  std::string fetch_desc = " (texture null)";
-  if (texture && !PlausibleGuestPtr(texture)) {
-    static std::atomic<uint64_t> s_badTexture{0};
-    fetch_desc = fmt::format(" (texture 0x{:08X} NOT a plausible guest pointer, "
-                             "not dereferenced; {} so far)",
-                             texture,
-                             s_badTexture.fetch_add(1, std::memory_order_relaxed) + 1);
-  } else if (texture && !GuestRangeReadable(base, texture + 0x1Cu, 6u * 4u)) {
-    // The same distinction one level down. PlausibleGuestPtr passed this value
-    // -- that is exactly how "Litl" got dereferenced -- so the six fetch dwords
-    // need the mapping checked, not the range.
-    static std::atomic<uint64_t> s_unreadableTexture{0};
-    fetch_desc = fmt::format(
-        " (texture 0x{:08X} plausible but +0x1C..+0x34 is not readable, not "
-        "dereferenced; {} so far)",
-        texture,
-        s_unreadableTexture.fetch_add(1, std::memory_order_relaxed) + 1);
-  } else if (texture) {
-    uint32_t fetch[6] = {};
-    for (uint32_t i = 0; i < 6; ++i)
-      fetch[i] = REX_LOAD_U32(texture + 0x1C + i * 4);
-    const uint32_t type = fetch[0] & 3u;
-    fetch_desc = fmt::format(
-        " fetch0=0x{:08X} type={} {} addr=0x{:08X}"
-        " [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
-        fetch[0], type,
-        type == 2u ? "IS-A-TEXTURE" : "not a texture fetch",
-        fetch[0] & 0xFFFFF000u, fetch[0], fetch[1], fetch[2], fetch[3],
-        fetch[4], fetch[5]);
-  }
-  REXLOG_INFO("native: UIVideoLayer::SetTextureAsset layer 0x{:08X} video "
-              "\"{}\" asset 0x{:08X} -> TEXTURE 0x{:08X}, player 0x{:08X};{}",
-              layer, name, asset, texture, player, fetch_desc);
-  NoteVideoComponent(layer, name, texture, player);
+  NoteVideoComponent(layer, name, REX_LOAD_U32(layer + kLayerTexture));
 }
-
-//-----------------------------------------------------------------------------
-// What does the FE_Smoke QUAD actually carry?
-//
-// Both video render targets are produced, bound only for the resolve idiom and
-// sampled by nothing -- measured, see VIDEO TARGET CONSUMPTION. So the question
-// is no longer which host texture we lose, but what the guest's own draw item
-// holds. UIVideoComponent, decompiled 2026-08-17:
-//
-//   this+260  { material, pack, index }   <- what the quad samples
-//   this+236  -> ImageIconProperties (this+320); +164 is the installed material
-//   this+664  <TextureAsset>              <- where the video decodes
-//
-//   sub_82388560(this+260, name)   resolves a NAME to a material. The MATERIAL
-//                                  branch always fails for these (no material
-//                                  named *VideoRenderTarget exists in any of
-//                                  the game's 130 databases), so it wraps the
-//                                  TEXTURE of that name in a synthesised one.
-//   sub_8237ABA8(this)             vtable slot 15, the render prepare:
-//                                    sub_82B26778(*(this+236), *(this+260))
-//   sub_82B26778(props, material)  installs it at props+164.
-//
-// Three probes, because each answers a different question and the previous
-// round of this investigation was lost to conflating them:
-//
-//   sub_82388560   which NAME each material handle came from. Without it every
-//                  handle below is an unnamed pointer and we are back to
-//                  identifying resources by resemblance.
-//   sub_8237ABA8   is the video component's render path running AT ALL, and
-//                  what does it hold when it runs. `0 calls` and `calls but
-//                  the wrong material` are opposite diagnoses.
-//   sub_82B26778   whether the material actually reaches the draw item. NOTE:
-//                  guarded by `props[41] != material`, so it fires ONLY on
-//                  CHANGE -- a low call count here means "stable", NOT "not
-//                  drawing". Do not read it as a per-frame counter.
-//-----------------------------------------------------------------------------
 
 namespace {
 
-constexpr uint32_t kCompMaterialSlot = 260;
-constexpr uint32_t kCompTextureAsset = 664;
-// The three fields slot 13 (sub_8236EBB0) actually branches on:
-//
-//     v2 = this[167];                      // +668 the video player object
-//     if (v2) (*(v2->vtbl + 24))(v2);      // begin
-//     v3 = this[48];                       // +192 THE SUBMITTER
-//     if (v3) {
-//         (*(v3->vtbl + 12))(v3, this[60], 0);   // submit the item at +240
-//         this[60] = 0;                          // consumed
-//     }
-//
-// So a null +192 means the draw is never submitted no matter how healthy
-// everything upstream is -- and upstream is now proven healthy: the
-// component is visited, visible, enqueued and drained 1:1 (UI ENQUEUE /
-// UI DRAIN). +240 is refilled EVERY frame by sub_8237AB78 (a bump
-// allocation from the pool dword_82DD8084), so a zero there would mean the
-// allocation step never ran, not that it was consumed once.
-// The sort key the emit computes for every UI draw:
-//
-//     sub_82B26860(*(short*)(item + 248), ...):
-//         key = table[idx] * 10000.0 - seq++
-//
-// where `table` is the float array at 0x830C0000. A layer index that sorts
-// the intro's items outside whatever range actually gets drawn would produce
-// exactly the observed symptom: every gate passes, the item is queued, and
-// no draw comes out.
-constexpr uint32_t kItemLayerIndex = 248;
-// kLayerPriorityTable, kMaxSaneLayerIndex, kCompSubmitter, kCompPendingItem and
-// kCompPlayerObj went with the VIDEO COMPONENT RENDER report (2026-08-30). They
-// were read only to fill its row, and a constant nothing uses is the kind of
-// thing a later reader takes for live structure.
-
-// What the BINK GATE needs, and nothing else.
-//
-// This was a ~25-field probe feeding a VIDEO COMPONENT RENDER line, built for
-// the Bink/video-composite investigations. Those are closed --
-// [[bink-gate-fe-smoke]] LANDED, [[intro-logo-is-orphaned-video-target]] and
-// [[menu-backdrop-is-post-composite]] solved -- and bink and the UI work, so
-// the reporting went with them (2026-08-30).
-//
-// The STRUCT stays because it is not diagnostics: sub_8234D630's gate decides
-// whether to skip a Bink decode entirely, and it decides it from these three
-// fields. Deleting them would silently revert that optimisation and put
-// FE_Smoke.bik back to decoding, compositing and resolving every frame into a
-// texture nothing samples.
+// The three fields the Bink gate decides on. sub_8234D630 skips a decode
+// outright when a movie's target has never been traversed, so these are live
+// state, not instrumentation.
 struct VideoComponentProbe {
   uint32_t component = 0;
   // Only so the gate's log line can name the movie it is skipping.
@@ -2848,16 +2683,12 @@ struct VideoComponentProbe {
 
 std::mutex g_videoProbeMu;
 std::vector<VideoComponentProbe> g_videoProbes;   // 6 in the whole game
-// The material name table has its OWN mutex, not the probe mutex, because two
-// unrelated collectors read it: the video report (under g_videoProbeMu) and the
-// UI inventory (under g_uiMu). Lock order is always <collector> -> g_materialMu
-// and nothing takes a collector lock while holding this one, so there is no
-// cycle. Sharing g_videoProbeMu for it would have made every UI-inventory read
-// a data race.
-std::mutex g_materialMu;
-std::map<uint32_t, std::string> g_materialNames;  // handle -> resolved name
-std::atomic<uint64_t> g_materialResolves{0};
 
+// Lock-free prefilter for the per-frame visit hook. sub_8236DB10 runs for EVERY
+// UI component every frame; taking g_videoProbeMu there would put a contended
+// lock on the UI's hot path to watch six objects. Written under the mutex at
+// registration (load time only), read without it.
+std::atomic<uint32_t> g_videoCompFast[16] = {};
 
 // Linear scan: the population is six. Caller holds the lock.
 VideoComponentProbe* FindProbe(uint32_t component) {
@@ -2866,148 +2697,10 @@ VideoComponentProbe* FindProbe(uint32_t component) {
   return nullptr;
 }
 
-std::string MaterialLabel(uint32_t handle) {
-  if (!handle) return "none";
-  std::lock_guard<std::mutex> lk(g_materialMu);
-  const auto it = g_materialNames.find(handle);
-  return it == g_materialNames.end()
-             ? fmt::format("0x{:08X} <unnamed>", handle)
-             : fmt::format("0x{:08X} \"{}\"", handle, it->second);
-}
-
-// ---- The full UI inventory -------------------------------------------------
-
-struct UiComponentRow {
-  std::string name;       // read once, from +16
-  uint64_t visits = 0;
-  uint64_t visible = 0;
-  uint32_t material = 0;
-  uint32_t flags172 = 0;
-  // The class, from the vtable pointer at +0.
-  //
-  // Needed because +260 (material) and +172 (flags) belong to the IMAGE
-  // component family and are NOT valid for every UIComponent subclass. The
-  // first inventory printed rows like `mat=0x64547269 f172=0x4672655D` -- those
-  // are ASCII ("dTri", "Fre]"), i.e. some other member read through the wrong
-  // layout. The names at +16 are all sensible, so +16 is right and these two
-  // are class-specific. Logging the vtable makes the row self-describing
-  // instead of quietly inviting the same misreading the material handles did.
-  uint32_t vtable = 0;
-  // The draw item's layer index, for components that have a draw item at
-  // +236 at all. Recorded here as well as on the video rows because a bare
-  // layer number is uninterpretable: the question is whether the intro's
-  // components sort differently from the MENU's, which do produce draws.
-  uint32_t item = 0;
-  uint32_t layer248 = 0;
-  bool has_layer = false;
-};
-
-std::mutex g_uiMu;
-std::map<uint32_t, UiComponentRow> g_uiRows;
-uint64_t g_uiVisits = 0;
-uint64_t g_uiDropped = 0;
-
-constexpr size_t kMaxUiRows = 768;
-
-// The component's own <Name>, at +16.
-//
-// The offset comes from sub_8237F320, which passes `a1 + 4` (dwords, so byte
-// 16) into the video-player factory alongside `a1 + 152` (byte 608), and 608 is
-// confirmed to be the <Video> path by the SetTextureAsset hook. It is read
-// through a printable-ASCII filter and reported as `name?` when it does not
-// look like a string, so a wrong offset shows up as visibly empty rather than
-// as plausible garbage.
-std::string ReadComponentName(uint32_t component, uint8_t* base) {
-  std::string out;
-  for (uint32_t i = 0; i < 48; ++i) {
-    const uint8_t c = REX_LOAD_U8(component + 16 + i);
-    if (!c) break;
-    if (c < 0x20 || c > 0x7E) return std::string();
-    out.push_back(char(c));
-  }
-  return out;
-}
-
 }  // namespace
 
-void NoteUiComponentVisit(uint32_t component, uint32_t flags172,
-                          uint32_t flags176, uint8_t* base) {
-  if (!component) return;
-  const uint32_t material = REX_LOAD_U32(component + kCompMaterialSlot);
-  std::lock_guard<std::mutex> lk(g_uiMu);
-  ++g_uiVisits;
-  auto it = g_uiRows.find(component);
-  if (it == g_uiRows.end()) {
-    if (g_uiRows.size() >= kMaxUiRows) { ++g_uiDropped; return; }
-    it = g_uiRows.emplace(component, UiComponentRow{}).first;
-    it->second.name = ReadComponentName(component, base);
-    it->second.vtable = REX_LOAD_U32(component);
-  }
-  UiComponentRow& r = it->second;
-  ++r.visits;
-  if ((flags172 >> 4) & 1u) ++r.visible;
-  r.material = material;
-  r.flags172 = flags172;
-  // The draw item and its layer index, for whatever carries one. This is
-  // the comparison population for the video component's own layer248: a
-  // bare layer number says nothing, but the MENU's components DO produce
-  // draws, so their values are the reference.
-  //
-  // Guarded, not assumed: +236 is an IMAGE-family field like +260 and +172,
-  // and reading it on a class that has no draw item is exactly the misread
-  // that produced the ASCII "dTri"/"Fre]" material handles. has_layer says
-  // whether the row's value is worth anything at all.
-  r.item = REX_LOAD_U32(component + kCompDrawItem);
-  if (PlausibleGuestPtr(r.item)) {
-    r.layer248 = REX_LOAD_U16(r.item + kItemLayerIndex);
-    r.has_layer = true;
-  }
-
-  // Report the inventory every 5s, ordered by visits. Bounded to the top rows
-  // because a menu walks a few hundred components; the whole count and the
-  // dropped count are printed so a truncated list is never mistaken for the
-  // whole population.
-  static std::chrono::steady_clock::time_point s_last{};
-  const auto now = std::chrono::steady_clock::now();
-  if (now - s_last < std::chrono::seconds(5)) return;
-  s_last = now;
-  std::vector<const std::pair<const uint32_t, UiComponentRow>*> order;
-  order.reserve(g_uiRows.size());
-  for (const auto& kv : g_uiRows) order.push_back(&kv);
-  std::sort(order.begin(), order.end(), [](auto* a, auto* b) {
-    return a->second.visits > b->second.visits;
-  });
-  std::string rows;
-  size_t shown = 0, drawn = 0;
-  for (const auto* kv : order) {
-    if (kv->second.visible) ++drawn;
-    if (shown >= 48) continue;
-    ++shown;
-    rows += fmt::format(" [{}0x{:08X} vt0x{:08X} visits{} mat?={} f172?=0x{:08X}"
-                        " item0x{:08X} layer{}]",
-                        kv->second.name.empty()
-                            ? std::string("name? ")
-                            : ("\"" + kv->second.name + "\" "),
-                        kv->first, kv->second.vtable, kv->second.visits,
-                        MaterialLabel(kv->second.material), kv->second.flags172,
-                        kv->second.item,
-                        kv->second.has_layer
-                            ? std::to_string(kv->second.layer248)
-                            : std::string("?"));
-  }
-  // mat? and f172? carry question marks because they are only valid for the
-  // IMAGE component family; group by vt (the class vtable) before believing
-  // them. `drawn` is derived from f172 and inherits the same doubt, so it is
-  // labelled rather than presented as a count of what draws.
-  REXLOG_INFO("native: UI INVENTORY {} components, {} visits, {} dropped "
-              "(cap {}); showing {} by visits; {} rows had f172 bit4 set "
-              "(only meaningful for image-family vt) --{}",
-              g_uiRows.size(), g_uiVisits, g_uiDropped, kMaxUiRows, shown, drawn,
-              rows.empty() ? " (none)" : rows);
-}
-
 void NoteVideoComponent(uint32_t component, const std::string& video,
-                        uint32_t texture_asset, uint32_t player) {
+                        uint32_t texture_asset) {
   if (!component) return;
   std::lock_guard<std::mutex> lk(g_videoProbeMu);
   if (VideoComponentProbe* p = FindProbe(component)) {
@@ -3021,87 +2714,13 @@ void NoteVideoComponent(uint32_t component, const std::string& video,
   g_videoProbes.push_back({component, video, texture_asset, 0});
 }
 
-// sub_82388560(slot, name) — the material-name resolver.
-REX_IMPORT(__imp__sub_82388560, orig_ResolveMaterialByName, void());
-extern "C" REX_FUNC(sub_82388560) {
-  const uint32_t slot = ctx.r3.u32;
-  const uint32_t name_ptr = ctx.r4.u32;
-  std::string name;
-  for (uint32_t i = 0; i < 64 && name_ptr; ++i) {
-    const char c = char(REX_LOAD_U8(name_ptr + i));
-    if (!c) break;
-    name.push_back(c);
-  }
-  orig_ResolveMaterialByName(ctx, base);
-  // The slot is written by the original; slot[0] is the material it chose.
-  const uint32_t material = slot ? REX_LOAD_U32(slot) : 0;
-  std::lock_guard<std::mutex> lk(g_materialMu);
-  ++g_materialResolves;
-  if (!material || name.empty()) return;
-  // The name table is what makes every material handle downstream readable, so
-  // it records EVERY handle regardless of logging.
-  if (g_materialNames.size() < 4096) g_materialNames.emplace(material, name);
-  if (name.find("VideoRenderTarget") == std::string::npos) return;
-  // Deduped on (SLOT, material), not on the handle. The handle is shared: the
-  // asset system caches materials by name, so both video components resolve
-  // "1280_720_VideoRenderTarget" to the same 0x21B0D720 and a handle-keyed
-  // dedupe printed one line for the whole run -- hiding WHICH components
-  // resolved it, which is the part worth knowing. The slot is component+260,
-  // so each line names a distinct component.
-  static std::set<uint64_t> s_seen;
-  if (s_seen.size() < 64 && s_seen.insert((uint64_t(slot) << 32) | material).second) {
-    REXLOG_INFO("native: MATERIAL RESOLVE \"{}\" -> material 0x{:08X} "
-                "(slot 0x{:08X} = component 0x{:08X}); {} resolves so far",
-                name, material, slot, slot - kCompMaterialSlot,
-                g_materialResolves.load());
-  }
-}
-
-// sub_82B26778(props, material) — installs the material on the draw item.
-// Fires only when it CHANGES; see the header note.
-REX_IMPORT(__imp__sub_82B26778, orig_InstallDrawItemMaterial, void());
-extern "C" REX_FUNC(sub_82B26778) {
-  const uint32_t props = ctx.r3.u32;
-  const uint32_t material = ctx.r4.u32;
-  orig_InstallDrawItemMaterial(ctx, base);
-  static std::mutex s_mu;
-  static std::set<uint64_t> s_seen;
-  static uint64_t s_calls = 0, s_dropped = 0;
-  std::string label;
-  {
-    std::lock_guard<std::mutex> lk(g_materialMu);
-    ++s_calls;
-    // Only pairs involving a *VideoRenderTarget material. Everything else is
-    // the rest of the UI and would bury it.
-    const auto it = g_materialNames.find(material);
-    if (it == g_materialNames.end() ||
-        it->second.find("VideoRenderTarget") == std::string::npos)
-      return;
-    label = it->second;
-  }
-  const uint64_t key = (uint64_t(props) << 32) | material;
-  {
-    std::lock_guard<std::mutex> lk(s_mu);
-    if (s_seen.size() >= 64) { ++s_dropped; return; }
-    if (!s_seen.insert(key).second) return;
-  }
-  REXLOG_INFO("native: DRAW ITEM MATERIAL props 0x{:08X} <- material 0x{:08X} "
-              "\"{}\"; {} installs total, {} pairs dropped",
-              props, material, label, s_calls, s_dropped);
-}
-
 // sub_8236DB10(this) — the per-frame visit, called at the top of the component
-// draw step (sub_8237A6D0 / sub_8237B1D0) before anything is submitted:
-//
-//     if (this[+176] & 0xC0000000) { slot15(this); this[+176] &= 0x3FFFFFFF; }
-//     this[+176] &= 0xCFFFFFFF;
-//
-// Runs for every UI component every frame, so it is prefiltered without a lock
-// against the five registered video components.
+// draw step (sub_8237A6D0 / sub_8237B1D0) before anything is submitted. It runs
+// for every UI component every frame, so the six the gate cares about are
+// picked out through a lock-free prefilter.
 REX_IMPORT(__imp__sub_8236DB10, orig_UIComponentVisit, void());
 extern "C" REX_FUNC(sub_8236DB10) {
   const uint32_t self = ctx.r3.u32;
-  uint32_t flags172 = 0, flags176 = 0;
   bool watched = false;
   if (self) {
     for (auto& slot : g_videoCompFast) {
@@ -3110,39 +2729,10 @@ extern "C" REX_FUNC(sub_8236DB10) {
       if (c == self) { watched = true; break; }
     }
   }
-  // Read BEFORE the original: it CLEARS both flag groups on the way out, so
-  // sampling afterwards would report every component as clean and the dirty
-  // counter could never fire.
-  if (self) {
-    flags172 = REX_LOAD_U32(self + 172);
-    flags176 = REX_LOAD_U32(self + 176);
-  }
-  // The FULL UI inventory, not just the video components.
-  //
-  // "What actually paints the menu backdrop" has now been answered wrongly four
-  // times by inference, and the direct probe is unavailable: pixel history on a
-  // plugin capture cannot work, because Xenia renders into an emulated EDRAM
-  // buffer whose target is 80x8192 rather than 1280x720. So name it from the
-  // guest instead -- every component the UI walk actually visits, with the
-  // material it carries. The guest submits the same work in both modes, so this
-  // inventory is the menu's 2D layer by name.
-  NoteUiComponentVisit(self, flags172, flags176, base);
   orig_UIComponentVisit(ctx, base);
-  // Before the `watched` early-out and while holding no other lock: the UI
-  // ENQUEUE line has to appear even when zero video components are registered
-  // and even when the render list never receives a push, because "no pushes"
-  // is the answer this probe exists to report.
-  ReportUiEnqueue(false);
-  ReportUiDrain(false);
   if (!watched) return;
   std::lock_guard<std::mutex> lk(g_videoProbeMu);
-  VideoComponentProbe* p = FindProbe(self);
-  if (!p) return;
-  // visit_calls ONLY. Everything else this hook sampled -- dirty/visible
-  // counts, the flag words, the submitter/pending/player pointers, the draw
-  // item's layer index and priority -- existed to fill a report that is gone.
-  // The gate reads this counter and nothing else.
-  ++p->visit_calls;
+  if (VideoComponentProbe* p = FindProbe(self)) ++p->visit_calls;
 }
 
 //-----------------------------------------------------------------------------
@@ -3300,25 +2890,6 @@ extern "C" REX_FUNC(sub_8234D630) {
   REX_STORE_U32(player + kPlayerPaused, 1);
   orig_BinkDecodeAndBlit(ctx, base);
   REX_STORE_U32(player + kPlayerPaused, paused);
-}
-
-// sub_8237ABA8(this) — vtable slot 15, the render prepare that binds
-// *(this+260) onto the draw item. Called per render, so this is a COUNTER with
-// a periodic report rather than a line per call.
-REX_IMPORT(__imp__sub_8237ABA8, orig_UIImageRenderPrepare, void());
-extern "C" REX_FUNC(sub_8237ABA8) {
-  const uint32_t self = ctx.r3.u32;
-  // Read BEFORE the original: it makes calls of its own, and the callee is
-  // free to leave whatever it likes in lr by the time control comes back.
-  const uint32_t caller = uint32_t(ctx.lr);
-  orig_UIImageRenderPrepare(ctx, base);
-  if (!self) return;
-
-  // Read AFTER the original: it is what assigns the draw item's material, and
-  // the whole question is what it ended up holding.
-  // Nothing left to record here: render_calls, the material, the draw item
-  // and the caller were all report-only. The gate never read any of them.
-  (void)caller;
 }
 
 //-----------------------------------------------------------------------------

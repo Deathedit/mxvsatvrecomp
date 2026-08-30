@@ -5083,9 +5083,9 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
       // They are cumulative whole-population snapshots, identical on
       // consecutive slow frames apart from monotonic counter drift.
       //
-      // So the fire condition becomes the one ReportVideoComponents already
-      // uses: print when the POPULATION or the FINDING changes, plus a
-      // heartbeat. Every property the original comments defend survives --
+      // So the fire condition is: print when the POPULATION or the FINDING
+      // changes, plus a heartbeat. Every property the original comments
+      // defend survives --
       //   - the first report always prints, so "0 orphans of 14" and "no line
       //     at all" stay distinguishable;
       //   - a new destination or video row appearing prints immediately;
