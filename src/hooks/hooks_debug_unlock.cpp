@@ -14,9 +14,9 @@
 //                 AllowDebugMenu(), and FE_Title.lua puts the dev menu on the
 //                 title screen from the same test. Reaches the UI scripts and
 //                 nothing else.
-//   debug_native  the NATIVE gate. sub_829E8FA8() is `return 0;` with 40+ call
-//                 sites across assets, UI, render and audio. Per call site,
-//                 because answering true everywhere segfaults in two seconds.
+//   debug_native  a `return 0;` the engine tests in places. NOT a single
+//                 predicate -- see the correction at its cvar. Per call site,
+//                 and each site needs checking before it is flipped.
 //   debug_binds   the INPUT gate, which is really an absence: the engine
 //                 registers a full debug action set that the shipped
 //                 ControllerPresets.bxml binds to nothing.
@@ -59,16 +59,46 @@
 //                 so the overlay builds itself and then marks itself off.
 //   sub_82AB58F8  a screen/state poller, whose second branch is
 //                     if (sub_829E8FA8() && sub_82B6F070(&unk_830C1140, 1, i))
+//                 -- though with the folding below, that call may be a
+//                 different stub that merely shares the address.
 //
-// PER CALL SITE, NOT GLOBAL. Answering true everywhere was tried and SEGFAULTS
-// within two seconds -- 40 call sites means 40 paths the retail build never
-// executes, last exercised on a dev kit in 2011. So the lever selects sites by
-// the RETURN ADDRESS, and "census" reports which sites actually ask without
-// changing a single answer. Discover first, then enable the one you want.
+// CORRECTION, 2026-08-30: sub_829E8FA8 IS NOT ONE FUNCTION.
 //
-//   debug_native=census                 answer FALSE, report distinct callers
-//   debug_native=0x82AB63C4,0x82AB63D0  answer TRUE only for those lr values
-//   debug_native=all                    answer TRUE everywhere (it crashes)
+// It is the shared body of every `return 0;` in the image, folded together by
+// the linker (identical COMDAT folding). The proof is that its callers cannot
+// all be the same function -- one address cannot simultaneously be:
+//
+//     a Lua C function, registered as `print` in sub_82500760:
+//         push "print"; push C closure sub_829E8FA8; set global
+//     a boolean predicate:      if (sub_829E8FA8() && ...)
+//     a stored flag:            a1[217] = sub_829E8FA8();
+//
+// Those are three incompatible signatures. So the "40+ call sites" the census
+// reports are every STUBBED-OUT function in the binary sharing one body, not
+// forty debug checks.
+//
+// This also corrects why `all` crashes. The first explanation here was
+// "40 paths retail never executes" -- wrong. It crashes because it returns 1
+// to callers that expect 0 from unrelated stubs, Lua's `print` among them.
+//
+// A consequence worth knowing: the guest's `print()` is that stub, so every
+// print() in the shipped Lua discards its output. Nothing is being lost on our
+// side. The same is true of the debug printing the dev menu leans on --
+// Engine.DebugPrintTable (sub_824B31B0) and Engine.DebugPrintRows
+// (sub_824B2700) fully validate their arguments (`Rdb::Table *`, `RdbRows *`,
+// arg counts, type-mismatch messages) and then call nullsub_1. Measured: 7
+// calls in one run, zero output. They are stubs, not a TTY channel we fail to
+// capture.
+//
+// PER CALL SITE, and CHECK THE SITE FIRST. "census" reports which sites ask
+// without changing an answer; decompile a site's caller before flipping it,
+// because the census cannot tell a debug check from any other stub.
+// 0x82AB6638 is verified: it is `a1[217] = sub_829E8FA8()` inside the
+// DebugOverlay constructor.
+//
+//   debug_native=census        answer FALSE, report the distinct callers
+//   debug_native=0x82AB6638    answer TRUE for that site only (verified)
+//   debug_native=all           answer TRUE everywhere; crashes, see above
 REXCVAR_DEFINE_STRING(debug_native, "", "Debug",
                       "The engine's is-debug-build predicate, per call site. "
                       "'census' lists the callers without changing anything; a "
