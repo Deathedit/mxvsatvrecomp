@@ -136,6 +136,11 @@ struct TranslatedShader {
   std::shared_ptr<const std::string> fetch_source;
   uint32_t vertex_fetch_count = 0;
   uint32_t vertex_fetch_slot[mx::hle::HlslShader::kMaxVertexFetches] = {};
+  // Streams whose fetch is indexed by a register the shader computed rather
+  // than by the vertex index. The CPU vertex path cannot reproduce those
+  // indices at all, so it zero-fills them instead of reading an unrelated
+  // row. See HlslShader::computed_index_streams.
+  uint32_t computed_index_streams = 0;
   // The fetch variant's compiled DXBC, same contract as `dxbc`.
   std::shared_ptr<const std::vector<uint8_t>> fetch_dxbc;
 };

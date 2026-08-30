@@ -454,6 +454,17 @@ bool TranscodeHleVertices(const HleDrawInputs& in, DrawCall& out,
   // of the unaccounted remainder. Read by the caller and reset each frame.
   const auto transcode_t0 = std::chrono::steady_clock::now();
 
+  // A stream whose fetch the shader indexes by a computed register carries
+  // no value this path can read: `src_index` is the vertex, and the row the
+  // shader would have addressed is a different one entirely. Reading it
+  // anyway yields an unrelated vertex -- plausible, wrong, and invisible.
+  // The attribute keeps its default instead, which is what an out-of-range
+  // fetch already produces here, and is counted so the gap is visible
+  // rather than inferred.
+  const auto unknowable = [&](uint32_t stream) {
+    return ((in.computed_index_streams >> stream) & 1u) != 0;
+  };
+
   uint8_t vtx[256];   // one guest vertex, larger than any observed stride
   for (uint32_t i = 0; i < nverts; ++i) {
     const uint32_t src_index = lo + i;
@@ -463,7 +474,9 @@ bool TranscodeHleVertices(const HleDrawInputs& in, DrawCall& out,
     {
       const HleStream& s = in.streams[pos->stream];
       if (s.stride > sizeof(vtx)) { skip = HleSkip::kZeroStride; return false; }
-      if (!CopyVertex(s, src_index, vtx, sizeof(vtx), pos->stream)) {
+      if (unknowable(pos->stream)) {
+        ++HleComputedIndexSkips();
+      } else if (!CopyVertex(s, src_index, vtx, sizeof(vtx), pos->stream)) {
         skip = HleSkip::kVertexOutOfRange;
         return false;
       }
@@ -502,8 +515,10 @@ bool TranscodeHleVertices(const HleDrawInputs& in, DrawCall& out,
     float c[4] = {1, 1, 1, 1};
     if (col) {
       const HleStream& s = in.streams[col->stream];
-      if (s.stride <= sizeof(vtx) &&
-          CopyVertex(s, src_index, vtx, sizeof(vtx), col->stream)) {
+      if (unknowable(col->stream)) {
+        ++HleComputedIndexSkips();
+      } else if (s.stride <= sizeof(vtx) &&
+                 CopyVertex(s, src_index, vtx, sizeof(vtx), col->stream)) {
         if (!ReadHleElement(vtx, s.stride, *col, s.endian, c)) {
           c[0] = c[1] = c[2] = c[3] = 1.0f;
         }
@@ -513,8 +528,10 @@ bool TranscodeHleVertices(const HleDrawInputs& in, DrawCall& out,
     float t[4] = {0, 0, 0, 0};
     if (tex) {
       const HleStream& s = in.streams[tex->stream];
-      if (s.stride <= sizeof(vtx) &&
-          CopyVertex(s, src_index, vtx, sizeof(vtx), tex->stream)) {
+      if (unknowable(tex->stream)) {
+        ++HleComputedIndexSkips();
+      } else if (s.stride <= sizeof(vtx) &&
+                 CopyVertex(s, src_index, vtx, sizeof(vtx), tex->stream)) {
         if (!ReadHleElement(vtx, s.stride, *tex, s.endian, t)) {
           t[0] = t[1] = 0.0f;
         }
@@ -626,6 +643,11 @@ uint64_t& HleBuiltCount() {
 }
 
 uint64_t& HleVertexZeroFillCount() {
+  static uint64_t n = 0;
+  return n;
+}
+
+uint64_t& HleComputedIndexSkips() {
   static uint64_t n = 0;
   return n;
 }

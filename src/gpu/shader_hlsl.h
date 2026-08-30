@@ -376,6 +376,18 @@ struct HlslShader {
   static constexpr uint32_t kMaxVertexFetches = 32;
   uint32_t vertex_fetch_count = 0;
   uint32_t vertex_fetch_slot[kMaxVertexFetches] = {};
+
+  // Streams whose fetch is indexed by a register OTHER than r0.x -- a value
+  // the shader COMPUTED, not the vertex index. One bit per stream, using the
+  // same 95-minus-slot numbering the host binds by.
+  //
+  // The GPU fetch path handles these by indexing with the named register and
+  // copying the whole stream. The CPU path CANNOT: it is declaration-driven,
+  // finds attributes by usage, and never executes the ALU that produces the
+  // index -- so for these streams there is no value it could read. This flag
+  // exists so it can say so instead of reading vertex N and producing
+  // confident nonsense.
+  uint32_t computed_index_streams = 0;
 };
 
 // Emit HLSL for one shader blob.

@@ -21,7 +21,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 D3D9 = ROOT / "assets" / "d3d9"
-OBJS = D3D9 / "objs"
+OBJS = D3D9 / "objs_d3d9"
 SYMBOLS = D3D9 / "d3d9_symbols.txt"
 
 # Functions worth matching, in priority order. Everything here is >= 128 bytes;

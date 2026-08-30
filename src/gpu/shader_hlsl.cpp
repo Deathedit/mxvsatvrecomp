@@ -1365,8 +1365,15 @@ class Emitter {
   // game reads r0.x with is_index_rounded false, so the vertex ID is what r0.x
   // holds. A shader that indexed by anything else would need the ALU value and
   // is refused below.
+  // `src_reg`/`src_swizzle`/`rounded` are the EFFECTIVE index operand,
+  // which for a vfetch_mini is the preceding vfetch_full's. The SDK is
+  // explicit: "the source is applicable only to vfetch_full (the address
+  // from vfetch_full is reused in vfetch_mini)", and the same holds for
+  // is_index_rounded and stride. Reading them off a mini instruction gets
+  // garbage, so the caller tracks them across the pair.
   void EmitVertexFetch(const uc::VertexFetchInstruction& vf,
-                       uint32_t fetch_ordinal) {
+                       uint32_t fetch_ordinal, uint32_t src_reg,
+                       uint32_t src_swizzle, bool rounded) {
     if (vf.exp_adjust() != 0) {
       // Decoded by the ucode reader and applied by nothing, on either path. A
       // power-of-two scale dropped silently is wrong geometry that looks
@@ -1375,7 +1382,7 @@ class Emitter {
       blocking_opcode = uint32_t(vf.opcode());
       return;
     }
-    if (vf.is_index_rounded()) {
+    if (rounded) {
       status = HlslStatus::kVertexFetchIndex;
       blocking_opcode = uint32_t(vf.opcode());
       return;
@@ -1413,7 +1420,27 @@ class Emitter {
     const std::string n = std::to_string(fetch_ordinal);
     const std::string base = "xe_vf[" + n + "]";
     // offset() is in dwords, like stride().
-    Line("uint xe_vfa = " + base + ".x + xe_vid * " + base + ".y + " +
+    // The INDEX REGISTER the guest named, not SV_VertexID.
+    //
+    // This was `xe_vid` unconditionally, which is only correct while
+    // every vfetch indexes by r0.x -- the note below called that
+    // assumption unchecked, and run mx_1829 produced the
+    // counter-example: three shaders fetch a 48-byte per-object stream
+    // with `src r0.y` while fetching a FOUR-entry, 64-byte corner table
+    // with `src r0.x`. Xenia writes the vertex index to GPR 0 `.x` ONLY
+    // (StartVertexShader_LoadVertexIndex, mask 0b0001), so r0.y holds a
+    // value the shader computed. Substituting the vertex ID for it
+    // addressed that table at 8984..15443 instead of 0..6777, which is
+    // what every dropped fetch region in a run actually was.
+    //
+    // Xenos keeps the index in a float register, so convert here;
+    // is_index_rounded picks round-to-nearest over truncation, the same
+    // choice the CPU decoder makes.
+    Line("uint xe_vfi = (uint)" +
+         std::string(rounded ? "round(" : "trunc(") + "r[" +
+         std::to_string(src_reg) + "]." +
+         std::string(1, "xyzw"[src_swizzle & 3]) + ");");
+    Line("uint xe_vfa = " + base + ".x + xe_vfi * " + base + ".y + " +
          std::to_string(uint32_t(vf.offset()) * 4) + "u;");
 
     const char* load = dwords == 1 ? "Load" : dwords == 2 ? "Load2"
@@ -1715,6 +1742,11 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   uint32_t last_full_slot = 0;
   bool have_full = false;
   uint32_t fetch_slot_of[HlslShader::kMaxVertexFetches] = {};
+  // The index operand carried across a vfetch_full -> vfetch_mini pair,
+  // and the streams a non-r0.x index makes unknowable to the CPU path.
+  uint32_t last_full_src = 0, last_full_src_swz = 0;
+  bool last_full_rounded = false;
+  uint32_t computed_index_streams = 0;
 
   for (uint32_t i = 0; i + 2 < max_cf_dword; i += 3) {
     uc::ControlFlowInstruction cf[2];
@@ -1844,13 +1876,23 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
             // wrong stream.
             if (!vf.is_mini_fetch()) {
               last_full_slot = vf.fetch_constant_index();
+              last_full_src = vf.src();
+              last_full_src_swz = vf.src_swizzle();
+              last_full_rounded = vf.is_index_rounded();
               have_full = true;
             } else if (!have_full) {
               out.status = HlslStatus::kVertexFetchIndex;
               return false;
             }
-            em.EmitVertexFetch(vf, vfetch_ordinal);
+            em.EmitVertexFetch(vf, vfetch_ordinal, last_full_src,
+                               last_full_src_swz, last_full_rounded);
             fetch_slot_of[vfetch_ordinal] = last_full_slot;
+            // r0.x, and only r0.x, is the vertex index. Anything else is a
+            // value the shader computed, which the declaration-driven CPU
+            // path has no way to reproduce.
+            if ((last_full_src != 0 || last_full_src_swz != 0) &&
+                last_full_slot <= 95 && (95u - last_full_slot) < 32)
+              computed_index_streams |= 1u << (95u - last_full_slot);
             ++vfetch_ordinal;
           } else if (fetch_op == uint32_t(uc::FetchOpcode::kTextureFetch)) {
             uc::TextureFetchInstruction tf{};
@@ -2295,6 +2337,15 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   src += "  float4 r[" + std::to_string(kNumTemps) + "];\n";
   src += "  [unroll] for (int xe_i = 0; xe_i < " + std::to_string(kNumTemps) +
          "; ++xe_i) r[xe_i] = float4(0, 0, 0, 0);\n";
+  // r0.x IS the vertex index on Xenos, and nothing set it here before.
+  // Xenia does exactly this in StartVertexShader_LoadVertexIndex: the index
+  // goes to GPR 0 with write mask 0b0001, converted to float (OpUToF at the
+  // end of RemapAndConvertVertexIndices). It was invisible while the fetch
+  // hard-coded SV_VertexID, because nothing else read the register -- but
+  // now that each fetch indexes by the register it names, an r0.x fetch
+  // reads this, and any shader reading r0.x for its own arithmetic was
+  // silently getting 0 all along.
+  if (emit_vertex_fetch) src += "  r[0].x = (float)xe_vid;\n";
   src += "  float4 xe_v = float4(0, 0, 0, 0);\n";
   src += "  float xe_s = 0.0, xe_ps = 0.0;\n";
   // Written by setTexLOD, read by any later tfetch whose use_reg_lod is set.
@@ -2492,6 +2543,7 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   out.vertex_fetch_count = em.vertex_fetch_count;
   for (uint32_t i = 0; i < em.vertex_fetch_count; ++i)
     out.vertex_fetch_slot[i] = fetch_slot_of[i];
+  out.computed_index_streams = computed_index_streams;
   return true;
 }
 

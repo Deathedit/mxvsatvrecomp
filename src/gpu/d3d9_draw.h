@@ -33,6 +33,12 @@ struct HleStream {
   uint32_t stride        = 0;
   uint32_t offset_bytes  = 0;        // SetStreamSource's OffsetInBytes
   uint32_t endian        = 0;        // 0 none, 1 8in16, 2 8in32
+  // The guest D3DVertexBuffer `size_bytes` was snapshotted from, kept so the
+  // snapshot can be re-checked against that object's LIVE fetch-constant
+  // dwords. D3DVertexBuffer_Lock/AsyncLock/Unlock are not hooked, so nothing
+  // tells us when a bound buffer is re-pointed or resized under a binding we
+  // already read. 0 on the UP path, where there is no buffer object to re-read.
+  uint32_t buffer_obj    = 0;
   bool     bound         = false;
 };
 
@@ -52,6 +58,19 @@ struct HleDrawInputs {
   uint32_t first       = 0;   // StartVertex, or StartIndex when indexed
   uint32_t count       = 0;   // VertexCount, or IndexCount when indexed
   int32_t  base_vertex = 0;   // DrawIndexedVertices' BaseVertexIndex
+
+  // Streams whose vertex fetch is indexed by a register other than r0.x --
+  // a value the SHADER computes. One bit per stream, from
+  // HlslShader::computed_index_streams.
+  //
+  // The GPU fetch path indexes these by the named register and copies the
+  // whole stream. This path cannot: it is declaration-driven, finds
+  // attributes by USAGE, and never runs the ALU that produces the index.
+  // Reading vertex N from such a stream is not an approximation, it is an
+  // unrelated row -- confident nonsense of exactly the kind that is
+  // undebuggable later. Those attributes are zero-filled and counted
+  // instead, which is what an out-of-range fetch already yields here.
+  uint32_t computed_index_streams = 0;
 
   // How the hardware conditions an index before it reaches the vertex fetch.
   // Ignoring these is what lost the ground: one 0xFFFF primitive-restart index
@@ -208,6 +227,14 @@ uint64_t& HleBuiltCount();
 // CopyVertex: this is the gate that `kVertexOutOfRange` used to be, and it
 // discarded 16% of every frame's draws.
 uint64_t& HleVertexZeroFillCount();
+
+// Attributes this path could not read because their stream is fetched with a
+// SHADER-COMPUTED index -- see HleDrawInputs::computed_index_streams. Not a
+// failure to be fixed here: the value does not exist without running the ALU,
+// so the attribute keeps its default. Counted because the alternative was
+// reading an unrelated vertex and never knowing, and because a non-zero here
+// means those draws want the GPU fetch path rather than this one.
+uint64_t& HleComputedIndexSkips();
 
 // Primitive restart. `Draws` counts draws that contained at least one marker and
 // were therefore walked into a list topology; `Count` counts the markers.

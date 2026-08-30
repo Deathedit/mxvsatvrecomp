@@ -697,6 +697,82 @@ uint32_t FetchFileDword1Offset(uint32_t stream) {
   return 0x6F4 + (0x11 - stream) * 8;
 }
 
+// The DEVICE's own vertex fetch SIZE for a stream, preferred over the size we
+// snapshotted from the D3DVertexBuffer header at SetStreamSource.
+//
+// Xenia takes the vertex buffer window from this register file --
+// `regs.GetVertexFetch(vfetch_index)`, d3d12_command_processor.cc:3065 -- and
+// never consults a buffer object. Measured with --hle_capture, the two sources
+// disagree on 29.7% of stream-0 draws (same 601476 / differ 254455), and
+// stream 0 is the only stream that ever zero-fills or loses a GPU-fetch
+// region; stream 1 agrees 52677/52677 and never fails.
+//
+// ONLY the size is taken, and that is deliberate. Every dropped region is a
+// SIZE failure -- `offset + first_vertex * stride` past the end -- and never an
+// address failure, so the base is not needed to fix one. A first cut also read
+// a base from `off1 - 4`, which yielded CpuToGpu(snapshot) + 0x1000 on all
+// 1,571,568 draws of run mx_1824: the same page skew for three different
+// buffers, but Xenia's CpuToGpu is a plain `& 0x1FFFFFFF` with no such skew
+// (xenos.h:1132), and a real one-page base error would garble every draw in the
+// game rather than 30% of them. So `off1 - 4` is not dword0, and the address
+// half of this file remains unlocated. dword1 is not in doubt: the sizes at
+// 0x77C matched the snapshot exactly (33800, 67080, 24) in every sample where
+// the two agreed.
+//
+// Substituting the size alone is consistent with the existing arithmetic. The
+// agreeing 70% show the device's size IS the whole-buffer size measured from
+// `address`, the same origin `size_bytes` uses, so
+// `avail = size - (offset_bytes + first_vertex * stride)` keeps its meaning.
+uint64_t g_fcCompared[mx::hle::kMaxStreams] = {};
+uint64_t g_fcSizeDiffer[mx::hle::kMaxStreams] = {};
+uint64_t g_fcSizeLarger = 0, g_fcSizeSmaller = 0;
+uint64_t g_fcUnreadable = 0;
+uint64_t g_fcBadType = 0;
+
+void ApplyDeviceFetchConstant(mx::hle::HleStream& s,
+                              const mx::hle::StreamBinding& b, uint32_t stream,
+                              uint32_t device, uint8_t* base) {
+  if (!device || !base) return;
+  const uint32_t off1 = FetchFileDword1Offset(stream);
+  if (!HostPageReadable(REX_RAW_ADDR(device + off1 - 4)) ||
+      !HostPageReadable(REX_RAW_ADDR(device + off1))) {
+    ++g_fcUnreadable;
+    return;
+  }
+  // Type 3 is a vertex fetch. Xenia refuses anything else outright
+  // (kInvalidVertex, behind --gpu_allow_invalid_fetch_constants). Here it means
+  // the slot is not describing this stream, and the snapshot is a better answer
+  // than a window read out of an unrelated constant.
+  if ((REX_LOAD_U32(device + off1 - 4) & 0x3u) != 0x3u) {
+    ++g_fcBadType;
+    return;
+  }
+  const uint32_t d1 = REX_LOAD_U32(device + off1);
+  const uint32_t size = ((d1 >> 2) & 0xFFFFFFu) * 4;
+  if (!size) return;
+  if (size != b.size_bytes) {
+    ++g_fcSizeDiffer[stream];
+    (size > b.size_bytes ? g_fcSizeLarger : g_fcSizeSmaller) += 1;
+  }
+  // NOT APPLIED, and this is the measurement that says why. Run mx_1826:
+  // 137,087 of 1,118,181 draws disagree with the snapshot and the device's
+  // size is SMALLER on every one of them -- larger 0. A smaller window can
+  // only drop more regions, never rescue one that failed for being too small,
+  // so the register file cannot be the explanation for the 12-13% of regions
+  // that lose their stream. That kills the theory outright rather than
+  // weakening it.
+  //
+  // "Smaller" is also just what an OffsetInBytes-tightened window looks like,
+  // which `start = offset_bytes + first_vertex * stride` already accounts for.
+  // The snapshot size was correct all along.
+  //
+  // Kept as a counter, not a behaviour: the comparison is what stops this
+  // theory being re-proposed, and it costs two loads on a path that already
+  // reads the device.
+  (void)s;
+  ++g_fcCompared[stream];
+}
+
 //---------------------------------------------------------------------------
 // Stage 3 -- the vertex shader float constant file.
 //
@@ -1560,6 +1636,10 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
 // paid for at its ordinary price; `lost` should stay at zero, and means a
 // deferred draw reached a caller that could not supply the inputs to fill it.
 uint64_t g_transcodeDeferred = 0, g_transcodeLate = 0, g_transcodeLost = 0;
+// Draws whose vertex shader indexes some stream by a register it computed.
+// The denominator for HleComputedIndexSkips: a zero skip count means
+// "the CPU path never touched such a stream" only if this is non-zero.
+uint64_t g_computedIndexDraws = 0;
 
 // Are the PER-DRAW diagnostics on?
 //
@@ -2380,7 +2460,13 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
       streams[i].stride = b.stride;
       streams[i].offset_bytes = b.offset_bytes;
       streams[i].endian = b.endian;
+      streams[i].buffer_obj = b.buffer_obj;
       streams[i].bound = true;
+      // Overrides host/size/offset/endian from the device's own fetch
+      // constant where that file agrees about the base. See
+      // ApplyDeviceFetchConstant: the snapshot is a bind-time copy of the
+      // buffer header, the register file is what the GPU actually reads.
+      ApplyDeviceFetchConstant(streams[i], b, i, device, base);
     }
   }
   in.streams = streams;
@@ -2426,6 +2512,17 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   {
     const uint32_t vs = st.vs_seen ? st.vertex_shader : 0;
     const TranslatedShader* vst = vs ? TranslatedVertexShader(vs) : nullptr;
+    // Streams this shader indexes by a computed register. The CPU vertex path
+    // reads them as if indexed by the vertex, which is an unrelated row rather
+    // than an approximation, so it zero-fills them instead.
+    if (vst) in.computed_index_streams = vst->computed_index_streams;
+    // The DENOMINATOR for the skip counter below. "0 attributes left
+    // default" reads as "never happens" and as "the flag never arrived",
+    // and those are opposite conclusions -- the same ambiguity that made an
+    // unreachable 100% look like a measurement earlier in this branch. This
+    // counts every draw that CARRIES a computed-index stream, whichever path
+    // it then takes, so the pair can be read.
+    if (in.computed_index_streams) ++g_computedIndexDraws;
     in.defer_transcode =
         vst && vst->source && vst->fetch_source && vst->sampler_count == 0 &&
         prim_type != uint32_t(mx::hle::PrimitiveType::kRectangleList) &&
@@ -3293,7 +3390,16 @@ void ScoreDraw(bool indexed, uint32_t first, uint32_t count,
         } else {
           ++g_fileDiffer[s];
           // Does the device's size explain a draw the snapshot could not?
-          if (b.stride && static_cast<uint64_t>(hi_vertex) * b.stride <= live) {
+          //
+          // `have_range` is REQUIRED here. Without it an indexed draw arrives
+          // with hi_vertex == 0 -- kProbeIndexRange is false, so have_range is
+          // never true for one -- and `0 * stride <= live` is true whatever
+          // the sizes are. That reported "explains 254455 of 254455" in run
+          // mx_1823, a clean 100% that measured nothing at all and was very
+          // nearly acted on. A counter whose test cannot fail is not a
+          // measurement.
+          if (have_range && b.stride &&
+              static_cast<uint64_t>(hi_vertex) * b.stride <= live) {
             ++g_fileRescues[s];
           }
         }
@@ -3627,6 +3733,31 @@ uint64_t g_gpuFetchNoVariant = 0;
 // beside it -- that counter can no longer be incremented, and a counter that
 // cannot fire reads as a measurement of zero instead of as dead code.
 uint64_t g_gpuFetchClamped = 0;
+// The clamp above is a magnitude with no denominator, and worse, it does not
+// separate the two cases it covers. A window shortened by a few vertices loses
+// a tail the shader zeroes; a window shortened to NOTHING loses the whole
+// stream, and every fetch bound to it reads zero for every vertex. Those are
+// the same counter today, which is why xe_vf[0] arriving as
+// (base 0, stride 16, limit 0) on the tree billboards -- an entire vertex
+// stream dropped -- produced no log line at all.
+//
+// Counted on every region considered, so the denominator is structural rather
+// than the population of failures, and the first total drop is kept whole
+// because one concrete case is what says which field is wrong.
+uint64_t g_gpuFetchRegions = 0;
+uint64_t g_gpuFetchDropped = 0;
+uint32_t g_gpuFetchDropCases = 0;
+struct GpuFetchDrop {
+  bool seen = false;
+  uint32_t handle = 0, stream = 0, stride = 0, size_bytes = 0, offset_bytes = 0;
+  uint32_t first_vertex = 0, vertex_count = 0, live_size = 0;
+};
+GpuFetchDrop g_gpuFetchFirstDrop;
+// Drops split by what the buffer object says NOW: `stale` is any disagreement
+// with the snapshot, `live_holds` the subset the live size would have rescued.
+uint64_t g_gpuFetchDropStale = 0;
+uint64_t g_gpuFetchDropLiveHolds = 0;
+uint64_t g_gpuFetchDropNoObject = 0;
 // Vertices the CPU path zero-filled because the stream ran short, where it
 // used to abandon the whole draw. Same rule as the clamp above, same reason.
 uint64_t g_hleShaderZeroFilledVertex = 0;
@@ -3863,12 +3994,55 @@ ShaderApplyResult ApplyShaderOutputs(
             st.first.size_bytes, st.first.offset_bytes, st.first.index,
             st.first.byte_off);
       }
+      // The GPU fetch side of the same question. `dropped` is the one that
+      // loses geometry outright: base == limit means every fetch bound to that
+      // stream reads zero for every vertex, so the draw renders but its
+      // vertices do not exist. The first case is printed whole because the
+      // ratio alone cannot say which of stride/size/offset/first_vertex is the
+      // wrong one.
+      std::string g = " | gpu-fetch regions none";
+      if (g_gpuFetchRegions) {
+        g = fmt::format(" | gpu-fetch {} regions, {} clamped, {} DROPPED",
+                        g_gpuFetchRegions, g_gpuFetchClamped,
+                        g_gpuFetchDropped);
+        const auto& d0 = g_gpuFetchFirstDrop;
+        if (d0.seen)
+          g += fmt::format(
+              " [snapshot stale {}, live size would hold {}, no object {}]"
+              " (first: vs 0x{:08X} stream {} stride {} size {} live {} off {} "
+              "first_vertex {} vertex_count {}, wanted {} bytes from {})",
+              g_gpuFetchDropStale, g_gpuFetchDropLiveHolds,
+              g_gpuFetchDropNoObject, d0.handle, d0.stream, d0.stride,
+              d0.size_bytes, d0.live_size, d0.offset_bytes, d0.first_vertex,
+              d0.vertex_count, uint64_t(d0.vertex_count) * d0.stride,
+              uint64_t(d0.offset_bytes) + uint64_t(d0.first_vertex) * d0.stride);
+      }
+      // The fetch-constant override, reported unconditionally because it now
+      // decides which bytes every draw reads. `unmatched` is the one to watch:
+      // it means neither base composition fitted, so that stream silently kept
+      // the old snapshot window.
+      std::string f;
+      {
+        uint64_t used = 0, differ = 0;
+        for (uint32_t i = 0; i < mx::hle::kMaxStreams; ++i) {
+          used += g_fcCompared[i];
+          differ += g_fcSizeDiffer[i];
+        }
+        f = fmt::format(
+            " | fetch-constant size compared {} (differs from snapshot {}: "
+            "larger {} smaller {} -- NOT applied), bad-type {}, "
+            "unreadable {}"
+            " | computed-index draws {} (CPU attrs left default {})",
+            used, differ, g_fcSizeLarger, g_fcSizeSmaller, g_fcBadType,
+            g_fcUnreadable, g_computedIndexDraws,
+            mx::hle::HleComputedIndexSkips());
+      }
       REXLOG_INFO(
           "d3d9: index conditioning: registers read {} draws, restart enabled "
-          "{}, cut {} draws at {} markers{}",
+          "{}, cut {} draws at {} markers{}{}{}",
           g_indexCondRead, g_indexCondResetOn,
           mx::hle::HleRestartCutDraws(), mx::hle::HleRestartCutCount(),
-          s.empty() ? " | zero-fill: none" : s);
+          s.empty() ? " | zero-fill: none" : s, g, f);
     }
   } zreport{attempt};
   if (!handle || !device) {
@@ -3947,7 +4121,15 @@ ShaderApplyResult ApplyShaderOutputs(
       }
     }
   }
-  if (g_diag) {
+  // NOT behind g_diag any more. This census is one line per DISTINCT
+  // (register, swizzle, rounded, exp_adjust) combination, so its whole cost is
+  // a handful of lines per run -- and it answers the question the emitter's own
+  // comment says has never been checked: whether every vfetch really is indexed
+  // by the vertex ID. Run mx_1827 produced a draw of 148 vertices whose stream
+  // 1 holds FOUR (stride 16, size 64) -- a corner table that cannot be
+  // addressed by vertex ID at all -- so the assumption now has a concrete
+  // counter-example and this needs to be readable without a special run.
+  {
     static std::map<uint64_t, bool> s_seen;
     for (const auto& a : attrs) {
       const uint64_t sig = (uint64_t(a.src_reg) << 32) |
@@ -4185,6 +4367,29 @@ ShaderApplyResult ApplyShaderOutputs(
     uint32_t limit_of_stream[kMaxStreams];
     std::memset(region_of_stream, 0xFF, sizeof(region_of_stream));
     std::memset(limit_of_stream, 0, sizeof(limit_of_stream));
+    // Which streams cannot be windowed by the draw's vertex range.
+    //
+    // A fetch indexed by r0.x is indexed by the VERTEX, so copying only
+    // [first_vertex, first_vertex + vertex_count) and rebasing the index to 0
+    // is exact. A fetch indexed by any other register is indexed by something
+    // the shader COMPUTED -- an absolute row in a per-object table, 0..6777 for
+    // the foliage -- and that number has no relationship to the draw's vertex
+    // range. Windowing such a stream is what produced every dropped region:
+    // `offset + first_vertex * stride` ran past the buffer while the index the
+    // shader would actually use sat comfortably inside it.
+    //
+    // Xenia never windows at all -- it makes the whole fetch-constant range
+    // resident (d3d12_command_processor.cc:3105) and lets the index land where
+    // it lands. That is done here only for the streams that need it, because
+    // the whole-stream copy is 325KB for the foliage against 7KB for a window,
+    // and the census says exactly one fetch form in this title is affected.
+    bool whole_stream[kMaxStreams] = {};
+    for (size_t a = 0; a < attrs.size(); ++a) {
+      // r0.x, and only r0.x, is the vertex index (Xenia writes it to GPR 0
+      // with mask 0b0001 and nothing else).
+      const bool by_vertex = attrs[a].src_reg == 0 && attrs[a].src_swizzle == 0;
+      if (!by_vertex) whole_stream[attr_stream[a]] = true;
+    }
     dc.raw_vertex_bytes.clear();
     dc.raw_fetch_count = 0;
     for (size_t a = 0; a < attrs.size() && gpu_fetch; ++a) {
@@ -4196,9 +4401,16 @@ ShaderApplyResult ApplyShaderOutputs(
       const uint32_t si = attr_stream[a];
       const mx::hle::HleStream& s = streams[si];
       if (region_of_stream[si] == 0xFFFFFFFFu) {
-        const uint64_t start = uint64_t(s.offset_bytes) +
-                               uint64_t(dc.first_vertex) * s.stride;
-        const uint64_t want = uint64_t(dc.vertex_count) * s.stride;
+        const uint64_t start =
+            whole_stream[si] ? uint64_t(s.offset_bytes)
+                             : uint64_t(s.offset_bytes) +
+                                   uint64_t(dc.first_vertex) * s.stride;
+        const uint64_t want =
+            whole_stream[si]
+                ? (s.size_bytes > s.offset_bytes
+                       ? uint64_t(s.size_bytes) - s.offset_bytes
+                       : 0)
+                : uint64_t(dc.vertex_count) * s.stride;
         // This used to refuse the draw outright when the window ran past the
         // stream, on the grounds that a clamp would read "whatever follows the
         // buffer". That was the right call while the shader had no bound to
@@ -4218,7 +4430,78 @@ ShaderApplyResult ApplyShaderOutputs(
         const uint64_t avail =
             s.size_bytes > start ? uint64_t(s.size_bytes) - start : 0;
         const uint64_t bytes = std::min(want, avail);
+        ++g_gpuFetchRegions;
         if (bytes < want) ++g_gpuFetchClamped;
+        if (!bytes && want) {
+          ++g_gpuFetchDropped;
+          // Is our snapshot stale? size_bytes was read from the buffer object
+          // at SetStreamSource; nothing is hooked that would tell us the guest
+          // re-pointed or resized it since. Re-read the object's own size
+          // field NOW and ask whether the live one would have held this
+          // window. A high rescue count means the bug is the snapshot, not the
+          // guest over-indexing -- and those want opposite fixes, which is why
+          // this is measured before either is attempted.
+          if (s.buffer_obj) {
+            const uint32_t d1 = REX_LOAD_U32(s.buffer_obj + 0x1C);
+            const uint64_t live = uint64_t((d1 >> 2) & 0xFFFFFFu) * 4;
+            if (live != s.size_bytes) ++g_gpuFetchDropStale;
+            if (live >= start + want) ++g_gpuFetchDropLiveHolds;
+            if (!g_gpuFetchFirstDrop.seen) g_gpuFetchFirstDrop.live_size =
+                uint32_t(live);
+          } else {
+            ++g_gpuFetchDropNoObject;
+          }
+          // THE DECISIVE CASE. The size theory is dead (see
+          // ApplyDeviceFetchConstant: the device's own size is never larger),
+          // so what is left is whether `first_vertex` -- the MINIMUM index in
+          // the conditioned index buffer -- is real. Print every bound stream
+          // of the failing draw beside it: if another stream comfortably holds
+          // index first_vertex+vertex_count while this one cannot, the guest is
+          // fetching one attribute from a buffer sized for fewer vertices and
+          // the hardware zero-fill we emulate is correct. If NO stream holds
+          // it, the index range itself is wrong and the fault is on the index
+          // path, not the vertex one. One printed case separates those; a
+          // counter cannot.
+          // Keyed by SHADER, not "the first N drops". The first three cases
+          // of run mx_1828 were all one shader (0x21689720, two fetch slots),
+          // which is not the tree billboard VS at all -- that one has three.
+          // Reading them as representative of a 95,000-drop population was the
+          // wrong-population mistake: what is needed is one case per distinct
+          // producer, so the shader losing the foliage can be seen among them.
+          static std::map<uint64_t, bool> s_dropSeen;
+          const uint64_t dkey = (uint64_t(handle) << 8) | si;
+          if (s_dropSeen.size() < 12 && s_dropSeen.emplace(dkey, true).second) {
+            std::string all;
+            for (uint32_t k = 0; k < kMaxStreams; ++k) {
+              if (!streams[k].bound || !streams[k].stride) continue;
+              all += fmt::format(
+                  " s{}(stride {} size {} off {} -> {} verts)", k,
+                  streams[k].stride, streams[k].size_bytes,
+                  streams[k].offset_bytes,
+                  streams[k].size_bytes / streams[k].stride);
+            }
+            REXLOG_INFO(
+                "d3d9: DROP CASE vs 0x{:08X} slot {} stream {}: indices "
+                "[{}..{}] ({} verts, {} indices) need {} verts; index src "
+                "r{}.{} rounded={}; fetches {}, draws-since-bind {};{}",
+                handle, attrs[a].fetch_slot, si, dc.first_vertex,
+                dc.first_vertex + dc.vertex_count - 1, dc.vertex_count,
+                dc.index_count, dc.first_vertex + dc.vertex_count,
+                attrs[a].src_reg, "xyzw"[attrs[a].src_swizzle & 3],
+                attrs[a].is_index_rounded ? 1 : 0, attrs.size(),
+                g_drawsSinceBind[si], all);
+          }
+          if (!g_gpuFetchFirstDrop.seen) {
+            g_gpuFetchFirstDrop.handle = handle;
+            g_gpuFetchFirstDrop.stream = si;
+            g_gpuFetchFirstDrop.stride = s.stride;
+            g_gpuFetchFirstDrop.size_bytes = s.size_bytes;
+            g_gpuFetchFirstDrop.offset_bytes = s.offset_bytes;
+            g_gpuFetchFirstDrop.first_vertex = dc.first_vertex;
+            g_gpuFetchFirstDrop.vertex_count = dc.vertex_count;
+            g_gpuFetchFirstDrop.seen = true;
+          }
+        }
         // ByteAddressBuffer.Load needs 4-byte alignment, and every address the
         // shader forms is base + vid * stride + a dword-derived offset. Guest
         // strides and offsets are dword counts so this should always hold --
@@ -4236,7 +4519,14 @@ ShaderApplyResult ApplyShaderOutputs(
         limit_of_stream[si] = uint32_t(dc.raw_vertex_bytes.size());
       }
       auto& rf = dc.raw_fetch[dc.raw_fetch_count++];
+      // A whole-stream region starts at the buffer's own origin, so a fetch
+      // that IS indexed by the vertex has to skip forward to where its window
+      // would have begun -- the shader still rebases its index to 0. A fetch
+      // indexed by a computed register addresses from the origin directly.
+      const bool by_vertex = attrs[a].src_reg == 0 && attrs[a].src_swizzle == 0;
       rf.base = region_of_stream[si];
+      if (whole_stream[si] && by_vertex)
+        rf.base += uint32_t(uint64_t(dc.first_vertex) * s.stride);
       rf.stride = s.stride;
       rf.endian = s.endian;
       rf.limit = limit_of_stream[si];
@@ -6163,6 +6453,7 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
           kept.vertex_fetch_count = fetched.vertex_fetch_count;
           for (uint32_t i = 0; i < fetched.vertex_fetch_count; ++i)
             kept.vertex_fetch_slot[i] = fetched.vertex_fetch_slot[i];
+          kept.computed_index_streams = fetched.computed_index_streams;
           ++g_vfetchCompiled;
         } else {
           ++g_vfetchRefused["FXC rejected"];
