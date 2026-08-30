@@ -126,13 +126,10 @@ REXCVAR_DEFINE_STRING(dev, "", "Debug",
                       "Developer switches, comma separated: menu, print, "
                       "native:census|<hex>|all. See hooks_debug_unlock.cpp");
 
-// Deliberately NOT in the anonymous namespace: the renderer asks for `dev`
-// tokens too (wireframe), and one switch means one reader. Declared where it
-// is used rather than in a header, because a header for one function that four
-// files call is more ceremony than it buys.
-//
-// Read on cold paths only -- a Lua global registration, a preset parse, a stub
-// call, PSO creation -- so it never needs caching.
+namespace {
+
+// Split `dev` per call. It is read on cold paths only -- a Lua global
+// registration, a preset parse, a stub call -- so it never needs caching.
 bool DevFlag(const char* name) {
   const std::string spec = REXCVAR_GET(dev);
   size_t pos = 0;
@@ -144,8 +141,6 @@ bool DevFlag(const char* name) {
   }
   return false;
 }
-
-namespace {
 
 // Every value given as `name:value`, in order.
 std::vector<std::string> DevOptions(const char* name) {

@@ -17,9 +17,6 @@
 
 #include "gfx/d3d12_renderer.h"
 
-// Defined in hooks/hooks_debug_unlock.cpp -- the `dev` cvar reader.
-bool DevFlag(const char* name);
-
 #include "gfx/d3d12_game_internal.h"
 #include "gfx/d3d12_internal.h"
 #include "gfx/d3d12_shaders.h"
@@ -258,13 +255,7 @@ bool D3D12Renderer::CreateGamePipeline() {
   pso.VS.BytecodeLength = vsBlob->GetBufferSize();
   pso.PS.pShaderBytecode = psBlob->GetBufferPointer();
   pso.PS.BytecodeLength = psBlob->GetBufferSize();
-  // --dev=wireframe. This desc becomes m_gamePsoTemplate below, so setting it
-  // here also covers OpaquePSO and BlendedPSO, which copy the template and
-  // only override CullMode via ApplyCullBits. Two lines reach all four
-  // graphics PSO builders; wiring one and assuming the rest is how stencil
-  // ended up silently inert in two whole phases.
-  pso.RasterizerState.FillMode =
-      DevFlag("wireframe") ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID;
+  pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
   // Deliberately CULL_NONE: these are the 32 eagerly-built variants, which are
   // by definition the packed-cull-bits-0 state ("cull nothing, front is CW").
   // OpaquePSO and BlendedPSO override the rasterizer for every other mode via
@@ -979,10 +970,7 @@ ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
   pso.VS.BytecodeLength = vsBlob->GetBufferSize();
   pso.PS.pShaderBytecode = ps->GetBufferPointer();
   pso.PS.BytecodeLength = ps->GetBufferSize();
-  // --dev=wireframe. TranslatedPSO builds its own desc rather than copying the
-  // template, so it needs the flag separately.
-  pso.RasterizerState.FillMode =
-      DevFlag("wireframe") ? D3D12_FILL_MODE_WIREFRAME : D3D12_FILL_MODE_SOLID;
+  pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
   // The guest's cull mode, carried in flags bits 5-7. Hardcoding CULL_NONE
   // here is what let a closed volume containing the camera paint the menu
   // background black -- see DrawCall::pa_su_sc_mode_cntl.

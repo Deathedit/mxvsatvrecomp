@@ -45,9 +45,6 @@
 // as it is read, which is what shipping a different MXRegistry.bxml would do —
 // tools/ has bxml decoders but no encoder, so this is the only way to change one.
 // Empty means off. Diagnostic only. See AGENTS.md "the registry chokepoint".
-// Defined in hooks_debug_unlock.cpp -- the `dev` cvar reader.
-bool DevFlag(const char* name);
-
 REXCVAR_DEFINE_STRING(registry_override, "", "Debug",
                       "Comma-separated key=value overrides for guest registry string reads");
 
@@ -144,26 +141,6 @@ extern "C" REX_FUNC(sub_82B70370) {
                 REX_LOAD_U32(a1 + 32));
   }
   orig_Timing(ctx, base);
-
-  // --dev=freeze, the engine's own `space FreezeGame` in effect if not in
-  // name: hold the world still while rendering keeps running.
-  //
-  // Three fields, not one. The guest has already advanced its accumulated time
-  // by this frame's dt inside the call above, and computes a scaled clock from
-  // it -- `*(a1+60) += dt; *(a1+64) = *(a1+68) * *(a1+60)`. Zeroing dt alone
-  // would leave a world that does not move beside a clock that does, which is
-  // a stranger state than either running or frozen.
-  if (a1 && DevFlag("freeze") && GuestRangeReadable(base, a1 + 60, 12)) {
-    constexpr uint32_t kDt = 24, kTotal = 60, kScaled = 64, kScale = 68;
-    const float dt = std::bit_cast<float>(REX_LOAD_U32(a1 + kDt));
-    const float total =
-        std::bit_cast<float>(REX_LOAD_U32(a1 + kTotal)) - dt;
-    const float scale = std::bit_cast<float>(REX_LOAD_U32(a1 + kScale));
-    REX_STORE_U32(a1 + kDt, std::bit_cast<uint32_t>(0.0f));
-    REX_STORE_U32(a1 + kTotal, std::bit_cast<uint32_t>(total));
-    REX_STORE_U32(a1 + kScaled, std::bit_cast<uint32_t>(scale * total));
-  }
-
   if ((tm <= 5 || (tm % 1000) == 0) && a1) {
     REXLOG_INFO("{}: Timing #{} dt={:.6f} total={:.3f} a1=0x{:08X}",
                 mx::native::g_plugin_mode ? "plugin" : "native", tm,
