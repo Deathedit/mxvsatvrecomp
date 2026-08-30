@@ -4252,50 +4252,6 @@ ShaderApplyResult ApplyShaderOutputs(
   alu_in.alu_consts = consts.data();
   alu_in.alu_const_dwords = uint32_t(consts.size());
 
-  // Commit only after every vertex succeeds. Mixing shader outputs and raw
-  // declaration positions within one primitive produces plausible-looking but
-  // invalid geometry and is worse than dropping the draw explicitly.
-  std::vector<uint8_t> transformed = dc.vertices;
-  std::vector<uint8_t> referenced(dc.vertex_count, dc.index_count ? 0 : 1);
-  if (dc.index_count) {
-    const uint32_t iw = dc.index_16bit ? 2u : 4u;
-    if (dc.indices.size() < uint64_t(dc.index_count) * iw) {
-      ++g_hleShaderBadVertex;
-      ++g_hleShaderBadVertexShort;
-      return ShaderApplyResult::kFailed;
-    }
-    for (uint32_t i = 0; i < dc.index_count; ++i) {
-      uint32_t index = 0;
-      if (dc.index_16bit) {
-        uint16_t v;
-        std::memcpy(&v, dc.indices.data() + size_t(i) * 2, 2);
-        index = v;
-      } else {
-        std::memcpy(&index, dc.indices.data() + size_t(i) * 4, 4);
-      }
-      if (index >= dc.vertex_count) {
-        ++g_hleShaderBadVertex;
-        ++g_hleShaderBadVertexRange;
-        if (index == 0xFFFFu) ++g_hleShaderBadVertexRangeComputed;
-        static bool s_shown = false;
-        if (!s_shown) {
-          s_shown = true;
-          // The INDEX VALUE separates the two candidates on its own: exactly
-          // 0xFFFF is a strip cut being read as a vertex number, anything else
-          // above vertex_count is a stream addressed absolutely.
-          REXLOG_INFO(
-              "d3d9: BAD VERTEX range (first case) index {} of vertex_count {} "
-              "at i {} of {}; index_16bit {} stride {} vertices {} B; "
-              "0xFFFF here would be a strip cut read as a vertex",
-              index, dc.vertex_count, i, dc.index_count,
-              dc.index_16bit ? 1 : 0, dc.vertex_stride,
-              uint32_t(dc.vertices.size()));
-        }
-        return ShaderApplyResult::kFailed;
-      }
-      referenced[index] = 1;
-    }
-  }
   uint8_t vtx[kMaxStreams][256];
   std::vector<std::array<float, 4>> values(attrs.size());
 
@@ -4787,13 +4743,78 @@ ShaderApplyResult ApplyShaderOutputs(
       ++HleSkipCounts()[uint32_t(tskip)];
       return ShaderApplyResult::kFailed;
     }
-    // `transformed` was copied from dc.vertices at the top of this function,
-    // which for a deferred draw was EMPTY. The per-vertex loop below writes the
-    // shader's clip-space export into it by offset, so leaving it empty is a
-    // memcpy to nullptr -- an access violation writing address 0, which is
-    // exactly what mx_882 and mx_883 crashed on.
-    transformed = dc.vertices;
+    // `transformed` used to be copied from dc.vertices at the TOP of this
+    // function, which for a deferred draw was empty, so it had to be re-copied
+    // here or the per-vertex loop wrote through a null data() -- the access
+    // violation mx_882 and mx_883 crashed on. It is now declared below this
+    // block instead, from the vertices the transcode has just filled in, so
+    // there is nothing to re-copy and the crash is structurally impossible
+    // rather than patched.
     ++g_transcodeLate;
+  }
+
+  // THE INDEX WALK RUNS HERE, not before the two blocks above, and that
+  // placement is the whole point.
+  //
+  // It builds `referenced[]` for the per-vertex loop below and rejects a draw
+  // whose indices fall outside its vertex buffer. Both questions are only
+  // answerable once dc.vertices is FINAL, and above this line it is not:
+  //
+  //   - a gpu_fetch draw returns kApplied before ever needing CPU vertices;
+  //     the GPU fetches them itself and its indices are ABSOLUTE and unrebased
+  //     by design, so `index >= dc.vertex_count` is not a defect there, it is
+  //     the contract;
+  //   - a deferred draw arrives with vertex_stride 0 and an EMPTY dc.vertices,
+  //     and only the transcode above fills them.
+  //
+  // Running it at the top of the function therefore tested absolute indices
+  // against a local count that described nothing, and returned kFailed -- and
+  // the caller drops a kFailed draw without FinishHleDraw. Measured in
+  // FR_Dunes run 1874: 16795 draws killed this way, 100% of them the range
+  // test, zero strip cuts, matching `computed-index draws 16884` to 99.5%,
+  // with a first case reading `index 6608 of vertex_count 16, stride 0,
+  // vertices 0 B`. That is a draw with no CPU vertex data at all being
+  // rejected for the indices it was built to have.
+  std::vector<uint8_t> transformed = dc.vertices;
+  std::vector<uint8_t> referenced(dc.vertex_count, dc.index_count ? 0 : 1);
+  if (dc.index_count) {
+    const uint32_t iw = dc.index_16bit ? 2u : 4u;
+    if (dc.indices.size() < uint64_t(dc.index_count) * iw) {
+      ++g_hleShaderBadVertex;
+      ++g_hleShaderBadVertexShort;
+      return ShaderApplyResult::kFailed;
+    }
+    for (uint32_t i = 0; i < dc.index_count; ++i) {
+      uint32_t index = 0;
+      if (dc.index_16bit) {
+        uint16_t v;
+        std::memcpy(&v, dc.indices.data() + size_t(i) * 2, 2);
+        index = v;
+      } else {
+        std::memcpy(&index, dc.indices.data() + size_t(i) * 4, 4);
+      }
+      if (index >= dc.vertex_count) {
+        ++g_hleShaderBadVertex;
+        ++g_hleShaderBadVertexRange;
+        if (index == 0xFFFFu) ++g_hleShaderBadVertexRangeComputed;
+        static bool s_shown = false;
+        if (!s_shown) {
+          s_shown = true;
+          // The INDEX VALUE separates the candidates on its own: exactly
+          // 0xFFFF is a strip cut being read as a vertex number, anything else
+          // above vertex_count is a stream addressed absolutely.
+          REXLOG_INFO(
+              "d3d9: BAD VERTEX range (first case) index {} of vertex_count {} "
+              "at i {} of {}; index_16bit {} stride {} vertices {} B; "
+              "0xFFFF here would be a strip cut read as a vertex",
+              index, dc.vertex_count, i, dc.index_count,
+              dc.index_16bit ? 1 : 0, dc.vertex_stride,
+              uint32_t(dc.vertices.size()));
+        }
+        return ShaderApplyResult::kFailed;
+      }
+      referenced[index] = 1;
+    }
   }
 
   uint64_t applied_vertices = 0;
