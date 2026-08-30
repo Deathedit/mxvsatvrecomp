@@ -942,11 +942,57 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameDepthTarget(
   if (!object || !width || !height || width > 8192 || height > 8192 ||
       !m_gameDepthDsvHeap || !m_gameSrvHeap)
     return nullptr;
+  // BASE-KEYED, and sized to the TALLEST extent ever seen at this base.
+  //
+  // The alias search further down only accepts an owner that is already tall
+  // enough, which is fine when the newcomer is a smaller band of a bigger
+  // surface -- the deferred-lighting case it was written for. It fails when the
+  // newcomer is TALLER, and that is the shadow map: the casters bind
+  // 768x384 at base 0x710 and create the surface, then the RESOLVE binds
+  // 768x1024 at the same base, finds no owner tall enough, and gets a fresh
+  // surface nothing ever drew into. Measured in shadows.rdc: 38 draws into
+  // 756 (768x384), clear+resolve on 755 (768x1024), and the resolved shadow
+  // map came back min = max = 1.0 -- every shadow lookup then said
+  // "unshadowed".
+  //
+  // On Xenos two descriptors at one EDRAM base ARE the same tiles, so the
+  // height a surface needs is the largest any descriptor asks for. Remembering
+  // that per base means the owner is created big enough the next time round,
+  // and the taller descriptor then aliases instead of splitting.
+  uint32_t& baseMax = m_depthBaseMaxHeight[edramBase];
+  if (height > baseMax) baseMax = height;
+  const uint32_t want = baseMax;
+
+  // Taken BEFORE the per-object lookup on purpose. An object that created its
+  // own standalone surface on an earlier frame would otherwise keep hitting
+  // that entry and never reach the alias search at all, so the split would
+  // survive however tall the owner later grew.
+  for (auto& [ownerObject, owner] : m_gameDepthTargets) {
+    if (ownerObject == object) continue;
+    if (owner.edramBase != edramBase || owner.width != width) continue;
+    if (owner.height < want) continue;
+    if (m_gameDepthAliases[object] != ownerObject) {
+      m_gameDepthAliases[object] = ownerObject;
+      char m[192];
+      std::snprintf(m, sizeof(m),
+                    "depth EDRAM alias (base-keyed): 0x%08X %ux%u base 0x%X ->"
+                    " owner 0x%08X %ux%u",
+                    object, width, height, edramBase, ownerObject, owner.width,
+                    owner.height);
+      LogInfo(m);
+    }
+    ++m_depthAliasHits;
+    return &owner;
+  }
+
   uint32_t reuseDsvIndex = UINT32_MAX;
   uint32_t reuseSrvIndex = UINT32_MAX;
   if (auto it = m_gameDepthTargets.find(object);
       it != m_gameDepthTargets.end()) {
-    if (it->second.width == width && it->second.height == height) {
+    // `want`, not `height`: an entry created before this base was known to
+    // need more rows is replaced in place at the larger size rather than
+    // handed back short.
+    if (it->second.width == width && it->second.height == want) {
       it->second.edramBase = edramBase;
       return &it->second;
     }
@@ -1053,7 +1099,7 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameDepthTarget(
   spec.flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
   spec.initialState = D3D12_RESOURCE_STATE_DEPTH_WRITE;
   spec.clear = &cv;
-  if (!CreatePooledSurface(entry, width, height, spec, reuseSrvIndex))
+  if (!CreatePooledSurface(entry, width, want, spec, reuseSrvIndex))
     return nullptr;
   entry.state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
 

@@ -2175,6 +2175,12 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // use rather than invalidated on retire, so an owner going away degrades to a
   // fresh surface instead of a dangling pointer.
   std::unordered_map<uint32_t, uint32_t> m_gameDepthAliases;
+  // Tallest extent any descriptor has asked for at a given EDRAM base. Two
+  // descriptors at one base are the same tiles on Xenos, so the host surface
+  // has to be the union -- created short, a taller descriptor cannot alias it
+  // and silently gets a second, empty surface instead. That is what left the
+  // shadow map resolving as uniform 1.0.
+  std::unordered_map<uint32_t, uint32_t> m_depthBaseMaxHeight;
   uint64_t m_depthAliasHits = 0;
   // Bands at a NON-ZERO row offset into their owner, which take a per-frame
   // copy of the owner's rows instead of sharing its surface.
