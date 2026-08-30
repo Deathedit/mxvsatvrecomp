@@ -6,9 +6,6 @@
 
 #include "hooks/hook_common.h"
 
-#include <atomic>
-#include <string>
-
 //=============================================================================
 // sub_82BFB740 — NtWaitForSingleObjectEx
 //=============================================================================
@@ -52,64 +49,8 @@
 //
 // A level loads and exits cleanly with this as a pass-through (2026-08-16).
 
-// COUNTED AGAIN 2026-08-30, but LOCK-FREE, because the note above is about the
-// implementation and not about the measurement. The removed version took a
-// process-wide mutex on every guest wait and serialised every waiting thread in
-// the process; this claims a slot once per thread with a CAS and then does one
-// relaxed increment, so the hot path takes no lock at all.
-//
-// What it answers: whether some guest thread runs an UNPACED loop. A thread
-// that paces itself blocks here every iteration, so its rate tracks the frame
-// rate; one that free-runs never appears while still consuming the machine.
-// Every other counter in this project is per tick frame and cannot see that.
-namespace {
-struct WaitSlot {
-  std::atomic<uint32_t> tid{0};
-  std::atomic<uint64_t> n{0};
-};
-constexpr size_t kWaitSlots = 128;
-WaitSlot g_waitSlots[kWaitSlots];
-std::atomic<uint64_t> g_waitSlotOverflow{0};
-thread_local WaitSlot* t_waitSlot = nullptr;
-}  // namespace
-
-std::string GuestWaitReport(double seconds) {
-  std::string out;
-  size_t used = 0;
-  for (auto& s : g_waitSlots) {
-    const uint32_t tid = s.tid.load(std::memory_order_acquire);
-    if (!tid) continue;
-    ++used;
-    const uint64_t n = s.n.load(std::memory_order_relaxed);
-    out += fmt::format(" [t{} {} = {:.1f}/s]", tid, n,
-                       seconds > 0.0 ? double(n) / seconds : 0.0);
-  }
-  const uint64_t of = g_waitSlotOverflow.load(std::memory_order_relaxed);
-  return fmt::format("{} thread(s) block in NtWaitForSingleObjectEx{}:{}", used,
-                     of ? fmt::format(", {} waits from threads past the {}-slot "
-                                      "cap (rows are then not the whole set)",
-                                      of, kWaitSlots)
-                        : std::string(),
-                     out.empty() ? " (none)" : out);
-}
-
 REX_IMPORT(__imp__sub_82BFB740, orig_Wait, void());
-extern "C" REX_FUNC(sub_82BFB740) {
-  if (!t_waitSlot) {
-    const uint32_t me = uint32_t(GetCurrentThreadId());
-    for (auto& s : g_waitSlots) {
-      uint32_t expected = 0;
-      if (s.tid.load(std::memory_order_acquire) == me ||
-          s.tid.compare_exchange_strong(expected, me, std::memory_order_acq_rel)) {
-        t_waitSlot = &s;
-        break;
-      }
-    }
-    if (!t_waitSlot) g_waitSlotOverflow.fetch_add(1, std::memory_order_relaxed);
-  }
-  if (t_waitSlot) t_waitSlot->n.fetch_add(1, std::memory_order_relaxed);
-  orig_Wait(ctx, base);
-}
+extern "C" REX_FUNC(sub_82BFB740) { orig_Wait(ctx, base); }
 
 // The sub_82BFB748 (NtSetEvent) hook is REMOVED 2026-08-06. It was a frontier
 // probe for a crash between LoaderTick #1 and Timing #2 that no longer happens,
