@@ -198,7 +198,16 @@ void NoteType0Write(uint32_t reg_base, const uint32_t* data, uint32_t count) {
     // the power-on 0.0.
     if ((data[i] & 0x7F800000u) == 0x7F800000u && (data[i] & 0x007FFFFFu) != 0)
       continue;
-    // TARGETED TRACE: c140..c143, dwords 560..575.
+    // TARGETED TRACE: the PIXEL bank's c140..c143, i.e. guest ALU constants
+    // 396..399, dwords 1584..1599.
+    //
+    // The first cut watched dwords 560..575 -- constants 140..143 -- and
+    // compared them against a PIXEL shader's xe_c[140..143]. Wrong registers:
+    // pixel constants 256..511 map into the shader's bank at reg-256
+    // (hooks_d3d9_texture.cpp:3485), so the mask pass's xe_c[140] is guest
+    // constant 396. The values disagreed because they were different
+    // registers, not because anything was corrupt, and the conclusion drawn
+    // from that ("PM4 does not supply these") was void.
     //
     // shadows--.rdc shows those four registers holding c100..c103 with a
     // corrupted THIRD COLUMN -- c14x.z equals the negated .y of c128..c131
@@ -210,7 +219,7 @@ void NoteType0Write(uint32_t reg_base, const uint32_t* data, uint32_t count) {
     // the value arriving here already carries 306.99 in c142.z, the data is
     // the guest's and our reading of it is what is wrong; if it arrives sane
     // and reads corrupt later, the defect is downstream of this write.
-    if (d >= 560u && d < 576u) {
+    if (d >= 1584u && d < 1600u) {
       // NON-ZERO ONLY, and the cap counts what it PRINTS. The first cut
       // logged every write and spent all 48 lines on the bulk zero-fill
       // (base 0x4000 count 2048) plus an early all-zero block -- the same
@@ -225,9 +234,10 @@ void NoteType0Write(uint32_t reg_base, const uint32_t* data, uint32_t count) {
         float f;
         std::memcpy(&f, &data[i], sizeof(f));
         REXLOG_INFO(
-            "gpu: TYPE0 c{}.{} = {} (0x{:08X}) [reg 0x{:X}, dword {}, base "
-            "0x{:X} count {}]",
-            d / 4u, "xyzw"[d & 3u], f, data[i], reg, d, reg_base, count);
+            "gpu: TYPE0 guest c{} = PIXEL c{}.{} = {} (0x{:08X}) [reg 0x{:X}, "
+            "dword {}, base 0x{:X} count {}]",
+            d / 4u, (d / 4u) - 256u, "xyzw"[d & 3u], f, data[i], reg, d,
+            reg_base, count);
       }
     }
     g_file[d] = data[i];
