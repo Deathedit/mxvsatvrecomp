@@ -381,10 +381,41 @@ void D3D12Renderer::RenderGameFrame() {
       // Nothing ever carried the band back. This does, for bands of THIS
       // resolve source that have actually been drawn into, so the owner holds
       // the union of its bands at the moment it is copied out.
+      // WHICH condition rejects a band, counted. The write-back has fired
+      // ZERO times in every run on record -- including 1871-1873, taken right
+      // after it shipped, when shadows were confirmed back. So it is NOT what
+      // fixed them (the band row arithmetic in the same commit was), and a
+      // mechanism that never runs cannot be reasoned about from its absence.
+      // Six conditions can reject; only a per-condition count says which, and
+      // guessing at this guard has already cost two wrong cuts.
+      static std::atomic<uint64_t> s_wbNoOwner{0}, s_wbOwnerDrawn{0},
+          s_wbNotOurBand{0}, s_wbBandNotDrawn{0}, s_wbWidth{0}, s_wbRow{0},
+          s_wbAccepted{0}, s_wbResolves{0};
       if (d.resolveSourceIsDepth) {
         auto oit = m_gameDepthTargets.find(d.resolveSource);
-        if (oit != m_gameDepthTargets.end() && oit->second.resource &&
-            !oit->second.drawnSinceClear) {
+        const bool have_owner =
+            oit != m_gameDepthTargets.end() && oit->second.resource;
+        if (!have_owner) ++s_wbNoOwner;
+        else if (oit->second.drawnSinceClear) ++s_wbOwnerDrawn;
+        if ((++s_wbResolves % 4000) == 0) {
+          char wb[400];
+          std::snprintf(
+              wb, sizeof(wb),
+              "  BAND WRITE-BACK census over %llu depth resolves: accepted "
+              "%llu | rejected: no-owner %llu, owner already drawn %llu, band "
+              "belongs to another owner %llu, band not drawn %llu, width "
+              "mismatch %llu, row+height past owner %llu",
+              (unsigned long long)s_wbResolves.load(),
+              (unsigned long long)s_wbAccepted.load(),
+              (unsigned long long)s_wbNoOwner.load(),
+              (unsigned long long)s_wbOwnerDrawn.load(),
+              (unsigned long long)s_wbNotOurBand.load(),
+              (unsigned long long)s_wbBandNotDrawn.load(),
+              (unsigned long long)s_wbWidth.load(),
+              (unsigned long long)s_wbRow.load());
+          LogInfo(wb);
+        }
+        if (have_owner && !oit->second.drawnSinceClear) {
           // ONLY into an owner nothing has drawn into.
           //
           // Without this the write-back also fires for the deferred LIGHT
@@ -402,10 +433,23 @@ void D3D12Renderer::RenderGameFrame() {
           GameRenderTarget& owner = oit->second;
           for (auto& [bobj, band] : m_gameDepthTargets) {
             if (bobj == d.resolveSource) continue;
-            if (band.bandDepthOwner != d.resolveSource) continue;
-            if (!band.resource || !band.drawnSinceClear) continue;
-            if (band.width != owner.width) continue;
-            if (band.bandDepthRow + band.height > owner.height) continue;
+            if (band.bandDepthOwner != d.resolveSource) {
+              ++s_wbNotOurBand;
+              continue;
+            }
+            if (!band.resource || !band.drawnSinceClear) {
+              ++s_wbBandNotDrawn;
+              continue;
+            }
+            if (band.width != owner.width) {
+              ++s_wbWidth;
+              continue;
+            }
+            if (band.bandDepthRow + band.height > owner.height) {
+              ++s_wbRow;
+              continue;
+            }
+            ++s_wbAccepted;
             D3D12_RESOURCE_BARRIER toCopy[2] = {};
             for (auto& b : toCopy)
               b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
