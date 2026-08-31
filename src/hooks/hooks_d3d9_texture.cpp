@@ -3528,6 +3528,35 @@ void ApplyShaderLoadTable(uint32_t shader, uint32_t table_at, uint32_t data_at,
       if (dst >= bank.size()) continue;
       if (!HostPageReadable(REX_RAW_ADDR(src + j * 4))) continue;
       bank[dst] = REX_LOAD_U32(src + j * 4);
+      // TRACE: the mask pass's xe_c[140..143] = pixel ALU c396..c399, bank
+      // dwords 560..575.
+      //
+      // RESULT, run 1895: PRINTS NOTHING. The load table never writes those
+      // registers, so it is not the source either. Nor is PM4 (traced
+      // separately, b028a00). They come from the straight linear copy of the
+      // guest's own shadow at device+0x1780 above -- 1024 dwords, no
+      // reindexing -- so the values are the GUEST's and we reproduce them
+      // faithfully.
+      //
+      // That kills the hypothesis this was built for. shadows--.rdc shows
+      // c140..c143 equal to c100..c103 except in .z, with c14x.z == -c12x.y
+      // exactly, 4 of 4 -- which I read as a corrupted column. For an
+      // orthonormal rotation the inverse IS the transpose, so a column equal
+      // to a negated row is what correct inverse-transpose math produces. An
+      // exact algebraic identity was the evidence AGAINST corruption, not for
+      // it. The mountain-shadow defect is not in these constants.
+      if (dst >= 560u && dst < 576u) {
+        static uint32_t s_traced = 0;
+        if (s_traced++ < 64) {
+          float f;
+          std::memcpy(&f, &bank[dst], sizeof(f));
+          REXLOG_INFO(
+              "d3d9: LOADTABLE pixel c{}.{} = {} (0x{:08X}) [entry reg {} "
+              "dwords {}, j {}, src 0x{:08X}, shader 0x{:08X}]",
+              (abs_reg - 256u), "xyzw"[j % 4], f, bank[dst], reg, dwords, j,
+              src + j * 4, shader);
+        }
+      }
       if (written && dst < written->size()) (*written)[dst] = 1;
       ++applied;
     }
