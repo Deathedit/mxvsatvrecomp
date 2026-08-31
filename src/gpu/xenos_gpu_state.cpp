@@ -198,6 +198,38 @@ void NoteType0Write(uint32_t reg_base, const uint32_t* data, uint32_t count) {
     // the power-on 0.0.
     if ((data[i] & 0x7F800000u) == 0x7F800000u && (data[i] & 0x007FFFFFu) != 0)
       continue;
+    // TARGETED TRACE: c140..c143, dwords 560..575.
+    //
+    // shadows--.rdc shows those four registers holding c100..c103 with a
+    // corrupted THIRD COLUMN -- c14x.z equals the negated .y of c128..c131
+    // (which appear transposed at c188..c191). Two shadow cascades, one
+    // intact and one with a broken column, is the shape of "player shadow
+    // correct, distant shadow tracking the camera".
+    //
+    // This says whether the GUEST publishes that column or we assemble it: if
+    // the value arriving here already carries 306.99 in c142.z, the data is
+    // the guest's and our reading of it is what is wrong; if it arrives sane
+    // and reads corrupt later, the defect is downstream of this write.
+    if (d >= 560u && d < 576u) {
+      // NON-ZERO ONLY, and the cap counts what it PRINTS. The first cut
+      // logged every write and spent all 48 lines on the bulk zero-fill
+      // (base 0x4000 count 2048) plus an early all-zero block -- the same
+      // first-N sampling trap that has cost this investigation repeatedly.
+      // The values worth seeing arrive later, once the shadow pass runs.
+      //
+      // The block itself is already informative: base 0x4200 count 64 is
+      // constant 128 for 16 constants, so the guest writes c128..c143 in ONE
+      // packet -- exactly the span where c14x.z appears to take c12x.y.
+      static uint32_t s_traced = 0;
+      if (data[i] != 0u && s_traced++ < 64) {
+        float f;
+        std::memcpy(&f, &data[i], sizeof(f));
+        REXLOG_INFO(
+            "gpu: TYPE0 c{}.{} = {} (0x{:08X}) [reg 0x{:X}, dword {}, base "
+            "0x{:X} count {}]",
+            d / 4u, "xyzw"[d & 3u], f, data[i], reg, d, reg_base, count);
+      }
+    }
     g_file[d] = data[i];
     g_have[d >> 5] |= 1u << (d & 31);
     ++g_written;
