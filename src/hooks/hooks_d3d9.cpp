@@ -4446,7 +4446,7 @@ ShaderApplyResult ApplyShaderOutputs(
   if (vs_translated) {
     static std::mutex s_stMutex;
     static uint64_t s_stDraws = 0, s_st3d = 0, s_stBb = 0, s_stBark = 0;
-    static uint64_t s_stRel = 0;
+    static uint64_t s_stRel = 0, s_stTree = 0, s_stTreeStatic = 0;
     const auto reads = [&](uint32_t c) {
       return ((vs_translated->const_mask[(c & 255u) >> 6] >> (c & 63u)) &
               1ull) != 0;
@@ -4475,6 +4475,38 @@ ShaderApplyResult ApplyShaderOutputs(
     // xe_vf[0] = {base 0, stride 16, endian 2, limit 64} alongside a stride-48
     // instance table, and it is the single most common stream shape in the
     // frame. A skinned mesh has no such stream.
+    // THE .tree VERTEX LAYOUT, tested on the FETCH rather than on a constant.
+    //
+    // Every earlier classifier keyed on c70, or c69+c82. StaticVertexShader --
+    // the entry point the material XML lists FIRST -- reads none of them, only
+    // c4/c8/c14/c15/c26/c64. So 3D vegetation drawn through the DEFAULT entry
+    // point was invisible to all of them, and "the guest never submits a
+    // close-range LOD" rested on that blindness.
+    //
+    // Xenia's dump has 16 vertex shaders we never translate, several with
+    // `Stride=7` dwords (28 bytes) and FMT_16_16_16_16_FLOAT positions -- the
+    // guest's repacked .tree layout, half-float, exactly as the asset stores
+    // it. A fetch shape cannot be dodged by a shader that declines to read a
+    // particular register, which is why this is keyed on the stream and not on
+    // the constant file.
+    //
+    // Format 32 is k_16_16_16_16_FLOAT (shader_hlsl.cpp case 32).
+    //
+    // MEASURED, run 1889: 376,000 draws of ~900,000 (42%), ALL static-form.
+    // So this layout is COMMON static geometry, not a vegetation fingerprint,
+    // and it does not isolate trees -- the sixth property-guess in this
+    // investigation to over-match. Kept because the NEGATIVE is worth having:
+    // we receive and translate this geometry class in bulk, so the 16 vertex
+    // shaders in Xenia's dump that we never translate are more likely session
+    // coverage than a systemic gap, and vegetation draws are most likely
+    // PRESENT rather than missing.
+    bool tree_layout = false;
+    for (const auto& a : attrs) {
+      if (a.format == 32u && a.stride_bytes == 28u) {
+        tree_layout = true;
+        break;
+      }
+    }
     const bool rel = vs_translated->const_relative;
     const bool bb = !rel && reads(80);
     const bool leaf3d = !rel && reads(70) && !reads(80);          // T_EcoLeaves
@@ -4486,6 +4518,12 @@ ShaderApplyResult ApplyShaderOutputs(
     if (leaf3d) ++s_st3d;
     if (bark3d) ++s_stBark;
     if (rel) ++s_stRel;
+    if (tree_layout) {
+      ++s_stTree;
+      // Reads none of the tree LOD constants -> the StaticVertexShader form,
+      // the one every previous census could not see.
+      if (!reads(70) && !reads(69) && !reads(82)) ++s_stTreeStatic;
+    }
     if ((s_stDraws % 20000) == 0) {
       // THE DELTA IS THE POINT, not the total. A cumulative count cannot show
       // whether the billboard rate COLLAPSES as the camera closes on a tree,
@@ -4494,20 +4532,27 @@ ShaderApplyResult ApplyShaderOutputs(
       // line now carries the change since the previous line, so driving in and
       // out of a tree shows up as a moving rate rather than a flat total.
       static uint64_t s_prevBb = 0, s_prev3d = 0, s_prevBark = 0, s_prevRel = 0;
+      static uint64_t s_prevTree = 0, s_prevTreeStatic = 0;
       REXLOG_INFO(
           "d3d9: SPEEDTREE path census over {} draws: billboard (reads c80 "
           "g_BBTreeTypes) {} (+{} in the last 20000), 3D leaf (c70 "
           "g_TreeFade, no c80) {} (+{}), 3D bark (c69+c82, no c70/c80) {} "
-          "(+{}), a0-relative/unclassifiable {} (+{}). A billboard delta "
+          "(+{}), a0-relative/unclassifiable {} (+{}), .tree LAYOUT "
+          "(stride 28, FMT_16_16_16_16_FLOAT) {} (+{}) of which STATIC-form "
+          "(no c69/c70/c82) {} (+{}). A billboard delta "
           "falling to 0 while driving INTO a tree means the guest stopped "
           "submitting it. NOTE: BBVertexShader is itself a0-relative, so the "
           "TRUE billboard draws are in the relative bucket, not the c80 one.",
           s_stDraws, s_stBb, s_stBb - s_prevBb, s_st3d, s_st3d - s_prev3d,
-          s_stBark, s_stBark - s_prevBark, s_stRel, s_stRel - s_prevRel);
+          s_stBark, s_stBark - s_prevBark, s_stRel, s_stRel - s_prevRel,
+          s_stTree, s_stTree - s_prevTree, s_stTreeStatic,
+          s_stTreeStatic - s_prevTreeStatic);
       s_prevBb = s_stBb;
       s_prev3d = s_st3d;
       s_prevBark = s_stBark;
       s_prevRel = s_stRel;
+      s_prevTree = s_stTree;
+      s_prevTreeStatic = s_stTreeStatic;
     }
   }
   if (gpu_fetch && attrs.size() != vs_translated->vertex_fetch_count) {
