@@ -4446,25 +4446,68 @@ ShaderApplyResult ApplyShaderOutputs(
   if (vs_translated) {
     static std::mutex s_stMutex;
     static uint64_t s_stDraws = 0, s_st3d = 0, s_stBb = 0, s_stBark = 0;
+    static uint64_t s_stRel = 0;
     const auto reads = [&](uint32_t c) {
       return ((vs_translated->const_mask[(c & 255u) >> 6] >> (c & 63u)) &
               1ull) != 0;
     };
-    const bool bb = reads(80);
-    const bool leaf3d = reads(70) && !bb;          // T_EcoLeaves
-    const bool bark3d = reads(69) && reads(82) && !reads(70) && !bb;  // T_EcoBark
+    // A shader that indexes xe_c[] through a0 has a SATURATED mask, so it
+    // "reads" every slot and can be identified by none of them. Counted apart
+    // rather than folded into billboard: BBVertexShader does exactly this
+    // (`maxas a0, floor(instance.w)*3` then c[a0+80/81/82]), and so do skinned
+    // meshes reaching gBoneMatrixVectors -- which silently put every rider and
+    // bike draw in the billboard bucket and inflated it.
+    // REMOVED: a "billboard = has a stride-16/64-byte corner table" test.
+    // Measured 15,800 of every 20,000 draws (79%) -- a 4-entry stride-16
+    // stream is a generic small buffer, not a billboard signature. Kept only
+    // as a warning: the VB-shape census had already reported s16/sz64 at 60%
+    // of all draws and I read that as confirmation instead of refutation.
+    //
+    // THE BILLBOARD SIGNATURE IS THE FETCH, NOT A CONSTANT. Classifying by
+    // constants cannot work here: BBVertexShader reaches g_BBTreeTypes through
+    // a0, so its mask saturates, and skinned meshes reach gBoneMatrixVectors
+    // the same way -- run 1883 measured `billboard (static c80) 0` against
+    // 53,185 a0-relative, i.e. NO shader reads c80 statically and the two
+    // populations are inseparable by constant use.
+    //
+    // What is unambiguous is the 4-entry CORNER TABLE every billboard draw
+    // binds: stride 16, exactly 64 bytes. The capture shows it as
+    // xe_vf[0] = {base 0, stride 16, endian 2, limit 64} alongside a stride-48
+    // instance table, and it is the single most common stream shape in the
+    // frame. A skinned mesh has no such stream.
+    const bool rel = vs_translated->const_relative;
+    const bool bb = !rel && reads(80);
+    const bool leaf3d = !rel && reads(70) && !reads(80);          // T_EcoLeaves
+    const bool bark3d =
+        !rel && reads(69) && reads(82) && !reads(70) && !reads(80);  // T_EcoBark
     std::lock_guard<std::mutex> st_lock(s_stMutex);
     ++s_stDraws;
     if (bb) ++s_stBb;
     if (leaf3d) ++s_st3d;
     if (bark3d) ++s_stBark;
+    if (rel) ++s_stRel;
     if ((s_stDraws % 20000) == 0) {
+      // THE DELTA IS THE POINT, not the total. A cumulative count cannot show
+      // whether the billboard rate COLLAPSES as the camera closes on a tree,
+      // which is the whole question -- run 1881 read `billboard 29040` over
+      // 380,000 draws and said nothing about when those draws happened. Each
+      // line now carries the change since the previous line, so driving in and
+      // out of a tree shows up as a moving rate rather than a flat total.
+      static uint64_t s_prevBb = 0, s_prev3d = 0, s_prevBark = 0, s_prevRel = 0;
       REXLOG_INFO(
           "d3d9: SPEEDTREE path census over {} draws: billboard (reads c80 "
-          "g_BBTreeTypes) {}, 3D leaf (c70 g_TreeFade, no c80) {}, 3D bark "
-          "(c69+c82, no c70/c80) {}. Near-zero 3D means the guest never "
-          "submits a close-range LOD.",
-          s_stDraws, s_stBb, s_st3d, s_stBark);
+          "g_BBTreeTypes) {} (+{} in the last 20000), 3D leaf (c70 "
+          "g_TreeFade, no c80) {} (+{}), 3D bark (c69+c82, no c70/c80) {} "
+          "(+{}), a0-relative/unclassifiable {} (+{}). A billboard delta "
+          "falling to 0 while driving INTO a tree means the guest stopped "
+          "submitting it. NOTE: BBVertexShader is itself a0-relative, so the "
+          "TRUE billboard draws are in the relative bucket, not the c80 one.",
+          s_stDraws, s_stBb, s_stBb - s_prevBb, s_st3d, s_st3d - s_prev3d,
+          s_stBark, s_stBark - s_prevBark, s_stRel, s_stRel - s_prevRel);
+      s_prevBb = s_stBb;
+      s_prev3d = s_st3d;
+      s_prevBark = s_stBark;
+      s_prevRel = s_stRel;
     }
   }
   if (gpu_fetch && attrs.size() != vs_translated->vertex_fetch_count) {
@@ -6354,8 +6397,28 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
     // rare and they are the point; letting 160 successes arrive first would
     // starve exactly the file anyone came looking for.
     {
+      // BUDGETED AND NAMED BY CONTENT, NOT BY HANDLE.
+      //
+      // Both used to key on `handle`, and a guest shader handle is an ADDRESS
+      // the guest reuses within a run ([[shader-handles-are-not-stable]]). So
+      // many DIFFERENT shaders wrote to one filename, each overwriting the
+      // last while still spending budget. The intro and menu burned the whole
+      // cap across ~57 distinct handles and every level shader was then
+      // skipped silently -- a dump directory that looked healthy and contained
+      // no level shader at all, which is how the SPEEDTREE census could not be
+      // checked against the source it was supposed to describe.
+      //
+      // Keyed on content_key, one dump per DISTINCT shader, and the key goes
+      // in the filename so two shaders at one handle cannot collide.
+      static std::mutex s_dumpMu;
+      static std::set<uint64_t> s_dumpedKeys;
       static uint32_t s_dumped = 0;
       static uint32_t s_dumpedFailed = 0;
+      bool fresh_dump;
+      {
+        std::lock_guard<std::mutex> dump_lk(s_dumpMu);
+        fresh_dump = s_dumpedKeys.insert(content_key).second;
+      }
       uint32_t& budget = compiled ? s_dumped : s_dumpedFailed;
       // 160 was a menu-sized budget: a freeroam session saturates it, and a
       // saturated cap silently truncates the corpus that
@@ -6364,7 +6427,7 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
       // leaves headroom without pretending to be unbounded. The directory is
       // emptied once per process, and a dump is ~15 KB.
       const uint32_t cap = compiled ? 512u : 64u;
-      if (budget < cap) {
+      if (fresh_dump && budget < cap) {
         ++budget;
         std::error_code ec;
         EnsureHlslDumpDir();
@@ -6376,10 +6439,10 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
         // A rejection gets its own prefix so it sorts apart from the ~4900
         // files that compiled, and so `ls FAILED_*` names a run's failures
         // without grepping every file in the directory.
-        std::snprintf(path, sizeof(path), "logs/hlsldump/%s%s_%08X.txt",
+        std::snprintf(path, sizeof(path), "logs/hlsldump/%s%s_%08X_%016llX.txt",
                       compiled ? "" : "FAILED_",
                       stage == mx::hle::HlslStage::kPixel ? "ps" : "vs",
-                      handle);
+                      handle, (unsigned long long)content_key);
         std::ofstream f(path, std::ios::trunc | std::ios::binary);
         if (f) {
           f << "; guest "
@@ -6555,6 +6618,18 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
     for (uint32_t i = 0; i < out.sampler_count; ++i)
       kept.slot_guest[i] = out.sampler_slot_guest[i];
     kept.max_const_index = out.max_const_index;
+    // FROM `out`, THE MAIN TRANSLATION -- not from the fetch variant.
+    //
+    // These were originally set only in the vfetch block below, from
+    // `fetched`, while every other field here comes from `out`. That made the
+    // mask describe a DIFFERENT translation than the shader a draw actually
+    // runs, and left it all-zero for any shader with no fetch variant, which
+    // reads as "reads no constants at all". The SPEEDTREE census built on it
+    // was therefore measuring nothing it claimed to: it reported tens of
+    // thousands of a0-relative draws in a run whose 41 dumped shaders contain
+    // not one use of xe_a0. The dump was right and the census was wrong.
+    for (int ci = 0; ci < 4; ++ci) kept.const_mask[ci] = out.const_mask[ci];
+    kept.const_relative = out.const_relative;
     kept.dxbc = dxbc_bytes;
 
     // The vertex fetch variant of the same blob. Emitted and compiled here,
@@ -6644,7 +6719,11 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
             kept.vertex_fetch_slot[i] = fetched.vertex_fetch_slot[i];
           kept.computed_index_streams = fetched.computed_index_streams;
           for (int ci = 0; ci < 4; ++ci)
-            kept.const_mask[ci] = fetched.const_mask[ci];
+            kept.const_mask[ci] |= fetched.const_mask[ci];
+          // OR, not assign: the fetch variant is a second translation of the
+          // same shader, and a constant either of them reads is read. Assigning
+          // here would clobber the main translation's mask set above.
+          kept.const_relative = kept.const_relative || fetched.const_relative;
           kept.computed_index_fetches = fetched.computed_index_fetches;
           ++g_vfetchCompiled;
         } else {

@@ -252,6 +252,12 @@ struct HlslShader {
   // c80-c94. That distinguishes the two paths exactly, where geometry shape
   // could not -- the guest repacks .tree data into its own stride.
   uint64_t const_mask[4] = {};
+  // True when the shader indexes xe_c[] through a0, which saturates the mask
+  // to all-ones. Such a shader cannot be identified by constant use at all --
+  // BBVertexShader does `maxas a0, type*3` then c[a0+80/81/82], and skinned
+  // meshes index gBoneMatrixVectors the same way. Counting them as "reads c80"
+  // silently folds every skinned draw into the billboard bucket.
+  bool const_relative = false;
   bool reads_constants = false;
 
   // Count of setp_* instructions — the ops that WRITE p0.

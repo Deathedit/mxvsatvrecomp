@@ -143,6 +143,7 @@ struct TranslatedShader {
   uint32_t computed_index_streams = 0;
   // See HlslShader::const_mask.
   uint64_t const_mask[4] = {};
+  bool const_relative = false;
   // Per fetch ordinal; see HlslShader::computed_index_fetches.
   uint32_t computed_index_fetches = 0;
   // The fetch variant's compiled DXBC, same contract as `dxbc`.
