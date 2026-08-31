@@ -180,9 +180,15 @@ class Emitter {
   uint64_t const_mask[4] = {};   // which xe_c[] slots this shader reads
   bool const_relative = false;   // reads xe_c[] through a0; mask is saturated
   bool reads_constants = false;
-  // setp_* instructions emitted with their value semantics but whose p0 result
-  // nothing acts on, because predicated issue is not implemented. Non-zero means
-  // this shader may take a branch or an instruction it should have skipped.
+  // setp_* instructions -- the ops that WRITE p0.
+  //
+  // The name is historical and the field is deliberately not renamed; see
+  // HlslShader::unhonoured_predicate_ops, which carries the full note and
+  // explains why a dump from before the change still lines up on it. It was
+  // accurate while nothing read xe_p0. Since per-instruction predication
+  // landed, p0 written here IS obeyed: by every following ALU instruction
+  // carrying the `(p0)` bit (PredicateBlock in EmitAlu), by predicated
+  // fetches, and in the vertex stage by cond_exec_pred as well.
   uint32_t unhonoured_predicate_ops = 0;
   // ALU instructions carrying their own predicate bits, now emitted inside
   // `if (xe_p0 == ...)`. Seen and obeyed are the same number here -- unlike the
@@ -816,13 +822,22 @@ class Emitter {
         r = "XeMax(" + a + ", " + b + ")";
         break;
       case Op::kRetainPrev: r = "xe_ps"; break;
-      // The predicate-set family. p0 itself is NOT honoured yet — nothing reads
-      // xe_p0, because predicated instruction issue (the `pred` prefix and
-      // cond_exec_pred) is unimplemented. What matters here is that these still
-      // produce a VALUE, and that value lands in ps for a following *_prev to
-      // read. Refusing the shader over the unimplemented half would throw away
-      // the implemented one and drop the draw to the stand-in; this title has
-      // two such shaders. Counted so the gap stays visible instead of inferred.
+      // The predicate-set family. BOTH halves of these matter and both are
+      // honoured.
+      //
+      // p0 is WRITTEN here and READ downstream: a following ALU instruction
+      // carrying the `(p0)` bit is emitted inside `if (xe_p0 == ...)` by
+      // EmitAlu's PredicateBlock, a predicated fetch gates its destination
+      // write, and in the vertex stage cond_exec_pred gates a whole block.
+      // This comment used to say the opposite -- that nothing read xe_p0 and
+      // that predicated issue was unimplemented -- which stopped being true
+      // when per-instruction predication landed. Left stale it is worse than
+      // absent: it sends a reader auditing a shadow-mask shader off hunting a
+      // dropped predicate that the emitter in fact gets right.
+      //
+      // The second half is the VALUE, which lands in ps for a following *_prev
+      // to read. Refusing the shader over either half would drop the draw to
+      // the stand-in.
       //
       // Note the polarity, from the SDK (ucode.h:1140-1226): the predicate being
       // TRUE writes 0.0 to the destination, not 1.0.
