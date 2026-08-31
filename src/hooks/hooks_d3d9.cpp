@@ -6756,8 +6756,36 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
                    << fetched.export_mask << " dropped_export_mask 0x"
                    << fetched.dropped_export_mask << std::dec
                    << " writes_position " << (fetched.writes_position ? 1 : 0)
-                   << " vertex_fetch_count " << fetched.vertex_fetch_count
-                   << "\n\n=== EMITTED HLSL ===\n"
+                   << " vertex_fetch_count " << fetched.vertex_fetch_count;
+                // The guest's own bits, in the same format and under the same
+                // section name the main dump uses, so xenos_shader_disasm.py
+                // and its --xenia diff read this variant too.
+                //
+                // The section was simply absent, though `code` and `count` are
+                // the arguments handed to EmitShaderHlsl a few lines above.
+                // The effect was that 59 of 247 dumps -- and specifically the
+                // form that ACTUALLY RUNS for a gpuVertexFetch draw, 226,624 of
+                // them in mx_1895 -- could only ever be compared against
+                // themselves, since the DXBC below is this file's own HLSL
+                // compiled. An audit of the whole corpus reached every plain
+                // vs_/ps_ dump and had to reconstruct these from the paired
+                // vs_ file by guest handle, which is an address and is reused
+                // within a run: 5 of the 59 could not be paired at all.
+                if (code && count) {
+                  vf << "\n\n=== GUEST MICROCODE (" << count
+                     << " dwords) ===\n";
+                  char vline[160];
+                  for (uint32_t i = 0; i < count; i += 8) {
+                    int n = std::snprintf(vline, sizeof(vline), "; %04X:", i);
+                    if (n > 0) vf.write(vline, n);
+                    for (uint32_t j = i; j < i + 8 && j < count; ++j) {
+                      n = std::snprintf(vline, sizeof(vline), " %08X", code[j]);
+                      if (n > 0) vf.write(vline, n);
+                    }
+                    vf << "\n";
+                  }
+                }
+                vf << "\n\n=== EMITTED HLSL ===\n"
                    << fetched.source << "\n=== DXBC DISASSEMBLY ===\n";
                 Microsoft::WRL::ComPtr<ID3DBlob> fdis;
                 if (SUCCEEDED(D3DDisassemble(fblob->GetBufferPointer(),
