@@ -2867,6 +2867,60 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   NoteSignedBind(source);
   NotePackedBase(source);
   NoteMipCensus();
+  // VEGETATION BINDS, by texture SHAPE -- the one identification that has
+  // actually held on this problem.
+  //
+  // Six attempts to fingerprint a vegetation DRAW all over-matched (asset byte
+  // sizes, a compound constant predicate, per-constant counts, a stride-16
+  // corner table, the const mask, the stride-28 vertex layout). The texture is
+  // different: it is established, not guessed. treeeee.rdc event 31875 -- a
+  // bush billboard drawing into the 1280x720 scene -- sampled texture 23728,
+  // 2048x1024 BC3, and in FR_Dunes the ONLY 2048x1024 DXT4_5 assets are
+  // FR_DU_Eco_D and FR_DU_Eco_N, the impostor atlas pair. The fan palm's bark
+  // is likewise uniquely 256x1024 (DXT1 diffuse + DXN normal).
+  //
+  // So: does anything BIND the palm's bark while the tree is on screen? Its
+  // material decodes `via slot` every run yet no capture has ever held the
+  // texture, which is the contradiction this counts.
+  //
+  // MEASURED, run 1890, FR_Dunes driven up to a palm:
+  //     impostor atlas  63998 binds, climbing +2000 per interval
+  //     palm bark           2 binds, never incrementing
+  // Two is the impostor BAKE -- diffuse and normal, once each. The bark is a
+  // trunk-only material that appears in no impostor, so two binds means the
+  // palm's 3D material NEVER reaches a scene draw. Vegetation in the scene is
+  // billboards, exclusively. This is the runtime half of the IDA result that
+  // only sub_823F82D0 (the bake) calls the 3D renderer sub_823F6960, and
+  // unlike the constant-mask censuses it cannot be blind to an entry point:
+  // it counts a texture bind, not a register read.
+  //
+  // Formats: 18 = FMT_DXT1, 20 = FMT_4_5 (DXT4_5/BC3), 49 = FMT_DXN.
+  // Counts BINDS (per draw, per slot), not draws -- named as such on the line.
+  {
+    static std::mutex s_vegMu;
+    static uint64_t s_vegAtlas = 0, s_vegBark = 0, s_vegBinds = 0;
+    static uint64_t s_prevAtlas = 0, s_prevBark = 0;
+    const bool atlas = source.width == 2048u && source.height == 1024u &&
+                       source.guest_format == 20u;
+    const bool bark = source.width == 256u && source.height == 1024u &&
+                      (source.guest_format == 18u || source.guest_format == 49u);
+    if (atlas || bark) {
+      std::lock_guard<std::mutex> veg_lk(s_vegMu);
+      if (atlas) ++s_vegAtlas;
+      if (bark) ++s_vegBark;
+      if ((++s_vegBinds % 2000) == 0) {
+        REXLOG_INFO(
+            "d3d9: VEGETATION BINDS: impostor atlas (2048x1024 BC3) {} "
+            "(+{} since last), palm bark (256x1024 DXT1/DXN) {} (+{}). Bark "
+            "binding while a tree is on screen means the 3D material reaches "
+            "a draw; bark at 0 with atlas climbing means billboards only.",
+            s_vegAtlas, s_vegAtlas - s_prevAtlas, s_vegBark,
+            s_vegBark - s_prevBark);
+        s_prevAtlas = s_vegAtlas;
+        s_prevBark = s_vegBark;
+      }
+    }
+  }
   // WHICH guest surface does each sampler slot actually ask for?
   //
   // Traced from the rider's gear rendering green. Its material computes
