@@ -6679,14 +6679,30 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
           // then zero for every interpolator, and only this variant can show
           // why. Written before the source is moved out of `fetched`.
           {
+            // CONTENT-KEYED, like the main dump above and for the same
+            // reason: this had the identical defect -- a handle-keyed filename
+            // and a budget that counted WRITES -- and its own note that it
+            // "saturated at 96 in a freeroam run" was the symptom. Measured
+            // after fixing only the main dump: 55 vs handles against 16
+            // vsfetch handles with ZERO overlap, i.e. every fetch variant on
+            // file was still menu-era while the vs dumps had reached the level.
+            static std::mutex s_vfDumpMu;
+            static std::set<uint64_t> s_vfDumpedKeys;
             static uint32_t s_vf_dumped = 0;
-            // Saturated at 96 in a freeroam run; see the cap note above.
-            if (s_vf_dumped < 256) {
+            const uint64_t vf_key =
+                ShaderSourceKey(mx::hle::HlslStage::kVertex, fetched.source);
+            bool vf_fresh;
+            {
+              std::lock_guard<std::mutex> vf_lk(s_vfDumpMu);
+              vf_fresh = s_vfDumpedKeys.insert(vf_key).second;
+            }
+            if (vf_fresh && s_vf_dumped < 256) {
               ++s_vf_dumped;
               EnsureHlslDumpDir();
               char vpath[128];
               std::snprintf(vpath, sizeof(vpath),
-                            "logs/hlsldump/vsfetch_%08X.txt", handle);
+                            "logs/hlsldump/vsfetch_%08X_%016llX.txt", handle,
+                            (unsigned long long)vf_key);
               std::ofstream vf(vpath, std::ios::trunc | std::ios::binary);
               if (vf) {
                 vf << "; guest vertex shader 0x" << std::hex << handle
