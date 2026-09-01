@@ -44,7 +44,6 @@ namespace tu = rex::graphics::texture_util;
 #include "hooks/guest_read_watch.h"
 #include "hooks/hooks_d3d9_internal.h"
 
-REXCVAR_DECLARE(bool, d3d9_cmdbuf_replay);
 REXCVAR_DECLARE(bool, hle_capture);
 REXCVAR_DECLARE(bool, hle_diag);
 
@@ -1220,8 +1219,7 @@ void mx::hooks::d3d9::ReportCommandBuffers() {
 REX_IMPORT(__imp__sub_8255E9A0, orig_BeginCommandBuffer, void());
 extern "C" REX_FUNC(sub_8255E9A0) {
   MX_D3D9_PLUGIN_PASSTHROUGH(orig_BeginCommandBuffer);
-  if (REXCVAR_GET(d3d9_cmdbuf_replay))
-    mx::hooks::d3d9::BeginCmdBufRecording(ctx.r3.u32, ctx.r4.u32);
+  mx::hooks::d3d9::BeginCmdBufRecording(ctx.r3.u32, ctx.r4.u32);
   orig_BeginCommandBuffer(ctx, base);
 }
 
@@ -1232,8 +1230,7 @@ extern "C" REX_FUNC(sub_825601B8) {
   orig_EndCommandBuffer(ctx, base);
   // AFTER the original: a draw issued inside the End call still belongs to
   // this recording, and closing first would leak it into the live frame.
-  if (REXCVAR_GET(d3d9_cmdbuf_replay))
-    mx::hooks::d3d9::EndCmdBufRecording(device);
+  mx::hooks::d3d9::EndCmdBufRecording(device);
 }
 
 REX_IMPORT(__imp__sub_825605D8, orig_ExecuteCommandBuffer, void());
@@ -1252,12 +1249,10 @@ extern "C" REX_FUNC(sub_825605D8) {
   // its constants from. After the original, matching the two draw
   // hooks: the guest call is free to clobber volatile registers, so the
   // arguments are saved above.
-  if (REXCVAR_GET(d3d9_cmdbuf_replay)) {
-    // Walked per execution: the guest rewrites these between replays.
-    std::vector<std::vector<mx::hooks::d3d9::CmdBufConstOverlay>> ov;
-    mx::hooks::d3d9::CollectCmdBufConstants(cmdbuf, base, ov);
-    mx::hooks::d3d9::ReplayCmdBuf(cmdbuf, replay_device, base, ov);
-  }
+  // Walked per execution: the guest rewrites these between replays.
+  std::vector<std::vector<mx::hooks::d3d9::CmdBufConstOverlay>> ov;
+  mx::hooks::d3d9::CollectCmdBufConstants(cmdbuf, base, ov);
+  mx::hooks::d3d9::ReplayCmdBuf(cmdbuf, replay_device, base, ov);
 }
 
 REX_IMPORT(__imp__sub_82555B88, orig_DrawVerticesUP, void());
