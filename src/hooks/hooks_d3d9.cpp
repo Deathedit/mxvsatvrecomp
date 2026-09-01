@@ -29,7 +29,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <limits>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -57,6 +59,7 @@
 #include <rex/graphics/format/ucode.h>
 
 #include "gpu/guard_census.h"
+#include "gpu/health.h"
 #include "gpu/d3d9_draw.h"
 #include "gpu/d3d9_layout.h"
 #include "gpu/d3d9_texture.h"
@@ -77,6 +80,12 @@
 // Everything here was internal-linkage until 2026-08-12 and is still private to
 // the D3D9 HLE layer by convention -- the namespace is the boundary, and
 // hooks_d3d9_internal.h is the only place that publishes anything out of it.
+// Declared in hooks_d3d9.h and defined at the bottom of this file, both at
+// global scope. Forward-declared rather than including that header: it needs
+// <string>, and the project includes in this file come before the standard
+// ones, so including it there does not compile.
+bool GuestRangeReadable(uint8_t* base, uint32_t addr, uint32_t bytes);
+
 namespace mx::hooks::d3d9 {
 
 namespace uc = rex::graphics::ucode;
@@ -114,7 +123,27 @@ using mx::hle::kMaxElements;   // refuses to walk a runaway array
 // A first run hit 23 of a 24 cap, which says nothing about how many exist.
 // The dump is a few hundred bytes per declaration and does not rotate, so the
 // cap is only here to bound a runaway.
-constexpr uint64_t kDrawReportEvery = 2500;  // see the om1 trap in AGENTS.md
+// How often the whole census prints. TIME, not draw count.
+//
+// This was `total % 2500` -- every 2500 draws -- and the trouble with a
+// draw-proportional throttle is that it gets NOISIER exactly when the game gets
+// busier. Measured on run mx_1901: 687,500 draws in 60.7 s of a segment, so the
+// full census ran 275 times, 4.5 times a SECOND. 63% of a 5 MB log segment was
+// lines firing once per census pass, and another 17% was one line inside it
+// with its own draw-proportional gate. 1% of the log was one-shot startup.
+//
+// That is why logs/mx_NNNN.log only ever holds ~30 seconds and its segments
+// overwrite while a run is still going -- something that has already cost this
+// project a near-miss false theory. Cumulative counters do not need reprinting
+// 4.5 times a second; the numbers barely move between prints.
+//
+// The old constant is kept as a FLOOR so a report cannot fire twice for
+// essentially the same state on a machine where the clock is coarse.
+//
+// (The old comment pointed at "the om1 trap in AGENTS.md". No such note exists
+// in AGENTS.md or anywhere in docs/ -- it had rotted, so it is not preserved.)
+constexpr uint64_t kDrawReportEvery = 2500;      // minimum draw delta
+constexpr int64_t kDrawReportPeriodMs = 2000;    // and at most this often
 
 uint64_t g_indexed_draws = 0;
 uint64_t g_draws = 0;
@@ -164,20 +193,89 @@ int KnownDeclId(uint32_t p) {
   return -1;
 }
 
+uint64_t g_declTableFull = 0;   // declarations that arrived with no slot left
+uint64_t g_declRebuilt = 0;     // addresses reused for a different element list
+
+// Identifies WHICH declaration an address holds, not merely that we have seen
+// the address. The guest frees declarations and the allocator hands the same
+// address back, so a pointer match alone is not identity -- it used to return
+// the previous declaration's record, which decoded the new geometry with the
+// old element list.
+uint64_t DeclSignature(uint32_t elems, const mx::hle::D3D9Element* parsed) {
+  uint64_t h = 1469598103934665603ull;   // FNV-1a
+  auto mix = [&](uint32_t v) {
+    for (int b = 0; b < 4; ++b) {
+      h ^= uint8_t(v >> (b * 8));
+      h *= 1099511628211ull;
+    }
+  };
+  mix(elems);
+  for (uint32_t i = 0; i < elems && i < kMaxElements; ++i) {
+    const mx::hle::D3D9Element& e = parsed[i];
+    mix(e.stream);
+    mix(e.offset);
+    mix(e.type);
+    mix(uint32_t(e.method) | (uint32_t(e.usage) << 8) |
+        (uint32_t(e.usage_index) << 16));
+  }
+  return h;
+}
+
+uint64_t g_declSig[kMaxTrackedDecls] = {};
+
+// Fills one slot from a parsed declaration. Split out because it now runs on
+// two paths -- a fresh slot, and a slot whose address the guest reused.
+void FillDeclSlot(int id, uint32_t decl, bool has_colour, uint32_t elems,
+                  const mx::hle::D3D9Element* parsed) {
+  g_declPtr[id] = decl;
+  g_declElems[id] = elems;
+  g_declHasColour[id] = has_colour;
+  g_declSig[id] = DeclSignature(elems, parsed);
+  g_declLayoutOk[id] = mx::hle::BuildInputLayout(parsed, elems, g_declLayout[id],
+                                                 g_declLayoutErr[id]);
+}
+
 // Called from the CreateVertexDeclaration hook, where both pointers are valid.
 // Returns the id, or -1 if the table is full.
 int RecordDeclaration(uint32_t decl, bool has_colour, uint32_t elems,
                       const mx::hle::D3D9Element* parsed) {
-  if (!decl || g_declCount >= kMaxTrackedDecls) return -1;
-  const int existing = KnownDeclId(decl);
-  if (existing >= 0) return existing;   // pointer reuse after a free
-  const int id = g_declCount++;
-  g_declPtr[id] = decl;
-  g_declElems[id] = elems;
-  g_declHasColour[id] = has_colour;
+  if (!decl) return -1;
 
-  g_declLayoutOk[id] = mx::hle::BuildInputLayout(parsed, elems, g_declLayout[id],
-                                                 g_declLayoutErr[id]);
+  const int existing = KnownDeclId(decl);
+  if (existing >= 0) {
+    // Same address. Only the same DECLARATION if the elements match -- if they
+    // do not, the guest freed the old one and built a different one here, and
+    // returning `existing` would hand every draw the previous element list.
+    if (g_declSig[existing] == DeclSignature(elems, parsed)) return existing;
+    ++g_declRebuilt;
+    if (g_declRebuilt == 1) {
+      REXLOG_INFO(
+          "d3d9: declaration id {} address 0x{:08X} reused for a DIFFERENT "
+          "element list ({} elements) -- rebuilding rather than reusing the "
+          "old layout",
+          existing, decl, elems);
+    }
+    FillDeclSlot(existing, decl, has_colour, elems, parsed);
+    g_declDraws[existing] = 0;   // the draw count belonged to the old one
+    return existing;
+  }
+
+  if (g_declCount >= kMaxTrackedDecls) {
+    // Loud, and once. Every draw using this declaration is about to be dropped
+    // as kNoLayout, which is indistinguishable at the draw site from a game
+    // that simply did not submit them.
+    if (++g_declTableFull == 1) {
+      REXLOG_WARN(
+          "d3d9: vertex declaration table FULL at {} entries -- declaration "
+          "0x{:08X} and every later one is untracked, and EVERY DRAW USING "
+          "THEM WILL BE DROPPED as kNoLayout",
+          kMaxTrackedDecls, decl);
+    }
+    return -1;
+  }
+
+  const int id = g_declCount++;
+  FillDeclSlot(id, decl, has_colour, elems, parsed);
   return id;
 }
 
@@ -220,9 +318,166 @@ uint64_t g_declDeviceUnknown = 0;   // non-zero, but never seen created
 uint64_t g_declAgree = 0;           // device field == the patch hook's value
 uint64_t g_declDisagree = 0;        // it does not, i.e. the patch value is stale
 
+//---------------------------------------------------------------------------
+// WHICH pointers are unknown, not just how many.
+//
+// decl.unknown_ptr is the census's only standing BAD: the device holds a
+// declaration we never watched CreateVertexDeclaration build, so the draw gets
+// no layout and is dropped as kNoLayout. A bare count cannot name the draw, and
+// the count alone had two readings that call for different work:
+//
+//   an early burst  -> declarations built before the hook was live
+//   a steady rate   -> some specific draw, every frame, forever
+//
+// Run mx_1905 says BOTH. 838 arrive in the first 13 seconds, then it climbs
+// ~6.5 a second for the rest of the run -- against ~6.1 fps, which is almost
+// exactly ONE DRAW PER FRAME. That is a specific recurring draw, not noise, and
+// naming its declaration is the whole job.
+//
+// XGSetVertexDeclaration was the obvious suspect and is RULED OUT: in the IDB
+// it has two xrefs, one from inside D3DDevice_CreateVertexDeclaration itself
+// and one data reference. The guest never calls it directly, so no declaration
+// reaches the device by that route.
+//
+// Bounded at 16 distinct pointers with the overflow counted, so a runaway
+// cannot cost the log and "16 of many" cannot read as "16 of 16".
+// The two fields of a CVertexDeclaration this code reads, both from
+// PatchVertexShaderToMatchVertexDeclaration, which takes one and walks it.
+// kDeclElementsOffset is where the array BEGINS -- it is not a pointer to the
+// array, which run mx_1907's probe settled; see AdoptUnknownDecl.
+constexpr uint32_t kDeclCountOffset = 0x18;
+constexpr uint32_t kDeclElementsOffset = 0x34;
+
+// Declarations adopted straight off the device because we never saw them
+// created, and the attempts that could not be trusted enough to adopt.
+uint64_t g_declAdopted = 0;
+uint64_t g_declAdoptRefused = 0;
+
+constexpr uint32_t kMaxUnknownDecls = 16;
+uint32_t g_unknownPtr[kMaxUnknownDecls] = {};
+uint64_t g_unknownPtrDraws[kMaxUnknownDecls] = {};
+uint32_t g_unknownDistinct = 0;
+uint64_t g_unknownOverflow = 0;     // draws whose pointer did not fit the table
+
+// Run mx_1906 answered the shape question: ONE pointer, 0x21240E50, carrying
+// every unknown-declaration draw. It is not among the 24 declarations the dump
+// records, but it sits in the same heap region as decl #1 (0x2124AA60), so it
+// is a plausible allocation rather than a wild value.
+//
+// So the next question is whether that address actually HOLDS a declaration. If
+// it does, the fix is to read it at draw time instead of insisting we watched
+// it being built; if it does not, the device field is not what we think during
+// those draws and the whole reading changes.
+//
+// READ GUARDED, ONCE. The arena is not fully mapped and an earlier round
+// crashed the guest at 0x030013A0 by speculatively dereferencing a dword that
+// happened to look like a pointer. This has an address the DEVICE ITSELF holds
+// rather than a guess, and it still goes through GuestRangeReadable first --
+// the rule that was violated then is "never dereference unverified", not "never
+// dereference".
+//
+// The two fields are known from PatchVertexShaderToMatchVertexDeclaration,
+// which takes a CVertexDeclaration* and reads count at +0x18 and the element
+// array at +0x34.
+// +0x34 IS THE ELEMENT ARRAY, NOT A POINTER TO IT.
+//
+// The probe on run mx_1907 settled it. 0x21240E50 reads:
+//
+//   count(+0x18)=2  +34=00000000  +38=002A23B9  +3C=00000000
+//
+// Taken as a pointer, +0x34 is null and the object looks broken. Taken as the
+// array itself it is a textbook D3DVERTEXELEMENT9: stream 0, offset 0, type
+// 0x002A23B9 -> format 57 (k_32_32_32_FLOAT) with swizzle 0xA88, method
+// DEFAULT, usage POSITION, index 0. The `count` of 2 then puts a second element
+// at +0x40, just past where that dump stopped.
+//
+// So this IS a declaration -- a real one, correctly formed, that we simply
+// never watched being created. Which means it can be read off the device at
+// draw time, and there is no reason to keep dropping 2,534 draws a run over it.
+//
+// WHY IT IS MISSED IS STILL OPEN and does not block this: the object sits in
+// the same heap region as decl #1 and is bound once a frame, so the likeliest
+// story is that it predates the hooks. Adopting on sight is the right shape
+// either way, because it makes the draw path depend on what the device HOLDS
+// rather than on our having witnessed its construction -- and a witness we can
+// miss is a worse thing to depend on than a value we can read.
+//
+// Bounded and verified before it is trusted: the count must be a legal element
+// count, the whole array must be readable, and BuildInputLayout (inside
+// RecordDeclaration) must accept it. If any of that fails the draw is dropped
+// exactly as it was before, so a wrong guess here can only match the old
+// behaviour, never do worse than it.
+int AdoptUnknownDecl(uint32_t p, uint8_t* base) {
+  if (!base) return -1;
+  const uint32_t elem_at = p + kDeclElementsOffset;
+  if (!GuestRangeReadable(base, p, kDeclElementsOffset + kElementSize))
+    return -1;
+  const uint32_t count = REX_LOAD_U32(p + kDeclCountOffset);
+  if (count == 0 || count > kMaxElements) return -1;
+  if (!GuestRangeReadable(base, elem_at, count * kElementSize)) return -1;
+
+  mx::hle::D3D9Element parsed[kMaxElements] = {};
+  bool has_colour = false;
+  for (uint32_t i = 0; i < count; ++i) {
+    uint8_t raw[kElementSize];
+    const uint32_t at = elem_at + i * kElementSize;
+    for (uint32_t b = 0; b < kElementSize; ++b) raw[b] = REX_LOAD_U8(at + b);
+    parsed[i] = mx::hle::ReadElement(raw);
+    if (raw[9] == mx::hle::kUsageColor) has_colour = true;
+  }
+  const int id = RecordDeclaration(p, has_colour, count, parsed);
+  // Recorded but undecodable is not an adoption: leave it unknown so the draw
+  // takes the same exit it always did rather than binding an empty layout.
+  if (id < 0 || !g_declLayoutOk[id]) return -1;
+  return id;
+}
+
+void ProbeUnknownDecl(uint32_t p, uint8_t* base) {
+  if (!base || !GuestRangeReadable(base, p, 0x40)) {
+    REXLOG_WARN("d3d9: decl-unknown 0x{:08X} is NOT READABLE -- the device's "
+                "declaration field is holding something that is not a mapped "
+                "object",
+                p);
+    return;
+  }
+  // INFO, not WARN. This described a defect while an unknown pointer meant a
+  // dropped draw; now it describes a declaration that is about to be adopted
+  // successfully, and nothing is wrong. Leaving it at WARN would break the one
+  // property that makes severity useful here -- that `grep "[warning]"` finds
+  // things that broke and nothing else -- for the sake of a line that is just
+  // describing normal work.
+  //
+  // The NOT READABLE case above stays at WARN, because that one really is a
+  // defect: the device's declaration field would be holding something that is
+  // not a mapped object.
+  std::string dwords;
+  for (uint32_t i = 0; i < 0x40; i += 4)
+    dwords += fmt::format(" +{:02X}={:08X}", i, REX_LOAD_U32(p + i));
+  REXLOG_INFO("d3d9: decl-unknown 0x{:08X} count(+0x{:02X})={} |{}", p,
+              kDeclCountOffset, REX_LOAD_U32(p + kDeclCountOffset), dwords);
+}
+
+void NoteUnknownDecl(uint32_t p, uint8_t* base) {
+  for (uint32_t i = 0; i < g_unknownDistinct; ++i) {
+    if (g_unknownPtr[i] == p) {
+      ++g_unknownPtrDraws[i];
+      return;
+    }
+  }
+  if (g_unknownDistinct >= kMaxUnknownDecls) {
+    ++g_unknownOverflow;
+    return;
+  }
+  const uint32_t i = g_unknownDistinct++;
+  g_unknownPtr[i] = p;
+  g_unknownPtrDraws[i] = 1;
+  // Once per distinct pointer, so a per-frame draw cannot turn this into a
+  // per-frame line.
+  ProbeUnknownDecl(p, base);
+}
+
 // Called from both draw hooks.
 void NoteDrawDeclaration(uint32_t device, uint8_t* base) {
-  (void)base;
   g_currentDecl = -1;
   if (device) {
     const uint32_t p = REX_LOAD_U32(device + kDeviceVertexDeclaration);
@@ -230,7 +485,20 @@ void NoteDrawDeclaration(uint32_t device, uint8_t* base) {
       ++g_declDeviceNull;
     } else {
       g_currentDecl = KnownDeclId(p);
-      if (g_currentDecl < 0) ++g_declDeviceUnknown;
+      if (g_currentDecl < 0) {
+        ++g_declDeviceUnknown;
+        NoteUnknownDecl(p, base);
+        // Read it off the device rather than dropping the draw. On success the
+        // pointer is in the table from here on, so this runs once per
+        // declaration and g_declDeviceUnknown counts FIRST SIGHTINGS after
+        // this, not draws lost.
+        g_currentDecl = AdoptUnknownDecl(p, base);
+        if (g_currentDecl >= 0) {
+          ++g_declAdopted;
+        } else {
+          ++g_declAdoptRefused;
+        }
+      }
     }
   }
   if (g_currentDecl >= 0) {
@@ -1196,6 +1464,45 @@ std::mutex g_pixelShaderByDeviceMu;
 std::map<uint32_t, uint32_t> g_pixelShaderByDevice;
 uint32_t g_lastPixelShaderAnyDevice = 0;
 
+// THE RENDER TARGET, KEYED BY DEVICE.
+//
+// DeviceState is thread-local. A command-buffer replay runs on whatever thread
+// drives the guest's render loop, and run mx_1931 measured rt_valid 0 on every
+// palm replay: that thread had never called SetRenderTarget, so the replayed
+// draw kept the surface it was RECORDED against (surface_base 0x2D0) and the
+// renderer filtered it out. The geometry and the per-instance transform were
+// both already correct -- only the target was wrong.
+//
+// Same shape as the pixel-shader map below it, and for the same reason. See
+// the device-state-is-thread-local note: this port has been bitten by exactly
+// this before, on shaders.
+std::mutex g_rtByDeviceMu;
+std::map<uint32_t, mx::hle::RenderTargetBinding> g_colourByDevice;
+std::map<uint32_t, mx::hle::RenderTargetBinding> g_depthByDevice;
+
+void NoteRenderTargetForDevice(uint32_t device,
+                               const mx::hle::RenderTargetBinding& rt,
+                               bool is_depth) {
+  if (!device) return;
+  std::lock_guard<std::mutex> lock(g_rtByDeviceMu);
+  // Only valid bindings are remembered. An invalid snapshot is the absence of
+  // an observation, not a state transition to "no target": the guest rebinds
+  // constantly and a null here would erase a target the device really holds.
+  if (!rt.valid) return;
+  (is_depth ? g_depthByDevice : g_colourByDevice)[device] = rt;
+}
+
+bool RenderTargetForDevice(uint32_t device, mx::hle::RenderTargetBinding& out,
+                           bool is_depth) {
+  if (!device) return false;
+  std::lock_guard<std::mutex> lock(g_rtByDeviceMu);
+  auto& m = is_depth ? g_depthByDevice : g_colourByDevice;
+  auto it = m.find(device);
+  if (it == m.end() || !it->second.valid) return false;
+  out = it->second;
+  return true;
+}
+
 void NotePixelShaderForDevice(uint32_t device, uint32_t shader) {
   std::lock_guard<std::mutex> lock(g_pixelShaderByDeviceMu);
   // A null shader is a real D3D9 state transition, not a missing observation.
@@ -1675,6 +1982,9 @@ ShaderApplyResult ApplyShaderOutputs(
 bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
                         uint32_t device, uint8_t* base,
                         mx::hle::PixelTextureBinding& binding);
+// Defined next to g_translatedMu, which it locks. Declared here because the
+// transform probe cross-tabs by shader CONTENT and runs well above that.
+uint64_t VertexShaderContentId(uint32_t handle);
 void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
                         const uint32_t* code, uint32_t count);
 // Draws whose 36-byte host vertex was never built because the fetch path was
@@ -2275,6 +2585,500 @@ void NoteShaderlessDraw(const mx::hle::DrawCall& dc) {
               bound.empty() ? " none" : bound);
 }
 
+//===========================================================================
+// COMMAND-BUFFER RECORD AND REPLAY -- the fourth unhooked submission path.
+//
+// sub_823F82D0 renders vegetation record-once / replay-per-instance:
+//
+//     if (!latch) {                           // 119052 / 118976
+//         cmdbuf = sub_8255DDF0(10240, 0);
+//         sub_8255D850(0, 2, 0, 0, 0, &dev);  // a RECORDING device
+//         *(globals + 22428) = dev;           // installed as current
+//         sub_8255E9A0(dev, cmdbuf, 16, ...); // begin recording
+//         sub_823F6960(...);                  // the 3D tree draw, ONCE
+//         sub_825601B8(dev);                  // end recording
+//     }
+//     for (each instance) {
+//         sub_82550208(real_dev, 0, 64, &a, &b, 4);
+//         memcpy(a, matrix, 64); memcpy(b, matrix, 64);
+//         sub_825605D8(real_dev, cmdbuf, 0);  // REPLAY
+//     }
+//
+// On hardware the recorded draw does not execute; it is written into the
+// buffer, and every visible instance comes from the replay. Our port did the
+// opposite -- it executed the recording (twice a run) and discarded ~123,000
+// replays. That is the missing 3D tree foliage, and the bark renders only
+// because bark is NOT in the recorded set.
+//
+// WHY CAPTURE RATHER THAN INTERPRET PM4. The recorded stream is register
+// level, but our translation path is D3D9 level: streams come from
+// DeviceState, shaders from the device, constants from device+0x780. At
+// RECORD time the guest makes all of those D3D9 calls on the recording
+// device, so our hooks already see everything the draw needs -- it builds
+// exactly as any other draw does. Capturing the built DrawCall reuses the
+// whole translation path instead of growing a second one. The PM4 translator
+// was deleted in 4dd1790; this deliberately does not resurrect it.
+//
+// PER-INSTANCE PLACEMENT. The transform is written to the REAL device's
+// constant bank between replays, and sub_825605D8's r3 IS that device, so
+// re-reading device+0x780 at replay time is what separates the instances.
+// Replaying the recorded snapshot would stack every tree at one point. Both
+// values are logged side by side below rather than asserted here.
+//===========================================================================
+namespace {
+
+struct CmdBufRecording {
+  std::vector<mx::hle::DrawCall> draws;
+  uint64_t replays = 0;
+};
+
+// Keyed by command buffer, because the recording DEVICE is destroyed
+// (sub_8255D3A8) as soon as recording ends and cannot key anything that has to
+// outlive the recording. Both are guest addresses and are valid only within a
+// run -- see the shader-handle rule.
+std::map<uint32_t, CmdBufRecording> g_cmdBufRec;
+std::map<uint32_t, uint32_t> g_recDevice;   // recording device -> cmdbuf
+std::recursive_mutex g_cmdBufRecMu;
+
+// A recorded model is small: the palm is 2 draws and the largest buffer
+// measured is 27. The cap stops a runaway recording growing without bound, and
+// its overflow is COUNTED rather than silently dropped.
+constexpr size_t kMaxRecordedDraws = 256;
+
+uint64_t g_cmdBufCaptured = 0;      // draws captured at record time
+uint64_t g_cmdBufCapOverflow = 0;   // draws past kMaxRecordedDraws
+uint64_t g_cmdBufDeferred = 0;      // recorded draws that took the pending path
+uint64_t g_cmdBufReplayed = 0;      // draws re-issued at replay time
+uint64_t g_cmdBufReplayRefused = 0; // re-issued draws FinishHleDraw rejected
+uint64_t g_cmdBufReplayNoRec = 0;   // replays of a buffer holding no capture
+uint64_t g_cmdBufConstRecorded = 0; // replays with no patch in the buffer
+uint64_t g_cmdBufConstPatched = 0;  // constants overlaid per instance
+uint64_t g_cmdBufConstLiveBase = 0; // replays based on the live bank
+uint64_t g_cmdBufConstNoLive = 0;   // replays that could not read it
+uint64_t g_cmdBufConstUnpaired = 0; // draws with no matching overlay
+uint64_t g_cmdBufPixelLiveBase = 0; // pixel banks refreshed live
+uint64_t g_cmdBufPixelNoLive = 0;   // pixel banks left at record time
+uint64_t g_cmdBufLightSlotFixed = 0;      // 1x1 slots rebound to a snapshot
+uint64_t g_cmdBufLightSlotNoSnapshot = 0; // 1x1 slots with no live snapshot
+constexpr uint32_t kXeSqProgramCntl = 0x2180;
+constexpr uint32_t kXeSqContextMisc = 0x2181;
+uint64_t g_cmdBufTexFromBuffer = 0;      // slots bound from the buffer
+uint64_t g_cmdBufTexBufferShort = 0;     // buffer described some, filled fewer
+uint64_t g_cmdBufTexNoBufferBinding = 0; // buffer described no slot
+
+
+
+}  // namespace
+
+void BeginCmdBufRecording(uint32_t device, uint32_t cmdbuf) {
+  if (!device || !cmdbuf) return;
+  std::lock_guard<std::recursive_mutex> lk(g_cmdBufRecMu);
+  g_recDevice[device] = cmdbuf;
+  // A re-record replaces the previous content. The guest re-records only when
+  // its own latch says the recording is stale, so keeping the old draws would
+  // replay geometry it has already discarded.
+  g_cmdBufRec[cmdbuf].draws.clear();
+}
+
+void EndCmdBufRecording(uint32_t device) {
+  std::lock_guard<std::recursive_mutex> lk(g_cmdBufRecMu);
+  g_recDevice.erase(device);
+}
+
+uint32_t CmdBufForDevice(uint32_t device) {
+  if (!device) return 0;
+  std::lock_guard<std::recursive_mutex> lk(g_cmdBufRecMu);
+  auto it = g_recDevice.find(device);
+  return it == g_recDevice.end() ? 0u : it->second;
+}
+
+// True means the draw belonged to a recording and must NOT be issued now.
+// False means "not recording" and the caller submits it normally.
+bool CaptureDrawIfRecording(uint32_t device, mx::hle::DrawCall& dc) {
+  std::lock_guard<std::recursive_mutex> lk(g_cmdBufRecMu);
+  auto it = g_recDevice.find(device);
+  if (it == g_recDevice.end()) return false;
+  auto& rec = g_cmdBufRec[it->second];
+  if (rec.draws.size() >= kMaxRecordedDraws) {
+    ++g_cmdBufCapOverflow;
+    return true;
+  }
+  rec.draws.push_back(dc);
+  ++g_cmdBufCaptured;
+  return true;
+}
+
+void NoteCmdBufDeferredDraw() { ++g_cmdBufDeferred; }
+
+
+uint32_t ReplayCmdBuf(
+    uint32_t cmdbuf, uint32_t device, uint8_t* base,
+    const std::vector<std::vector<CmdBufConstOverlay>>& ov) {
+  std::vector<mx::hle::DrawCall> copies;
+  {
+    std::lock_guard<std::recursive_mutex> lk(g_cmdBufRecMu);
+    auto it = g_cmdBufRec.find(cmdbuf);
+    if (it == g_cmdBufRec.end() || it->second.draws.empty()) {
+      ++g_cmdBufReplayNoRec;
+      return 0;
+    }
+    ++it->second.replays;
+    copies = it->second.draws;
+  }
+  // THE RECORDED TARGET IS THE IMPOSTOR, NOT THE SCENE. sub_823F82D0 does
+  // SetRenderTarget/SetDepthStencilSurface to an off-screen surface before it
+  // records, and patches the real target into the buffer before each replay
+  // (sub_8255F1C8/sub_8255F310 return and apply that patch handle). A captured
+  // DrawCall therefore carries the record-time surface, and replaying it
+  // unchanged would paint every tree into a surface nothing presents -- the
+  // same shape as the orphaned-target findings already in this branch.
+  //
+  // DeviceState is thread-local and the replay runs on the guest's own render
+  // thread, so by here it holds the LIVE target. Whether the two actually
+  // differ is logged rather than assumed.
+  const auto& live_st = DeviceState();
+  // Thread-local FIRST -- when the replay does run on the binding thread that
+  // is the freshest answer -- then the per-device mirror, which is the only
+  // one that survives a replay on another thread.
+  mx::hle::RenderTargetBinding live_rt = live_st.render_target[0];
+  bool rt_from_device = false;
+  if (!live_rt.valid && RenderTargetForDevice(device, live_rt, false))
+    rt_from_device = true;
+  mx::hle::RenderTargetBinding live_depth = live_st.depth_stencil;
+  if (!live_depth.valid) RenderTargetForDevice(device, live_depth, true);
+  float replay_vp[16];
+  uint32_t replay_vp_w = 0, replay_vp_h = 0;
+  const bool have_replay_vp =
+      BuildViewportMvp(device, base, replay_vp, &replay_vp_w, &replay_vp_h);
+
+  uint32_t issued = 0;
+  for (auto& dc : copies) {
+    if (live_rt.valid) {
+
+      static uint64_t s_rtShown = 0;
+      if (s_rtShown < 4 && live_rt.object != dc.render_target_object) {
+        ++s_rtShown;
+        REXLOG_INFO("d3d9: CMDBUF REPLAY cb 0x{:08X} retarget: recorded "
+                    "0x{:08X} {}x{} -> live 0x{:08X} {}x{}",
+                    cmdbuf, dc.render_target_object, dc.render_target_width,
+                    dc.render_target_height, live_rt.object, live_rt.width,
+                    live_rt.height);
+      }
+      dc.render_target_object = live_rt.object;
+      dc.render_target_surface_info = live_rt.surface_info;
+      dc.render_target_color_info = live_rt.color_info;
+      dc.render_target_width = live_rt.width;
+      dc.render_target_height = live_rt.height;
+      dc.surface_base = live_rt.color_info & 0xFFFu;
+      dc.surface_pitch = live_rt.surface_info & 0x3FFFu;
+    }
+    if (live_depth.valid) {
+      dc.depth_target_object = live_depth.object;
+      dc.depth_target_width = live_depth.width;
+      dc.depth_target_height = live_depth.height;
+    }
+    if (have_replay_vp) {
+      std::copy_n(replay_vp, 16, dc.mvp);
+      dc.viewport_width = replay_vp_w;
+      dc.viewport_height = replay_vp_h;
+    }
+    // THE CONSTANT BANK: LIVE STATE AS THE BASE, RECORDED WRITES ON TOP.
+    //
+    // This is what the console does. A recorded buffer does not carry a whole
+    // constant file -- it carries only the writes the guest made while
+    // recording, and the replay runs against whatever the GPU's constant state
+    // already is. Three earlier versions each got half of that:
+    //
+    //   live base, no overlay   -> lost the model's own constants: shards
+    //   recorded base, none     -> lost the CAMERA. Capture palm.rdc showed
+    //                              xe_c[0..63] all zero with a correct world
+    //                              matrix at c64, so every one of the 226
+    //                              vertices came out exactly (0,0,0).
+    //   recorded base, flat     -> draw 1 got draw 27's constants: shards
+    //
+    // The per-instance matrix needs no special case here: sub_82550208 writes
+    // it to device + 0x780 + reg*16, which IS this live bank.
+    {
+      std::array<uint32_t, kD3d9ConstRegs * 4> live;
+      if (CaptureVertexConstants(device, base, dc.vertex_shader_handle, live)) {
+        dc.vertex_constants.assign(live.begin(), live.end());
+        ++g_cmdBufConstLiveBase;
+      } else {
+        // Recorded bank stands. Counted, because a draw transformed by a stale
+        // camera is a different failure from one transformed by none.
+        ++g_cmdBufConstNoLive;
+      }
+      // THE PIXEL BANK IS LIVE TOO. Settled by capture tree-black2.rdc: with
+      // the recorded base, the palm's pixel constants are xe_c[0..253] ALL
+      // ZERO, and the recorded buffer carries no pixel-constant packets at all
+      // -- so widening the collector to constants 256-511 could not supply
+      // them. They only exist on the real device, exactly like the camera on
+      // the vertex side.
+      //
+      // That is also the console's own model: a recorded buffer contributes
+      // only what the guest wrote WHILE recording, and everything else is
+      // whatever the constant file already holds when the executor runs.
+      //
+      // KNOWN CONSEQUENCE, not a mystery: the rider and bike are replayed
+      // draws too (pixel_history named draw 35207, numIndices 1753, which is
+      // in the pool buffer's own captured list), so they now read live pixel
+      // constants and the game's dirt effect switches on. The dirt is a real
+      // feature that should be inactive on a freshly loaded map, so the value
+      // itself is wrong somewhere upstream. The diff below names the register
+      // rather than leaving it to guesswork.
+      if (!dc.pixel_constants.empty()) {
+        constexpr uint32_t kPixelConstBase = 0x1780;
+        const uint32_t bytes = uint32_t(dc.pixel_constants.size()) * 4;
+        if (device && HostPageReadable(REX_RAW_ADDR(device + kPixelConstBase)) &&
+            HostPageReadable(
+                REX_RAW_ADDR(device + kPixelConstBase + bytes - 4))) {
+          // WHICH REGISTERS ACTUALLY CHANGE, for the draw that carries the
+          // dirt. 1753 is the rider, from the same index-count identification
+          // used everywhere else in this investigation. Printed once per
+          // register so the list is the answer, not a sample.
+          const bool trace = dc.index_count == 1753;
+          for (size_t i = 0; i < dc.pixel_constants.size(); ++i) {
+            const uint32_t live =
+                REX_LOAD_U32(device + kPixelConstBase + uint32_t(i) * 4);
+            if (trace && live != dc.pixel_constants[i]) {
+              static std::set<uint32_t> s_shown;
+              const uint32_t reg = uint32_t(i) / 4;
+              if (s_shown.size() < 24 && s_shown.insert(reg).second) {
+                REXLOG_INFO("d3d9: RIDER PS CONST c{} differs -- recorded "
+                            "0x{:08X} live 0x{:08X}",
+                            reg, dc.pixel_constants[i], live);
+              }
+            }
+            dc.pixel_constants[i] = live;
+          }
+          // THE RAW READ IS ONLY HALF THE BANK, exactly as at capture.
+          // Run mx_1937 measured SIX NaNs in the live pixel file for the
+          // rider draw -- c14, c21-c25 -- and a NaN through that shader is
+          // the speckling that looked like the game's dirt effect. The
+          // capture path already repairs this; the replay skipped it,
+          // while CaptureVertexConstants does the vertex equivalent
+          // internally, which is why only the pixel side showed it.
+          ApplyPixelShaderLoadTable(dc.pixel_shader_handle, device, base,
+                                    dc.pixel_constants);
+          ++g_cmdBufPixelLiveBase;
+        } else {
+          ++g_cmdBufPixelNoLive;
+        }
+      }
+      // THE TEXTURES COME FROM THE BUFFER, not from either device.
+      //
+      // Two wrong sources, each with its own screen signature:
+      //   live device    -> a rock texture on the rider (regession3.rdc,
+      //                     65,215 draws rebound, 0 kept -- the fallback never
+      //                     fired because the live descriptors were perfectly
+      //                     valid, just not this draw's)
+      //   recording dev  -> the palm's 696 leaf draw bound a 1024x1024 bush
+      //                     atlas and rendered black
+      //
+      // The recorded buffer writes its own texture fetch constants -- 354,640
+      // per run, measured -- and that is what the console's replay binds from.
+      // A guest SetTexture made while recording emits the packet into the
+      // buffer; it does not have to leave anything in the recording device's
+      // shadow at device+0x480, which is exactly what the capture path reads.
+      //
+      // Only slots the buffer actually describes are re-bound. Anything it is
+      // silent about keeps its recorded texture, so a draw can only move
+      // toward the buffer's own answer.
+      if (dc.pixel_shader_handle && issued < ov.size()) {
+        const TranslatedShader* t =
+            TranslatedPixelShader(dc.pixel_shader_handle);
+        if (t && t->sampler_count) {
+          const std::vector<uint32_t>* by_sampler[mx::hle::kMaxSamplers] = {};
+          for (const auto& blk : ov[issued]) {
+            if (blk.is_fetch && blk.first_const < mx::hle::kMaxSamplers &&
+                blk.dwords.size() >= 6)
+              by_sampler[blk.first_const] = &blk.dwords;
+          }
+          mx::hle::DrawCall probe = dc;
+          uint32_t described = 0, filled = 0;
+          for (uint32_t k = 0; k < t->sampler_count &&
+                               k < mx::hle::DrawCall::kMaxPixelTextures;
+               ++k) {
+            const uint32_t gs = t->slot_guest[k];
+            const std::vector<uint32_t>* f =
+                gs < mx::hle::kMaxSamplers ? by_sampler[gs] : nullptr;
+            if (!f) continue;
+            ++described;
+            if (ResolvePixelSlotTexture(probe, k, gs, device, base,
+                                        /*vertex=*/false,
+                                        /*stage_handle_hint=*/0, f->data()))
+              ++filled;
+          }
+          if (described && filled == described) {
+            dc.pixel_textures = probe.pixel_textures;
+            dc.pixel_sampled_objects = probe.pixel_sampled_objects;
+            ++g_cmdBufTexFromBuffer;
+          } else if (described) {
+            ++g_cmdBufTexBufferShort;
+          } else {
+            ++g_cmdBufTexNoBufferBinding;
+          }
+        }
+      }
+      // THE LIGHT BUFFER SLOT MUST BE RESOLVED AT REPLAY TIME.
+      //
+      // T_EcoLeaves samples samplerLightBuffer at its PARAM_GEN screen
+      // position, unnormalized, so that slot's xe_texinv has to be 1/extent of
+      // a 1280x720 target. On the palm frond it read (1,1) -- a 1x1 -- so the
+      // screen position was never scaled down and every fragment sampled one
+      // clamped texel. That is the flat fog-coloured frond.
+      //
+      // WHY IT IS 1x1: the light buffer is a RESOLVE SNAPSHOT written later in
+      // the frame by the deferred lighting pass. When the guest RECORDS this
+      // buffer that snapshot does not exist yet, so the slot falls back to a
+      // placeholder. Every non-replayed shader binds it correctly because it
+      // resolves at draw time, after the lighting pass has run. A replayed
+      // draw keeps its record-time textures and so keeps the placeholder.
+      //
+      // NARROW ON PURPOSE. Re-resolving EVERY slot against the live device is
+      // what put a rock texture on the rider (capture regession3.rdc, 65,215
+      // draws rebound): the live descriptors were valid, just not that draw's.
+      // Only a slot that is currently sampling a 1x1 is a candidate, and its
+      // live resolution is adopted only if it yields a resolve SNAPSHOT --
+      // which is the one thing a record-time bind could not have seen. A slot
+      // with a real texture is never touched, so the rider and bike cannot
+      // regress through here.
+      if (dc.pixel_shader_handle) {
+        if (const TranslatedShader* t =
+                TranslatedPixelShader(dc.pixel_shader_handle)) {
+          for (uint32_t k = 0; k < t->sampler_count &&
+                               k < mx::hle::DrawCall::kMaxPixelTextures;
+               ++k) {
+            const bool has_object =
+                k < dc.pixel_sampled_objects.size() && dc.pixel_sampled_objects[k];
+            if (has_object) continue;  // already a snapshot
+            const auto& cur =
+                k < dc.pixel_textures.size() ? dc.pixel_textures[k] : nullptr;
+            if (!cur || cur->width > 1 || cur->height > 1) continue;
+            mx::hle::DrawCall probe = dc;
+            if (!ResolvePixelSlotTexture(probe, k, t->slot_guest[k], device,
+                                         base))
+              continue;
+            if (k >= probe.pixel_sampled_objects.size() ||
+                !probe.pixel_sampled_objects[k]) {
+              ++g_cmdBufLightSlotNoSnapshot;
+              continue;
+            }
+            dc.pixel_sampled_objects[k] = probe.pixel_sampled_objects[k];
+            dc.pixel_textures[k] = probe.pixel_textures[k];
+            if (k < dc.pixel_sampled_swizzles.size() &&
+                k < probe.pixel_sampled_swizzles.size())
+              dc.pixel_sampled_swizzles[k] = probe.pixel_sampled_swizzles[k];
+            if (k < dc.pixel_sampler_signs.size() &&
+                k < probe.pixel_sampler_signs.size())
+              dc.pixel_sampler_signs[k] = probe.pixel_sampler_signs[k];
+            ++g_cmdBufLightSlotFixed;
+          }
+        }
+      }
+
+      // PARAM_GEN COMES FROM THE BUFFER. The hardware fills one interpolator
+      // with the pixel position and the vertex shader does not export it; the
+      // palm leaf's pixel shader uses that slot as the UV for its colour
+      // texture. dc.pixel_param_gen was captured from the RECORDING device,
+      // which reports it off, and so does the live device (measured on run
+      // mx_1942: recorded 0, live raw 0x10610F06 param_gen 0). The recorded
+      // buffer programs SQ_PROGRAM_CNTL itself -- 51,272 writes a run, 27,816
+      // of them with the bit set -- so that is the authoritative source, the
+      // same way the texture fetch constants are.
+      //
+      // Only when the buffer actually programmed the register: silence leaves
+      // the recorded value alone.
+      if (issued < ov.size()) {
+        uint32_t pc_raw = 0, cm_raw = 0;
+        bool have_pc = false, have_cm = false;
+        for (const auto& blk : ov[issued]) {
+          if (!blk.is_reg || blk.dwords.empty()) continue;
+          if (blk.first_const == kXeSqProgramCntl) {
+            pc_raw = blk.dwords[0];
+            have_pc = true;
+          } else if (blk.first_const == kXeSqContextMisc) {
+            cm_raw = blk.dwords[0];
+            have_cm = true;
+          }
+        }
+        if (have_pc) {
+          const bool gen = (pc_raw & (1u << 18)) != 0;
+          const uint32_t pos = have_cm ? ((cm_raw >> 8) & 0xFFu) : 0xFFu;
+          // The SDK limits the destination to the sixteen interpolators;
+          // malformed state disables it rather than indexing out of range.
+          dc.pixel_param_gen = (gen && pos < 16) ? pos + 1 : 0;
+        }
+      }
+      // The buffer's own writes for THIS draw, in stream order.
+      if (issued < ov.size()) {
+        for (const auto& blk : ov[issued]) {
+          // Constants 256+ are the PIXEL bank -- the collector records both
+          // ranges and flags which by index, so one loop routes each to its
+          // own file rather than silently dropping half of them.
+          const bool is_pixel = blk.first_const >= 256;
+          auto& bank = is_pixel ? dc.pixel_constants : dc.vertex_constants;
+          if (bank.empty()) continue;
+          const size_t reg = is_pixel ? blk.first_const - 256 : blk.first_const;
+          const size_t at = reg * 4;
+          if (at >= bank.size()) continue;
+          const size_t n = std::min(blk.dwords.size(), bank.size() - at);
+          std::copy_n(blk.dwords.begin(), n, bank.begin() + at);
+          g_cmdBufConstPatched += uint64_t(n / 4);
+        }
+      } else if (!ov.empty()) {
+        // More captured draws than recorded DRAW_INDX packets: the two are out
+        // of step and pairing them by position would be a guess.
+        ++g_cmdBufConstUnpaired;
+      }
+    }
+    if (FinishHleDraw(dc)) {
+      ++issued;
+    } else {
+      ++g_cmdBufReplayRefused;
+    }
+  }
+  g_cmdBufReplayed += issued;
+  return issued;
+}
+
+void ReportCmdBufReplay() {
+  std::lock_guard<std::recursive_mutex> lk(g_cmdBufRecMu);
+  std::string rows;
+  for (const auto& [cb, rec] : g_cmdBufRec)
+    if (!rec.draws.empty())
+    {
+      // NAME THE GEOMETRY, do not just count it. A buffer holding "2 draws"
+      // and a buffer holding "the palm" are different claims, and the palm
+      // buffer matching on COUNT (2 == 2) is what made the wrong one look
+      // right. 696 is the 3D leaf and 85/86 the branch; if those index counts
+      // are absent here, whatever we replay for that buffer is not the palm.
+      std::string counts;
+      for (const auto& d : rec.draws)
+        counts += fmt::format("{}{}", counts.empty() ? "" : ",",
+                              d.index_count);
+      rows += fmt::format(" [0x{:08X} {} draw(s) x{} replays idx:{}]", cb,
+                          rec.draws.size(), rec.replays, counts);
+    }
+  // Printed even at zero: "nothing was recorded" and "this report is not
+  // wired" are different findings, and a suppressed line looks like neither.
+  REXLOG_INFO("d3d9: CMDBUF RECORD/REPLAY -- captured {} draw(s) ({} past the "
+              "{} cap, {} deferred to the pending path and NOT captured); "
+              "replayed {} ({} refused by FinishHleDraw, {} replays had no "
+              "recording); vs {} live / {} stale, ps {} live / {} stale, "
+              "{} overlaid, {} unpaired; textures {} from buffer / {} short / "
+              "{} undescribed; 1x1 slots {} -> snapshot, {} still none:{}",
+              g_cmdBufCaptured, g_cmdBufCapOverflow, kMaxRecordedDraws,
+              g_cmdBufDeferred, g_cmdBufReplayed, g_cmdBufReplayRefused,
+              g_cmdBufReplayNoRec, g_cmdBufConstLiveBase,
+              g_cmdBufConstNoLive, g_cmdBufPixelLiveBase,
+              g_cmdBufPixelNoLive, g_cmdBufConstPatched,
+              g_cmdBufConstUnpaired, g_cmdBufTexFromBuffer,
+              g_cmdBufTexBufferShort, g_cmdBufTexNoBufferBinding,
+              g_cmdBufLightSlotFixed, g_cmdBufLightSlotNoSnapshot,
+              rows.empty() ? " none" : rows);
+}
+
 bool FinishHleDraw(mx::hle::DrawCall& dc) {
   mx::hle::HleSkip skip = mx::hle::HleSkip::kNone;
   if (!mx::hle::FinalizeHleTopology(dc, skip)) {
@@ -2748,8 +3552,9 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   if (g_diag) {
     static float consts[kHleProbeRegs * 4];
     if (ReadVsConstants(device, base, consts)) {
+      const uint32_t vs_h = st.vs_seen ? st.vertex_shader : 0;
       ScoreHleTransform(dc, consts, have_vp ? vp : nullptr,
-                        st.vs_seen ? st.vertex_shader : 0);
+                        VertexShaderContentId(vs_h), vs_h);
       // The first few register files in full. A ranking with no numbers behind
       // it cannot be checked by eye, and "c3 col-major, 94%" is worth much less
       // than seeing that c3..c6 look like a projection matrix.
@@ -3311,7 +4116,11 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
       have_texture ? &texture_binding : nullptr, nullptr,
       in.defer_transcode ? &in : nullptr);
   if (applied == ShaderApplyResult::kApplied) {
-    FinishHleDraw(dc);
+    // A draw made on a RECORDING device is not rendered now -- on the
+    // console it is written into the command buffer and rendered once
+    // per instance by the replay. Issuing it here is what drew the palm
+    // foliage twice a RUN instead of once per tree.
+    if (!CaptureDrawIfRecording(device, dc)) FinishHleDraw(dc);
     return;
   }
   if (applied != ShaderApplyResult::kNoCode ||
@@ -3328,6 +4137,10 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     return;
   }
 
+  // A recorded draw that defers cannot be captured: the recording has
+  // ended by the time the pending queue finalizes. Counted rather than
+  // lost quietly, so "captured N" always has its denominator beside it.
+  if (CmdBufForDevice(device)) NoteCmdBufDeferredDraw();
   PendingHleDraw pending;
   pending.draw = std::move(dc);
   std::copy_n(streams, kMaxStreams, pending.streams.begin());
@@ -3542,8 +4355,6 @@ void ScoreDraw(bool indexed, uint32_t first, uint32_t count,
 constexpr uint32_t kMaxBlobDwords = 4096;   // 16 KB ceiling on one blob
 
 
-
-
 //---------------------------------------------------------------------------
 // Stage C -- execute the shader and see where the position lands.
 //
@@ -3710,8 +4521,6 @@ const PatchedCode* CodeFromShaderObject(uint32_t shader, uint8_t* base) {
   s_failed.emplace(shader, true);
   return nullptr;
 }
-
-
 
 
 // Stage I -- REMOVED 2026-08-17. `ShaderScore` and `kCtlSpreadEpsilon` were
@@ -4055,7 +4864,31 @@ ShaderApplyResult ApplyShaderOutputs(
   struct ReportZeroFill {
     uint64_t attempt;
     ~ReportZeroFill() {
-      if (attempt > 10 && (attempt % 250) != 0) return;
+      // TIME, not attempt count -- the same fix and the same reason as
+      // kDrawReportPeriodMs. `attempt % 250` made this the single largest line
+      // in the log: 693 KB of a 5 MB segment on run mx_1901, 1,716 prints, 13%
+      // of everything written, because 429,000 attempts divided by 250 is
+      // exactly that. Every counter on the line is cumulative, so the value of
+      // printing it 28 times a second is nil.
+      //
+      // A change-detector would be WRONG here, unlike the sibling report above:
+      // every counter this line carries climbs monotonically with draws, so a
+      // "did anything move" predicate is true on essentially every attempt.
+      // That is the trap the sibling's own comment records having been caught
+      // by twice. A period is the right shape for a cumulative total.
+      if (attempt > 10) {
+        using namespace std::chrono;
+        static std::atomic<int64_t> s_lastMs{
+            std::numeric_limits<int64_t>::min() / 2};
+        const int64_t now_ms = duration_cast<milliseconds>(
+                                   steady_clock::now().time_since_epoch())
+                                   .count();
+        int64_t last = s_lastMs.load(std::memory_order_relaxed);
+        if (now_ms - last < 10000) return;
+        if (!s_lastMs.compare_exchange_strong(last, now_ms,
+                                              std::memory_order_relaxed))
+          return;
+      }
       const auto& c = mx::hle::HleZeroFillCensus();
       std::string s;
       for (uint32_t i = 0; i < mx::hle::HleZeroFillCensusStreams; ++i) {
@@ -4112,9 +4945,15 @@ ShaderApplyResult ApplyShaderOutputs(
             mx::hle::HleComputedIndexSkips());
       }
       REXLOG_INFO(
-          "d3d9: index conditioning: registers read {} draws, restart enabled "
-          "{}, cut {} draws at {} markers{}{}{}",
-          g_indexCondRead, g_indexCondResetOn,
+          "d3d9: index conditioning: registers read {} draws [{}], restart "
+          "enabled {}, cut {} draws at {} markers{}{}{}",
+          g_indexCondRead,
+          // NOT a zero check -- the opposite. A zero here means the register
+          // offsets are wrong and every index goes through unconditioned,
+          // which is the state that lost the ground.
+          mx::gpu::health::Tag(mx::gpu::health::NonZero(
+              "index_cond.registers_read", g_indexCondRead, g_draws)),
+          g_indexCondResetOn,
           mx::hle::HleRestartCutDraws(), mx::hle::HleRestartCutCount(),
           s.empty() ? " | zero-fill: none" : s, g, f);
     }
@@ -4797,9 +5636,17 @@ ShaderApplyResult ApplyShaderOutputs(
         }
       }
       if (s_checked == 400) {
+        // "They must be bit-identical" -- the same attribute decoded from the
+        // guest stream and from the merged buffer at the address the shader
+        // will form. A mismatch means the shader is pointed at the wrong bytes,
+        // which misaddresses geometry with no symptom at the point of the
+        // mistake. One-shot: it reports once at 400 draws and never again,
+        // which staleness tolerates because a check seen once is never stale.
         REXLOG_INFO("d3d9: VFETCH addressing self-check: {} draws, {} "
-                    "mismatches",
-                    s_checked, s_mismatch);
+                    "mismatches [{}]",
+                    s_checked, s_mismatch,
+                    mx::gpu::health::Tag(mx::gpu::health::Zero(
+                        "gpu_fetch.address_mismatch", s_mismatch, s_checked)));
       }
     }
   }
@@ -5898,6 +6745,14 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
   for (uint32_t r = 0; r < 3; ++r)
     g_loopUs[r] = g_loopVerts[r] = g_loopDraws[r] = 0;
   mx::hle::g_transcodeUs = mx::hle::g_transcodeVerts = 0;
+  // "`lost` should stay at zero, and means a deferred draw reached a caller
+  // that could not supply the inputs to fill it" -- from the declaration of
+  // these three. Checked HERE, immediately before the reset, rather than beside
+  // the FRAME COST line that prints it: that line is gated on an expensive
+  // frame, so a check inside it would only ever see the frames that were slow.
+  // The population is the deferred draws, since only a deferred draw can be
+  // lost.
+  mx::gpu::health::Zero("transcode.lost", g_transcodeLost, g_transcodeDeferred);
   g_transcodeDeferred = g_transcodeLate = g_transcodeLost = 0;
   g_phaseVertexUs = g_phaseInterpUs = g_tex.phaseUs = 0;
   g_phaseVertexLoopUs = g_phaseVertexCount = 0;
@@ -6165,6 +7020,21 @@ std::map<uint32_t, TranslatedShader> g_translatedVs;
 // is held only around find/insert; the returned pointer stays valid without it
 // because std::map nodes are stable and nothing is ever erased.
 std::mutex g_translatedMu;
+
+// The microcode content id for a bound vertex shader handle, or 0 if that
+// handle has not been translated yet.
+//
+// This is the identity anything cross-tabbing BY SHADER must use. The map is
+// already maintained for exactly this reason -- a recycled address has to
+// re-translate -- so the value is a lookup, not a hash on the draw path. That
+// distinction matters: an FNV over the microcode per draw was measured at
+// 4.6 ms a frame elsewhere in this tree.
+uint64_t VertexShaderContentId(uint32_t handle) {
+  if (!handle) return 0;
+  std::lock_guard<std::mutex> lk(g_translatedMu);
+  auto it = g_hlslReportedVs.find(handle);
+  return it == g_hlslReportedVs.end() ? 0 : it->second;
+}
 thread_local bool t_shaderCompileWorker = false;
 
 const TranslatedShader* TranslatedPixelShader(uint32_t handle) {
@@ -6909,15 +7779,39 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
                     ? fmt::format("{} bytes", source_size)
                     : fmt::format("opcode {}", out.blocking_opcode));
   }
-  if ((seen.size() % 16) == 0 || seen.size() <= 6) {
-    REXLOG_INFO("d3d9: HLSL {} coverage over {} shaders: {}", tag, seen.size(),
-                HlslCoverageSummary(cov));
+  // `seen.size() % 16` IS BIMODAL, and the note below records only half of it.
+  //
+  // This function runs on every pass, not once per distinct shader, so the
+  // predicate is re-evaluated against a count that has stopped moving. Where it
+  // parks decides everything: off a multiple of 16 the line never prints again
+  // (the documented half, run 1433 parked at 42), ON a multiple it prints on
+  // EVERY pass. Both were observed a run apart -- mx_1901 printed it 0 times,
+  // mx_1902 printed it 8,564 times for 1.27 MB, 24.5% of a whole segment, and
+  // it went from invisible to the single largest line in the log without a line
+  // of code changing between them.
+  //
+  // Same fix as the VFETCH coverage report below, which already learned this:
+  // bound on the only thing here that actually changes -- a new distinct
+  // shader -- plus a slow heartbeat, so a run that ends between shaders still
+  // shows its final tally.
+  {
+    static size_t s_lastCovSeen = ~size_t(0);
+    static std::chrono::steady_clock::time_point s_lastCovReport{};
+    const auto now = std::chrono::steady_clock::now();
+    if (seen.size() != s_lastCovSeen ||
+        now - s_lastCovReport >= std::chrono::seconds(10)) {
+      s_lastCovSeen = seen.size();
+      s_lastCovReport = now;
+      REXLOG_INFO("d3d9: HLSL {} coverage over {} shaders: {}", tag,
+                  seen.size(), HlslCoverageSummary(cov));
+    }
   }
-  // Deliberately NOT on the coverage report's schedule: that one fires at 6 and
-  // then at multiples of 16, so a run ending at 11 shaders never shows its final
-  // tally -- which is exactly what happened the first time. Worth knowing that
-  // the same schedule is why `HLSL VS coverage` stops printing entirely once
-  // seen.size() parks on a value that is not a multiple of 16 (42 in run 1433).
+  // Deliberately NOT on the coverage report's schedule -- and as of 2026-08-31
+  // that schedule is gone, because the trap this paragraph described had a
+  // second half it did not: parking OFF a multiple of 16 silenced the line,
+  // parking ON one made it print every pass. See the note at the coverage
+  // report above. This report has been on change-plus-heartbeat all along,
+  // which is what the coverage one now uses too.
   //
   // But "every new vertex shader" was never what this did. It ran on every pass
   // through this function, and g_vfetchCompiled advances on every RE-translation
@@ -7403,9 +8297,74 @@ void ReportDeclHistogram() {
   // must stay at 0 or the field is not what SetVertexDeclaration writes, and a
   // large `stale` is the 2508-calls-per-165000-draws problem, measured.
   REXLOG_INFO(
-      "d3d9: decl-source -- from device+0x2ED8: null={} unknown={} | vs the "
-      "patch hook: same={} stale={}",
-      g_declDeviceNull, g_declDeviceUnknown, g_declAgree, g_declDisagree);
+      "d3d9: decl-source -- from device+0x2ED8: null={} unknown={} [{}] | vs "
+      "the patch hook: same={} stale={} | adopted {} refused {}",
+      g_declDeviceNull, g_declDeviceUnknown,
+      // WHAT IS STILL LOST, not what was merely unfamiliar.
+      //
+      // This checked g_declDeviceUnknown, which was the right number while an
+      // unknown pointer meant a dropped draw. Since those are adopted off the
+      // device, an unknown pointer is a FIRST SIGHTING and costs nothing --
+      // leaving the check on that counter would report a BAD for work that now
+      // succeeds, which is the same error as reporting a healthy zero for work
+      // that never ran. The population that still loses draws is the adoption
+      // REFUSALS, so that is what carries the expectation.
+      mx::gpu::health::Tag(mx::gpu::health::Zero(
+          "decl.unknown_ptr", g_declAdoptRefused,
+          with + without + g_drawsNoDecl)),
+      g_declAgree, g_declDisagree, g_declAdopted, g_declAdoptRefused);
+  // WHICH pointers, when there are any. A count cannot name the draw, and the
+  // shape of the answer decides the next step: one address recurring every
+  // frame is a specific draw to go and find, while hundreds of distinct
+  // addresses is a lifetime or ordering problem instead.
+  if (g_unknownDistinct) {
+    std::string u;
+    for (uint32_t i = 0; i < g_unknownDistinct; ++i)
+      u += fmt::format(" 0x{:08X}x{}", g_unknownPtr[i], g_unknownPtrDraws[i]);
+    REXLOG_INFO("d3d9: decl-unknown -- {} distinct pointer(s){}{}",
+                g_unknownDistinct, u,
+                g_unknownOverflow
+                    ? fmt::format(" (+{} draws on pointers past the {} cap)",
+                                  g_unknownOverflow, kMaxUnknownDecls)
+                    : "");
+  }
+  // LAYOUT DECODE, with its denominator. Three outcomes, never folded:
+  // clean, decoded-with-elements-dropped, and refused outright. The middle
+  // one used to BE the last one -- BuildInputLayout returned false on the
+  // first element it could not describe, which nulled in.layout for every
+  // draw using that declaration and dropped them all as kNoLayout, over
+  // elements the 36-byte transcode never reads. table_full and reused are
+  // the other two ways a draw loses its declaration; both must read 0.
+  {
+    uint32_t clean = 0, partial = 0, refused = 0, dropped_elems = 0;
+    for (int i = 0; i < g_declCount; ++i) {
+      if (!g_declLayoutOk[i]) { ++refused; continue; }
+      if (g_declLayoutErr[i].skipped) {
+        ++partial;
+        dropped_elems += g_declLayoutErr[i].skipped;
+      } else {
+        ++clean;
+      }
+    }
+    // Three expectations, each stated where it is measured. A refused
+    // declaration nulls in.layout for every draw that uses it; a full table
+    // does the same to every declaration past the cap; a reused address hands
+    // new geometry the previous element list. None of the three can be
+    // non-zero without draws being lost or decoded wrong.
+    namespace h = mx::gpu::health;
+    const char* t_refused =
+        h::Tag(h::Zero("decl.layout_refused", refused, uint64_t(g_declCount)));
+    const char* t_full = h::Tag(h::Zero("decl.table_full", g_declTableFull,
+                                        g_decls));
+    const char* t_reuse = h::Tag(h::Zero("decl.addr_reused", g_declRebuilt,
+                                         g_decls));
+    REXLOG_INFO(
+        "d3d9: decl-layout -- of {} declarations: clean={} partial={} "
+        "refused={} [{}] | elements dropped={} | table_full={} [{}] "
+        "addr_reused={} [{}]",
+        g_declCount, clean, partial, refused, t_refused, dropped_elems,
+        g_declTableFull, t_full, g_declRebuilt, t_reuse);
+  }
   // One row per declaration, held back while no NEW declaration has appeared.
   // 17,987 rows over 783 reports in run mx_1782 -- ~23 a report, and the only
   // thing moving between prints is each row's draw count. The two summary
@@ -7538,7 +8497,28 @@ void ReportUpDrawCallers() {
 
 void ReportDrawCounts(uint8_t* base) {
   const uint64_t total = g_indexed_draws + g_draws + g_up_draws + g_indexed_up_draws;
+  // Both gates, cheapest first. The draw floor keeps the clock read off the
+  // draw path for all but every 2500th call; the clock is what actually bounds
+  // the rate. Atomics because this runs on every draw hook and the guest draws
+  // from more than one thread -- the old modulo had the same race and could
+  // print twice for one crossing.
   if ((total % kDrawReportEvery) != 0) return;
+  {
+    using namespace std::chrono;
+    static std::atomic<int64_t> s_lastMs{
+        std::numeric_limits<int64_t>::min() / 2};
+    const int64_t now_ms = duration_cast<milliseconds>(
+                               steady_clock::now().time_since_epoch())
+                               .count();
+    int64_t last = s_lastMs.load(std::memory_order_relaxed);
+    if (now_ms - last < kDrawReportPeriodMs) return;
+    // Whoever wins the exchange prints; the losers return. Without this two
+    // threads crossing the floor together both report, which is how a "census"
+    // ends up with duplicate rows nobody can explain.
+    if (!s_lastMs.compare_exchange_strong(last, now_ms,
+                                          std::memory_order_relaxed))
+      return;
+  }
   REXLOG_INFO("d3d9: draws -- DrawIndexedVertices={} DrawVertices={} "
               "DrawVerticesUP={} DrawIndexedVerticesUP={} (skipped {}) total={}",
               g_indexed_draws, g_draws, g_up_draws, g_indexed_up_draws,
@@ -7626,6 +8606,60 @@ void ReportDrawCounts(uint8_t* base) {
   // expects equality will otherwise read a correct result as a failure.
   {
     std::lock_guard<std::mutex> lk(g_plumbedStencilMu);
+    // "config KEY SET must be IDENTICAL. A configuration present in the census
+    // and absent here would be state Phase 2 can never act on." Stated as a
+    // check rather than left to a reader diffing two key dumps by eye -- which
+    // is what the line above has been asking for all along.
+    //
+    // Only census-minus-plumbed is a defect. The reverse cannot happen (the
+    // consumer sees a subset), and counting it would turn an impossibility into
+    // a number someone has to think about.
+    // A GRACE PERIOD, because the two sides are not recorded at the same
+    // moment. The census records a configuration when the guest programs it;
+    // the consumer records it when a draw carrying it reaches the renderer.
+    // If the first draw with a configuration is dropped and a later one is
+    // not, the sets differ for a while and then agree.
+    //
+    // That is exactly what run mx_1913 did: 3 of 12 at 19:17:57, and 0 BAD
+    // by the end of the same run. Reporting it was a FALSE ALARM, and a
+    // false alarm in the census is worse than no check at all -- the same
+    // lesson the staleness rule had to learn when a fixed tolerance called
+    // every cross-path check stale.
+    //
+    // So a key counts as missing only once the consumer has had several
+    // report passes to see it. A configuration the guest programs and the
+    // renderer still has not seen after ~6 seconds is a real finding; one
+    // that resolves within a pass or two is the recording window.
+    constexpr uint64_t kConfigGracePasses = 3;
+    static std::map<std::pair<uint32_t, uint32_t>, uint64_t> s_firstSeen;
+    static uint64_t s_configPass = 0;
+    ++s_configPass;
+    uint64_t census_keys_missing = 0;
+    std::string missing;
+    for (const auto& [key, n] : g_stencilConfigs) {
+      const auto it = s_firstSeen.emplace(key, s_configPass).first;
+      if (g_plumbedConfigs.count(key)) continue;
+      if (s_configPass - it->second < kConfigGracePasses) continue;
+      ++census_keys_missing;
+      // NAMED, not just counted. Both lines already print "12 distinct
+      // configs" and "key set unchanged" while three of those twelve keys
+      // differ, so the sets are the same SIZE and different MEMBERS -- which
+      // is precisely what a size comparison cannot see and why this check
+      // was written as set membership. A count alone would leave the reader
+      // diffing two heartbeat-gated key dumps by eye.
+      if (census_keys_missing <= 8)
+        missing += fmt::format(" depthcontrol=0x{:08X}/refmask=0x{:08X}x{}",
+                               key.first, key.second, n);
+    }
+    if (census_keys_missing) {
+      REXLOG_WARN(
+          "d3d9: STENCIL {} of {} census config key(s) NEVER reach the "
+          "consumer -- state the renderer can never act on:{}{}",
+          census_keys_missing, g_stencilConfigs.size(), missing,
+          census_keys_missing > 8 ? " ..." : "");
+    }
+    mx::gpu::health::Zero("stencil.config_keys_missing", census_keys_missing,
+                          g_stencilConfigs.size());
     // The KEY SET is the payload and it is add-only, so its size is a faithful
     // "a configuration you have not seen has reached the consumer". The counts
     // and the gaps are cumulative and stay on the line either way, because the
@@ -7651,12 +8685,18 @@ void ReportDrawCounts(uint8_t* base) {
     const int64_t eff_gap =
         int64_t(g_stencilEffective) - int64_t(g_plumbedEffective);
     REXLOG_INFO("d3d9: STENCIL PLUMBED at the CONSUMER -- {} draws carried the "
-                "fields ({} had an unreadable register), {} effective, {} "
+                "fields ({} had an unreadable register [{}]), {} effective, {} "
                 "distinct configs. Counts are EXPECTED to be lower than the "
                 "census: {} draws and {} effective never reached the renderer "
                 "(cross-check FRAME DRAWS guest-minus-accepted). The KEY SET "
                 "is what must match:{}",
-                g_plumbedSeen, g_plumbedUnreadable, g_plumbedEffective,
+                g_plumbedSeen, g_plumbedUnreadable,
+                // A draw that carried the fields but whose register could not
+                // be read has stencil state we invented rather than observed.
+                mx::gpu::health::Tag(mx::gpu::health::Zero(
+                    "stencil.unreadable_reg", g_plumbedUnreadable,
+                    g_plumbedSeen)),
+                g_plumbedEffective,
                 g_plumbedConfigs.size(), seen_gap, eff_gap,
                 cfgs.empty() ? " none" : cfgs);
   }
@@ -7723,17 +8763,6 @@ void ReportDrawCounts(uint8_t* base) {
     if (filled_zero)
       REXLOG_INFO("d3d9: ZERO-FILL BY CONSTANT:{}",
                   mx::gpu::alu::FilledHistogram(12));
-  {
-    // c32 is the vertex tint that renders the legal screen's logos black:
-    // the pixel shader multiplies a correctly-sampled white texel by it and
-    // LegacyMul forces +0 because it is zero. c252..c255 are the CONTROL --
-    // known screen-space scale/bias, so if they read wrong the file cannot be
-    // trusted and c32's value means nothing either.
-    static const uint32_t kWatch[] = {32, 252, 253, 254, 255};
-    REXLOG_INFO("d3d9: WOULD-FILL VALUES (c252-255 are the control -- expect "
-                "screen-space scale/bias like 0.5/-0.5):{}",
-                mx::gpu::alu::WouldFillValues(kWatch, 5));
-  }
     // The narrow window that actually substitutes. Printed unconditionally,
     // zero included: "never fired" and "fired and changed nothing" are the two
     // outcomes worth telling apart, and a suppressed line looks like neither.
@@ -7759,6 +8788,37 @@ void ReportDrawCounts(uint8_t* base) {
                 mx::gpu::alu::FileValues(kTint, 1));
   }
   ReportDeclHistogram();
+  // The submission path that bypasses every draw hook. Reported next to the
+  // declaration census because the two answer the same question from
+  // opposite ends: that one says the draws we SEE are described, this one
+  // says how many never arrive to be described at all.
+  ReportCommandBuffers();
+  ReportVegetationLod();
+  // LAST, and unconditional. Every line above states a fact; this one states
+  // whether any of those facts broke an expectation the source itself wrote
+  // down. It is the line to read first: "is anything wrong" should not require
+  // reading the other eighty, which is how time goes into the wrong defect.
+  //
+  // Checked here rather than beside the number, which is printed on the
+  // per-attempt DRAW REPORTS line: health::Record takes a mutex, and that site
+  // runs on every draw. A check is not worth lock traffic in the draw path when
+  // the counters it reads are cumulative and a periodic look is just as good.
+  //
+  // "The emitter and DecodeVertexShaderFetches walk the same instruction
+  // stream, so these must agree. If they ever do not, the xe_vf[] entries would
+  // be paired with the wrong fetches and geometry would be misaddressed with no
+  // symptom at the point of the mistake."
+  mx::gpu::health::Zero("gpu_fetch.ordinal_mismatch", g_gpuFetchOrdinalMismatch,
+                        g_gpuFetchDraws);
+  // A check that has just turned bad says so at WARN -- once, on the
+  // transition. That is the only thing in this whole report that is not
+  // [info], which is the point: `grep "\[warning\]"` over a run now means
+  // "show me what broke an expectation" and nothing else. The same entries are
+  // appended to logs/health.txt, which does not rotate the way mx_NNNN.log
+  // does, so a finding outlives the 30-second window it appeared in.
+  for (const std::string& bad : mx::gpu::health::DrainNewlyBad())
+    REXLOG_WARN("health: BAD {}", bad);
+  REXLOG_INFO("d3d9: HEALTH -- {}", mx::gpu::health::Report());
   if (REXCVAR_GET(hle_capture)) ReportCoverage(base);
 }
 
@@ -7842,8 +8902,6 @@ void ReportGlyphCache() {
   // the raster cache; REFUSED == 0 with a healthy CALLS count moves it into
   // composition, because then every glyph the guest asked for was delivered
   // and the missing quads were never requested in the first place.
-
-
 
 
 

@@ -84,13 +84,12 @@ void Stats(uint64_t& written, uint64_t& repaired, uint32_t& constants_seen,
 // and those want opposite fixes — narrow the range, or stop treating a
 // frame-global PM4 file as authoritative for a mid-frame draw.
 std::string FilledHistogram(uint32_t top);
-// Float values we declined to fill, for the given constant indices. Includes a
-// control group by convention -- see the definition.
-std::string WouldFillValues(const uint32_t* consts, size_t n);
 // The LIVE file contents for the given constants, with unpublished components
-// marked. NOT interchangeable with WouldFillValues, which cannot report a zero
-// -- it snapshots declined non-zero values only, and goes on printing a stale
-// one after the file has changed underneath it.
+// marked. Read a live value here rather than reintroducing a snapshot of
+// REFUSALS: the WouldFillValues report that used to sit beside this could not
+// express a zero at all, because its pass skipped `v == 0`, and it therefore
+// went on printing a stale non-zero after the file had changed underneath it.
+// It was removed on 2026-08-31 with the rest of the c32 investigation.
 std::string FileValues(const uint32_t* consts, size_t n);
 
 // One constant as floats, for callers that need the VALUE rather than a line of

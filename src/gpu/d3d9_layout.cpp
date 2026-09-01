@@ -221,43 +221,75 @@ bool BuildInputLayout(const D3D9Element* elements, uint32_t count,
   }
 
   out.elements.reserve(count);
+  err.offered = count;
+
   for (uint32_t i = 0; i < count; ++i) {
     const D3D9Element& e = elements[i];
-    err.failed_element = i;
+
+    // Whichever check below fails first, with the value that failed it. Nothing
+    // returns from inside the checks any more: the decision of what a failure
+    // COSTS is made once, after them, and depends on which element this is.
+    LayoutError::Reason bad = LayoutError::Reason::kNone;
+    uint32_t detail = 0;
+    DecodedVertexType decoded;
+    const char* semantic = nullptr;
 
     // Four streams because SetStreamSource takes 0..3 on this hardware and the
     // captures reach stream 1 at most. A higher index means the element was
     // misread, not that the game used stream 9.
     if (e.stream >= 4) {
-      err.reason = LayoutError::Reason::kStreamOutOfRange;
-      err.detail = e.stream;
-      return false;
-    }
+      bad = LayoutError::Reason::kStreamOutOfRange;
+      detail = e.stream;
     // The runtime stores offset >> 2 into the vfetch dword offset field, so a
     // non-multiple of 4 would silently lose its low bits there.
-    if ((e.offset & 3) != 0) {
-      err.reason = LayoutError::Reason::kMisalignedOffset;
-      err.detail = e.offset;
-      return false;
-    }
-    if (e.method != 0) {
-      err.reason = LayoutError::Reason::kUnsupportedMethod;
-      err.detail = e.method;
-      return false;
-    }
-
-    const char* semantic = UsageSemanticName(e.usage);
-    if (!semantic) {
-      err.reason = LayoutError::Reason::kUnknownUsage;
-      err.detail = e.usage;
-      return false;
+    } else if ((e.offset & 3) != 0) {
+      bad = LayoutError::Reason::kMisalignedOffset;
+      detail = e.offset;
+    } else if (e.method != 0) {
+      bad = LayoutError::Reason::kUnsupportedMethod;
+      detail = e.method;
+    } else if ((semantic = UsageSemanticName(e.usage)) == nullptr) {
+      bad = LayoutError::Reason::kUnknownUsage;
+      detail = e.usage;
+    } else if (!DecodeVertexType(e.type, decoded)) {
+      bad = LayoutError::Reason::kUnknownType;
+      detail = e.type;
     }
 
-    DecodedVertexType decoded;
-    if (!DecodeVertexType(e.type, decoded)) {
-      err.reason = LayoutError::Reason::kUnknownType;
-      err.detail = e.type;
-      return false;
+    if (bad != LayoutError::Reason::kNone) {
+      // POSITION0 is the one element the transcode cannot do without, so it is
+      // still fatal -- and it is identified by the usage byte, which is
+      // readable whether or not the rest of the element decoded.
+      const bool is_position =
+          e.usage == kUsagePosition && e.usage_index == 0;
+      if (is_position) {
+        err.reason = bad;
+        err.failed_element = i;
+        err.detail = detail;
+        return false;
+      }
+
+      if (err.skipped++ == 0) {
+        err.skip_reason = bad;
+        err.skip_element = i;
+        err.skip_detail = detail;
+      }
+
+      // The element is dropped from the layout but NOT from the stride. It
+      // still occupies its bytes in the guest's vertex, and min_stride is what
+      // the bound stride is checked against -- shrinking it here would turn a
+      // real short-stride binding into a silent pass. VertexFormatSizeBytes
+      // reads the guest's own table and is valid even where the DXGI mapping
+      // is not; it returns 0 for a format the runtime marks unusable, which
+      // correctly contributes nothing.
+      if (e.stream < 4) {
+        if (e.stream > out.max_stream) out.max_stream = e.stream;
+        const uint32_t skipped_end =
+            e.offset + VertexFormatSizeBytes(e.type & kTypeFormatMask);
+        if (skipped_end > out.min_stride[e.stream])
+          out.min_stride[e.stream] = skipped_end;
+      }
+      continue;
     }
 
     HleInputElement h;
@@ -278,6 +310,17 @@ bool BuildInputLayout(const D3D9Element* elements, uint32_t count,
     if (e.stream > out.max_stream) out.max_stream = e.stream;
     const uint32_t end = e.offset + decoded.size_bytes;
     if (end > out.min_stride[e.stream]) out.min_stride[e.stream] = end;
+  }
+
+  // Every element was dropped. There is no layout to hand back, and the reason
+  // to report is the first one that fired rather than a bare "empty" -- which
+  // is also what keeps a single-element declaration failing with the reason its
+  // one element failed for.
+  if (out.elements.empty()) {
+    err.reason = err.skipped ? err.skip_reason : LayoutError::Reason::kEmpty;
+    err.failed_element = err.skipped ? err.skip_element : 0;
+    err.detail = err.skip_detail;
+    return false;
   }
 
   err.failed_element = 0;

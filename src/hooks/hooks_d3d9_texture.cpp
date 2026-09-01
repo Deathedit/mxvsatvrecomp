@@ -2630,8 +2630,9 @@ void NoteUnhandledSign(uint32_t guest_format, uint32_t mode) {
 // session, after the renderer census and the uniform-decode line.
 bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
                              uint32_t guest_sampler, uint32_t device,
-                             uint8_t* base, bool vertex = false,
-                             uint32_t stage_handle_hint = 0) {
+                             uint8_t* base, bool vertex,
+                             uint32_t stage_handle_hint,
+                             const uint32_t* fetch_override) {
   using namespace mx::hle;
   auto& out_textures = vertex ? dc.vertex_textures : dc.pixel_textures;
   auto& out_objects =
@@ -2812,8 +2813,16 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // dc.pixel_shader_handle is the handle AttachTranslatedPixelShader resolved
   // for this DEVICE, not the thread-local one -- see the resolution above it --
   // which is the handle whose load table may carry this sampler's descriptor.
-  if (!ReadLiveTextureFetch(device, base, guest_sampler, fetch,
-                            dc.pixel_shader_handle)) {
+  // A REPLAYED DRAW BRINGS ITS OWN BINDING. The recorded command buffer
+  // writes texture fetch constants (Xenos 0x4800 + sampler*6) and the
+  // console sets textures from those, so for a replay this is the
+  // authoritative descriptor and the device shadow is not. Reading the
+  // live device instead put a rock texture on the rider; reading the
+  // RECORDING device left the palm leaf with a bush atlas.
+  if (fetch_override) {
+    std::memcpy(fetch, fetch_override, sizeof(uint32_t) * 6);
+  } else if (!ReadLiveTextureFetch(device, base, guest_sampler, fetch,
+                                   dc.pixel_shader_handle)) {
     ++g_slotFailFetch;
     ++g_slotFailFetchBySampler[guest_sampler];
     ReportSlotFailures();

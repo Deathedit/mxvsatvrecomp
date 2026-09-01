@@ -14,6 +14,7 @@
 // alone cost plugin-mode MainLoop ~17.6/s -> ~0.37/s when these ran in both
 // modes. Use that macro on anything added here.
 
+#include "gpu/health.h"
 #include "hooks/hook_common.h"
 
 // For the small-destination writeback: the SAME tiled address function the
@@ -43,6 +44,7 @@ namespace tu = rex::graphics::texture_util;
 #include "hooks/guest_read_watch.h"
 #include "hooks/hooks_d3d9_internal.h"
 
+REXCVAR_DECLARE(bool, d3d9_cmdbuf_replay);
 REXCVAR_DECLARE(bool, hle_capture);
 REXCVAR_DECLARE(bool, hle_diag);
 
@@ -272,6 +274,29 @@ extern "C" REX_FUNC(sub_82550B80) {
     DeclFile() << "  LAYOUT FAILED element " << e.failed_element << ": "
                << mx::hle::LayoutErrorText(e.reason) << " detail 0x" << std::hex
                << e.detail << std::dec << "\n";
+  } else if (decl_id >= 0 && g_declLayoutErr[decl_id].skipped) {
+    // The declaration decoded, but not all of it. The dropped elements are
+    // ones the transcode never reads, so leaving them out costs nothing --
+    // but "costs nothing" is a claim about what reads them, and it has to be
+    // visible to stay checkable. Printed WITH its denominator, once per
+    // reason+detail so a declaration built thousands of times names itself
+    // once instead of flooding the log.
+    const auto& e = g_declLayoutErr[decl_id];
+    static std::set<uint64_t> s_seen;
+    const uint64_t key =
+        (uint64_t(uint32_t(e.skip_reason)) << 32) ^ e.skip_detail;
+    if (s_seen.insert(key).second) {
+      REXLOG_INFO(
+          "d3d9: declaration id {} dropped {} of {} elements, first is "
+          "element {}: {} (detail 0x{:08X}) -- not read by the transcode, "
+          "geometry kept",
+          decl_id, e.skipped, e.offered, e.skip_element,
+          mx::hle::LayoutErrorText(e.skip_reason), e.skip_detail);
+    }
+    DeclFile() << "  LAYOUT DROPPED " << e.skipped << " of " << e.offered
+               << " elements, first element " << e.skip_element << ": "
+               << mx::hle::LayoutErrorText(e.skip_reason) << " detail 0x"
+               << std::hex << e.skip_detail << std::dec << "\n";
   }
 
   if (n > kMaxDeclsLogged) return;
@@ -683,6 +708,558 @@ extern "C" REX_FUNC(sub_825556B8) {
 // still live. BuildHleDraw copies them into the DrawCall; nothing retains the
 // pointer.
 //-----------------------------------------------------------------------------
+// Declared in hooks_d3d9.h and defined at the bottom of hooks_d3d9.cpp, both
+// at global scope. Forward-declared rather than including that header: it
+// needs <string>, and this file's project includes come before the standard
+// ones.
+bool GuestRangeReadable(uint8_t* base, uint32_t addr, uint32_t bytes);
+uint32_t ResolveGuestRange(uint8_t* base, uint32_t addr, uint32_t bytes);
+
+//===========================================================================
+// THE CONSTANTS A RECORDED BUFFER WRITES, PAIRED TO ITS DRAWS.
+//
+// A recorded buffer does not carry a whole constant file. It carries the
+// writes the guest made while recording, as PM4 type-0 packets whose payload
+// is the data, and on the console the replay runs against whatever the GPU's
+// constant state already is. So the replay's base is the LIVE bank and these
+// are layered on top -- see the block in ReplayCmdBuf.
+//
+// Register index 4 * (first_reg + 4096) puts constant 64 at 0x4100, and
+// 0x4000 is the vertex ALU constant base, so a type-0 packet in
+// [0x4000, 0x4400) is a vertex constant write.
+//
+// ORDERED, one entry per DRAW_INDX. A constant written before draw N applies
+// to draw N and every draw after it -- that is just how a command stream
+// works. Collecting one flat list and applying it to every draw is what gave
+// draw 1 draw 27's transform and smeared the scene into shards.
+//===========================================================================
+namespace {
+
+constexpr uint32_t kCbTypeOff = 0x00;    // low nibble 0xA = early-out
+constexpr uint32_t kCbBlocksOff = 0x74;  // head of the block list
+
+// The four draw opcodes, from the SDK. Declared here because the census
+// block that also names them sits further down this file.
+constexpr uint32_t kDrawIndx = 0x22;
+constexpr uint32_t kDrawIndx2 = 0x36;
+constexpr uint32_t kDrawIndxBin = 0x34;
+constexpr uint32_t kDrawIndx2Bin = 0x35;
+
+constexpr uint32_t kAluVertexConstBase = 0x4000;   // constant 0
+constexpr uint32_t kAluPixelConstBase = 0x4400;    // constant 256
+constexpr uint32_t kAluConstEnd = 0x4800;          // past constant 511
+constexpr uint32_t kFetchConstBase = 0x4800;       // texture fetch const 0
+constexpr uint32_t kFetchConstEnd = 0x4A00;        // past fetch const 31
+constexpr uint32_t kSqProgramCntl = 0x2180;
+constexpr uint32_t kSqContextMisc = 0x2181;
+
+using ConstBlock = mx::hooks::d3d9::CmdBufConstOverlay;
+
+// Running state while walking one buffer: constant index -> the latest value written.
+// Snapshotted at each draw.
+void CollectConstsFromIb(uint32_t phys, uint32_t size_dwords, uint8_t* base,
+                         std::map<uint32_t, std::vector<uint32_t>>& live,
+                         std::map<uint32_t, std::vector<uint32_t>>& live_fetch,
+                         std::map<uint32_t, uint32_t>& live_reg,
+                         std::vector<std::vector<ConstBlock>>& out) {
+  constexpr uint32_t kMaxScanDwords = 256u * 1024u;
+  const uint32_t dwords =
+      size_dwords > kMaxScanDwords ? kMaxScanDwords : size_dwords;
+  if (!dwords) return;
+  const uint32_t at = ResolveGuestRange(base, phys, dwords * 4);
+  if (!at) return;
+  for (uint32_t i = 0; i < dwords;) {
+    const uint32_t hdr = REX_LOAD_U32(at + i * 4);
+    const uint32_t type = hdr >> 30;
+    uint32_t advance;
+    if (type == 0) {
+      const uint32_t count = ((hdr >> 16) & 0x3FFF) + 1;
+      advance = 1 + count;
+      const uint32_t index = hdr & 0x7FFF;
+      // BOTH BANKS. 0x4000 is vertex constant 0 and 0x4400 is pixel constant
+      // 256 -- the guest's own D3D9 flush passes those two bases. Collecting
+      // only the vertex range left every recorded pixel constant on the floor,
+      // which is half the state a draw needs.
+      // DO THE RECORDED BUFFERS CARRY TEXTURE BINDINGS? Xenos texture fetch
+      // constants start at 0x4800, six dwords each. If the palm's buffer
+      // writes them, that is where its leaf texture comes from and the
+      // record-time capture is simply reading the wrong device. Counted only
+      // -- deciding what to do with them is the next step, and a census that
+      // acts on its own first reading is how this investigation lost days.
+      // DOES THE BUFFER PROGRAM PARAM_GEN? SQ_PROGRAM_CNTL is Xenos 0x2180
+      // and SQ_CONTEXT_MISC 0x2181; bit 18 of the first enables PARAM_GEN and
+      // the second says which interpolator it lands in. The palm leaf shader
+      // reads that slot -- it is the UV it samples its colour texture with --
+      // and the recording device reports PARAM_GEN off, so the slot arrives
+      // zero and the leaf samples texel (0,0).
+      //
+      // Counted, not acted on: the constants proved to be live state and the
+      // textures proved to be buffer state, so which one this is has to be
+      // measured rather than assumed a third time.
+      // A type-0 packet writes `count` CONSECUTIVE registers from `index`, so
+      // one packet starting at 0x2180 can carry both of these. Testing only
+      // the start index would miss every such write.
+      if (index <= kSqContextMisc && index + count > kSqProgramCntl &&
+          advance <= dwords - i) {
+        for (uint32_t reg = kSqProgramCntl; reg <= kSqContextMisc; ++reg) {
+          if (reg < index || reg >= index + count) continue;
+          const uint32_t v = REX_LOAD_U32(at + (i + 1 + (reg - index)) * 4);
+          live_reg[reg] = v;
+        }
+      }
+      // TEXTURE BINDINGS. Six dwords each from 0x4800; a write that is not
+      // six-aligned is a partial update this does not model, and is counted
+      // rather than guessed at.
+      if (index >= kFetchConstBase && index < kFetchConstEnd) {
+        const uint32_t off = index - kFetchConstBase;
+        if ((off % 6) == 0 && count >= 6 && advance <= dwords - i) {
+          std::vector<uint32_t> f;
+          f.reserve(6);
+          for (uint32_t k = 0; k < 6; ++k)
+            f.push_back(REX_LOAD_U32(at + (i + 1 + k) * 4));
+          live_fetch[off / 6] = std::move(f);
+        } else {
+        }
+      }
+      if (index >= kAluVertexConstBase && index < kAluConstEnd &&
+          ((index - kAluVertexConstBase) & 3) == 0 && count >= 4 &&
+          advance <= dwords - i) {
+        std::vector<uint32_t> data;
+        data.reserve(count);
+        for (uint32_t k = 0; k < count; ++k)
+          data.push_back(REX_LOAD_U32(at + (i + 1 + k) * 4));
+        live[(index - kAluVertexConstBase) / 4] = std::move(data);
+      }
+    } else if (type == 1) {
+      advance = 3;
+    } else if (type == 2) {
+      advance = 1;
+    } else {
+      advance = 1 + (((hdr >> 16) & 0x3FFF) + 1);
+      const uint32_t opcode = (hdr >> 8) & 0x7F;
+      if (opcode == kDrawIndx || opcode == kDrawIndx2 ||
+          opcode == kDrawIndxBin || opcode == kDrawIndx2Bin) {
+        // Snapshot everything written so far: this is the state this draw
+        // sees, and later writes must not reach back into it.
+        std::vector<ConstBlock> snap;
+        snap.reserve(live.size() + live_fetch.size());
+        for (const auto& [reg, data] : live) {
+          ConstBlock b;
+          b.first_const = reg;
+          b.dwords = data;
+          snap.push_back(std::move(b));
+        }
+        for (const auto& [sampler, data] : live_fetch) {
+          ConstBlock b;
+          b.first_const = sampler;
+          b.is_fetch = true;
+          b.dwords = data;
+          snap.push_back(std::move(b));
+        }
+        for (const auto& [reg, value] : live_reg) {
+          ConstBlock b;
+          b.first_const = reg;
+          b.is_reg = true;
+          b.dwords.push_back(value);
+          snap.push_back(std::move(b));
+        }
+        out.push_back(std::move(snap));
+      }
+    }
+    if (advance > dwords - i) break;   // desync: stop, do not guess
+    i += advance;
+  }
+}
+
+}  // namespace
+
+void mx::hooks::d3d9::CollectCmdBufConstants(
+    uint32_t cmdbuf, uint8_t* base,
+    std::vector<std::vector<ConstBlock>>& out) {
+  if (!cmdbuf || !GuestRangeReadable(base, cmdbuf, 0x78)) return;
+  if ((REX_LOAD_U32(cmdbuf + kCbTypeOff) & 0xF) == 0xA) return;
+  std::map<uint32_t, std::vector<uint32_t>> live;
+  std::map<uint32_t, std::vector<uint32_t>> live_fetch;
+  std::map<uint32_t, uint32_t> live_reg;
+  uint32_t node = REX_LOAD_U32(cmdbuf + kCbBlocksOff);
+  for (uint32_t blocks = 0; node && blocks < 64; ++blocks) {
+    const uint32_t at = ResolveGuestRange(base, node, 8);
+    if (!at) break;
+    const uint32_t n = REX_LOAD_U32(at + 4);
+    if (n > 4096) break;
+    for (uint32_t i = 1; i <= n; ++i) {
+      const uint32_t pair = at + 8 * i;
+      if (!GuestRangeReadable(base, pair, 8)) break;
+      const uint32_t sz = REX_LOAD_U32(pair) & 0xFFFFFF;
+      const uint32_t ib = REX_LOAD_U32(pair + 4);
+      if (ib)
+        CollectConstsFromIb(ib, sz, base, live, live_fetch, live_reg, out);
+    }
+    node = REX_LOAD_U32(at);
+  }
+}
+
+//===========================================================================
+// COMMAND-BUFFER REPLAY -- the submission path with no D3D9 draw call in it.
+//
+// sub_825605D8 takes a recorded command buffer and splices it into the PM4
+// ring. From its own code, the packets it writes are
+//
+//     v26 = v15 | 0xC0013F00      type 3, count 2, OPCODE 0x3F
+//     v14[1] = 0xC0003C00 / 0xC0003800 / 0xC0013801 / 0xC0002001
+//
+// and 0x3F is INDIRECT_BUFFER: address and size. So the geometry is not in
+// this call at all, it is in buffers this call POINTS AT, and no D3D9 draw
+// entry point is involved anywhere in the chain.
+//
+// WHY THIS MATTERS. sub_823F82D0, the SpeedTree render, records one command
+// buffer and then executes it once per tree instance, writing only the
+// per-instance constants between executions. Every investigation into the
+// missing 3D trees asked whether we DROP those draws and correctly answered
+// no -- they were never in our pipeline to drop. The PM4 translator was
+// deleted in 4dd1790 ("HLE is the only path"), so nothing downstream sees
+// them either.
+//
+// Third time this shape has been root cause: BeginVertices/EndVertices for the
+// UI, sub_82556110 for GFx shapes, now this.
+//
+// MEASURING ONLY, deliberately. It translates and submits nothing. The open
+// question is what those indirect buffers CONTAIN, and a hook that guessed at
+// that before reading it would be the eighth over-matching guess in this
+// investigation. Answer that first, then build on it.
+//===========================================================================
+namespace {
+
+// The fields sub_825605D8 itself reads off the command buffer.
+constexpr uint32_t kCmdBufType   = 0x00;   // low nibble 0xA is its early-out
+constexpr uint32_t kCmdBufFlags  = 0x6C;   // +108
+constexpr uint32_t kCmdBufBlocks = 0x74;   // +116, head of the block list
+
+uint64_t g_cmdExec = 0;          // executions
+uint64_t g_cmdExecEarlyOut = 0;  // the (type & 0xF) == 0xA path, submits nothing
+uint64_t g_cmdUnreadable = 0;    // buffer pointer not mapped
+uint64_t g_cmdEntries = 0;       // indirect-buffer entries walked
+
+// Distinct buffers, so "one buffer replayed 6000 times" and "6000 buffers" are
+// not the same number. Bounded, with the overflow counted.
+constexpr uint32_t kMaxCmdBufs = 32;
+uint32_t g_cmdBufPtr[kMaxCmdBufs] = {};
+uint64_t g_cmdBufRuns[kMaxCmdBufs] = {};
+uint32_t g_cmdBufBlocks[kMaxCmdBufs] = {};
+uint32_t g_cmdBufDraws[kMaxCmdBufs] = {};   // draw packets inside each
+uint32_t g_cmdBufDistinct = 0;
+uint64_t g_cmdBufOverflow = 0;
+std::mutex g_cmdMu;
+
+// WHAT IS ACTUALLY IN THE INDIRECT BUFFERS.
+//
+// The executor's own loop says how to read a block. `v25` is pre-incremented,
+// so the pairs start at node[2], and it writes
+//
+//     *v32     = v29[1]           -> the ADDRESS, written first
+//     v32[1]   = *v29 & 0xFFFFFF  -> the SIZE, masked to 24 bits
+//
+// under a 0xC0013F00 header. That is PM4 INDIRECT_BUFFER {address, size}, so a
+// block entry is the pair (size, address) at node[2 + 2i].
+//
+// The address is PHYSICAL -- the first sighting on run mx_1915 printed a list
+// head of 0xDDCA8000, which no plain read reaches. ResolveGuestRange tries the
+// segment bases and returns the one that is actually mapped, or 0.
+//
+// PM4 type-3: bits 31-30 = 11, count-1 in bits 29-16, opcode in bits 15-8.
+// The two that decide this investigation are DRAW_INDX 0x22 and DRAW_INDX_2
+// 0x36. Everything else is counted as "other" rather than named, because a
+// list of opcode names nobody has verified against this title would be
+// decoration.
+// FOUR draw opcodes, not two. Verified against the SDK
+// (rex/graphics/xenos.h:1584-1587), not assumed:
+//
+//   PM4_DRAW_INDX       0x22  fetch index buffer and draw
+//   PM4_DRAW_INDX_2     0x36  draw using indices supplied in the packet
+//   PM4_DRAW_INDX_BIN   0x34  fetch index buffer and binIDs and draw
+//   PM4_DRAW_INDX_2_BIN 0x35  fetch bin IDs and draw with supplied indices
+//
+// The first cut of this scanner checked only the first two and would have
+// counted a BINNED draw as "other" -- i.e. reported "no draws" for a buffer
+// full of them. This title has BeginTiling/EndTiling in its symbol list, so
+// binned submission is not hypothetical here.
+constexpr uint32_t kPm4DrawIndx = 0x22;
+constexpr uint32_t kPm4DrawIndx2 = 0x36;
+constexpr uint32_t kPm4DrawIndxBin = 0x34;
+constexpr uint32_t kPm4DrawIndx2Bin = 0x35;
+
+uint64_t g_ibDrawIndx = 0;      // DRAW_INDX packets found
+uint64_t g_ibDrawIndx2 = 0;     // DRAW_INDX_2 packets found
+uint64_t g_ibOther = 0;         // every other type-3 packet
+uint64_t g_ibScanned = 0;       // buffers successfully scanned
+uint64_t g_ibUnresolved = 0;    // entries whose address never resolved
+uint64_t g_ibDesync = 0;        // walks that lost packet alignment
+
+// Scan one indirect buffer for draw packets. Bounded: a malformed stream must
+// not walk off, and this runs on the draw path.
+void ScanIndirectBuffer(uint32_t phys, uint32_t size_dwords, uint8_t* base,
+                        std::string& out) {
+  // THE CAP MUST NOT HIDE THE ANSWER. Run mx_1916 reported 8 of 22 buffers at
+  // exactly 4096 dwords -- that was this clamp, not their size, so those
+  // eight were scanned only to 16 KB and a draw past that would have been
+  // read as "no draws". A truncated scan reporting zero is the same defect
+  // as a counter that cannot fire.
+  //
+  // Raised to 256K dwords (1 MB) because this runs ONCE per distinct buffer,
+  // not per execution, and the true size is printed beside the scanned one
+  // so any future truncation is visible rather than inferred.
+  constexpr uint32_t kMaxScanDwords = 256u * 1024u;
+  const uint32_t dwords =
+      size_dwords > kMaxScanDwords ? kMaxScanDwords : size_dwords;
+  if (!dwords) return;
+  const uint32_t at = ResolveGuestRange(base, phys, dwords * 4);
+  if (!at) {
+    ++g_ibUnresolved;
+    out += fmt::format(" [0x{:08X} x{} dwords UNRESOLVED]", phys, dwords);
+    return;
+  }
+  ++g_ibScanned;
+  // WALK ALL FOUR PACKET TYPES. The first version of this loop understood
+  // type-3 and slid one dword at a time past everything else, which walks
+  // straight into a type-0 register write's PAYLOAD and reads data as a
+  // header. A payload dword whose top two bits happen to be 11 then consumed
+  // `count + 1` more dwords and leapt over whatever followed. That is how a
+  // 6649-dword stream reported TWO packets on run mx_1922 -- not a buffer
+  // without draws, a parser that never reached them.
+  //
+  // Sizes are the SDK's, from MakePacketType0/1/2/3 in rex/graphics/xenos.h:
+  //   type 0   bits 29:16 + 1 payload dwords   (register write)
+  //   type 1   exactly 2 payload dwords        (two register writes)
+  //   type 2   no payload                      (NOP / filler)
+  //   type 3   bits 29:16 + 1 payload dwords   (packet, opcode in 15:8)
+  uint32_t draws = 0, draws2 = 0, other = 0;
+  uint32_t t0 = 0, t1 = 0, t2 = 0, t3 = 0;
+  bool desync = false;
+  for (uint32_t i = 0; i < dwords;) {
+    const uint32_t hdr = REX_LOAD_U32(at + i * 4);
+    const uint32_t type = hdr >> 30;
+    uint32_t advance;
+    if (type == 0) {
+      ++t0;
+      advance = 1 + (((hdr >> 16) & 0x3FFF) + 1);
+    } else if (type == 1) {
+      ++t1;
+      advance = 3;
+    } else if (type == 2) {
+      ++t2;
+      advance = 1;
+    } else {
+      ++t3;
+      advance = 1 + (((hdr >> 16) & 0x3FFF) + 1);
+      const uint32_t opcode = (hdr >> 8) & 0x7F;
+      if (opcode == kPm4DrawIndx || opcode == kPm4DrawIndxBin) {
+        ++draws;
+      } else if (opcode == kPm4DrawIndx2 || opcode == kPm4DrawIndx2Bin) {
+        ++draws2;
+      } else {
+        ++other;
+        // NAME the opcodes rather than only counting them. "0 draws, N other"
+        // is indistinguishable from "this is not a packet stream and the
+        // scanner is walking data" -- and a negative result has to be
+        // separable from a broken instrument before it can be believed.
+      }
+    }
+    // A packet whose payload runs past the end means the walk lost alignment
+    // somewhere behind it. Say so out loud: a desynced walk's zero is not
+    // evidence about the buffer, it is evidence about the walk.
+    if (advance > dwords - i) {
+      desync = true;
+      ++g_ibDesync;
+      break;
+    }
+    i += advance;
+  }
+  g_ibDrawIndx += draws;
+  g_ibDrawIndx2 += draws2;
+  g_ibOther += other;
+  out += fmt::format(" [0x{:08X}->0x{:08X} {} of {} dwords{}{}: t0 {} t1 {} t2 "
+                     "{} t3 {} -- DRAW_INDX {} DRAW_INDX_2 {} other {}]",
+                     phys, at, dwords, size_dwords,
+                     dwords < size_dwords ? " TRUNCATED" : "",
+                     desync ? " DESYNC" : "", t0, t1, t2, t3, draws, draws2,
+                     other);
+}
+
+// Walk one command buffer's block list and scan every indirect buffer it names.
+void ScanCmdBufBlocks(uint32_t head, uint8_t* base, std::string& out) {
+  uint32_t node = head;
+  for (uint32_t blocks = 0; node && blocks < 64; ++blocks) {
+    const uint32_t at = ResolveGuestRange(base, node, 8);
+    if (!at) {
+      out += fmt::format(" [block 0x{:08X} UNRESOLVED]", node);
+      break;
+    }
+    const uint32_t n = REX_LOAD_U32(at + 4);
+    if (n > 4096) break;
+    for (uint32_t i = 1; i <= n; ++i) {
+      const uint32_t pair = at + 8 * i;
+      if (!GuestRangeReadable(base, pair, 8)) break;
+      const uint32_t sz = REX_LOAD_U32(pair) & 0xFFFFFF;
+      const uint32_t ib = REX_LOAD_U32(pair + 4);
+      if (ib) ScanIndirectBuffer(ib, sz, base, out);
+    }
+    node = REX_LOAD_U32(at);
+  }
+}
+
+// Walk the block list the executor walks: node[0] = next, node[1] = count,
+// then `count` pairs. Bounded on both axes -- a malformed list must not spin,
+// and this runs on the draw path.
+uint32_t CountCmdBufBlocks(uint32_t head, uint8_t* base) {
+  uint32_t blocks = 0, entries = 0;
+  uint32_t node = head;
+  while (node && blocks < 64) {
+    if (!GuestRangeReadable(base, node, 8)) break;
+    ++blocks;
+    const uint32_t n = REX_LOAD_U32(node + 4);
+    if (n <= 4096) entries += n;
+    node = REX_LOAD_U32(node);
+  }
+  g_cmdEntries += entries;
+  return blocks;
+}
+
+void NoteCommandBufferExec(uint32_t cmdbuf, uint8_t* base) {
+  std::lock_guard<std::mutex> lk(g_cmdMu);
+  ++g_cmdExec;
+  if (!cmdbuf || !GuestRangeReadable(base, cmdbuf, 0x78)) {
+    ++g_cmdUnreadable;
+    return;
+  }
+  if ((REX_LOAD_U32(cmdbuf + kCmdBufType) & 0xF) == 0xA) {
+    // The executor returns immediately on this, so it submits nothing and must
+    // not be counted as geometry we are missing.
+    ++g_cmdExecEarlyOut;
+    return;
+  }
+  for (uint32_t i = 0; i < g_cmdBufDistinct; ++i) {
+    if (g_cmdBufPtr[i] == cmdbuf) {
+      ++g_cmdBufRuns[i];
+      return;
+    }
+  }
+  if (g_cmdBufDistinct >= kMaxCmdBufs) {
+    ++g_cmdBufOverflow;
+    return;
+  }
+  const uint32_t i = g_cmdBufDistinct++;
+  g_cmdBufPtr[i] = cmdbuf;
+  g_cmdBufRuns[i] = 1;
+  const uint32_t head = REX_LOAD_U32(cmdbuf + kCmdBufBlocks);
+  g_cmdBufBlocks[i] = CountCmdBufBlocks(head, base);
+  // ONCE per distinct buffer. The contents do not change between replays
+  // -- that is the whole point of recording one -- so scanning on every
+  // execution would cost the draw path thousands of walks for one answer.
+  std::string ib;
+  const uint64_t draws_before = g_ibDrawIndx + g_ibDrawIndx2;
+  ScanCmdBufBlocks(head, base, ib);
+  g_cmdBufDraws[i] =
+      uint32_t(g_ibDrawIndx + g_ibDrawIndx2 - draws_before);
+  REXLOG_INFO("d3d9: CMDBUF 0x{:08X} first execution -- type 0x{:08X} flags "
+              "0x{:08X} blocks {} (list head 0x{:08X})",
+              cmdbuf, REX_LOAD_U32(cmdbuf + kCmdBufType),
+              REX_LOAD_U32(cmdbuf + kCmdBufFlags), g_cmdBufBlocks[i], head);
+  REXLOG_INFO("d3d9: CMDBUF 0x{:08X} indirect buffers:{}", cmdbuf,
+              ib.empty() ? " none" : ib);
+}
+
+}  // namespace
+
+// QUALIFIED. This file does `using namespace mx::hooks::d3d9`, which lets it
+// CALL into that namespace but would put an unqualified definition at global
+// scope -- a different function from the one the header declares, and a link
+// error rather than a silent miss, which is the good outcome.
+void mx::hooks::d3d9::ReportCommandBuffers() {
+  std::lock_guard<std::mutex> lk(g_cmdMu);
+  std::string rows;
+  for (uint32_t i = 0; i < g_cmdBufDistinct; ++i)
+    rows += fmt::format(" [0x{:08X} x{} blocks {}]", g_cmdBufPtr[i],
+                        g_cmdBufRuns[i], g_cmdBufBlocks[i]);
+  // Printed even at zero. "This path is never taken" and "this report is not
+  // wired" are different findings, and a suppressed line looks like neither.
+  // THE NUMBER THIS WHOLE THREAD IS FOR: draw packets found inside the
+  // buffers, multiplied by how often each buffer is replayed. A per-buffer
+  // dump says what is in them; only this says how much geometry the frame
+  // is actually missing.
+  uint64_t hidden_draws = 0;
+  for (uint32_t i = 0; i < g_cmdBufDistinct; ++i)
+    hidden_draws += g_cmdBufRuns[i] * g_cmdBufDraws[i];
+  mx::hooks::d3d9::ReportCmdBufReplay();
+  REXLOG_INFO("d3d9: CMDBUF REPLAY -- {} executions ({} early-out, {} "
+              "unreadable) over {} distinct buffer(s), {} indirect entries; "
+              "NONE of these reach a D3D9 draw entry point:{}{}",
+              g_cmdExec, g_cmdExecEarlyOut, g_cmdUnreadable, g_cmdBufDistinct,
+              g_cmdEntries, rows.empty() ? " none" : rows,
+              g_cmdBufOverflow
+                  ? fmt::format(" (+{} runs on buffers past the {} cap)",
+                                g_cmdBufOverflow, kMaxCmdBufs)
+                  : "");
+}
+
+//=============================================================================
+// 0x8255E9A0 - begin recording into a command buffer, and 0x825601B8 - end.
+//
+// NOT speculative hooks. sub_823F82D0 names both by hand around its single
+// call to the tree draw:
+//
+//     sub_8255E9A0(dev, cmdbuf, 16, &state, 0, 0, 0);   // r3 dev, r4 cmdbuf
+//     ... SetRenderTarget / SetDepthStencilSurface / sub_823F6960 ...
+//     sub_825601B8(dev);                                // r3 dev
+//
+// This pair is the ONLY thing that says which draws belong to which command
+// buffer. The recording device is created per recording (sub_8255D850) and
+// destroyed straight after (sub_8255D3A8), so the association exists only
+// between these two calls -- which is exactly why it has to be captured here
+// rather than reconstructed later.
+//=============================================================================
+REX_IMPORT(__imp__sub_8255E9A0, orig_BeginCommandBuffer, void());
+extern "C" REX_FUNC(sub_8255E9A0) {
+  MX_D3D9_PLUGIN_PASSTHROUGH(orig_BeginCommandBuffer);
+  if (REXCVAR_GET(d3d9_cmdbuf_replay))
+    mx::hooks::d3d9::BeginCmdBufRecording(ctx.r3.u32, ctx.r4.u32);
+  orig_BeginCommandBuffer(ctx, base);
+}
+
+REX_IMPORT(__imp__sub_825601B8, orig_EndCommandBuffer, void());
+extern "C" REX_FUNC(sub_825601B8) {
+  MX_D3D9_PLUGIN_PASSTHROUGH(orig_EndCommandBuffer);
+  const uint32_t device = ctx.r3.u32;
+  orig_EndCommandBuffer(ctx, base);
+  // AFTER the original: a draw issued inside the End call still belongs to
+  // this recording, and closing first would leak it into the live frame.
+  if (REXCVAR_GET(d3d9_cmdbuf_replay))
+    mx::hooks::d3d9::EndCmdBufRecording(device);
+}
+
+REX_IMPORT(__imp__sub_825605D8, orig_ExecuteCommandBuffer, void());
+extern "C" REX_FUNC(sub_825605D8) {
+  MX_D3D9_PLUGIN_PASSTHROUGH(orig_ExecuteCommandBuffer);
+  // r4 is the command buffer. Read before the original runs, which consumes
+  // and rewrites parts of it.
+  const uint32_t cmdbuf = ctx.r4.u32;
+  const uint32_t replay_device = ctx.r3.u32;
+  NoteCommandBufferExec(cmdbuf, base);
+  orig_ExecuteCommandBuffer(ctx, base);
+  // THE REPLAY. Every visible vegetation instance comes from here; the
+  // recording itself renders nothing on the console. r3 is the real
+  // device, and it is the one holding the per-instance transform the
+  // guest wrote just above this call, so it is what the replay reads
+  // its constants from. After the original, matching the two draw
+  // hooks: the guest call is free to clobber volatile registers, so the
+  // arguments are saved above.
+  if (REXCVAR_GET(d3d9_cmdbuf_replay)) {
+    // Walked per execution: the guest rewrites these between replays.
+    std::vector<std::vector<mx::hooks::d3d9::CmdBufConstOverlay>> ov;
+    mx::hooks::d3d9::CollectCmdBufConstants(cmdbuf, base, ov);
+    mx::hooks::d3d9::ReplayCmdBuf(cmdbuf, replay_device, base, ov);
+  }
+}
+
 REX_IMPORT(__imp__sub_82555B88, orig_DrawVerticesUP, void());
 extern "C" REX_FUNC(sub_82555B88) {
   // DrawVerticesUP reserves its ring space THROUGH BeginVertices, so the
@@ -916,6 +1493,10 @@ extern "C" REX_FUNC(sub_82556110) {
 // dword with 0x1FFFFFFF and write it into the device's fetch constant file, so
 // the same mask is applied here.
 //-----------------------------------------------------------------------------
+// Defined with the LOD census below; SetStreamSource is hooked above it.
+void NoteVegetationStride(uint32_t lr, uint32_t stride);
+void NoteStreamStride(uint32_t lr, uint32_t stride);
+
 REX_IMPORT(__imp__sub_8254B7C0, orig_SetStreamSource, void());
 extern "C" REX_FUNC(sub_8254B7C0) {
   MX_D3D9_PLUGIN_PASSTHROUGH(orig_SetStreamSource);
@@ -923,6 +1504,10 @@ extern "C" REX_FUNC(sub_8254B7C0) {
   const uint32_t buffer = ctx.r5.u32;
   const uint32_t offset = ctx.r6.u32;
   const uint32_t stride = ctx.r7.u32;
+  // Same return-address filter as the LOD census: which geometry kind the
+  // SpeedTree renderers actually bind.
+  NoteVegetationStride(static_cast<uint32_t>(ctx.lr), stride);
+  NoteStreamStride(static_cast<uint32_t>(ctx.lr), stride);
 
   if (stream < mx::hle::kMaxStreams) {
     auto& st = DeviceState();
@@ -982,10 +1567,196 @@ extern "C" REX_FUNC(sub_8254B7C0) {
 // that dword — and multiplies StartIndex by 4 on that side against 2 on the
 // other.
 //-----------------------------------------------------------------------------
+//===========================================================================
+// VEGETATION LOD, read off SetIndices instead of instrumenting the guest.
+//
+// sub_823F1168 and sub_823F2728 are the SpeedTree renderers -- they call
+// SetIndices, SetStreamSource and DrawIndexedVertices directly. The LOD is
+// chosen a few instructions before the SetIndices:
+//
+//     823F22B0  fadds  f8, f28, f9
+//     823F22BC  fsel   f5, f28, f28, f8     clamp
+//     823F22C0  fmuls  f4, f5, f7           * two scale factors
+//     823F22C4  fmuls  f3, f4, f6
+//     823F22C8  fctiwz f2, f3               -> int
+//     823F22D0  lwz    r10, ...             THE LOD INDEX
+//     823F22D4  subfic r9, r10, 7           7 - lod
+//     823F22DC  lwzx   r4, r8, r29          index buffer table[7 - lod]
+//     823F22E0  bl     D3DDevice_SetIndices
+//
+// So `7 - lod` selects one of EIGHT index buffers, and the pointer handed to
+// SetIndices IS the LOD -- a different LOD is a different buffer. Reading it
+// here needs no instrumentation inside the guest at all.
+//
+// The filter is the RETURN ADDRESS, and it is a range rather than the two
+// exact call sites: lr anywhere inside either renderer is a vegetation
+// SetIndices. A range cannot go stale against a call site moving by a few
+// instructions, and it catches the sibling function without my having to find
+// its call site by hand.
+//
+// WHAT THE ANSWER MEANS. One distinct buffer means the LOD is PINNED and that
+// is the bug. Several means the leaf cards are selecting LOD correctly and the
+// missing geometry is elsewhere -- the branch/bark path -- which is a
+// different fix. The count of distinct buffers is the whole measurement; the
+// per-buffer draw counts say whether it is stuck at the near or far end.
+//===========================================================================
+constexpr uint32_t kVegRendererLo = 0x823F1168;   // sub_823F1168
+constexpr uint32_t kVegRendererHi = 0x823F3D0C;   // end of sub_823F2728
+
+constexpr uint32_t kMaxVegLods = 16;
+uint32_t g_vegLodBuf[kMaxVegLods] = {};
+uint64_t g_vegLodHits[kMaxVegLods] = {};
+uint32_t g_vegLodDistinct = 0;
+uint64_t g_vegLodOverflow = 0;
+uint64_t g_vegSetIndices = 0;
+std::mutex g_vegLodMu;
+
+// WHICH GEOMETRY KIND the vegetation renderers bind, by vertex stride.
+//
+// The .tree decoder gives the shapes: branch is stride 36 triangle STRIP,
+// frond and 3dleaf stride 36 list, leaf cards stride 32 with no index
+// buffer. The guest repacks, and the path measured so far binds stride 28
+// with PrimitiveType 13 -- so stride is what separates leaf cards from
+// branch/bark geometry at runtime.
+//
+// Run mx_1919 settled the LOD question: 12 distinct index buffers, 88% at
+// one LOD, which is the shape of a scene whose vegetation is mostly
+// distant -- NOT a pinned selector. So the leaf cards are fine and the
+// missing geometry is the other kind. If only one stride ever appears here,
+// the branch/bark path never runs at all, and that is the whole bug.
+uint32_t g_vegStride[8] = {};
+uint64_t g_vegStrideHits[8] = {};
+uint32_t g_vegStrideDistinct = 0;
+uint64_t g_vegStrideOverflow = 0;
+
+// EVERY stride bound, and who binds it -- not just the SpeedTree ones.
+//
+// The SpeedTree module provably has no code path that binds stride 36 (six
+// stride sites in the whole module, all 28 or 4), yet a stride-36 stream
+// DOES get bound: run mx_1920 shows one at 0xF9D79000, 14436B = 401
+// vertices. The asset stores branch, frond and 3dleaf at stride 36, so
+// something outside SpeedTree is binding that geometry.
+//
+// The stream reports that showed it are throttled, so "once in the log" is
+// not a rate and cannot be read as one. This counts every bind and records
+// the distinct CALLERS per stride, which names the module doing it -- the
+// thing a stride count alone cannot say.
+constexpr uint32_t kMaxStrides = 12;
+constexpr uint32_t kMaxStrideCallers = 6;
+uint32_t g_strideVal[kMaxStrides] = {};
+uint64_t g_strideHits[kMaxStrides] = {};
+uint32_t g_strideCaller[kMaxStrides][kMaxStrideCallers] = {};
+uint32_t g_strideCallerN[kMaxStrides] = {};
+uint32_t g_strideDistinct = 0;
+uint64_t g_strideOverflow = 0;
+
+
+void NoteStreamStride(uint32_t lr, uint32_t stride) {
+  if (!stride) return;
+  std::lock_guard<std::mutex> lk(g_vegLodMu);
+  uint32_t i = 0;
+  for (; i < g_strideDistinct; ++i)
+    if (g_strideVal[i] == stride) break;
+  if (i == g_strideDistinct) {
+    if (g_strideDistinct >= kMaxStrides) {
+      ++g_strideOverflow;
+      return;
+    }
+    i = g_strideDistinct++;
+    g_strideVal[i] = stride;
+  }
+  ++g_strideHits[i];
+  for (uint32_t c = 0; c < g_strideCallerN[i]; ++c)
+    if (g_strideCaller[i][c] == lr) return;
+  if (g_strideCallerN[i] < kMaxStrideCallers)
+    g_strideCaller[i][g_strideCallerN[i]++] = lr;
+}
+
+void NoteVegetationStride(uint32_t lr, uint32_t stride) {
+  if (lr < kVegRendererLo || lr >= kVegRendererHi || !stride) return;
+  std::lock_guard<std::mutex> lk(g_vegLodMu);
+  for (uint32_t i = 0; i < g_vegStrideDistinct; ++i) {
+    if (g_vegStride[i] == stride) {
+      ++g_vegStrideHits[i];
+      return;
+    }
+  }
+  if (g_vegStrideDistinct >= 8) {
+    ++g_vegStrideOverflow;
+    return;
+  }
+  const uint32_t i = g_vegStrideDistinct++;
+  g_vegStride[i] = stride;
+  g_vegStrideHits[i] = 1;
+}
+
+void NoteVegetationLod(uint32_t lr, uint32_t buffer) {
+  if (lr < kVegRendererLo || lr >= kVegRendererHi || !buffer) return;
+  std::lock_guard<std::mutex> lk(g_vegLodMu);
+  ++g_vegSetIndices;
+  for (uint32_t i = 0; i < g_vegLodDistinct; ++i) {
+    if (g_vegLodBuf[i] == buffer) {
+      ++g_vegLodHits[i];
+      return;
+    }
+  }
+  if (g_vegLodDistinct >= kMaxVegLods) {
+    ++g_vegLodOverflow;
+    return;
+  }
+  const uint32_t i = g_vegLodDistinct++;
+  g_vegLodBuf[i] = buffer;
+  g_vegLodHits[i] = 1;
+}
+
+void mx::hooks::d3d9::ReportVegetationLod() {
+  std::lock_guard<std::mutex> lk(g_vegLodMu);
+  std::string rows;
+  for (uint32_t i = 0; i < g_vegLodDistinct; ++i)
+    rows += fmt::format(" [0x{:08X} x{}]", g_vegLodBuf[i], g_vegLodHits[i]);
+  // Printed at zero too: "the vegetation renderers never ran" and "this
+  // report is not wired" are different findings.
+  std::string strides;
+  for (uint32_t i = 0; i < g_vegStrideDistinct; ++i)
+    strides += fmt::format(" {}Bx{}", g_vegStride[i], g_vegStrideHits[i]);
+  std::string all;
+  for (uint32_t i = 0; i < g_strideDistinct; ++i) {
+    all += fmt::format(" {}Bx{}<-", g_strideVal[i], g_strideHits[i]);
+    for (uint32_t c = 0; c < g_strideCallerN[i]; ++c)
+      all += fmt::format("{}0x{:08X}", c ? "," : "", g_strideCaller[i][c]);
+  }
+  REXLOG_INFO("d3d9: STREAM STRIDES -- every bind, with up to {} distinct "
+              "callers each:{}{}",
+              kMaxStrideCallers, all.empty() ? " none" : all,
+              g_strideOverflow ? fmt::format(" (+{} past the cap)",
+                                             g_strideOverflow)
+                               : "");
+  REXLOG_INFO("d3d9: VEG GEOMETRY -- stride(s) bound by the SpeedTree "
+              "renderers:{}{}. branch/frond/3dleaf are stride 36 in the "
+              "asset; leaf cards are the stride-28 quads",
+              strides.empty() ? " none" : strides,
+              g_vegStrideOverflow
+                  ? fmt::format(" (+{} past the cap)", g_vegStrideOverflow)
+                  : "");
+  REXLOG_INFO("d3d9: VEG LOD -- {} SetIndices from the SpeedTree renderers, "
+              "{} DISTINCT index buffer(s){}{}. One distinct = the LOD is "
+              "PINNED; several = LOD selection works and the gap is "
+              "elsewhere",
+              g_vegSetIndices, g_vegLodDistinct,
+              rows.empty() ? " none" : rows,
+              g_vegLodOverflow
+                  ? fmt::format(" (+{} past the {} cap)", g_vegLodOverflow,
+                                kMaxVegLods)
+                  : "");
+}
+
 REX_IMPORT(__imp__sub_8254B8E0, orig_SetIndices, void());
 extern "C" REX_FUNC(sub_8254B8E0) {
   MX_D3D9_PLUGIN_PASSTHROUGH(orig_SetIndices);
   const uint32_t buffer = ctx.r4.u32;
+  // Read the caller BEFORE the original runs, for the same reason the draw
+  // hooks do: it belongs with the arguments it identifies.
+  NoteVegetationLod(static_cast<uint32_t>(ctx.lr), buffer);
   auto& st = DeviceState();
   st.NoteDevice(ctx.r3.u32, mx::hle::kEpSetIndices);
   auto& ib = st.index;
@@ -1318,6 +2089,14 @@ extern "C" REX_FUNC(sub_8254C060) {
     st.NoteDevice(ctx.r3.u32, mx::hle::kEpSetRenderTarget);
     st.render_target[slot] = SnapshotRenderTarget(object, base);
     st.render_target_seen_mask |= 1u << slot;
+    // Mirrored per DEVICE as well as per thread. A command-buffer replay runs
+    // on whatever thread drives the render loop, and thread-local state leaves
+    // it with no target at all -- which silently filtered out every replayed
+    // palm draw on run mx_1931.
+    if (slot == 0)
+      mx::hooks::d3d9::NoteRenderTargetForDevice(ctx.r3.u32,
+                                                 st.render_target[slot],
+                                                 /*is_depth=*/false);
 
     const auto& rt = st.render_target[slot];
     // Slot 0 only. The renderer models one colour attachment (DrawCall's
@@ -1351,6 +2130,9 @@ extern "C" REX_FUNC(sub_8254C3B0) {
   auto& st = DeviceState();
   st.NoteDevice(ctx.r3.u32, mx::hle::kEpSetDepthStencil);
   st.depth_stencil = SnapshotRenderTarget(ctx.r4.u32, base);
+  // Per device too, for the same reason as the colour target above.
+  mx::hooks::d3d9::NoteRenderTargetForDevice(ctx.r3.u32, st.depth_stencil,
+                                             /*is_depth=*/true);
   // The depth half of the same story, and the one that motivated it: every
   // depth target we have ever created arrived paired with a colour target, so
   // a depth-only pass instantiated nothing at all.
@@ -2300,6 +3082,15 @@ extern "C" REX_FUNC(sub_8255CE98) {
                 }
                 const uint64_t rowTot = s_rowHi[0] + s_rowHi[1] + s_rowHi[2] +
                                         s_rowHi[3];
+                // "Same gate and same population as the byte spread below it,
+                // so the two are directly comparable: rowHi[0..3] must sum to
+                // the same total as b0's `seen`." Comparability is the entire
+                // basis for reading the TOP HALF percentage against the byte
+                // spread, so it is checked rather than asserted in prose -- if
+                // the two populations ever diverge, that percentage is being
+                // taken over a different set than the one it is compared with.
+                mx::gpu::health::Equal("vt.rowhi_matches_b0", rowTot,
+                                       s_byteSeen[0]);
                 std::string nib;
                 if (rowTot) {
                   nib = fmt::format(

@@ -41,7 +41,20 @@ using mx::hle::kMaxElements;   // refuses to walk a runaway array
 
 // ---- Shared constants -----------------------------------------------------
 
-constexpr int kMaxTrackedDecls = 256;
+// A declaration is never destroyed as far as this table is concerned: there is
+// no Release hook, so an entry is only ever added. 256 was a silent cliff --
+// RecordDeclaration returned -1 past it, which made every draw using a later
+// declaration look like one with no declaration bound, which BuildHleDraw
+// refuses as kNoLayout and the hook then drops with a bare `return`. Assets
+// streamed in later therefore stopped rendering with no report of any kind,
+// the same shape as the snapshot map that leaked a set per map load until its
+// 128 cap killed water and lighting.
+//
+// Raised, and exhaustion is now reported by name at the point it happens. The
+// table is flat arrays scanned linearly by KnownDeclId, so this trades a
+// larger scan for not losing draws; the scan is once per CreateVertexDeclaration
+// and per draw, not per vertex.
+constexpr int kMaxTrackedDecls = 4096;
 constexpr int kMaxDeclsLogged = 512;
 constexpr int kMaxDrawsLogged = 16;
 constexpr uint32_t kD3d9ConstRegs = 256;
@@ -289,6 +302,44 @@ struct PendingHleDraw {
 
 // ---- Draw building --------------------------------------------------------
 
+// Command-buffer record and replay. sub_823F82D0 records vegetation once
+// into a guest command buffer and replays it per instance; see the block
+// comment above FinishHleDraw for the full chain.
+void BeginCmdBufRecording(uint32_t device, uint32_t cmdbuf);
+void EndCmdBufRecording(uint32_t device);
+uint32_t CmdBufForDevice(uint32_t device);
+bool CaptureDrawIfRecording(uint32_t device, mx::hle::DrawCall& dc);
+void NoteCmdBufDeferredDraw();
+// One block of ALU constants written inside a recorded command buffer.
+// sub_82550208 emits these as PM4 type-0 packets whose payload is the data.
+struct CmdBufConstOverlay {
+  // ALU constant index when !is_fetch (0..255 vertex, 256..511 pixel), or the
+  // sampler index when is_fetch.
+  uint32_t first_const = 0;
+  // A TEXTURE FETCH CONSTANT rather than an ALU one: six dwords describing a
+  // texture binding, from Xenos register 0x4800 + sampler*6. The recorded
+  // buffers carry 354,640 of these per run, and they are the only reliable
+  // source for a replayed draw's textures -- see the note in ReplayCmdBuf.
+  bool is_fetch = false;
+  // A RAW XENOS REGISTER the buffer programmed, with first_const holding the
+  // register index and dwords[0] its value. Only the shader-program registers
+  // are collected: the recorded buffers write SQ_PROGRAM_CNTL 51,272 times a
+  // run and 27,816 of those enable PARAM_GEN, which neither device reports.
+  bool is_reg = false;
+  std::vector<uint32_t> dwords;
+};
+
+// The constant state in effect at each DRAW_INDX in the buffer, in stream
+// order: entry i is everything written before draw i. Ordered, because a
+// single flat list applied to every draw gives draw 1 draw 27's transform.
+void CollectCmdBufConstants(
+    uint32_t cmdbuf, uint8_t* base,
+    std::vector<std::vector<CmdBufConstOverlay>>& out);
+
+uint32_t ReplayCmdBuf(uint32_t cmdbuf, uint32_t device, uint8_t* base,
+                      const std::vector<std::vector<CmdBufConstOverlay>>& ov);
+void ReportCmdBufReplay();
+
 void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
                        uint32_t count, int32_t base_vertex, uint32_t device,
                        uint8_t* base, const UpVertexData* up = nullptr);
@@ -323,11 +374,43 @@ void NoteDrawDeclaration(uint32_t device, uint8_t* base);
 
 extern bool g_declLayoutOk[kMaxTrackedDecls];
 extern mx::hle::LayoutError g_declLayoutErr[kMaxTrackedDecls];
+// Declarations that arrived after the table was full, and declarations whose
+// address was reused by the guest for a different element list. Both used to be
+// silent; both cost draws.
+extern uint64_t g_declTableFull;
+extern uint64_t g_declRebuilt;
 extern int g_patchDecl;
 
 // ---- Shaders --------------------------------------------------------------
 
+// Repairs the pixel constant bank read off the device: overlays the
+// shader's own load tables and replaces the non-finite registers the
+// device shadow never held. The raw read alone leaves NaNs in it.
+// Fills one texture slot of a draw from the DEVICE's live texture fetch
+// constants. The replay re-runs this so a replayed draw samples the
+// texture bound when it executes, not the one bound while it was
+// recorded.
+bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
+                             uint32_t guest_sampler, uint32_t device,
+                             uint8_t* base, bool vertex = false,
+                             uint32_t stage_handle_hint = 0,
+                             const uint32_t* fetch_override = nullptr);
+
+void ApplyPixelShaderLoadTable(uint32_t shader, uint32_t device,
+                               uint8_t* base,
+                               std::vector<uint32_t>& bank);
+
 void NotePixelShaderForDevice(uint32_t device, uint32_t shader);
+
+// The colour and depth surfaces bound on a DEVICE, mirroring the
+// thread-local DeviceState copy. Needed because a command-buffer replay
+// can run on a thread that never bound one, and a draw with no target is
+// filtered out by surface rather than drawn.
+void NoteRenderTargetForDevice(uint32_t device,
+                               const mx::hle::RenderTargetBinding& rt,
+                               bool is_depth);
+bool RenderTargetForDevice(uint32_t device, mx::hle::RenderTargetBinding& out,
+                           bool is_depth);
 void CollectPixelShaderBlob(uint32_t handle, uint8_t* base);
 uint32_t ReadPatchFetchCount(uint32_t self, uint32_t variant, uint8_t* base);
 void PredictPatchedFetches(uint32_t self, uint32_t dest, uint32_t decl,
@@ -475,6 +558,12 @@ std::ofstream& DeclFile();
 void DumpHleDraw(bool indexed, uint64_t n, uint32_t prim, int32_t base_vertex,
                  uint32_t start, uint32_t count);
 void ReportDrawCounts(uint8_t* base);
+// Command-buffer replay: the guest submission path that emits PM4 directly
+// and touches no D3D9 draw entry point. Defined in hooks_d3d9_entry.cpp.
+void ReportCommandBuffers();
+// Which vegetation LOD the SpeedTree renderers select, read off the index
+// buffer they bind. Defined in hooks_d3d9_entry.cpp.
+void ReportVegetationLod();
 
 
 }  // namespace mx::hooks::d3d9

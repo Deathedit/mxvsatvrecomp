@@ -117,7 +117,6 @@ uint64_t g_filledByConst[kAluConstants] = {};
 // with is sane -- and the last attempt at this substitution was reverted for
 // spraying end-of-frame garbage. Recording the value makes that checkable
 // BEFORE turning anything on.
-uint32_t g_wouldFillVal[kFileDwords] = {};
 // Substitutions actually APPLIED in the narrow material-gate window, as opposed
 // to g_filledZero which counts the whole dry-run population. Separate because
 // "the window never fires" and "the window fires and changes nothing" are
@@ -140,9 +139,13 @@ constexpr uint32_t kMaterialGateEndConst = 256 + 88;
 //     (468,445 all-zero float4s against 13,520 non-zero). The zero is the
 //     guest's own value, not a hole we failed to fill.
 //   - the (1,1,1,1) that made it look like a white tint is an early-boot value
-//     that g_file's last-write-wins simply never let go of. WOULD-FILL VALUES
-//     kept printing it for the whole run because that report snapshots declined
-//     NON-ZERO values and structurally cannot show a zero.
+//     that g_file's last-write-wins simply never let go of. The WOULD-FILL
+//     VALUES report kept printing it for the whole run because it snapshotted
+//     declined NON-ZERO values and structurally could not show a zero. That
+//     report and its backing array were REMOVED on 2026-08-31 along with the
+//     rest of this closed investigation; the trap is recorded here because the
+//     shape of it -- a diagnostic that cannot express the state you are looking
+//     for -- is what cost the time, not the specific report.
 //   - no shader in legal.rdc reads xe_c[32] at all.
 //   - and the premise underneath was wrong anyway: the legal-screen logo and
 //     the intro are NOT missing. They render. The missing images are elsewhere.
@@ -571,7 +574,6 @@ uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
     // zero by our two modelled sources.
     ++g_filledZero;
     ++g_filledByConst[d >> 2];
-    g_wouldFillVal[d] = v;
 
     // The substitution that used to live here has MOVED to FillMaterialGate,
     // which runs after the shader load table instead of before it. Doing it
@@ -768,12 +770,13 @@ uint32_t FillMaterialGate(uint32_t* bank, uint32_t bank_regs,
 // come back as garbage, the file is stale or misindexed and NOTHING here should
 // be acted on, least of all a blanket substitution.
 std::string FileValues(const uint32_t* consts, size_t n) {
-  // The LIVE contents of g_file, which is not what WouldFillValues shows.
-  // WouldFillValues is a snapshot of values the zero-fill DECLINED, and that
-  // pass skips `v == 0` -- so it structurally cannot report a zero, and keeps
-  // printing the last non-zero it ever saw. In run 1529 it went on saying
-  // c32 = (1,1,1,1) for thirty seconds after the fill had stopped firing,
-  // because the thing that changed was exactly the thing it cannot show.
+  // The LIVE contents of g_file. This is deliberately not the shape the
+  // removed WouldFillValues report had: that one snapshotted values the
+  // zero-fill DECLINED, and its pass skipped `v == 0`, so it structurally could
+  // not report a zero and kept printing the last non-zero it ever saw. In run
+  // 1529 it went on saying c32 = (1,1,1,1) for thirty seconds after the fill
+  // had stopped firing, because the thing that changed was exactly the thing it
+  // could not show. Read a live value, not a snapshot of refusals.
   //
   // `unpub:` marks a component PM4 has never written, which is a different
   // state from a published 0.0 and must not print the same.
@@ -805,31 +808,6 @@ bool FileFloat4(uint32_t c, float* out4) {
     std::memcpy(&out4[i], &g_file[d], sizeof(float));
   }
   return true;
-}
-
-std::string WouldFillValues(const uint32_t* consts, size_t n) {
-  std::lock_guard<std::mutex> lk(g_mu);
-  std::string out;
-  char one[128];
-  for (size_t k = 0; k < n; ++k) {
-    const uint32_t c = consts[k];
-    if (c >= kAluConstants) continue;
-    float f[4];
-    bool any = false;
-    for (uint32_t i = 0; i < 4; ++i) {
-      const uint32_t bits = g_wouldFillVal[c * 4 + i];
-      std::memcpy(&f[i], &bits, 4);
-      if (bits) any = true;
-    }
-    if (c >= 256)
-      std::snprintf(one, sizeof(one), " c%u(ps c%u)=%s(%.4g,%.4g,%.4g,%.4g)", c,
-                    c - 256, any ? "" : "NEVER ", f[0], f[1], f[2], f[3]);
-    else
-      std::snprintf(one, sizeof(one), " c%u(vs)=%s(%.4g,%.4g,%.4g,%.4g)", c,
-                    any ? "" : "NEVER ", f[0], f[1], f[2], f[3]);
-    out += one;
-  }
-  return out;
 }
 
 std::string FilledHistogram(uint32_t top) {

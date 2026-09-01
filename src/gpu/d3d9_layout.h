@@ -205,11 +205,45 @@ struct LayoutError {
   } reason = Reason::kNone;
   uint32_t failed_element = 0;
   uint32_t detail         = 0;   // the Type dword, usage, or offset
+
+  //-------------------------------------------------------------------------
+  // Elements OMITTED from the layout rather than fatal to it.
+  //
+  // The transcode reads exactly three elements -- POSITION0, COLOR0 and
+  // TEXCOORD0 (ResolveTranscodeElements in d3d9_draw.cpp) -- and the 36-byte
+  // host vertex has room for nothing else. Every other element in the
+  // declaration is described and then never looked at.
+  //
+  // This build used to return false on the FIRST element it could not
+  // describe, which refused the whole declaration, which left in.layout null,
+  // which dropped every draw that used it as kNoLayout. A NORMAL in
+  // k_11_11_10 -- a packed format this decoder has no DXGI equivalent for, and
+  // the ordinary way foliage stores normals -- therefore erased geometry whose
+  // position and texcoord decode perfectly and whose normal is never read.
+  // Same all-or-nothing shape as the pixel-fetch refusal that discarded a
+  // shader's good 2D bindings over one non-2D fetch.
+  //
+  // So: an undescribable element that is NOT POSITION0 is dropped and counted.
+  // Nothing is substituted -- the element is absent from `elements`, FindUsage
+  // returns null for it, and the transcode's existing "colour and texcoord are
+  // optional" path handles the two that matter. POSITION0 stays fatal, because
+  // it is the one element the transcode cannot do without.
+  //
+  // `offered` is the denominator and is set on every call, including the ones
+  // that drop nothing. A skip count without it is not a measurement.
+  //-------------------------------------------------------------------------
+  uint32_t offered       = 0;   // elements the declaration presented
+  uint32_t skipped       = 0;   // of those, omitted from the layout
+  Reason   skip_reason   = Reason::kNone;   // the FIRST skip's reason
+  uint32_t skip_element  = 0;               // and which element it was
+  uint32_t skip_detail   = 0;               // and its Type dword / usage
 };
 
 const char* LayoutErrorText(LayoutError::Reason r);
 
-// False on the first element it cannot describe, with `err` filled in.
+// True unless POSITION0 cannot be described or no element survives at all.
+// Elements that cannot be described and are not POSITION0 are left out of
+// `out` and counted in `err.skipped`; see the note on LayoutError.
 bool BuildInputLayout(const D3D9Element* elements, uint32_t count,
                       HleInputLayout& out, LayoutError& err);
 

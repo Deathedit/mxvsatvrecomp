@@ -333,12 +333,31 @@ constexpr uint32_t kHleProbeRegs = 64;
 // viewport inverse so the HLE picture is comparable to the PM4 one on screen.
 // Wiring a constant-file matrix in is a separate edit, made after reading the
 // verdict, not an adaptive choice made mid-run.
-// `vertex_shader` is the bound shader handle, cross-tabbed against the winner:
-// if the winning register is a property of the shader rather than of the run,
-// that is what says so, and a spread of winners across many registers means the
-// opposite. Pass 0 when unknown.
+// The winner is cross-tabbed against the SHADER, and the shader is identified
+// by the CONTENT of its microcode, never by its handle.
+//
+// `vs_content` is an FNV-1a over the microcode dwords; `vs_handle` is the guest
+// address, carried only so the report can say how many handles one shader wore.
+// Pass 0 for content when it is not known yet -- those draws are counted apart
+// rather than merged into a single bucket, because merging every unknown into
+// one key is the same error this keying exists to avoid.
+//
+// WHY NOT THE HANDLE. Handles are guest addresses and the runtime recycles them
+// onto DIFFERENT microcode within a single run -- measured at 9,968 of 10,074
+// compiles. Keying by handle therefore does two things to this table at once:
+// it splits one shader across several rows, and it merges several shaders into
+// one row. Run mx_1911 shows both, with byte-identical triples
+// (0x216030E0 / 0x216A68A0 / 0x216A7BA0, each "1681 explained, 1681/1681, 1
+// distinct winner") sitting alongside rows reading "7 distinct winners".
+//
+// That matters because the whole verdict here is a judgment about SCATTER: a
+// shader whose draws agree on one register is evidence the register belongs to
+// the shader, and one whose draws scatter means the scoring is fitting noise.
+// A handle covering three shaders manufactures exactly that scatter, so under
+// handle keying neither reading can be trusted.
 void ScoreHleTransform(const DrawCall& dc, const float* consts,
-                       const float* viewport_mvp, uint32_t vertex_shader);
+                       const float* viewport_mvp, uint64_t vs_content,
+                       uint32_t vs_handle);
 
 // The verdict, written to the log. Reports the controls first so a candidate
 // that merely beats nothing is visible as such.

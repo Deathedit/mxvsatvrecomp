@@ -10,6 +10,7 @@
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -736,8 +737,27 @@ bool     g_probeSawViewport = false;
 // question a run-wide histogram cannot answer: is the register a property of
 // the shader? If it is, each handle has one dominant winner and the spread
 // across the run is just the shader changing.
-std::map<uint64_t, uint32_t> g_shaderWins;
-std::map<uint32_t, uint32_t> g_shaderDraws;
+// Keyed by microcode CONTENT, not by handle -- see ScoreHleTransform in the
+// header for why. g_shaderHandles carries the handles each shader wore so
+// the recycling is visible in the report instead of silently folded away.
+std::map<std::pair<uint64_t, uint32_t>, uint32_t> g_shaderWins;
+std::map<uint64_t, uint32_t> g_shaderDraws;
+std::map<uint64_t, std::set<uint32_t>> g_shaderHandles;
+// Draws whose shader content was not known yet. Counted apart rather than
+// keyed as 0: one bucket holding every unidentified shader would scatter
+// exactly the way the handle keying did.
+uint64_t g_shaderNoContent = 0;
+
+// The probe runs on the DRAW PATH and this game draws from several guest
+// threads: run mx_1912 shows the report itself emitted from two of them
+// (t10196 and t16328) two seconds apart. These are std::map and std::set, so
+// concurrent insert is undefined behaviour, not merely a racy count. The
+// maps were unguarded before the content re-keying too; the re-key did not
+// introduce this, but it did add a std::set insert to the same path, so it
+// is fixed here rather than left.
+//
+// A plain mutex is free in practice: everything below is behind hle_diag.
+std::mutex g_probeMu;
 
 // A candidate "explains" a draw when it puts at least this much of it in the
 // clip volume. Not 100%: real geometry is legitimately clipped at the screen
@@ -780,9 +800,13 @@ const char* CandidateName(uint32_t c, char* buf, size_t n) {
 }  // namespace
 
 void ScoreHleTransform(const DrawCall& dc, const float* consts,
-                       const float* viewport_mvp, uint32_t vertex_shader) {
+                       const float* viewport_mvp, uint64_t vs_content,
+                       uint32_t vs_handle) {
   if (!consts || dc.vertex_count == 0 || dc.vertex_stride != kHostVertexStride)
     return;
+  // Whole function: the scoring lambda writes g_candExplains as it goes, so
+  // guarding only the tally at the end would leave that unprotected.
+  std::lock_guard<std::mutex> lk(g_probeMu);
   if (viewport_mvp) g_probeSawViewport = true;
 
   static const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0,
@@ -863,8 +887,13 @@ void ScoreHleTransform(const DrawCall& dc, const float* consts,
   if (best != kCandidates && best_in >= need) {
     ++g_candWins[best];
     ++g_probeExplained;
-    ++g_shaderWins[(uint64_t(vertex_shader) << 32) | best];
-    ++g_shaderDraws[vertex_shader];
+    if (vs_content) {
+      ++g_shaderWins[{vs_content, best}];
+      ++g_shaderDraws[vs_content];
+      g_shaderHandles[vs_content].insert(vs_handle);
+    } else {
+      ++g_shaderNoContent;
+    }
     // The first few winners in full. The last round's ranking was won by a
     // matrix that turned out to collapse everything to a point — visible
     // immediately in its numbers, and not at all in its score.
@@ -889,6 +918,7 @@ void ScoreHleTransform(const DrawCall& dc, const float* consts,
 }
 
 void ReportHleTransform() {
+  std::lock_guard<std::mutex> lk(g_probeMu);
   if (g_probeDraws == 0) {
     REXLOG_INFO(
         "d3d9: stage3  transform probe — no draws scored ({} were entirely "
@@ -939,20 +969,33 @@ void ReportHleTransform() {
   // register is evidence the register belongs to the shader; a shader whose
   // draws scatter means the scoring is fitting noise, and no table built from it
   // would be worth anything.
-  for (const auto& [handle, draws] : g_shaderDraws) {
+  // The denominator for the rows below: draws that could not be attributed
+  // to a shader at all. Printed even at zero, because "no rows" and "rows
+  // covering only part of the population" look identical otherwise.
+  REXLOG_INFO("d3d9: stage3    {} distinct shader(s) by microcode; {} "
+              "explained draw(s) had no content id and are in none of the "
+              "rows below",
+              g_shaderDraws.size(), g_shaderNoContent);
+  for (const auto& [content, draws] : g_shaderDraws) {
     if (draws < 32) continue;   // too few to say anything
     uint32_t top = 0, top_n = 0, distinct = 0;
     for (uint32_t c = 0; c < kCandidates; ++c) {
-      auto it = g_shaderWins.find((uint64_t(handle) << 32) | c);
+      auto it = g_shaderWins.find({content, c});
       if (it == g_shaderWins.end() || it->second == 0) continue;
       ++distinct;
       if (it->second > top_n) { top_n = it->second; top = c; }
     }
     if (!top_n) continue;
+    // The handle count is printed because it is the thing that used to
+    // corrupt this table silently: a shader wearing several handles was
+    // several rows, and a handle wearing several shaders was one row of
+    // manufactured scatter.
+    const size_t handles = g_shaderHandles[content].size();
     REXLOG_INFO(
-        "d3d9: stage3    vs 0x{:08X}: {} explained draws, top {} on {}/{} "
-        "({}%), {} distinct winners",
-        handle, draws, CandidateName(top, buf, sizeof(buf)), top_n, draws,
+        "d3d9: stage3    vs ucode {:016X} ({} handle{}): {} explained "
+        "draws, top {} on {}/{} ({}%), {} distinct winners",
+        content, handles, handles == 1 ? "" : "s", draws,
+        CandidateName(top, buf, sizeof(buf)), top_n, draws,
         (top_n * 100) / draws, distinct);
   }
 }

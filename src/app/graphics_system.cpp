@@ -123,6 +123,13 @@ REXCVAR_DEFINE_INT32(hle_strict, 0, "Debug",
 // StencilFailOp becomes unreachable and only the pass and depth-fail ops ever
 // run. The writes are therefore NOT preserved -- one of the three op paths is
 // removed with them. Anything this flag exonerates, it exonerates as a pair.
+REXCVAR_DEFINE_BOOL(d3d9_cmdbuf_replay, true, "Graphics",
+                    "Capture draws recorded into a guest command buffer and "
+                    "re-issue them on each replay. Off restores the old "
+                    "behaviour, where the recording rendered once and every "
+                    "replay was discarded -- which is what left the 3D tree "
+                    "foliage missing.");
+
 REXCVAR_DEFINE_BOOL(d3d9_stencil_test, true, "Graphics",
                     "Honour the guest's stencil comparison. Off forces every "
                     "test to ALWAYS, which cannot reject a fragment -- and so "

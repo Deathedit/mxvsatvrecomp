@@ -26,6 +26,9 @@
 #include <vector>
 
 #include "gpu/d3d9_layout.h"
+// For ReadVertexAttributeAs: the endian test checks the raw attribute read
+// and the swizzled element read separately.
+#include "gpu/shader_ucode.h"
 
 // The one place the SDK is consulted: the local format constants in
 // d3d9_layout.cpp must be xenos::VertexFormat and not a drifting copy.
@@ -244,11 +247,11 @@ const Fixture kFixtures[] = {
 // stream, elements are laid out consecutively, so element i's size must equal
 // offset[i+1] - offset[i]. The offsets are the game's; the sizes come from the
 // runtime's table; neither was derived from the other.
-void CheckSizesAgainstOffsets(const Fixture& f, const mx::pm4::HleInputLayout& l) {
+void CheckSizesAgainstOffsets(const Fixture& f, const mx::hle::HleInputLayout& l) {
   for (uint32_t s = 0; s <= l.max_stream; ++s) {
     // Collect this stream's elements in declaration order, which the captures
     // show is already ascending by offset within a stream.
-    std::vector<const mx::pm4::HleInputElement*> in_stream;
+    std::vector<const mx::hle::HleInputElement*> in_stream;
     for (const auto& e : l.elements) {
       if (e.stream == s) in_stream.push_back(&e);
     }
@@ -277,18 +280,18 @@ void CheckSizesAgainstOffsets(const Fixture& f, const mx::pm4::HleInputLayout& l
 }
 
 void RunFixture(const Fixture& f) {
-  mx::pm4::D3D9Element elems[mx::pm4::kMaxElements];
+  mx::hle::D3D9Element elems[mx::hle::kMaxElements];
   for (uint32_t i = 0; i < f.count; ++i) {
-    elems[i] = mx::pm4::ReadElement(f.raw + i * mx::pm4::kElementSize);
+    elems[i] = mx::hle::ReadElement(f.raw + i * mx::hle::kElementSize);
   }
 
-  mx::pm4::HleInputLayout layout;
-  mx::pm4::LayoutError err;
-  if (!mx::pm4::BuildInputLayout(elems, f.count, layout, err)) {
+  mx::hle::HleInputLayout layout;
+  mx::hle::LayoutError err;
+  if (!mx::hle::BuildInputLayout(elems, f.count, layout, err)) {
     char msg[200];
     std::snprintf(msg, sizeof(msg),
                   "decl #%d element %u: %s (detail 0x%08X)", f.id,
-                  err.failed_element, mx::pm4::LayoutErrorText(err.reason),
+                  err.failed_element, mx::hle::LayoutErrorText(err.reason),
                   err.detail);
     Fail("layout builds", msg);
     return;
@@ -314,7 +317,7 @@ void RunFixture(const Fixture& f) {
     std::printf("      %-13s%u s%u off=%-3u size=%-2u dxgi=%-3d swiz=0x%03X%s\n",
                 e.semantic_name, e.semantic_index, e.stream, e.offset,
                 e.size_bytes, static_cast<int>(e.format), e.swizzle,
-                e.unpack == mx::pm4::Unpack::kSnorm2_10_10_10
+                e.unpack == mx::hle::Unpack::kSnorm2_10_10_10
                     ? "  (shader unpacks snorm 2_10_10_10)"
                     : "");
   }
@@ -334,8 +337,8 @@ void RunFixture(const Fixture& f) {
 
 // Build a single-element layout the same way the runtime does, so the test
 // exercises BuildInputLayout rather than a hand-filled struct.
-bool MakeElement(uint32_t type, uint8_t usage, mx::pm4::HleInputElement& out) {
-  uint8_t raw[2 * mx::pm4::kElementSize] = {};
+bool MakeElement(uint32_t type, uint8_t usage, mx::hle::HleInputElement& out) {
+  uint8_t raw[2 * mx::hle::kElementSize] = {};
   raw[0] = 0; raw[1] = 0;                       // stream 0
   raw[2] = 0; raw[3] = 0;                       // offset 0
   raw[4] = uint8_t(type >> 24); raw[5] = uint8_t(type >> 16);
@@ -345,13 +348,13 @@ bool MakeElement(uint32_t type, uint8_t usage, mx::pm4::HleInputElement& out) {
   raw[10] = 0;                                  // usage index
   raw[12] = 0xFF; raw[13] = 0xFF;               // D3DDECL_END
 
-  mx::pm4::D3D9Element parsed[2];
+  mx::hle::D3D9Element parsed[2];
   for (int i = 0; i < 2; ++i)
-    parsed[i] = mx::pm4::ReadElement(raw + i * mx::pm4::kElementSize);
+    parsed[i] = mx::hle::ReadElement(raw + i * mx::hle::kElementSize);
 
-  mx::pm4::HleInputLayout layout;
-  mx::pm4::LayoutError err;
-  if (!mx::pm4::BuildInputLayout(parsed, 1, layout, err)) return false;
+  mx::hle::HleInputLayout layout;
+  mx::hle::LayoutError err;
+  if (!mx::hle::BuildInputLayout(parsed, 1, layout, err)) return false;
   if (layout.elements.size() != 1) return false;
   out = layout.elements[0];
   return true;
@@ -402,36 +405,36 @@ void CheckVertexDecode() {
   const Case cases[] = {
       // The captured COLOR dword: format 6, unsigned, normalized, swizzle
       // 0x60A = (z,y,x,w) — D3DCOLOR's BGRA arriving as RGBA.
-      {"COLOR 8_8_8_8 unorm+bgra", 0x00182886u, mx::pm4::kUsageColor, bgra, 4,
+      {"COLOR 8_8_8_8 unorm+bgra", 0x00182886u, mx::hle::kUsageColor, bgra, 4,
        {0xC0 / 255.0f, 0x80 / 255.0f, 0x40 / 255.0f, 1.0f}},
 
       // The captured BLENDINDICES dword: same format 6, same bytes, but the
       // integer bit is set and the swizzle is identity. If these two ever
       // agree, the two Type bits are being ignored.
-      {"BLENDINDICES 8_8_8_8 uint", 0x001A2286u, mx::pm4::kUsageBlendIndices,
+      {"BLENDINDICES 8_8_8_8 uint", 0x001A2286u, mx::hle::kUsageBlendIndices,
        bgra, 4, {64.0f, 128.0f, 192.0f, 255.0f}},
 
-      {"NORMAL 2_10_10_10 snorm", 0x002A2107u, mx::pm4::kUsageNormal,
+      {"NORMAL 2_10_10_10 snorm", 0x002A2107u, mx::hle::kUsageNormal,
        n2101010, 4, {1.0f, -1.0f, 0.0f, 1.0f}},
 
-      {"POSITION 16_16 sint", 0x002C2319u, mx::pm4::kUsagePosition, i1616, 4,
+      {"POSITION 16_16 sint", 0x002C2319u, mx::hle::kUsagePosition, i1616, 4,
        {-2.0f, 300.0f, 0.0f, 1.0f}},
 
-      {"POSITION 16_16_16_16 snorm", 0x001A211Au, mx::pm4::kUsagePosition,
+      {"POSITION 16_16_16_16 snorm", 0x001A211Au, mx::hle::kUsagePosition,
        s16x4, 8, {1.0f, -1.0f, 0.0f, 1.0f}},
 
-      {"POSITION 32_32_32_FLOAT", 0x002A2039u, mx::pm4::kUsagePosition, f32x3,
+      {"POSITION 32_32_32_FLOAT", 0x002A2039u, mx::hle::kUsagePosition, f32x3,
        12, {1.0f, -2.0f, 0.5f, 1.0f}},
   };
 
   for (const auto& c : cases) {
-    mx::pm4::HleInputElement e;
+    mx::hle::HleInputElement e;
     if (!MakeElement(c.type, c.usage, e)) {
       Fail("build element", c.what);
       continue;
     }
     float got[4];
-    if (!mx::pm4::ReadHleElement(c.bytes, c.nbytes, e, 0, got)) {
+    if (!mx::hle::ReadHleElement(c.bytes, c.nbytes, e, 0, got)) {
       Fail("read element", c.what);
       continue;
     }
@@ -444,12 +447,12 @@ void CheckVertexDecode() {
   // fraction and the second a whole byte value. Asserted separately so a
   // regression that made both UNORM would fail here loudly.
   {
-    mx::pm4::HleInputElement col, idx;
-    if (MakeElement(0x00182886u, mx::pm4::kUsageColor, col) &&
-        MakeElement(0x001A2286u, mx::pm4::kUsageBlendIndices, idx)) {
+    mx::hle::HleInputElement col, idx;
+    if (MakeElement(0x00182886u, mx::hle::kUsageColor, col) &&
+        MakeElement(0x001A2286u, mx::hle::kUsageBlendIndices, idx)) {
       float a[4], b[4];
-      if (mx::pm4::ReadHleElement(bgra, 4, col, 0, a) &&
-          mx::pm4::ReadHleElement(bgra, 4, idx, 0, b)) {
+      if (mx::hle::ReadHleElement(bgra, 4, col, 0, a) &&
+          mx::hle::ReadHleElement(bgra, 4, idx, 0, b)) {
         if (a[0] == b[0]) {
           Fail("COLOR vs BLENDINDICES differ",
                "same value from the same bits — the Type bits are ignored");
@@ -458,34 +461,63 @@ void CheckVertexDecode() {
     }
   }
 
-  // The endian swap width must be the format's packed unit, not the mode's
-  // nominal one.
+  // The 8-in-32 swap over a 16-bit format exchanges the component pair, and
+  // that exchange is the HARDWARE, not a defect. Reversing all four bytes of a
+  // dword holding two halves byte-swaps each and swaps their order; the vfetch
+  // destination swizzle is what puts them back, and the guest compiler emits
+  // exactly that permutation for exactly these formats. See the note on
+  // ApplyFetchEndianFor: over 1851 fetches every 16-bit format asks for the
+  // pairwise exchange (fmt 32 and 26 -> 0x4C1, fmt 31 -> 0xFC1) and no 32-bit
+  // format does.
   //
-  // These are the real bytes of vertex 0 of shader 0x22D4B320 (NAT_Farm, 300 s
-  // run, mx_257.log), in guest order, with the endian=2 the stream's fetch
-  // constant carries. A literal 8-in-32 swap reverses each dword, which
-  // byte-swaps the two 16-bit components *and exchanges them*, yielding
-  // (y, x, w, z) = (0.263, 0.185, 1, 0.201) — a constant 1.0 sitting where z
-  // belongs. That shipped, and it is why the interpreter's positions never
-  // landed in the clip volume.
+  // This test USED TO assert the swapped-then-unswizzled read came out already
+  // ordered, using a synthetic element carrying swizzle 0xA88 -- an identity,
+  // 32-bit-unit shape that no real fmt-32 fetch carries. That is the narrowing
+  // that was tried, shipped, and reverted; the test outlived the revert because
+  // it stopped compiling at the mx::pm4 -> mx::hle rename and nobody ran it.
   //
-  // The correct read is a homogeneous position, w last and equal to 1.
+  // What is checked now is the PAIR composing, which is the thing that has to
+  // hold: the raw read exchanges, the swizzle undoes it, and the position comes
+  // out homogeneous with w last.
+  //
+  // Bytes are vertex 0 of shader 0x22D4B320 (NAT_Farm, mx_257.log) in guest
+  // order, with the endian=2 its stream fetch constant carries.
   {
     const uint8_t pos16x4[8] = {0x31, 0xED, 0x34, 0x37, 0x32, 0x72, 0x3C, 0x00};
-    mx::pm4::HleInputElement e;
-    // FLOAT16_4 at offset 0, POSITION 0 — format 32, float, identity swizzle.
-    if (MakeElement(0x002A2020u, mx::pm4::kUsagePosition, e)) {
+
+    // Half 1: the attribute read alone, before any swizzle. The exchange is
+    // expected here -- pinned so that suppressing it again fails loudly.
+    float raw[4];
+    if (!mx::hle::ReadVertexAttributeAs(pos16x4, 8, /*format=*/32,
+                                        /*offset_bytes=*/0, /*size_bytes=*/8,
+                                        mx::hle::NumFormat::kUnorm,
+                                        /*endian=*/2, raw)) {
+      Fail("16_16_16_16_FLOAT with endian 8in32", "read refused");
+    } else {
+      const float want_raw[4] = {0.263428f, 0.185181f, 1.0f, 0.201416f};
+      CheckFloat4("FLOAT16_4 8in32 exchanges the pair (hardware)", raw,
+                  want_raw);
+    }
+
+    // Half 2: the same bytes through the real element, whose swizzle is the
+    // 0x4C1 every fmt-32 fetch in the census carries. 0x4C1 is [1,0,3,2] --
+    // precisely the inverse of the exchange above.
+    mx::hle::HleInputElement e;
+    if (MakeElement((0x4C1u << 10) | 32u, mx::hle::kUsagePosition, e)) {
+      CheckU32("FLOAT16_4 element carries the census swizzle", e.swizzle,
+               0x4C1u);
       float got[4];
-      if (!mx::pm4::ReadHleElement(pos16x4, 8, e, 2, got)) {
-        Fail("16_16_16_16_FLOAT with endian 8in32", "read refused");
+      if (!mx::hle::ReadHleElement(pos16x4, 8, e, 2, got)) {
+        Fail("16_16_16_16_FLOAT through the element", "read refused");
       } else {
         const float want[4] = {0.185181f, 0.263428f, 0.201416f, 1.0f};
-        CheckFloat4("FLOAT16_4 endian 8in32 keeps component order", got, want);
-        std::printf("  %-28s -> (%g, %g, %g, %g)\n", "FLOAT16_4 8in32", got[0],
-                    got[1], got[2], got[3]);
+        CheckFloat4("FLOAT16_4 8in32 + swizzle is a homogeneous position", got,
+                    want);
+        std::printf("  %-28s -> (%g, %g, %g, %g)\n", "FLOAT16_4 8in32+swz",
+                    got[0], got[1], got[2], got[3]);
         if (got[2] == 1.0f && got[3] != 1.0f) {
           Fail("FLOAT16_4 endian 8in32",
-               "the dword swap exchanged the component pair: w landed in z");
+               "the pair was left exchanged: w landed in z");
         }
       }
     } else {
@@ -497,10 +529,10 @@ void CheckVertexDecode() {
   // narrowing the unit for every format would break colours instead.
   {
     const uint8_t be_color[4] = {0xFF, 0xC0, 0x80, 0x40};  // guest-order dword
-    mx::pm4::HleInputElement e;
-    if (MakeElement(0x001A2286u, mx::pm4::kUsageBlendIndices, e)) {
+    mx::hle::HleInputElement e;
+    if (MakeElement(0x001A2286u, mx::hle::kUsageBlendIndices, e)) {
       float got[4];
-      if (!mx::pm4::ReadHleElement(be_color, 4, e, 2, got)) {
+      if (!mx::hle::ReadHleElement(be_color, 4, e, 2, got)) {
         Fail("8_8_8_8 with endian 8in32", "read refused");
       } else {
         // Reversed dword is 40 80 C0 FF; component 0 is the low byte.
@@ -514,10 +546,10 @@ void CheckVertexDecode() {
   // A read that would run past the end of the vertex must fail rather than
   // return whatever follows.
   {
-    mx::pm4::HleInputElement e;
-    if (MakeElement(0x002A2039u, mx::pm4::kUsagePosition, e)) {
+    mx::hle::HleInputElement e;
+    if (MakeElement(0x002A2039u, mx::hle::kUsagePosition, e)) {
       float got[4];
-      if (mx::pm4::ReadHleElement(f32x3, 8, e, 0, got)) {
+      if (mx::hle::ReadHleElement(f32x3, 8, e, 0, got)) {
         Fail("reject short vertex", "12-byte element read from 8 bytes");
       }
     }
@@ -526,28 +558,28 @@ void CheckVertexDecode() {
   // FindUsage must return the declaration's own answer, and null rather than a
   // near miss.
   {
-    uint8_t raw[3 * mx::pm4::kElementSize] = {};
+    uint8_t raw[3 * mx::hle::kElementSize] = {};
     // [0] POSITION 0 at offset 0, k_32_32_32_FLOAT
     raw[3] = 0x00; raw[4] = 0x00; raw[5] = 0x2A; raw[6] = 0x2A; raw[7] = 0x39;
-    raw[9] = mx::pm4::kUsagePosition;
+    raw[9] = mx::hle::kUsagePosition;
     // [1] COLOR 0 at offset 12, k_8_8_8_8
     raw[12 + 2] = 0x00; raw[12 + 3] = 0x0C;
     raw[12 + 4] = 0x00; raw[12 + 5] = 0x18; raw[12 + 6] = 0x28; raw[12 + 7] = 0x86;
-    raw[12 + 9] = mx::pm4::kUsageColor;
+    raw[12 + 9] = mx::hle::kUsageColor;
     raw[24] = 0xFF; raw[25] = 0xFF;
 
-    mx::pm4::D3D9Element parsed[2];
+    mx::hle::D3D9Element parsed[2];
     for (int i = 0; i < 2; ++i)
-      parsed[i] = mx::pm4::ReadElement(raw + i * mx::pm4::kElementSize);
-    mx::pm4::HleInputLayout layout;
-    mx::pm4::LayoutError err;
-    if (!mx::pm4::BuildInputLayout(parsed, 2, layout, err)) {
-      Fail("FindUsage fixture builds", mx::pm4::LayoutErrorText(err.reason));
+      parsed[i] = mx::hle::ReadElement(raw + i * mx::hle::kElementSize);
+    mx::hle::HleInputLayout layout;
+    mx::hle::LayoutError err;
+    if (!mx::hle::BuildInputLayout(parsed, 2, layout, err)) {
+      Fail("FindUsage fixture builds", mx::hle::LayoutErrorText(err.reason));
     } else {
-      const auto* pos = mx::pm4::FindUsage(layout, mx::pm4::kUsagePosition, 0);
-      const auto* col = mx::pm4::FindUsage(layout, mx::pm4::kUsageColor, 0);
-      const auto* nrm = mx::pm4::FindUsage(layout, mx::pm4::kUsageNormal, 0);
-      const auto* col1 = mx::pm4::FindUsage(layout, mx::pm4::kUsageColor, 1);
+      const auto* pos = mx::hle::FindUsage(layout, mx::hle::kUsagePosition, 0);
+      const auto* col = mx::hle::FindUsage(layout, mx::hle::kUsageColor, 0);
+      const auto* nrm = mx::hle::FindUsage(layout, mx::hle::kUsageNormal, 0);
+      const auto* col1 = mx::hle::FindUsage(layout, mx::hle::kUsageColor, 1);
       if (!pos || pos->offset != 0) Fail("FindUsage POSITION 0", "wrong element");
       if (!col || col->offset != 12) Fail("FindUsage COLOR 0", "wrong element");
       if (nrm) Fail("FindUsage absent NORMAL", "returned an element");
@@ -559,44 +591,143 @@ void CheckVertexDecode() {
 // The decode must reject rather than approximate. A silent fallback is the
 // failure mode this whole file exists to prevent: it produces geometry that
 // looks like geometry.
+const char* LayoutErrorTextOrNull(const mx::hle::LayoutError& e) {
+  return mx::hle::LayoutErrorText(e.reason);
+}
+
+//===========================================================================
+// A declaration is refused ONLY over POSITION0.
+//
+// The transcode reads POSITION0, COLOR0 and TEXCOORD0 and nothing else, so an
+// element it cannot describe that is none of those costs nothing to leave out.
+// This used to return false on the first such element, which nulled the layout
+// for every draw that used the declaration and dropped them all as kNoLayout.
+// A NORMAL in k_11_11_10 -- no DXGI equivalent, and the ordinary way foliage
+// packs a normal -- therefore erased geometry whose position and texcoord
+// decode exactly.
+//===========================================================================
+
+// type dword: format in [5:0], signed at bit 8, INTEGER at bit 9 (so a clear
+// bit 9 means normalized), swizzle in [21:10]. 0x688 is xyzw, the value every
+// float element in the fixtures carries.
+constexpr uint32_t MakeType(uint32_t format, bool is_signed, bool is_integer) {
+  return (0x688u << 10) | (is_integer ? 0x200u : 0u) |
+         (is_signed ? 0x100u : 0u) | format;
+}
+
+void PutElement(uint8_t* raw, uint16_t offset, uint32_t type, uint8_t usage) {
+  raw[0] = 0; raw[1] = 0;                                    // stream 0
+  raw[2] = uint8_t(offset >> 8); raw[3] = uint8_t(offset);
+  raw[4] = uint8_t(type >> 24); raw[5] = uint8_t(type >> 16);
+  raw[6] = uint8_t(type >> 8);  raw[7] = uint8_t(type);
+  raw[8] = 0;                                                // method DEFAULT
+  raw[9] = usage;
+  raw[10] = 0;                                               // usage index 0
+  raw[11] = 0;
+}
+
+void CheckPartialLayout() {
+  constexpr uint32_t kPos3F = MakeType(57, false, false);   // k_32_32_32_FLOAT
+  constexpr uint32_t kUv2H  = MakeType(31, false, false);   // k_16_16_FLOAT
+  constexpr uint32_t kNrmP  = MakeType(17, true,  false);   // k_11_11_10, snorm
+
+  // POSITION0 float3 at 0, TEXCOORD0 half2 at 12, NORMAL0 k_11_11_10 at 16.
+  // The undescribable element is LAST and highest, which is what makes the
+  // stride assertion below mean something.
+  uint8_t raw[3 * mx::hle::kElementSize] = {};
+  PutElement(raw + 0 * mx::hle::kElementSize,  0, kPos3F, mx::hle::kUsagePosition);
+  PutElement(raw + 1 * mx::hle::kElementSize, 12, kUv2H,  mx::hle::kUsageTexcoord);
+  PutElement(raw + 2 * mx::hle::kElementSize, 16, kNrmP,  mx::hle::kUsageNormal);
+
+  mx::hle::D3D9Element parsed[3];
+  for (int i = 0; i < 3; ++i)
+    parsed[i] = mx::hle::ReadElement(raw + i * mx::hle::kElementSize);
+
+  mx::hle::HleInputLayout l;
+  mx::hle::LayoutError err;
+  if (!mx::hle::BuildInputLayout(parsed, 3, l, err)) {
+    Fail("keep a layout whose NORMAL is k_11_11_10", LayoutErrorTextOrNull(err));
+    return;
+  }
+
+  CheckU32("partial: elements kept", uint32_t(l.elements.size()), 2);
+  CheckU32("partial: elements offered", err.offered, 3);
+  CheckU32("partial: elements skipped", err.skipped, 1);
+  CheckU32("partial: which element skipped", err.skip_element, 2);
+  CheckU32("partial: skip reason", uint32_t(err.skip_reason),
+           uint32_t(mx::hle::LayoutError::Reason::kUnknownType));
+  CheckU32("partial: skip detail", err.skip_detail, kNrmP);
+
+  // The two the transcode reads survive; the one it does not is simply absent,
+  // which is what FindUsage already reports as "no such element".
+  if (!mx::hle::FindUsage(l, mx::hle::kUsagePosition, 0))
+    Fail("partial: POSITION0 kept", "missing");
+  if (!mx::hle::FindUsage(l, mx::hle::kUsageTexcoord, 0))
+    Fail("partial: TEXCOORD0 kept", "missing");
+  if (mx::hle::FindUsage(l, mx::hle::kUsageNormal, 0))
+    Fail("partial: NORMAL0 dropped", "still present");
+
+  // A dropped element still occupies its bytes in the guest vertex. min_stride
+  // is what the bound stride is checked against, so letting it shrink to 16
+  // here would turn a genuinely short stream binding into a silent pass.
+  CheckU32("partial: stride still covers the dropped element",
+           l.min_stride[0], 20);
+
+  // POSITION0 is the one element with no fallback, so it stays fatal.
+  uint8_t bad_pos[1 * mx::hle::kElementSize] = {};
+  PutElement(bad_pos, 0, kNrmP, mx::hle::kUsagePosition);
+  mx::hle::D3D9Element only = mx::hle::ReadElement(bad_pos);
+  mx::hle::HleInputLayout l2;
+  mx::hle::LayoutError err2;
+  if (mx::hle::BuildInputLayout(&only, 1, l2, err2)) {
+    Fail("refuse a layout whose POSITION0 is k_11_11_10", "accepted");
+  } else {
+    CheckU32("position failure reason", uint32_t(err2.reason),
+             uint32_t(mx::hle::LayoutError::Reason::kUnknownType));
+    CheckU32("position failure element", err2.failed_element, 0);
+  }
+
+  std::printf("  partial layouts behave\n");
+}
+
 void CheckRejections() {
-  mx::pm4::DecodedVertexType d;
+  mx::hle::DecodedVertexType d;
 
   // Format 0 (kUndefined) and format 5 both have a zero entry in the guest's
   // own size table.
-  if (mx::pm4::DecodeVertexType(0x00000000u, d))
+  if (mx::hle::DecodeVertexType(0x00000000u, d))
     Fail("reject format 0", "accepted");
-  if (mx::pm4::DecodeVertexType(0x00002305u, d))
+  if (mx::hle::DecodeVertexType(0x00002305u, d))
     Fail("reject format 5", "accepted");
 
   // k_11_11_10 has a valid size but no DXGI equivalent.
-  if (mx::pm4::DecodeVertexType(0x00002311u, d))
+  if (mx::hle::DecodeVertexType(0x00002311u, d))
     Fail("reject k_11_11_10", "accepted");
 
   // A normalized 32-bit integer format: DXGI has nothing that holds it.
   //   format 34 (k_32_32) | signed | normalized (integer bit clear)
-  if (mx::pm4::DecodeVertexType(0x00000122u, d))
+  if (mx::hle::DecodeVertexType(0x00000122u, d))
     Fail("reject normalized k_32_32", "accepted");
 
   // An element with a usage outside D3DDECLUSAGE must fail the layout, not
   // land on a null semantic name.
   const uint8_t bad_usage[] = {0x00,0x00,0x00,0x00, 0x00,0x2C,0x23,0xA5,
                                0x00,0x63,0x00,0x00};
-  mx::pm4::D3D9Element e = mx::pm4::ReadElement(bad_usage);
-  mx::pm4::HleInputLayout l;
-  mx::pm4::LayoutError err;
-  if (mx::pm4::BuildInputLayout(&e, 1, l, err))
+  mx::hle::D3D9Element e = mx::hle::ReadElement(bad_usage);
+  mx::hle::HleInputLayout l;
+  mx::hle::LayoutError err;
+  if (mx::hle::BuildInputLayout(&e, 1, l, err))
     Fail("reject usage 0x63", "accepted");
-  else if (err.reason != mx::pm4::LayoutError::Reason::kUnknownUsage)
+  else if (err.reason != mx::hle::LayoutError::Reason::kUnknownUsage)
     Fail("reject usage 0x63", "wrong reason");
 
   // A half-dword offset would lose its low bits in the vfetch offset field.
   const uint8_t misaligned[] = {0x00,0x00,0x00,0x02, 0x00,0x2C,0x23,0xA5,
                                 0x00,0x00,0x00,0x00};
-  e = mx::pm4::ReadElement(misaligned);
-  if (mx::pm4::BuildInputLayout(&e, 1, l, err))
+  e = mx::hle::ReadElement(misaligned);
+  if (mx::hle::BuildInputLayout(&e, 1, l, err))
     Fail("reject offset 2", "accepted");
-  else if (err.reason != mx::pm4::LayoutError::Reason::kMisalignedOffset)
+  else if (err.reason != mx::hle::LayoutError::Reason::kMisalignedOffset)
     Fail("reject offset 2", "wrong reason");
 
   std::printf("  rejections behave\n");
@@ -633,8 +764,8 @@ void CheckSignedNormalized() {
   };
 
   for (const auto& c : cases) {
-    mx::pm4::DecodedVertexType d;
-    if (!mx::pm4::DecodeVertexType(c.type, d)) {
+    mx::hle::DecodedVertexType d;
+    if (!mx::hle::DecodeVertexType(c.type, d)) {
       Fail("signed/normalized", c.what);
       continue;
     }
@@ -652,9 +783,9 @@ void CheckSignedNormalized() {
   }
 
   // The one combination that needs shader help must say so.
-  mx::pm4::DecodedVertexType d;
-  mx::pm4::DecodeVertexType(0x002A2187u, d);
-  if (d.unpack != mx::pm4::Unpack::kSnorm2_10_10_10)
+  mx::hle::DecodedVertexType d;
+  mx::hle::DecodeVertexType(0x002A2187u, d);
+  if (d.unpack != mx::hle::Unpack::kSnorm2_10_10_10)
     Fail("snorm 2_10_10_10 flagged", "unpack not set");
 
   std::printf("  signed/normalized bits agree with every usage\n");
@@ -691,8 +822,8 @@ void CheckSwizzle() {
   };
 
   for (const auto& c : cases) {
-    mx::pm4::DecodedVertexType d;
-    if (!mx::pm4::DecodeVertexType(c.type, d)) {
+    mx::hle::DecodedVertexType d;
+    if (!mx::hle::DecodeVertexType(c.type, d)) {
       Fail("swizzle", c.what);
       continue;
     }
@@ -727,7 +858,7 @@ void CheckAgainstSdk() {
   };
   for (const auto& c : cases) {
     const uint32_t got =
-        mx::pm4::VertexFormatSizeBytes(static_cast<uint32_t>(c.fmt));
+        mx::hle::VertexFormatSizeBytes(static_cast<uint32_t>(c.fmt));
     if (got != c.bytes) {
       char msg[120];
       std::snprintf(msg, sizeof(msg), "format %u: table says %u bytes, want %u",
@@ -753,6 +884,7 @@ int main() {
   CheckSignedNormalized();
   CheckSwizzle();
   CheckRejections();
+  CheckPartialLayout();
 
   std::printf("\nReading vertex bytes:\n");
   CheckVertexDecode();

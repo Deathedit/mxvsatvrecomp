@@ -24,6 +24,7 @@
 #include <filesystem>
 #include <system_error>
 
+#include "gpu/health.h"
 #include "hooks/hook_common.h"
 
 // timeBeginPeriod. WIN32_LEAN_AND_MEAN keeps mmsystem.h out of windows.h,
@@ -319,12 +320,21 @@ extern "C" REX_FUNC(sub_82566B58) {
     uint64_t no_vp = 0, sh_failed = 0, nocode_full = 0, skips = 0;
     UnbuiltDrawReasons(no_vp, sh_failed, nocode_full, skips);
     const uint64_t attributed = no_vp + sh_failed + nocode_full + skips;
+    const uint64_t gap =
+        guest > accepted + refused ? guest - accepted - refused : 0;
+    // "They should sum to it", from the comment above, stated so the run says
+    // whether they did rather than leaving the subtraction to the reader. A
+    // gap of 0 is UNMEASURED, not ok: with nothing lost there is nothing for
+    // the attribution to be checked against.
+    const uint64_t unattributed =
+        attributed > gap ? attributed - gap : gap - attributed;
     REXLOG_INFO("{}: UNBUILT WHY cumulative — {} no viewport, {} shader "
                 "failed, {} no-code with the queue full, {} BuildHleDraw skips "
-                "= {} attributed against a gap of {}",
+                "= {} attributed against a gap of {} [{}]",
                 mx::native::g_plugin_mode ? "plugin" : "native", no_vp,
-                sh_failed, nocode_full, skips, attributed,
-                guest > accepted + refused ? guest - accepted - refused : 0);
+                sh_failed, nocode_full, skips, attributed, gap,
+                mx::gpu::health::Tag(mx::gpu::health::Zero(
+                    "draws.gap_unattributed", unattributed, gap)));
     // Measured 2026-08-27: the skips ARE the gap, 16,706 of 16,706, with every
     // other exit at zero. So the reasons are the finding and belong on the
     // ungated line rather than behind --hle_capture.
