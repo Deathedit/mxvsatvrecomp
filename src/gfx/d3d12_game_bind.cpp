@@ -33,6 +33,49 @@ using mx::gfx::LogInfo;
 // computes `v * xe_texsign + (1 - xe_texsign)`, so a zero scale turns every
 // sample into a constant 1.0 -- white -- rather than into an unmodified sample.
 // A plain unsigned fetch needs a scale of exactly one.
+// THE D3D9 HALF-PIXEL OFFSET, as an NDC offset on the vertex position.
+//
+// D3D9 centres pixels at .0, the host rasterises at .5. Without the correction
+// a guest full-screen shape sits half a pixel up and to the left: measured on
+// the start screen, the UI border at event 2542 spans NDC y -0.998598..1.00138
+// -- exactly 720 pixels tall but centred half a pixel high -- so it misses the
+// bottom row entirely and leaves the row beneath it showing through.
+//
+// NOT a host viewport shift. Moving viewport.TopLeftX/Y moves rasterisation
+// and nothing else, so a texel-exact pass then samples BETWEEN texels: that is
+// what blew the 160x90 luminance downsample and drove the whole scene white.
+// The reference folds the same +0.5 into the viewport offset in the GUEST's
+// space (draw_util.cc:389) and hands it to the shader as an NDC offset, which
+// is what this is.
+//
+// A pixel spans 2/extent in NDC, so half a pixel is 1/extent. Y is negated
+// because NDC runs up and the screen runs down. PER DRAW, because at 160x90
+// half a pixel is eight times what it is at 1280x720 and one global value
+// cannot serve both.
+//
+// THE EXTENT FALLS BACK TO THE TARGET. The first cut used only guestVpWidth /
+// guestVpHeight and read ZERO on the UI draws -- which are exactly the ones
+// that show the defect -- so the correction was emitted into the shader and
+// then multiplied by nothing. The target extent is what the host viewport is
+// actually set from, so it is the right second answer rather than a guess.
+void D3D12Renderer::FillVertexNdcOffset(const GameDraw& d, uint8_t* cb,
+                                        uint32_t cbBytes,
+                                        uint32_t constDwords) {
+  const uint32_t at = constDwords * 4 + kTranslatedSamplerSlots * 16 +
+                      mx::hle::HlslShader::kMaxVertexFetches * 16 +
+                      kTranslatedSamplerSlots * 16;
+  if (!cb || at + 16 > cbBytes) return;
+  auto* ndc = reinterpret_cast<float*>(cb + at);
+  const uint32_t wu = d.guestVpWidth ? d.guestVpWidth : d.targetWidth;
+  const uint32_t hu = d.guestVpHeight ? d.guestVpHeight : d.targetHeight;
+  // Zero when neither extent is known: no correction is the old behaviour, and
+  // a divide by zero here would poison every position in the draw.
+  ndc[0] = (d.halfPixel != 0.0f && wu) ? (2.0f * d.halfPixel / float(wu)) : 0.0f;
+  ndc[1] = (d.halfPixel != 0.0f && hu) ? (-2.0f * d.halfPixel / float(hu)) : 0.0f;
+  ndc[2] = 0.0f;
+  ndc[3] = 0.0f;
+}
+
 void D3D12Renderer::FillVertexTextureSigns(const GameDraw& d, uint8_t* cb,
                                            uint32_t cbBytes,
                                            uint32_t constDwords) {

@@ -203,11 +203,6 @@ REXCVAR_DEFINE_BOOL(d3d9_guest_viewport, false, "Graphics",
 // guest wants .0 centres, turning this on corrects a half-pixel error. If it
 // already wants .5, turning it on puts everything a FULL pixel out, which is
 // unmistakable. Default off: the burden is on the change to show it helps.
-REXCVAR_DEFINE_BOOL(d3d9_half_pixel_offset, false, "Graphics",
-                    "Shift the viewport half a pixel to convert Direct3D 9 "
-                    "pixel centres (.0) to the host's (.5). A/B switch -- see "
-                    "the note at the definition.");
-
 REXCVAR_DEFINE_BOOL(hle_diag, false, "Debug",
                     "Per-draw and per-vertex HLE diagnostics: the transform "
                     "probe, the prim-type and vfetch censuses, and the vertex "
@@ -744,8 +739,13 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   mx::hle::IsPrimitivePolygonal(d->prim_type)
                                       ? d->pa_su_sc_mode_cntl
                                       : 0u,
-                                  REXCVAR_GET(d3d9_half_pixel_offset) ? 0u
-                                                                      : 1u,
+                                  // PA_SU_VTX_CNTL::PIX_CENTER, same
+                                  // encoding: 0 is D3D9 centring at .0
+                                  // and needs the correction. The
+                                  // register is not locatable in the
+                                  // device shadow and this is a D3D9
+                                  // title, so 0 is what it would read.
+                                  0u,
                                   d->guest_vp_width, d->guest_vp_height,
                                   REXCVAR_GET(d3d9_guest_viewport),
                                   REXCVAR_GET(d3d12_edram_takeover_copy),

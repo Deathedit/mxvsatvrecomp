@@ -1363,8 +1363,8 @@ void D3D12Renderer::RenderGameFrame() {
         // See GameDraw::halfPixel. TopLeftX/Y are floats and a sub-pixel origin
         // is exactly the screen-space translation the reference performs on the
         // vertex, without a shader constant.
-        viewport.TopLeftX = d.halfPixel;
-        viewport.TopLeftY = d.halfPixel;
+        viewport.TopLeftX = 0.0f;
+        viewport.TopLeftY = 0.0f;
         // Does the guest's own viewport agree with the extent we are about
         // to use? Census only -- the extent is still the target's.
         if (!d.guestVpWidth || !d.guestVpHeight) {
@@ -1538,8 +1538,6 @@ void D3D12Renderer::RenderGameFrame() {
       // A local copy: m_viewport is also used by the present blit, which draws
       // our own quad and must not be shifted.
       D3D12_VIEWPORT mainViewport = m_viewport;
-      mainViewport.TopLeftX += d.halfPixel;
-      mainViewport.TopLeftY += d.halfPixel;
       m_commandList->RSSetViewports(1, &mainViewport);
       boundTargetObject = 0;
       // The main target binds m_gameDepth, which is not one of the per-object
@@ -3197,6 +3195,18 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.texture = std::move(texture);
   d.targetObject = targetObject;
   d.targetWidth = targetWidth;
+  // BEFORE the constant buffers are filled, not after. FillVertexNdcOffset
+  // reads d.halfPixel and the viewport extents, and these used to be
+  // assigned ~680 lines further down -- so the fill saw halfPixel 0.0 and
+  // wrote a zero offset on every draw while the shader dutifully applied it.
+  // The census read "applied 174478, skipped 0" because it was incremented
+  // beside the assignment, measuring a later moment than the one that used
+  // the value.
+  d.guestVpWidth = guestVpWidth;
+  d.guestVpHeight = guestVpHeight;
+  d.useGuestVp = useGuestVp;
+  d.halfPixel = (vtxCntl != 0xFFFFFFFFu && (vtxCntl & 1u) == 0) ? 0.5f : 0.0f;
+  if (d.halfPixel != 0.0f) ++m_halfPixelDraws; else ++m_halfPixelSkipped;
   d.targetHeight = targetHeight;
   d.sampledTargetObject = sampledTargetObject;
   d.sampledTextureObject = sampledTextureObject;
@@ -3775,10 +3785,14 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
     // this cbuffer without moving that. Leaving it out of the size was the
     // trap this comment already warns about -- the shader declares it either
     // way, so an unsized tail is a read past the end of the resource.
+    // ... and float4 xe_ndc_offset after xe_texsign, which is why it is
+    // sized here too. Same trap as the members before it: the shader declares
+    // it unconditionally, so leaving it out of the size is a read past the end
+    // of the resource.
     const uint32_t vsConstBytes =
         ((vertexStage->constDwords * 4 + kTranslatedSamplerSlots * 16 +
           mx::hle::HlslShader::kMaxVertexFetches * 16 +
-          kTranslatedSamplerSlots * 16) + 255u) & ~255u;
+          kTranslatedSamplerSlots * 16 + 16) + 255u) & ~255u;
     if (vertexStage->rawBytes) {
       // The fetch path: one raw buffer, no vertex buffer view, and xe_vf[]
       // written into the cbuffer tail immediately after xe_texinv.
@@ -3800,6 +3814,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                     vertexStage->rawFetchCount * 16);
         FillVertexTexinv(d, p, vsConstBytes, vertexStage->constDwords);
         FillVertexTextureSigns(d, p, vsConstBytes, vertexStage->constDwords);
+        FillVertexNdcOffset(d, p, vsConstBytes, vertexStage->constDwords);
         d.vertexShaderHandle = vertexStage->handle;
         d.vertexShaderHlsl = vertexStage->hlsl;
         d.vertexShaderDxbc = vertexStage->dxbc;
@@ -3856,12 +3871,9 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.cullMode = cullMode;
   // Bit 0 has PA_SU_VTX_CNTL::PIX_CENTER's meaning -- 0 is Direct3D 9 centres
   // at .0 and needs the offset, 1 is the host's own .5 and does not -- but the
-  // value currently comes from the d3d9_half_pixel_offset cvar rather than from
-  // the register, which is not locatable in the device shadow. Keeping the
+  // value is assumed rather than read: the register is not locatable and this
+  // is a D3D9 title, so 0 is what it would hold. Keeping the
   // decode identical means the register drops straight in when it is found.
-  d.guestVpWidth = guestVpWidth;
-  d.guestVpHeight = guestVpHeight;
-  d.useGuestVp = useGuestVp;
   d.edramCopy = edramCopy;
   // Interned HERE rather than at draw time: StencilIndexFor mutates the intern
   // table, and the draw loop runs on the render thread while this runs on the
@@ -3876,8 +3888,6 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
     if (stencil->frontFunc != 7u || stencil->backFunc != 7u)
       ++m_stencilTestingDraws;
   }
-  d.halfPixel = (vtxCntl != 0xFFFFFFFFu && (vtxCntl & 1u) == 0) ? 0.5f : 0.0f;
-  if (d.halfPixel != 0.0f) ++m_halfPixelDraws; else ++m_halfPixelSkipped;
   if (scissor) {
     d.scissorSeen = true;
     d.scissorLeft = scissor[0];

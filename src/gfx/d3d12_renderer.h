@@ -1003,6 +1003,10 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // Not static: it resolves snapshot extents through m_gameSnapshots.
   void FillVertexTexinv(const GameDraw& d, uint8_t* cb, uint32_t cbBytes,
                         uint32_t constDwords);
+  // The D3D9 half-pixel correction, as an NDC offset on the vertex
+  // position. See the definition for why this is not a viewport shift.
+  static void FillVertexNdcOffset(const GameDraw& d, uint8_t* cb,
+                                  uint32_t cbBytes, uint32_t constDwords);
   static void FillVertexTextureSigns(const GameDraw& d, uint8_t* cb,
                                      uint32_t cbBytes, uint32_t constDwords);
   // `vertex` fills from the VERTEX stage's slot arrays instead of the pixel

@@ -2104,6 +2104,25 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
     // fetch at all -- so their vertex positions came out as silent zeros.
     src += "  float4 xe_texsign[" +
            std::to_string(HlslShader::kMaxSamplerSlots) + "];\n";
+    // THE D3D9 HALF-PIXEL OFFSET, in NDC, already scaled for this draw's
+    // viewport: .xy is added to the clip-space position times w.
+    //
+    // D3D9 centres pixels at .0 and the host rasterises at .5, so a guest quad
+    // covering the whole target lands half a pixel short and its last row and
+    // column clamp -- one anomalous line on the bottom and right edges of every
+    // full-screen pass, which is what shows on the start and loading screens.
+    //
+    // APPLIED HERE, NOT TO THE HOST VIEWPORT. Shifting viewport.TopLeftX/Y
+    // moves rasterisation without moving anything else, so a texel-exact pass
+    // then samples BETWEEN texels: that is what blew the 160x90 luminance
+    // downsample and drove the whole scene white. The reference folds the same
+    // +0.5 into the viewport offset in the GUEST's space and emits it as an NDC
+    // offset on the vertex position (draw_util.cc:389), which is what this is.
+    //
+    // LAST in the cbuffer, for the reason the note above gives: the renderer
+    // writes xe_vf at a fixed offset computed from the members before it, so
+    // appending is the only way to add one without moving that.
+    src += "  float4 xe_ndc_offset;\n";
   }
   src += "};\n";
   // RECIP_FF / RECIPSQ_FF: an infinity becomes a signed zero. See the note at
@@ -2584,6 +2603,10 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   } else {
     src += "  XeInterpolants xe_out;\n";
     src += "  xe_out.pos = xe_pos;\n";
+    // Times w because this runs before the perspective divide, so the offset
+    // is a constant number of PIXELS at any depth rather than shrinking with
+    // distance.
+    src += "  xe_out.pos.xy += xe_ndc_offset.xy * xe_pos.w;\n";
     for (uint32_t i = 0; i < link; ++i)
       src += "  xe_out.i" + std::to_string(i) + " = xe_o" + std::to_string(i) +
              ";\n";
