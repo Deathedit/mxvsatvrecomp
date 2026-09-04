@@ -1,9 +1,7 @@
-// DIAGNOSTIC HOOKS -- log critical functions that fail in native mode. Most only
-// log when --gpu_plugin=xenos and otherwise fall straight through to the guest
-// original; sub_8253AA40 logs in both modes.
+// DIAGNOSTIC HOOKS -- log critical functions around the guest original.
 //
 // The mid-ASM hooks that skip these call sites are unconditional, so a hook
-// being silent means its call site is jumped, not that the mode is wrong.
+// being silent means its call site is jumped.
 
 #include "hooks/hook_common.h"
 #include "hooks/hooks_d3d9.h"  // GuestDrawCalls
@@ -43,16 +41,10 @@ REXCVAR_DEFINE_STRING(registry_override, "", "Debug",
                       "Comma-separated key=value overrides for guest registry string reads");
 
 // sub_82B34998 -- RendererDispatchBlock, called from LoaderTick on the
-// Transition thread.
-//
-// MADE MODE-NEUTRAL, and keep it that way. It used to log only under the plugin
-// and call the original silently in native, which hid the number that found the
-// frame-pacing bug: `f1` arriving here was exactly 0.00 in native and varied
-// under the plugin. **A one-sided probe was read as evidence that native behaved
-// the same.** Most Transition-thread probes in this file are still plugin-only.
+// Transition thread. `f1` arriving here is the frame delta, and it reading
+// exactly 0.00 is what found the frame-pacing bug.
 REX_IMPORT(__imp__sub_82B34998, orig_RendererDispatch, void());
 extern "C" REX_FUNC(sub_82B34998) {
-  const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
   static int rd = 0;
   ++rd;
   const bool loud = rd <= 20 || (rd % 500) == 0;
@@ -60,7 +52,7 @@ extern "C" REX_FUNC(sub_82B34998) {
   const double dt = ctx.f1.f64;
   orig_RendererDispatch(ctx, base);
   if (loud) {
-    REXLOG_INFO("{}: RendererDispatch #{} a1=0x{:08X} f1={:.6f} -> r3=0x{:08X}", tag,
+    REXLOG_INFO("native: RendererDispatch #{} a1=0x{:08X} f1={:.6f} -> r3=0x{:08X}",
                 rd, a1, dt, ctx.r3.u32);
   }
 }
@@ -83,20 +75,18 @@ extern "C" REX_FUNC(sub_82B3C7D0) {
   orig_GetEngineGlobal(ctx, base);
   const bool null_global = ctx.r3.u32 == 0;
   if (li <= 5 || null_global) {
-    REXLOG_INFO("{}: GetEngineGlobal(sub_82B3C7D0) #{} -> 0x{:08X}{}",
-                mx::native::g_plugin_mode ? "plugin" : "native", li, ctx.r3.u32,
-                null_global ? "  <-- NULL, assert path" : "");
+    REXLOG_INFO("native: GetEngineGlobal(sub_82B3C7D0) #{} -> 0x{:08X}{}",
+                li, ctx.r3.u32, null_global ? "  <-- NULL, assert path" : "");
   }
 }
 
 // sub_82B70370 -- frame pacing: QPC delta / perf frequency -> dt at a1+24, then
 // a 5-sample smoothing pass and the running totals at a1+56/60/64.
 //
-// This was stubbed in native mode, and that stub was the reason the front end
-// never ran: it wrote a fixed 1/60 to a1+24 and nothing else, so a1+60 never
-// advanced and the dt reaching LoaderTick's RendererDispatch was exactly 0.00.
-// Unstubbing took the script VM from 28 dispatches to 686 and Bink opens from 0
-// to 3 -- plugin mode's numbers exactly, 3/3 runs.
+// This was stubbed once, and that stub was the reason the front end never ran:
+// it wrote a fixed 1/60 to a1+24 and nothing else, so a1+60 never advanced and
+// the dt reaching LoaderTick's RendererDispatch was exactly 0.00. Unstubbing
+// took the script VM from 28 dispatches to 686 and Bink opens from 0 to 3.
 //
 // The stub's two stated hazards were both false and neither had been checked
 // against the guest code:
@@ -114,16 +104,15 @@ extern "C" REX_FUNC(sub_82B70370) {
   // The guards are what make this call safe, so record them once rather than
   // trusting the reading above to still hold.
   if (tm == 1 && a1) {
-    REXLOG_INFO("{}: Timing guards +20=0x{:08X} (FLT_MAX={}) +28=0x{:08X} +32=0x{:08X}",
-                mx::native::g_plugin_mode ? "plugin" : "native", REX_LOAD_U32(a1 + 20),
+    REXLOG_INFO("native: Timing guards +20=0x{:08X} (FLT_MAX={}) +28=0x{:08X} +32=0x{:08X}",
+                REX_LOAD_U32(a1 + 20),
                 REX_LOAD_U32(a1 + 20) == 0x7F7FFFFFu, REX_LOAD_U32(a1 + 28),
                 REX_LOAD_U32(a1 + 32));
   }
   orig_Timing(ctx, base);
   if ((tm <= 5 || (tm % 1000) == 0) && a1) {
-    REXLOG_INFO("{}: Timing #{} dt={:.6f} total={:.3f} a1=0x{:08X}",
-                mx::native::g_plugin_mode ? "plugin" : "native", tm,
-                std::bit_cast<float>(REX_LOAD_U32(a1 + 24)),
+    REXLOG_INFO("native: Timing #{} dt={:.6f} total={:.3f} a1=0x{:08X}",
+                tm, std::bit_cast<float>(REX_LOAD_U32(a1 + 24)),
                 std::bit_cast<float>(REX_LOAD_U32(a1 + 60)), a1);
   }
 }
@@ -155,7 +144,6 @@ REX_IMPORT(__imp__sub_8253AA40, orig_LoadStateMachine, void());
 // 2 is idle-awaiting-a-request -- sub_82534980 is what moves it 2 -> 3, and in a
 // front-end-only run nothing calls it.
 extern "C" REX_FUNC(sub_8253AA40) {
-  const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
   static int sm = 0;
   ++sm;
   uint32_t a1 = ctx.r3.u32;
@@ -170,8 +158,8 @@ extern "C" REX_FUNC(sub_8253AA40) {
   // last return and this entry, something outside sub_8253AA40 wrote it.
   static uint32_t s_prev_out = 0xFFFFFFFE;
   if (s_prev_out != 0xFFFFFFFE && state_in != s_prev_out) {
-    REXLOG_INFO("{}: EXTERNAL WRITE to AssetDB+28: {} -> {} between calls #{} and #{}",
-                tag, s_prev_out, state_in, sm - 1, sm);
+    REXLOG_INFO("native: EXTERNAL WRITE to AssetDB+28: {} -> {} between calls #{} and #{}",
+                s_prev_out, state_in, sm - 1, sm);
   }
   orig_LoadStateMachine(ctx, base);
   uint32_t state_out = a1 ? REX_LOAD_U32(a1 + 28) : 0xFFFFFFFF;
@@ -182,7 +170,7 @@ extern "C" REX_FUNC(sub_8253AA40) {
   bool changed = state_out != s_last;
   s_last = state_out;
   if (changed || sm <= 10 || (sm % 200) == 0) {
-    REXLOG_INFO("{}: LoadStateMachine #{} state {} -> {} r3=0x{:08X}{}", tag, sm,
+    REXLOG_INFO("native: LoadStateMachine #{} state {} -> {} r3=0x{:08X}{}", sm,
                 state_in, state_out, ctx.r3.u32, changed ? "  <-- CHANGED" : "");
   }
 
@@ -201,15 +189,15 @@ extern "C" REX_FUNC(sub_8253AA40) {
       uint32_t obj = REX_LOAD_U32(a1 + 110788);
       uint32_t sib = REX_LOAD_U32(a1 + 110792);
       uint32_t vt = obj ? REX_LOAD_U32(obj) : 0;
-      REXLOG_INFO("{}: state6 gate — listener(+110788)=0x{:08X} sibling(+110792)=0x{:08X} "
+      REXLOG_INFO("native: state6 gate — listener(+110788)=0x{:08X} sibling(+110792)=0x{:08X} "
                   "vt=0x{:08X} +110328=0x{:08X}",
-                  tag, obj, sib, vt, REX_LOAD_U32(a1 + 110328));
+                  obj, sib, vt, REX_LOAD_U32(a1 + 110328));
       if (vt) {
         // A real guest function pointer lives in 0x82xxxxxx. Anything else in a
         // vtable slot is data — assetdb vt[36] reads 0x53505F45 ("SP_E") — so
         // print the slots raw and judge them by range, never call them blind.
-        REXLOG_INFO("{}: state6 gate — vt[0]=0x{:08X} vt[1]=0x{:08X} vt[2]=0x{:08X} vt[3]=0x{:08X}",
-                    tag, REX_LOAD_U32(vt), REX_LOAD_U32(vt + 4),
+        REXLOG_INFO("native: state6 gate — vt[0]=0x{:08X} vt[1]=0x{:08X} vt[2]=0x{:08X} vt[3]=0x{:08X}",
+                    REX_LOAD_U32(vt), REX_LOAD_U32(vt + 4),
                     REX_LOAD_U32(vt + 8), REX_LOAD_U32(vt + 12));
       }
     }
@@ -248,14 +236,13 @@ std::string GuestString(uint8_t* base, uint32_t addr, size_t max = 260) {
 // selector 2 -> 3.
 REX_IMPORT(__imp__sub_82534980, orig_RequestLoad, void());
 extern "C" REX_FUNC(sub_82534980) {
-  const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
   uint32_t a1 = ctx.r3.u32;
   std::string name = GuestString(base, ctx.r4.u32);
   uint32_t state_in = a1 ? REX_LOAD_U32(a1 + 28) : 0xFFFFFFFF;
-  REXLOG_INFO("{}: RequestLoad(sub_82534980) a1=0x{:08X} name=\"{}\" flags=0x{:08X} state={}",
-              tag, a1, name, ctx.r5.u32, state_in);
+  REXLOG_INFO("native: RequestLoad(sub_82534980) a1=0x{:08X} name=\"{}\" flags=0x{:08X} state={}",
+              a1, name, ctx.r5.u32, state_in);
   orig_RequestLoad(ctx, base);
-  REXLOG_INFO("{}: RequestLoad returned — state {} -> {}", tag, state_in,
+  REXLOG_INFO("native: RequestLoad returned — state {} -> {}", state_in,
               a1 ? REX_LOAD_U32(a1 + 28) : 0xFFFFFFFF);
 }
 
@@ -263,8 +250,8 @@ extern "C" REX_FUNC(sub_82534980) {
 // the registry. Takes a `this` pointer in r3.
 REX_IMPORT(__imp__sub_82352AE0, orig_RequestLoadCaller, void());
 extern "C" REX_FUNC(sub_82352AE0) {
-  REXLOG_INFO("{}: sub_82352AE0 (RequestLoad caller) ENTER this=0x{:08X}",
-              mx::native::g_plugin_mode ? "plugin" : "native", ctx.r3.u32);
+  REXLOG_INFO("native: sub_82352AE0 (RequestLoad caller) ENTER this=0x{:08X}",
+              ctx.r3.u32);
   orig_RequestLoadCaller(ctx, base);
 }
 
@@ -275,8 +262,7 @@ extern "C" REX_FUNC(sub_82352AE0) {
   extern "C" REX_FUNC(sub_##addr) {                                           \
     static int n = 0;                                                         \
     if (++n <= 5)                                                             \
-      REXLOG_INFO("{}: chain " sym " ENTER #{} r3=0x{:08X}",                  \
-                  mx::native::g_plugin_mode ? "plugin" : "native", n,         \
+      REXLOG_INFO("native: chain " sym " ENTER #{} r3=0x{:08X}", n,           \
                   ctx.r3.u32);                                                \
     orig_chain_##addr(ctx, base);                                             \
   }
@@ -350,8 +336,6 @@ const std::vector<std::pair<std::string, std::string>>& RegistryOverrides() {
 // sub_825487C8 — the registry string getter.
 REX_IMPORT(__imp__sub_825487C8, orig_RegistryGetString, void());
 extern "C" REX_FUNC(sub_825487C8) {
-  const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
-
   // The original clobbers r4/r5 (it moves the key into r3 to hash it), so the
   // arguments have to be captured before it runs. `lr` goes with them: the call
   // overwrites it, and the log line below runs after.
@@ -366,13 +350,13 @@ extern "C" REX_FUNC(sub_825487C8) {
   static bool s_dumped = false;
   if (!s_dumped) {
     s_dumped = true;
-    REXLOG_INFO("{}: registry — key(0x{:08X})=\"{}\" key(0x{:08X})=\"{}\" key(0x{:08X})=\"{}\"",
-                tag, kSceneKey, GuestString(base, kSceneKey, 64), kModeKey,
+    REXLOG_INFO("native: registry — key(0x{:08X})=\"{}\" key(0x{:08X})=\"{}\" key(0x{:08X})=\"{}\"",
+                kSceneKey, GuestString(base, kSceneKey, 64), kModeKey,
                 GuestString(base, kModeKey, 64), kGateKey,
                 GuestString(base, kGateKey, 64));
     for (uint32_t i = 0; i < 5; ++i) {
       uint32_t p = REX_LOAD_U32(kModeTable + i * 4);
-      REXLOG_INFO("{}: registry — mode[{}] ptr=0x{:08X} \"{}\"", tag, i, p,
+      REXLOG_INFO("native: registry — mode[{}] ptr=0x{:08X} \"{}\"", i, p,
                   GuestString(base, p, 64));
     }
   }
@@ -387,8 +371,8 @@ extern "C" REX_FUNC(sub_825487C8) {
   static std::vector<std::string> s_seen;
   if (s_seen.size() < 40 && std::find(s_seen.begin(), s_seen.end(), key) == s_seen.end()) {
     s_seen.push_back(key);
-    REXLOG_INFO("{}: registry get \"{}\" size={} -> r3={} value=\"{}\" from lr=0x{:08X}",
-                tag, key, size, ctx.r3.u32,
+    REXLOG_INFO("native: registry get \"{}\" size={} -> r3={} value=\"{}\" from lr=0x{:08X}",
+                key, size, ctx.r3.u32,
                 ctx.r3.u32 ? GuestString(base, out, size) : std::string(), from);
   }
 
@@ -405,7 +389,7 @@ extern "C" REX_FUNC(sub_825487C8) {
     static std::vector<std::string> s_logged;
     if (std::find(s_logged.begin(), s_logged.end(), key) == s_logged.end()) {
       s_logged.push_back(key);
-      REXLOG_INFO("{}: registry OVERRIDE \"{}\" -> \"{}\" (size={})", tag, key, v, size);
+      REXLOG_INFO("native: registry OVERRIDE \"{}\" -> \"{}\" (size={})", key, v, size);
     }
     break;
   }
@@ -417,7 +401,6 @@ extern "C" REX_FUNC(sub_825487C8) {
 // which makes the setting sticky once anything satisfies it.
 REX_IMPORT(__imp__sub_82548758, orig_RegistryGetInt, void());
 extern "C" REX_FUNC(sub_82548758) {
-  const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
   const uint32_t key_addr = ctx.r4.u32;
   const uint32_t out = ctx.r5.u32;
   const uint32_t from = static_cast<uint32_t>(ctx.lr);
@@ -431,7 +414,7 @@ extern "C" REX_FUNC(sub_82548758) {
     static std::vector<std::string> s_logged;
     if (std::find(s_logged.begin(), s_logged.end(), key) == s_logged.end()) {
       s_logged.push_back(key);
-      REXLOG_INFO("{}: registry OVERRIDE int \"{}\" -> {}", tag, key, v);
+      REXLOG_INFO("native: registry OVERRIDE int \"{}\" -> {}", key, v);
     }
     break;
   }
@@ -439,7 +422,7 @@ extern "C" REX_FUNC(sub_82548758) {
   static std::vector<std::string> s_seen;
   if (s_seen.size() < 40 && std::find(s_seen.begin(), s_seen.end(), key) == s_seen.end()) {
     s_seen.push_back(key);
-    REXLOG_INFO("{}: registry getint \"{}\" -> {} from lr=0x{:08X}", tag, key,
+    REXLOG_INFO("native: registry getint \"{}\" -> {} from lr=0x{:08X}", key,
                 out ? REX_LOAD_U32(out) : 0xFFFFFFFFu, from);
   }
 }
@@ -467,8 +450,8 @@ extern "C" REX_FUNC(sub_82536250) {
   orig_GateMode(ctx, base);
   static int n = 0;
   if (++n <= 3 || (n % 500) == 0)
-    REXLOG_INFO("{}: GateMode(sub_82536250) #{} a1=0x{:08X} -> {}",
-                mx::native::g_plugin_mode ? "plugin" : "native", n, a1, ctx.r3.u32);
+    REXLOG_INFO("native: GateMode(sub_82536250) #{} a1=0x{:08X} -> {}",
+                n, a1, ctx.r3.u32);
 }
 
 // sub_8253CF80 — the gate itself, (*(AssetDB+110788))->vt[2].
@@ -479,9 +462,8 @@ extern "C" REX_FUNC(sub_8253CF80) {
   static uint32_t s_last = 0xFFFFFFFF;
   uint32_t ret = ctx.r3.u32;
   if (++n <= 3 || ret != s_last || (n % 500) == 0) {
-    REXLOG_INFO("{}: state6 gate(sub_8253CF80) #{} -> {}  assetdb(0x830577C0)=0x{:08X} "
-                "flag(0x83057900)=0x{:08X}",
-                mx::native::g_plugin_mode ? "plugin" : "native", n, ret,
+    REXLOG_INFO("native: state6 gate(sub_8253CF80) #{} -> {}  assetdb(0x830577C0)=0x{:08X} "
+                "flag(0x83057900)=0x{:08X}", n, ret,
                 REX_LOAD_U32(0x830577C0), REX_LOAD_U32(0x83057900));
     s_last = ret;
   }
@@ -564,9 +546,8 @@ void ReportScriptProbe(const char* name, uint32_t a1, uint32_t lr,
   const bool due = (now - s_last[slot]) >= std::chrono::seconds(5);
   if (++count <= 4 || due) {
     if (due) s_last[slot] = now;
-    REXLOG_INFO("{}: script {} #{} arg1=\"{}\" a1=0x{:08X} from lr=0x{:08X}",
-                mx::native::g_plugin_mode ? "plugin" : "native", name, count,
-                arg, a1, lr);
+    REXLOG_INFO("native: script {} #{} arg1=\"{}\" a1=0x{:08X} from lr=0x{:08X}",
+                name, count, arg, a1, lr);
   }
   // EVERY DISTINCT ARGUMENT, uncapped and independent of the rate limit above.
   // The throttle exists so a per-frame binding cannot flood the log, and it is
@@ -577,8 +558,8 @@ void ReportScriptProbe(const char* name, uint32_t a1, uint32_t lr,
     static std::set<std::string> s_seen;
     std::lock_guard<std::mutex> lk(s_mu);
     if (s_seen.size() < 256 && s_seen.insert(std::string(name) + "|" + arg).second)
-      REXLOG_INFO("{}: script {} FIRST SAW \"{}\"",
-                  mx::native::g_plugin_mode ? "plugin" : "native", name, arg);
+      REXLOG_INFO("native: script {} FIRST SAW \"{}\"",
+                  name, arg);
   }
 }
 
@@ -628,9 +609,8 @@ extern "C" REX_FUNC(sub_824AF3C0) {
   const std::string db = ScriptArgString(base, L, 0);
   orig_LoadAssetDB(ctx, base);
   static uint64_t s_n = 0;
-  REXLOG_INFO("{}: script LoadAssetDB #{} db=\"{}\" -> r3=0x{:08X}",
-              mx::native::g_plugin_mode ? "plugin" : "native", ++s_n, db,
-              ctx.r3.u32);
+  REXLOG_INFO("native: script LoadAssetDB #{} db=\"{}\" -> r3=0x{:08X}",
+              ++s_n, db, ctx.r3.u32);
 }
 
 //=============================================================================
@@ -727,22 +707,20 @@ extern "C" REX_FUNC(sub_8234CE20) {
     if (found) {
       REX_STORE_U32(self + 0x94u, found);
       const uint64_t n = s_repaired.fetch_add(1, std::memory_order_relaxed) + 1;
-      REXLOG_INFO("{}: AcquirePlayer REPAIRED comp=0x{:08X} movie=\"{}\" -- "
+      REXLOG_INFO("native: AcquirePlayer REPAIRED comp=0x{:08X} movie=\"{}\" -- "
                   "cached bink was NULL, re-resolved to 0x{:08X} ({} repaired, "
-                  "{} nulls seen)",
-                  mx::native::g_plugin_mode ? "plugin" : "native", self,
+                  "{} nulls seen)", self,
                   GuestString(base, self + 0x98u, 128), found, n, seen);
     } else {
       // SAID OUT LOUD. This is the branch that still faults, and a silent one
       // would look identical to a fix from the outside.
       const uint64_t n = s_stillNull.fetch_add(1, std::memory_order_relaxed) + 1;
       if (n <= 8)
-        REXLOG_ERROR("{}: AcquirePlayer comp=0x{:08X} movie=\"{}\" -- cached "
+        REXLOG_ERROR("native: AcquirePlayer comp=0x{:08X} movie=\"{}\" -- cached "
                      "bink is NULL and re-resolve FAILED (manager 0x{:08X}, "
                      "name {}); calling the original anyway, expect the "
                      "0x8234CE20 fault ({} so far)",
-                     mx::native::g_plugin_mode ? "plugin" : "native", self,
-                     have_name ? GuestString(base, self + 0x98u, 128)
+                     self, have_name ? GuestString(base, self + 0x98u, 128)
                                : std::string("<unreadable>"),
                      manager, have_name ? "ok" : "missing", n);
     }
@@ -922,10 +900,9 @@ extern "C" REX_FUNC(sub_824F8E20) {
     }
   }
   static uint64_t s_n = 0;
-  REXLOG_INFO("{}: AssetDB_LoadPackage #{} db=\"{}\" package=\"{}\" -> {} "
+  REXLOG_INFO("native: AssetDB_LoadPackage #{} db=\"{}\" package=\"{}\" -> {} "
               "(0 = the package did NOT load)",
-              mx::native::g_plugin_mode ? "plugin" : "native", ++s_n, db, pkg,
-              ctx.r3.u32);
+              ++s_n, db, pkg, ctx.r3.u32);
 }
 
 REX_IMPORT(__imp__sub_824AF488, orig_LoadAssetPackage, void());
@@ -935,9 +912,8 @@ extern "C" REX_FUNC(sub_824AF488) {
   const std::string pkg = ScriptArgString(base, L, 1);
   orig_LoadAssetPackage(ctx, base);
   static uint64_t s_n = 0;
-  REXLOG_INFO("{}: script LoadAssetPackage #{} db=\"{}\" package=\"{}\" -> "
-              "r3=0x{:08X}",
-              mx::native::g_plugin_mode ? "plugin" : "native", ++s_n, db, pkg,
+  REXLOG_INFO("native: script LoadAssetPackage #{} db=\"{}\" package=\"{}\" -> "
+              "r3=0x{:08X}", ++s_n, db, pkg,
               ctx.r3.u32);
 }
 MX_SCRIPT_PROBE(sub_824CD280, orig_StartWorldLoad, "StartWorldLoad")
@@ -958,9 +934,8 @@ MX_SCRIPT_PROBE(rex_MXRavage_Xenon_00cb, orig_ScriptBindingRegister, "BindingReg
 REX_IMPORT(__imp__sub_82A9F4F8, orig_LuaError, void());
 extern "C" REX_FUNC(sub_82A9F4F8) {
   static uint64_t s_count = 0;
-  REXLOG_INFO("{}: lua error #{} fmt=\"{}\" (L=0x{:08X}) from lr=0x{:08X}",
-              mx::native::g_plugin_mode ? "plugin" : "native", ++s_count,
-              GuestString(base, ctx.r4.u32, 160), ctx.r3.u32,
+  REXLOG_INFO("native: lua error #{} fmt=\"{}\" (L=0x{:08X}) from lr=0x{:08X}",
+              ++s_count, GuestString(base, ctx.r4.u32, 160), ctx.r3.u32,
               uint32_t(ctx.lr));
   orig_LuaError(ctx, base);
 }
@@ -968,9 +943,8 @@ extern "C" REX_FUNC(sub_82A9F4F8) {
 REX_IMPORT(__imp__sub_82AA9D48, orig_LuaRunError, void());
 extern "C" REX_FUNC(sub_82AA9D48) {
   static uint64_t s_count = 0;
-  REXLOG_INFO("{}: lua runerror #{} msg=\"{}\" (L=0x{:08X}) from lr=0x{:08X}",
-              mx::native::g_plugin_mode ? "plugin" : "native", ++s_count,
-              GuestString(base, ctx.r4.u32, 160), ctx.r3.u32,
+  REXLOG_INFO("native: lua runerror #{} msg=\"{}\" (L=0x{:08X}) from lr=0x{:08X}",
+              ++s_count, GuestString(base, ctx.r4.u32, 160), ctx.r3.u32,
               uint32_t(ctx.lr));
   orig_LuaRunError(ctx, base);
 }
@@ -985,9 +959,8 @@ extern "C" REX_FUNC(sub_824F91E8) {
   const uint32_t name_ptr = ctx.r3.u32;
   const std::string name = GuestString(base, name_ptr, 128);
   static uint64_t s_count = 0;
-  REXLOG_INFO("{}: script asset #{} \"{}\" (ptr=0x{:08X}) from lr=0x{:08X}",
-              mx::native::g_plugin_mode ? "plugin" : "native", ++s_count, name,
-              name_ptr, uint32_t(ctx.lr));
+  REXLOG_INFO("native: script asset #{} \"{}\" (ptr=0x{:08X}) from lr=0x{:08X}",
+              ++s_count, name, name_ptr, uint32_t(ctx.lr));
   orig_RunScriptAsset(ctx, base);
 }
 
@@ -1022,9 +995,8 @@ extern "C" REX_FUNC(sub_82C08EC0) {
     const uint32_t packet = state_ptr ? REX_LOAD_U32(state_ptr) : 0;
     const uint32_t buttons = state_ptr ? REX_LOAD_U32(state_ptr + 4) : 0;
     REXLOG_INFO(
-        "{}: XamInputGetState #{} user={} r3=0x{:08X} packet={} buttons=0x{:08X}"
-        " from lr=0x{:08X}",
-        mx::native::g_plugin_mode ? "plugin" : "native", s_count, user,
+        "native: XamInputGetState #{} user={} r3=0x{:08X} packet={} buttons=0x{:08X}"
+        " from lr=0x{:08X}", s_count, user,
         ctx.r3.u32, packet, buttons, lr);
   }
 }
@@ -1040,9 +1012,8 @@ extern "C" REX_FUNC(sub_82C08EC0) {
     ++s_count;                                                              \
     orig(ctx, base);                                                        \
     if (s_count <= 8)                                                       \
-      REXLOG_INFO("{}: {} #{} a1=0x{:08X} -> r3=0x{:08X} from lr=0x{:08X}",  \
-                  mx::native::g_plugin_mode ? "plugin" : "native", label,   \
-                  s_count, a1, ctx.r3.u32, lr);                             \
+      REXLOG_INFO("native: {} #{} a1=0x{:08X} -> r3=0x{:08X} from lr=0x{:08X}", \
+                  label, s_count, a1, ctx.r3.u32, lr);                      \
   }
 
 MX_IO_PROBE(sub_82C08ED0, orig_XInputGetCaps, "XamInputGetCapabilities")
@@ -1062,9 +1033,8 @@ extern "C" REX_FUNC(sub_82C87B98) {
   if (++s_count <= 4 || due) {
     if (due) s_last = now;
     REXLOG_INFO(
-        "{}: XAudioSubmitRenderDriverFrame #{} a1=0x{:08X} -> r3=0x{:08X}"
-        " from lr=0x{:08X}",
-        mx::native::g_plugin_mode ? "plugin" : "native", s_count, a1,
+        "native: XAudioSubmitRenderDriverFrame #{} a1=0x{:08X} -> r3=0x{:08X}"
+        " from lr=0x{:08X}", s_count, a1,
         ctx.r3.u32, lr);
   }
 }
@@ -1099,25 +1069,14 @@ extern "C" REX_FUNC(sub_82C87950) {
   const bool due = (now - s_last) >= std::chrono::seconds(5);
   if (++s_count <= 4 || due) {
     if (due) s_last = now;
-    REXLOG_INFO("{}: audio mix #{} dst=0x{:08X} peak={:.6f} non-silent={}/{}",
-                mx::native::g_plugin_mode ? "plugin" : "native", s_count, dst,
-                peak, s_nonsilent, s_count);
+    REXLOG_INFO("native: audio mix #{} dst=0x{:08X} peak={:.6f} non-silent={}/{}",
+                s_count, dst, peak, s_nonsilent, s_count);
   }
 }
 
 // sub_82B38558 — TerminatorVtableCtor (installs off_8213F70C vtable)
 REX_IMPORT(__imp__sub_82B38558, orig_VtableCtor, void());
 extern "C" REX_FUNC(sub_82B38558) {
-  if (mx::native::g_plugin_mode) {
-    LogEngSlot8(base, "VtableCtor ENTER");
-    REXLOG_INFO("plugin: VtableCtor(sub_82B38558) a1=0x{:08X}", ctx.r3.u32);
-    orig_VtableCtor(ctx, base);
-    uint32_t a1 = ctx.r3.u32;
-    uint32_t vt = a1 ? REX_LOAD_U32(a1) : 0;
-    REXLOG_INFO("plugin: VtableCtor done r3=0x{:08X} *a1->vt=0x{:08X}", ctx.r3.u32, vt);
-    LogEngSlot8(base, "VtableCtor RETURNED");
-    return;
-  }
   orig_VtableCtor(ctx, base);
 }
 
@@ -1439,17 +1398,17 @@ constexpr WatchedBinding kWatchedBindings[] = {
     {0x824AF3C0, "LoadAssetDB"},
 };
 
-void ReportBindingCensus(uint8_t* base, const char* tag) {
+void ReportBindingCensus(uint8_t* base) {
   std::map<uint32_t, BindingCensusEntry> snapshot;
   {
     std::lock_guard<std::mutex> lk(g_bindingCensusMu);
     snapshot = g_bindingCensus;
   }
-  REXLOG_INFO("{}: BINDING CENSUS — {} distinct C bindings called", tag,
+  REXLOG_INFO("native: BINDING CENSUS — {} distinct C bindings called",
               snapshot.size());
   for (const auto& [fn, e] : snapshot) {
     const std::string name = BindingName(base, fn);
-    REXLOG_INFO("{}:   0x{:08X} x{} {} <- {}", tag, fn, e.count,
+    REXLOG_INFO("native:   0x{:08X} x{} {} <- {}", fn, e.count,
                 name.empty() ? "(unresolved — no SWIG table names it)" : name,
                 e.first_caller.empty() ? "?" : e.first_caller);
   }
@@ -1468,8 +1427,8 @@ void ReportBindingCensus(uint8_t* base, const char* tag) {
     std::string list;
     for (const auto& [name, protos] : by_name)
       list += fmt::format(" {}({})", name, protos);
-    REXLOG_INFO("{}: CHUNK CENSUS — {} distinct Lua chunks executed, {} protos:{}",
-                tag, by_name.size(), chunks.size(), list);
+    REXLOG_INFO("native: CHUNK CENSUS — {} distinct Lua chunks executed, {} protos:{}",
+                by_name.size(), chunks.size(), list);
   }
   // Binding calls per calling chunk, worst first. THIS is the "which scripts
   // are doing anything" list; the `<-` column on the census above is only ever
@@ -1497,14 +1456,14 @@ void ReportBindingCensus(uint8_t* base, const char* tag) {
     std::string list;
     for (const auto& [name, count] : sorted)
       list += fmt::format(" {}={}", name, count);
-    REXLOG_INFO("{}: CALLER CENSUS — {} chunks made binding calls:{}", tag,
+    REXLOG_INFO("native: CALLER CENSUS — {} chunks made binding calls:{}",
                 sorted.size(), list);
   }
   // State the zeroes. This is the half that a "which bindings fired" list
   // cannot give you, and it is the half the UI_World question needs.
   for (const auto& w : kWatchedBindings) {
     const auto it = snapshot.find(w.addr);
-    REXLOG_INFO("{}:   WATCHED {:<28} 0x{:08X} x{} <- {}", tag, w.name, w.addr,
+    REXLOG_INFO("native:   WATCHED {:<28} 0x{:08X} x{} <- {}", w.name, w.addr,
                 it == snapshot.end() ? 0 : it->second.count,
                 it == snapshot.end() ? "(never called)"
                                      : (it->second.first_caller.empty()
@@ -1581,8 +1540,6 @@ extern "C" REX_FUNC(sub_82AA7638) {
   // that both modes run the front end it fires ~700 times a minute, so the head
   // is small and the rest is sampled. It stays because it is the cheapest
   // "is the front end actually running" signal there is.
-  const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
-
   // A binding seen for the first time always logs, whatever the sampler says.
   // `lr` is kept only to separate a script caller from a C one -- see
   // LuaCallerSite for why it can say nothing more than that -- and the script
@@ -1595,8 +1552,8 @@ extern "C" REX_FUNC(sub_82AA7638) {
       site = g_bindingCensus[cfunc].first_caller;
     }
     REXLOG_INFO(
-        "{}: BINDING FIRST CALL 0x{:08X} {} at dispatch #{} from {} (lr=0x{:08X})",
-        tag, cfunc, name.empty() ? "(unresolved — no SWIG table names it)" : name, n,
+        "native: BINDING FIRST CALL 0x{:08X} {} at dispatch #{} from {} (lr=0x{:08X})",
+        cfunc, name.empty() ? "(unresolved — no SWIG table names it)" : name, n,
         site.empty() ? "?" : site, from);
   }
 
@@ -1614,7 +1571,7 @@ extern "C" REX_FUNC(sub_82AA7638) {
     // naming the calling script says where it is alive -- which is the whole
     // question while the post-composite draw list is short. It runs at most
     // once every 5s, so the walk is free here.
-    REXLOG_INFO("{}: vm dispatch #{} {} cfunc=0x{:08X}{}{} from {}", tag, n,
+    REXLOG_INFO("native: vm dispatch #{} {} cfunc=0x{:08X}{}{} from {}", n,
                 !is_fn ? "non-function" : (is_c ? "C" : "lua"), cfunc,
                 name.empty() ? "" : " name=", name,
                 LuaCallerSite(base, ctx.r3.u32));
@@ -1628,7 +1585,7 @@ extern "C" REX_FUNC(sub_82AA7638) {
       s_last_census = now;
     } else if ((now - s_last_census) >= std::chrono::seconds(30)) {
       s_last_census = now;
-      ReportBindingCensus(base, tag);
+      ReportBindingCensus(base);
     }
   }
 

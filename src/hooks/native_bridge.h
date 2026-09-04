@@ -18,11 +18,6 @@
 
 namespace mx::native {
 
-// Set true when --gpu_plugin=<name> was passed on the command line. All native
-// C++ hooks short-circuit to "call orig" when this is true, letting the plugin
-// own rendering. Set once from MxApp::OnPreSetup (read in ~23 REX_FUNC hooks).
-extern bool g_plugin_mode;
-
 void SetWindowHandle(HWND hwnd);
 void SetRenderer(D3D12Renderer* renderer);
 

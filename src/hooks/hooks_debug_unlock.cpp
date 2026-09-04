@@ -195,9 +195,8 @@ extern "C" REX_FUNC(sub_829E8FA8) {
   std::string rows;
   for (const auto& [site, n] : g_dbgNativeAsks)
     rows += fmt::format(" [lr=0x{:08X} x{}]", site, n);
-  REXLOG_INFO("{}: dev native CALLERS ({}) -- {} distinct site(s), {} answer(s) "
-              "flipped to true:{}",
-              mx::native::g_plugin_mode ? "plugin" : "native", REXCVAR_GET(dev),
+  REXLOG_INFO("native: dev native CALLERS ({}) -- {} distinct site(s), {} answer(s) "
+              "flipped to true:{}", REXCVAR_GET(dev),
               g_dbgNativeAsks.size(), g_dbgNativeTrue,
               rows.empty() ? " (none)" : rows);
 }
@@ -273,7 +272,6 @@ extern "C" REX_FUNC(sub_82308300) {
   orig_ParsePresets(ctx, base);
   const std::vector<std::string> pairs = DevOptions("bind");
   if (pairs.empty()) return;
-  const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
 
   std::lock_guard<std::mutex> lk(g_bindMu);
 
@@ -287,10 +285,10 @@ extern "C" REX_FUNC(sub_82308300) {
       GuestRangeReadable(base, PresetEntry(0, it_probe->second), kActionStride))
     probe = ReadGuestCString(base, PresetEntry(0, it_probe->second), 64);
   if (probe != "Throttle") {
-    REXLOG_ERROR("{}: debug_binds REFUSED -- preset table layout check failed. "
+    REXLOG_ERROR("native: debug_binds REFUSED -- preset table layout check failed. "
                  "Expected Button12 of preset 0 to read \"Throttle\", got "
                  "\"{}\" ({} button names learned). Nothing written.",
-                 tag, probe, g_buttonIndex.size());
+                 probe, g_buttonIndex.size());
     return;
   }
 
@@ -307,7 +305,7 @@ extern "C" REX_FUNC(sub_82308300) {
     const auto it = g_buttonIndex.find(btn);
     if (it == g_buttonIndex.end()) {
       ++unknown;
-      REXLOG_ERROR("{}: debug_binds unknown button \"{}\"", tag, btn);
+      REXLOG_ERROR("native: debug_binds unknown button \"{}\"", btn);
       continue;
     }
     for (uint32_t preset = 0; preset < kPresetCount; ++preset) {
@@ -321,10 +319,10 @@ extern "C" REX_FUNC(sub_82308300) {
       ++applied;
     }
   }
-  REXLOG_INFO("{}: dev bind applied {} binding(s) across {} presets, {} slot(s) "
+  REXLOG_INFO("native: dev bind applied {} binding(s) across {} presets, {} slot(s) "
               "left alone because the guest already bound them, {} unknown "
               "button name(s); {} button names learned",
-              tag, applied, kPresetCount, skipped_taken, unknown,
+              applied, kPresetCount, skipped_taken, unknown,
               g_buttonIndex.size());
 }
 
@@ -360,9 +358,8 @@ extern "C" REX_FUNC(sub_82A9F468) {
     static std::atomic<bool> s_said{false};
     bool expected = false;
     if (s_said.compare_exchange_strong(expected, true))
-      REXLOG_INFO("{}: DEFINE_BuildConfig pushed as \"DEBUG\" instead of "
-                  "\"RELEASE\" -- AllowDebugMenu() will now return TRUE",
-                  mx::native::g_plugin_mode ? "plugin" : "native");
+      REXLOG_INFO("native: DEFINE_BuildConfig pushed as \"DEBUG\" instead of "
+                  "\"RELEASE\" -- AllowDebugMenu() will now return TRUE");
   }
   orig_LuaPushString(ctx, base);
 }

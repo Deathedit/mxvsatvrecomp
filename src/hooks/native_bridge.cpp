@@ -2,10 +2,6 @@
 
 namespace mx::native {
 
-// True when --gpu_plugin=<name> is requested. Hooks short-circuit to call
-// their original function instead of diverting through our native path.
-bool g_plugin_mode = false;
-
 namespace {
 
 HWND g_native_hwnd = nullptr;

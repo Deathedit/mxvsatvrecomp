@@ -57,7 +57,7 @@ namespace {
 
 // logs/pm4dump, emptied once per process before the first dump of the run.
 // Mirrors EnsureHlslDumpDir, and for the same reason: these filenames are
-// (tag, swap_count) and repeat every run, so a short run leaves the high frame
+// (swap_count) and repeat every run, so a short run leaves the high frame
 // numbers of a longer earlier run sitting in the directory, where they read as
 // belonging to the current one.
 void EnsurePm4DumpDir() {
@@ -74,7 +74,7 @@ void EnsurePm4DumpDir() {
 // Type3 opcode histogram for a parsed range. This is what says whether draws
 // are inline (0x22/0x34/0x35/0x36), hidden behind INDIRECT_BUFFER (0x3F/0x37),
 // or simply absent. Diagnostic only now that nothing translates the ring.
-void LogOpcodeHistogram(const char* tag, const char* range, int swap_count,
+void LogOpcodeHistogram(const char* range, int swap_count,
                         const std::vector<mx::pm4::Pm4Packet>& packets) {
   uint32_t counts[128] = {};
   uint32_t type0 = 0, type2 = 0;
@@ -83,12 +83,12 @@ void LogOpcodeHistogram(const char* tag, const char* range, int swap_count,
     else if (p.type == mx::pm4::PacketType::Type0) ++type0;
     else if (p.type == mx::pm4::PacketType::Type2) ++type2;
   }
-  REXLOG_INFO("{}: hist #{} {} — Type0={} Type2={}", tag, swap_count, range,
+  REXLOG_INFO("native: hist #{} {} — Type0={} Type2={}", swap_count, range,
               type0, type2);
   for (uint32_t op = 0; op < 128; ++op) {
     if (!counts[op]) continue;
     const char* name = mx::pm4::Pm4Parser::OpcodeName(op);
-    REXLOG_INFO("{}: hist #{} {} — Type3 0x{:02X} {} x{}", tag, swap_count,
+    REXLOG_INFO("native: hist #{} {} — Type3 0x{:02X} {} x{}", swap_count,
                 range, op, name ? name : "???", counts[op]);
   }
 }
@@ -205,7 +205,7 @@ extern "C" REX_FUNC(sub_82566B58) {
   // SwapTimer has already logged. See FramePacer's note.
   FramePacer _frame_pacer;
   SwapTimer _swap_timer{"VdSwap hook total", swap_count};
-  if (!mx::native::g_plugin_mode) ReportHostPageQueryStats();
+  ReportHostPageQueryStats();
 
   // Frame period, swap to swap. The first swap has no predecessor and is not
   // counted — otherwise the whole of startup lands in the first "frame" and
@@ -241,8 +241,7 @@ extern "C" REX_FUNC(sub_82566B58) {
   // native run whose capture holds 340 host draws.
   //
   // Printed EVERY swap and never sampled: every previous attempt at this number
-  // was gated or modulus-sampled and gave a wrong answer. The tag is
-  // `native`/`plugin`, so the two runs are told apart by the line itself.
+  // was gated or modulus-sampled and gave a wrong answer.
   {
     // The deltas are taken EVERY swap and held; only the printing is sampled.
     // Summing them across the interval is what makes the cadence lossless --
@@ -263,10 +262,9 @@ extern "C" REX_FUNC(sub_82566B58) {
     s_prev_refused = refused;
     if (FrameDiagDue(swap_count)) {
       const uint64_t frames = swap_count - s_spanFrom + 1;
-      REXLOG_INFO("{}: FRAME DRAWS #{} over {} frame(s) from #{}: guest {} "
+      REXLOG_INFO("native: FRAME DRAWS #{} over {} frame(s) from #{}: guest {} "
                   "accepted {} refused {} (unbuilt {}); cumulative guest {} "
-                  "accepted {} refused {}",
-                  mx::native::g_plugin_mode ? "plugin" : "native", swap_count,
+                  "accepted {} refused {}", swap_count,
                   frames, s_spanFrom, s_accGuest, s_accAccepted, s_accRefused,
                   s_accGuest > s_accAccepted + s_accRefused
                       ? s_accGuest - s_accAccepted - s_accRefused
@@ -288,18 +286,16 @@ extern "C" REX_FUNC(sub_82566B58) {
     // the attribution to be checked against.
     const uint64_t unattributed =
         attributed > gap ? attributed - gap : gap - attributed;
-    REXLOG_INFO("{}: UNBUILT WHY cumulative — {} no viewport, {} shader "
+    REXLOG_INFO("native: UNBUILT WHY cumulative — {} no viewport, {} shader "
                 "failed, {} no-code with the queue full, {} BuildHleDraw skips "
                 "= {} attributed against a gap of {} [{}]",
-                mx::native::g_plugin_mode ? "plugin" : "native", no_vp,
-                sh_failed, nocode_full, skips, attributed, gap,
+                no_vp, sh_failed, nocode_full, skips, attributed, gap,
                 mx::gpu::health::Tag(mx::gpu::health::Zero(
                     "draws.gap_unattributed", unattributed, gap)));
     // Measured 2026-08-27: the skips ARE the gap, 16,706 of 16,706, with every
     // other exit at zero. So the reasons are the finding and belong on the
     // ungated line rather than behind --hle_capture.
-    REXLOG_INFO("{}: UNBUILT SKIPS BY REASON:{}",
-                mx::native::g_plugin_mode ? "plugin" : "native",
+    REXLOG_INFO("native: UNBUILT SKIPS BY REASON:{}",
                 UnbuiltSkipBreakdown());
     }
   }
@@ -319,9 +315,6 @@ extern "C" REX_FUNC(sub_82566B58) {
 
   uint32_t pm4_write_before = REX_LOAD_U32(a1 + 48);
 
-  bool is_plugin = mx::native::g_plugin_mode;
-  const char* tag = is_plugin ? "plugin" : "native";
-
   // Ring bounds are not established. The fields this code used to read as base
   // and end (+44 and +52) logged 0x00000000 and 0xBEBA0000 at swap #1, but
   // packets parse at 0xBEBB3260 and later swaps write at 0xBED0653C -- so
@@ -331,8 +324,8 @@ extern "C" REX_FUNC(sub_82566B58) {
   // parse a wrapped range rather than fabricate packets.
   if (swap_count == 1) {
     for (uint32_t off = 0; off <= 96; off += 16) {
-      REXLOG_INFO("{}: VdSwap dev+{:3} = 0x{:08X} 0x{:08X} 0x{:08X} 0x{:08X}",
-                  tag, off, REX_LOAD_U32(a1 + off), REX_LOAD_U32(a1 + off + 4),
+      REXLOG_INFO("native: VdSwap dev+{:3} = 0x{:08X} 0x{:08X} 0x{:08X} 0x{:08X}",
+                  off, REX_LOAD_U32(a1 + off), REX_LOAD_U32(a1 + off + 4),
                   REX_LOAD_U32(a1 + off + 8), REX_LOAD_U32(a1 + off + 12));
     }
   }
@@ -360,21 +353,10 @@ extern "C" REX_FUNC(sub_82566B58) {
           : 0;
   if (frame_size >= 1024 * 1024) frame_size = 0;
 
-  // GUEST DRAWS per frame, reported HERE rather than from BeginFrame, and the
-  // reason is a measurement that was nearly read as a finding: printed from
-  // BeginFrame at `bf <= 3 || bf % 600 == 0`, a native run ending at 424 swaps
-  // logged only #1..#3 while a plugin run reaching 760 logged #600 -- which
-  // reads as "BeginFrame fires 3 times natively and 600 times under the plugin".
-  // VdSwap ticks once per present in BOTH modes.
-  //
-  // What the number decides: plugin mode renders the main-menu backdrop and
-  // native does not, so
-  //
-  //   same per-frame count in both -> the guest submits the same work and our
-  //                                   draws produce the wrong image; the defect
-  //                                   is state, not submission.
-  //   lower under native           -> this hook layer is changing guest
-  //                                   behaviour upstream of the renderer.
+  // GUEST DRAWS per frame, reported HERE rather than from BeginFrame: BeginFrame
+  // is throttled at `bf <= 3 || bf % 600 == 0`, so a run ending at 424 swaps
+  // logs only #1..#3 and reads as a hook that fires three times. VdSwap ticks
+  // once per present.
   //
   // Averaged over the interval, not sampled from one frame: the front end
   // alternates cheap and expensive frames.
@@ -384,9 +366,8 @@ extern "C" REX_FUNC(sub_82566B58) {
     if (swap_count <= 3 || (swap_count % 100) == 0) {
       const uint64_t now = GuestDrawCalls();
       const int frames = swap_count - s_prev_swap;
-      REXLOG_INFO("{}: GUEST DRAWS #{} — {} total, {} per frame over the last "
-                  "{} frames",
-                  tag, swap_count, now,
+      REXLOG_INFO("native: GUEST DRAWS #{} — {} total, {} per frame over the last "
+                  "{} frames", swap_count, now,
                   frames > 0 ? (now - s_prev_draws) / uint64_t(frames) : 0,
                   frames);
       s_prev_draws = now;
@@ -400,334 +381,321 @@ extern "C" REX_FUNC(sub_82566B58) {
                        frame_wrapped || (pm4_write_after < pm4_write_before);
   if (log_this_swap) {
     if (pm4_write_after >= pm4_write_before) {
-      REXLOG_INFO("{}: VdSwap #{} frame [0x{:08X}+{}]{} swap [0x{:08X}+{}] "
+      REXLOG_INFO("native: VdSwap #{} frame [0x{:08X}+{}]{} swap [0x{:08X}+{}] "
                   "ptr span 0x{:08X}..0x{:08X}",
-                  tag, swap_count, frame_start, frame_size,
+                  swap_count, frame_start, frame_size,
                   frame_wrapped ? " WRAPPED-SKIPPED" : "", pm4_write_before,
                   pm4_write_after - pm4_write_before, s_ptr_min, s_ptr_max);
     } else {
-      REXLOG_INFO("{}: VdSwap #{} ring WRAP (before=0x{:08X} after=0x{:08X}) "
+      REXLOG_INFO("native: VdSwap #{} ring WRAP (before=0x{:08X} after=0x{:08X}) "
                   "ptr span 0x{:08X}..0x{:08X}",
-                  tag, swap_count, pm4_write_before, pm4_write_after, s_ptr_min,
+                  swap_count, pm4_write_before, pm4_write_after, s_ptr_min,
                   s_ptr_max);
     }
   }
 
-  // Native mode now parses every swap: the load completes around swap ~600 and
-  // the old native limit of 5 meant nothing after boot was ever examined. The
-  // expensive extras below (gpu_state, file dumps) stay on their sparse
-  // schedules. Plugin mode keeps its original cadence.
-  bool should_parse = !is_plugin || (swap_count <= 20) ||
-                      (swap_count == 300 || swap_count == 600 ||
-                       swap_count == 1000) ||
-                      (swap_count >= 1200 && (swap_count % 100 == 0));
+  mx::pm4::Pm4Parser frame_parser;
+  if (frame_size > 0) {
+    frame_parser.ParseRange(
+        reinterpret_cast<const uint32_t*>(base + frame_start),
+        frame_size / 4, frame_start);
+  }
 
-  if (should_parse) {
-    mx::pm4::Pm4Parser frame_parser;
-    if (frame_size > 0) {
-      frame_parser.ParseRange(
-          reinterpret_cast<const uint32_t*>(base + frame_start),
-          frame_size / 4, frame_start);
-    }
-
-    mx::pm4::Pm4Parser swap_parser;
-    if (pm4_write_after > pm4_write_before) {
-      uint32_t sz = pm4_write_after - pm4_write_before;
-      if (sz < 1024 * 1024) {
-        if (swap_count == 1) {
-          const uint32_t* raw = reinterpret_cast<const uint32_t*>(base + pm4_write_before);
-          uint32_t dump_count = (sz / 4) < 16 ? (sz / 4) : 16;
-          for (uint32_t i = 0; i < dump_count; ++i) {
-            REXLOG_INFO("{}: PM4 raw[{}] = 0x{:08X}  (guest: 0x{:08X})", tag, i, raw[i], _byteswap_ulong(raw[i]));
-          }
-        }
-        swap_parser.ParseRange(
-            reinterpret_cast<const uint32_t*>(base + pm4_write_before),
-            sz / 4, pm4_write_before);
-      }
-    }
-
-    auto& frame_packets = frame_parser.Packets();
-    auto& swap_packets = swap_parser.Packets();
-
-    // Feed the ALU constant file on EVERY parsed swap, deliberately outside the
-    // gate below. That gate keeps the noisy per-packet logging off the hot path
-    // and only lets swaps <= 20 plus three checkpoints through, so anything hung
-    // off it stops updating ~20 frames into a run. Cheap by construction: one
-    // range test per Type0 packet.
-    //
-    // RING vs HLE CENSUS, added to test one premise before building per-draw
-    // constant ordering on it: that a draw's position in the RING can be matched
-    // to a draw in the D3D9 HLE path. Ordering by index is only meaningful if
-    // the two counts track each other.
-    //
-    // The Type3 constant opcodes are counted for a separate reason. The ALU
-    // constant file is fed ONLY from Type0 writes, but SET_CONSTANT,
-    // SET_SHADER_CONSTANTS and LOAD_ALU_CONSTANT are Type3 -- if the guest
-    // publishes constants through those, we never record them at all.
-    //
-    // MEASUREMENT ONLY: nothing here changes what is recorded or drawn.
-
-    uint32_t ring_draws = 0, t3_set_const = 0, t3_set_shader = 0, t3_load_alu = 0;
-    // Cumulative, so a zero in APPLIED is readable against what we saw and why
-    // each skip happened rather than being one undifferentiated number.
-    static uint64_t s_alu_applied = 0, s_alu_dwords = 0, s_alu_nonalu = 0,
-                    s_alu_unreadable = 0, s_alu_range = 0, s_alu_short = 0;
-    for (const auto* list : {&frame_packets, &swap_packets}) {
-      for (const auto& p : *list) {
-        if (p.type == mx::pm4::PacketType::Type3) {
-          switch (static_cast<mx::pm4::Pm4Opcode>(p.opcode)) {
-            case mx::pm4::Pm4Opcode::DRAW_INDX:
-            case mx::pm4::Pm4Opcode::DRAW_INDX_2:
-            case mx::pm4::Pm4Opcode::DRAW_INDX_BIN:
-            case mx::pm4::Pm4Opcode::DRAW_INDX_2_BIN:
-              ++ring_draws;
-              break;
-            case mx::pm4::Pm4Opcode::SET_CONSTANT:       ++t3_set_const; break;
-            case mx::pm4::Pm4Opcode::SET_SHADER_CONSTANTS: ++t3_set_shader; break;
-            case mx::pm4::Pm4Opcode::LOAD_ALU_CONSTANT: {
-              // THE SECOND PUBLISHER. The ALU constant file was fed from Type0
-              // writes only, and this Type3 opcode runs ~234 times a frame
-              // carrying constants we recorded none of.
-              //
-              // Body layout and the index arithmetic are Xenia's, from
-              // ExecutePacketType3_LOAD_ALU_CONSTANT and WriteALURangeFromMem:
-              //
-              //   body[0] address     & 0x3FFFFFFF
-              //   body[1] offset_type -> index = & 0x7FF, type = >> 16 & 0xFF
-              //   body[2] size_dwords & 0xFFF          (a REGISTER count)
-              //   ALU registers live at 0x4000 + index, which is our kAluRegBase
-              //
-              // The packet carries an ADDRESS, not values: the constants sit in
-              // guest memory, so this reads them the same way
-              // OverlayShaderConstants reads a shader's own table. p.body is
-              // host-order (the parser byte-swaps on the way in); guest memory
-              // is not, hence REX_LOAD_U32.
-              //
-              // ONLY type 0 (ALU) is applied. 1=FETCH, 2=BOOL, 3=LOOP,
-              // 4=REGISTERS are counted and skipped.
-              ++t3_load_alu;
-              if (p.body.size() < 3) { ++s_alu_short; break; }
-              const uint32_t addr = p.body[0] & 0x3FFFFFFFu;
-              const uint32_t offset_type = p.body[1];
-              const uint32_t index = offset_type & 0x7FFu;
-              const uint32_t type = (offset_type >> 16) & 0xFFu;
-              uint32_t n = p.body[2] & 0xFFFu;
-              if (type != 0) { ++s_alu_nonalu; break; }
-              if (!n || index >= mx::gpu::alu::kAluConstants * 4) { ++s_alu_range; break; }
-              if (index + n > mx::gpu::alu::kAluConstants * 4)
-                n = mx::gpu::alu::kAluConstants * 4 - index;
-              // The masked physical address is rarely the readable one, so
-              // walk the mirrors. First cut of this skipped 55,357 packets and
-              // applied ZERO purely because it trusted `addr` as-is -- the
-              // separate unreadable bucket is what said so, rather than the
-              // whole thing just reading 0.
-              const uint32_t src = ResolveGuestRange(base, addr, n * 4);
-              if (!src) {
-                ++s_alu_unreadable;
-                break;
-              }
-              static thread_local std::vector<uint32_t> vals;
-              vals.resize(n);
-              for (uint32_t k = 0; k < n; ++k)
-                vals[k] = REX_LOAD_U32(src + k * 4);
-              mx::gpu::alu::NoteType0Write(mx::gpu::alu::kAluRegBase + index,
-                                           vals.data(), n);
-              ++s_alu_applied;
-              s_alu_dwords += n;
-              break;
-            }
-            default: break;
-          }
-          continue;
-        }
-        if (p.type != mx::pm4::PacketType::Type0 || p.body.empty()) continue;
-        mx::gpu::alu::NoteType0Write(p.reg_base, p.body.data(),
-                                     static_cast<uint32_t>(p.body.size()));
-      }
-    }
-    {
-      // The HLE side of the comparison, as a per-frame delta on the same counter
-      // FRAME DRAWS reports, so the two lines can be read together. Both sides
-      // ACCUMULATE across the reporting interval: a modulus that sampled one
-      // frame in thirty would compare two numbers drawn from a single frame
-      // while the other twenty-nine went unexamined.
-      static uint64_t s_prev_ring_guest = 0;
-      static uint64_t s_accRing = 0, s_accHle = 0;
-      static uint64_t s_ringSpanFrom = 1;
-      const uint64_t g = GuestDrawCalls();
-      s_accHle += g - s_prev_ring_guest;
-      s_accRing += ring_draws;
-      s_prev_ring_guest = g;
-      if (FrameDiagDue(swap_count)) {
-        const uint64_t frames = swap_count - s_ringSpanFrom + 1;
-        REXLOG_INFO("{}: RING vs HLE #{} over {} frame(s) from #{}: ring draws "
-                    "{} vs HLE draws {} (ordering by index is only usable if "
-                    "these track) | Type3 constant opcodes: SET_CONSTANT {}, "
-                    "SET_SHADER_CONSTANTS {}, LOAD_ALU_CONSTANT {} (non-zero "
-                    "means the ALU file, which is fed from Type0 only, is "
-                    "missing a publish path)",
-                    tag, swap_count, frames, s_ringSpanFrom, s_accRing,
-                    s_accHle, t3_set_const, t3_set_shader, t3_load_alu);
-        s_accRing = s_accHle = 0;
-        s_ringSpanFrom = swap_count + 1;
-        REXLOG_INFO("{}: ALU LOAD applied {} packets / {} dwords into the "
-                    "constant file | skipped: {} non-ALU type, {} unreadable "
-                    "address, {} out of range, {} short body",
-                    tag, s_alu_applied, s_alu_dwords, s_alu_nonalu,
-                    s_alu_unreadable, s_alu_range, s_alu_short);
-      }
-    }
-
-    // Only write dump files for spot-check swaps — keeps the disk clean when
-    // we're parsing every swap looking for indexed draws.
-    bool should_dump_file = (swap_count <= 20) ||
-                            swap_count == 300 || swap_count == 600 ||
-                            swap_count == 1000 ||
-                            (swap_count >= 1200 && (swap_count % 500 == 0));
-    if (should_dump_file) {
-      // Into logs/pm4dump/, with every other dump directory. These used to land
-      // next to the executable and had accumulated 137 files in the project root
-      // before anyone noticed -- they are gitignored, so nothing complained.
-      // Wiped once per process, same reason as EnsureHlslDumpDir: the names
-      // repeat every run.
-      EnsurePm4DumpDir();
-      char dumpfname[96];
-      snprintf(dumpfname, sizeof(dumpfname), "logs/pm4dump/%s_frame_%02d.txt", tag, swap_count);
-      mx::pm4::Pm4Parser::DumpPackets(frame_packets, dumpfname);
-      snprintf(dumpfname, sizeof(dumpfname), "logs/pm4dump/%s_swap_%02d.txt", tag, swap_count);
-      mx::pm4::Pm4Parser::DumpPackets(swap_packets, dumpfname);
-      LogOpcodeHistogram(tag, "frame", swap_count, frame_packets);
-      LogOpcodeHistogram(tag, "swap", swap_count, swap_packets);
-    }
-
-    // Skip ApplyPackets gpu_state tracking + per-packet logging for high swap
-    // counts (too noisy) — only the translator needs to run.
-    if (swap_count <= 20 || swap_count == 300 || swap_count == 600 ||
-        swap_count == 1000) {
-      static mx::gpu::XenosGpuState gpu_state;
-      for (const auto* list : {&frame_packets, &swap_packets}) {
-        for (const auto& p : *list) {
-          if (p.type == mx::pm4::PacketType::Type0) {
-            uint32_t cnt = p.reg_count;
-            if (cnt > p.body.size()) cnt = (uint32_t)p.body.size();
-            if (cnt > 0) gpu_state.ApplyType0Write(p.reg_base, p.body.data(), cnt);
-          } else if (p.type == mx::pm4::PacketType::Type3) {
-            gpu_state.ApplyType3Packet(p);
-          }
+  mx::pm4::Pm4Parser swap_parser;
+  if (pm4_write_after > pm4_write_before) {
+    uint32_t sz = pm4_write_after - pm4_write_before;
+    if (sz < 1024 * 1024) {
+      if (swap_count == 1) {
+        const uint32_t* raw = reinterpret_cast<const uint32_t*>(base + pm4_write_before);
+        uint32_t dump_count = (sz / 4) < 16 ? (sz / 4) : 16;
+        for (uint32_t i = 0; i < dump_count; ++i) {
+          REXLOG_INFO("native: PM4 raw[{}] = 0x{:08X}  (guest: 0x{:08X})", i, raw[i], _byteswap_ulong(raw[i]));
         }
       }
-      REXLOG_INFO("{}: ApplyPackets done, {} regs", tag, gpu_state.Registers().size());
-    }
-
-    // The PM4 translator used to run here, building draws from the ring. It is
-    // gone: the ring reached ~15k vertices a frame and left 99.9% of them
-    // untranscoded, while the D3D9 HLE path carries 27.4M. The packets are
-    // still parsed above, but only as diagnostics — nothing downstream of this
-    // point consumes them to produce pixels.
-
-    //-----------------------------------------------------------------------
-    // Does the ring carry the same number of draws D3D9 was asked for?
-    //
-    // This is the last route left from a D3D9 shader handle to its microcode.
-    // The direct ones are all closed: the blob at +0x368 is not the code (23%
-    // agreement against what the ring loaded), SH_pPhysical reads as zeros at
-    // bind time, and its address is not the ring key. But the ring does load 41
-    // shaders *by address*, so the code is in guest memory -- only the mapping
-    // is missing. If each frame's ring draw count equals its D3D9 draw count,
-    // the Nth ring draw is the Nth D3D9 draw.
-    //
-    // Counted from the *raw draw packets*, not from DrawCalls(): the translator
-    // drops draws it cannot build, so its output would understate the ring and
-    // manufacture a mismatch that is really a filter.
-    //-----------------------------------------------------------------------
-    {
-      // Per opcode, not as one total: the ring has four draw opcodes and two of
-      // them are the binned forms, which replay a draw per bin. A bare total
-      // cannot tell that apart from D3D9 issuing draws the game never asked
-      // for, and those point opposite ways.
-      uint64_t op[4] = {};   // 0x22, 0x34, 0x35, 0x36
-      auto count_draw_packets = [&](const std::vector<mx::pm4::Pm4Packet>& v) {
-        for (const auto& p : v) {
-          if (p.type != mx::pm4::PacketType::Type3) continue;
-          switch (p.opcode) {
-            case 0x22: ++op[0]; break;
-            case 0x34: ++op[1]; break;
-            case 0x35: ++op[2]; break;
-            case 0x36: ++op[3]; break;
-            default: break;
-          }
-        }
-      };
-      count_draw_packets(frame_packets);
-      count_draw_packets(swap_packets);
-      const uint64_t ring = op[0] + op[1] + op[2] + op[3];
-
-      static uint64_t s_lastD3d9 = 0, s_lastIndexed = 0;
-      const uint64_t now = mx::hle::D3D9DrawCounter();
-      const uint64_t now_idx = mx::hle::D3D9IndexedDrawCounter();
-      const uint64_t d3d9 = now - s_lastD3d9;
-      const uint64_t d3d9_idx = now_idx - s_lastIndexed;
-      s_lastD3d9 = now;
-      s_lastIndexed = now_idx;
-
-      static uint64_t s_swaps = 0, s_equal = 0, s_ringTotal = 0, s_d3d9Total = 0;
-      static uint64_t s_opTotal[4] = {}, s_idxTotal = 0;
-      static uint64_t s_eqIdx35 = 0, s_eqNonIdx = 0;
-      // Only frames where either side drew say anything; a pair of zeros agrees
-      // trivially and would inflate the rate.
-      if (ring || d3d9) {
-        ++s_swaps;
-        s_ringTotal += ring;
-        s_d3d9Total += d3d9;
-        s_idxTotal += d3d9_idx;
-        for (int i = 0; i < 4; ++i) s_opTotal[i] += op[i];
-        if (ring == d3d9) ++s_equal;
-        // The two subsets worth testing on their own: the binned indexed form
-        // against D3D9's indexed draws, and the unbinned forms against the
-        // non-indexed ones.
-        if (op[2] == d3d9_idx) ++s_eqIdx35;
-        if (op[0] + op[3] == d3d9 - d3d9_idx) ++s_eqNonIdx;
-        if ((s_swaps % 60) == 0) {
-          REXLOG_INFO(
-              "{}: draw correspondence — total equal {}/{} frames; ring {} vs "
-              "D3D9 {} (indexed {}); ring by opcode 0x22={} 0x34={} 0x35={} "
-              "0x36={}; subsets equal: 0x35-vs-indexed {}, unbinned-vs-"
-              "nonindexed {}",
-              tag, s_equal, s_swaps, s_ringTotal, s_d3d9Total, s_idxTotal,
-              s_opTotal[0], s_opTotal[1], s_opTotal[2], s_opTotal[3],
-              s_eqIdx35, s_eqNonIdx);
-        }
-      }
-    }
-
-    if (log_this_swap) {
-      REXLOG_INFO("{}: PM4 #{}: frame {} packets, swap {} packets",
-                  tag, swap_count, frame_packets.size(), swap_packets.size());
-    }
-
-    // Always propagate, even when empty: empty list clears the renderer's stale
-    // draw data so frames without a VdSwap don't replay the last captured draws.
-    if (!is_plugin) {
-      // Drains draws parked with ShaderApplyResult::kNoCode. This used to be the
-      // retry that mattered, while the code came from the ring; it now comes
-      // from CapturePatchedCode inside the PatchVertexShader hook, which runs
-      // before the draw it patches.
-      //
-      // Kept as a drain, not as a working retry: `skipped no-code` reads 0 and
-      // the deferred-draw line never prints. It stays because kNoCode is still
-      // reachable and a parked draw with nothing to drain it would leak.
-      //
-      // Same lock the D3D9 hooks take: FinalizePendingD3D9Draws drains
-      // g_pendingHleDraws and reads the shader caches, all of which a record
-      // worker may be writing at this instant.
-      std::lock_guard<std::recursive_mutex> lock(mx::hle::HleGlobalMutex());
-      FinalizePendingD3D9Draws(base);
-      auto& hle = mx::hle::HleFrameDraws();
-      mx::native::NativeGraphics::Get().SetDrawCalls(hle);
-      hle.clear();
+      swap_parser.ParseRange(
+          reinterpret_cast<const uint32_t*>(base + pm4_write_before),
+          sz / 4, pm4_write_before);
     }
   }
+
+  auto& frame_packets = frame_parser.Packets();
+  auto& swap_packets = swap_parser.Packets();
+
+  // Feed the ALU constant file on EVERY parsed swap, deliberately outside the
+  // gate below. That gate keeps the noisy per-packet logging off the hot path
+  // and only lets swaps <= 20 plus three checkpoints through, so anything hung
+  // off it stops updating ~20 frames into a run. Cheap by construction: one
+  // range test per Type0 packet.
+  //
+  // RING vs HLE CENSUS, added to test one premise before building per-draw
+  // constant ordering on it: that a draw's position in the RING can be matched
+  // to a draw in the D3D9 HLE path. Ordering by index is only meaningful if
+  // the two counts track each other.
+  //
+  // The Type3 constant opcodes are counted for a separate reason. The ALU
+  // constant file is fed ONLY from Type0 writes, but SET_CONSTANT,
+  // SET_SHADER_CONSTANTS and LOAD_ALU_CONSTANT are Type3 -- if the guest
+  // publishes constants through those, we never record them at all.
+  //
+  // MEASUREMENT ONLY: nothing here changes what is recorded or drawn.
+
+  uint32_t ring_draws = 0, t3_set_const = 0, t3_set_shader = 0, t3_load_alu = 0;
+  // Cumulative, so a zero in APPLIED is readable against what we saw and why
+  // each skip happened rather than being one undifferentiated number.
+  static uint64_t s_alu_applied = 0, s_alu_dwords = 0, s_alu_nonalu = 0,
+                  s_alu_unreadable = 0, s_alu_range = 0, s_alu_short = 0;
+  for (const auto* list : {&frame_packets, &swap_packets}) {
+    for (const auto& p : *list) {
+      if (p.type == mx::pm4::PacketType::Type3) {
+        switch (static_cast<mx::pm4::Pm4Opcode>(p.opcode)) {
+          case mx::pm4::Pm4Opcode::DRAW_INDX:
+          case mx::pm4::Pm4Opcode::DRAW_INDX_2:
+          case mx::pm4::Pm4Opcode::DRAW_INDX_BIN:
+          case mx::pm4::Pm4Opcode::DRAW_INDX_2_BIN:
+            ++ring_draws;
+            break;
+          case mx::pm4::Pm4Opcode::SET_CONSTANT:       ++t3_set_const; break;
+          case mx::pm4::Pm4Opcode::SET_SHADER_CONSTANTS: ++t3_set_shader; break;
+          case mx::pm4::Pm4Opcode::LOAD_ALU_CONSTANT: {
+            // THE SECOND PUBLISHER. The ALU constant file was fed from Type0
+            // writes only, and this Type3 opcode runs ~234 times a frame
+            // carrying constants we recorded none of.
+            //
+            // Body layout and the index arithmetic are Xenia's, from
+            // ExecutePacketType3_LOAD_ALU_CONSTANT and WriteALURangeFromMem:
+            //
+            //   body[0] address     & 0x3FFFFFFF
+            //   body[1] offset_type -> index = & 0x7FF, type = >> 16 & 0xFF
+            //   body[2] size_dwords & 0xFFF          (a REGISTER count)
+            //   ALU registers live at 0x4000 + index, which is our kAluRegBase
+            //
+            // The packet carries an ADDRESS, not values: the constants sit in
+            // guest memory, so this reads them the same way
+            // OverlayShaderConstants reads a shader's own table. p.body is
+            // host-order (the parser byte-swaps on the way in); guest memory
+            // is not, hence REX_LOAD_U32.
+            //
+            // ONLY type 0 (ALU) is applied. 1=FETCH, 2=BOOL, 3=LOOP,
+            // 4=REGISTERS are counted and skipped.
+            ++t3_load_alu;
+            if (p.body.size() < 3) { ++s_alu_short; break; }
+            const uint32_t addr = p.body[0] & 0x3FFFFFFFu;
+            const uint32_t offset_type = p.body[1];
+            const uint32_t index = offset_type & 0x7FFu;
+            const uint32_t type = (offset_type >> 16) & 0xFFu;
+            uint32_t n = p.body[2] & 0xFFFu;
+            if (type != 0) { ++s_alu_nonalu; break; }
+            if (!n || index >= mx::gpu::alu::kAluConstants * 4) { ++s_alu_range; break; }
+            if (index + n > mx::gpu::alu::kAluConstants * 4)
+              n = mx::gpu::alu::kAluConstants * 4 - index;
+            // The masked physical address is rarely the readable one, so
+            // walk the mirrors. First cut of this skipped 55,357 packets and
+            // applied ZERO purely because it trusted `addr` as-is -- the
+            // separate unreadable bucket is what said so, rather than the
+            // whole thing just reading 0.
+            const uint32_t src = ResolveGuestRange(base, addr, n * 4);
+            if (!src) {
+              ++s_alu_unreadable;
+              break;
+            }
+            static thread_local std::vector<uint32_t> vals;
+            vals.resize(n);
+            for (uint32_t k = 0; k < n; ++k)
+              vals[k] = REX_LOAD_U32(src + k * 4);
+            mx::gpu::alu::NoteType0Write(mx::gpu::alu::kAluRegBase + index,
+                                         vals.data(), n);
+            ++s_alu_applied;
+            s_alu_dwords += n;
+            break;
+          }
+          default: break;
+        }
+        continue;
+      }
+      if (p.type != mx::pm4::PacketType::Type0 || p.body.empty()) continue;
+      mx::gpu::alu::NoteType0Write(p.reg_base, p.body.data(),
+                                   static_cast<uint32_t>(p.body.size()));
+    }
+  }
+  {
+    // The HLE side of the comparison, as a per-frame delta on the same counter
+    // FRAME DRAWS reports, so the two lines can be read together. Both sides
+    // ACCUMULATE across the reporting interval: a modulus that sampled one
+    // frame in thirty would compare two numbers drawn from a single frame
+    // while the other twenty-nine went unexamined.
+    static uint64_t s_prev_ring_guest = 0;
+    static uint64_t s_accRing = 0, s_accHle = 0;
+    static uint64_t s_ringSpanFrom = 1;
+    const uint64_t g = GuestDrawCalls();
+    s_accHle += g - s_prev_ring_guest;
+    s_accRing += ring_draws;
+    s_prev_ring_guest = g;
+    if (FrameDiagDue(swap_count)) {
+      const uint64_t frames = swap_count - s_ringSpanFrom + 1;
+      REXLOG_INFO("native: RING vs HLE #{} over {} frame(s) from #{}: ring draws "
+                  "{} vs HLE draws {} (ordering by index is only usable if "
+                  "these track) | Type3 constant opcodes: SET_CONSTANT {}, "
+                  "SET_SHADER_CONSTANTS {}, LOAD_ALU_CONSTANT {} (non-zero "
+                  "means the ALU file, which is fed from Type0 only, is "
+                  "missing a publish path)",
+                  swap_count, frames, s_ringSpanFrom, s_accRing,
+                  s_accHle, t3_set_const, t3_set_shader, t3_load_alu);
+      s_accRing = s_accHle = 0;
+      s_ringSpanFrom = swap_count + 1;
+      REXLOG_INFO("native: ALU LOAD applied {} packets / {} dwords into the "
+                  "constant file | skipped: {} non-ALU type, {} unreadable "
+                  "address, {} out of range, {} short body",
+                  s_alu_applied, s_alu_dwords, s_alu_nonalu,
+                  s_alu_unreadable, s_alu_range, s_alu_short);
+    }
+  }
+
+  // Only write dump files for spot-check swaps — keeps the disk clean when
+  // we're parsing every swap looking for indexed draws.
+  bool should_dump_file = (swap_count <= 20) ||
+                          swap_count == 300 || swap_count == 600 ||
+                          swap_count == 1000 ||
+                          (swap_count >= 1200 && (swap_count % 500 == 0));
+  if (should_dump_file) {
+    // Into logs/pm4dump/, with every other dump directory. These used to land
+    // next to the executable and had accumulated 137 files in the project root
+    // before anyone noticed -- they are gitignored, so nothing complained.
+    // Wiped once per process, same reason as EnsureHlslDumpDir: the names
+    // repeat every run.
+    EnsurePm4DumpDir();
+    char dumpfname[96];
+    snprintf(dumpfname, sizeof(dumpfname), "logs/pm4dump/native_frame_%02d.txt", swap_count);
+    mx::pm4::Pm4Parser::DumpPackets(frame_packets, dumpfname);
+    snprintf(dumpfname, sizeof(dumpfname), "logs/pm4dump/native_swap_%02d.txt", swap_count);
+    mx::pm4::Pm4Parser::DumpPackets(swap_packets, dumpfname);
+    LogOpcodeHistogram("frame", swap_count, frame_packets);
+    LogOpcodeHistogram("swap", swap_count, swap_packets);
+  }
+
+  // Skip ApplyPackets gpu_state tracking + per-packet logging for high swap
+  // counts (too noisy) — only the translator needs to run.
+  if (swap_count <= 20 || swap_count == 300 || swap_count == 600 ||
+      swap_count == 1000) {
+    static mx::gpu::XenosGpuState gpu_state;
+    for (const auto* list : {&frame_packets, &swap_packets}) {
+      for (const auto& p : *list) {
+        if (p.type == mx::pm4::PacketType::Type0) {
+          uint32_t cnt = p.reg_count;
+          if (cnt > p.body.size()) cnt = (uint32_t)p.body.size();
+          if (cnt > 0) gpu_state.ApplyType0Write(p.reg_base, p.body.data(), cnt);
+        } else if (p.type == mx::pm4::PacketType::Type3) {
+          gpu_state.ApplyType3Packet(p);
+        }
+      }
+    }
+    REXLOG_INFO("native: ApplyPackets done, {} regs", gpu_state.Registers().size());
+  }
+
+  // The PM4 translator used to run here, building draws from the ring. It is
+  // gone: the ring reached ~15k vertices a frame and left 99.9% of them
+  // untranscoded, while the D3D9 HLE path carries 27.4M. The packets are
+  // still parsed above, but only as diagnostics — nothing downstream of this
+  // point consumes them to produce pixels.
+
+  //-----------------------------------------------------------------------
+  // Does the ring carry the same number of draws D3D9 was asked for?
+  //
+  // This is the last route left from a D3D9 shader handle to its microcode.
+  // The direct ones are all closed: the blob at +0x368 is not the code (23%
+  // agreement against what the ring loaded), SH_pPhysical reads as zeros at
+  // bind time, and its address is not the ring key. But the ring does load 41
+  // shaders *by address*, so the code is in guest memory -- only the mapping
+  // is missing. If each frame's ring draw count equals its D3D9 draw count,
+  // the Nth ring draw is the Nth D3D9 draw.
+  //
+  // Counted from the *raw draw packets*, not from DrawCalls(): the translator
+  // drops draws it cannot build, so its output would understate the ring and
+  // manufacture a mismatch that is really a filter.
+  //-----------------------------------------------------------------------
+  {
+    // Per opcode, not as one total: the ring has four draw opcodes and two of
+    // them are the binned forms, which replay a draw per bin. A bare total
+    // cannot tell that apart from D3D9 issuing draws the game never asked
+    // for, and those point opposite ways.
+    uint64_t op[4] = {};   // 0x22, 0x34, 0x35, 0x36
+    auto count_draw_packets = [&](const std::vector<mx::pm4::Pm4Packet>& v) {
+      for (const auto& p : v) {
+        if (p.type != mx::pm4::PacketType::Type3) continue;
+        switch (p.opcode) {
+          case 0x22: ++op[0]; break;
+          case 0x34: ++op[1]; break;
+          case 0x35: ++op[2]; break;
+          case 0x36: ++op[3]; break;
+          default: break;
+        }
+      }
+    };
+    count_draw_packets(frame_packets);
+    count_draw_packets(swap_packets);
+    const uint64_t ring = op[0] + op[1] + op[2] + op[3];
+
+    static uint64_t s_lastD3d9 = 0, s_lastIndexed = 0;
+    const uint64_t now = mx::hle::D3D9DrawCounter();
+    const uint64_t now_idx = mx::hle::D3D9IndexedDrawCounter();
+    const uint64_t d3d9 = now - s_lastD3d9;
+    const uint64_t d3d9_idx = now_idx - s_lastIndexed;
+    s_lastD3d9 = now;
+    s_lastIndexed = now_idx;
+
+    static uint64_t s_swaps = 0, s_equal = 0, s_ringTotal = 0, s_d3d9Total = 0;
+    static uint64_t s_opTotal[4] = {}, s_idxTotal = 0;
+    static uint64_t s_eqIdx35 = 0, s_eqNonIdx = 0;
+    // Only frames where either side drew say anything; a pair of zeros agrees
+    // trivially and would inflate the rate.
+    if (ring || d3d9) {
+      ++s_swaps;
+      s_ringTotal += ring;
+      s_d3d9Total += d3d9;
+      s_idxTotal += d3d9_idx;
+      for (int i = 0; i < 4; ++i) s_opTotal[i] += op[i];
+      if (ring == d3d9) ++s_equal;
+      // The two subsets worth testing on their own: the binned indexed form
+      // against D3D9's indexed draws, and the unbinned forms against the
+      // non-indexed ones.
+      if (op[2] == d3d9_idx) ++s_eqIdx35;
+      if (op[0] + op[3] == d3d9 - d3d9_idx) ++s_eqNonIdx;
+      if ((s_swaps % 60) == 0) {
+        REXLOG_INFO(
+            "native: draw correspondence — total equal {}/{} frames; ring {} vs "
+            "D3D9 {} (indexed {}); ring by opcode 0x22={} 0x34={} 0x35={} "
+            "0x36={}; subsets equal: 0x35-vs-indexed {}, unbinned-vs-"
+            "nonindexed {}",
+            s_equal, s_swaps, s_ringTotal, s_d3d9Total, s_idxTotal,
+            s_opTotal[0], s_opTotal[1], s_opTotal[2], s_opTotal[3],
+            s_eqIdx35, s_eqNonIdx);
+      }
+    }
+  }
+
+  if (log_this_swap) {
+    REXLOG_INFO("native: PM4 #{}: frame {} packets, swap {} packets",
+                swap_count, frame_packets.size(), swap_packets.size());
+  }
+
+  // Drains draws parked with ShaderApplyResult::kNoCode. This used to be the
+  // retry that mattered, while the code came from the ring; it now comes
+  // from CapturePatchedCode inside the PatchVertexShader hook, which runs
+  // before the draw it patches.
+  //
+  // Kept as a drain, not as a working retry: `skipped no-code` reads 0 and
+  // the deferred-draw line never prints. It stays because kNoCode is still
+  // reachable and a parked draw with nothing to drain it would leak.
+  //
+  // Same lock the D3D9 hooks take: FinalizePendingD3D9Draws drains
+  // g_pendingHleDraws and reads the shader caches, all of which a record
+  // worker may be writing at this instant.
+  std::lock_guard<std::recursive_mutex> lock(mx::hle::HleGlobalMutex());
+  FinalizePendingD3D9Draws(base);
+  auto& hle = mx::hle::HleFrameDraws();
+  // Always propagate, even when empty: an empty list clears the renderer's
+  // stale draw data so frames without a VdSwap don't replay the last capture.
+  mx::native::NativeGraphics::Get().SetDrawCalls(hle);
+  hle.clear();
 
   s_prev_after = pm4_write_after;
 }
@@ -738,10 +706,6 @@ extern "C" REX_FUNC(sub_82566B58) {
 
 REX_IMPORT(__imp__sub_82BFBF30, orig_XenosWait, void());
 extern "C" REX_FUNC(sub_82BFBF30) {
-  if (mx::native::g_plugin_mode) {
-    orig_XenosWait(ctx, base);
-    return;
-  }
   REX_STORE_U32(0x83144208, REX_LOAD_U32(0x82D21818));
 
   // Retire the GPU fence. This is the body of the command-buffer spin loop in
@@ -785,21 +749,14 @@ extern "C" REX_FUNC(sub_82BFBF30) {
 //=============================================================================
 // GPU call stubs -- UNHOOKED
 //
-// These four ran an empty body in native mode and the guest original only under
-// the plugin. That divergence is now closed: all four call the original in both
-// modes, and the only thing left mode-specific is the log tag.
-//
-// Why: the plugin path loads `UI_World` -- the 3D level the UI system owns, and
-// the main menu's stadium backdrop -- and native does not, while submitting
-// every draw the guest gives it (1,709,357 translated, 0 dropped). So the
-// divergence is upstream of the renderer, and these were the only native-only
-// overrides left in the frame path. The stubs date from before the D3D9 HLE
-// layer, when "there is no Xenos GPU behind them" was true of the whole backend.
+// These four used to run an empty body. They date from before the D3D9 HLE
+// layer, when "there is no Xenos GPU behind them" was true of the whole
+// backend; all four now call the guest original.
 //
 // If this reintroduces a hang or an access violation, the two to suspect are
 // BeginFrame (sub_82ABF828), which reaches XenonRenderer at gs+80, and
-// GpuStateXenos, whose original had not run past call #3 in native. Revert
-// per-hook rather than wholesale.
+// GpuStateXenos, whose original had not run past call #3. Revert per-hook
+// rather than wholesale.
 //=============================================================================
 
 REX_IMPORT(__imp__sub_8255D430, orig_BeginFrameXenos, void());
@@ -819,13 +776,12 @@ extern "C" REX_FUNC(sub_8255D470) {
 // always implied.
 REX_IMPORT(__imp__sub_8255D520, orig_GpuStateXenos, void());
 extern "C" REX_FUNC(sub_8255D520) {
-  const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
   static int gs = 0;
   ++gs;
   const bool loud = gs <= 3 || (gs % 600) == 0;
-  if (loud) REXLOG_INFO("{}: GpuState #{} — calling orig", tag, gs);
+  if (loud) REXLOG_INFO("native: GpuState #{} — calling orig", gs);
   orig_GpuStateXenos(ctx, base);
-  if (loud) REXLOG_INFO("{}: GpuState #{} — returned", tag, gs);
+  if (loud) REXLOG_INFO("native: GpuState #{} — returned", gs);
 }
 
 //=============================================================================
@@ -840,8 +796,7 @@ extern "C" REX_FUNC(sub_82ABF828) {
   static int bf = 0;
   ++bf;
   if (bf <= 3 || (bf % 600) == 0)
-    REXLOG_INFO("{}: BeginFrame #{}",
-                mx::native::g_plugin_mode ? "plugin" : "native", bf);
+    REXLOG_INFO("native: BeginFrame #{}", bf);
   orig_BeginFrame(ctx, base);
 }
 
@@ -851,14 +806,6 @@ extern "C" REX_FUNC(sub_82ABF828) {
 
 REX_IMPORT(__imp__sub_82ABF930, orig_EndFrame, void());
 extern "C" REX_FUNC(sub_82ABF930) {
-  if (mx::native::g_plugin_mode) {
-    static int ef = 0;
-    ++ef;
-    if (ef <= 3 || (ef % 600) == 0)
-      REXLOG_INFO("plugin: EndFrame #{}", ef);
-    orig_EndFrame(ctx, base);
-    return;
-  }
   static int ef = 0;
   ++ef;
   orig_EndFrame(ctx, base);
@@ -878,8 +825,7 @@ extern "C" REX_FUNC(sub_82ABF930) {
 //=============================================================================
 REX_IMPORT(__imp__sub_8255CFE0, orig_FramePendingPoll, int());
 extern "C" REX_FUNC(sub_8255CFE0) {
-  if (mx::native::g_plugin_mode) { orig_FramePendingPoll(ctx, base); return; }
-  // Native: no GPU to poll — always "not pending".
+  // No GPU to poll — always "not pending".
   ctx.r3.u32 = 0;
 }
 
@@ -907,7 +853,6 @@ extern "C" REX_FUNC(sub_8255CFE0) {
 
 REX_IMPORT(__imp__sub_82AC8A18, orig_RecordFork, void());
 extern "C" REX_FUNC(sub_82AC8A18) {
-  if (mx::native::g_plugin_mode) { orig_RecordFork(ctx, base); return; }
   static uint64_t n = 0;
   ++n;
   const bool loud = n <= 24 || (n % 300) == 0;
@@ -918,7 +863,6 @@ extern "C" REX_FUNC(sub_82AC8A18) {
 
 REX_IMPORT(__imp__sub_82AC8CC8, orig_RecordWorker, void());
 extern "C" REX_FUNC(sub_82AC8CC8) {
-  if (mx::native::g_plugin_mode) { orig_RecordWorker(ctx, base); return; }
   // r3 points at the worker's index; the proc reads it as `lwz r31, 0(r3)`.
   const uint32_t idx = ctx.r3.u32 ? REX_LOAD_U32(ctx.r3.u32) : 0xFFFFFFFF;
   REXLOG_INFO("native: RecordWorker[{}] ENTER", idx);
@@ -931,7 +875,6 @@ extern "C" REX_FUNC(sub_82AC8CC8) {
 
 REX_IMPORT(__imp__sub_82AC8B68, orig_RecordJoin, void());
 extern "C" REX_FUNC(sub_82AC8B68) {
-  if (mx::native::g_plugin_mode) { orig_RecordJoin(ctx, base); return; }
   static uint64_t n = 0;
   ++n;
   const bool loud = n <= 24 || (n % 300) == 0;

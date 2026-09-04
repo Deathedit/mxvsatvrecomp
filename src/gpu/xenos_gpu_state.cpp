@@ -747,8 +747,7 @@ void XenosGpuState::ApplyType3Packet(const pm4::Pm4Packet& pkt) {
     //
     // This used to treat rmw_info as a base and the two operands as a RUN of
     // register values, and the comment that stood here called the case dead --
-    // "the Type3 histogram has no 0x21". It fires 23 times in a menu run, in
-    // BOTH modes, because this parser does not sit behind the D3D9 passthrough.
+    // "the Type3 histogram has no 0x21". It fires 23 times in a menu run.
     //
     // The damage was nil, which is why it survived: every register it reaches is
     // scanout, not 3D (D1GRPH_CONTROL, D1GRPH_LUT_10BIT_BYPASS_CNTL,

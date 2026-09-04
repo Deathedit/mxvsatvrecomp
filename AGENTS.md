@@ -205,7 +205,7 @@ so they describe what a plain run already does, not what you can turn on.
 | `hle_shader_exec` | 0 | Execute the bound guest vertex shader for one draw in N. Requires `hle_capture` |
 | `hle_shader_verts` | 8 | How many vertices per executed draw. Only with `hle_shader_exec` |
 | `d3d9_page_cache_verify` | off | Re-query the OS on every cache hit and log mismatches. Slow; correctness check |
-| `d3d9_hooks_passthrough` | off | Pass the D3D9 hooks through in native mode. **Breaks rendering by design** — an A/B instrument, not a mode |
+
 | `d3d9_diag_row_heartbeat` | 16 | Draw reports an unchanged population may pass before `UP CALLERS`, the per-config stencil rows and the per-declaration `decl-draws` rows dump anyway. A new call site or config still prints immediately; `0` = only on change, `1` = every report |
 | `d3d9_diag_frame_every` | 30 | Frames between the per-swap lines (`FRAME DRAWS`, `UNBUILT *`, `RING vs HLE`, `ALU LOAD`). Per-frame deltas accumulate across the gap rather than being dropped, and the first five swaps always print; `0`/`1` = every swap |
 | `dev` | — | Developer switches, comma separated. `menu` sets the guest's `DEFINE_BuildConfig` Lua global to `DEBUG`, which its own scripts gate the dev menu on. `print` captures the guest's `print()` to `logs/guest_print.log` (retail binds print to a no-op stub, so this is the only way to see it). `native:census` lists the callers of `sub_829E8FA8` without changing anything; `native:<hex>` answers 1 for that one return address (`0x82AB6638` is the DebugOverlay enable check); `native:all` crashes. `bind:<Button>=<Action>` adds a debug input binding, off unless asked for |
@@ -315,7 +315,7 @@ name their layer: `#include "gpu/pm4_parser.h"`.
 | `src/hooks/hooks_wait.cpp` | Two guest-wait passthroughs, nothing else |
 | `src/hooks/hooks_plugin_diag.cpp` | Registry hooks, load-state-machine probes, script-VM probes |
 | `src/hooks/midasm_stubs.cpp` | Exported mid-ASM hook targets (must stay at global namespace) |
-| `src/hooks/native_bridge.*` | `NativeGraphics` singleton, `g_plugin_mode` |
+| `src/hooks/native_bridge.*` | `NativeGraphics` singleton |
 
 Input is handled entirely by ReXGlue's built-in `SDLInputDriver` at kernel level;
 there is no manual input hook.
@@ -403,25 +403,13 @@ screen for a stretch.
 
 ---
 
-### The D3D9 HLE hooks must no-op in plugin mode (2026-08-06)
+### The D3D9 HLE layer is ~85% of native frame time (2026-08-06)
 
-`hooks_d3d9.cpp` is the native renderer, but until 2026-08-06 all 14 of its
-hooks ran in **both** modes — the only hooks file without `g_plugin_mode`
-guards (`hooks_boot.cpp` 9/9, `hooks_frame.cpp` 8/8, `hooks_gameloop.cpp` 2/2).
-`hle_render` and `hle_shader_exec` defaulted off then, so the transcode and
-CPU-shader paths were not running; the per-draw bookkeeping alone was enough, at ~1,480
-draws a frame in a Debug build.
+`hooks_d3d9_entry.cpp` is the native renderer, and it is **on the critical
+path**. Every hook there opens with `MX_D3D9_HLE_LOCK` — use it on anything
+added to that file — and calls its original exactly once.
 
-Measured cost: plugin-mode `MainLoop` fell from **~17.6/s** (2026-08-03, before
-this file grew — every commit that grew it is dated 2026-08-05) to **~0.37/s**.
-Restoring the guard brings it back to ~16.4/s.
-
-Use `MX_D3D9_PLUGIN_PASSTHROUGH(orig)` on any hook added to that file. Every
-hook there calls its original exactly once, so returning straight after it is
-the complete plugin-mode behaviour.
-
-**The same layer is ~85% of native frame time, where it is on the critical
-path.** Native `MainLoop` bodies run 300ms rising to 3100ms. Timing each level
+Native `MainLoop` bodies run 300ms rising to 3100ms. Timing each level
 gives one chain, each step matching its parent to within milliseconds:
 
 ```
@@ -439,11 +427,10 @@ Two measurements identify it as ours, not the guest's:
 
 - **A Release build costs exactly what Debug does** — same 300ms bodies, same 27
   MainLoop iterations in 70s. Recompiled PPC compute would not behave that way.
-- `--d3d9_hooks_passthrough=true` makes the 14 hooks pass through in native too.
-  MainLoop bodies drop to **7–70ms**, a ~50x change. That flag **breaks
-  rendering by design and the run crashes ~19s in** (the host renderer loses the
-  state tracking while the PM4 translator keeps going) — it is an A/B
-  instrument, not a mode.
+- Bypassing the layer — every hook returning straight after its original —
+  drops MainLoop bodies to **7–70ms**, a ~50x change. It renders nothing and
+  crashes ~19s in (the host renderer loses the state tracking while the PM4
+  translator keeps going), so it is only ever a temporary A/B.
 
 ## D3D9 HLE rendering
 
@@ -539,9 +526,9 @@ transcribed into `GuestTextureFormatName` in
 
 All four are handled as of `319a5c2`; both configurations now reject nothing.
 `k_4_4_4_4` is the front end's own format and the only one it ever asks for --
-independently corroborated, since it is also the format Xenia complains about
-in plugin mode. The other three are single-channel and are decoded but never
-bound as base colour.
+independently corroborated, since it is also the format Xenia complains about.
+The other three are single-channel and are decoded but never bound as base
+colour.
 
 Two traps in that decoder, both fixed, both worth remembering:
 

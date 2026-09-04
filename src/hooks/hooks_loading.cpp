@@ -27,46 +27,6 @@
 
 REX_IMPORT(__imp__sub_82B71148, orig_SetupRenderer, void());
 extern "C" REX_FUNC(sub_82B71148) {
-  if (mx::native::g_plugin_mode) {
-    LogEngSlot8(base, "SetupRenderer ENTER");
-    REXLOG_INFO("plugin: SetupRenderer ENTER a1=0x{:08X}", ctx.r3.u32);
-    orig_SetupRenderer(ctx, base);
-    LogEngSlot8(base, "SetupRenderer RETURNED");
-    REXLOG_INFO("plugin: SetupRenderer RETURNED — dumping state");
-    // Dump engine state
-    uint32_t eng = REX_LOAD_U32(0x830BE400);
-    REXLOG_INFO("plugin: eng(0x830BE400)=0x{:08X}", eng);
-    if (eng) {
-      for (int off = 0; off <= 40; off += 4)
-        REXLOG_INFO("plugin: eng+{}=0x{:08X}", off, REX_LOAD_U32(eng + off));
-    }
-    // Dump transition renderer state
-    uint32_t tr = 0x830EC248;
-    REXLOG_INFO("plugin: transition_renderer+8(AssetDB)=0x{:08X}", REX_LOAD_U32(0x830EC250));
-    REXLOG_INFO("plugin: transition_renderer+0x190=0x{:08X} +0x194=0x{:08X} +0x2DC=0x{:08X} +0x2E0=0x{:08X}",
-      REX_LOAD_U32(tr + 0x190), REX_LOAD_U32(tr + 0x194),
-      REX_LOAD_U32(tr + 0x2DC), REX_LOAD_U32(tr + 0x2E0));
-    // dword_830BE190 — the 60KB block
-    uint32_t be190 = REX_LOAD_U32(0x830BE190);
-    REXLOG_INFO("plugin: dword_830BE190=0x{:08X}", be190);
-    if (be190) {
-      REXLOG_INFO("plugin: BE190+0=0x{:08X} +4=0x{:08X} +8=0x{:08X} +68=0x{:08X} +72=0x{:08X}",
-        REX_LOAD_U32(be190), REX_LOAD_U32(be190+4), REX_LOAD_U32(be190+8),
-        REX_LOAD_U32(be190+68), REX_LOAD_U32(be190+72));
-      uint32_t vt = REX_LOAD_U32(be190);
-      REXLOG_INFO("plugin: BE190 vtable=0x{:08X}", vt);
-      if (vt >= 0x82000000) {
-        for (int i = 0; i < 20; ++i)
-          REXLOG_INFO("plugin: BE190 vt[{}]=0x{:08X}", i, REX_LOAD_U32(vt + i*4));
-      }
-    }
-    // Entity count globals
-    REXLOG_INFO("plugin: pass0_count(0x830C2150)={} pass1_count(0x830C4560)={} pass2_count(0x830C6970)={}",
-      REX_LOAD_U32(0x830C2150), REX_LOAD_U32(0x830C4560), REX_LOAD_U32(0x830C6970));
-    // GPU physical base
-    REXLOG_INFO("plugin: gpu_phys(0x830B03EC)=0x{:08X}", REX_LOAD_U32(0x830B03EC));
-    return;
-  }
   REXLOG_INFO("native: SetupRenderer ENTER (0x82B71148)");
   orig_SetupRenderer(ctx, base);
   REXLOG_INFO("native: SetupRenderer RETURNED");
@@ -120,16 +80,6 @@ extern "C" REX_FUNC(sub_82B71148) {
 
 REX_IMPORT(__imp__sub_82B710D0, orig_Transition, void());
 extern "C" REX_FUNC(sub_82B710D0) {
-  if (mx::native::g_plugin_mode) {
-    static int pt = 0;
-    ++pt;
-    if (pt <= 3)
-      REXLOG_INFO("plugin: Transition #{}", pt);
-    orig_Transition(ctx, base);
-    if (pt <= 3)
-      REXLOG_INFO("plugin: Transition #{} returned", pt);
-    return;
-  }
   REXLOG_INFO("native: Transition (0x82B710D0)");
   // Bisect aid for the LoaderTick entity block (0x82B70E18..0x82B70EC8), which
   // access-violates when mid-ASM hook #7 is disabled. The two candidates are the
@@ -208,14 +158,6 @@ extern "C" REX_FUNC(sub_82B710D0) {
 
 REX_EXTERN(__imp__sub_82B70DE8);
 REX_HOOK_RAW(sub_82B70DE8) {
-  if (mx::native::g_plugin_mode) {
-    static int plt = 0;
-    ++plt;
-    __imp__sub_82B70DE8(ctx, base);
-    if (plt <= 10 || (plt % 10000) == 0)
-      REXLOG_INFO("plugin: LoaderTick #{} r3={}", plt, ctx.r3.u32);
-    return;
-  }
   static int lt = 0;
   ++lt;
   __imp__sub_82B70DE8(ctx, base);

@@ -50,14 +50,6 @@
 
 REX_IMPORT(__imp__sub_82B70578, orig_RenderPipeline, void());
 extern "C" REX_FUNC(sub_82B70578) {
-  if (mx::native::g_plugin_mode) {
-    static int rp = 0;
-    ++rp;
-    if (rp <= 5 || (rp % 600) == 0)
-      REXLOG_INFO("plugin: RenderPipeline #{}", rp);
-    orig_RenderPipeline(ctx, base);
-    return;
-  }
   static int rp = 0;
   ++rp;
   if (rp == 1 || (rp % 600) == 0)

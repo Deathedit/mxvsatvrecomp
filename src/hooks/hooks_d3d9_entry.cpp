@@ -4,9 +4,8 @@
 // plus the eight render-state hooks and the helpers only they use. extern "C",
 // so they reach into the layer's namespace through hooks_d3d9_internal.h.
 //
-// Every hook calls its original exactly once and MX_D3D9_PLUGIN_PASSTHROUGH
-// returns straight after it under the GPU plugin. Use that macro on anything
-// added here.
+// Every hook calls its original exactly once and opens with MX_D3D9_HLE_LOCK.
+// Use that macro on anything added here.
 
 #include "gpu/health.h"
 #include "hooks/hook_common.h"
@@ -111,38 +110,11 @@ extern "C" REX_FUNC(sub_8293C778) {
   g_glyphCacheGeneration.fetch_add(1, std::memory_order_release);
 }
 
-//=============================================================================
-// Plugin-mode passthrough
-//=============================================================================
-// This whole layer is the native renderer, so under --gpu_plugin=xenos none of
-// the work below is wanted, and it is not free: plugin-mode MainLoop fell from
-// ~17.6/s to ~0.37/s once this file had grown. Every hook here calls its
-// original exactly once, so returning straight after it is the complete
-// plugin-mode behaviour.
-//
-// d3d9_hooks_passthrough additionally disables this layer in *native* mode. It
-// breaks native rendering by design, and answers one question: whether native
-// MainLoop is blocking inside these hooks or in the guest's own scene traversal.
-
-
-
-REXCVAR_DEFINE_BOOL(d3d9_hooks_passthrough, false, "Debug",
-                    "Diagnostic: make the D3D9 HLE hooks pass straight through "
-                    "in native mode too. Breaks rendering; isolates whether "
-                    "native frame time is spent in this layer");
-
 // Every hook below takes the HLE lock for its whole body, including across the
 // call to the guest original. The guest's three record workers never take a lock
 // our hooks could hold, so the only effect is that they queue through this layer
 // one at a time -- which is what the ~30 shared globals in this file require.
-//
-// Passthrough returns BEFORE the lock is taken, so --d3d9_hooks_passthrough=1
-// remains a genuine bypass.
-#define MX_D3D9_PLUGIN_PASSTHROUGH(orig)                                 \
-  if (mx::native::g_plugin_mode || REXCVAR_GET(d3d9_hooks_passthrough)) { \
-    orig(ctx, base);                                                     \
-    return;                                                              \
-  }                                                                      \
+#define MX_D3D9_HLE_LOCK \
   std::lock_guard<std::recursive_mutex> _hle_lock(mx::hle::HleGlobalMutex())
 
 //=============================================================================
@@ -193,7 +165,7 @@ void GfxGuestStr(uint8_t* base, uint32_t addr, char* out, size_t max) {
 
 REX_IMPORT(__imp__sub_82550B80, orig_CreateVertexDeclaration, void());
 extern "C" REX_FUNC(sub_82550B80) {
-  MX_D3D9_PLUGIN_PASSTHROUGH(orig_CreateVertexDeclaration);
+  MX_D3D9_HLE_LOCK;
   const uint32_t elements = ctx.r3.u32;
   const uint64_t n = ++g_decls;
 
@@ -314,7 +286,7 @@ extern "C" REX_FUNC(sub_82550B80) {
 
 REX_IMPORT(__imp__sub_82564C50, orig_PatchVertexShader, void());
 extern "C" REX_FUNC(sub_82564C50) {
-  MX_D3D9_PLUGIN_PASSTHROUGH(orig_PatchVertexShader);
+  MX_D3D9_HLE_LOCK;
   const uint32_t args[5] = {ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32,
                             ctx.r7.u32};
   int found = -1;
@@ -383,9 +355,8 @@ extern "C" REX_FUNC(sub_82564C50) {
 REX_IMPORT(__imp__sub_825565C8, orig_DrawIndexedVertices, void());
 extern "C" REX_FUNC(sub_825565C8) {
   NoteUpDrawCaller(static_cast<uint32_t>(ctx.lr), ctx.r6.u32, 0);
-  // BEFORE the passthrough return, so the count is comparable across modes.
   g_guestDrawCalls.fetch_add(1, std::memory_order_relaxed);
-  MX_D3D9_PLUGIN_PASSTHROUGH(orig_DrawIndexedVertices);
+  MX_D3D9_HLE_LOCK;
   const uint32_t primitive_type = ctx.r4.u32;
   const int32_t base_vertex = ctx.r5.s32;
   const uint32_t start_index = ctx.r6.u32;
@@ -432,7 +403,7 @@ REX_IMPORT(__imp__sub_825561B0, orig_DrawVertices, void());
 extern "C" REX_FUNC(sub_825561B0) {
   NoteUpDrawCaller(static_cast<uint32_t>(ctx.lr), ctx.r6.u32, 1);
   g_guestDrawCalls.fetch_add(1, std::memory_order_relaxed);
-  MX_D3D9_PLUGIN_PASSTHROUGH(orig_DrawVertices);
+  MX_D3D9_HLE_LOCK;
   const uint32_t primitive_type = ctx.r4.u32;
   const uint32_t start_vertex = ctx.r5.u32;
   const uint32_t vertex_count = ctx.r6.u32;
@@ -540,7 +511,7 @@ extern "C" REX_FUNC(sub_825556C8) {
   // Only the outermost reservation is a draw of its own; the UP wrapper counts
   // its own.
   if (!nested) g_guestDrawCalls.fetch_add(1, std::memory_order_relaxed);
-  MX_D3D9_PLUGIN_PASSTHROUGH(orig_BeginVertices);
+  MX_D3D9_HLE_LOCK;
 
   const uint32_t device = ctx.r3.u32;
   const uint32_t prim_type = ctx.r4.u32;
@@ -576,7 +547,7 @@ extern "C" REX_FUNC(sub_825556C8) {
 
 REX_IMPORT(__imp__sub_825556B8, orig_EndVertices, void());
 extern "C" REX_FUNC(sub_825556B8) {
-  MX_D3D9_PLUGIN_PASSTHROUGH(orig_EndVertices);
+  MX_D3D9_HLE_LOCK;
   // Consume unconditionally: a reservation must never outlive its End, or the
   // next unrelated End on this thread would build a draw from stale bounds.
   const PendingVertices pv = t_pendingVertices;
@@ -1105,14 +1076,14 @@ void mx::hooks::d3d9::ReportCommandBuffers() {
 //=============================================================================
 REX_IMPORT(__imp__sub_8255E9A0, orig_BeginCommandBuffer, void());
 extern "C" REX_FUNC(sub_8255E9A0) {
-  MX_D3D9_PLUGIN_PASSTHROUGH(orig_BeginCommandBuffer);
+  MX_D3D9_HLE_LOCK;
   mx::hooks::d3d9::BeginCmdBufRecording(ctx.r3.u32, ctx.r4.u32);
   orig_BeginCommandBuffer(ctx, base);
 }
 
 REX_IMPORT(__imp__sub_825601B8, orig_EndCommandBuffer, void());
 extern "C" REX_FUNC(sub_825601B8) {
-  MX_D3D9_PLUGIN_PASSTHROUGH(orig_EndCommandBuffer);
+  MX_D3D9_HLE_LOCK;
   const uint32_t device = ctx.r3.u32;
   orig_EndCommandBuffer(ctx, base);
   // AFTER the original: a draw issued inside the End call still belongs to
@@ -1122,7 +1093,7 @@ extern "C" REX_FUNC(sub_825601B8) {
 
 REX_IMPORT(__imp__sub_825605D8, orig_ExecuteCommandBuffer, void());
 extern "C" REX_FUNC(sub_825605D8) {
-  MX_D3D9_PLUGIN_PASSTHROUGH(orig_ExecuteCommandBuffer);
+  MX_D3D9_HLE_LOCK;
   // r4 is the command buffer. Read before the original runs, which consumes
   // and rewrites parts of it.
   const uint32_t cmdbuf = ctx.r4.u32;
@@ -1143,10 +1114,10 @@ REX_IMPORT(__imp__sub_82555B88, orig_DrawVerticesUP, void());
 extern "C" REX_FUNC(sub_82555B88) {
   // DrawVerticesUP reserves its ring space THROUGH BeginVertices, so the
   // hook below would build a second DrawCall for every UP draw. RAII, not a
-  // plain ++/--, because the plugin passthrough returns early.
+  // plain ++/--, so the depth unwinds on every exit.
   const UpDepthGuard up_depth_guard;
   g_guestDrawCalls.fetch_add(1, std::memory_order_relaxed);
-  MX_D3D9_PLUGIN_PASSTHROUGH(orig_DrawVerticesUP);
+  MX_D3D9_HLE_LOCK;
   const uint32_t device = ctx.r3.u32;
   const uint32_t primitive_type = ctx.r4.u32;
   const uint32_t vertex_count = ctx.r5.u32;
@@ -1243,7 +1214,7 @@ REX_IMPORT(__imp__sub_82556110, orig_DrawIndexedVerticesUP, void());
 extern "C" REX_FUNC(sub_82556110) {
   const UpDepthGuard up_depth_guard;
   g_guestDrawCalls.fetch_add(1, std::memory_order_relaxed);
-  MX_D3D9_PLUGIN_PASSTHROUGH(orig_DrawIndexedVerticesUP);
+  MX_D3D9_HLE_LOCK;
 
   // Every argument is read BEFORE the original runs: the callee clobbers the
   // volatiles, and both data pointers are frequently caller stack locals --
@@ -1362,7 +1333,7 @@ void NoteStreamStride(uint32_t lr, uint32_t stride);
 
 REX_IMPORT(__imp__sub_8254B7C0, orig_SetStreamSource, void());
 extern "C" REX_FUNC(sub_8254B7C0) {
-  MX_D3D9_PLUGIN_PASSTHROUGH(orig_SetStreamSource);
+  MX_D3D9_HLE_LOCK;
   const uint32_t stream = ctx.r4.u32;
   const uint32_t buffer = ctx.r5.u32;
   const uint32_t offset = ctx.r6.u32;
@@ -1584,7 +1555,7 @@ void mx::hooks::d3d9::ReportVegetationLod() {
 
 REX_IMPORT(__imp__sub_8254B8E0, orig_SetIndices, void());
 extern "C" REX_FUNC(sub_8254B8E0) {
-  MX_D3D9_PLUGIN_PASSTHROUGH(orig_SetIndices);
+  MX_D3D9_HLE_LOCK;
   const uint32_t buffer = ctx.r4.u32;
   // Read the caller BEFORE the original runs, for the same reason the draw
   // hooks do: it belongs with the arguments it identifies.
@@ -1780,7 +1751,7 @@ void ProbeVertexShaderConstantPatch(uint32_t shader, uint32_t device,
 
 REX_IMPORT(__imp__sub_825508A8, orig_SetVertexShader, void());
 extern "C" REX_FUNC(sub_825508A8) {
-  MX_D3D9_PLUGIN_PASSTHROUGH(orig_SetVertexShader);
+  MX_D3D9_HLE_LOCK;
   auto& st = DeviceState();
   const uint32_t device = ctx.r3.u32;
   const uint32_t shader = ctx.r4.u32;
@@ -1803,7 +1774,7 @@ extern "C" REX_FUNC(sub_825508A8) {
 
 REX_IMPORT(__imp__sub_825506E8, orig_SetPixelShader, void());
 extern "C" REX_FUNC(sub_825506E8) {
-  MX_D3D9_PLUGIN_PASSTHROUGH(orig_SetPixelShader);
+  MX_D3D9_HLE_LOCK;
   auto& st = DeviceState();
   st.NoteDevice(ctx.r3.u32, mx::hle::kEpSetPixelShader);
   st.pixel_shader = ctx.r4.u32;
@@ -1883,7 +1854,7 @@ void NoteSurfaceBind(const mx::hle::RenderTargetBinding& rt, bool is_depth) {
 
 REX_IMPORT(__imp__sub_8254C060, orig_SetRenderTarget, void());
 extern "C" REX_FUNC(sub_8254C060) {
-  MX_D3D9_PLUGIN_PASSTHROUGH(orig_SetRenderTarget);
+  MX_D3D9_HLE_LOCK;
   const uint32_t slot = ctx.r4.u32;
   const uint32_t object = ctx.r5.u32;
   if (slot < 4) {
@@ -1928,7 +1899,7 @@ extern "C" REX_FUNC(sub_8254C060) {
 
 REX_IMPORT(__imp__sub_8254C3B0, orig_SetDepthStencil, void());
 extern "C" REX_FUNC(sub_8254C3B0) {
-  MX_D3D9_PLUGIN_PASSTHROUGH(orig_SetDepthStencil);
+  MX_D3D9_HLE_LOCK;
   auto& st = DeviceState();
   st.NoteDevice(ctx.r3.u32, mx::hle::kEpSetDepthStencil);
   st.depth_stencil = SnapshotRenderTarget(ctx.r4.u32, base);
@@ -1987,7 +1958,7 @@ extern "C" REX_FUNC(sub_8254C3B0) {
 //-----------------------------------------------------------------------------
 REX_IMPORT(__imp__sub_8255B258, orig_Clear, void());
 extern "C" REX_FUNC(sub_8255B258) {
-  MX_D3D9_PLUGIN_PASSTHROUGH(orig_Clear);
+  MX_D3D9_HLE_LOCK;
   const uint32_t rect_count = ctx.r4.u32;
   const uint32_t rects = ctx.r5.u32;
   const uint32_t flags = ctx.r6.u32;
@@ -2196,7 +2167,7 @@ extern "C" REX_FUNC(sub_8255B258) {
 
 REX_IMPORT(__imp__sub_8255CE98, orig_Resolve, void());
 extern "C" REX_FUNC(sub_8255CE98) {
-  MX_D3D9_PLUGIN_PASSTHROUGH(orig_Resolve);
+  MX_D3D9_HLE_LOCK;
   auto& st = DeviceState();
   st.NoteDevice(ctx.r3.u32, mx::hle::kEpResolve);
   const uint32_t resolve_flags = ctx.r4.u32;
@@ -2957,7 +2928,7 @@ extern "C" REX_FUNC(sub_8255CE98) {
 //-----------------------------------------------------------------------------
 REX_IMPORT(__imp__sub_8254E748, orig_SetTexture, void());
 extern "C" REX_FUNC(sub_8254E748) {
-  MX_D3D9_PLUGIN_PASSTHROUGH(orig_SetTexture);
+  MX_D3D9_HLE_LOCK;
   const uint32_t device = ctx.r3.u32;
   const uint32_t sampler = ctx.r4.u32;
   const uint32_t texture = ctx.r5.u32;
@@ -3094,7 +3065,7 @@ extern "C" REX_FUNC(sub_8254E748) {
 //-----------------------------------------------------------------------------
 REX_IMPORT(__imp__sub_8254BF50, orig_SetViewport, void());
 extern "C" REX_FUNC(sub_8254BF50) {
-  MX_D3D9_PLUGIN_PASSTHROUGH(orig_SetViewport);
+  MX_D3D9_HLE_LOCK;
   const uint32_t p = ctx.r4.u32;
   if (p) {
     auto& st = DeviceState();
@@ -3124,7 +3095,7 @@ extern "C" REX_FUNC(sub_8254BF50) {
 //-----------------------------------------------------------------------------
 REX_IMPORT(__imp__sub_8254B678, orig_SetScissorRect, void());
 extern "C" REX_FUNC(sub_8254B678) {
-  MX_D3D9_PLUGIN_PASSTHROUGH(orig_SetScissorRect);
+  MX_D3D9_HLE_LOCK;
   const uint32_t p = ctx.r4.u32;
   if (p) {
     auto& st = DeviceState();

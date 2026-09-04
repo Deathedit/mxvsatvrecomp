@@ -275,13 +275,6 @@ void MxApp::OnPreSetup(rex::RuntimeConfig& config) {
   }
   REXLOG_INFO("MxApp::OnPreSetup");
 
-  if (!config.gpu_plugin.empty()) {
-    REXLOG_INFO("MxApp::OnPreSetup - gpu_plugin='{}' requested, deferring to runtime",
-                config.gpu_plugin);
-    mx::native::g_plugin_mode = true;
-    return;
-  }
-
   auto gs = std::make_unique<rex::system::D3D12GraphicsSystem>();
   m_graphicsSystem = gs.get();
   config.graphics = std::move(gs);
