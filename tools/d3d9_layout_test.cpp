@@ -5,16 +5,14 @@
 //       -o d3d9_layout_test.exe tools/d3d9_layout_test.cpp src/gpu/d3d9_layout.cpp
 //
 // The fixtures are the 23 vertex declarations this title created in a 165s run,
-// transcribed verbatim from d3d9_dump_decls.txt and reproduced byte-identically
-// across three runs.
+// transcribed verbatim from d3d9_dump_decls.txt.
 //
 // The central assertion is not "the decode returns something". It is that
-// **each element's decoded size equals the distance to the next element's
-// offset in the same stream**, and that the resulting stride matches what the
-// PM4 translator independently measured for the two declarations where it has a
-// number (28 and 36). The offsets come from the game, the sizes from the
-// runtime's own table at 0x8204E188, and the strides from a different pipeline;
-// three sources agreeing is the evidence.
+// **each element's decoded size equals the distance to the next element's offset
+// in the same stream**, and that the resulting stride matches what the PM4
+// translator independently measured (28 and 36). The offsets come from the game,
+// the sizes from the runtime's own table at 0x8204E188, and the strides from a
+// different pipeline; three sources agreeing is the evidence.
 
 #include <cstdio>
 #include <cstdint>
@@ -318,11 +316,9 @@ void RunFixture(const Fixture& f) {
 }
 
 //===========================================================================
-// Reading actual bytes.
-//
-// Everything above checks that a declaration *describes* a layout correctly.
-// These check that the described layout then reads the right numbers out of
-// real vertex bytes.
+// Reading actual bytes. Everything above checks that a declaration *describes* a
+// layout correctly; these check that the described layout then reads the right
+// numbers out of real vertex bytes.
 //
 // The pair that matters most is COLOR and BLENDINDICES: identical bits,
 // identical format 6, differing only in the two Type bits, and one must come
@@ -455,20 +451,17 @@ void CheckVertexDecode() {
     }
   }
 
-  // The 8-in-32 swap over a 16-bit format exchanges the component pair, and
-  // that exchange is the HARDWARE, not a defect. The vfetch destination swizzle
-  // is what puts them back, and the guest compiler emits exactly that
-  // permutation for exactly these formats -- over 1851 fetches every 16-bit
-  // format asks for the pairwise exchange and no 32-bit format does.
+  // The 8-in-32 swap over a 16-bit format exchanges the component pair, and that
+  // exchange is the HARDWARE, not a defect. The vfetch destination swizzle is
+  // what puts them back, and the guest compiler emits exactly that permutation
+  // for exactly these formats -- over 1851 fetches every 16-bit format asks for
+  // the pairwise exchange and no 32-bit format does.
   //
   // This test USED TO assert the swapped-then-unswizzled read came out already
   // ordered, using a synthetic element carrying an identity 32-bit-unit swizzle
-  // that no real fmt-32 fetch carries. That is the narrowing that was tried,
-  // shipped and reverted; the test outlived the revert because it stopped
-  // compiling at a rename and nobody ran it.
-  //
-  // What is checked now is the PAIR composing: the raw read exchanges, the
-  // swizzle undoes it, and the position comes out homogeneous with w last.
+  // that no real fmt-32 fetch carries. What is checked now is the PAIR
+  // composing: the raw read exchanges, the swizzle undoes it, and the position
+  // comes out homogeneous with w last.
   //
   // Bytes are vertex 0 of a real shader in guest order, with the endian=2 its
   // stream fetch constant carries.
@@ -590,11 +583,10 @@ const char* LayoutErrorTextOrNull(const mx::hle::LayoutError& e) {
 //
 // The transcode reads POSITION0, COLOR0 and TEXCOORD0 and nothing else, so an
 // element it cannot describe that is none of those costs nothing to leave out.
-// This used to return false on the first such element, which nulled the layout
-// for every draw that used the declaration and dropped them all as kNoLayout. A
-// NORMAL in k_11_11_10 -- no DXGI equivalent, and the ordinary way foliage packs
-// a normal -- therefore erased geometry whose position and texcoord decode
-// exactly.
+// Returning false on the first such element nulls the layout for every draw that
+// uses the declaration and drops them all as kNoLayout -- a NORMAL in
+// k_11_11_10, the ordinary way foliage packs a normal, therefore erased geometry
+// whose position and texcoord decode exactly.
 //===========================================================================
 
 // type dword: format in [5:0], signed at bit 8, INTEGER at bit 9 (so a clear
@@ -781,13 +773,11 @@ void CheckSignedNormalized() {
   std::printf("  signed/normalized bits agree with every usage\n");
 }
 
-// The 12-bit swizzle, and specifically which end of it holds component x.
-//
-// The shift chain inside PatchVertexShaderToMatchVertexDeclaration is dense
-// enough that reading a direction out of it is not evidence. The captures are:
-// the swizzle a format gets is fixed by its component count, and only one
-// reading makes all four counts come out right. Component values are 0-3 for
-// xyzw, 4 for constant 0, 5 for constant 1.
+// The 12-bit swizzle, and specifically which end of it holds component x. The
+// shift chain inside PatchVertexShaderToMatchVertexDeclaration is dense enough
+// that reading a direction out of it is not evidence; the captures are, and only
+// one reading makes all four component counts come out right. Component values
+// are 0-3 for xyzw, 4 for constant 0, 5 for constant 1.
 void CheckSwizzle() {
   auto comp = [](uint32_t swiz, int i) { return (swiz >> (3 * i)) & 7u; };
 

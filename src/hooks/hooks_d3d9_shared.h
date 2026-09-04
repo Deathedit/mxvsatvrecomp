@@ -5,17 +5,17 @@
 //
 // This surface is deliberately small in the part that matters. The file holds
 // 224 mutable globals, and a naive split published NINETEEN of them here.
-// Grouping the families that cross this boundary into five structs first brought
-// that to six objects. Types, functions and constants in a header are ordinary;
-// loose mutable globals are the smell, and six is the number to watch.
+// Grouping the families that cross this boundary into five structs brought that
+// to six objects: types, functions and constants in a header are ordinary; loose
+// mutable globals are the smell, and six is the number to watch.
 
 #pragma once
 
 // ORDER MATTERS. hooks_d3d9_internal.h names mx::hle types (HleStream,
-// D3D9Element, LayoutError) and rex::graphics::xenos, and does not include
-// their headers itself -- in the original single TU it was included near the
-// BOTTOM of a long include block, after all of these. Including it first here
-// fails with a page of "no member named ... in namespace mx::hle".
+// D3D9Element, LayoutError) and rex::graphics::xenos, and does not include their
+// headers itself -- in the original single TU it was included near the BOTTOM of
+// a long include block. Including it first here fails with a page of "no member
+// named ... in namespace mx::hle".
 #include <rex/cvar.h>
 #include <rex/graphics/format/ucode.h>
 
@@ -51,14 +51,12 @@ namespace xn = rex::graphics::xenos;
 
 // Why PrepareBinkPlanes refused. Every one of these used to be a bare
 // `return false` -- no counter, no log -- so a run in which the composite never
-// happened looked identical to one in which it was never asked for. Measured:
-// 54,000 calls, 0 successes, and not one line to say which of the five walls
-// they hit.
+// happened looked identical to one in which it was never asked for: 54,000
+// calls, 0 successes, and not one line to say which of the five walls they hit.
 //
 // `no_fetch` is the one to read first: it is the only refusal that does not come
 // from the texture itself but from the DEVICE's live fetch registers, a
 // different source from the DeviceState texture bindings a draw probe prints.
-// Those two agreeing was assumed once and never checked.
 struct BinkPlaneRefusals {
   uint64_t calls = 0;
   uint64_t ok = 0;
@@ -101,11 +99,9 @@ struct TexDecodeSite {
 
 // The emitted source, kept per shader handle. Shared with every draw that binds
 // the shader, so a frame's ~158 draws across a few dozen shaders copy a pointer
-// rather than a few kilobytes of text each.
-//
-// Defined here rather than beside the emitter probe that fills it because
-// ApplyShaderOutputs -- further up the file -- now reads the vertex stage's
-// input_mask to build the GPU vertex layout.
+// rather than a few kilobytes of text each. Defined here rather than beside the
+// emitter probe that fills it because ApplyShaderOutputs now reads the vertex
+// stage's input_mask to build the GPU vertex layout.
 struct TranslatedShader {
   std::shared_ptr<const std::string> source;  // null unless emitted AND compiled
   uint32_t input_mask = 0;
@@ -126,18 +122,15 @@ struct TranslatedShader {
   // The same vertex shader emitted a second way: performing its own vfetches out
   // of the raw guest vertex buffer, indexed by SV_VertexID. Null when that
   // variant refused or did not compile, in which case the draw stays on the CPU
-  // vertex path and `source` above is what runs.
-  //
-  // Both are kept because they are not interchangeable -- the fetch variant has
-  // an empty input layout and needs xe_vf[], the other needs an input layout
-  // built from input_mask.
+  // vertex path. Both are kept because they are not interchangeable -- the fetch
+  // variant has an empty input layout and needs xe_vf[], the other needs an input
+  // layout built from input_mask.
   std::shared_ptr<const std::string> fetch_source;
   uint32_t vertex_fetch_count = 0;
   uint32_t vertex_fetch_slot[mx::hle::HlslShader::kMaxVertexFetches] = {};
-  // Streams whose fetch is indexed by a register the shader computed rather
-  // than by the vertex index. The CPU vertex path cannot reproduce those
-  // indices at all, so it zero-fills them instead of reading an unrelated
-  // row. See HlslShader::computed_index_streams.
+  // Streams whose fetch is indexed by a register the shader computed rather than
+  // by the vertex index. The CPU vertex path cannot reproduce those indices at
+  // all, so it zero-fills them instead of reading an unrelated row.
   uint32_t computed_index_streams = 0;
   // See HlslShader::const_mask.
   uint64_t const_mask[4] = {};
@@ -150,16 +143,12 @@ struct TranslatedShader {
 
 // INSIDE the texture bucket. A finer breakdown is worth having only once one
 // bucket is known to dominate -- it now is: texture runs 156-182ms against
-// 29-35ms for the whole vertex path, about 80% of a steady frame, and 215us per
-// draw is far more than a cache hit should cost.
+// 29-35ms for the whole vertex path, about 80% of a steady frame.
 //
 // Split so the answer cannot be argued: a hit that is expensive points at the
-// staleness fingerprint, a miss that is expensive points at copy + decode. The
-// two have completely different fixes.
-//
-// `scan` is the pair of whole-buffer passes that follow every decode. Counted
-// separately from the decode because they are OURS, not the guest's, and a
-// 2048x2048 BC1 gets walked twice by them on top of being untiled.
+// staleness fingerprint, a miss that is expensive points at copy + decode.
+// `scan` is the pair of whole-buffer passes that follow every decode, counted
+// separately because they are OURS, not the guest's.
 //
 // Grouped into one object rather than eleven loose globals, so that splitting
 // this file publishes ONE symbol instead of eleven.
@@ -187,10 +176,9 @@ struct ResolveAddressCensus {
 };
 
 // Winning start, as a signed dword distance from dest. The histogram is the
-// finding: one value across every shader means a fixed layout.
-// One object rather than three containers. g_patch.psBlobs moved down here from its
-// original site ~100 lines earlier so that all three live together and the
-// struct can be declared after PatchedCode.
+// finding: one value across every shader means a fixed layout. One object rather
+// than three containers, so all three live together and the struct can be
+// declared after PatchedCode.
 struct ShaderPatchState {
   std::map<uint32_t, std::vector<uint32_t>> psBlobs;
   std::map<int32_t, uint64_t> codeOffsets;
@@ -266,10 +254,10 @@ void CapturePatchedCode(uint32_t self, uint32_t dest, uint32_t variant,
                         uint8_t* base);
 uint32_t ReadPatchFetchCount(uint32_t self, uint32_t variant, uint8_t* base);
 void ReportPatchRule();
-// Whether any RESOLVE reaches a guest address range, with the denominator.
-// On Xenos a render target lives in EDRAM and only a resolve moves GPU output
-// into guest memory, so a zero here proves the GPU never wrote those bytes.
-// See the note at the definition for why `resolved=0` could not answer this.
+// Whether any RESOLVE reaches a guest address range, with the denominator. On
+// Xenos a render target lives in EDRAM and only a resolve moves GPU output into
+// guest memory, so a zero here proves the GPU never wrote those bytes. See the
+// note at the definition for why `resolved=0` could not answer this.
 struct ResolveRangeProbe {
   uint32_t total = 0;         // resolve destinations known -- the denominator
   uint32_t exact = 0;         // a destination starts exactly at this address

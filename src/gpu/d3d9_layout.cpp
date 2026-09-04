@@ -11,15 +11,14 @@ namespace {
 // The guest's own size table, lifted verbatim from the XEX at 0x8204E188.
 //
 // PatchVertexShaderToMatchVertexDeclaration indexes it by the vfetch format
-// field — `byte_8204E188[*(_WORD *)(instr + 4) & 0x3F]`, where that halfword is
-// the big-endian top of dword1 and the mask picks out bits [21:16] — and uses
+// field -- `byte_8204E188[*(_WORD *)(instr + 4) & 0x3F]`, where that halfword is
+// the big-endian top of dword1 and the mask picks out bits [21:16] -- and uses
 // the result to compare attribute extents. **The entries are dwords**, so the
-// byte size is 4x. Every entry not listed below is zero in the XEX, which is
-// the runtime saying that format is not a legal vertex format.
+// byte size is 4x. Every entry not listed below is zero in the XEX, which is the
+// runtime saying that format is not a legal vertex format.
 //
-// This replaces the size derivation an earlier round did by hand. That
-// derivation happened to agree on all ten formats the captures contain; this
-// is the runtime's answer for all 64.
+// This replaces a size derivation done by hand, which happened to agree on all
+// ten formats the captures contain; this is the runtime's answer for all 64.
 //---------------------------------------------------------------------------
 constexpr uint8_t kFormatSizeDwords[64] = {
     0, 0, 0, 0, 0, 0, 1, 1,   //  0..7   ( 6 k_8_8_8_8, 7 k_2_10_10_10)
@@ -59,7 +58,7 @@ enum : uint32_t {
 
 // Picks the host format for an integer Xenon format from the two bits the
 // runtime itself keys on. Returns UNKNOWN where DXGI has no format that holds
-// the same values — the caller turns that into a reported failure, never a
+// the same values -- the caller turns that into a reported failure, never a
 // substitution.
 DXGI_FORMAT IntegerFormat(uint32_t format, bool is_signed, bool is_normalized) {
   switch (format) {
@@ -166,12 +165,12 @@ bool DecodeVertexType(uint32_t type, DecodedVertexType& out) {
     case k_32_32_32_32_FLOAT: out.dxgi = DXGI_FORMAT_R32G32B32A32_FLOAT; break;
 
     case k_2_10_10_10:
-      // The unsigned normalized case maps exactly. The signed normalized one —
-      // which is what this title uses for NORMAL and TANGENT — has no DXGI
-      // equivalent, so the raw bits are passed through as UINT and the shader
-      // is told to finish the job. R10G10B10A2_SNORM does not exist; picking
-      // UNORM instead would halve and bias every normal, and the result would
-      // still look like geometry.
+      // The unsigned normalized case maps exactly. The signed normalized one --
+      // which is what this title uses for NORMAL and TANGENT -- has no DXGI
+      // equivalent, so the raw bits are passed through as UINT and the shader is
+      // told to finish the job. R10G10B10A2_SNORM does not exist; picking UNORM
+      // instead would halve and bias every normal, and the result would still
+      // look like geometry.
       if (!out.is_normalized) {
         out.dxgi = DXGI_FORMAT_R10G10B10A2_UINT;
       } else if (!out.is_signed) {
@@ -275,13 +274,11 @@ bool BuildInputLayout(const D3D9Element* elements, uint32_t count,
         err.skip_detail = detail;
       }
 
-      // The element is dropped from the layout but NOT from the stride. It
-      // still occupies its bytes in the guest's vertex, and min_stride is what
-      // the bound stride is checked against -- shrinking it here would turn a
-      // real short-stride binding into a silent pass. VertexFormatSizeBytes
-      // reads the guest's own table and is valid even where the DXGI mapping
-      // is not; it returns 0 for a format the runtime marks unusable, which
-      // correctly contributes nothing.
+      // The element is dropped from the layout but NOT from the stride. It still
+      // occupies its bytes in the guest's vertex, and min_stride is what the
+      // bound stride is checked against -- shrinking it here would turn a real
+      // short-stride binding into a silent pass. VertexFormatSizeBytes reads the
+      // guest's own table and is valid even where the DXGI mapping is not.
       if (e.stream < 4) {
         if (e.stream > out.max_stream) out.max_stream = e.stream;
         const uint32_t skipped_end =
@@ -312,10 +309,10 @@ bool BuildInputLayout(const D3D9Element* elements, uint32_t count,
     if (end > out.min_stride[e.stream]) out.min_stride[e.stream] = end;
   }
 
-  // Every element was dropped. There is no layout to hand back, and the reason
-  // to report is the first one that fired rather than a bare "empty" -- which
-  // is also what keeps a single-element declaration failing with the reason its
-  // one element failed for.
+  // Every element was dropped. There is no layout to hand back, and the reason to
+  // report is the first one that fired rather than a bare "empty" -- which is
+  // also what keeps a single-element declaration failing with the reason its one
+  // element failed for.
   if (out.elements.empty()) {
     err.reason = err.skipped ? err.skip_reason : LayoutError::Reason::kEmpty;
     err.failed_element = err.skipped ? err.skip_element : 0;
@@ -338,10 +335,10 @@ const HleInputElement* FindUsage(const HleInputLayout& layout, uint8_t usage,
 bool ReadHleElement(const uint8_t* vertex_base, uint32_t vertex_bytes,
                     const HleInputElement& element, uint32_t endian,
                     float out[4]) {
-  // The two Type bits pick the interpretation. This is the whole reason the
-  // D3D9 route exists: COLOR and BLENDINDICES are both k_8_8_8_8 and differ
-  // only here, and a decode that ignored them would turn every bone index into
-  // a fraction while still producing something that looks like geometry.
+  // The two Type bits pick the interpretation. This is the whole reason the D3D9
+  // route exists: COLOR and BLENDINDICES are both k_8_8_8_8 and differ only here,
+  // and a decode that ignored them would turn every bone index into a fraction
+  // while still producing something that looks like geometry.
   NumFormat num;
   if (element.is_normalized) {
     num = element.is_signed ? NumFormat::kSnorm : NumFormat::kUnorm;
@@ -358,9 +355,8 @@ bool ReadHleElement(const uint8_t* vertex_base, uint32_t vertex_bytes,
 
   // Apply the swizzle. On the host-layout path it is left for the shader,
   // because that is where D3D9 puts it and a DXGI format that reordered
-  // components would apply it twice — but a CPU read has no shader downstream,
-  // so it has to happen here. Values are 0-3 for xyzw, 4 for constant 0 and 5
-  // for constant 1.
+  // components would apply it twice -- but a CPU read has no shader downstream.
+  // Values are 0-3 for xyzw, 4 for constant 0 and 5 for constant 1.
   for (int i = 0; i < 4; ++i) {
     const uint32_t sel = (element.swizzle >> (i * 3)) & 0x7;
     switch (sel) {

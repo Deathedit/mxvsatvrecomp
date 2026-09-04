@@ -4,8 +4,8 @@
 //   - kGameVS / kGamePS : position+color+uv vertex layout with an MVP constant
 //                         buffer, the target for translated guest draw calls.
 //
-// The kVideoVS / kVideoPS fullscreen-blit pair was REMOVED 2026-08-06 with the
-// host FFmpeg intro player; the guest decodes and draws its own video.
+// The kVideoVS / kVideoPS fullscreen-blit pair was REMOVED with the host FFmpeg
+// intro player; the guest decodes and draws its own video.
 
 namespace mx::gfx::shaders {
 
@@ -60,11 +60,10 @@ float4 main(float4 pos : SV_POSITION, float4 col : COLOR) : SV_TARGET {
 // one binding RB_COLOR_MASK 0. Without a pixel stage to pair with, the whole
 // draw used to fall back to the software vertex interpreter.
 //
-// Returning zero is not a colour decision. TranslatedPSO already sets
+// Returning zero is not a colour decision: TranslatedPSO already sets
 // RenderTargetWriteMask to 0 for these draws, so nothing this returns can reach
-// the target -- and the hooks side only routes a draw here when it has
-// established exactly that. If this output is ever visible, the gate upstream is
-// wrong, not this value.
+// the target. If this output is ever visible, the gate upstream is wrong, not
+// this value.
 //
 // Declaring only SV_Position is deliberate: a pixel shader's input signature
 // must be a SUBSET of the vertex stage's output, and every translated vertex
@@ -83,8 +82,8 @@ float4 main(float4 pos : SV_Position) : SV_TARGET { return 0; }
 // holds only because PrepareBinkPlanes crops the chroma planes to exactly half
 // the luma extent first -- the guest rounds their allocation up, and sampling
 // the padding rows gave zero chroma, which the conversion turns into a saturated
-// green line along the bottom edge of every video. Do not remove that crop
-// without scaling the chroma uv here instead.
+// green line along the bottom edge. Do not remove that crop without scaling the
+// chroma uv here instead.
 //
 // BT.601 with the usual 16-235 luma and 16-240 chroma ranges, which is what Bink
 // encodes. If video comes out washed out or too contrasty, this range handling

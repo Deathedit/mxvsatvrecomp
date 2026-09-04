@@ -9,10 +9,9 @@
 // same way the SRV applies it.
 //
 // WHAT IT CANNOT SEE. A texture only reaches this path when it is BOUND TO A
-// SAMPLER. A resolve destination the guest renders into and never samples --
-// which is what the menu backdrop is believed to be -- produces no binding and
-// therefore no file. A missing texture here means "never sampled", not "never
-// produced".
+// SAMPLER, so a resolve destination the guest renders into and never samples
+// produces no binding and therefore no file. A missing texture here means "never
+// sampled", not "never produced".
 //
 // Bink's video planes are deliberately NOT dumped: they are new guest memory
 // every video frame under a per-frame key, so dumping them would write four
@@ -35,10 +34,8 @@ bool TextureDumpEnabled();
 
 // One PNG per distinct (key, content_version) pair, capped. `site` names the
 // decode path that produced it ("slot", "prepare", "bink") and is recorded in
-// the index rather than in the filename.
-//
-// `payload.key` and `payload.content_version` must already be set -- call this
-// after the caller has assigned them, not straight off the decoder.
+// the index rather than in the filename. `payload.key` and
+// `payload.content_version` must already be set.
 void DumpDecodedTexture(const mx::hle::HleTextureSource& source,
                         const mx::hle::HleTexturePayload& payload,
                         const char* site, uint32_t sampler);

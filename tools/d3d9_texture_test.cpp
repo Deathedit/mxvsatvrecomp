@@ -165,9 +165,9 @@ int main() {
             expanded.host_format == HostTextureFormat::kR16,
         "k_16 maps to R16 storage");
   // FMT_8_8, the format the reject tally has been naming: 1273 descriptors in
-  // one run, every one of them a translated shader's slot that then failed the
-  // whole draw back to the stand-in. 1x1 blocks of 2 bytes, matching the
-  // reference's own R8G8_UNORM / 16bpb entry.
+  // one run, every one a translated shader's slot that then failed the whole
+  // draw back to the stand-in. 1x1 blocks of 2 bytes, matching the reference's
+  // own R8G8_UNORM / 16bpb entry.
   fetch16.format = rex::graphics::xenos::TextureFormat::k_8_8;
   Check(DescribeHleTexture2D(fetch16Words, expanded, &why) &&
             expanded.host_format == HostTextureFormat::kRg8,
@@ -180,8 +180,7 @@ int main() {
   // format table (0x82D54414) that used to hit the accept-list default and drop
   // the draw. Each is checked for its host format AND its block geometry,
   // because a wrong bytes_per_block does not fail -- it reads plausible bytes
-  // from the wrong place, which is the failure mode the packed-mip work already
-  // paid for once.
+  // from the wrong place.
   fetch16.format = rex::graphics::xenos::TextureFormat::k_16_16_FLOAT;
   Check(DescribeHleTexture2D(fetch16Words, expanded, &why) &&
             expanded.host_format == HostTextureFormat::kRg16Float,
@@ -241,10 +240,10 @@ int main() {
             expanded.signs == 0,
         "signs are carried out of the descriptor");
 
-  // The 8-byte block claim the accept-list comment makes: SwapBlock's dword
-  // loop runs TWICE over one block and each dword is swapped on its own. An
+  // The 8-byte block claim the accept-list comment makes: SwapBlock's dword loop
+  // runs TWICE over one block and each dword is swapped on its own. An
   // implementation that reversed all eight bytes would pass a 4-byte test and
-  // fail here, which is exactly why this is checked at 8 and not at 4.
+  // fail here, which is why this is checked at 8 and not at 4.
   {
     HleTextureSource wide{};
     wide.source_bytes = 8;
@@ -298,10 +297,10 @@ int main() {
           "2-byte blocks are endian-swapped");
 
     // The same swap, stated as the claim that matters for k_8_8: the guest
-    // stores the texel big-endian and component 0 is its LOW half, so after
-    // the swap host R must be component 0 and host G component 1. Get this
-    // backwards and every two-channel texture samples with its channels
-    // exchanged -- which for a normal map is a sign flip nothing else catches.
+    // stores the texel big-endian and component 0 is its LOW half, so after the
+    // swap host R must be component 0 and host G component 1. Backwards, every
+    // two-channel texture samples with its channels exchanged -- which for a
+    // normal map is a sign flip nothing else catches.
     narrow.host_format = HostTextureFormat::kRg8;
     const uint8_t rg[4] = {0xAA, 0xBB, 0xCC, 0xDD};
     Check(DecodeHleTexture2D(narrow, rg, sizeof(rg), out16, &why),
@@ -313,8 +312,7 @@ int main() {
   // PACKED MIP TAIL. A texture 16 texels or smaller stores its base level at an
   // offset inside the tail, not at the origin. The offsets come from the SDK's
   // GetPackedMipOffset -- for an 8x8 DXT1 it reports x=4 blocks -- and this
-  // checks the decode actually reads from there. Before the fix every such
-  // texture returned the bytes at x=0, which belong to a different image.
+  // checks the decode actually reads from there.
   {
     HleTextureSource packed{};
     packed.width = 8;
@@ -365,8 +363,7 @@ int main() {
   //
   //  - At 64 texels wide, LINEAR proves nothing. A linear mip's pitch is rounded
   //    up to 256 bytes, which for a 64-wide RGBA8 texture lands exactly on the
-  //    base pitch -- so a decode using the base pitch for every level was
-  //    indistinguishable from a correct one.
+  //    base pitch.
   //  - At 64 texels wide, TILED proves nothing either. Level 1 is then 32x32, a
   //    single tile, and GetTiledOffset2D only consults the pitch across tile
   //    boundaries. 256 makes level 1 a 4x4 grid of tiles.
@@ -489,10 +486,9 @@ int main() {
 
   // A CUBE WITH MIPS. Array slices live INSIDE a level on the guest and outside
   // it on the host, and each level has its own slice stride -- so a decode that
-  // reused the base level's stride for the chain would return face 0's bytes
-  // for five of six faces, at every level but the first. Nothing in the
-  // single-slice case above can see that: it was written after mutating the
-  // stride and watching the test pass anyway.
+  // reused the base level's stride for the chain would return face 0's bytes for
+  // five of six faces, at every level but the first. Nothing in the single-slice
+  // case above can see that.
   {
     namespace xg = rex::graphics::xenos;
     namespace tu = rex::graphics::texture_util;

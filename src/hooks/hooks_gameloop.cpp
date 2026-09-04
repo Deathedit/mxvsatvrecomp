@@ -13,21 +13,19 @@
 // It ran for ~3-4 hours of continuous sessions disabled before deletion, across
 // boot, menu, freeroam level load and level exit, with no regression -- which is
 // the evidence, because several of the things it did read as load-bearing and
-// are not.
-//
-// What it did, and why each is gone:
+// are not:
 //
 //   ::Sleep(16) at the tail. The one with a measurable cost: it paced the
-//     guest's own main loop at 60Hz from inside the emulator. Removing it is
+//     guest's own main loop at 60Hz from inside the emulator, and removing it is
 //     most of why logo/intro went from 20fps to 40fps.
 //
 //   REX_STORE_U8(0x82D57994, 1) every iteration. byte_82D57994 gates MainLoop's
-//     call to RenderPipeline. The comment argued that "nothing in the guest sets
-//     it, so forcing it is load-bearing". Falsified: with the hook gone
-//     RenderPipeline still runs every frame (7,264 times in one run).
+//     call to RenderPipeline, and the comment argued that "nothing in the guest
+//     sets it, so forcing it is load-bearing". Falsified: with the hook gone
+//     RenderPipeline still runs every frame.
 //
-//   NtSetEvent on *(0x830EC248 + 0x194) once per frame, to drive the loader. The
-//     reasoning was that hook #6 skipped the guest renderer that would satisfy
+//   NtSetEvent on *(0x830EC248 + 0x194) once per frame, to drive the loader, on
+//     the reasoning that hook #6 skipped the guest renderer that would satisfy
 //     LoaderTick's Wait. Levels load AND exit without it.
 //
 //   ctx.r3.u32 = 1, GuestTick() (whose only consumer, the stall watchdog, is
@@ -72,8 +70,7 @@ extern "C" REX_FUNC(sub_82B70578) {
   if (ms >= 50) REXLOG_INFO("native: RenderPipeline #{} took {}ms", rp, ms);
 }
 
-// The per-callee timing probes that found this are REMOVED 2026-08-06, having
-// done their job. They wrapped hot recursive guest functions in two
-// steady_clock reads each, which is its own cost on the path being measured.
-// The chain they established is in AGENTS.md; git history has the probes if
-// another level ever needs walking.
+// The per-callee timing probes that found this are REMOVED, having done their
+// job. They wrapped hot recursive guest functions in two steady_clock reads
+// each, which is its own cost on the path being measured. The chain they
+// established is in AGENTS.md.

@@ -24,8 +24,8 @@ namespace {
 // that table.
 //
 // PPCFuncMappings is sorted by GUEST address, not by host, so this is a linear
-// sweep for the greatest host entry at or below the RIP, plus the smallest
-// above it. Those two bracket the function, which makes the answer a containment
+// sweep for the greatest host entry at or below the RIP, plus the smallest above
+// it. Those two bracket the function, which makes the answer a containment
 // result rather than a nearest-neighbour guess: a RIP outside [best, next) is
 // not in recompiled code at all, and saying so is the point.
 struct GuestFuncHit {
@@ -93,10 +93,10 @@ const PPCContext* GuestContextFrom(const CONTEXT* c, uint64_t gbase) {
 }
 
 // Crash reporter. The log loses its last lines on a hard fault, which made
-// bisecting the native LoaderTick path unreliable — a probe would appear to
-// die before a log line that had actually already executed. This catches the
-// fault, records exactly what address was touched, and flushes before the
-// process dies. Registered first (last arg 1) so it runs before anything else.
+// bisecting the native LoaderTick path unreliable -- a probe would appear to die
+// before a log line that had actually already executed. This catches the fault,
+// records exactly what address was touched, and flushes before the process dies.
+// Registered first (last arg 1) so it runs before anything else.
 LONG CALLBACK CrashReporter(EXCEPTION_POINTERS* info) {
   const auto* rec = info->ExceptionRecord;
 
@@ -120,18 +120,15 @@ LONG CALLBACK CrashReporter(EXCEPTION_POINTERS* info) {
       const bool is_write = rec->ExceptionInformation[0] == 1;
       const uint64_t rip = reinterpret_cast<uint64_t>(rec->ExceptionAddress);
       const GuestFuncHit hit = ResolveGuestFunction(rip);
-      // THE FULL ATTRIBUTION RULE, not just containment.
+      // THE FULL ATTRIBUTION RULE, not just containment. `hit.guest &&
+      // (!hit.next_host || rip < next_host)` immediately reported our OWN
+      // writeback as "FROM GUEST CODE" -- at +0x9014E5C5C past a 0x60-byte
+      // function, i.e. 38 GB -- because when next_host is 0 (a RIP above every
+      // mapping, which is where host code lives) that test accepts anything.
       //
-      // The first cut used `hit.guest && (!hit.next_host || rip < next_host)`
-      // and immediately reported our OWN writeback as "FROM GUEST CODE" -- at
-      // +0x9014E5C5C past a 0x60-byte function, i.e. 38 GB. When next_host is 0
-      // (a RIP above every mapping, which is where host code lives) that test
-      // accepts anything.
-      //
-      // A probe that answers its own question with our own traffic is worse than
-      // no probe. Both signals the crash report already documents are required
-      // here: the host/guest size ratio, and the absence of a PPCContext in the
-      // argument registers, which every recompiled function has.
+      // Both signals the crash report already documents are required here: the
+      // host/guest size ratio, and the absence of a PPCContext in the argument
+      // registers, which every recompiled function has.
       const uint64_t off = hit.guest ? rip - hit.host : 0;
       const bool implausible =
           !hit.guest_size || off > uint64_t(hit.guest_size) * 24ull;
@@ -199,16 +196,15 @@ LONG CALLBACK CrashReporter(EXCEPTION_POINTERS* info) {
     //
     // So the claim now carries its evidence: the offset is reported against the
     // function's guest size, and the absence of a PPCContext is stated rather
-    // than left as a missing line. An honest "I do not know" is worth more than
-    // a plausible function name.
+    // than left as a missing line.
     const GuestFuncHit hit = ResolveGuestFunction(rip);
     const PPCContext* ctx = GuestContextFrom(info->ContextRecord, gbase);
     if (hit.guest && (!hit.next_host || rip < hit.next_host)) {
       const uint64_t off = rip - hit.host;
-      // Recompiled x64 runs roughly 5-15 bytes of host per guest byte. Well
-      // past that means the RIP is in whatever sits after the function, not in
-      // it. Deliberately generous -- this only has to catch the order-of-
-      // magnitude case.
+      // Recompiled x64 runs roughly 5-15 bytes of host per guest byte. Well past
+      // that means the RIP is in whatever sits after the function, not in it.
+      // Deliberately generous -- this only has to catch the order-of-magnitude
+      // case.
       const bool implausible =
           hit.guest_size && off > uint64_t(hit.guest_size) * 24ull;
       if (implausible || !ctx) {

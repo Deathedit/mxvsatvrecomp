@@ -14,8 +14,7 @@ constexpr uint32_t kMaxTextureLevels = 14;
 // One mip level's geometry, resolved once in DescribeHleTexture2D so nothing
 // downstream has to re-derive it. A level is NOT "the base with everything
 // halved": its pitch comes from a different rule, and beyond the packed level
-// several levels share one image. See the field notes below and the block
-// comment on HleTextureSource::levels.
+// several levels share one image.
 struct HleTextureLevel {
   // Where this level's storage starts in the blob CopyTexturePhysical builds:
   // the base allocation, then the mip allocation appended after it. Level 0 is
@@ -40,10 +39,10 @@ struct HleTextureLevel {
 };
 
 struct HleTextureSource {
-  // The raw 6-bit format field, already folded through GetBaseFormat. Set
-  // before the accept-list switch runs, so it is valid even when
-  // DescribeHleTexture2D returns false — that is the whole point of it, since
-  // "unsupported texture format" is useless without naming the format.
+  // The raw 6-bit format field, already folded through GetBaseFormat. Set before
+  // the accept-list switch runs, so it is valid even when DescribeHleTexture2D
+  // returns false -- which is the whole point: "unsupported texture format" is
+  // useless without naming the format.
   uint32_t guest_format = 0;
   uint32_t address = 0;
   uint32_t source_bytes = 0;
@@ -59,9 +58,7 @@ struct HleTextureSource {
   uint32_t clamp_y = 0;
   // TEX_FORMAT_COMP / GPUSIGN, one xenos::TextureSign per component packed two
   // bits each in XYZW order -- kUnsigned(0), kSigned(1), kUnsignedBiased(2,
-  // meaning 2*c-1), kGamma(3, sRGB linearized when sampled). Decoded so the
-  // census can say whether this game uses anything but kUnsigned; nothing acts
-  // on it yet.
+  // meaning 2*c-1), kGamma(3, sRGB linearized when sampled).
   uint8_t signs = 0;
   // 1 for a plain 2D or 1D texture; 6 for a cube; stack_depth+1 for a stacked
   // 2D. Each slice is a whole 2D image of the width/height above, and
@@ -85,8 +82,7 @@ struct HleTextureSource {
   // constant is not merely a shape we do not support, it is one the reference
   // itself calls invalid. Xenia's response is to drop the BINDING and keep
   // drawing -- an invalid key samples zero -- so a caller that would otherwise
-  // fail the whole draw should bind zero instead. Refusing the draw discards
-  // every other slot's correct shading over one slot the shader may not read.
+  // fail the whole draw should bind zero instead.
   bool sample_as_zero = false;
   // PACKED MIP TAIL. A texture whose width OR height is 16 or smaller does not
   // store its BASE level plainly at base_address: the level lives inside a mip
@@ -97,15 +93,14 @@ struct HleTextureSource {
   //
   // The offsets are not decorative: for an 8x8 DXT1 the base sits at x=4 blocks
   // and for an 8x8 k_8_8_8_8 at x=16, so reading from the origin returns a whole
-  // texture's worth of unrelated bytes. Zero for anything larger than 16, and
-  // zero when the fetch constant does not set packed_mips.
+  // texture's worth of unrelated bytes.
   uint32_t packed_offset_x_blocks = 0;
   uint32_t packed_offset_y_blocks = 0;
   // THE MIP CHAIN. The guest allocates it SEPARATELY from the base level, at its
-  // own address (xenos.h:1249: mip_address is stored >> 12 like base_address,
-  // and the levels run mip_min_level..mip_max_level). Measured over 460,000
-  // binds in a level: 29% carry a chain, at a readable address, up to twelve
-  // levels deep, and every one sets packed_mips.
+  // own address (xenos.h:1249: mip_address is stored >> 12 like base_address, and
+  // the levels run mip_min_level..mip_max_level). Measured over 460,000 binds in
+  // a level: 29% carry a chain, at a readable address, up to twelve levels deep,
+  // and every one sets packed_mips.
   //
   // mip_address is zero when there is no chain, and that ZERO WINS over a
   // non-zero mip_max_level -- 81,934 binds in that run declare levels with no
@@ -115,16 +110,15 @@ struct HleTextureSource {
   uint32_t mip_min_level = 0;
   uint32_t mip_max_level = 0;
   // The fetch constant's LOD bias, RAW and signed -- the 10-bit field at bit 12
-  // of dword 4, not yet scaled. The scale is 1/32 per the reference (sampler_
-  // info.cc:45), NOT the 1/16 the INSTRUCTION's bias uses. Kept raw so the unit
-  // lives at exactly one call site instead of being baked into a field name that
-  // was wrong once already.
+  // of dword 4, not yet scaled. The scale is 1/32 per the reference
+  // (sampler_info.cc:45), NOT the 1/16 the INSTRUCTION's bias uses. Kept raw so
+  // the unit lives at exactly one call site instead of being baked into a field
+  // name that was wrong once already.
   //
-  // COUNTED for a long time and never carried, so there was no way to ask
-  // whether a PARTICULAR texture has one. Recorded now because which mip a
-  // texture samples is the live question for the terrain page table, and this is
-  // the one per-texture control over it that we do not implement --
-  // D3D12_SAMPLER_DESC::MipLODBias appears nowhere in the tree.
+  // COUNTED for a long time and never carried, so there was no way to ask whether
+  // a PARTICULAR texture has one. Which mip a texture samples is the live
+  // question for the terrain page table, and this is the one per-texture control
+  // over it that we do not implement.
   int32_t lod_bias_raw = 0;
   // TextureFilter: kPoint(0), kLinear(1), kBaseMap(2). kBaseMap means the guest
   // never wants to minify past level 0, and we honour it by not building a
@@ -135,10 +129,10 @@ struct HleTextureSource {
   uint32_t mip_source_bytes = 0;
   uint32_t level_count = 1;
   // Indexed by ABSOLUTE level, matching how the reference indexes its own
-  // offsets. **levels[0] is deliberately unused and stays zero**: the base
-  // level is described by the flat fields above and by nothing else, so the two
-  // cannot drift apart, and a caller that fills this struct by hand -- the
-  // decode tests do -- keeps working without knowing the chain exists.
+  // offsets. **levels[0] is deliberately unused and stays zero**: the base level
+  // is described by the flat fields above and by nothing else, so the two cannot
+  // drift apart, and a caller that fills this struct by hand -- the decode tests
+  // do -- keeps working without knowing the chain exists.
   HleTextureLevel levels[kMaxTextureLevels] = {};
   bool tiled = false;
   bool linear_filter = true;
@@ -157,15 +151,11 @@ const char* GuestTextureFormatName(uint32_t guest_format);
 // holds guest component swizzle[c], so it needs that component's sign. A swizzle
 // entry of 4 or 5 forces a literal 0 or 1, which carries no guest component and
 // is therefore unsigned. Mirrors the reference's SwizzleSigns.
-//
-// Returns two bits per host component in XYZW order, same packing as
-// HleTextureSource::signs.
 uint8_t SwizzleTextureSigns(uint8_t signs, uint32_t swizzle);
 
 // What the mip chain looked like across every texture described so far. Kept
 // because "the field exists" is not "the title fills it", and because the two
-// suppressed cases below are deliberate gaps that should be visible as numbers
-// rather than inferred from the picture.
+// suppressed cases below are deliberate gaps that should be visible as numbers.
 struct HleMipCensus {
   uint64_t described = 0;
   uint64_t with_chain = 0;      // level_count > 1
@@ -199,13 +189,11 @@ HleMipCensus HleMipChainStats();
 // Nothing has ever asked. Every tiled 2D texture in the game goes through
 // tu::GetTiledOffset2D, and the mip self-check cannot cover it: that compares
 // level n against a box-filtered level n-1, so an addressing error applied
-// consistently to both scrambles them identically and still passes. It is a
-// relative check; this is the absolute one.
+// consistently to both scrambles them identically and still passes.
 //
 // Run once per process over a coordinate sweep at every block size, against a
 // transcription of xenia-edge's own implementation. `mismatched == 0` is the
-// only acceptable result -- anything else means every tiled texture is read from
-// the wrong bytes, so the first disagreement is carried here to name it.
+// only acceptable result, so the first disagreement is carried here to name it.
 struct HleTiledAddressCheck {
   uint64_t checked = 0;
   uint64_t mismatched = 0;
@@ -216,10 +204,10 @@ struct HleTiledAddressCheck {
 HleTiledAddressCheck HleTiledAddressStats();
 
 // 1D textures, which this title had never been shown to use. `seen` is the
-// number that reached the describe at all, so a run of zeros means the whole
-// 1D path -- including the three divergences from xenia-edge it used to carry
-// -- is unexercised, and a non-zero `seen` with zero everything else means it
-// is exercised and correct. Without `seen` the other four are unreadable.
+// number that reached the describe at all, so a run of zeros means the whole 1D
+// path -- including the three divergences from xenia-edge it used to carry -- is
+// unexercised, and a non-zero `seen` with zero everything else means it is
+// exercised and correct. Without `seen` the other four are unreadable.
 struct HleOneDCensus {
   uint64_t seen = 0;
   uint64_t tiled = 0;     // refused: tiling is meaningless for one row
@@ -236,17 +224,16 @@ bool DecodeHleTexture2D(const HleTextureSource& source,
                         HleTexturePayload& out, const char** fail = nullptr);
 uint64_t HleTextureKey(const uint32_t fetch_words[6]);
 // Returns true when the decoded base mip contains more than an empty/cleared
-// backing store. This is intentionally format-agnostic: it is a guard against
-// publishing guest render-target storage that is all zero because the original
-// GPU dispatch is skipped, not an attempt to classify texture semantics.
+// backing store. Intentionally format-agnostic: it is a guard against publishing
+// guest render-target storage that is all zero because the original GPU dispatch
+// is skipped, not an attempt to classify texture semantics.
 bool HleTextureHasNonzeroData(const HleTexturePayload& texture,
                               size_t* nonzero_bytes = nullptr);
 // Returns true when every byte of the decoded base mip is the same value, and
 // reports it. The companion to the test above for the case it cannot see: guest
-// memory the CPU never writes reads back all-0xFF as readily as all-zero, and
-// only the zero form is "empty" to HleTextureHasNonzeroData. Use this ONLY where
-// a better source exists to fall back to -- a uniform decode is suspicious, not
-// proof, and a genuinely flat texture is legal.
+// memory the CPU never writes reads back all-0xFF as readily as all-zero. Use
+// this ONLY where a better source exists to fall back to -- a uniform decode is
+// suspicious, not proof, and a genuinely flat texture is legal.
 bool HleTextureIsConstant(const HleTexturePayload& texture,
                           uint8_t* value = nullptr);
 

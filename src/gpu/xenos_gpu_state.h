@@ -23,8 +23,7 @@ namespace mx::gpu {
 //
 // 0x4600 is ALU dword 1536 = constant c384, and 48 dwords is 12 float4s, so that
 // one packet publishes c384..c395. Guest c394 is xe_c[138] in the rebased pixel
-// bank, and it read as NaN -- which saturated a full-screen draw to white and is
-// why the legal, start and main-menu screens have no background.
+// bank, and it read as NaN.
 //
 // This is NOT the LOAD_ALU_CONSTANT path. That one only ever targets index
 // 0x3F0/0x7F0 (c252-255, c508-511) in this title and ApplyShaderLoadTable
@@ -50,14 +49,13 @@ void NoteType0Write(uint32_t reg_base, const uint32_t* data, uint32_t count);
 //
 // `count_finite_zeros` enables a second pass that MEASURES ONLY: it counts
 // components our sources left at a finite zero that Type-0 PM4 published a value
-// for, and changes nothing. Both banks, since it is now harmless.
+// for, and changes nothing.
 //
 // It briefly SUBSTITUTED those values and that was wrong in both banks: vertex
 // sprayed a stride-6 matrix palette and tore the geometry apart, pixel still
 // flashed and never brightened. `g_file` is frame-global last-write-wins, so a
 // mid-frame draw gets the frame's final constants -- fine for rare NaN repair,
-// destructive the moment it reaches an array. Read `filled_zero` as a WARNING,
-// not as a repair count.
+// destructive the moment it reaches an array. Read `filled_zero` as a WARNING.
 uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
                           uint32_t reg_count, bool count_finite_zeros);
 
@@ -71,22 +69,20 @@ void Stats(uint64_t& written, uint64_t& repaired, uint32_t& constants_seen,
 
 // Which constants the zero-fill actually touched, worst first. The total alone
 // cannot distinguish "a handful of registers" from "spraying the whole bank",
-// and those want opposite fixes — narrow the range, or stop treating a
-// frame-global PM4 file as authoritative for a mid-frame draw.
+// and those want opposite fixes.
 std::string FilledHistogram(uint32_t top);
 // The LIVE file contents for the given constants, with unpublished components
 // marked. Read a live value here rather than reintroducing a snapshot of
 // REFUSALS: the WouldFillValues report that used to sit beside this could not
-// express a zero at all, because its pass skipped `v == 0`, and it therefore
-// went on printing a stale non-zero after the file had changed underneath it.
+// express a zero at all, because its pass skipped `v == 0`, and it went on
+// printing a stale non-zero after the file had changed underneath it.
 std::string FileValues(const uint32_t* consts, size_t n);
 
 // One constant as floats, for callers that need the VALUE rather than a line of
 // text. Returns false unless PM4 has published all four components, so an
 // unpublished register cannot be mistaken for a published zero -- the same
 // distinction FileValues draws with its `unpub:` marker, in a form arithmetic
-// can use. Parsing FileValues' string instead would silently swallow that
-// marker, which is how a probe ends up dividing by an imaginary zero.
+// can use.
 bool FileFloat4(uint32_t c, float* out4);
 
 // THE SAME, BUT DRAW-SCOPED TO THE TERRAIN. The ALU file is global, so
@@ -97,7 +93,7 @@ bool FileFloat4(uint32_t c, float* out4);
 //
 // TerrainFloat4 returns false unless that register was published at snapshot
 // time; TerrainSnapshots is 0 until the terrain has drawn, which is a different
-// fact from a zero value and must not read the same.
+// fact from a zero value.
 bool TerrainFloat4(uint32_t c, float* out4);
 uint64_t TerrainSnapshots();
 std::string TerrainValues();
@@ -122,8 +118,8 @@ uint64_t MaterialGateFilled();
 // Fill the narrow material-gate window (pixel c84..c87) from the Type-0 PM4
 // file, for dwords the shader's own load table did NOT publish and that are
 // still zero. `bank` is the PIXEL bank (guest c256 at index 0), `load_written`
-// is one byte per bank dword, non-zero where the load table wrote. Call AFTER
-// ApplyShaderLoadTable -- before it, the table overwrites the fill.
+// is one byte per bank dword. Call AFTER ApplyShaderLoadTable -- before it, the
+// table overwrites the fill.
 uint32_t FillMaterialGate(uint32_t* bank, uint32_t bank_regs,
                           const uint8_t* load_written);
 

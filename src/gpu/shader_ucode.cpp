@@ -17,17 +17,16 @@ namespace mx::hle {
 
 namespace {
 
-// Guard rails. Both are far above anything this game emits (the largest
-// captured vertex shader is 27 dwords, i.e. 9 instructions) and exist so a
-// desynced parser handing us garbage produces a `fail` reason rather than a
-// hang or a runaway vector.
+// Guard rails. Both are far above anything this game emits (the largest captured
+// vertex shader is 27 dwords) and exist so a desynced parser handing us garbage
+// produces a `fail` reason rather than a hang or a runaway vector.
 constexpr uint32_t kMaxCfInstructions = 512;
 constexpr uint32_t kMaxAttributes = 32;
 
 // address(), count() and sequence() sit at identical bit offsets in all three
-// exec structs, but they are distinct union members, so reaching them requires
-// a switch on the opcode rather than picking one arbitrarily. Getting this
-// wrong would compile silently and read the right bits by luck -- until someone
+// exec structs, but they are distinct union members, so reaching them requires a
+// switch on the opcode rather than picking one arbitrarily. Getting this wrong
+// would compile silently and read the right bits by luck -- until someone
 // changed a field.
 bool IsExec(uc::ControlFlowOpcode op) { return uc::IsControlFlowOpcodeExec(op); }
 
@@ -87,10 +86,10 @@ uint32_t ExecSequence(const uc::ControlFlowInstruction& cf) {
 
 // How many source operands each vector opcode actually reads. The SDK knows --
 // kAluVectorOpcodeInfos::GetOperandCount -- but that table is `extern const` and
-// defined inside the sealed plugin DLL, so it cannot be linked against. This is
-// transcribed from the per-opcode signatures documented in the enum itself.
+// defined inside the sealed plugin DLL. This is transcribed from the per-opcode
+// signatures documented in the enum itself.
 //
-// Reading a source the opcode does not use is not harmless here. The position
+// Reading a source the opcode does not use is not harmless here: the position
 // export in both ground-truth shaders is a two-operand op whose unused src3
 // field still names temp register 0 -- the colour register -- so consulting all
 // three marked colour as feeding the position.
@@ -330,8 +329,8 @@ bool ReadVertexAttributeAs(const uint8_t* vertex_base, uint32_t vertex_bytes,
 bool ReadVertexAttribute(const uint8_t* vertex_base, uint32_t vertex_bytes,
                          const VertexAttribute& attr, uint32_t endian,
                          float out[4]) {
-  // The interpretation this function has always applied, kept exactly so the
-  // PM4 path's output does not move. attr.is_signed / attr.is_normalized are
+  // The interpretation this function has always applied, kept exactly so the PM4
+  // path's output does not move. attr.is_signed / attr.is_normalized are
   // deliberately *not* consulted here: they were never consulted before, and
   // honouring them would change PM4 geometry as a side effect of a D3D9 change.
   NumFormat num = NumFormat::kUnorm;
@@ -345,11 +344,11 @@ const VertexAttribute* PickPositionAttribute(
     const std::vector<VertexAttribute>& attrs, bool* out_from_export) {
   if (out_from_export) *out_from_export = false;
 
-  // The shader's own answer, when the ALU trace produced one. Several
-  // attributes can legitimately reach the export -- a skinned mesh exports a
-  // position built from bone weights and indices as well as the point -- so
-  // among the contributors still prefer the one that looks most like a
-  // coordinate, lowest offset breaking the tie.
+  // The shader's own answer, when the ALU trace produced one. Several attributes
+  // can legitimately reach the export -- a skinned mesh exports a position built
+  // from bone weights and indices as well as the point -- so among the
+  // contributors prefer the one that looks most like a coordinate, lowest offset
+  // breaking the tie.
   const VertexAttribute* best = nullptr;
   for (const auto& a : attrs) {
     if (!a.feeds_position || a.components < 2) continue;
@@ -408,8 +407,8 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
   // The blob carries no header saying so. CF instructions are 48-bit, packed two
   // per three dwords, and the section runs until the first instruction the
   // control flow jumps to. So the end is the lowest exec target address, and the
-  // bound is re-read each iteration so it shrinks as execs are seen. That is
-  // sound because a compiler never places an exec target ahead of the CF that
+  // bound is re-read each iteration so it shrinks as execs are seen -- sound
+  // because a compiler never places an exec target ahead of the CF that
   // references it.
   uint32_t max_cf_dword = dword_count - (dword_count % 3);
   bool saw_exec = false;
@@ -431,11 +430,8 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
   // Branches are deliberately not followed and loops are not unrolled: each exec
   // is visited exactly once. That over-approximates the attribute set for a
   // shader with alternative paths, which is the right error for gathering a
-  // layout. A shader with two genuine layouts would show up as two attributes at
-  // one offset with different formats, and that should be reported.
-  //
-  // last_full persists across exec blocks: a vfetch_full in one exec followed by
-  // minis in another is legal.
+  // layout. last_full persists across exec blocks: a vfetch_full in one exec
+  // followed by minis in another is legal.
   uc::VertexFetchInstruction last_full{};
   bool have_full = false;
   uint32_t cf_seen = 0;
@@ -449,8 +445,7 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
   // unions them into pos_taint. kMaxAttributes is 32, so one uint32_t per
   // register is exactly enough.
   //
-  // Only the operands the opcode actually reads count -- see
-  // kVectorOperandCount, and the false positive that made it necessary.
+  // Only the operands the opcode actually reads count -- see kVectorOperandCount.
   const size_t out_base = out.size();
   uint32_t taint[64] = {};
   uint32_t pos_taint = 0;
@@ -508,8 +503,8 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
 
           // A full write mask replaces the register's provenance; a partial one
           // leaves the untouched components carrying whatever they had, so it
-          // has to union. Relative destination addressing is not resolved --
-          // the index lives in a register we do not evaluate -- so such a write
+          // has to union. Relative destination addressing is not resolved -- the
+          // index lives in a register we do not evaluate -- so such a write
           // lands on the base register and is a known imprecision.
           if (alu.vector_write_mask()) {
             uint32_t& t = taint[alu.vector_dest() & 63];
@@ -540,8 +535,7 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
         // format, offset, dest and modifiers. Its stride field usually reads 0
         // and its const_index reads garbage, so consuming them unconditionally
         // would silently yield a stride-0 attribute. (Not always zero: one
-        // captured shader's mini carries the same stride as its full. The
-        // inherited value is correct in both cases.)
+        // captured shader's mini carries the same stride as its full.)
         if (a.from_mini) {
           if (!have_full) return reject("vfetch_mini with no preceding full");
           a.fetch_slot = last_full.fetch_constant_index();
@@ -569,8 +563,7 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
 
         // A fetch defines its destination outright, discarding whatever the
         // register held. Attributes past the 32nd cannot be represented in the
-        // mask, but kMaxAttributes caps the list at 32 above, so the index is
-        // always in range.
+        // mask, but kMaxAttributes caps the list at 32 above.
         const size_t index = out.size() - out_base;
         taint[a.dest_reg & 63] = uint32_t(1) << index;
         out.push_back(a);
@@ -718,24 +711,19 @@ bool DecodePixelTextureFetches(const uint32_t* dwords, uint32_t dword_count,
         // NAME THE DIMENSION. This was a single static "non-2D texture fetch"
         // for every kind, which made the population unactionable: one run
         // refused 48 of 178 pixel shaders here and the log could not say whether
-        // they wanted cube, 3D or 1D. Those are three different pieces of work.
+        // they wanted cube, 3D or 1D -- three different pieces of work.
         //
         // Static literals, one per dimension, because `fail` is a const char**
-        // with no storage of its own. No allocation, no lifetime question, and
-        // the string still groups cleanly under `sort | uniq -c`.
-        //
-        // The precedent is expensive: a fetch refusal read from a too-vague
-        // message already cost this project a session (the exp_adjust "phantom",
-        // where a misread FetchOpcode refusal held ~89k draws off the GPU fetch
-        // path).
+        // with no storage of its own. The precedent is expensive: a fetch
+        // refusal read from a too-vague message already cost this project a
+        // session (the exp_adjust "phantom").
         if (tf.dimension() != rex::graphics::xenos::FetchOpDimension::k2D) {
           // SKIP IT, do not reject the blob. See the header for the measurement;
           // the short version is that this used to discard 3-7 already-decoded
           // 2D bindings (15 in one case) because of a single fetch we cannot
-          // represent, so the draw got NO textures instead of most of them.
-          //
-          // The skipped fetch's sampler is simply absent from the profile, so
-          // that one slot falls back to whatever an unbound sampler does today.
+          // represent. The skipped fetch's sampler is simply absent from the
+          // profile, so that one slot falls back to whatever an unbound sampler
+          // does today.
           ++skipped;
           if (!skipped_kind) {
             switch (tf.dimension()) {
@@ -766,11 +754,10 @@ bool DecodePixelTextureFetches(const uint32_t* dwords, uint32_t dword_count,
   }
   if (skipped_out) *skipped_out = skipped;
   if (out.size() != out_base) {
-    // `fail` doubles as a diagnostic note on SUCCESS when something was
-    // skipped. It is the only channel available without widening the signature
-    // further, and every caller reads it under a !decoded test, so a non-null
-    // fail alongside a true return cannot be mistaken for a failure. Documented
-    // in the header.
+    // `fail` doubles as a diagnostic note on SUCCESS when something was skipped.
+    // It is the only channel available without widening the signature further,
+    // and every caller reads it under a !decoded test, so a non-null fail
+    // alongside a true return cannot be mistaken for a failure.
     if (skipped && fail) *fail = skipped_kind;
     return true;
   }

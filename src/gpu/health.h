@@ -5,13 +5,10 @@
 // THE PROBLEM THIS SOLVES. A run emits ~250 log lines and every one is [info]:
 // 393 REXLOG_INFO call sites against 3 REXLOG_WARN, so severity says nothing and
 // there is no way to ask "is anything wrong". Meanwhile 33 places in this tree
-// state an expectation in a COMMENT beside the line that prints the number --
-// "must stay at 0", "both must read 0", "must match" -- and the join happens in
-// the reader's head, every time.
-//
-// It does not survive contact. `decl-source ... unknown=N` carries the comment
-// "must stay at 0"; it has never been 0 in any run anyone looked at, and nothing
-// ever said so.
+// state an expectation in a COMMENT beside the line that prints the number, and
+// the join happens in the reader's head every time -- `decl-source ... unknown=N`
+// carries "must stay at 0", has never been 0 in any run anyone looked at, and
+// nothing ever said so.
 //
 // THREE VERDICTS, AND THE THIRD IS THE POINT.
 //
@@ -32,7 +29,7 @@
 //
 // WHAT IS NOT HERE. No thresholds invented for lines that have no defensible
 // expectation. A check exists only where the source already asserted one in
-// prose; inventing a bound nobody has justified is how a report starts lying.
+// prose.
 
 #include <cstddef>
 #include <cstdint>
@@ -54,21 +51,19 @@ const char* Tag(Verdict v);
 
 // The four shapes that cover every expectation currently written in a comment in
 // this tree. Each returns its verdict so the caller can print it on its own line
-// as well as have it counted.
-//
-// `name` must be stable and greppable: "decl-source.unknown", not a sentence. It
-// is the key, so reusing one name for two quantities silently merges them.
+// as well as have it counted. `name` must be stable and greppable --
+// "decl-source.unknown", not a sentence -- because it is the key, and reusing
+// one name for two quantities silently merges them.
 
 // "this must read 0". `population` is what it was counted OUT OF -- the number
 // of opportunities the zero is a claim about. Pass it honestly: a zero out of
 // zero is UNMEASURED, and that is usually the finding.
 Verdict Zero(const char* name, uint64_t value, uint64_t population);
 
-// "this must NOT sit at zero" -- a counter whose zero means the thing feeding
-// it is broken rather than merely quiet. g_indexCondRead is the example the
-// tree already spells out: "if read is 0 the offsets are wrong and every index
-// is unconditioned -- which is the state that lost the ground -- so this must
-// not be allowed to sit silently at zero."
+// "this must NOT sit at zero" -- a counter whose zero means the thing feeding it
+// is broken rather than merely quiet. g_indexCondRead is the example the tree
+// already spells out: if read is 0 the offsets are wrong and every index is
+// unconditioned, which is the state that lost the ground.
 Verdict NonZero(const char* name, uint64_t value, uint64_t population);
 
 // "these two must be equal" -- applied vs attempted, accepted vs submitted.
@@ -81,27 +76,23 @@ Verdict AtMost(const char* name, uint64_t value, uint64_t population,
 
 // One line for the whole census, the same discipline the guard census uses:
 // every check, zero included, counts beside the names, and the BAD ones spelled
-// out so the line is actionable without opening anything else.
-//
-// Calling this advances the cycle counter, so it must be called once per report
-// pass and from one place.
+// out. Calling this advances the cycle counter, so it must be called once per
+// report pass and from one place.
 std::string Report();
 
 // Checks that turned BAD since the last call, rendered ready to log, and cleared
 // by the call. This module deliberately does not log: keeping it free of the
-// SDK's logging dependency is what lets it be built and tested on its own. The
-// caller emits these at WARN so severity finally distinguishes a finding from a
-// fact.
+// SDK's logging dependency is what lets it be built and tested on its own.
 //
 // Only the TRANSITION into BAD is reported, not every cycle a check stays bad:
 // reports run several times a minute and a stuck check would bury everything
 // else. Nothing is hidden -- Report() carries every check's current verdict.
 std::vector<std::string> DrainNewlyBad();
 
-// How many checks this build declares. The report's total is this plus any
-// name a call site used that is not on the declared list. Exposed so a test can
-// reason about the totals without hard-coding a number that changes every time
-// a check is added.
+// How many checks this build declares. The report's total is this plus any name
+// a call site used that is not on the declared list. Exposed so a test can
+// reason about the totals without hard-coding a number that changes every time a
+// check is added.
 size_t DeclaredCount();
 
 // True if anything is currently BAD. For callers that want to raise their own

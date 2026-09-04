@@ -25,9 +25,8 @@ Range g_range;  // one range is enough for the question being asked
 bool g_armed = false;
 
 // BUDGETS, because a guard page in a hot buffer is not free and the answer is
-// binary. Once these are spent the watch disarms permanently: it has either
-// seen a guest-code access or it has not, and re-arming forever would only add
-// cost to a question already answered.
+// binary. Once these are spent the watch disarms permanently: it has either seen
+// a guest-code access or it has not.
 std::atomic<uint64_t> g_arms{0};
 std::atomic<uint64_t> g_hitsTotal{0};
 std::atomic<uint64_t> g_hitsGuestRead{0};
@@ -57,8 +56,8 @@ void ArmGuestReadWatch(void* host_addr, size_t bytes, uint32_t guest_addr,
 
   // THROTTLED. The buffer is rewritten every frame and arming every time would
   // put a guard fault in the path of every access forever. One arm per 30
-  // writebacks samples it at ~2 Hz, which is far more than enough to catch a
-  // reader that runs per frame, and cheap enough to leave in.
+  // writebacks samples it at ~2 Hz, far more than enough to catch a reader that
+  // runs per frame.
   static uint64_t s_calls = 0;
   if ((s_calls++ % 30) != 0) return;
 
@@ -101,17 +100,14 @@ GuardHit OnGuardPageHit(uint64_t fault_addr, uint32_t* guest_addr,
   std::lock_guard<std::mutex> lk(g_mu);
   // NOT gated on g_armed. A hit anywhere in a range we ever armed is OURS and
   // must be swallowed, and getting that wrong KILLED THE PROCESS five seconds
-  // into run 1700.
+  // into a run: the guard covers 17 pages and Windows clears the bit for ONE
+  // page per fault, so our own writeback faulted the first page, g_armed went
+  // false, and the remaining 16 -- still armed -- reported kNotOurs, fell
+  // through to EXCEPTION_CONTINUE_SEARCH and took the process down with no crash
+  // line.
   //
-  // The guard covers 17 pages and Windows clears the bit for ONE page per
-  // fault. Our own writeback walks the whole buffer, so the first page faulted,
-  // the old code set g_armed = false, and the remaining 16 pages -- still
-  // armed -- reported kNotOurs, fell through to EXCEPTION_CONTINUE_SEARCH, and
-  // took the process down with no crash line. The log ends mid-writeback on
-  // exactly that.
-  //
-  // So: the range stays claimed for the life of the process, and the whole
-  // span is un-guarded on the FIRST hit rather than one page at a time.
+  // So: the range stays claimed for the life of the process, and the whole span
+  // is un-guarded on the FIRST hit rather than one page at a time.
   if (!g_range.host) return GuardHit::kNotOurs;
   const auto addr = reinterpret_cast<uintptr_t>(fault_addr);
   const auto lo = reinterpret_cast<uintptr_t>(g_range.host);

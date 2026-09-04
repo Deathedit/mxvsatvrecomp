@@ -92,8 +92,7 @@ uint32_t ExecSequence(const uc::ControlFlowInstruction& cf) {
 // every exec once and over-approximate the attribute set, because a superset of
 // the fetches is still a correct layout. Execution cannot: taking a branch the
 // real shader would not, or running a loop body once when it runs eight times,
-// produces a confidently wrong position. Every shader captured from this game so
-// far is a straight run of execs.
+// produces a confidently wrong position.
 bool IsUnsupportedCf(uc::ControlFlowOpcode op) {
   switch (op) {
     case uc::ControlFlowOpcode::kCondJmp:
@@ -137,8 +136,7 @@ class Interpreter {
   //
   // The counters exist because a shader can execute perfectly and still export
   // (0,0,0,w=0) -- 19% of them do -- and that is computing nothing *from
-  // something*. Whether the something was there is the question, and which slots
-  // it wanted is what names the gap if it was not.
+  // something*. Which slots it wanted is what names the gap.
   Vec4 Const(uint32_t index) const {
     Vec4 r;
     const uint32_t base = index * 4;
@@ -163,20 +161,19 @@ class Interpreter {
   // value is still produced, this only governs the instrumentation.
   //
   // An operand the opcode does not consume still has a register field, holding
-  // whatever the assembler left there, and 0xFF is common. Counting those is
-  // what produced a long-running "this shader reads c255 and gets zero" signal:
-  // c255 is genuinely unwritten, so every unused operand looked like a real read
-  // returning zero.
+  // whatever the assembler left there, and 0xFF is common. Counting those
+  // produced a long-running "this shader reads c255 and gets zero" signal: c255
+  // is genuinely unwritten, so every unused operand looked like a real read.
   mutable bool counting_ = true;
   mutable uint32_t const_reads = 0;
   mutable uint32_t const_zero_reads = 0;
   mutable uint32_t const_min_index = 0xFFFFFFFF;
   mutable uint32_t const_max_index = 0;
 
-  // One source operand, swizzled, absolute-valued and negated as the
-  // instruction asks. Swizzles are component-relative on Xenos — component c
-  // reads ((swizzle >> 2c) + c) & 3 — which is why a swizzle of 0 is identity
-  // rather than xxxx.
+  // One source operand, swizzled, absolute-valued and negated as the instruction
+  // asks. Swizzles are component-relative on Xenos — component c reads
+  // ((swizzle >> 2c) + c) & 3 — which is why a swizzle of 0 is identity rather
+  // than xxxx.
   Vec4 Src(const uc::AluInstruction& alu, size_t i) {
     const uint32_t reg = alu.src_reg(i);
     const uint32_t swiz = alu.src_swizzle(i);
@@ -203,17 +200,14 @@ class Interpreter {
         // out -- kAbsolute = 1 = c[a0 + n], kRelative = 0 = c[aL + n]
         // (ucode.h:191).
         //
-        // This condition used to be written without the negation, which is
-        // exactly backwards: it refused every a0 read -- the case this
-        // interpreter implements -- and applied a0_ to every aL read, a case
-        // that never occurs in this game. The a0 arithmetic below was therefore
-        // never once executed, which is why modelling a0 measured as converting
-        // zero failures. That null was the bug, not a fact about the game.
+        // Written without the negation this is exactly backwards: it refuses
+        // every a0 read -- the case this interpreter implements -- and applies
+        // a0_ to every aL read, which never occurs in this game. The a0
+        // arithmetic below was therefore never executed, which is why modelling
+        // a0 measured as converting zero failures.
         //
         // aL is the loop counter, and we walk every exec block once rather than
-        // unrolling, so there is no honest value for it. Refused, not guessed;
-        // expect this to fire ~0 times, since no shader in this game contains a
-        // loop at all.
+        // unrolling, so there is no honest value for it. Refused, not guessed.
         if (!alu.is_const_address_register_relative()) {
           status = AluStatus::kLoopRelative;
           return base;
@@ -269,14 +263,12 @@ class Interpreter {
 
   // Direct3D 9 legacy multiply: a zero OR DENORMAL multiplicand yields +0
   // regardless of the other operand, so 0 * INF is +0 and not NaN. Every
-  // multiplying operation on this hardware behaves this way -- see ucode.h ("+-0
-  // or denormal * anything = +0") and the matching XeMul in shader_hlsl.cpp,
-  // which carries the longer explanation. Titles rely on this for vector
-  // normalisation written as rcp-then-mul.
+  // multiplying operation on this hardware behaves this way -- see ucode.h and
+  // the matching XeMul in shader_hlsl.cpp, which carries the longer explanation.
   //
-  // Keep the two in step. They have the same contract and a divergence between
-  // the interpreter and the emitter is invisible until a draw silently changes
-  // colour depending on which path served it.
+  // Keep the two in step: a divergence between the interpreter and the emitter
+  // is invisible until a draw silently changes colour depending on which path
+  // served it.
   static float LegacyMul(float a, float b) {
     constexpr float kSmallestNormal = 1.175494351e-38f;
     return (std::fabs(a) < kSmallestNormal || std::fabs(b) < kSmallestNormal)
@@ -379,11 +371,9 @@ class Interpreter {
   // operand encoding, so they must not go through Src(): src3 names a constant
   // *register* directly, and the temp register it multiplies against is
   // scattered -- one bit lives in the opcode field itself, which is why each
-  // operation has a _0 and a _1 form.
-  //
-  // The constant is selected with the W-relative src3 swizzle and the temporary
-  // with the X-relative src3 swizzle (the Xenos AB = WX scalar convention).
-  // abs_constants and src3 negate apply to both operands.
+  // operation has a _0 and a _1 form. The constant is selected with the
+  // W-relative src3 swizzle and the temporary with the X-relative one (the Xenos
+  // AB = WX scalar convention); abs_constants and src3 negate apply to both.
   bool ConstRegScalarOp(const uc::AluInstruction& alu, float& out) {
     using Op = uc::AluScalarOpcode;
     const Op op = alu.scalar_opcode();
@@ -428,10 +418,10 @@ class Interpreter {
     }
 
     const Vec4 s = Src(alu, 3);
-    // Xenos scalar operands use AB = WX, not XY. Src() has already applied
-    // the component-relative swizzle, so the W-relative left operand is [3]
-    // and the X-relative right operand is [0]. One-component scalar opcodes
-    // consume only a; the two-component forms consume both a and b.
+    // Xenos scalar operands use AB = WX, not XY. Src() has already applied the
+    // component-relative swizzle, so the W-relative left operand is [3] and the
+    // X-relative right operand is [0]. One-component scalar opcodes consume only
+    // a; the two-component forms consume both.
     const float a = s[3], b = s[0];
     float r = 0.0f;
     switch (op) {
@@ -460,20 +450,18 @@ class Interpreter {
       case Op::kExp: r = std::exp2(a); break;
       // No fabs, matching the emitter: the abs is an operand MODIFIER the
       // guest's compiler sets, not part of the operation. log2(0) is already
-      // -INF, so the zero special case was doing nothing but hiding -0.0.
-      // logc saturates -INF and only -INF; isinf() also caught log2(+INF).
+      // -INF, so the zero special case was doing nothing but hiding -0.0. logc
+      // saturates -INF and only -INF; isinf() also caught log2(+INF).
       case Op::kLog: case Op::kLogc:
         r = std::log2(a);
         if (op == Op::kLogc && r == -INFINITY) r = -3.402823466e+38f;
         break;
       // The three forms differ only on an infinity, and treating the FF form as
-      // IEEE is what blacked out the menu on the HLSL side. Corrected here too
-      // so the interpreter and the emitter cannot disagree about a shader they
-      // both run.
+      // IEEE is what blacked out the menu on the HLSL side.
       //   RECIP_IEEE  +INF          RECIP_CLAMP  +/-FLT_MAX   RECIP_FF  +/-0.0
       // The `a == 0` special cases are gone: 1/0 is +INF and 1/-0 is -INF
-      // already, and forcing +INF for both lost the sign that kRcpf then flushes
-      // -- it handed back +0.0 where the hardware gives -0.0.
+      // already, and forcing +INF for both lost the sign that kRcpf then
+      // flushes -- it handed back +0.0 where the hardware gives -0.0.
       case Op::kRcp: case Op::kRcpc: case Op::kRcpf:
         r = 1.0f / a;
         if (op == Op::kRcpc && std::isinf(r)) r = r > 0 ? 3.402823466e+38f : -3.402823466e+38f;
@@ -500,9 +488,8 @@ class Interpreter {
         break;
       case Op::kRetainPrev: r = ps_; break;
       // Predicate-set family, value semantics only — p0_ is recorded but no
-      // instruction is skipped on it, exactly as in shader_hlsl.cpp. Kept in
-      // step with the emitter so the two cannot disagree about a shader they
-      // both run. Polarity per ucode.h:1140-1226: predicate TRUE writes 0.0.
+      // instruction is skipped on it, exactly as in shader_hlsl.cpp. Polarity
+      // per ucode.h:1140-1226: predicate TRUE writes 0.0.
       case Op::kSetpEq: p0_ = a == 0.0f; r = p0_ ? 0.0f : 1.0f; break;
       case Op::kSetpNe: p0_ = a != 0.0f; r = p0_ ? 0.0f : 1.0f; break;
       case Op::kSetpGt: p0_ = a > 0.0f;  r = p0_ ? 0.0f : 1.0f; break;
@@ -532,8 +519,8 @@ class Interpreter {
 
   void Execute(const uc::AluInstruction& alu) {
     // The raw vector/scalar mask fields overlap with the export constant 0/1
-    // encoding. Use the canonical decoded masks for both temp and export writes.
-    // Treating the raw bits as ordinary masks happened to preserve position in
+    // encoding. Use the canonical decoded masks for both temp and export writes:
+    // treating the raw bits as ordinary masks happened to preserve position in
     // many shaders, but turned interpolator exports (including UV r0) into zero.
     const uint32_t vmask = alu.GetVectorOpResultWriteMask();
     const uint32_t smask = alu.GetScalarOpResultWriteMask();
@@ -543,12 +530,12 @@ class Interpreter {
     //
     // maxa/maxas/maxasf are issued for their address-register side effect and
     // routinely leave the write mask empty, so a mask test skips the a0 load
-    // along with the instruction. That pinned a0 at 0 and rendered skinned
-    // meshes rigid at the palette base. The SDK's
-    // kAluOpChangedStateAddressRegister flag names exactly this set, but its
-    // opcode-info tables are extern-declared and never defined in anything the
-    // runtime links, so the opcodes are named directly here and in
-    // shader_hlsl.cpp. The two lists must stay identical.
+    // along with the instruction -- pinning a0 at 0 and rendering skinned meshes
+    // rigid at the palette base. The SDK's kAluOpChangedStateAddressRegister
+    // flag names exactly this set, but its opcode-info tables are
+    // extern-declared and never defined in anything the runtime links, so the
+    // opcodes are named directly here and in shader_hlsl.cpp. The two lists must
+    // stay identical.
     const bool vector_sets_a0 =
         alu.vector_opcode() == uc::AluVectorOpcode::kMaxA;
     const bool scalar_sets_a0 =
@@ -561,8 +548,8 @@ class Interpreter {
     const bool has_vector = vmask != 0 || alu.is_export() || vector_sets_a0;
     if (has_vector) {
       // VectorOp still runs when vmask is 0 and this is an export — kMaxA's
-      // address-register side effect depends on it. But nothing consumes vres
-      // in that case (the write loop only takes it under `vmask & bit`), so the
+      // address-register side effect depends on it. But nothing consumes vres in
+      // that case (the write loop only takes it under `vmask & bit`), so the
       // operands are not counted. An export writing only constant 0/1, such as
       // position.w = 1, is exactly this shape and is very common.
       in_counting = counting_;
@@ -575,10 +562,8 @@ class Interpreter {
     // whether the result is ALSO committed to a register. Gating this on the
     // mask meant a `maxs` issued purely for its ps side effect never ran, and
     // the following `muls_prev` multiplied by a stale ps. Same class of error as
-    // the a0 one above.
-    //
-    // Operands still are not counted when nothing consumes the value: sres is
-    // read only under `smask & bit`.
+    // the a0 one above. Operands still are not counted when nothing consumes the
+    // value.
     in_counting = counting_;
     counting_ = smask != 0;
     sres = ScalarOp(alu);
@@ -610,11 +595,10 @@ class Interpreter {
       return;
     }
 
-    // Destinations name temp registers, so a relative destination is
-    // aL-relative for the same reason a relative temp source is. Refused, not
-    // approximated. (In the export path above, is_scalar_dest_relative is not
-    // an index at all — it is the "write unwritten components as 0" flag —
-    // which is why this check lives here and not at the top of Execute.)
+    // Destinations name temp registers, so a relative destination is aL-relative
+    // for the same reason a relative temp source is. Refused, not approximated.
+    // (In the export path above, is_scalar_dest_relative is not an index at all
+    // — it is the "write unwritten components as 0" flag.)
     if (alu.is_vector_dest_relative() || alu.is_scalar_dest_relative()) {
       status = AluStatus::kLoopRelative;
       return;
@@ -689,9 +673,7 @@ AluResult ExecuteVertexShader(
   // Writing all four components unconditionally is wrong, and wrong in a way
   // that hides: two vfetches are allowed to target the SAME register and fill
   // different components of it, which is what a position-plus-texcoord vertex
-  // does. The second fetch then overwrote the first outright -- measured, a real
-  // texcoord immediately replaced by (0, 0, 0, 0), after which the shader
-  // exported a zero UV and the draw sampled one texel.
+  // does. The second fetch then overwrote the first outright.
   //
   // ucode.h FetchDestinationSwizzle, three bits per destination component:
   //   0..3 = x/y/z/w of the fetched value, 4 = 0.0, 5 = 1.0, 7 = keep.

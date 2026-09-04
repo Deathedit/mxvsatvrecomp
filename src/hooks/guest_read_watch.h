@@ -8,7 +8,7 @@
 // The surface readback path writes resolve results back into guest memory on the
 // theory that the guest reads them with a plain load. For the terrain HEIGHT
 // snapshot that is 99 KB a frame, and the only consumer we can SEE binds the
-// host snapshot instead, so the write has no demonstrated reader at all.
+// host snapshot instead.
 //
 // It cannot be answered by logging: guest-reads-resolves-from-memory is the
 // record of exactly this trap -- the exposure value came back through an
@@ -17,8 +17,7 @@
 //
 // So this arms a PAGE_GUARD on the pages behind the buffer. The next access of
 // any kind raises STATUS_GUARD_PAGE_VIOLATION, Windows clears the guard bit for
-// that page automatically, and execution resumes -- one report per page per arm,
-// self-limiting by construction.
+// that page automatically, and execution resumes -- one report per page per arm.
 //
 // READS AND WRITES ARE BOTH REPORTED, because our own writeback is a writer and
 // the texture fingerprint is a reader: if the guard could not tell them apart it
@@ -28,8 +27,8 @@
 namespace mx::watch {
 
 // Arm the pages covering [guest_addr, guest_addr + bytes) via their host
-// mapping. Call AFTER writing, so the next toucher is somebody else. `what` is
-// a short label carried into the report. Safe to call every frame -- the arm is
+// mapping. Call AFTER writing, so the next toucher is somebody else. `what` is a
+// short label carried into the report. Safe to call every frame -- the arm is
 // throttled internally and stops for good once the budget is spent.
 void ArmGuestReadWatch(void* host_addr, size_t bytes, uint32_t guest_addr,
                        const char* what);

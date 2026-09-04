@@ -16,10 +16,10 @@
 #include "mx_init.h"
 
 // The guest-stall watchdog declarations (GuestWaitEnter / GuestWaitLeave /
-// GuestTick) are REMOVED 2026-08-16 with their definitions in hooks_wait.cpp.
-// It was armed by GuestTick(), which only the MainLoop hook called, so once
-// that hook went the watchdog thread was never started — and the entry/leave
-// pair cost a process-wide mutex on every guest wait to feed it.
+// GuestTick) are REMOVED with their definitions in hooks_wait.cpp. It was armed
+// by GuestTick(), which only the MainLoop hook called, so once that hook went
+// the watchdog thread was never started -- and the entry/leave pair cost a
+// process-wide mutex on every guest wait to feed it.
 
 namespace {
 

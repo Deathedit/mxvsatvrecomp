@@ -39,8 +39,8 @@ std::atomic<uint32_t> g_strictMask{0};
 //
 // kConstantNanToZero left this set once its substitution was deleted outright,
 // so there is nothing for a bit to switch. The enum entry and its census row
-// stay -- the NaNs are still counted, just no longer replaced. Removing the
-// ENTRY would shift every bit below it.
+// stay -- the NaNs are still counted, just no longer replaced -- because
+// removing the ENTRY would shift every bit below it.
 constexpr uint32_t kSwitchable = (1u << uint32_t(Guard::kStandInDraw)) |
                                  (1u << uint32_t(Guard::kBlankTexturePayload));
 }  // namespace
@@ -75,18 +75,16 @@ std::string Report() {
     // EVERY guard, zero included, and the population always beside the fires. A
     // guard at 0/0 has never been reached and is a different finding from one at
     // 0/225000, which is reached constantly and never needed -- that second one
-    // can simply be deleted, and it is the cheapest win this census produces.
-    //
-    // "NOT WIRED" is not the same finding as "reached and never fired", and with
-    // both printed as 0/0 they were indistinguishable -- the exact defect this
-    // census exists to prevent, committed inside the census itself.
+    // can simply be deleted. "NOT WIRED" is likewise not the same finding as
+    // "reached and never fired", and with both printed as 0/0 they were
+    // indistinguishable: the exact defect this census exists to prevent,
+    // committed inside the census itself.
     //
     // THE BIT NUMBER IS PRINTED, and that is not decoration. hle_strict is keyed
     // on enum POSITION, and three guards were deleted from this enum -- every
     // deletion shifts every bit below it. The cvar's own comment carried the
     // pre-deletion numbers and sent a run at bit 4 when the guard it named had
-    // moved to bit 3. Now the log is the authority, because it is computed from
-    // the same enum the switch is.
+    // moved to bit 3. The log is the authority, computed from the same enum.
     out += fmt::format(" [{} bit{} {}/{}{}{}]", kNames[i], i, f, p,
                        p ? fmt::format(" {:.1f}%", double(f) * 100.0 / double(p))
                          : " NOT WIRED",

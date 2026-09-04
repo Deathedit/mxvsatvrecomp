@@ -2,12 +2,9 @@
 //
 // These five functions and two counters used to sit in an anonymous namespace in
 // d3d12_game.cpp. Splitting that file put their definitions and their callers in
-// different TUs, and internal linkage does not cross a TU. So they are declared
-// here and defined, once, in d3d12_game.cpp.
-//
-// This is the ONLY linkage change the split required; everything else moved
-// verbatim. Checked before making it: none of these seven names appears anywhere
-// else in src/.
+// different TUs, and internal linkage does not cross a TU, so they are declared
+// here and defined once in d3d12_game.cpp. This is the ONLY linkage change the
+// split required.
 
 #pragma once
 
@@ -33,8 +30,7 @@ bool ToD3D12BlendOp(uint32_t guest, D3D12_BLEND_OP& out);
 
 // One-shot log of a guest colour format per target object, and the topology
 // CLASS a topology belongs to (D3D12 wants both at PSO creation). Both already
-// had external linkage in d3d12_game.cpp -- they were never in the anonymous
-// namespace -- so these are declarations only, not a linkage change.
+// had external linkage in d3d12_game.cpp, so these are declarations only.
 void LogGuestColorFormat(uint32_t object, uint32_t width, uint32_t height,
                          uint32_t guestColorFormat);
 D3D12_PRIMITIVE_TOPOLOGY_TYPE TopologyTypeOf(D3D12_PRIMITIVE_TOPOLOGY topo);

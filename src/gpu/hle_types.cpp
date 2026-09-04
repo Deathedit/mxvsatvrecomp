@@ -20,8 +20,7 @@ HostTopology MapTopology(uint32_t prim_type) {
     //
     // TriangleFan has no D3D12 equivalent either and is still not handled: it is
     // dropped and counted. Unlike the other two that is not a backlog item -- it
-    // does not appear once in a prim_type histogram of a full run, so there is
-    // no measured population to justify the code.
+    // does not appear once in a prim_type histogram of a full run.
     default:                            return HostTopology::kUndefined;
   }
 }
@@ -36,21 +35,17 @@ namespace {
 // GPU vertex stage's input registers and the CPU path's interpolator stream are
 // both built BEFORE topology finalisation, sized to the incoming vertex_count of
 // 3 -- so after expansion the index buffer referenced a fourth vertex whose
-// registers did not exist. The vertex stage read zeros, the position came out
-// (0,0,0,0), and the second triangle of every rectangle collapsed to a point.
-//
-// Measured at the 320x180 luminance pass: post-transform v3 = (0,0) where it
-// should be (1,-1). Every full-screen post pass in this game is a RECTLIST, so
-// each reduction stage lost half its area and the chain drove the average
-// luminance toward zero.
+// registers did not exist, and the second triangle of every rectangle collapsed
+// to a point. Every full-screen post pass in this game is a RECTLIST, so each
+// reduction stage lost half its area and the chain drove the average luminance
+// toward zero.
 //
 // Every register here is affine across the rectangle, so the same rule that
 // gives the fourth corner gives the fourth vertex's registers.
 //
 // `starts` is the per-rect permutation ExpandRectangleList chose from the
 // POSITIONS. It has to be passed in rather than recomputed, because this stream
-// may not contain a position at all: choosing independently would let the
-// interpolators be permuted differently from the vertices they belong to.
+// may not contain a position at all.
 void ExpandRectStream(std::vector<uint8_t>& stream, uint32_t stride,
                       uint32_t rects, const std::vector<uint8_t>& starts) {
   if (stream.empty() || !stride) return;
@@ -139,15 +134,13 @@ uint32_t ExpandRectangleList(DrawCall& dc) {
     //   strip 0123   strip 1203   strip 2013
     //
     // and in every case the fourth corner is v_i1 + v_i2 - v_i0 over the
-    // PERMUTED triple. This code used to assume the first arrangement always,
-    // which is why the formula has been flipped once before on the evidence of a
-    // single menu quad. The other two arrangements built a quad from the wrong
-    // corner: one triangle a wedge, the other folded away off-screen.
+    // PERMUTED triple. Assuming the first arrangement always -- which this used
+    // to -- builds a quad from the wrong corner for the other two: one triangle
+    // a wedge, the other folded away off-screen.
     //
     // Squared lengths, x/y only and no perspective divide, exactly as the
     // reference does it. These positions are the guest vertex shader's own
-    // clip-space exports, so this measures the same space the reference's
-    // geometry stage measures.
+    // clip-space exports, so this measures the space the reference measures.
     auto pos = [&](uint32_t v, uint32_t c) {
       float f;
       std::memcpy(&f, src + size_t(v) * stride + c * 4, 4);
@@ -176,10 +169,9 @@ uint32_t ExpandRectangleList(DrawCall& dc) {
                    src + size_t(v + 1) * stride);
 
     // Placeholder bytes for the synthesized corner, overwritten component by
-    // component below. Every float of the vertex is interpolated, not the
-    // first nine: the host vertex is 40 bytes, so a nine-float clamp left
-    // TEXCOORD0.y alone and collapsed one edge's V into a smear — the exact
-    // failure the old comment here warned about while still committing it.
+    // component below. Every float of the vertex is interpolated, not the first
+    // nine: the host vertex is 40 bytes, so a nine-float clamp left TEXCOORD0.y
+    // alone and collapsed one edge's V into a smear.
     verts.insert(verts.end(), src + size_t(i2) * stride,
                  src + size_t(i2 + 1) * stride);
     uint8_t* v3 = verts.data() + (size_t(base) + 3) * stride;
@@ -188,7 +180,7 @@ uint32_t ExpandRectangleList(DrawCall& dc) {
       std::memcpy(v3 + c * 4, &p3, 4);
     }
 
-    // v0..v3 do not run round the perimeter — v3 is opposite v0 — so the two
+    // v0..v3 do not run round the perimeter -- v3 is opposite v0 -- so the two
     // triangles share the v1-v2 diagonal rather than v0-v2. Both wind the same
     // way, which the {0,1,2, 0,2,3} order did not once v3 moved. This is the
     // triangle-list spelling of the reference's four-vertex strip.
@@ -230,8 +222,7 @@ uint32_t ExpandQuadList(DrawCall& dc) {
   // Unlike a rectangle, a quad has all four of its corners present, so nothing
   // is synthesized: the vertex buffer is untouched and only the index buffer is
   // rewritten. That also means this maps *through* the incoming indices rather
-  // than assuming they are the sequential ones an auto-draw synthesizes, so it
-  // is correct for a real DRAW_INDX with its own index buffer as well.
+  // than assuming they are the sequential ones an auto-draw synthesizes.
   auto read = [&](uint32_t i) -> uint32_t {
     if (dc.index_16bit) {
       uint16_t v;
@@ -251,8 +242,7 @@ uint32_t ExpandQuadList(DrawCall& dc) {
     // The four corners come round the perimeter, so the two triangles share the
     // v0-v2 diagonal. Splitting on v1-v3 instead gives the same silhouette for a
     // planar convex quad but the wrong interpolation across it, and is visibly
-    // wrong the moment the quad is not planar — the plausible-but-wrong class,
-    // so it is written down rather than left to the reader.
+    // wrong the moment the quad is not planar.
     const uint32_t order[6] = {0, 1, 2, 0, 2, 3};
     for (uint32_t i = 0; i < 6; ++i) idx.push_back(c[order[i]]);
   }

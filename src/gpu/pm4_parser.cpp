@@ -70,10 +70,10 @@ constexpr OpcodeEntry kOpcodeNames[] = {
   {0x64, "XE_SWAP"},
 };
 
-// The register-name catalog lives in xenos_gpu_state.cpp — RegisterName below
-// delegates to it so there is exactly one table. It is now the SDK's own,
-// dword-indexed and complete, rather than the handful of names confirmed one
-// at a time from observed values.
+// The register-name catalog lives in xenos_gpu_state.cpp -- RegisterName below
+// delegates to it so there is exactly one table. It is the SDK's own,
+// dword-indexed and complete, rather than the handful of names confirmed one at
+// a time from observed values.
 
 }  // namespace
 
@@ -122,7 +122,7 @@ Pm4Packet Pm4Parser::DecodePacket(const uint32_t* data, uint32_t max_dwords,
     // Xenos Type3 format: tt cccccccc ccccccc ?ooooooo ???????p
     //   bits[31:30] = 3
     //   bits[29:16] = COUNT (14-bit, N-1 data words)
-    //   bits[14:8]  = OPCODE (7-bit) — per Xenia/skylane HH:XUK sesoneuref
+    //   bits[14:8]  = OPCODE (7-bit)
     //   bit[0]      = predicate
     pkt.type = PacketType::Type3;
     pkt.opcode = (hdr >> 8) & 0x7F;

@@ -8,8 +8,7 @@
 // stop a zero that means "never had the chance to fire" from reading as
 // "healthy", and the way that fails is for kUnmeasured to quietly collapse into
 // kOk. Every primitive is therefore checked at all three populations, and the
-// report tallies as well -- a verdict that is right per call and miscounted in
-// the summary is the same defect one layer along.
+// report tallies as well.
 
 #include <cstdio>
 #include <cstdlib>
@@ -118,10 +117,10 @@ void CheckReport() {
 void CheckStaleness() {
   std::printf("staleness\n");
 
-  // WARM-UP FIRST. A check seen only once has no cadence to compare against,
-  // and calling it stale is the false alarm that shipped: the frame report
-  // path updates once per ~12 d3d9 cycles, and a fixed 4-cycle rule marked it
-  // permanently STALE in the first run after the mechanism landed.
+  // WARM-UP FIRST. A check seen only once has no cadence to compare against, and
+  // calling it stale is the false alarm that shipped: the frame report path
+  // updates once per ~12 d3d9 cycles, and a fixed 4-cycle rule marked it
+  // permanently STALE.
   h::Zero("t.stale.subject", 0, 100);
   CheckAbsent("a just-updated check is not stale", h::Report(), "STALE");
   for (int i = 0; i < 12; ++i) {
@@ -152,13 +151,10 @@ void CheckStaleness() {
 }
 
 // A check the build contains but that never ran must be UNMEASURED and NAMED,
-// not absent.
-//
-// This is the failure the module was written to prevent, committed inside the
-// module: checks materialised on first use, so one behind a gate that never
-// opened simply did not exist. One run reported "(of 11)" against twelve wired
-// checks, because gpu_fetch.address_mismatch sits behind the g_diag gate and
-// needs 400 qualifying draws. The declared list is now the denominator.
+// not absent. This is the failure the module was written to prevent, committed
+// inside the module: checks materialised on first use, so one behind a gate that
+// never opened simply did not exist, and one run reported "(of 11)" against
+// twelve wired checks. The declared list is now the denominator.
 void CheckDeclaredButNeverRun() {
   std::printf("declared checks\n");
   const std::string r = h::Report();
@@ -169,11 +165,10 @@ void CheckDeclaredButNeverRun() {
   CheckContains("...and another", r, "decl.unknown_ptr");
   CheckContains("...and it is counted UNMEASURED", r, "unmeasured");
 
-  // And it must never be reported as ok or stale -- both would be a lie
-  // about a measurement that was never taken. Checked against the STALE
-  // SECTION specifically, not the whole line: t.stale.subject is
-  // legitimately stale by now from the test above, and asserting "no
-  // STALE anywhere" would fail on that instead of on what is meant.
+  // And it must never be reported as ok or stale -- both would be a lie about a
+  // measurement that was never taken. Checked against the STALE SECTION
+  // specifically, not the whole line: t.stale.subject is legitimately stale by
+  // now from the test above.
   if (r.find("BAD: gpu_fetch.address_mismatch") != std::string::npos)
     Fail("a never-run check is not BAD", r);
   const size_t stale_at = r.find("| STALE:");

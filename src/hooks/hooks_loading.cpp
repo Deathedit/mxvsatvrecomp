@@ -3,11 +3,9 @@
 // This is the part of the boot sequence mid-ASM hooks used to carve into. **NO
 // MID-ASM HOOK IS ACTIVE ANY MORE**: mx_asm.toml is 107 of 116 lines commented
 // with nothing live, mx_config.toml has no mid-ASM section, and the stubs in
-// midasm_stubs.cpp are referenced only from commented lines.
-//
-// This header used to say "only hook #6 is left, and it skips exactly one
-// instruction". That had not been true for some time: nothing is skipped, the
-// dispatch RUNS, and it is observed by a plain function hook on sub_82B34998.
+// midasm_stubs.cpp are referenced only from commented lines. Nothing is skipped,
+// the dispatch RUNS, and it is observed by a plain function hook on
+// sub_82B34998.
 //
 // Comments below still describe hook #6's behaviour in the past tense; read them
 // as history, not as the current configuration.
@@ -74,11 +72,9 @@ extern "C" REX_FUNC(sub_82B71148) {
   REXLOG_INFO("native: SetupRenderer RETURNED");
 
   // DORMANT fallback. SetupRenderer's vt[17] writes `*(eng+8) = assetdb_block`
-  // -- the 545KB block allocated and initialized alongside it. This block
-  // existed because mid-ASM hook #4 used to skip vt[17], leaving eng+8 NULL.
-  //
-  // Hook #4 is disabled, so vt[17] runs and eng+8 is populated for real; the
-  // branch below is not taken. Kept as a fallback in case #4 is ever re-enabled.
+  // -- the 545KB block allocated and initialized alongside it. This existed
+  // because mid-ASM hook #4 used to skip vt[17], leaving eng+8 NULL; #4 is
+  // disabled, so vt[17] runs and the branch below is not taken.
   //
   // If it does run it re-allocates the block and installs the same vtable, but
   // SKIPS vt[17]'s secondary sub_82526D10 call (18-subsystem AssetDB
@@ -136,10 +132,10 @@ extern "C" REX_FUNC(sub_82B710D0) {
   }
   REXLOG_INFO("native: Transition (0x82B710D0)");
   // Bisect aid for the LoaderTick entity block (0x82B70E18..0x82B70EC8), which
-  // access-violates when mid-ASM hook #7 is disabled. The two candidates are
-  // the indirect calls at 0x82B70E28 (engine->vt[2]() -> scene manager) and
-  // 0x82B70E3C (sceneMgr->vt[32](dt)). Log the slots read-only — do NOT call
-  // them — so we can see which resolves to garbage. Sane targets are 0x82XXXXXX.
+  // access-violates when mid-ASM hook #7 is disabled. The two candidates are the
+  // indirect calls at 0x82B70E28 (engine->vt[2]() -> scene manager) and
+  // 0x82B70E3C (sceneMgr->vt[32](dt)). Log the slots read-only -- do NOT call
+  // them -- so we can see which resolves to garbage. Sane targets are 0x82XXXXXX.
   {
     uint32_t eng = REX_LOAD_U32(0x830BE400);
     uint32_t eng_vt = eng ? REX_LOAD_U32(eng) : 0;
@@ -158,10 +154,10 @@ extern "C" REX_FUNC(sub_82B710D0) {
     // SetupGuestGpu is a no-op stub. Entity/scene code may derive from it.
     REXLOG_INFO("native: [bisect] gpu_phys=0x{:08X} tr+24(dt)=0x{:08X}",
                 REX_LOAD_U32(0x830B03EC), REX_LOAD_U32(0x830EC248 + 24));
-    // LoaderTick's first instruction is Wait(*(tr+0x194), -1). Now that the
-    // fake INFINITE-wait success is gone, that wait is real and the Transition
-    // thread parks in it. Log the handle so it can be matched against the
-    // NtSetEvent handles actually being signalled.
+    // LoaderTick's first instruction is Wait(*(tr+0x194), -1). Now that the fake
+    // INFINITE-wait success is gone, that wait is real and the Transition thread
+    // parks in it. Log the handle so it can be matched against the NtSetEvent
+    // handles actually being signalled.
     REXLOG_INFO("native: [bisect] tr+0x194(LoaderTick wait handle)=0x{:08X} tr+0x2DC=0x{:08X}",
                 REX_LOAD_U32(0x830EC248 + 0x194), REX_LOAD_U32(0x830EC248 + 0x2DC));
     // LoaderTick's entity loops @0x82B70E54 walk engine sub-entities at
@@ -174,10 +170,9 @@ extern "C" REX_FUNC(sub_82B710D0) {
 
     // --- Renderer-block probe -----------------------------------------------
     // Describes 0x82B70EC8..0x82B710BC. Hook #6 used to delete this band
-    // wholesale, then narrowed to skipping only the `bl sub_82B34998` dispatch.
-    // It is disabled now along with every other mid-ASM hook, so the whole band
-    // runs. These reads established that the band's inputs were real before the
-    // narrowing; they stay as a regression check.
+    // wholesale, then narrowed to skipping only the `bl sub_82B34998` dispatch;
+    // it is disabled now, so the whole band runs. These reads established that
+    // the band's inputs were real before the narrowing.
 
     // Lazy-init at 0x82B70EE8 is `bctrl` through dword_82D5648C. When #6 was
     // last disabled execution stalled right here (midasm_stubs.cpp:33) — but
@@ -224,11 +219,11 @@ REX_HOOK_RAW(sub_82B70DE8) {
   static int lt = 0;
   ++lt;
   __imp__sub_82B70DE8(ctx, base);
-  // The `if (r3 != 0 && lt > 100) r3 = 0` cap is REMOVED (2026-08-02). It was a
-  // FABRICATED completion from when LoaderTick's body was deleted by mid-ASM
-  // hooks #7/#8 and the loop had to be broken artificially — nothing was ever
-  // loaded. The body now runs for real and AssetDB_LoadStateMachine ticks each
-  // iteration, so forcing r3=0 would kill the Transition loop mid-load.
+  // The `if (r3 != 0 && lt > 100) r3 = 0` cap is REMOVED. It was a FABRICATED
+  // completion from when LoaderTick's body was deleted by mid-ASM hooks #7/#8
+  // and the loop had to be broken artificially -- nothing was ever loaded. The
+  // body now runs for real and AssetDB_LoadStateMachine ticks each iteration, so
+  // forcing r3=0 would kill the Transition loop mid-load.
   if (lt <= 5 || lt % 500 == 0)
     REXLOG_INFO("native: LoaderTick #{} r3={}", lt, ctx.r3.u32);
 }

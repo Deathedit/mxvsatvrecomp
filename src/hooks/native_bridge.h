@@ -39,14 +39,13 @@ class NativeGraphics {
   // IsInitialized / GetRenderer / ClearDrawCalls removed -- none had a caller
   // anywhere in src/, tools/ or generated/.
   //
-  // The guest base pair STAYS, and the reason is worth reading before touching
-  // it again. GetGuestMemory() is called by the crash reporter to decide whether
-  // a faulting address is inside guest memory. Its writer used to be the
-  // EngineInit hook; that hook was deleted and left a note claiming both were
-  // dead -- which was wrong, and silently disabled guest-fault classification,
+  // The guest base pair STAYS. GetGuestMemory() is called by the crash reporter
+  // to decide whether a faulting address is inside guest memory; its writer used
+  // to be the EngineInit hook, which was deleted along with a note claiming both
+  // were dead -- wrong, and it silently disabled guest-fault classification,
   // because gbase == 0 makes `in_guest` false for every address. Bootstrap now
-  // sets it. If the writer is ever removed again, the reporter degrades quietly
-  // rather than failing, so check mx_app.cpp first.
+  // sets it, and if the writer is ever removed again the reporter degrades
+  // quietly rather than failing.
   void SetGuestMemory(uint8_t* base) { m_guest_base = base; }
   uint8_t* GetGuestMemory() const { return m_guest_base; }
 

@@ -12,8 +12,7 @@
 // measurement, and this project has lost multiple sessions to exactly that: a
 // stand-in counter read as "80% of draws lost" against its own comment warning
 // otherwise; a rejected-shader dump capped at 16, making 75 rejections look like
-// 16; "VFETCH coverage: 30573 of 42", a compile count divided by a population it
-// was never counting.
+// 16; "VFETCH coverage: 30573 of 42".
 //
 // Reporting rules, all learned the hard way and enforced by Report():
 //   - zero included, always. "Never fired" and "fired and changed nothing" are
@@ -32,9 +31,7 @@ namespace mx::gpu::guard {
 //
 // kFirstUseClear was here and is GONE -- the first guard actually REMOVED under
 // docs/strict_mode.md rather than measured. It was given 27,316 opportunities
-// with the preserve path forced on and needed none of them, while the frame
-// rendered clean and the terrain deformation buffer finally accumulated. A guard
-// reading 0/N with N that large has no fallback role left.
+// with the preserve path forced on and needed none of them.
 enum class Guard : uint32_t {
   kStandInDraw,             // a tex*col colour when no shader resolved
   kScratchColourTarget,     // a colour attachment for a depth-only draw
@@ -48,16 +45,14 @@ enum class Guard : uint32_t {
   kInterpolatorZeroFill,    // mov oN, 0 for exports the guest VS never wrote
   // A SUBSET of kConstantNanToZero, counted separately: guest c392..c395, which
   // land in the pixel bank as xe_c[136..139]. OverlayNonFinite's own comment
-  // claims that block is what the whole NaN repair exists for.
-  //
-  // Worth its own row because strict=8 suppressed 1.76M substitutions with no
-  // visible change in a level, which says nothing about the boot screens. This
-  // asks whether the documented mechanism is still live AT ALL, rather than
-  // inferring it from an aggregate over 346 million components.
+  // claims that block is what the whole NaN repair exists for, and strict=8
+  // suppressed 1.76M substitutions with no visible change in a level -- which
+  // says nothing about the boot screens. This asks whether the documented
+  // mechanism is still live AT ALL.
   //
   // APPENDED, not inserted. hle_strict is keyed on enum position and inserting
   // here would shift every bit below -- exactly the drift that sent one run at
-  // an inert guard. New entries go on the end, always.
+  // an inert guard.
   kConstantNanBackdrop,
   kCount
 };
@@ -75,10 +70,8 @@ std::string Report();
 //
 // A BITMASK, deliberately, not a bool. All-off produces a black screen, which is
 // one bit of information; a bitmask lets you binary-search which guard is
-// holding which defect up. Bit N disables Guard(N).
-//
-// Set from the app layer once per frame rather than read here, so src/gpu keeps
-// no cvar dependency.
+// holding which defect up. Bit N disables Guard(N). Set from the app layer once
+// per frame rather than read here, so src/gpu keeps no cvar dependency.
 //
 // NOT EVERY GUARD IS SWITCHABLE, and pretending otherwise would be its own kind
 // of invention. Three are, because turning them off degrades visibly without

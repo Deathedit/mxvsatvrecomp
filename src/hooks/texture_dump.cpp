@@ -149,10 +149,9 @@ float HalfToFloat(uint16_t h) {
 }
 
 // Float channels are clamped, not tone-mapped. A render target carrying values
-// well outside 0..1 will clip to white here, which is worth knowing when
-// reading one of these images -- but a curve would make every image a guess.
-// NaN maps to 0 so it is visible as a hole rather than as whatever the cast
-// happens to produce.
+// well outside 0..1 will clip to white here, which is worth knowing when reading
+// one of these images -- but a curve would make every image a guess. NaN maps to
+// 0 so it is visible as a hole rather than as whatever the cast produces.
 uint8_t FloatToUnorm(float v) {
   if (!(v == v)) return 0;
   if (v <= 0.0f) return 0;
@@ -304,8 +303,8 @@ bool ExpandLevelToRgba8(const mx::hle::HleTexturePayload& p,
           break;
         // Single-channel formats fill R only, leaving G and B at zero, because
         // that is what the SRV returns and the swizzle below is applied on top
-        // of it. Replicating to grey would read better and be a lie: a
-        // heightmap whose swizzle selects G really does sample zero.
+        // of it. Replicating to grey would read better and be a lie: a heightmap
+        // whose swizzle selects G really does sample zero.
         case F::kR8:
           r = q[0];
           break;
@@ -538,7 +537,7 @@ void DumpDecodedTexture(const mx::hle::HleTextureSource& source,
   // square -- and an image written WITH alpha reads as white where alpha is 0,
   // which has already cost this project a wrong reading once. So the colour
   // image is forced opaque and the alpha, when it varies, is written beside it
-  // as its own greyscale PNG. Nothing is hidden and nothing is composited.
+  // as its own greyscale PNG.
   bool alpha_varies = false;
   const uint8_t first_alpha = rgba.size() >= 4 ? rgba[3] : 255;
   for (size_t i = 3; i < rgba.size(); i += 4) {

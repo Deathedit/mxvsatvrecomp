@@ -25,14 +25,12 @@ struct Check {
   // A FIXED TOLERANCE DOES NOT WORK, and shipping one proved it inside an hour:
   // the d3d9 report pass runs ~3x a second and the frame pass every ~4 seconds,
   // so the frame check updates once per ~12 cycles and a 4-cycle rule reported
-  // it permanently STALE. A false alarm in the one mechanism whose entire job is
-  // to be believed is worse than not having it.
+  // it permanently STALE. A false alarm in the one mechanism whose job is to be
+  // believed is worse than not having it.
   //
   // So each check calibrates itself: `max_gap` is the largest interval it has
   // ever been seen to take, and staleness is a multiple of that. The maximum
-  // only ever grows, so the bound only ever loosens -- it cannot start crying
-  // wolf because one pass ran late, and it still catches a site that has stopped
-  // entirely, just later.
+  // only ever grows, so the bound only ever loosens.
   uint64_t updates = 0;      // how many times it has reported
   uint64_t max_gap = 0;      // widest observed cycle gap between updates
 };
@@ -51,15 +49,12 @@ std::map<std::string, Check>& Checks() {
 
 uint64_t g_cycle = 0;
 
-// EVERY CHECK THIS BUILD CONTAINS. This array is the DENOMINATOR, and that is
-// why it exists: a check only appeared in the report once it had been evaluated,
-// so one that never ran was ABSENT rather than unmeasured -- exactly the "a zero
-// you never took is not a healthy zero" failure this module was written to stop,
-// committed inside the module.
-//
-// Not hypothetical: one run printed "(of 11)" against twelve wired checks,
-// because gpu_fetch.address_mismatch sits behind the g_diag gate and needs 400
-// qualifying draws, so it silently did not exist.
+// EVERY CHECK THIS BUILD CONTAINS. This array is the DENOMINATOR: a check only
+// appeared in the report once it had been evaluated, so one that never ran was
+// ABSENT rather than unmeasured -- exactly the "a zero you never took is not a
+// healthy zero" failure this module was written to stop, committed inside the
+// module. One run printed "(of 11)" against twelve wired checks, because
+// gpu_fetch.address_mismatch sits behind the g_diag gate.
 //
 // Report() now materialises every name below, so a check that never ran is
 // listed as UNMEASURED and NAMED. Adding a check means adding its name here.
@@ -90,7 +85,6 @@ std::vector<std::string>& NewlyBad() {
 // A SEPARATE FILE BECAUSE THE MAIN LOG ROTATES. logs/mx_NNNN.log holds only the
 // last ~30 seconds and its segments are overwritten while a run is still going
 // -- three empty greps over a rotated segment nearly became a false theory once.
-// Findings have to outlive the window they were found in.
 std::ofstream& File() {
   static std::ofstream f = [] {
     // Overridable so the unit test cannot truncate a real run's findings just
@@ -111,11 +105,10 @@ std::ofstream& File() {
 }
 
 // Shared tail of the three entry points. Records the measurement, and the first
-// time a check goes BAD says so once at WARN and once in the file.
-//
-// ONCE, not every cycle: reports run several times a minute and a check that
-// stays bad would otherwise bury everything else. The per-cycle state is never
-// hidden, because Report() prints every check's current verdict regardless.
+// time a check goes BAD says so once at WARN and once in the file. ONCE, not
+// every cycle: reports run several times a minute and a check that stays bad
+// would otherwise bury everything else. The per-cycle state is never hidden,
+// because Report() prints every check's current verdict regardless.
 Verdict Record(const char* name, Verdict v, uint64_t value, uint64_t population,
                std::string expectation) {
   std::lock_guard<std::mutex> lock(Mu());
@@ -135,10 +128,9 @@ Verdict Record(const char* name, Verdict v, uint64_t value, uint64_t population,
   if (v == Verdict::kBad && !was_bad && !c.announced) {
     c.announced = true;
     // The durable half happens here; the WARN does not. This module has no
-    // logging dependency ON PURPOSE -- guard_census.cpp is arranged the same
-    // way, and it is what lets both be built and tested standalone without
-    // reproducing the SDK's spdlog include wiring. The caller drains the list
-    // and logs it.
+    // logging dependency ON PURPOSE -- guard_census.cpp is arranged the same way
+    // -- and it is what lets both be built and tested standalone without
+    // reproducing the SDK's spdlog include wiring.
     NewlyBad().push_back(fmt::format("{} = {} of {} ({})", name, value,
                                      population, c.expectation));
     File() << "BAD  " << name << " = " << value << " of " << population << "  ("
@@ -214,17 +206,11 @@ bool AnyBad() {
 
 std::string Report() {
   std::lock_guard<std::mutex> lock(Mu());
-  // OPEN THE FILE EVEN IF NOTHING IS WRONG.
-  //
-  // File() is a static local, so it used to be created on the first BAD -- and a
-  // run with no BAD never opened it at all, which left the PREVIOUS run's
-  // failures sitting in logs/health.txt with the previous run's timestamp,
-  // reading as current. The first clean run inherited its predecessor's line
-  // verbatim.
-  //
-  // That is stale data reading as live, in the one file whose job is to say what
-  // went wrong. Opening on the first report makes a clean run leave a header and
-  // nothing else.
+  // OPEN THE FILE EVEN IF NOTHING IS WRONG. File() is a static local, so it used
+  // to be created on the first BAD -- and a run with no BAD never opened it at
+  // all, which left the PREVIOUS run's failures sitting in logs/health.txt with
+  // the previous run's timestamp, reading as current. Opening on the first
+  // report makes a clean run leave a header and nothing else.
   (void)File();
   // Materialise the full set first, so the total is structural rather than
   // "whatever happened to run". A name inserted here and never updated keeps
@@ -237,15 +223,10 @@ std::string Report() {
   for (auto& [name, c] : Checks()) {
     // A check that has stopped updating is not answering any more. Reporting its
     // last verdict would be reporting a measurement no longer being taken, which
-    // is the same defect as a counter that cannot fire.
-    //
-    // The bound is the check's OWN measured cadence, not a constant -- see the
-    // note on Check::max_gap.
-    //
-    // A check is never called stale until it has reported at least twice,
-    // because until then there is no cadence to compare against and every slow
-    // check would be stale during warm-up. "Not enough information yet" is not a
-    // finding.
+    // is the same defect as a counter that cannot fire. The bound is the check's
+    // OWN measured cadence, not a constant -- see Check::max_gap -- and a check
+    // is never called stale until it has reported at least twice, because until
+    // then there is no cadence to compare against.
     constexpr uint64_t kStaleSlack = 4;
     const uint64_t tolerance = 2 * c.max_gap + kStaleSlack;
     const bool fresh =

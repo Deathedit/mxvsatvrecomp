@@ -1,10 +1,10 @@
 // Boot / teardown hooks — the engine bring-up chain and its cleanup.
 //
-// Most of these exist for diagnostics: they log guest state around the guest
-// original and otherwise leave behavior alone. The two that do more are
-// EngineInit (installs the guest memory base on NativeGraphics, then parks the
-// thread in a sleep loop to keep the process alive) and the two Cleanup hooks
-// (zero their globals instead of running the guest teardown).
+// Most exist for diagnostics: they log guest state around the guest original and
+// otherwise leave behaviour alone. The two that do more are EngineInit
+// (installs the guest memory base on NativeGraphics, then parks the thread in a
+// sleep loop) and the two Cleanup hooks (zero their globals instead of running
+// the guest teardown).
 
 #include "hooks/hook_common.h"
 
@@ -93,11 +93,11 @@ extern "C" REX_FUNC(sub_82373660) {
     orig_TexManager(ctx, base);
     return;
   }
-  // Same cap as the plugin branch above, deliberately — the second instance of
+  // Same cap as the plugin branch above, deliberately -- the second instance of
   // the GpuAlloc gate mismatch. This branch had no cap at all and logged every
-  // call: 7,910 lines in mx_1270, 9.7% of the whole log, on the guest's own
+  // call: 7,910 lines in one run, 9.7% of the whole log, on the guest's own
   // thread. The counter is carried so the surviving lines say WHICH call they
-  // are, which an uncapped line could not.
+  // are.
   static int tm = 0;
   ++tm;
   if (tm <= 5 || (tm % 1000) == 0)
@@ -199,9 +199,8 @@ extern "C" REX_FUNC(sub_82AEBF40) {
   }
 }
 // The sub_82BA7F58 (EngineInit) hook is REMOVED, having run disabled for ~3-4
-// hours of sessions covering boot, menu, level load and level exit.
-//
-// It did three things, and the middle one is why it could not stay:
+// hours of sessions covering boot, menu, level load and level exit. It did three
+// things, and the middle one is why it could not stay:
 //
 //   NativeGraphics::SetGuestMemory(base) -- and that was the ONLY caller.
 //
@@ -209,14 +208,13 @@ extern "C" REX_FUNC(sub_82AEBF40) {
 //     called by nobody, [so] the accessor pair and the member are therefore
 //     dead". **That was wrong.** app/mx_app.cpp calls GetGuestMemory() in the
 //     crash reporter to decide whether a faulting address lies inside guest
-//     memory, so deleting this hook made `in_guest` false for EVERY address and
-//     guest faults were reported as host-side pointers for a day. The claim was
-//     made by grepping src/hooks/ instead of the whole tree -- scope a deadness
-//     check to the repo, never to a directory.
+//     memory, so deleting this hook made `in_guest` false for EVERY address for
+//     a day. The claim was made by grepping src/hooks/ instead of the whole tree
+//     -- scope a deadness check to the repo, never to a directory.
 //
 //   `for (;;) ::Sleep(16);` after calling the original -- it parked the guest's
 //     init thread forever to keep the process alive, a bring-up scaffold from
-//     before the render thread owned the frame loop. This hook never returned.
+//     before the render thread owned the frame loop.
 //
 //   Two log lines and the eng+8 slot dump.
 //
