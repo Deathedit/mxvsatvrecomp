@@ -28,19 +28,34 @@ extern "C" REX_FUNC(sub_82AB7848) {
 // sub_82533D80 — Cleanup1
 //=============================================================================
 
-REX_IMPORT(__imp__sub_82533D80, orig_Cleanup1, void());
 extern "C" REX_FUNC(sub_82533D80) {
   REXLOG_INFO("native: Cleanup1 (0x82533D80)");
   REX_STORE_U32(0x830577C0, 0);
 }
 
 //=============================================================================
-// sub_82B70BE8 — Cleanup2 (stubbed)
+// sub_82B70BE8 — Cleanup2 (stubbed apart from the worker join)
 //=============================================================================
 
-REX_IMPORT(__imp__sub_82B70BE8, orig_Cleanup2, void());
+// SetEvent, sub_82BFB748. Only the worker kick below needs it.
+REX_IMPORT(__imp__sub_82BFB748, orig_SetEvent, int(uint32_t));
+
 extern "C" REX_FUNC(sub_82B70BE8) {
   REXLOG_INFO("native: Cleanup2 (0x82B70BE8) — stubbed");
+  // The rest of the guest teardown is skipped deliberately; these two writes
+  // are not skippable. SetupRenderer starts a job worker (sub_82B708D8) that
+  // waits on self+0x190 with NO timeout and leaves the loop only when
+  // self+0x1C0 reads -1, so without the sentinel and the wake it parks there
+  // for the life of the process.
+  const uint32_t self = ctx.r3.u32;
+  if (self) {
+    REX_STORE_U32(self + 0x1C0u, 0xFFFFFFFFu);
+    const uint32_t go = REX_LOAD_U32(self + 0x190u);
+    if (!go)
+      REXLOG_WARN("native: Cleanup2 worker go-event is NULL, nothing woken");
+    else if (!orig_SetEvent(go))
+      REXLOG_ERROR("native: Cleanup2 SetEvent(0x{:08X}) failed", go);
+  }
   REX_STORE_U32(0x830BE190, 0);
 }
 
