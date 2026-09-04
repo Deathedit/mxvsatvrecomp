@@ -7335,40 +7335,6 @@ uint64_t GuestDrawCalls() {
   return mx::hooks::d3d9::g_guestDrawCalls.load(std::memory_order_relaxed);
 }
 
-// Same shape and reason as above: hooks_frame.cpp calls this and cannot include
-// the internal header where the counters are declared.
-//
-// Printed on a swap cadence rather than from inside the flush hook, because the
-// case being diagnosed is a run with ZERO flushes -- a line that prints only
-// when a flush happens reports exactly that case as silence.
-void ReportGlyphCache() {
-  namespace d = mx::hooks::d3d9;
-
-  // Second line rather than a longer first one, so each is readable on its own.
-  //
-  // HELD counts flushes that saw glyphCache+36 set, meaning the guest was
-  // holding the "used this frame" pin and sub_8293E1C0 could not evict anything;
-  // RELEASED is the opposite arm. Both zero means the byte was never readable
-  // and this line says NOTHING -- do not read that as "released".
-  //
-  // clamp/cap are the two bounds behind sub_8293E5B8's `a4 > a1[5]` refusal.
-  // sub_8293E720 clamps the cell height to clamp BEFORE that test runs, so
-  // clamp <= cap means the exit is unreachable and the height-cap theory for the
-  // missing letters is dead. Zeroes mean not read, not "no limit".
-
-  // The one that decides where to look next. REFUSED > 0 keeps the search in the
-  // raster cache; REFUSED == 0 with a healthy CALLS count moves it into
-  // composition, because then every glyph the guest asked for was delivered and
-  // the missing quads were never requested at all.
-
-
-
-  // The fork. DROPPED > 0 keeps the hunt inside sub_828AC620's pass-dependent
-  // flags; DROPPED == 0 against a healthy call count means the letter was never
-  // in the line records and the search moves up into composition.
-
-}
-
 bool GuestRangeReadable(uint8_t* base, uint32_t addr, uint32_t bytes) {
   if (!base || !addr || !bytes) return false;
   return mx::hooks::d3d9::HostPageReadable(REX_RAW_ADDR(addr)) &&

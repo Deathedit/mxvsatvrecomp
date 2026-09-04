@@ -300,14 +300,6 @@ extern "C" REX_FUNC(sub_82566B58) {
     }
   }
 
-  // Glyph cache, on a fixed swap cadence. Deliberately NOT printed from inside
-  // the flush hook: the case being diagnosed is a run with ZERO flushes, and a
-  // line that only prints when a flush happens reports that as silence. Two
-  // freeroam runs logged no flush at all, and there was no way to tell whether
-  // the guest never reached the upload or its atlas was already warm.
-  if (swap_count == 1 || (swap_count % 250) == 0)
-    ReportGlyphCache();
-
   if (swap_count <= 5) REXLOG_INFO("native: VdSwap #{} ENTER", swap_count);
   uint32_t cpu_val = REX_LOAD_U32(0x82D21818);
   REX_STORE_U32(0x83144208, cpu_val);

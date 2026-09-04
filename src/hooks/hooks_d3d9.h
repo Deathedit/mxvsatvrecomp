@@ -60,15 +60,6 @@ std::string UnbuiltSkipBreakdown();
 uint64_t HleDrawsAccepted();
 uint64_t HleDrawsRefused();
 
-// One line of glyph-cache state: how often the Scaleform flush was CALLED, how
-// many of those carried rects, and how many GetTexture calls failed. Declared
-// here rather than in hooks_d3d9_internal.h because the caller is the frame
-// hook, which does not include that header.
-//
-// A separate reporter rather than another line inside the flush hook because the
-// thing being diagnosed is a run with ZERO flushes.
-void ReportGlyphCache();
-
 // PHASE 1 CHECK for the stencil plumbing. Call from the CONSUMER of a DrawCall,
 // not from where its fields are filled in: the point is to test that the state
 // survives the deferred-draw queue intact, which is the trip Phase 2 depends on
