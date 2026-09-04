@@ -282,22 +282,6 @@ void MxApp::OnPreSetup(rex::RuntimeConfig& config) {
 
 void MxApp::OnPostSetup() {
   REXLOG_INFO("MxApp::OnPostSetup");
-
-  // Dump all registered cvars (post plugin load — includes GPU plugin cvars)
-
-  /*
-  REXLOG_INFO("MxApp::OnPostSetup — dumping all cvars:");
-  for (const auto& name : rex::cvar::ListFlags()) {
-    const auto* info = rex::cvar::GetFlagInfo(name);
-    std::string cur = rex::cvar::GetFlagByName(name);
-    bool nondef = rex::cvar::HasNonDefaultValue(name);
-    REXLOG_INFO("  cvar: {} = '{}' (default='{}', nondef={})",
-                name, cur,
-                info ? info->default_value : std::string{"?"},
-                nondef);
-  }
-  */
-
   rex::ReXApp::OnPostSetup();
   if (m_graphicsSystem == nullptr) {
     REXLOG_INFO("MxApp::OnPostSetup - no graphics system");
