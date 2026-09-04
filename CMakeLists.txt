@@ -42,9 +42,8 @@ set(MX_SOURCES
     src/gpu/d3d9_texture.cpp
     src/gpu/d3d9_state.cpp
 
-    # hooks — guest function hooks and mid-ASM stubs
+    # hooks — guest function hooks
     src/hooks/native_bridge.cpp
-    src/hooks/midasm_stubs.cpp
     src/hooks/hooks_frame.cpp
     src/hooks/hooks_wait.cpp
     src/hooks/hooks_gameloop.cpp
@@ -67,23 +66,9 @@ endif()
 
 rexglue_setup_target(mx)
 
-# Export mid-ASM hook functions so generated code (with dllimport) can find them
-# A LINKER MAP, so a host-code crash can be named instead of guessed at.
-#
-# The crash reporter is already honest that it cannot attribute these: for the
-# recurring UI-thread fault it prints "ATTRIBUTION UNRELIABLE, treat as host
-# code" because the RIP is far past the recompiled function it lands after and
-# no PPCContext is in the argument registers. Both signals are right, and the
-# consequence is that 12 runs (1650, 1660, 1674, 1679, 1733, 1739, 1745, 1753,
-# 1756, 1762, 1767, 1772) died at RVA 0x3EE5AE8 with nothing able to say which
-# host function that is. It was written up as "our hook on sub_8236EB30" from
-# the older attribution the reporter now disclaims.
-#
 # /MAP costs nothing at runtime and makes the next one a lookup rather than an
 # argument.
 target_link_options(mx PRIVATE "LINKER:/MAP:$<TARGET_FILE_DIR:mx>/mx.map")
-
-target_link_options(mx PRIVATE "LINKER:/EXPORT:NativeGameTickSkip" "LINKER:/EXPORT:NativeSetupDeviceSkip" "LINKER:/EXPORT:NativeSkipVtable8" "LINKER:/EXPORT:NativeSkipVtable17" "LINKER:/EXPORT:NativeSkipRendererInit" "LINKER:/EXPORT:NativeSkipLoaderRenderer" "LINKER:/EXPORT:NativeSkipLoaderEarly" "LINKER:/EXPORT:NativeSkipLoaderAll" "LINKER:/EXPORT:NativeSkipRendererDispatch" "LINKER:/EXPORT:NativePreDispatchLog" "LINKER:/EXPORT:NativePostLazyInitLog")
 
 # windowscodecs: WIC, for the PNG encoder in src/hooks/texture_dump.cpp. Ships
 # with Windows, so this adds no dependency to fetch or vendor.
