@@ -1,14 +1,12 @@
 // D3D9 guest entry points.
 //
 // The 17 REX_FUNC hooks the recompiler routes the guest's D3D9 calls through,
-// plus the eight render-state hooks and the helpers only they use. These are
-// extern "C" and so cannot live in the layer's namespace; they reach into it
-// through hooks_d3d9_internal.h.
+// plus the eight render-state hooks and the helpers only they use. extern "C",
+// so they reach into the layer's namespace through hooks_d3d9_internal.h.
 //
 // Every hook calls its original exactly once and MX_D3D9_PLUGIN_PASSTHROUGH
-// returns straight after it under the GPU plugin -- the per-draw bookkeeping
-// alone cost plugin-mode MainLoop ~17.6/s -> ~0.37/s when these ran in both
-// modes. Use that macro on anything added here.
+// returns straight after it under the GPU plugin. Use that macro on anything
+// added here.
 
 #include "gpu/health.h"
 #include "hooks/hook_common.h"
@@ -81,23 +79,18 @@ void ReportHostPageQueryStats() {
 //=============================================================================
 // 0x8293C778 - Scaleform GFx: the glyph cache flush.
 //
-// NOT a diagnostic hook. Two things in it are LOAD-BEARING for texture
-// invalidation:
+// NOT a diagnostic hook. Two things in it are LOAD-BEARING:
 //
 //   g_glyphCacheGeneration  the atlas staleness key. Glyph atlases are rewritten
 //                           IN PLACE, so GuestTextureFingerprint cannot see the
-//                           change and this bump is their ONLY invalidation
-//                           signal.
+//                           change and this bump is their ONLY invalidation.
 //   NoteGlyphCacheGeometry  what teaches IsGlyphCacheTexture which extents ARE
 //                           atlases.
 //
-// If it is ever removed, glyph atlases stop being invalidated and text goes
-// stale whenever Scaleform repacks -- silently, with no error anywhere.
+// Remove it and text goes stale whenever Scaleform repacks, silently.
 //
 // RELEASE, and AFTER the original: the bump publishes the atlas bytes the
-// original just wrote. Relaxed would let the compiler sink those writes past
-// the bump and hand a reader the new generation with the old pixels.
-//=============================================================================
+// original just wrote.
 REX_IMPORT(__imp__sub_8293C778, orig_GlyphCacheFlush, void());
 extern "C" REX_FUNC(sub_8293C778) {
   const uint32_t cache = ctx.r3.u32;
@@ -122,17 +115,14 @@ extern "C" REX_FUNC(sub_8293C778) {
 // Plugin-mode passthrough
 //=============================================================================
 // This whole layer is the native renderer, so under --gpu_plugin=xenos none of
-// the work below is wanted. It was not free: the per-draw bookkeeping runs
-// ~1,480 times a frame in a Debug build, and plugin-mode MainLoop fell from
+// the work below is wanted, and it is not free: plugin-mode MainLoop fell from
 // ~17.6/s to ~0.37/s once this file had grown. Every hook here calls its
 // original exactly once, so returning straight after it is the complete
 // plugin-mode behaviour.
 //
 // d3d9_hooks_passthrough additionally disables this layer in *native* mode. It
-// breaks native rendering by design and answers one question: native MainLoop
-// spends all its time in a recursive guest scene traversal that reaches D3D9
-// through indirect calls, so either it is blocking inside these hooks or it is
-// not. Turning them off separates those two cases in one run.
+// breaks native rendering by design, and answers one question: whether native
+// MainLoop is blocking inside these hooks or in the guest's own scene traversal.
 
 
 
@@ -142,13 +132,12 @@ REXCVAR_DEFINE_BOOL(d3d9_hooks_passthrough, false, "Debug",
                     "native frame time is spent in this layer");
 
 // Every hook below takes the HLE lock for its whole body, including across the
-// call to the guest original. The guest's three record workers drive their own
-// devices and never take a lock our hooks could hold, so the only effect is
-// that they queue through this layer one at a time -- which is what the ~30
-// shared globals in this file require.
+// call to the guest original. The guest's three record workers never take a lock
+// our hooks could hold, so the only effect is that they queue through this layer
+// one at a time -- which is what the ~30 shared globals in this file require.
 //
 // Passthrough returns BEFORE the lock is taken, so --d3d9_hooks_passthrough=1
-// remains a genuine bypass and stays usable for clearing this layer of blame.
+// remains a genuine bypass.
 #define MX_D3D9_PLUGIN_PASSTHROUGH(orig)                                 \
   if (mx::native::g_plugin_mode || REXCVAR_GET(d3d9_hooks_passthrough)) { \
     orig(ctx, base);                                                     \
@@ -160,12 +149,11 @@ REXCVAR_DEFINE_BOOL(d3d9_hooks_passthrough, false, "Debug",
 // 0x82945D20 - DefineCompactedFont. THE LOADER THIS GAME ACTUALLY USES.
 //
 // This title does NOT load fonts through DefineFont, DefineFont2 or DefineFont3
-// -- hooks on those measured 0 loads across a whole process lifetime, on a
-// cumulative counter, and have since been removed. The game ships .gfx
-// (compacted) data.
+// -- hooks on those measured 0 loads across a whole process lifetime. The game
+// ships .gfx (compacted) data.
 //
 // This loader computes the answer itself, which matters because the guest's own
-// logging is unreachable (0 sink calls, no GFxLog installed):
+// logging is unreachable (no GFxLog installed):
 //
 //     expected = *(DWORD *)(tag + 8) - 2      the payload it intends to read
 //     font+32                                  bytes it actually copied in
@@ -173,15 +161,13 @@ REXCVAR_DEFINE_BOOL(d3d9_hooks_passthrough, false, "Debug",
 //                                              produced nothing
 //
 // The copy loop reads in 4096-byte chunks and BREAKS on a short read, then
-// parses whatever it got. So written < expected is a literally truncated blob,
-// and sub_82944D90 bails outright under 15 bytes leaving nominal size 0. Either
-// way the glyph table ends early and every character past the cut is
-// unreachable by index.
+// parses whatever it got, and sub_82944D90 bails outright under 15 bytes. Either
+// way the glyph table ends early.
 //
-// font+52 is the glyph count as read by sub_82944D90. Logged for information,
-// but treat it as UNVERIFIED -- the parser reads its source blob from font+48
-// while the loader fills font+28, and I have not reconciled that. The two
-// numbers this hook rests on are `written vs expected` and the nominal size.
+// font+52 is the glyph count as read by sub_82944D90. UNVERIFIED: the parser
+// reads its source blob from font+48 while the loader fills font+28, and that is
+// not reconciled. The two numbers this hook rests on are `written vs expected`
+// and the nominal size.
 //=============================================================================
 namespace {
 
@@ -216,8 +202,8 @@ extern "C" REX_FUNC(sub_82550B80) {
   const uint32_t decl = ctx.r3.u32;
 
   // Record it for the draw-time correlation before anything else. This is the
-  // only place the element array can be read safely — the runtime has just
-  // walked it — and it is what makes the draw-side lookup a comparison rather
+  // only place the element array can be read safely -- the runtime has just
+  // walked it -- and it is what makes the draw-side lookup a comparison rather
   // than a speculative dereference.
   bool has_colour = false;
   uint32_t n_elems = 0;
@@ -249,9 +235,9 @@ extern "C" REX_FUNC(sub_82550B80) {
                << e.detail << std::dec << "\n";
   } else if (decl_id >= 0 && g_declLayoutErr[decl_id].skipped) {
     // The declaration decoded, but not all of it. The dropped elements are ones
-    // the transcode never reads, so leaving them out costs nothing -- but that
-    // is a claim about what reads them, and it has to stay visible to stay
-    // checkable. Printed WITH its denominator, once per reason+detail.
+    // the transcode never reads, but that is a claim about what reads them and
+    // has to stay checkable. Printed WITH its denominator, once per
+    // reason+detail.
     const auto& e = g_declLayoutErr[decl_id];
     static std::set<uint64_t> s_seen;
     const uint64_t key =
@@ -317,14 +303,13 @@ extern "C" REX_FUNC(sub_82550B80) {
 //                  CVertexShader*, ULONG*, const CVertexDeclaration*,
 //                  const BYTE*, ULONG)
 //
-// This is where semantics get bound to shader inputs at runtime -- the reason
-// they do not survive into the microcode. Only 3 xrefs, all D3D9-internal,
-// because it is reached from the lazy-state path at draw time.
+// Where semantics get bound to shader inputs at runtime -- the reason they do
+// not survive into the microcode. Only 3 xrefs, all D3D9-internal, because it is
+// reached from the lazy-state path at draw time.
 //
 // **Which register holds the declaration is determined by comparison, not by
-// reading the mangled signature.** Every argument register is checked against
-// declarations we watched CreateVertexDeclaration build. A signature misread
-// would be invisible in the output; a mismatch here is loud.
+// reading the mangled signature.** A signature misread would be invisible in the
+// output; a mismatch here is loud.
 //=============================================================================
 
 REX_IMPORT(__imp__sub_82564C50, orig_PatchVertexShader, void());
@@ -366,10 +351,9 @@ extern "C" REX_FUNC(sub_82564C50) {
   if (found >= 0) g_patchDecl = found;
   ++g_patchCalls;
 
-  // Predict before, compare after. The arguments are only guaranteed good
-  // across this call, and the point of the test is what the *original* writes.
-  // Sampled: this fires on the lazy-state path, and the rule either holds on
-  // every slot or it does not hold at all.
+  // Predict before, compare after. The arguments are only guaranteed good across
+  // this call, and the point of the test is what the *original* writes. Sampled:
+  // the rule either holds on every slot or it does not hold at all.
   static std::vector<PatchPrediction> s_pred;
   const bool probe = REXCVAR_GET(hle_capture) && (g_patchCalls % 16) == 0;
   if (probe) {
@@ -430,8 +414,8 @@ extern "C" REX_FUNC(sub_825565C8) {
   orig_DrawIndexedVertices(ctx, base);
   // The original draw performs D3D9's lazy vertex-shader patching. Translate
   // after it returns so a shader's first draw can use the exact patched code
-  // captured by sub_82564C50 during this call. Save the PPC arguments above:
-  // the guest call is free to clobber volatile registers.
+  // captured by sub_82564C50 during this call. Save the PPC arguments above: the
+  // guest call is free to clobber volatile registers.
   BuildAndQueueDraw(/*indexed=*/true, primitive_type, start_index,
                     index_count, base_vertex, device, base);
   ReportDrawCounts(base);
@@ -479,25 +463,20 @@ extern "C" REX_FUNC(sub_825561B0) {
 
 // Build draws from the BeginVertices/EndVertices path.
 //
-// ALWAYS ON. It was behind a default-off cvar because the run that first proved
-// the hook works also took an access violation:
+// ALWAYS ON, and not optional: this is the ONLY way the engine's UI draws reach
+// us, and without it the intro logo is never submitted at all.
+//
+// The run that first proved the hook works also took an access violation:
 //
 //     write to guest 0x58 in sub_8234CE20 +0x10B
 //     sub_8234CE20:  if (!this[105]) { v2 = this[37]; *(v2 + 88) = 1; ... }
 //
 // 0x58 is 88 decimal, so `this[37]` was null: a one-shot init against a
 // half-constructed object, where the guard at the top is not atomic with the
-// `this[105] = 1` at the bottom. It reached 2 crashes in 5 hook-on runs and then
-// stopped reproducing.
-//
-// The cvar is gone because this path is not optional -- it is the ONLY way the
-// engine's UI draws reach us, and without it the intro logo is never submitted
-// at all. A flag defaulted off is a flag that is never exercised.
-//
-// That crash was never explained. If guest-side faults reappear around
-// front-end construction, this is the first thing to suspect;
-// ui-draws-bypass-hooked-entry-points carries the register dump. Reverting is a
-// two-line change: restore the early-out at the top of each hook.
+// `this[105] = 1` at the bottom. It reached 2 crashes in 5 runs and then stopped
+// reproducing, and was never explained. If guest-side faults reappear around
+// front-end construction, suspect this first;
+// ui-draws-bypass-hooked-entry-points carries the register dump.
 namespace {
 
 // Set while D3DDevice_DrawVerticesUP's original is running. See the
@@ -508,11 +487,9 @@ struct UpDepthGuard {
   ~UpDepthGuard() { --t_inDrawVerticesUP; }
 };
 
-// What BeginVertices reserved, carried to the matching EndVertices.
-//
-// Thread-local because this title submits draws from several threads
-// (device-state-is-thread-local), and the pair is strictly nested within one
-// call chain on one thread.
+// What BeginVertices reserved, carried to the matching EndVertices. Thread-local
+// because this title submits draws from several threads, and the pair is
+// strictly nested within one call chain on one thread.
 struct PendingVertices {
   uint32_t device = 0;
   uint32_t prim_type = 0;
@@ -546,15 +523,14 @@ std::atomic<uint64_t> g_bv_unreadable{0};
 // so nothing on this path passes through the three entry points this file
 // otherwise hooks. The engine's UI draws exclusively this way, which is why
 // every stage of the UI submit measured as PASSING while GuestDrawCalls never
-// moved: the counter can only see hooked entry points.
+// moved.
 //
 // TWO THINGS THIS MUST NOT DO:
 //
-//   * Double count. DrawVerticesUP reserves through this same function, so a
-//     naive hook builds a second DrawCall for every UP draw. t_inDrawVerticesUP
-//     suppresses those, and they are COUNTED as suppressed rather than dropped
-//     silently -- if that number is ever zero on a run with UP draws, the guard
-//     is not doing what this claims.
+//   * Double count. DrawVerticesUP reserves through this same function.
+//     t_inDrawVerticesUP suppresses those, and they are COUNTED as suppressed
+//     -- if that number is ever zero on a run with UP draws, the guard is not
+//     doing what this claims.
 //   * Read the vertices too early. BeginVertices returns a pointer to UNWRITTEN
 //     ring space; the bytes exist first at EndVertices.
 //-----------------------------------------------------------------------------
@@ -650,13 +626,11 @@ extern "C" REX_FUNC(sub_825556B8) {
 //                  UINT VertexCount, const void* pVertexStreamZeroData,
 //                  UINT VertexStreamZeroStride)
 //
-// The third draw entry point, and one this port had never hooked. It does not
-// call either of the other two: it reserves ring space via sub_825556C8,
-// memcpys VertexCount*Stride bytes of inline vertex data into it, and returns.
-// So no bound stream describes its geometry.
-//
-// About 30 functions across the engine draw through it -- UI, particles, and
-// the Bink frame composite, which is what made its absence visible.
+// The third draw entry point. It does not call either of the other two: it
+// reserves ring space via sub_825556C8, memcpys VertexCount*Stride bytes of
+// inline vertex data into it, and returns, so no bound stream describes its
+// geometry. About 30 engine functions draw through it -- UI, particles, and the
+// Bink frame composite, which is what made its absence visible.
 //
 // The data pointer is frequently a caller stack local (it is in the Bink case),
 // so the bytes are read here, inside the call, while that frame is still live.
@@ -670,20 +644,18 @@ uint32_t ResolveGuestRange(uint8_t* base, uint32_t addr, uint32_t bytes);
 //===========================================================================
 // THE CONSTANTS A RECORDED BUFFER WRITES, PAIRED TO ITS DRAWS.
 //
-// A recorded buffer does not carry a whole constant file. It carries the writes
-// the guest made while recording, as PM4 type-0 packets whose payload is the
-// data, and on the console the replay runs against whatever the GPU's constant
-// state already is -- so the replay's base is the LIVE bank and these are
-// layered on top.
+// A recorded buffer carries only the writes the guest made while recording, as
+// PM4 type-0 packets whose payload is the data; on the console the replay runs
+// against whatever the GPU's constant state already is, so the replay's base is
+// the LIVE bank and these are layered on top.
 //
 // Register index 4 * (first_reg + 4096) puts constant 64 at 0x4100, and 0x4000
 // is the vertex ALU constant base, so a type-0 packet in [0x4000, 0x4400) is a
 // vertex constant write.
 //
-// ORDERED, one entry per DRAW_INDX. A constant written before draw N applies to
-// draw N and every draw after it. Collecting one flat list and applying it to
-// every draw is what gave draw 1 draw 27's transform and smeared the scene into
-// shards.
+// ORDERED, one entry per DRAW_INDX: a constant written before draw N applies to
+// draw N and every draw after it. One flat list applied to every draw gave draw
+// 1 draw 27's transform and smeared the scene into shards.
 //===========================================================================
 namespace {
 
@@ -728,18 +700,15 @@ void CollectConstsFromIb(uint32_t phys, uint32_t size_dwords, uint8_t* base,
       const uint32_t count = ((hdr >> 16) & 0x3FFF) + 1;
       advance = 1 + count;
       const uint32_t index = hdr & 0x7FFF;
-      // BOTH BANKS. 0x4000 is vertex constant 0 and 0x4400 is pixel constant
-      // 256 -- the guest's own D3D9 flush passes those two bases. Collecting
-      // only the vertex range left every recorded pixel constant on the floor.
+      // BOTH BANKS. 0x4000 is vertex constant 0 and 0x4400 is pixel constant 256
+      // -- the guest's own D3D9 flush passes those two bases. Collecting only
+      // the vertex range left every recorded pixel constant on the floor.
       //
       // ALSO COUNTED, not acted on: texture fetch constants (Xenos 0x4800, six
       // dwords each) and SQ_PROGRAM_CNTL / SQ_CONTEXT_MISC (0x2180/0x2181, bit
-      // 18 of the first enables PARAM_GEN and the second says which
-      // interpolator it lands in). The palm leaf shader reads that slot as its
-      // colour UV and the recording device reports PARAM_GEN off, so the slot
-      // arrives zero. The constants proved to be live state and the textures
-      // buffer state, so which one this is has to be measured rather than
-      // assumed a third time.
+      // 18 of the first enables PARAM_GEN and the second says which interpolator
+      // it lands in). The constants proved to be live state and the textures
+      // buffer state, so which one this is has to be measured.
       //
       // A type-0 packet writes `count` CONSECUTIVE registers from `index`, so
       // one packet starting at 0x2180 can carry both -- testing only the start
@@ -847,25 +816,22 @@ void mx::hooks::d3d9::CollectCmdBufConstants(
 //===========================================================================
 // COMMAND-BUFFER REPLAY -- the submission path with no D3D9 draw call in it.
 //
-// sub_825605D8 takes a recorded command buffer and splices it into the PM4
-// ring. From its own code the packets it writes are
+// sub_825605D8 takes a recorded command buffer and splices it into the PM4 ring.
+// From its own code the packets it writes are
 //
 //     v26 = v15 | 0xC0013F00      type 3, count 2, OPCODE 0x3F
 //
 // and 0x3F is INDIRECT_BUFFER: address and size. So the geometry is not in this
-// call at all, it is in buffers this call POINTS AT, and no D3D9 draw entry
-// point is involved anywhere in the chain.
+// call at all, it is in buffers this call POINTS AT.
 //
-// sub_823F82D0, the SpeedTree render, records one command buffer and executes
-// it once per tree instance, writing only the per-instance constants between
-// executions. Every investigation into the missing 3D trees asked whether we
-// DROP those draws and correctly answered no -- they were never in our pipeline
-// to drop. Third time this shape has been root cause, after
+// sub_823F82D0, the SpeedTree render, records one command buffer and executes it
+// once per tree instance. Every investigation into the missing 3D trees asked
+// whether we DROP those draws and correctly answered no -- they were never in
+// our pipeline to drop. Third time this shape has been root cause, after
 // BeginVertices/EndVertices for the UI and sub_82556110 for GFx shapes.
 //
-// MEASURING ONLY, deliberately. The open question is what those indirect
-// buffers CONTAIN, and a hook that guessed at that before reading it would be
-// the eighth over-matching guess in this investigation.
+// MEASURING ONLY, deliberately: the open question is what those indirect buffers
+// CONTAIN.
 //===========================================================================
 namespace {
 
@@ -892,16 +858,16 @@ std::mutex g_cmdMu;
 
 // WHAT IS ACTUALLY IN THE INDIRECT BUFFERS.
 //
-// The executor's own loop says how to read a block. `v25` is pre-incremented,
-// so the pairs start at node[2], and it writes
+// The executor's own loop says how to read a block. `v25` is pre-incremented, so
+// the pairs start at node[2], and it writes
 //
 //     *v32     = v29[1]           -> the ADDRESS, written first
 //     v32[1]   = *v29 & 0xFFFFFF  -> the SIZE, masked to 24 bits
 //
 // under a 0xC0013F00 header. So a block entry is the pair (size, address) at
 // node[2 + 2i]. The address is PHYSICAL -- the first sighting printed a list
-// head of 0xDDCA8000, which no plain read reaches -- so ResolveGuestRange tries
-// the segment bases and returns the one that is mapped, or 0.
+// head of 0xDDCA8000 -- so ResolveGuestRange tries the segment bases and returns
+// the one that is mapped, or 0.
 //
 // FOUR draw opcodes, not two, verified against the SDK (xenos.h:1584):
 //
@@ -910,11 +876,9 @@ std::mutex g_cmdMu;
 //   PM4_DRAW_INDX_BIN   0x34  fetch index buffer and binIDs and draw
 //   PM4_DRAW_INDX_2_BIN 0x35  fetch bin IDs and draw with supplied indices
 //
-// The first cut checked only the first two and would have counted a BINNED draw
-// as "other" -- i.e. reported "no draws" for a buffer full of them. This title
-// has BeginTiling/EndTiling in its symbol list, so that is not hypothetical.
-// Everything else is counted as "other" rather than named, because a list of
-// opcode names nobody has verified against this title would be decoration.
+// Checking only the first two would count a BINNED draw as "other", i.e. report
+// "no draws" for a buffer full of them, and this title has BeginTiling/EndTiling
+// in its symbol list. Everything else is counted as "other" rather than named.
 constexpr uint32_t kPm4DrawIndx = 0x22;
 constexpr uint32_t kPm4DrawIndx2 = 0x36;
 constexpr uint32_t kPm4DrawIndxBin = 0x34;
@@ -933,12 +897,9 @@ void ScanIndirectBuffer(uint32_t phys, uint32_t size_dwords, uint8_t* base,
                         std::string& out) {
   // THE CAP MUST NOT HIDE THE ANSWER. One run reported 8 of 22 buffers at
   // exactly 4096 dwords -- that was this clamp, not their size, so a draw past
-  // 16 KB would have been read as "no draws". A truncated scan reporting zero is
-  // the same defect as a counter that cannot fire.
-  //
-  // Raised to 256K dwords because this runs ONCE per distinct buffer, not per
-  // execution, and the true size is printed beside the scanned one so any future
-  // truncation is visible rather than inferred.
+  // 16 KB would have read as "no draws". Raised to 256K dwords because this runs
+  // ONCE per distinct buffer, and the true size is printed beside the scanned
+  // one so any future truncation is visible.
   constexpr uint32_t kMaxScanDwords = 256u * 1024u;
   const uint32_t dwords =
       size_dwords > kMaxScanDwords ? kMaxScanDwords : size_dwords;
@@ -950,12 +911,11 @@ void ScanIndirectBuffer(uint32_t phys, uint32_t size_dwords, uint8_t* base,
     return;
   }
   ++g_ibScanned;
-  // WALK ALL FOUR PACKET TYPES. The first version understood type-3 and slid one
-  // dword at a time past everything else, which walks straight into a type-0
-  // register write's PAYLOAD and reads data as a header. A payload dword whose
-  // top two bits happen to be 11 then consumed `count + 1` more dwords. That is
-  // how a 6649-dword stream reported TWO packets -- not a buffer without draws,
-  // a parser that never reached them.
+  // WALK ALL FOUR PACKET TYPES. Understanding only type-3 and sliding one dword
+  // at a time past everything else walks straight into a type-0 register write's
+  // PAYLOAD and reads data as a header; a payload dword whose top two bits are
+  // 11 then consumed `count + 1` more dwords, which is how a 6649-dword stream
+  // reported TWO packets.
   //
   // Sizes are the SDK's, from MakePacketType0/1/2/3:
   //   type 0   bits 29:16 + 1 payload dwords   (register write)
@@ -988,10 +948,10 @@ void ScanIndirectBuffer(uint32_t phys, uint32_t size_dwords, uint8_t* base,
         ++draws2;
       } else {
         ++other;
-        // NAME the opcodes rather than only counting them. "0 draws, N other"
-        // is indistinguishable from "this is not a packet stream and the
-        // scanner is walking data" -- and a negative result has to be
-        // separable from a broken instrument before it can be believed.
+        // NAME the opcodes rather than only counting them. "0 draws, N other" is
+        // indistinguishable from "this is not a packet stream and the scanner is
+        // walking data", and a negative result has to be separable from a broken
+        // instrument.
       }
     }
     // A packet whose payload runs past the end means the walk lost alignment
@@ -1102,8 +1062,7 @@ void NoteCommandBufferExec(uint32_t cmdbuf, uint8_t* base) {
 
 // QUALIFIED. This file does `using namespace mx::hooks::d3d9`, which lets it
 // CALL into that namespace but would put an unqualified definition at global
-// scope -- a different function from the one the header declares, and a link
-// error rather than a silent miss, which is the good outcome.
+// scope -- a different function from the one the header declares.
 void mx::hooks::d3d9::ReportCommandBuffers() {
   std::lock_guard<std::mutex> lk(g_cmdMu);
   std::string rows;
@@ -1114,9 +1073,7 @@ void mx::hooks::d3d9::ReportCommandBuffers() {
   // wired" are different findings, and a suppressed line looks like neither.
   //
   // hidden_draws is THE NUMBER THIS WHOLE THREAD IS FOR: draw packets found
-  // inside the buffers, multiplied by how often each buffer is replayed. A
-  // per-buffer dump says what is in them; only this says how much geometry the
-  // frame is actually missing.
+  // inside the buffers, multiplied by how often each buffer is replayed.
   uint64_t hidden_draws = 0;
   for (uint32_t i = 0; i < g_cmdBufDistinct; ++i)
     hidden_draws += g_cmdBufRuns[i] * g_cmdBufDraws[i];
@@ -1144,7 +1101,7 @@ void mx::hooks::d3d9::ReportCommandBuffers() {
 //
 // This pair is the ONLY thing that says which draws belong to which command
 // buffer: the recording device is created per recording and destroyed straight
-// after, so the association exists only between these two calls.
+// after.
 //=============================================================================
 REX_IMPORT(__imp__sub_8255E9A0, orig_BeginCommandBuffer, void());
 extern "C" REX_FUNC(sub_8255E9A0) {
@@ -1174,11 +1131,9 @@ extern "C" REX_FUNC(sub_825605D8) {
   orig_ExecuteCommandBuffer(ctx, base);
   // THE REPLAY. Every visible vegetation instance comes from here; the recording
   // itself renders nothing on the console. r3 is the real device, holding the
-  // per-instance transform the guest wrote just above this call, so it is what
-  // the replay reads its constants from. After the original, matching the two
-  // draw hooks: the guest call is free to clobber volatile registers, so the
-  // arguments are saved above. Overlays are walked per execution, since the
-  // guest rewrites them between replays.
+  // per-instance transform the guest wrote just above this call. After the
+  // original, matching the two draw hooks. Overlays are walked per execution,
+  // since the guest rewrites them between replays.
   std::vector<std::vector<mx::hooks::d3d9::CmdBufConstOverlay>> ov;
   mx::hooks::d3d9::CollectCmdBufConstants(cmdbuf, base, ov);
   mx::hooks::d3d9::ReplayCmdBuf(cmdbuf, replay_device, base, ov);
@@ -1245,19 +1200,17 @@ extern "C" REX_FUNC(sub_82555B88) {
 //                  D3DFORMAT IndexDataFormat, const void* pVertexStreamZeroData,
 //                  UINT VertexStreamZeroStride)
 //
-// THE FOURTH DRAW ENTRY POINT, and the second one this port shipped without.
-// DrawVerticesUP was the first; this is its INDEXED twin, and the ONLY path
-// Scaleform SHAPES use.
+// THE FOURTH DRAW ENTRY POINT, and the ONLY path Scaleform SHAPES use.
 //
 // How it was found: a caller census on the link register across all three
 // previously-hooked entry points found 31 distinct sites in a menu run and
 // exactly ONE of them in GFx -- inside DrawBitmaps. GFx's shape path,
-// GRenderer::DrawIndexedTriList, draws through this function instead. That one
-// fact accounts for the missing panels, bar backgrounds, star widget and button
+// GRenderer::DrawIndexedTriList, draws through this function instead. That
+// accounts for the missing panels, bar backgrounds, star widget and button
 // glyphs (all shapes), for text surviving (glyphs are bitmaps, drawn through
-// DrawVerticesUP), and for the vanishing menu text: the stencil MASK SHAPE
-// never drew, so the plane kept the 0 that BeginSubmitMask cleared it to and
-// 7,465 EQUAL-ref-1 draws per run were all rejected.
+// DrawVerticesUP), and for the vanishing menu text: the stencil MASK SHAPE never
+// drew, so the plane kept the 0 BeginSubmitMask cleared it to and 7,465
+// EQUAL-ref-1 draws per run were all rejected.
 //
 // SIGNATURE IS FROM THE DISASSEMBLY, not the decompiler (Hex-Rays gives this
 // function 28 phantom int args) and not the PC D3D9 headers, which have no such
@@ -1280,8 +1233,7 @@ extern "C" REX_FUNC(sub_82555B88) {
 // INDICES ARE ABSOLUTE. The guest uploads vertices starting at
 // `pVertexStreamZeroData + MinVertexIndex * stride` and passes -MinVertexIndex
 // as the base-vertex bias, so index values address the caller's FULL array.
-// Stream 0 is therefore synthesised at the array base with the bias left at
-// zero, rather than re-basing both and having to keep the two consistent.
+// Stream 0 is therefore synthesised at the array base with the bias left at zero.
 //
 // The UpDepthGuard is applied even though sub_82555BD0 reserves ring space
 // itself: it costs nothing when nothing nests, and if that reserve ever does
@@ -1346,10 +1298,9 @@ extern "C" REX_FUNC(sub_82556110) {
 
   if (readable) {
     // The inline indices are synthesised into the BOUND INDEX STATE for the
-    // duration of the build, exactly as UpVertexData is synthesised into
-    // stream 0 -- so this reuses BuildHleDraw whole instead of carving a second
-    // indexed path through it. DeviceState is thread-local, so no other thread
-    // can observe the swap.
+    // duration of the build, exactly as UpVertexData is synthesised into stream
+    // 0, so this reuses BuildHleDraw whole. DeviceState is thread-local, so no
+    // other thread can observe the swap.
     auto& st = DeviceState();
     const auto saved_index = st.index;
     st.index.seen = true;
@@ -1389,10 +1340,8 @@ extern "C" REX_FUNC(sub_82556110) {
 //
 // **No guest pointer is dereferenced speculatively.** Where a resource object is
 // read (SetStreamSource, SetIndices) it is read here, in the same call where
-// D3D9 reads the same fields itself, and only the resulting values are kept.
-// Reading it later at draw time would be the speculative dereference that
-// crashed an earlier round: the game can free a buffer without rebinding, and
-// the guest arena is sparse.
+// D3D9 reads the same fields itself. Reading it later at draw time crashed an
+// earlier round: the game can free a buffer without rebinding.
 //
 // Signatures come from the typed decompilation in assets/default.xex.probe.i64,
 // not from the PC D3D9 headers -- several differ.
@@ -1435,12 +1384,9 @@ extern "C" REX_FUNC(sub_8254B7C0) {
     if (buffer) {
       // The two dwords are a Xenos vertex fetch constant: dword0 is
       // {type[1:0], address[31:2]} and dword1 is {endian[1:0], size[25:2] in
-      // dwords}. That decode is the validated one -- it is what produced the
-      // stride-28 geometry that currently reaches the screen.
-      //
-      // A first pass masked dword0 with 0x1FFFFFFF, copying the mask out of
-      // SetStreamSource. That mask is right for what the runtime writes into its
-      // fetch constant file, but it leaves the two type bits in the address.
+      // dwords}. NOT 0x1FFFFFFF, copied out of SetStreamSource: that mask is
+      // right for what the runtime writes into its fetch constant file, but it
+      // leaves the two type bits in the address.
       const uint32_t d0 = REX_LOAD_U32(buffer + 0x18);
       const uint32_t d1 = REX_LOAD_U32(buffer + 0x1C);
       b.fetch_type = d0 & 0x3;
@@ -1494,10 +1440,6 @@ extern "C" REX_FUNC(sub_8254B7C0) {
 // SetIndices IS the LOD. The filter is the RETURN ADDRESS, as a RANGE rather
 // than two exact call sites: a range cannot go stale against a call site moving
 // by a few instructions, and it catches the sibling function too.
-//
-// One distinct buffer means the LOD is PINNED and that is the bug; several means
-// the leaf cards select correctly and the missing geometry is the branch/bark
-// path. The per-buffer draw counts say whether it is stuck near or far.
 //-----------------------------------------------------------------------------
 constexpr uint32_t kVegRendererLo = 0x823F1168;   // sub_823F1168
 constexpr uint32_t kVegRendererHi = 0x823F3D0C;   // end of sub_823F2728
@@ -1514,13 +1456,11 @@ std::mutex g_vegLodMu;
 //
 // The .tree decoder gives the shapes: branch is stride 36 triangle STRIP, frond
 // and 3dleaf stride 36 list, leaf cards stride 32 with no index buffer. The
-// guest repacks, and the path measured so far binds stride 28 -- so stride is
-// what separates leaf cards from branch/bark geometry at runtime.
+// guest repacks, and the path measured so far binds stride 28.
 //
 // The LOD question is settled: 12 distinct index buffers, 88% at one LOD, which
 // is a scene whose vegetation is mostly distant, NOT a pinned selector. So the
-// leaf cards are fine and the missing geometry is the other kind. If only one
-// stride ever appears here, the branch/bark path never runs at all.
+// leaf cards are fine and the missing geometry is the other kind.
 uint32_t g_vegStride[8] = {};
 uint64_t g_vegStrideHits[8] = {};
 uint32_t g_vegStrideDistinct = 0;
@@ -1530,12 +1470,9 @@ uint64_t g_vegStrideOverflow = 0;
 //
 // The SpeedTree module provably has no code path that binds stride 36 (six
 // stride sites in the whole module, all 28 or 4), yet a stride-36 stream DOES
-// get bound. The asset stores branch, frond and 3dleaf at stride 36, so
-// something outside SpeedTree is binding that geometry.
-//
-// The stream reports that showed it are throttled, so "once in the log" is not
-// a rate. This counts every bind and records the distinct CALLERS per stride,
-// which names the module doing it.
+// get bound, and the asset stores branch, frond and 3dleaf at stride 36. The
+// stream reports that showed it are throttled, so this counts every bind and
+// records the distinct CALLERS per stride.
 constexpr uint32_t kMaxStrides = 12;
 constexpr uint32_t kMaxStrideCallers = 6;
 uint32_t g_strideVal[kMaxStrides] = {};
@@ -1664,14 +1601,9 @@ extern "C" REX_FUNC(sub_8254B8E0) {
     // GPU needs a *physical* address -- but every read on this side goes through
     // the guest's *virtual* space, where the buffer lives at the unmasked
     // address. Masking relocated it: an index buffer at 0xF3B64000 was recorded
-    // as 0x13B64000, and reading there faulted in three separate runs.
-    //
-    // The vertex path never had this bug because it uses `& ~3` -- keeping the
-    // high bits and clearing only the fetch constant's two type bits.
-    //
-    // The "index buffer holds its range 66,726/66,726" result did not catch it
-    // and could not: that check compares a count against Size and never
-    // dereferences Address.
+    // as 0x13B64000, and reading there faulted in three separate runs. The
+    // vertex path uses `& ~3`, keeping the high bits and clearing only the fetch
+    // constant's two type bits.
     ib.address = REX_LOAD_U32(buffer + 0x18);
     ib.size_bytes = REX_LOAD_U32(buffer + 0x1C);
     ib.is_32bit = (ib.common & 0x80000000u) != 0;
@@ -1698,14 +1630,12 @@ extern "C" REX_FUNC(sub_8254B8E0) {
 //   GetPhysicalMicrocode(i)     = *(variant + 0x368) + *(this + 0x20)
 //   GetPhysicalMicrocodeSize(i) = *(variant + 0x36C)
 //
-// So the object carries a table of *patched* microcode variants -- what
-// PatchVertexShaderToMatchVertexDeclaration has been writing all along -- and
-// the bytes sit at a physical base plus an offset out of the header.
+// So the object carries a table of *patched* microcode variants and the bytes
+// sit at a physical base plus an offset out of the header.
 //
 // **The physical base is not dereferenced here.** `SH_pPhysical` is exactly the
 // kind of address that cost four access violations: D3D9 keeps it masked for the
-// GPU while every read on this side goes through virtual space. This dumps the
-// object's own fields only.
+// GPU while every read on this side goes through virtual space.
 //-----------------------------------------------------------------------------
 uint32_t g_vsDumped = 0;
 
@@ -1727,12 +1657,10 @@ void DumpVertexShaderObject(uint32_t handle, uint8_t* base) {
     << " ucode_offset=0x" << REX_LOAD_U32(handle + 0x368)
     << " ucode_size=0x" << REX_LOAD_U32(handle + 0x36C) << std::dec << "\n";
 
-  // The field's top bits are set (0xFD62A000), which is the *unmasked* form --
-  // the same shape the vertex buffer's address has before D3D9 masks it for the
-  // fetch constant. So this should be readable as-is, which is exactly the thing
-  // four access violations were caused by getting wrong. Page-guarded, and 16
-  // dwords only: if it is microcode the first words decode as one, and if it is
-  // not, that is the finding.
+  // The field's top bits are set (0xFD62A000), the *unmasked* form -- the same
+  // shape the vertex buffer's address has before D3D9 masks it. So this should
+  // be readable as-is, which is exactly what four access violations came from
+  // getting wrong. Page-guarded, and 16 dwords only.
   const uint32_t phys = REX_LOAD_U32(handle + 0x20);
   if (phys && HostPageReadable(REX_RAW_ADDR(phys)) &&
       HostPageReadable(REX_RAW_ADDR(phys + 0x3C))) {
@@ -1746,8 +1674,7 @@ void DumpVertexShaderObject(uint32_t handle, uint8_t* base) {
   // The physical base reads as sixteen zero dwords -- safe, and empty, so the
   // code is not behind that pointer at bind time. CreateVertexShader copies the
   // token stream to `this + 0x368`, and +0x36C here is 0x200, so the object very
-  // likely carries the microcode inline. Dumped so it can be compared against
-  // what the ring carried for the same shader.
+  // likely carries the microcode inline.
   if (HostPageReadable(REX_RAW_ADDR(handle + 0x468))) {
     f << "    inline +0x368:";
     for (uint32_t o = 0x368; o < 0x3E8; o += 4) f << " " << std::hex
@@ -1776,8 +1703,7 @@ void DumpVertexShaderObject(uint32_t handle, uint8_t* base) {
 //
 // Read either side of the original call on purpose. We call through to the
 // guest's own D3D9, so if this list is what fills c255 the value must CHANGE
-// across that call -- and if it does not, this mechanism is not the answer
-// whatever the list contains. The list alone would only show intent.
+// across that call. The list alone would only show intent.
 //-----------------------------------------------------------------------------
 
 // Walk the shader's embedded constant-load table and report what it publishes.
@@ -1792,15 +1718,14 @@ void DumpVertexShaderObject(uint32_t handle, uint8_t* base) {
 //   source = *(vs + 0x20) + data_offset
 //
 // These are the entries SetVertexShader's FIRST loop steps over without acting
-// on; its memcpy loop is a different, later list in the same block. An earlier
-// version of this probe walked the first list with the second's layout, read
-// reg_index 0xFC as a byte offset, compared it against c255's byte offset
-// 0x12F0, and concluded nothing published c255. 0xFC is c252, and the count of
-// 16 dwords covers c252..c255.
+// on; its memcpy loop is a different, later list in the same block. Walking the
+// first list with the second's layout reads reg_index 0xFC as a byte offset and
+// concludes nothing publishes c255 -- 0xFC is c252, and the count of 16 dwords
+// covers c252..c255.
 //
-// So this data never passes through device + 0x780. It is literal constant data
+// So this data never passes through device + 0x780: it is literal constant data
 // carried inside the shader's own code allocation and handed to the GPU by
-// address, which is why the device shadow the HLE reads shows zeros.
+// address, which is why the device shadow shows zeros.
 void ProbeVertexShaderConstantPatch(uint32_t shader, uint32_t device,
                                     const uint32_t before[4], uint8_t* base) {
   (void)base;
@@ -1868,9 +1793,9 @@ extern "C" REX_FUNC(sub_825508A8) {
   }
   orig_SetVertexShader(ctx, base);
   // Behind hle_capture like every other diagnostic here. No longer sampled
-  // either side of the original call: that comparison was built to test whether
-  // SetVertexShader itself writes c255 into the device shadow. It does not, and
-  // the reason is now known — the value never goes through the shadow at all.
+  // either side of the original call: that comparison tested whether
+  // SetVertexShader itself writes c255 into the device shadow. It does not --
+  // the value never goes through the shadow at all.
   if (capture && shader) {
     ProbeVertexShaderConstantPatch(shader, device, nullptr, base);
   }
@@ -1922,14 +1847,12 @@ mx::hle::RenderTargetBinding SnapshotRenderTarget(uint32_t object,
 // Tell the renderer a surface EXISTS, whether or not a draw ever names it.
 //
 // Host storage used to be created on the first draw that targeted a surface,
-// which loses any pass that binds and resolves without a draw we route. The
-// menu's shadow atlas is exactly that -- bound depth-only, resolved every frame,
-// never instantiated -- so the backdrop shader's slot 15 found no snapshot and
-// its draw was discarded whole.
+// which loses any pass that binds and resolves without a draw we route -- the
+// menu's shadow atlas is exactly that, so the backdrop shader's slot 15 found no
+// snapshot and its draw was discarded whole.
 //
-// Deduped per frame on object and extent. A bind fires far more often than a
-// surface changes, and the renderer only needs telling once per frame. Keyed on
-// the extent too so a surface rebound at a new size still reaches the factory.
+// Deduped per frame on object AND extent, so a surface rebound at a new size
+// still reaches the factory.
 void NoteSurfaceBind(const mx::hle::RenderTargetBinding& rt, bool is_depth) {
   if (!rt.valid || !rt.object || !rt.width || !rt.height) return;
   const uint64_t key = (uint64_t(rt.object) << 32) |
@@ -1968,10 +1891,10 @@ extern "C" REX_FUNC(sub_8254C060) {
     st.NoteDevice(ctx.r3.u32, mx::hle::kEpSetRenderTarget);
     st.render_target[slot] = SnapshotRenderTarget(object, base);
     st.render_target_seen_mask |= 1u << slot;
-    // Mirrored per DEVICE as well as per thread. A command-buffer replay runs
-    // on whatever thread drives the render loop, and thread-local state leaves
-    // it with no target at all -- which silently filtered out every replayed
-    // palm draw on run mx_1931.
+    // Mirrored per DEVICE as well as per thread. A command-buffer replay runs on
+    // whatever thread drives the render loop, and thread-local state leaves it
+    // with no target at all, which silently filtered out every replayed palm
+    // draw.
     if (slot == 0)
       mx::hooks::d3d9::NoteRenderTargetForDevice(ctx.r3.u32,
                                                  st.render_target[slot],
@@ -1979,10 +1902,10 @@ extern "C" REX_FUNC(sub_8254C060) {
 
     const auto& rt = st.render_target[slot];
     // Slot 0 only. The renderer models one colour attachment (DrawCall's
-    // render_target_object comes from render_target[0]), so instantiating
-    // slots 1-3 would spend budget on surfaces nothing routes -- and worse,
-    // would let a resolve out of an MRT slot copy a freshly cleared target
-    // instead of failing, trading a missing image for a confidently blank one.
+    // render_target_object comes from render_target[0]), so instantiating slots
+    // 1-3 would spend budget on surfaces nothing routes -- and would let a
+    // resolve out of an MRT slot copy a freshly cleared target instead of
+    // failing, trading a missing image for a confidently blank one.
     if (slot == 0) NoteSurfaceBind(rt, /*is_depth=*/false);
     static std::map<uint64_t, uint64_t> s_targets;
     if (rt.valid) {
@@ -2020,8 +1943,8 @@ extern "C" REX_FUNC(sub_8254C3B0) {
   // host depth surface to the colour target instead collapsed the frame, because
   // one depth object is bound alongside colour targets of several extents (the
   // 1280x720 surface and its 1280x640 and 1280x80 EDRAM bands). Whether the
-  // guest declares one depth for all of them, or a separate one per band,
-  // decides whether the host pool can be keyed by object alone.
+  // guest declares one depth for all of them decides whether the host pool can
+  // be keyed by object alone.
   {
     const auto& ds = st.depth_stencil;
     static std::mutex s_mu;
@@ -2071,37 +1994,27 @@ extern "C" REX_FUNC(sub_8255B258) {
   const uint32_t color = ctx.r7.u32;
   const auto& target = DeviceState().render_target[0];
 
-  // CLEAR CENSUS -- every call, BEFORE any bit test.
-  //
-  // The CLEAR line below lives inside the `flags & 1` branch, so it can only
-  // report clears that touch colour. A depth-only clear is invisible to it,
-  // which makes it useless for the one question being asked: does the guest ask
-  // for depth clears we drop on the floor?
+  // CLEAR CENSUS -- every call, BEFORE any bit test. The CLEAR line below lives
+  // inside the `flags & 1` branch, so it can only report clears that touch
+  // colour, and the question is whether the guest asks for depth clears we drop.
   //
   // That question is live. freeroam.rdc: the D32S8 depth target is Cleared
   // exactly ONCE in the whole frame and then used as the DepthStencilTarget by
   // six separate passes with no clear between them. The ground draw has its
   // three textures bound, a translated shader and a shaderOut of sand, and is
-  // discarded `depthTestFailed` against depth it did not write. So the ground is
-  // not a texture bug.
+  // discarded `depthTestFailed` against depth it did not write.
   //
-  // Reported as a HISTOGRAM with a total, not a sample, so the answer carries
-  // its own denominator: "0 of N calls had 0x10" and "the probe never ran" have
-  // to look different. One line per distinct flags value, and the total keeps
-  // counting past the line budget.
-  //
-  // LET THE FLAGS NAME THEMSELVES. The first cut printed the bit pattern and
-  // annotated it from an assumed layout. One run showed seven distinct values --
-  // 0x1, 0xF, 0x1F, 0x20, 0x30, 0x3F, 0x60 -- and 0x60 alone was 18280 of 28000
-  // calls, which no assumed layout accounted for.
-  //
-  // The call carries the answer. The decompiled signature is
+  // Reported as a HISTOGRAM with a total, so the answer carries its own
+  // denominator. LET THE FLAGS NAME THEMSELVES: one run showed seven distinct
+  // values -- 0x1, 0xF, 0x1F, 0x20, 0x30, 0x3F, 0x60 -- and 0x60 alone was 18280
+  // of 28000 calls, which no assumed bit layout accounted for. The call carries
+  // the answer instead:
   //
   //   D3DDevice_Clear(pDevice, Count, pRects, Flags, Color, Z, Stencil,
   //                   EDRAMClear)
   //
   // so a flag value whose calls carry Z=1.0 is a DEPTH clear whatever its bit
-  // pattern, and one that never varies Z is not.
+  // pattern.
   {
     struct FlagStat {
       uint64_t calls = 0;
@@ -2110,17 +2023,14 @@ extern "C" REX_FUNC(sub_8255B258) {
       uint64_t r9_nonzero = 0;
       bool z_varies = false;
     };
-    // ARGUMENT SLOTS ARE NOT ASSUMED. One run read Z as *(float*)&ctx.f1 and got
-    // 0 for every one of 24000 calls -- which is what the LOW half of a double
-    // looks like, since rex::ppc's FP register is a union. Z = 1.0 as a double
-    // has a zero low word, so the instrument was blind to exactly the value it
-    // existed to find. Read f64.
+    // ARGUMENT SLOTS ARE NOT ASSUMED. Reading Z as *(float*)&ctx.f1 gives 0 for
+    // every call -- that is the LOW half of a double, since rex::ppc's FP
+    // register is a union, and Z = 1.0 has a zero low word. Read f64.
     //
-    // The integer slots were wrong too: taking r8 as Stencil produced 47185920
-    // for flags 0x30, 0x3F AND 0x60 alike, and one identical value across three
+    // The integer slots were wrong too: r8 as Stencil produced 47185920 for
+    // flags 0x30, 0x3F AND 0x60 alike, and one identical value across three
     // unrelated groups is a leftover register. PowerPC ABIs differ over whether
-    // a float argument also consumes its GPR slot. Print r8, r9 and r10 raw and
-    // let the correlation say which one tracks the flags.
+    // a float argument also consumes its GPR slot, so print r8, r9 and r10 raw.
     static std::mutex s_mu;
     static std::map<uint32_t, FlagStat> s_byFlags;
     static uint64_t s_total = 0, s_fullSurface = 0;
@@ -2171,11 +2081,10 @@ extern "C" REX_FUNC(sub_8255B258) {
     clear.surface_base = target.color_info & 0xFFFu;
     mx::hle::HleFrameDraws().push_back(std::move(clear));
     // Keyed on (target, COLOUR), not on the target alone. Deduping by target
-    // logged only the FIRST colour each surface was ever cleared to -- so a run
+    // logs only the FIRST colour each surface was ever cleared to, so a run
     // whose targets are first cleared to black reads as "this game only ever
-    // clears to 0x00000000", which is not a measurement of the clear colours at
-    // all. That reading was used to argue a mid-grey clear could not be the
-    // guest's, and it could not support the claim.
+    // clears to 0x00000000" -- which was once used to argue a mid-grey clear
+    // could not be the guest's.
     static std::set<std::pair<uint32_t, uint32_t>> s_logged;
     if (s_logged.insert({target.object, color}).second &&
         s_logged.size() <= 64) {
@@ -2186,14 +2095,11 @@ extern "C" REX_FUNC(sub_8255B258) {
   }
   // D3DCLEAR_ZBUFFER is 0x10 on this hardware, NOT the 0x2 a PC D3D9 header
   // would tell you. Narrow on purpose: five of the seven flag values carry
-  // Z=1.0, but Z is an ARGUMENT rather than a flag -- a caller passing 1.0
-  // suggests depth-clear intent without proving the bit was set -- so this gates
-  // on 0x10 alone.
+  // Z=1.0, but Z is an ARGUMENT rather than a flag, so this gates on 0x10 alone.
   //
   // 0x60 is deliberately EXCLUDED even though it carries Z=1.0 and is 16139 of
-  // 24000 calls. It is the only value whose r9 is set on every call, and r9 is
-  // the EDRAMClear argument, so it is most likely the EDRAM tile clear and
-  // wiping the whole depth buffer for each one would erase the depth prepass.
+  // 24000 calls: it is the only value whose r9 is set on every call, and r9 is
+  // the EDRAMClear argument, so it is most likely the EDRAM tile clear.
   //
   // Bits 1..6 are still not named. IDA's bounds for D3DDevice_Clear stop on a
   // misdecoded instruction so the body is unreachable through the decompiler,
@@ -2212,20 +2118,16 @@ extern "C" REX_FUNC(sub_8255B258) {
     //
     // The caller-side decode agrees: sub_8255AAB0 loops bits 0..3 over the four
     // render targets and masks off 0xF0 after the first, so bits 0-3 are the MRT
-    // colour targets and 0x10/0x20/0x40/0x80 are the depth-stencil group. The
-    // observed distribution confirms rather than merely permits it: 0xF colours,
-    // 0x1F colours+depth, 0x20 stencil alone, 0x30 depth+stencil, 0x3F all
-    // three, 0x60 stencil+EDRAM.
+    // colour targets and 0x10/0x20/0x40/0x80 are the depth-stencil group.
     //
     // STENCIL IS r9, NOT r8, and this file said otherwise for a long time. On
     // this ABI a float argument consumes its integer register slot, so Z in f1
     // RESERVES r8 and the two integer args land in r9 and r10. Reading r8 logged
-    // `s=0` on every line, which looked correct and was not: 0x2D00000 & 0xFF
-    // is 0.
+    // `s=0` on every line, which looked correct: 0x2D00000 & 0xFF is 0.
     //
     // PROVEN by following the value through four frames rather than inferring it
-    // from the ABI (the census alone could not -- r9 being 0/1 is predicted
-    // equally well by EDRAMClear-as-a-BOOL):
+    // from the ABI (r9 being 0/1 is predicted equally well by
+    // EDRAMClear-as-a-BOOL):
     //
     //   D3DDevice_Clear   8255b270  mr  r27, r9
     //                     8255b2b8  mr  r8, r27          -> sub_8255B130
@@ -2254,9 +2156,8 @@ extern "C" REX_FUNC(sub_8255B258) {
     //          }
     //
     //      0x40 does NOT suppress the clear -- bit 2 of v41 is set before the
-    //      branch and stays set. It only moves the value into bits 8-15. So
-    //      0x60 is a stencil clear carrying its value in a second field, with
-    //      r9 = 1 on every call: "clear stencil to 1", 13,370 times a run.
+    //      branch and stays set -- it only moves the value into bits 8-15. So
+    //      0x60 is "clear stencil to 1", 13,370 times a run.
     //
     // Dropping them left the plane stuck at 0, and a terrain testing NotEqual-0
     // against 0 fails everywhere -- the broken ground.
@@ -2365,9 +2266,8 @@ extern "C" REX_FUNC(sub_8255CE98) {
 
     // The destination's own fetch constant, which is where its guest memory
     // address lives. The six dwords sit at +0x1C..+0x30 -- the same offsets
-    // SetTexture copies from -- and DescribeHleTexture2D already turns them
-    // into an address and an extent, so nothing here decodes a bitfield by
-    // hand. Only dword 0 used to be read, and only to print.
+    // SetTexture copies from -- and DescribeHleTexture2D already turns them into
+    // an address and an extent, so nothing here decodes a bitfield by hand.
     if (HostPageReadable(REX_RAW_ADDR(dest_texture + 0x1C)) &&
         HostPageReadable(REX_RAW_ADDR(dest_texture + 0x30))) {
       uint32_t dest_fetch[6] = {};
@@ -2401,10 +2301,9 @@ extern "C" REX_FUNC(sub_8255CE98) {
           entry.reached_x = std::max(entry.reached_x, dx + w);
           entry.reached_y = std::max(entry.reached_y, dy + h);
           // The bounding box stays -- it is still worth SEEING in the census,
-          // and it is what makes a scattered destination legible once printed
-          // next to the real coverage. It is no longer what the claim decision
-          // reads; MarkCoverage is. Marked AFTER width/height are assigned
-          // above, because the grid is derived from them.
+          // and it makes a scattered destination legible next to the real
+          // coverage. It is no longer what the claim decision reads; MarkCoverage
+          // is. Marked AFTER width/height are assigned above.
           entry.MarkCoverage(dx, dy, dx + w, dy + h);
           ++entry.resolves;
           g_resolveDestObjectPhys[dest_texture] = physical;
@@ -2416,25 +2315,20 @@ extern "C" REX_FUNC(sub_8255CE98) {
         // 0x1A2DD000 is 64x64, resolved once per frame, and no shader ever
         // touches it: the GPU writes page IDs there so the CPU can decide which
         // tiles to stream. Landing the resolve only in a host snapshot leaves
-        // the guest reading whatever was at that address when it was allocated
-        // -- a uniform index map and 3 of 64 atlas tiles.
+        // the guest reading whatever was at that address when it was allocated.
         //
         // Same moment as the 1x1 case above and for the same reason: the resolve
-        // the guest just issued is the one it is about to read, and the value is
-        // the previous frame's, which is the latency the console gives it.
+        // the guest just issued is the one it is about to read.
         //
         // NOT GATED ON THE DESTINATION'S EXTENT. It used to require 64x64,
         // conflating the region with the resource, so the terrain deformation's
-        // 128x32 tile into a 2048x2048 accumulation was refused even after the
-        // readback had been copied, drained and matched. `rb.destObject ==
-        // dest_texture` below is the real discriminator and it is exact.
+        // 128x32 tile into a 2048x2048 accumulation was refused. `rb.destObject
+        // == dest_texture` below is the real discriminator and it is exact.
         if (dest_desc.width > 1 && dest_desc.height > 1 &&
             dest_desc.bytes_per_block && dest_desc.address) {
-          // EVERY SLOT, not "has the global sequence moved". The old form kept
-          // one seq: the first destination to match stamped the frame consumed,
-          // and any other destination delivered in the same frame was skipped
-          // without being looked at -- invisible while one readback was in
-          // flight at a time.
+          // EVERY SLOT, not "has the global sequence moved". With one seq, the
+          // first destination to match stamped the frame consumed and any other
+          // delivered in the same frame was skipped without being looked at.
           //
           // The acquire load below is kept for its fence, not as a gate: it
           // pairs with the release bump in DrainSurfaceReadback so the bytes a
@@ -2447,7 +2341,6 @@ extern "C" REX_FUNC(sub_8255CE98) {
             uint32_t skipped_unwritable = 0;
             bool matched = false;
             // WHAT WE ACTUALLY DELIVER, over the exact byte the guest gates on.
-            //
             // The guest's page-table update (sub_82AF5D38) reads the LOW BYTE of
             // the big-endian dword as a mip level:
             //
@@ -2455,37 +2348,28 @@ extern "C" REX_FUNC(sub_8255CE98) {
             //     if (v92 < v66) { ...refine this page... }
             //
             // so every texel whose low byte is >= the level count is skipped. If
-            // all 4096 are skipped the update runs to completion and refines
-            // nothing -- exactly what we observe. "wrote 4096 texels" could
-            // never distinguish that from a healthy feed: it counts stores, not
-            // content.
+            // all 4096 are skipped the update refines nothing, and "wrote 4096
+            // texels" could never distinguish that from a healthy feed.
             uint32_t low_hist[256] = {};
             // Per-byte spread of the feedback texel, in GUEST byte order, over
             // the whole run rather than one writeback -- the interesting frames
-            // are a minority and any single-frame view is dominated by whichever
-            // phase the log cap landed in.
+            // are a minority.
             //
             // ROW/COL HIGH NIBBLES AS A DISTRIBUTION, not a min and a max. The
             // page table's coarse levels are exactly half resident with a knife
             // edge at the midpoint, and the guest decodes ROW from the HIGH
             // nibble of byte +0, so if it never sees rowHi 0 or 1 the top half
-            // can never go resident. The byte's RANGE said 0x21..0x33 on a short
-            // run and 0x00..0x33 on a long one, and I read the second as
-            // "requests reach the top half after all" -- but a min is one texel
-            // and cannot distinguish a handful of strays from a real share.
-            //
-            // Same gate and population as the byte spread below, so the two are
-            // directly comparable: rowHi[0..3] must sum to b0's `seen`.
+            // can never go resident. A min is one texel and cannot distinguish a
+            // handful of strays from a real share. Same gate and population as
+            // the byte spread below, so rowHi[0..3] must sum to b0's `seen`.
             //
             // THE LEVEL BYTE, AFTER THE GATE. Byte +3 is the LOD, and the guest
-            // does far more with it than accept or reject: it shifts BOTH
-            // coordinates by it and indexes THAT level's table. So a constant
-            // LOD aims every request in the run at one level of the pyramid --
-            // the shape of the half-populated pyramid we are chasing. Its raw
-            // range is known (00..FF, mean 0x87) and that is the WRONG
-            // population, since the guest skips any texel whose level is >= the
-            // level count. Bucketed 0..15 because the gate is `< 16`; a non-zero
-            // 16th bucket would mean the gate moved.
+            // shifts BOTH coordinates by it and indexes THAT level's table, so a
+            // constant LOD aims every request at one level of the pyramid. Its
+            // raw range (00..FF) is the WRONG population, since the guest skips
+            // any texel whose level is >= the level count. Bucketed 0..15
+            // because the gate is `< 16`; a non-zero 16th bucket would mean the
+            // gate moved.
             static uint64_t s_lod[16] = {};
             static uint64_t s_rowHi[4] = {}, s_colHi[4] = {};
             static uint64_t s_byteSeen[4] = {}, s_byteHigh[4] = {};
@@ -2496,10 +2380,8 @@ extern "C" REX_FUNC(sub_8255CE98) {
               const auto& rb = mx::hle::g_surfaceReadback[slot];
               // FORMAT CONVERSION, because a Xenos resolve converts. The old
               // guard demanded matching bytes-per-texel, which only the VT
-              // feedback buffer satisfies (4 == 4). The terrain deformation
-              // resolves an R32_FLOAT tile into a destination the guest fetches
-              // as FMT_8 -- 4 bytes against 1 -- so the pair was rejected before
-              // a byte moved.
+              // feedback buffer satisfies; the terrain deformation resolves an
+              // R32_FLOAT tile into a destination the guest fetches as FMT_8.
               //
               // The mapping is not a guess: sub_82AF7240 memsets that buffer to
               // 0x80 and the float accumulation's measured maximum is 0.5021 =
@@ -2513,20 +2395,14 @@ extern "C" REX_FUNC(sub_8255CE98) {
               // The R32_FLOAT deform tile is written raw as round(f * 255) into
               // a buffer the guest MEMSETS TO 0x80, which is defensible only if
               // the tile carries the accumulated height. In a real level it does
-              // not -- freeroam measured a mean of 6-7 against a neutral of 128,
-              // near-zero over ~96% of the surface, and the bike jumps as if it
-              // cannot track the terrain.
-              //
-              // An earlier MENU run read `byte 7A..80 mean 7F` and I took that
-              // as proof the mapping was right. In the menu the tile is neutral,
-              // so the raw write happened to land near 0x80 by accident. Menu
-              // data cannot validate a level-time mapping.
+              // not -- freeroam measured a mean of 6-7 against a neutral of 128
+              // -- and an earlier MENU run reading `byte 7A..80 mean 7F` proved
+              // nothing, because in the menu the tile is neutral anyway.
               //
               // Until it is known whether the tile is the accumulation or a
               // DELTA to be combined with the previous half (the guest has an
               // hft_deform_copy pass never observed executing), writing it raw
-              // is worse than not writing it: the buffer keeps its 0x80 memset,
-              // which is the neutral the guest itself chose.
+              // is worse than not writing it.
               const bool float_to_unorm8 =
                   false &&
                   rb.bytesPerTexel == 4 && dest_desc.bytes_per_block == 1 &&
@@ -2587,16 +2463,14 @@ extern "C" REX_FUNC(sub_8255CE98) {
                     if (bpb == 2 && dest_desc.endian != 0) {
                       std::swap(tmp[0], tmp[1]);
                     } else if (bpb == 4 && dest_desc.endian != 0) {
-                      // R<->B FIRST, then the reversal.
+                      // R<->B FIRST, then the reversal. The endian reversal was
+                      // right and was being applied to the wrong channel order:
+                      // the host resource is R8G8B8A8_UNORM so `rb.bytes` runs
+                      // R,G,B,A while the guest's k_8_8_8_8 surface is B,G,R,A,
+                      // and reversing the host order alone produced A,B,G,R
+                      // where the guest reads A,R,G,B.
                       //
-                      // The endian reversal was right and was being applied to
-                      // the wrong channel order. The host resource is
-                      // R8G8B8A8_UNORM so `rb.bytes` runs R,G,B,A; the guest's
-                      // k_8_8_8_8 surface is B,G,R,A. Reversing the host order
-                      // alone produced A,B,G,R where the guest reads A,R,G,B.
-                      //
-                      // Established from the guest's own feedback walk, which is
-                      // unambiguous about which byte is which:
+                      // Established from the guest's own feedback walk:
                       //
                       //   lwzu   r10, 4(r5)          big-endian texel
                       //   clrlwi r11, r10, 24        byte +3
@@ -2609,16 +2483,11 @@ extern "C" REX_FUNC(sub_8255CE98) {
                       //
                       // ps_hft_fback writes o0 = (page X, page Y, LOD, index),
                       // so the guest needs LEVEL <- o0.z (B) at byte +3 and X's
-                      // low bits <- o0.x (R) at +1. Before this it got the page
-                      // X as the level and the LOD as X's low bits.
+                      // low bits <- o0.x (R) at +1.
                       //
-                      // CONFIRMED QUANTITATIVELY. Under the wrong order X could
+                      // CONFIRMED QUANTITATIVELY: under the wrong order X could
                       // only ever land in 520..776, and every resident
                       // page-table entry sits at x 512..531, 18-20 columns wide.
-                      // That strip, its width, and its start at exactly the
-                      // level midpoint all fall out of this transposition -- so
-                      // if it does not change shape on the next run, this
-                      // derivation is wrong.
                       std::swap(tmp[0], tmp[2]);
                       std::swap(tmp[0], tmp[3]);
                       std::swap(tmp[1], tmp[2]);
@@ -2628,13 +2497,10 @@ extern "C" REX_FUNC(sub_8255CE98) {
                     // already in guest byte order, so for a 4-byte texel the
                     // guest's (uint8)value is the last byte of tmp.
                     ++low_hist[tmp[bpb - 1]];
-                    // EVERY byte, not just the one the mip gate reads.
-                    //
-                    // "usable 4881" says the mip byte is sane, which is enough
-                    // to conclude the feed is ALIVE and not enough to conclude
-                    // it is CORRECT: the page x and y ride in the other bytes of
-                    // the same texel, and a wrong channel order leaves the mip
-                    // plausible while putting the coordinates elsewhere.
+                    // EVERY byte, not just the one the mip gate reads. "usable
+                    // 4881" says the mip byte is sane, which is enough to
+                    // conclude the feed is ALIVE and not that it is CORRECT: the
+                    // page x and y ride in the other bytes of the same texel.
                     //
                     // Why look: every resident page-table entry sits at x >=
                     // half the level width, at two different mips, while the
@@ -2648,11 +2514,9 @@ extern "C" REX_FUNC(sub_8255CE98) {
                     //                               guest's, and IDA is next
                     //
                     // ONLY THE TEXELS THE GUEST ACTS ON, and cumulative across
-                    // writebacks. The first cut measured every texel of every
-                    // writeback under a cap of 8, so all it ever reported was
-                    // the MENU, where the surface is the guest's own 0xFF clear
-                    // and every byte reads FF..FF by construction. The guest's
-                    // own gate is the right population.
+                    // writebacks: measuring every texel under a cap of 8 only
+                    // ever reported the MENU, where the surface is the guest's
+                    // own 0xFF clear.
                     if (tmp[bpb - 1] < 16) {
                       for (uint32_t b = 0; b + 1 < bpb && b < 4; ++b) {
                         ++s_byteSeen[b];
@@ -2662,8 +2526,8 @@ extern "C" REX_FUNC(sub_8255CE98) {
                       }
                       // Byte +0 packs both high nibbles, exactly as the guest
                       // reads them: ROW = (+0 hi) << 8 | +2, COL = (+0 lo) << 8
-                      // | +1. Bucketed to 4 each because a 1024-wide level
-                      // needs 10 bits and the nibble carries the top two.
+                      // | +1. Bucketed to 4 each because a 1024-wide level needs
+                      // 10 bits and the nibble carries the top two.
                       ++s_rowHi[(tmp[0] >> 4) & 3u];
                       ++s_colHi[tmp[0] & 3u];
                       ++s_lod[tmp[bpb - 1] & 15u];
@@ -2675,15 +2539,13 @@ extern "C" REX_FUNC(sub_8255CE98) {
             }
             if (matched) {
               uint32_t distinct = 0, dominant = 0, dominant_n = 0, usable = 0;
-              // THE ACTUAL DISTRIBUTION, not a borrowed gate.
-              //
-              // `usable` counts texels whose low byte is < 16, which is the
-              // guest's MIP-LEVEL test in the feedback walk. For the terrain
-              // deformation that byte is a HEIGHT, and the same test reads as
-              // "more than half the tile is near zero" -- true, and it says
-              // nothing about whether zero is right. The buffer's neutral is
-              // 0x80, so min/max/mean over what we write is what separates a rut
-              // from a trench.
+              // THE ACTUAL DISTRIBUTION, not a borrowed gate. `usable` counts
+              // texels whose low byte is < 16, which is the guest's MIP-LEVEL
+              // test in the feedback walk. For the terrain deformation that byte
+              // is a HEIGHT, and the same test reads as "more than half the tile
+              // is near zero" -- true, and silent on whether zero is right. The
+              // buffer's neutral is 0x80, so min/max/mean is what separates a
+              // rut from a trench.
               uint32_t vmin = 255, vmax = 0;
               uint64_t vsum = 0, vcount = 0;
               for (uint32_t v = 0; v < 256; ++v) {
@@ -2720,17 +2582,13 @@ extern "C" REX_FUNC(sub_8255CE98) {
               // WHICH DESTINATIONS actually get written, uncapped. The `SURFACE
               // WRITEBACK` line stops after 8, and two destinations that queue
               // every frame consumed all eight long before the terrain
-              // deformation was ever eligible -- so "the deform address never
-              // appears" was not evidence of anything.
+              // deformation was ever eligible.
               //
               // PER DESTINATION, because `usable of wrote` is meaningless summed
-              // across them. It was a single running total while the feedback
-              // buffer was the only destination; once the deform started
-              // landing, its 1-byte texels -- ~0x00 almost everywhere, and so
-              // trivially satisfying the `< 16` mip gate -- were counted under a
-              // heading that says "a mip the guest would act on". One run
-              // printed 2,842,930 of 6,881,280 and read like the feedback feed
-              // had come back from nothing; ~89% of that numerator was deform
+              // across them: once the deform started landing, its 1-byte texels
+              // -- ~0x00 almost everywhere, trivially satisfying the `< 16` mip
+              // gate -- were counted under a heading that says "a mip the guest
+              // would act on", and ~89% of one 2,842,930 numerator was deform
               // bytes.
               //
               // The byte spread below is not affected: its loop is `b + 1 < bpb`,
@@ -2753,11 +2611,8 @@ extern "C" REX_FUNC(sub_8255CE98) {
               // one whose reader is in doubt: raising the readback cap to
               // deliver it stopped the tile churn but did not put the bike down,
               // and the only consumer we can see binds the host SNAPSHOT instead
-              // of decoding this memory. So "the guest reads these bytes" is an
-              // assumption the whole path rests on and has never been tested.
-              //
-              // A load leaves no trace unless the memory reports it -- see
-              // guest-reads-resolves-from-memory.
+              // of decoding this memory. A load leaves no trace unless the
+              // memory reports it -- see guest-reads-resolves-from-memory.
               if (dest_desc.width == 129 && dest_desc.height == 129 &&
                   mx::watch::GuestReadWatchActive()) {
                 const size_t span = size_t(dest_desc.width) *
@@ -2852,23 +2707,19 @@ extern "C" REX_FUNC(sub_8255CE98) {
         }
         if (dest_desc.width == 1 && dest_desc.height == 1) {
           // Write the GPU's answer where the guest is about to read it.
-          //
           // sub_82AFB8A8 resolves the 1x1 and then loads its bytes straight out
           // of guest memory rather than sampling them, so a host-only resolve
           // leaves it reading zero and its exposure comes out as a division by
-          // zero. This is the moment to write: the resolve the guest just issued
-          // is the one it is about to read, and the value is the previous
-          // frame's, which is what the console's own latency gives it anyway.
+          // zero. The value is the previous frame's, which is what the console's
+          // own latency gives it anyway.
           //
           // FMT_16_FLOAT with endian 1 is an 8-in-16 swap, so the host's
           // little-endian half goes out byte-reversed.
           //
           // Written to EVERY 1x1 destination seen, not just the one this resolve
           // names: sub_82AFB8A8 ping-pongs two of them and READS the one it is
-          // not resolving into, so writing only the current destination leaves
-          // the buffer the guest actually loads untouched. They are successive
-          // samples of one quantity, so giving both the latest value costs the
-          // adaptation one frame of history and nothing else.
+          // not resolving into. They are successive samples of one quantity, so
+          // giving both the latest value costs one frame of history.
           if (dest_desc.bytes_per_block == 2)
             g_luminanceDestAddrs[dest_texture] = dest_desc.address;
           const uint32_t seq =
@@ -2899,19 +2750,16 @@ extern "C" REX_FUNC(sub_8255CE98) {
               // destinations and left the other two at whatever they held. The
               // guest was loading a stale or zero luminance, computing exposure
               // = g_KeyValue / 0 = +Inf, and parking 0x7F800000 in pixel
-              // constant c100 -- every shader reading it then output NaN, which
-              // blacks out the whole 3D layer of the main menu.
+              // constant c100 -- every shader reading it then output NaN.
               if (have_latest) {
                 // NEVER hand the guest a zero. sub_82AFB8A8 DIVIDES by this, so
                 // a zero makes exposure +Inf, and the adaptation that consumes
-                // it is a feedback filter: once `adapted` is Inf it stays Inf
-                // for the rest of the run however good the later readings are.
+                // it is a feedback filter: once `adapted` is Inf it stays Inf.
                 //
                 // Zero is our artefact, not the scene's -- it is what the
                 // reduction chain reads before it has ever run. The floor is
                 // g_MinLuminance (0.075), the value the guest's own pass clamps
-                // to, so this cannot push exposure anywhere the guest would not
-                // have gone by itself.
+                // to, so this cannot push exposure anywhere the guest would not.
                 constexpr uint32_t kMinLuminanceHalf = 0x2CCD;  // 0.075
                 if ((latest_bits & 0x7FFFu) == 0) {
                   latest_bits = kMinLuminanceHalf;
@@ -2962,18 +2810,14 @@ extern "C" REX_FUNC(sub_8255CE98) {
     //
     // Recording the mapping alone left the renderer binding the source target's
     // one live surface to every draw that sampled any texture resolved out of
-    // it. One guest surface is a shared scratch buffer -- six distinct textures
-    // were measured resolving from a single target in one run -- so all of them
-    // aliased one resource.
+    // it, and one guest surface is a shared scratch buffer -- six distinct
+    // textures were measured resolving from a single target in one run.
     //
-    // A resolve has nothing that needs deferred shader finalisation. Putting it
-    // in g_pendingHleDraws delayed it until VdSwap while ordinary draws went
-    // straight into HleFrameDraws, which REVERSED the guest command stream: a
-    // resolve issued before a sampling draw appeared after it in the host list.
-    //
-    // Every D3D9 hook holds HleGlobalMutex, so inserting directly here is both
-    // ordered and synchronized with FinishHleDraw. The rare kNoCode draw is the
-    // only entry that still belongs in g_pendingHleDraws.
+    // A resolve has nothing that needs deferred shader finalisation, and putting
+    // it in g_pendingHleDraws delayed it until VdSwap while ordinary draws went
+    // straight into HleFrameDraws, REVERSING the guest command stream. Every
+    // D3D9 hook holds HleGlobalMutex, so inserting directly here is both ordered
+    // and synchronized with FinishHleDraw.
     mx::hle::DrawCall resolve{};
     resolve.resolve_dest_texture = dest_texture;
     resolve.resolve_source_object = source->object;
@@ -2984,8 +2828,8 @@ extern "C" REX_FUNC(sub_8255CE98) {
     resolve.resolve_dest_width = dest_extent_width;
     resolve.resolve_dest_height = dest_extent_height;
     // Without an explicit destination point, the source rectangle's origin is
-    // the best available answer: a banded resolve names the band's place in
-    // the full image there. Zero when neither is supplied, which is the whole
+    // the best available answer: a banded resolve names the band's place in the
+    // full image there. Zero when neither is supplied, which is the whole
     // -surface case and correct for it.
     resolve.resolve_dest_x =
         have_dest_point ? dest_point[0] : (have_src_rect ? src_rect[0] : 0);
@@ -3005,7 +2849,6 @@ extern "C" REX_FUNC(sub_8255CE98) {
     // clear the source EDRAM surface. Bink relies on exactly that sequence --
     // render FE_Smoke into the shared 1280x720 scratch, resolve its 1280x430
     // texture, then clear the scratch before the following swap resolve.
-    // Dropping the clear makes the smoke texture become the next presented frame.
     if ((resolve_flags & 0x100u) && source_slot < 4) {
       mx::hle::DrawCall clear{};
       clear.clear_color_target = true;
@@ -3031,10 +2874,9 @@ extern "C" REX_FUNC(sub_8255CE98) {
       mx::hle::HleFrameDraws().push_back(std::move(clear));
 
       // Was a flat "first 12" cap, which spends its whole budget on whatever
-      // happens at boot -- here, twelve identical (0,0,0,0) lines -- and can
-      // never show a DIFFERENT colour arriving later. Keyed on the colour
-      // itself instead, so each distinct clear colour reports once however late
-      // it first appears. Same correction as the CLEAR log above.
+      // happens at boot -- here, twelve identical (0,0,0,0) lines. Keyed on the
+      // colour itself instead, so each distinct clear colour reports once
+      // however late it first appears.
       static std::set<std::array<uint32_t, 4>> s_resolveClearColors;
       const auto& cc = mx::hle::HleFrameDraws().back().clear_color_float;
       std::array<uint32_t, 4> key{};
@@ -3066,7 +2908,7 @@ extern "C" REX_FUNC(sub_8255CE98) {
       //
       // That is the missing factor the rider's arithmetic demands: its material
       // needs the pre-pass luminance to exceed 1.03, and that surface measures
-      // 0.109 and cannot exceed 0.619. A bias of +4 gives 1.74 and +5 gives 3.5.
+      // 0.109 and cannot exceed 0.619.
       //
       // The bit position is READ OUT OF THE GUEST, not guessed. Resolve's body
       // sub_8255BD48 builds RB_COPY_DEST_INFO and stores it at device+10788:
@@ -3077,7 +2919,7 @@ extern "C" REX_FUNC(sub_8255CE98) {
       // with v38 the Flags argument -- bits 7-12 destination format, 13-15
       // endian, and bits 16-21 = `v38 >> 26`. Xenia's registers.h puts
       // `int32_t copy_dest_exp_bias : 6` at +16, so the field is the TOP SIX
-      // BITS OF Flags, signed, and an arithmetic shift extracts it directly.
+      // BITS OF Flags, signed.
       const int32_t copy_dest_exp_bias = int32_t(resolve_flags) >> 26;
       REXLOG_INFO(
           "d3d9: resolve slot {} target 0x{:08X} {}x{} -> texture "
@@ -3158,11 +3000,10 @@ extern "C" REX_FUNC(sub_8254E748) {
         uint64_t draws_at_bind = 0;
       };
       static thread_local OrphanWatch t_watch[mx::hle::kMaxSamplers];
-      // ACCUMULATED, not logged. The first cut printed a line per window under a
-      // global cap of 24, and the whole cap was spent in the first 0.3 seconds
-      // by one Bink-era object -- so the surface it was built to measure never
-      // got a line. A cap shared across a population reports on whoever is
-      // loudest, not on whoever is asked about.
+      // ACCUMULATED, not logged. A line per window under a global cap of 24
+      // spent the whole cap in the first 0.3 seconds on one Bink-era object, so
+      // the surface it was built to measure never got a line. A cap shared
+      // across a population reports on whoever is loudest.
       OrphanWatch& w = t_watch[sampler];
       if (w.object && w.object != texture) {
         if (const auto po = g_resolveDestObjectPhys.find(w.object);
@@ -3235,9 +3076,9 @@ extern "C" REX_FUNC(sub_8254E748) {
   // only past a shape test that rejects every bind in the game bar a handful.
   //
   // Deliberately AFTER the device-fetch-file cross-check above, so it reads the
-  // corrected constants. Placed before it, this would silently miss every bind
-  // that took the fallback path -- and it would miss them by reading
-  // `valid == false`, which is indistinguishable here from "not a texture".
+  // corrected constants. Placed before it, this would miss every bind that took
+  // the fallback path -- by reading `valid == false`, which is
+  // indistinguishable here from "not a texture".
   if (sampler < mx::hle::kMaxSamplers) {
     const auto& binding = DeviceState().texture[sampler];
     NoteVideoShapeBind(sampler, texture, binding.fetch, binding.valid, device);
@@ -3272,7 +3113,7 @@ extern "C" REX_FUNC(sub_8254BF50) {
     // last-write-wins, and the first Stage F run read 65535x65535 out of it,
     // which built a nonsense viewport inverse. Whether that is the only viewport
     // this title sets or merely the most recent one is the difference between a
-    // wrong read and a wrong *model*, and a single value cannot say which.
+    // wrong read and a wrong *model*.
     ++g_viewportExtents[(uint64_t(v.width) << 32) | v.height];
   }
   orig_SetViewport(ctx, base);
@@ -3306,8 +3147,7 @@ extern "C" REX_FUNC(sub_8254B678) {
 //
 // Only these eight were matched uniquely. The other ~90 leaves in state.obj are
 // 20-56 bytes with no relocations and several are byte-identical to each other,
-// so a byte match on them would not be an identification. These eight are the
-// output-merger states the renderer needs.
+// so a byte match on them would not be an identification.
 //
 // BlendFactor has **zero call sites** in this title. It is hooked anyway so that
 // "never called" stays a measured fact.
@@ -3340,23 +3180,21 @@ MX_RENDER_STATE_HOOK(sub_82549900, orig_RsBlendFactor, mx::hle::kRsBlendFactor)
 // run -- 60 track points and 4 splat triangles on the first call, then zero for
 // 300+ frames of riding. This is the other end of that, found by searching for
 // stores to the point-count offset 0x22A8: every one is in this function, and it
-// is reached only through a method table, so who invokes it cannot be read
-// statically.
+// is reached only through a method table.
 //
 // It appends SIX vertices of five floats each, bumping the float count at +8872
 // thirty times, then
 //
 //     *(int*)(obj + 4*(half + 296)) += 2;      // obj+1184 / obj+1188
 //
-// two triangles per call. So "60 points, 4 splat-tris" is exactly TWO calls to
-// this function, ever.
+// two triangles per call. So "60 points, 4 splat-tris" is exactly TWO calls.
 //
 // AND IT IS GATED, on a different array from the one it fills:
 //
 //     if (*(uint*)(obj + 520*half + 656) < 0x40u) { ...append... }
 //
-// a second list capped at 64. So "the guest stopped splatting" has two possible
-// shapes the draw-side census cannot tell apart:
+// a second list capped at 64. So "the guest stopped splatting" has two shapes
+// the draw-side census cannot tell apart:
 //
 //     never called          -> the track system is not running; guest-side
 //     called and REFUSED    -> the cap is full and nothing drains it, which is
@@ -3418,9 +3256,8 @@ extern "C" REX_FUNC(sub_82AD0FC8) {
 //
 // PURE MEASUREMENT, and it exists because the draw-side census cannot answer the
 // question. `SQUARE TARGET` reports exactly ONE draw per frame into the 512x512
-// deform surface and a capture shows that draw writing ZERO. So the ruts are
-// missing because nothing seeds them, and "one draw" is consistent with two
-// completely different causes:
+// deform surface and a capture shows that draw writing ZERO, which is consistent
+// with two completely different causes:
 //
 //   the guest has no track segments to splat        -> guest-side, not ours
 //   the guest HAS them and the splat draw is lost   -> ours
@@ -3460,11 +3297,9 @@ extern "C" REX_FUNC(sub_82AD49A0) {
 
   // READ THE COUNTS BEFORE THE BODY RUNS. They are INPUTS: the body tests `if
   // (splat count > 0)` and draws on that, and the producer's own log proves they
-  // are reset every frame. Reading them AFTER the body returns whatever survived
-  // the pass, and if the consumer is what clears them that is a guaranteed zero
-  // no matter what the body did -- a census that reads a consumed value after
-  // consumption reports "there was nothing" for both "there was nothing" and
-  // "there was something and it was used".
+  // are reset every frame. Reading them AFTER returns whatever survived the
+  // pass, and if the consumer is what clears them that is a guaranteed zero
+  // whatever the body did.
   //
   // TILES stay read AFTER, and that is not an inconsistency: the body zeroes
   // obj+16944 and REBUILDS it, so the post-call value is the list it drew from.
@@ -3537,12 +3372,9 @@ extern "C" REX_FUNC(sub_82AD49A0) {
   //
   // The producer writes block `obj[124]`; this render reads block `!obj[124]` --
   // deliberately opposite, a double buffer. TERRAIN TRACK APPEND says the
-  // producer appends on every call and reaches 60 points / 4 triangles every
-  // frame, while this side reads 0 every frame. Both hooks are on the SAME
-  // object, so the data is not missing: it is in a block nobody reads.
-  //
-  // Reading both halves says so outright instead of leaving it to be inferred
-  // from two logs with different `half` conventions.
+  // producer reaches 60 points / 4 triangles every frame while this side reads 0
+  // every frame, and both hooks are on the SAME object, so the data is not
+  // missing: it is in a block nobody reads.
   //
   // THE TWO PLAIN ALLOCATIONS, obj+112 and obj+116. sub_82AF7240 creates them
   // with a plain allocator -- NOT a texture creation -- and memsets both to
@@ -3552,8 +3384,7 @@ extern "C" REX_FUNC(sub_82AD49A0) {
   // those two textures.
   //
   // So the deform RESOLVE DESTINATION and a plain guest allocation the guest
-  // memsets to 0x80 are the same bytes. Logging the pointers ties the runtime
-  // address in the resolve log to this field.
+  // memsets to 0x80 are the same bytes.
   const uint32_t buf0 = HostPageReadable(REX_RAW_ADDR(obj + 112))
                             ? REX_LOAD_U32(obj + 112)
                             : 0;
@@ -3582,16 +3413,12 @@ extern "C" REX_FUNC(sub_82AD49A0) {
   bump(census->maxSplats, splats);
   bump(census->maxTiles, tiles);
 
-  // POPULATION *AND* FIRES. One run printed at ran<=4 and every 300, and the
-  // deform body ran fewer than 300 times in a 46-second run -- so every sample
-  // came from the first three seconds, while the bike was STATIONARY. The
-  // producer does not run then. The whole riding window went unsampled and the
-  // line still read "1 with track points", which is true of the window it saw
-  // and says nothing about the one that matters.
-  //
-  // So: every call that HAS points or splats is printed (capped), the periodic
-  // sample is 60 rather than 300, and the cumulative counters carry the
-  // denominator as before.
+  // POPULATION *AND* FIRES. Printing at ran<=4 and every 300 sampled only the
+  // first three seconds of a 46-second run, while the bike was STATIONARY and
+  // the producer does not run -- so "1 with track points" was true of the window
+  // it saw and said nothing about the one that matters. Every call that HAS
+  // points or splats is printed (capped), the periodic sample is 60, and the
+  // cumulative counters carry the denominator.
   static std::atomic<uint64_t> s_firePrints{0};
   const bool interesting = points || splats;
   const bool fire_budget =

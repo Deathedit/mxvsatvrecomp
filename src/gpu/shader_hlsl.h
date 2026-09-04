@@ -6,9 +6,7 @@
 // Why this exists: the pixel side was never translated at all. A guest pixel
 // shader was decoded far enough to find its texture fetches, one binding was
 // picked, the rest was discarded, and the draw rendered `tex * vertexColour`.
-// Real shaders in this game carry up to 16 fetches across four samplers, and
-// rendering a 16-tap compositor pass as one tap times a colour is what collapses
-// the intro chain to a uniform field.
+// Real shaders in this game carry up to 16 fetches across four samplers.
 //
 // Why an emitter and not the SDK's DxbcShaderTranslator: that translator is
 // Xenia's, and using it means adopting Xenia's binding model wholesale -- EDRAM
@@ -17,9 +15,8 @@
 // CompileShader path compiles and the existing root signature can feed.
 //
 // The walk is deliberately the same one shader_alu.cpp interprets and
-// shader_ucode.cpp decodes: bound the CF section at the lowest exec target, then
-// run the exec blocks in order. Two walks that disagree would be worse than one
-// walk that is wrong, so where this file makes a semantic choice it matches the
+// shader_ucode.cpp decodes. Two walks that disagree would be worse than one walk
+// that is wrong, so where this file makes a semantic choice it matches the
 // interpreter's, and where it cannot it refuses.
 //
 // SDK-free header, same rule as shader_ucode.h and shader_alu.h.
@@ -47,8 +44,7 @@ inline constexpr uint32_t kMaxHlslInterpolators = 16;
 // the emitted pixel shader declares its input struct with exactly this many
 // interpolators, so a vertex stage offering a different count produces two
 // signatures that cannot link and CreateGraphicsPipelineState fails with no
-// message. Not hypothetical -- emitting at kMaxHlslInterpolators while the
-// renderer's vertex shader carried 8 is exactly how it first failed.
+// message.
 //
 // Eight because the widest input_mask measured in this game is 0xFF (r0-r7).
 // Raising it costs vertex bandwidth on every translated draw; lowering it would
@@ -129,13 +125,10 @@ struct HlslShader {
   // heap within a frame.
   //
   // `sampler_slot_guest[i]` is the guest sampler that slot i was assigned, for
-  // the first `sampler_count` slots.
-  //
-  // Measured at 144 distinct shaders: 8 slots refused 5 of them outright. Must
-  // equal DrawCall::kMaxPixelTextures and the renderer's
-  // kTranslatedSamplerSlots -- that last is the width of the descriptor table,
-  // so the three are one number wearing three names and d3d12_game.cpp
-  // static_asserts them together.
+  // the first `sampler_count` slots. Measured at 144 distinct shaders: 8 slots
+  // refused 5 of them outright. Must equal DrawCall::kMaxPixelTextures and the
+  // renderer's kTranslatedSamplerSlots -- one number wearing three names, which
+  // d3d12_game.cpp static_asserts together.
   static constexpr uint32_t kMaxSamplerSlots = 16;
   uint32_t sampler_count = 0;
   uint32_t sampler_slot_guest[kMaxSamplerSlots] = {};
@@ -146,12 +139,11 @@ struct HlslShader {
   // ShaderVisibility scopes a register to a stage, so a VERTEX-visible table at
   // s0 and a PIXEL-visible one at s0 are different bind points. The two shaders
   // are translated and cached independently, so their compact slot 0 IS a
-  // different guest sampler -- the root signature keeps them apart, not the
-  // register number.
+  // different guest sampler -- the root signature keeps them apart.
   //
-  // The first attempt moved the vertex stage to t17/s16 to "avoid" a collision
-  // that does not exist. It is also impossible: vs_5_0 has exactly 16 sampler
-  // slots, so s16 is not a register and FXC rejects the shader with X4509.
+  // Moving the vertex stage to t17/s16 to "avoid" the collision is also
+  // impossible: vs_5_0 has exactly 16 sampler slots, so s16 is not a register
+  // and FXC rejects the shader with X4509.
   static constexpr uint32_t kPixelTextureBaseRegister = 0;
   static constexpr uint32_t kPixelSamplerBaseRegister = 0;
   static constexpr uint32_t kVertexTextureBaseRegister = 0;
@@ -172,11 +164,9 @@ struct HlslShader {
   // Bit i set = register i is read before this shader ever writes it, i.e. it
   // arrives as an input. For a pixel shader these are the interpolators the
   // vertex stage must supply; for a vertex shader they are the vfetch
-  // destinations.
-  //
-  // Reported rather than assumed because the two stages have to agree on a
-  // linkage and neither blob states one. The caller owns that decision; the
-  // emitter only says what it reads.
+  // destinations. Reported rather than assumed because the two stages have to
+  // agree on a linkage and neither blob states one: the caller owns that
+  // decision, the emitter only says what it reads.
   uint32_t input_mask = 0;
 
   // Bit i set = the shader exports interpolator i (VS), or writes colour
@@ -190,9 +180,9 @@ struct HlslShader {
   // it: a point size, a misc output, or an interpolator past the agreed linkage
   // width. Reported rather than dropped in silence, because "the walk saw no
   // exports" and "the walk saw exports and threw them away" are different
-  // defects with different fixes. Destinations >= 32 are not represented --
-  // those are MEMORY EXPORT and are counted separately below, because the guard
-  // that fills this mask (`dest < 32`) excluded them by construction.
+  // defects. Destinations >= 32 are not represented -- those are MEMORY EXPORT
+  // and are counted separately below, because the guard that fills this mask
+  // (`dest < 32`) excluded them by construction.
   uint32_t dropped_export_mask = 0;
 
   // Number of ALU exports to a MEMORY EXPORT register: ucode.h names them
@@ -201,24 +191,23 @@ struct HlslShader {
   // implement it -- such an export is dropped.
   //
   // This exists because the drop was not merely unimplemented, it was
-  // UNCOUNTABLE. The mask above is written under `if (dest < 32)`, so a
-  // memexport skipped the mask and the else-branch alike and left no trace: from
-  // outside, a shader that exports to memory and one that exports nothing read
-  // identically.
+  // UNCOUNTABLE: the mask above is written under `if (dest < 32)`, so a
+  // memexport skipped the mask and the else-branch alike, and from outside a
+  // shader that exports to memory and one that exports nothing read identically.
   //
-  // A nonzero count here does NOT by itself mean a defect -- it means the
-  // question "does this title use memory export?" now has an answer.
+  // A nonzero count does NOT by itself mean a defect -- it means the question
+  // "does this title use memory export?" now has an answer.
   uint32_t memexport_count = 0;
 
   // PS only. Bit i set = the shader EXPORTED to colour target i, so export_mask
   // reports it as produced, but no export to it ever assigned a channel.
   //
   // An export whose vector, scalar, constant-0 and constant-1 write masks are
-  // all empty assigns nothing, and per the reference that is correct (ucode.h:
-  // "vector_write_mask 0, scalar_write_mask 0 ... unchanged"). What is not
-  // obviously correct is still declaring the target produced, because
+  // all empty assigns nothing, and per the reference that is correct
+  // (ucode.h: "vector_write_mask 0, scalar_write_mask 0 ... unchanged"). What is
+  // not obviously correct is still declaring the target produced, because
   // `xe_colorN` then keeps its float4(0,0,0,0) initialiser and the shader
-  // compiles to `mov o0.xyzw, l(0,0,0,0)` -- one that opaquely paints black.
+  // compiles to `mov o0.xyzw, l(0,0,0,0)`.
   //
   // That is the exact body of the pixel shader on the 35-index draw which
   // replaces the menu background with (0,0,0,0), and whose guest state is blend
@@ -228,10 +217,10 @@ struct HlslShader {
 
   // The highest constant index the shader reads within its OWN stage bank, or 0
   // if it reads none. Each stage indexes its bank from 0: the vertex bank is ALU
-  // constants 0-255 at device+0x780, the pixel bank is 256-511 at device+0x1780.
-  // Proven from D3DDevice_DrawVertices' own flush, which passes Xenos register
+  // constants 0-255 at device+0x780, the pixel bank is 256-511 at device+0x1780,
+  // proven from D3DDevice_DrawVertices' own flush, which passes Xenos register
   // base 0x4000 for the first and 0x4400 for the second. Applying that base is
-  // the caller's job at upload time, so this index is never above 255.
+  // the caller's job, so this index is never above 255.
   uint32_t max_const_index = 0;
   // Bitmask of the xe_c[] slots the shader actually reads, one bit per slot.
   // Identity by CONSTANT USE: the SpeedTree 3D vegetation shaders read
@@ -253,15 +242,14 @@ struct HlslShader {
   // The name is now historical. It was accurate while nothing read xe_p0 at all;
   // since per-instruction predication landed, p0 written here is obeyed by any
   // `(p0)` ALU instruction that follows, and in the vertex stage by
-  // cond_exec_pred as well. What is still unobeyed is narrower and has its own
-  // counters below. Kept under the old name so a dump from before the change and
-  // one from after still line up on the same field.
+  // cond_exec_pred as well. Kept under the old name so a dump from before the
+  // change and one from after still line up on the same field.
   uint32_t unhonoured_predicate_ops = 0;
 
   // Count of ALU instructions carrying their own predicate bits, emitted as
   // `if (xe_p0 == condition) { ... }`. Seen and obeyed are one number: unlike
   // the exec-level blocks there is no stage where this is skipped, because an
-  // ALU instruction never samples and so its body is always legal flow control.
+  // ALU instruction never samples.
   //
   // This was the intro logo. Its pixel shader ends
   //
@@ -271,8 +259,7 @@ struct HlslShader {
   //
   // and run unpredicated it forces alpha to a compile-time 0 -- FXC even
   // dead-strips the tfetch feeding it, which is how a one-texture DXBC came out
-  // of a two-texture shader. The quad rasterised, output white, and blended to
-  // nothing.
+  // of a two-texture shader.
   uint32_t predicated_alu_ops = 0;
 
   // Count of TEXTURE FETCH instructions carrying predicate bits, all HONOURED by
@@ -281,25 +268,19 @@ struct HlslShader {
   // Previously counted and refused, on the grounds that .Sample() needs
   // derivatives and is illegal in varying flow control. That objection is real
   // but applies only to putting the SAMPLE inside the branch: a fetch's only
-  // effect is writing its destination register, so sampling unconditionally and
-  // predicating the write is observationally identical.
+  // effect is writing its destination register.
   //
   // Found in Xenia's dump of this title: 53 predicated fetches across 4 shaders,
   // every one carrying FetchValidOnly=false -- the guest telling the hardware
-  // NOT to make them lane-conditional.
-  //
-  // Does NOT cover p0-gated exec blocks, which remain unhonoured in the pixel
-  // stage; see honoured_pred_exec_blocks.
+  // NOT to make them lane-conditional. Does NOT cover p0-gated exec blocks; see
+  // honoured_pred_exec_blocks.
   uint32_t predicated_fetches = 0;
 
   // Count of PREDICATED EXEC blocks -- kCondExecPred / kCondExecPredClean and
   // their *End forms. The emitter walks them like ordinary execs, so their body
-  // runs UNCONDITIONALLY.
-  //
-  // Counted rather than refused: if the population is zero on this game, the
-  // setp_* value translation is harmless and there is nothing to refuse; if it
-  // is non-zero, this names the shaders to decide about instead of refusing a
-  // working draw on suspicion.
+  // runs UNCONDITIONALLY. Counted rather than refused: a zero population means
+  // there is nothing to refuse, and a non-zero one names the shaders to decide
+  // about instead of refusing a working draw on suspicion.
   //
   // SPLIT, because these were one counter conflating two entirely different
   // mechanisms. Confirmed against Xenia's ucode.h:258 (the ReXGlue SDK copy is
@@ -322,9 +303,9 @@ struct HlslShader {
   // A GAP HERE IS NOT A CORRECTNESS GAP, having been described as one here for
   // over a week. The exec-level predicate is a WAVEFRONT branch: "if any of the
   // invocations passes the predicate check, all of them will enter the exec". It
-  // never gated a lane. Per-lane correctness is the INSTRUCTION predicates,
-  // measured at 194 ALU + 46 fetch inside cond_exec_pred blocks in this title,
-  // all 240 individually predicated. This number is a speed figure.
+  // never gated a lane. Per-lane correctness is the INSTRUCTION predicates, all
+  // 240 of which are individually predicated in this title. This is a speed
+  // figure.
   uint32_t honoured_pred_exec_blocks = 0;
 
   // Count of fetch instructions skipped because their opcode is not one this
@@ -335,15 +316,13 @@ struct HlslShader {
   // Skipped and counted rather than refused. Before the three-way classification
   // existed, `!= kTextureFetch` sent every one of these into the VERTEX fetch
   // branch, where a pixel shader dropped it and a vertex shader read its bits as
-  // a VertexFetchInstruction and refused the whole shader on the garbage that
-  // landed in exp_adjust.
+  // a VertexFetchInstruction and refused the whole shader on garbage.
   //
   // getGradients IS NOW HONOURED and is no longer in this bucket. The sentence
   // that used to stand here -- "the one pixel shader that uses getGradients and
   // compiles fine without it" -- was true about compiling and wrong about
-  // everything else: that shader is ps_hft_fback, the terrain's virtual-texture
-  // feedback pass, and skipping the op left it computing a CONSTANT LOD from a
-  // stale interpolator. "Compiles fine without it" is not a test.
+  // everything else: that shader is ps_hft_fback, and skipping the op left it
+  // computing a CONSTANT LOD from a stale interpolator.
   uint32_t unhonoured_fetch_ops = 0;
 
   // --- vertex fetch, only when the caller asked for it ----------------------
@@ -355,8 +334,8 @@ struct HlslShader {
   // Ordinals follow program order, which is the order DecodeVertexShaderFetches
   // pushes its attributes in -- both walk the same stream the same way.
   // `fetch_slot` is still carried explicitly rather than inferred from that
-  // pairing, because a silent divergence between the two walks would misaddress
-  // geometry with no symptom at the point of the mistake.
+  // pairing, because a silent divergence would misaddress geometry with no
+  // symptom at the point of the mistake.
   static constexpr uint32_t kMaxVertexFetches = 32;
   uint32_t vertex_fetch_count = 0;
   uint32_t vertex_fetch_slot[kMaxVertexFetches] = {};
@@ -368,8 +347,8 @@ struct HlslShader {
   // The GPU fetch path handles these by indexing with the named register and
   // copying the whole stream. The CPU path CANNOT: it is declaration-driven,
   // finds attributes by usage, and never executes the ALU that produces the
-  // index -- so for these streams there is no value it could read. This flag
-  // exists so it can say so instead of producing confident nonsense.
+  // index. This flag exists so it can say so instead of producing confident
+  // nonsense.
   uint32_t computed_index_streams = 0;
 
   // The same fact per FETCH ORDINAL rather than per stream, because the
@@ -390,8 +369,7 @@ struct HlslShader {
 // SV_VertexID, instead of reading input elements the CPU unpacked. The two forms
 // are NOT interchangeable: the fetch form leaves input_mask empty and needs an
 // empty input layout plus xe_vf[], the other needs an input layout built from
-// input_mask. Emit both and keep both -- the CPU path still needs the second
-// whenever the first refuses.
+// input_mask. Emit both and keep both.
 //
 // Does not throw and does not loop unbounded. On failure `out.source` is empty
 // and `out.status` says why.

@@ -41,13 +41,10 @@ bool D3D12Renderer::EnsureYuvPlanes(const GameDraw& draw,
   }
   const uint32_t kPlanes = kMaxDrawPlanes;
   // One block per composite draw per frame in flight. Beyond the budget the draw
-  // is refused rather than aliasing an earlier draw's descriptors, which is the
-  // failure this striping exists to prevent.
-  //
-  // Counted because the refusal is otherwise invisible and drops a video draw in
-  // exactly the way a missing-video defect looks. Two concurrent streams is 2 per
-  // frame against kMaxYuvDrawsPerFrame, so this should read zero -- and if it
-  // ever does not, the budget is the bug, not the video.
+  // is refused rather than aliasing an earlier draw's descriptors. Counted
+  // because the refusal is otherwise invisible and drops a video draw in exactly
+  // the way a missing-video defect looks: two concurrent streams is 2 per frame
+  // against kMaxYuvDrawsPerFrame, so this should read zero.
   if (m_yuvDrawsThisFrame >= kMaxYuvDrawsPerFrame) {
     ++m_yuvRefusedBudget;
     return false;
@@ -83,11 +80,9 @@ bool D3D12Renderer::EnsureYuvPlanes(const GameDraw& draw,
         plane.height != src->height || plane.format != format) {
       // Retire the old resources through the deferred-release list rather than
       // dropping them here: the GPU may still be reading last frame's plane, and
-      // a command list does not keep the resources it references alive.
-      //
-      // Through RetireResource rather than building a RetiredFrame inline. The
-      // inline form was copied to three sites and every copy carried the same
-      // off-by-one fence tag; one owner means one place to be wrong.
+      // a command list does not keep the resources it references alive. Through
+      // RetireResource rather than an inline RetiredFrame -- the inline form was
+      // copied to three sites and every copy carried the same off-by-one fence.
       RetireResource(std::move(plane.resource));
       for (auto& up : plane.upload) {
         RetireResource(std::move(up));
@@ -210,11 +205,9 @@ bool D3D12Renderer::EnsureYuvPlanes(const GameDraw& draw,
 }
 
 // Fills an existing game-texture resource from a decoded payload, and records
-// which content_version it now holds.
-//
-// Split out of EnsureGameTexture so the first fill and every later refill are
-// the same code. Refills exist because Scaleform repacks its glyph atlas under a
-// stable cache key.
+// which content_version it now holds. Split out of EnsureGameTexture so the
+// first fill and every later refill are the same code; refills exist because
+// Scaleform repacks its glyph atlas under a stable cache key.
 //
 // The upload buffer is per frame in flight: a refill recorded this frame must
 // not write over the staging bytes an earlier frame's CopyTextureRegion may
@@ -227,11 +220,9 @@ bool D3D12Renderer::UploadGameTexture(GameTexture& entry,
 
   // One subresource per (level, slice). A cube arrives as six tightly packed 2D
   // images in `src.data`; the host wants each at its own aligned footprint
-  // offset.
-  //
-  // The two sides nest OPPOSITELY. The guest stores array slices inside a level
-  // and the payload keeps that order; D3D12 numbers subresources
-  // mip + slice * MipLevels, slices outermost. Hence the two-index walk.
+  // offset. The two sides nest OPPOSITELY: the guest stores array slices inside
+  // a level and the payload keeps that order, while D3D12 numbers subresources
+  // mip + slice * MipLevels, slices outermost.
   const uint32_t slices = std::max<uint32_t>(td.DepthOrArraySize, 1);
   const uint32_t levels = std::max<uint32_t>(td.MipLevels, 1);
   const uint32_t subresources = slices * levels;
@@ -239,12 +230,9 @@ bool D3D12Renderer::UploadGameTexture(GameTexture& entry,
   // Heap-allocated, deliberately. These were fixed arrays of 6 * 14 -- six
   // slices, because six is a cube and a cube was the only array texture that
   // existed. A true 3D VOLUME has up to 1024 slices, and a colour-grading LUT of
-  // 16 or 32 sailed past the guard and returned false: 428 `upload-failed` in the
-  // first run with volumes enabled, which is the whole texture silently absent.
-  //
-  // Sized from the resource rather than from a constant, so the next dimension
-  // that turns up cannot reintroduce the same cap. Reused across calls to keep
-  // the allocation off the per-texture path.
+  // 16 or 32 sailed past the guard and returned false: 428 `upload-failed` in
+  // the first run with volumes enabled. Sized from the resource rather than from
+  // a constant, and reused across calls to keep the allocation off the path.
   static thread_local std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> footprints;
   static thread_local std::vector<UINT> rowCounts;
   static thread_local std::vector<UINT64> rowByteCounts;
@@ -354,12 +342,9 @@ bool D3D12Renderer::EnsureGameTexture(
     // descriptor already published in the heap points here.
     //
     // Compared on upload_version, a hash of the DECODED BYTES, NOT on
-    // content_version -- that one is a 2 KB sample of guest memory, right for
-    // deciding whether to re-decode and blind to a sparse write. Gating the
-    // refill on it meant every re-decode the flat-retry backoff forced was
-    // computed, cached and then thrown away here: the terrain index map was
-    // decoded 137 times in one run and this resource still held the first
-    // decode's bytes.
+    // content_version -- that one is a 2 KB sample of guest memory, blind to a
+    // sparse write. Gating the refill on it meant every re-decode the flat-retry
+    // backoff forced was computed, cached and then thrown away here.
     if (it->second.uploadedVersion != texture->upload_version)
       UploadGameTexture(it->second, *texture);
     return true;
@@ -529,8 +514,7 @@ bool D3D12Renderer::EnsureGameTexture(
   // bits per component, so 6 and 7 are representable, but
   // D3D12_SHADER_COMPONENT_MAPPING defines only 0-5. DescribeHleTexture2D stores
   // the fetch swizzle raw, so this used to hand the driver an undefined
-  // component mapping. `& 5` maps 6 -> 4 (constant 0) and 7 -> 5 (constant 1)
-  // and leaves 0-5 alone.
+  // component mapping. `& 5` maps 6 -> 4 (constant 0) and 7 -> 5 (constant 1).
   const auto host_component = [](uint32_t c) -> UINT {
     return c >= 4u ? UINT(c & 5u) : UINT(c);
   };
@@ -558,26 +542,20 @@ bool D3D12Renderer::EnsureGameTexture(
 }
 
 // Unload the least recently used guest textures until the cache is back under
-// the high-water mark.
-//
-// The cache had no unload path at all -- find and emplace, no erase anywhere --
-// so every distinct fetch constant a session ever saw held its SRV slot until
-// the device died. Swapping riders is the pathological case: each one streams
-// its gear, helmet and goggles to fresh guest allocations, every one a new key.
+// the high-water mark. The cache had no unload path at all -- find and emplace,
+// no erase anywhere -- so every distinct fetch constant a session ever saw held
+// its SRV slot until the device died.
 //
 // LRU by the fence a texture was last bound on, which is monotonic and already
 // maintained. Textures touched by the frame being recorded are NOT evictable:
 // their descriptors are referenced by a command list that has not been submitted
-// yet. That is also why eviction can legitimately fail -- if a single frame
-// really does bind more than the high-water mark of distinct textures, there is
-// nothing safe to drop, and the honest outcome is to say so.
+// yet. That is also why eviction can legitimately fail.
 void D3D12Renderer::EvictGameTexturesToHighWater() {
   // DESCRIPTOR PRESSURE, not texture count. The SRV heap is shared: render
   // targets, snapshots and the video planes hold slots too -- measured at 117 in
   // a menu session, srv 824 against 707 cached textures. Thresholding on
   // m_gameTextures.size() against a figure derived from the whole heap leaves
-  // the real margin unknown, and in that session it was 11 slots rather than the
-  // intended 128.
+  // the real margin unknown, and in that session it was 11 slots rather than 128.
   const uint32_t in_use =
       m_nextGameSrvDescriptor - uint32_t(m_freeGameSrvDescriptors.size());
   if (in_use <= kGameTextureHighWater) return;
@@ -620,18 +598,14 @@ void D3D12Renderer::RetireResource(
     Microsoft::WRL::ComPtr<ID3D12Resource>&& res) {
   if (!res) return;
   // Tag with the fence the frame BEING RECORDED will signal -- m_fenceValue + 1
-  // -- not m_fenceValue itself.
-  //
-  // MoveToNextFrame does `++m_fenceValue` and *then* signals it, so while a frame
-  // is being recorded m_fenceValue names the PREVIOUS submission. Tagging with it
-  // told DrainRetired the resource was reclaimable the moment the previous frame
-  // finished -- while the command list still referencing it was executing. A
-  // use-after-free with a one-frame window.
+  // -- not m_fenceValue itself. MoveToNextFrame does `++m_fenceValue` and *then*
+  // signals it, so while a frame is being recorded m_fenceValue names the
+  // PREVIOUS submission: tagging with it told DrainRetired the resource was
+  // reclaimable while the command list still referencing it was executing.
   //
   // Found by DRED: CopyTextureRegion faulting on a page whose allocations were
   // all RECENTLY FREED, type 34 (RESOURCE). Intermittent because retirement only
-  // happens when a target is REPLACED, so it needs a level load or a resolution
-  // change to bite at all.
+  // happens when a target is REPLACED.
   const uint64_t pending = m_fenceValue + 1;
   RetiredFrame& r = (!m_retired.empty() && m_retired.back().fence == pending)
                         ? m_retired.back()
@@ -689,7 +663,7 @@ bool D3D12Renderer::CreatePooledSurface(GameRenderTarget& entry, uint32_t width,
   //
   // A recycled slot before a fresh one, matching EnsureGameTexture. Without this
   // the free list EvictGameSnapshots pushes to would only ever be drained by
-  // textures, and the descriptor allocator would stay a ratchet.
+  // textures.
   if (reuseSrvIndex != UINT32_MAX) {
     entry.srvIndex = reuseSrvIndex;
   } else if (!m_freeGameSrvDescriptors.empty()) {
@@ -742,17 +716,14 @@ void D3D12Renderer::NoteEdramOwnership(uint32_t object, uint32_t width,
   //                   64194 takeovers (17029 same-extent, 0 format-differs)
   //
   // Every base in the run is shared. On the console all those objects ARE the
-  // same physical memory, so a surface binding a base sees what the previous
-  // owner left there; here each object owns a separate D3D12 texture and sees
-  // nothing.
-  //
-  // The 17029 SAME-EXTENT takeovers are the tractable subset: identical size and
-  // 0 differing in format, so a straight CopyResource at the moment of takeover
-  // would carry the contents across. The remainder change extent and would need
-  // a real EDRAM model.
+  // same physical memory; here each object owns a separate D3D12 texture and
+  // sees nothing. The 17029 SAME-EXTENT takeovers are the tractable subset -- a
+  // straight CopyResource at the moment of takeover would carry the contents
+  // across -- while the remainder change extent and would need a real EDRAM
+  // model.
   //
   // This is the actual shape of what "the render target extent is wrong" turned
-  // out to be. The extent is the guest's own surface size and is not wrong; the
+  // out to be: the extent is the guest's own surface size and is not wrong; the
   // ALIASING is unmodelled.
   const auto last = m_edramLastOwner.find(edramBase);
   if (last != m_edramLastOwner.end() && last->second.object != object) {
@@ -793,13 +764,10 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameRenderTarget(
         it->second.format != format) {
       // A guest heap address reused at a different size. This used to refuse,
       // which made the object unroutable for the REST OF THE RUN -- every later
-      // draw onto it fell back to the main target and overpainted the scene,
-      // the exact bug offscreen routing exists to prevent. Measured 271 such
-      // refusals in one run.
-      //
-      // Replace instead. Both descriptor slots are reusable in place; only the
-      // resource changes. The old one goes through the retirement list because
-      // the GPU may still be reading it.
+      // draw onto it fell back to the main target and overpainted the scene, the
+      // exact bug offscreen routing exists to prevent. Replace instead: both
+      // descriptor slots are reusable in place, and the old resource goes
+      // through the retirement list because the GPU may still be reading it.
       ++m_rtRejectResized;
       reuseRtvIndex = it->second.rtvIndex;
       reuseSrvIndex = it->second.srvIndex;
@@ -872,14 +840,12 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameRenderTarget(
   rtv.ptr += SIZE_T(entry.rtvIndex) * m_gameRtvDescriptorSize;
   m_device->CreateRenderTargetView(entry.resource.Get(), nullptr, rtv);
 
-  // Clear once, HERE, at creation -- not only when a draw first lands on it.
-  //
-  // The per-frame clear below is gated on usedThisFrame, deliberately, so a
-  // target carries its contents across frames; that is what a resolve source
-  // needs. But it means a target created and never drawn into is never cleared
-  // at all, and CreateCommittedResource does not guarantee zeroed memory. The
-  // resolve branch copies such a target into a snapshot regardless, so undefined
-  // GPU memory reaches the screen -- which shows up as a flat uniform colour.
+  // Clear once, HERE, at creation -- not only when a draw first lands on it. The
+  // per-frame clear below is gated on usedThisFrame, deliberately, so a target
+  // carries its contents across frames, which is what a resolve source needs.
+  // But it means a target created and never drawn into is never cleared at all,
+  // and CreateCommittedResource does not guarantee zeroed memory, so the resolve
+  // branch would copy undefined GPU memory into a snapshot.
   {
     D3D12_RESOURCE_BARRIER toRt = {};
     toRt.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -912,8 +878,7 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameRenderTarget(
 // and tDepthEnable forced false, so the whole deferred scene ran with no depth
 // buffer. That is not only wrong for depth testing: the guest RESOLVES its depth
 // surface to a texture to reconstruct world position in the lighting pass, and
-// with nothing to copy every one of those resolves missed -- one source missed
-// 224 times in a single sample window.
+// with nothing to copy every one of those resolves missed.
 //
 // R32_TYPELESS so one resource serves both views: D3D12 will not give a
 // D32_FLOAT resource a colour SRV, and a resolve has to be sampled.
@@ -950,19 +915,15 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameDepthTarget(
   //   0x2123CB24  1280x80   surface=0x14000500  base=0x280   light band 2
   //
   // 640 + 80 = 720: one EDRAM surface the guest views as two bands. Keyed by
-  // OBJECT we handed the light pass a fresh, empty depth buffer and cleared it
-  // to 1.0, so every light-volume fragment passed LEqual against the far plane.
-  // The volume count is entirely depth-driven -- increment on back faces,
-  // decrement on front -- so both fired everywhere and cancelled exactly,
-  // leaving stencil at its cleared 128 while the light quad tests Greater(128).
-  // EVERY deferred light was discarded.
-  //
-  // [[edram-aliasing-unmodelled]] recorded this as "measurably harmless". It was
-  // not; it was the whole light pass.
+  // OBJECT we handed the light pass a fresh, empty depth buffer cleared to 1.0,
+  // so every light-volume fragment passed LEqual against the far plane. The
+  // volume count is entirely depth-driven -- increment on back faces, decrement
+  // on front -- so both fired everywhere and cancelled exactly, and EVERY
+  // deferred light was discarded. [[edram-aliasing-unmodelled]] recorded this as
+  // "measurably harmless"; it was the whole light pass.
   //
   // The viewport comes from the COLOUR target, not this one, so handing back a
-  // TALLER surface does not disturb the band's rasterisation: band 1 is 1280x640
-  // at origin, exactly the region it aliases.
+  // TALLER surface does not disturb the band's rasterisation.
   uint32_t bandOwner = 0, bandRow = 0;
   if (auto ait = m_gameDepthAliases.find(object);
       ait != m_gameDepthAliases.end()) {
@@ -999,13 +960,10 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameDepthTarget(
     if (owner.edramBase < edramBase && owner.height > height) {
       // TILES PER ROW, ROUNDED UP. A tile is 80x16 samples, so a surface 768
       // wide occupies ceil(768/80) = 10 tiles per row and 400 tiles is 40 tile
-      // rows = 640 pixel rows.
-      //
-      // The old form -- delta * 80 * 16 / width -- divides by the width rather
-      // than by whole tiles, so it is only right when the width is a multiple of
-      // 80. It is for the 1280-wide light bands and it is NOT for 768: it
-      // produced 666 instead of 640, and 666 + 384 > 1024 rejected the band --
-      // which is why the shadow map kept resolving as its clear value.
+      // rows = 640 pixel rows. The old form -- delta * 80 * 16 / width -- divides
+      // by the width rather than by whole tiles, so it is only right when the
+      // width is a multiple of 80: it produced 666 instead of 640 for the 768-
+      // wide shadow map, and 666 + 384 > 1024 rejected the band.
       const uint32_t tilesPerRow = (width + 79u) / 80u;
       const uint32_t rows =
           tilesPerRow ? (edramBase - owner.edramBase) / tilesPerRow * 16u : 0u;
@@ -1076,17 +1034,15 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameDepthTarget(
 
 // A snapshot is an offscreen surface like any other -- same struct, same
 // creation, same budget -- so EnsureGameSnapshot defers to
-// EnsureGameRenderTarget's storage rather than duplicating it. The only
-// difference is the key: destination texture object, not source target object.
-// That is what stops six resolves out of one shared scratch surface from
-// aliasing each other. It sits below, past the two exposure-readback helpers.
+// EnsureGameRenderTarget's storage. The only difference is the key: destination
+// texture object, not source target object, which is what stops six resolves out
+// of one shared scratch surface from aliasing each other.
 
-// Hand the frame-old 1x1 exposure result to the guest.
-//
-// Called at the top of a frame, so the slot about to be reused has already been
-// waited out by MoveToNextFrame and the map is guaranteed non-blocking. Only the
-// R channel is published: the reduction targets are R16G16_FLOAT and the guest's
-// destination is a single FMT_16_FLOAT texel.
+// Hand the frame-old 1x1 exposure result to the guest. Called at the top of a
+// frame, so the slot about to be reused has already been waited out by
+// MoveToNextFrame and the map is guaranteed non-blocking. Only the R channel is
+// published: the reduction targets are R16G16_FLOAT and the guest's destination
+// is a single FMT_16_FLOAT texel.
 void D3D12Renderer::DrainLuminanceReadback() {
   const uint32_t count = m_luminancePending[m_frameIndex];
   if (!count) return;
@@ -1137,10 +1093,7 @@ void D3D12Renderer::DrainLuminanceReadback() {
 // Copy a freshly written 1x1 snapshot into this frame's readback buffer. The
 // snapshot is in PIXEL_SHADER_RESOURCE when this runs -- the resolve path just
 // put it there -- and is returned to it, because the composite samples it later
-// in the same frame.
-//
-// SurfaceTallyFor is linear over a handful of slots: the population is two or
-// three destinations and a map would be ceremony.
+// in the same frame. SurfaceTallyFor is linear over a handful of slots.
 D3D12Renderer::SurfaceReadbackTally* D3D12Renderer::SurfaceTallyFor(
     uint32_t destObject) {
   SurfaceReadbackTally* dullest = nullptr;
@@ -1154,11 +1107,8 @@ D3D12Renderer::SurfaceReadbackTally* D3D12Renderer::SurfaceTallyFor(
     // this table with short-lived destinations that are ineligible every time,
     // and first-come-first-served let them hold every slot: one run overflowed
     // 73,185 times and the deform destination -- the one the table exists to
-    // describe -- had no row at all while the census header was naming it.
-    //
-    // A row that has ever been served or has ever lost the slot is an outcome
-    // and stays. Among the rest the least-seen goes, so a destination that is
-    // merely frequent cannot displace one that is merely new.
+    // describe -- had no row at all. A row that has ever been served or lost the
+    // slot is an outcome and stays; among the rest the least-seen goes.
     if (t.won || t.lostBusy) continue;
     if (!dullest || t.seen < dullest->seen) dullest = &t;
   }
@@ -1179,12 +1129,9 @@ D3D12Renderer::SurfaceReadbackTally* D3D12Renderer::SurfaceTallyFor(
 // and it is the entire reason the terrain deformation never came back: its
 // resolve puts a 128x32 tile into a 2048x2048 accumulation, the footprint came
 // to 16 MB, and the size check below returned WITHOUT INCREMENTING ANY COUNTER.
-// Every census this path printed therefore showed the deform destination nowhere
-// at all, which read as "never called".
 //
 // One readback per frame. If a second eligible destination appears the tally now
-// says so explicitly (lostBusy), instead of it having to be inferred from a
-// global refusal count that ineligible callers also increment.
+// says so explicitly (lostBusy).
 void D3D12Renderer::QueueSurfaceReadback(GameRenderTarget* snap,
                                          uint32_t destObject,
                                          uint32_t destWidth,
@@ -1195,12 +1142,10 @@ void D3D12Renderer::QueueSurfaceReadback(GameRenderTarget* snap,
   if (!destWidth || !destHeight) return;
   SurfaceReadbackTally* tally = SurfaceTallyFor(destObject);
   if (tally) ++tally->seen;
-  // Every exit below is one of these three, so `seen` is a real denominator.
-  //
-  // The EXTENT is recorded here too, not only on a win. It used to be set in the
-  // won branch alone, so every refused destination printed `0x0` and the census
-  // could not say WHAT was being refused -- the whole question when 55,702
-  // rejects share one reason code.
+  // Every exit below is one of these three, so `seen` is a real denominator. The
+  // EXTENT is recorded here too, not only on a win: set in the won branch alone,
+  // every refused destination printed `0x0` and the census could not say WHAT
+  // was being refused.
   auto reject = [&](uint32_t reason, uint32_t w = 0, uint32_t h = 0) {
     if (tally) {
       ++tally->ineligible;
@@ -1272,9 +1217,8 @@ void D3D12Renderer::QueueSurfaceReadback(GameRenderTarget* snap,
   // AGAINST THE CPU BUFFER, not the GPU one. kSurfaceReadbackBytes is the 64 KB
   // upload-heap resource; kMaxSurfaceReadbackBytes is the 16 KB array the bytes
   // are memcpy'd into, and DrainSurfaceReadback CLAMPS to it. Gating on the
-  // larger let a 16-64 KB readback through to be silently truncated -- a partial
-  // destination written as if it were whole. Nothing hit it while 64x64x4 was
-  // the only caller, because that is exactly 16 KB.
+  // larger let a 16-64 KB readback through to be silently truncated. Nothing hit
+  // it while 64x64x4 was the only caller, because that is exactly 16 KB.
   if (totalBytes > mx::hle::kMaxSurfaceReadbackBytes) {
     ++m_surfaceReadbackTooBig;
     reject(6, copyW, copyH);
@@ -1407,16 +1351,13 @@ void D3D12Renderer::DrainSurfaceReadback() {
     any = true;
   }
   if (!any) return;
-  // UNCAPPED, and with the refusals beside the successes.
-  //
-  // The per-readback line above stops after 8, and this path has exactly the
-  // shape that makes a cap useless: destinations that queue every frame consume
-  // all eight before the interesting one appears. Worse, the two refusal
-  // counters were once incremented and PRINTED NOWHERE.
+  // UNCAPPED, and with the refusals beside the successes. The per-readback line
+  // above stops after 8, and destinations that queue every frame consume all
+  // eight before the interesting one appears; worse, the two refusal counters
+  // were once incremented and PRINTED NOWHERE.
   //
   // `refused-busy` is the count of callers that were ELIGIBLE and found every
-  // slot taken, because the busy test moved after the eligibility tests. A large
-  // number here is the case for more slots.
+  // slot taken. A large number here is the case for more slots.
   if ((m_surfaceReadbacks % 240) < kSurfaceSlots && last) {
     char msg[224];
     std::snprintf(msg, sizeof(msg),
@@ -1494,12 +1435,11 @@ void D3D12Renderer::QueueLuminanceReadback(GameRenderTarget* snap,
   if (sd.Width != 1 || sd.Height != 1 || sd.DepthOrArraySize != 1 ||
       sd.MipLevels != 1 || sd.SampleDesc.Count != 1)
     return;
-  // Ask the device for the footprint rather than deriving one. The first cut
-  // hand-computed a 256-byte row and sized the buffer to match; the row pitch
-  // was right but D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT is 512, so the
-  // destination was too small for a placed footprint. The debug layer never
-  // flagged it -- the runtime deferred the complaint to Close(), which then
-  // failed every frame and took the command list with it.
+  // Ask the device for the footprint rather than deriving one. Hand-computing a
+  // 256-byte row gets the pitch right but D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT
+  // is 512, so the destination is too small for a placed footprint -- and the
+  // debug layer never flags it, because the runtime defers the complaint to
+  // Close(), which then fails every frame and takes the command list with it.
   D3D12_PLACED_SUBRESOURCE_FOOTPRINT layout = {};
   UINT numRows = 0;
   UINT64 rowSize = 0, totalBytes = 0;
@@ -1541,17 +1481,14 @@ void D3D12Renderer::QueueLuminanceReadback(GameRenderTarget* snap,
 //
 // Idle-only, never least-recently-used-to-make-room. The steady-state live count
 // is ~33 against a cap of 128, so everything above that is a dead map's
-// leftovers. Evicting the coldest LIVE entry to force progress would thrash a
-// snapshot the guest still samples, and one that is merely sampled rarely --
-// static compositor content, resolved once -- is legitimate. If a sweep frees
-// nothing the caller still refuses, and m_snapshotEvictBlocked says so.
+// leftovers, and evicting the coldest LIVE entry would thrash a snapshot the
+// guest still samples. If a sweep frees nothing the caller still refuses, and
+// m_snapshotEvictBlocked says so.
 //
 // EvictGameRenderTargets does the same for offscreen colour targets, idle-only
-// for one more reason besides: a target holds ACCUMULATED CONTENT, so evicting
-// one the guest still draws into loses what it has built up.
-//
-// Both descriptor slots go back to their free lists. The RTV one is the reason
-// rtvIndex stopped being derived from the map's size.
+// for one more reason besides: a target holds ACCUMULATED CONTENT. Both
+// descriptor slots go back to their free lists, which is why rtvIndex stopped
+// being derived from the map's size.
 uint32_t D3D12Renderer::EvictGameRenderTargets() {
   const size_t before = m_gameRenderTargets.size();
   for (auto it = m_gameRenderTargets.begin();
@@ -1605,15 +1542,12 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameSnapshot(
   if (!destTexture || !width || !height) return nullptr;
   // GROW to cover, never resize to match. A snapshot is assembled from one or
   // more resolve bands: the scene arrives as 1280x640 then 1280x80 at y=640, two
-  // EDRAM bands of one 1280x720 surface. Sizing to the band that happened to
-  // arrive last is what produced the white screen -- the 640-line band was
-  // destroyed microseconds after being copied and the whole scene became an
-  // 80-line strip.
+  // EDRAM bands of one 1280x720 surface, and sizing to whichever band arrived
+  // last made the whole scene an 80-line strip.
   //
   // An entry that already covers the request is returned untouched, so the
-  // steady state after the first frame is no allocation at all. That also ends
-  // the 2x-per-frame create-and-destroy of a 3.5MB committed resource -- 2711 of
-  // them in one run -- which was the RenderPipeline stall.
+  // steady state after the first frame is no allocation at all -- which also
+  // ends the 2x-per-frame create-and-destroy of a 3.5MB committed resource.
   uint32_t reuseSrvIndex = UINT32_MAX;
   Microsoft::WRL::ComPtr<ID3D12Resource> growFrom;
   D3D12_RESOURCE_STATES growFromState = D3D12_RESOURCE_STATE_COMMON;
@@ -1623,22 +1557,19 @@ D3D12Renderer::GameRenderTarget* D3D12Renderer::EnsureGameSnapshot(
     // into from sources of different formats over a run, and this cache returned
     // the first snapshot ever made for it -- so a later resolve out of an
     // R16G16B16A16 HDR target copied into an R8G8B8A8 snapshot, which
-    // CopyTextureRegion rejects outright. An invalid call makes the whole
-    // command list fail to Close, and until EndFrame learned to rebuild the list
-    // that killed the renderer for the rest of the run -- 4-5 SECONDS per frame,
-    // which is the 0.40 fps menu. Recovery alone does not fix it: the same copy
-    // is re-issued every frame.
+    // CopyTextureRegion rejects outright. An invalid call makes the whole command
+    // list fail to Close, which killed the renderer for the rest of the run --
+    // the 0.40 fps menu. Recovery alone does not fix it: the same copy is
+    // re-issued every frame.
     const bool format_ok = it->second.format == format;
     if (format_ok && it->second.width >= width && it->second.height >= height)
       return &it->second;
     ++m_rtRejectResized;
     // WHICH destination, and WHICH of the two reasons. `resized` lumps "grew to
     // cover another band" together with "destroyed on a format change" and names
-    // neither, so a snapshot being thrown away is indistinguishable from one
-    // being extended. That distinction is the whole question for an ATLAS: a
-    // band is rewritten every frame and survives either way, while the terrain
-    // atlas accumulates over ~1900 frames from NINE resolves, so anything
-    // discarded is never rebuilt.
+    // neither. That distinction is the whole question for an ATLAS: a band is
+    // rewritten every frame and survives either way, while the terrain atlas
+    // accumulates over ~1900 frames from NINE resolves.
     {
       static std::set<uint32_t> s_seen;
       if (s_seen.insert(destTexture).second && s_seen.size() <= 24) {

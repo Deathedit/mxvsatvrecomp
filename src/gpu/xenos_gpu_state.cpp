@@ -20,15 +20,14 @@ namespace {
 // Register indices are Xenos *dword* indices -- the same units a PM4 Type0
 // packet's reg_base is in. This table used to be hand-built with every entry
 // from 0x2000 up as a BYTE offset, so each one named a register four slots away
-// from the one it labelled. Those entries were deleted rather than rescaled,
-// leaving ten names confirmed one at a time against observed values, and all ten
-// then matched the SDK's own table exactly -- including the 0x210F..0x2114
-// viewport block the translator's inverse was derived from.
+// from the one it labelled; those entries were deleted rather than rescaled, and
+// the ten names confirmed one at a time against observed values then matched the
+// SDK's own table exactly.
 //
 // The SDK table is Xenia's, dword-indexed, 3434 live entries spanning
 // 0x0000..0x5002, and it is NOT sorted -- there are two out-of-order pairs. A
-// binary search would have silently missed entries, so the lookup is a
-// direct-indexed table instead: one pointer per register index, built once.
+// binary search would silently miss entries, so the lookup is a direct-indexed
+// table instead: one pointer per register index, built once.
 constexpr uint32_t kRegIndexCount = 0x5003;  // matches the SDK's kRegisterCount
 
 const char* const* RegNameTable() {
@@ -79,8 +78,7 @@ uint64_t g_terrainSnaps = 0;
 // with different origins: the terrain draws SEVERAL rings per frame, each with
 // its own resolution and origin, and a snapshot that keeps only the last packet
 // keeps the coarsest one. A height sampled at 256 units per cell says nothing
-// useful about a bike, so the ladder has to be visible before anything can pick
-// from it.
+// useful about a bike.
 struct TerrainRing {
   float mesh_res = 0.f;
   float origin_x = 0.f, origin_z = 0.f;
@@ -127,8 +125,7 @@ constexpr uint32_t kPixelBankFirstReg = 256;
 constexpr uint32_t kMaterialGateFirstConst = 256 + 84;
 constexpr uint32_t kMaterialGateEndConst = 256 + 88;
 
-// vs c32 IS NOT A TINT, and the fill that assumed it was is gone. Kept short so
-// the next reading does not re-derive it:
+// vs c32 IS NOT A TINT, and the fill that assumed it was is gone:
 //
 //   - PM4 publishes vs c32 as a plain (0,0,0,0) for 97.2% of a run (468,445
 //     all-zero float4s against 13,520 non-zero). The zero is the guest's own
@@ -136,9 +133,8 @@ constexpr uint32_t kMaterialGateEndConst = 256 + 88;
 //   - the (1,1,1,1) that made it look like a white tint is an early-boot value
 //     that g_file's last-write-wins never let go of. The WOULD-FILL VALUES
 //     report kept printing it because it snapshotted declined NON-ZERO values
-//     and structurally could not show a zero. The trap is recorded because the
-//     SHAPE of it -- a diagnostic that cannot express the state you are looking
-//     for -- is what cost the time.
+//     and structurally could not show a zero -- a diagnostic that cannot express
+//     the state you are looking for is what cost the time.
 //   - no shader in legal.rdc reads xe_c[32] at all.
 //   - the premise underneath was wrong anyway: the legal-screen logo and the
 //     intro are NOT missing. They render.
@@ -156,8 +152,7 @@ bool NonFinite(uint32_t bits) {
 // Exponent zero with a non-zero mantissa: a DENORMAL. Its own tiny magnitude is
 // not the problem -- shader_alu.cpp's LegacyMul treats anything under
 // kSmallestNormal as an exact zero, because that is what D3D9 fixed-function
-// multiply does on Xenos, so a denormal reaching a tint constant is
-// indistinguishable from black at the point of use.
+// multiply does on Xenos.
 //
 // It is also a reliable junk MARKER on this title. The one value PM4 has ever
 // been seen publishing into a colour slot is 2.074e-42, whose bit pattern is
@@ -187,19 +182,16 @@ void NoteType0Write(uint32_t reg_base, const uint32_t* data, uint32_t count) {
     //    `have` bit over a register nothing really published.
     //
     // Measured: with NaN allowed to publish, the file claimed 362 constants and
-    // 4.2M dwords -- far more than the ALU-range Type0 writes present in any
-    // pm4 dump -- and c136..c139 stayed NaN because OverlayNonFinite saw them as
+    // 4.2M dwords -- far more than the ALU-range Type0 writes present in any pm4
+    // dump -- and c136..c139 stayed NaN because OverlayNonFinite saw them as
     // published.
     if ((data[i] & 0x7F800000u) == 0x7F800000u && (data[i] & 0x007FFFFFu) != 0)
       continue;
     // TARGETED TRACE: the PIXEL bank's c140..c143, i.e. guest ALU constants
-    // 396..399, dwords 1584..1599.
-    //
-    // The first cut watched dwords 560..575 and compared them against a PIXEL
-    // shader's xe_c[140..143]. Wrong registers: pixel constants 256..511 map
-    // into the shader's bank at reg-256, so the mask pass's xe_c[140] is guest
-    // constant 396. The values disagreed because they were different registers,
-    // and the conclusion drawn from that was void.
+    // 396..399, dwords 1584..1599. Watching dwords 560..575 instead compares
+    // different registers -- pixel constants 256..511 map into the shader's bank
+    // at reg-256, so the mask pass's xe_c[140] is guest constant 396 -- and any
+    // conclusion drawn from that disagreement is void.
     //
     // shadows--.rdc shows those four registers holding c100..c103 with a
     // corrupted THIRD COLUMN -- c14x.z equals the negated .y of c128..c131 --
@@ -207,10 +199,9 @@ void NoteType0Write(uint32_t reg_base, const uint32_t* data, uint32_t count) {
     // camera". This says whether the GUEST publishes that column or we assemble
     // it.
     if (d >= 1584u && d < 1600u) {
-      // NON-ZERO ONLY, and the cap counts what it PRINTS. The first cut logged
-      // every write and spent all 48 lines on the bulk zero-fill plus an early
-      // all-zero block -- the same first-N sampling trap that has cost this
-      // investigation repeatedly. The values worth seeing arrive later.
+      // NON-ZERO ONLY, and the cap counts what it PRINTS. Logging every write
+      // spends all 48 lines on the bulk zero-fill plus an early all-zero block;
+      // the values worth seeing arrive later.
       //
       // The block itself is already informative: base 0x4200 count 64 is
       // constant 128 for 16 constants, so the guest writes c128..c143 in ONE
@@ -241,11 +232,11 @@ void NoteType0Write(uint32_t reg_base, const uint32_t* data, uint32_t count) {
   //
   // Keyed on c204 (gMeshResolution). No other shader in the corpus declares that
   // register, so a Type-0 packet covering it is the terrain's, and the whole
-  // c200..c220 block is copied out at that instant. That is draw-scoped by
-  // construction and needs no shader identification -- which is the point,
-  // because identifying the draw by hashing its microcode against the static
-  // assets does NOT work: runtime blobs carry trailing padding the static
-  // decoder excludes, and only 1 of 72 runtime dumps matched.
+  // c200..c220 block is copied out at that instant -- draw-scoped by
+  // construction and needing no shader identification, which is the point:
+  // identifying the draw by hashing its microcode against the static assets does
+  // NOT work, because runtime blobs carry trailing padding the static decoder
+  // excludes and only 1 of 72 runtime dumps matched.
   const uint32_t c204_reg = kAluRegBase + 204 * 4;
   if (reg_base <= c204_reg && c204_reg < reg_base + count) {
     for (uint32_t c = kTerrainFirst; c <= kTerrainLast; ++c) {
@@ -290,12 +281,9 @@ void NoteType0Write(uint32_t reg_base, const uint32_t* data, uint32_t count) {
 // A REAL ring, not a stray packet. The measured ladder is res 1,2,4,...,256 with
 // 386-706 packets each; alongside it were three entries with 1, 3 and 8 packets
 // and values like 3.66e-42 -- Type-0 packets that covered c204 without being the
-// terrain's.
-//
-// Both tests are needed and neither is arbitrary. The count separates hundreds
-// from single digits, a two-orders-of-magnitude gap rather than a tuned
-// threshold. The value test is the stronger one: a clipmap resolution is a
-// positive power of two.
+// terrain's. Both tests are needed: the count separates hundreds from single
+// digits, a two-orders-of-magnitude gap rather than a tuned threshold, and a
+// clipmap resolution is a positive power of two.
 bool RealRing(const TerrainRing& e) {
   if (!(e.mesh_res > 0.f) || e.packets < 16) return false;
   const float r = e.mesh_res;
@@ -392,18 +380,14 @@ uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
   // Guard-census tallies, flushed once after the loop. See the note inside.
   uint64_t n_seen = 0, n_fired = 0, n_bdSeen = 0, n_bdFired = 0;
   std::lock_guard<std::mutex> lk(g_mu);
-  // THE DENOMINATORS ARE STRUCTURAL, SO THEY ARE COUNTED STRUCTURALLY.
-  //
-  // The population is "every component examined", and this loop examines every
-  // component unconditionally -- so the count is `regs * 4` and does not depend
-  // on a single bank value. It used to be accumulated with a ++ inside the loop,
-  // alongside an unconditional g_have load and a range test, all ahead of the
-  // `if (!NonFinite(cur)) continue;` that discards ~all of it. That block was
-  // the cost: batching the atomics took this phase 8ms -> 3.5ms.
-  //
-  // Closed form here, fires inside the branch below. The census is IDENTICAL --
-  // same population, same fires, same rate -- because a `fired` can only happen
-  // where NonFinite already holds.
+  // THE DENOMINATORS ARE STRUCTURAL, SO THEY ARE COUNTED STRUCTURALLY. The
+  // population is "every component examined", and this loop examines every
+  // component unconditionally, so the count is `regs * 4`. Accumulating it with
+  // a ++ inside the loop, alongside an unconditional g_have load and a range
+  // test ahead of the `if (!NonFinite(cur)) continue;` that discards ~all of it,
+  // was the cost: batching the atomics took this phase 8ms -> 3.5ms. The census
+  // is IDENTICAL, because a `fired` can only happen where NonFinite already
+  // holds.
   n_seen = uint64_t(regs) * 4;
   // Same closed form for the backdrop block: guest c392..c395 are the guest
   // constants in [392, 396), this call covers [first_reg, first_reg + regs),
@@ -434,27 +418,19 @@ uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
     }
     // Nothing published it. On hardware the constant is not garbage -- the Xenos
     // register file POWERS ON ZEROED, and a title reading a constant it never
-    // wrote gets 0.0. Xenia models exactly that (register_file.cc:18). We
-    // rebuild the bank per draw out of a device shadow whose backing memory the
-    // guest has not written yet, so we hand the shader dirty heap instead.
+    // wrote gets 0.0 (register_file.cc:18). We rebuild the bank per draw out of
+    // a device shadow whose backing memory the guest has not written yet, so we
+    // hand the shader dirty heap instead.
     //
     // THE SUBSTITUTION IS GONE. The NaN stays in the bank and reaches the
     // shader; the measurement stays, so the population is still known.
     //
     // Its justification was that c392..c395 are NaN for a bounded startup prefix
     // "which is why the legal, loading and start screens have no background".
-    // Both halves are falsified:
-    //
-    //   THE TIMING. Censused on its own, that block reads 0/32 at the first
-    //   report and 21.5% at the last. It does not freeze, it CLIMBS.
-    //
-    //   THE SYMPTOM. With hle_strict=8 and 1.76M NaNs reaching the shaders, the
-    //   logo and intro are FINE and a level is unchanged. The white backdrop
-    //   this was built to prevent does not come back.
-    //
-    // So it was a workaround for a defect that no longer exists, and its cost is
-    // that a genuine NaN is silently turned into a zero, indistinguishable from
-    // a constant the guest meant to be zero.
+    // Both halves are falsified: censused on its own that block reads 0/32 at
+    // the first report and 21.5% at the last, so it CLIMBS rather than freezing;
+    // and with hle_strict=8 and 1.76M NaNs reaching the shaders, the logo and
+    // intro are FINE and a level is unchanged.
     //
     // g_zeroed is REPURPOSED rather than deleted: it now counts NaNs LEFT IN
     // PLACE, the same population it used to count substituting. A counter whose
@@ -465,36 +441,29 @@ uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
 
   // SECOND PASS: a component our sources left at a FINITE ZERO, which PM4
   // published a non-zero value for. The pass above cannot reach these -- it
-  // opens with `if (!NonFinite(cur)) continue;` and a zero is finite -- so a
-  // constant whose ONLY publisher is Type-0 PM4 stayed 0.0 forever.
+  // opens with `if (!NonFinite(cur)) continue;` -- so a constant whose ONLY
+  // publisher is Type-0 PM4 stayed 0.0 forever.
   //
   // SHADER_CONSTANT_340_X (0x4550) is written 330 times across the pm4 dumps =
   // PIXEL c84-c87, and the menu rider's material gates a lighting term on c85.w:
   //
   //     saturate(tex1.x + c85.w - 1)     w=1 -> tex1.x ;  w=0 -> 0
   //
-  // Guards keep this away from the retired `hle_sanitize_constants`: exact zeros
-  // only, only where PM4 genuinely published, never substituting a zero or a
-  // non-finite. Callers apply the shader load tables AFTER this.
+  // Guards: exact zeros only, only where PM4 genuinely published, never
+  // substituting a zero or a non-finite. Callers apply the shader load tables
+  // AFTER this.
   //
-  // MEASURED CONSEQUENCE: 6,705,127 substitutions in a 1020-frame menu run,
-  // 1.87% of the bank dwords rebuilt. It did NOT brighten the scene, and the
-  // menu developed a new visual fault. So the population it reaches is dominated
-  // by zeros the guest MEANT. Treat a non-zero `filled_zero` as a warning rather
-  // than a repair.
-  //
-  // Both banks now, because it no longer mutates -- and the histogram is why it
-  // must not: with substitution on, the vertex top was c155, c161, c167, c173,
-  // c179, c185, STRIDE 6 with counts decaying smoothly, a matrix palette being
-  // filled entry by entry with end-of-frame values. 207 distinct constants, so
-  // this is not a range to narrow; the frame-global file is simply the wrong
-  // authority for a mid-frame VERTEX draw.
+  // MEASURED CONSEQUENCE: 6,705,127 substitutions in a 1020-frame menu run. It
+  // did NOT brighten the scene and the menu developed a new visual fault, so the
+  // population it reaches is dominated by zeros the guest MEANT -- treat a
+  // non-zero `filled_zero` as a warning rather than a repair. The histogram is
+  // why it must not mutate: with substitution on, the vertex top was c155, c161,
+  // c167, c173, c179, c185, STRIDE 6 with counts decaying smoothly, a matrix
+  // palette being filled entry by entry with end-of-frame values.
   //
   // BLOCK SKIP. Every iteration ends at `if (!(g_have[...] & bit)) continue;`
   // and g_have is a bitmap 32 dwords to the word, so a zero word means none of
-  // its 32 dwords can pass. Exact, not sampled: the iterations elided are
-  // precisely the ones that did nothing. Worth doing because this pass is a DRY
-  // RUN that walks the full 1024-dword bank once per draw per stage.
+  // its 32 dwords can pass. Exact, not sampled.
   for (uint32_t i = 0; count_finite_zeros && i < regs * 4; ++i) {
     const uint32_t d = first_reg * 4 + i;
     if ((d & 31) == 0 && g_have[d >> 5] == 0) {
@@ -508,16 +477,14 @@ uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
     // DRY RUN. This used to assign `bank[i] = v`, and that was wrong in BOTH
     // banks: vertex, where it sprayed a stride-6 matrix palette with
     // end-of-frame values and tore the geometry apart; and pixel, where 84
-    // constants still produced flashing and no brightening.
+    // constants still produced flashing and no brightening. The cause is that
+    // `g_file` is FRAME-GLOBAL last-write-wins, so a mid-frame draw gets the
+    // frame's final constants -- harmless for NaN repair, destructive the moment
+    // it reaches an array.
     //
-    // The cause is that `g_file` is FRAME-GLOBAL last-write-wins: it has no
-    // notion of when in the frame a value was written, so a mid-frame draw gets
-    // the frame's final constants. Harmless for NaN repair, destructive the
-    // moment it reaches an array.
-    //
-    // Kept as a COUNT for the bank at large, because the question it answers is
-    // still open -- which constants are published only by Type-0 PM4 and left at
-    // zero by our two modelled sources.
+    // Kept as a COUNT, because the question it answers is still open: which
+    // constants are published only by Type-0 PM4 and left at zero by our two
+    // modelled sources.
     ++g_filledZero;
     ++g_filledByConst[d >> 2];
 
@@ -530,12 +497,9 @@ uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
     // materials with NO load-table entry kept the value, which is why the BIKE
     // AND RIDER changed appearance and the ground did not.
     //
-    // Kept below for the record: the window and the proof.
-    //
-    // The blanket version failed because g_file is FRAME-GLOBAL last-write-wins,
-    // which is destructive the moment it reaches an ARRAY. The window below is
-    // not an array: it is a four-constant material block PM4 publishes as a unit
-    // (SHADER_CONSTANT_340_X, 330 writes across the dumps = PIXEL c84-c87).
+    // The window is not an array: it is a four-constant material block PM4
+    // publishes as a unit (SHADER_CONSTANT_340_X, 330 writes across the dumps =
+    // PIXEL c84-c87).
     //
     // PROVEN, capture3.rdc draw 19725 (terrain, 1741 indices), pixel (640,640):
     //
@@ -545,15 +509,13 @@ uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
     //   209: mul r1.xyz, r0.xxxx, r1.xyzx 0 x (0.070, 0.034, -0.014) = 0
     //
     // c85.w = 1 makes that saturate(1.755 - 0.8) = 0.955 and the terrain diffuse
-    // survives. It misses the threshold by 0.045 and the constant is worth
-    // exactly 1.0. Everything else in that draw is correct: world Y 611.4 is
-    // real terrain height, both textures sample fine, and c86/c87 are populated.
-    // c85 is the only zero among populated neighbours -- unwritten, not wrong.
+    // survives. Everything else in that draw is correct: world Y 611.4 is real
+    // terrain height, both textures sample fine, and c86/c87 are populated. c85
+    // is the only zero among populated neighbours -- unwritten, not wrong.
     //
-    // PIXEL BANK ONLY. The frame-global risk is not gone, it is bounded: within
-    // this window the worst case is a material gated OFF this frame being lit as
-    // though it were ON. That is visible and reversible; a sprayed matrix
-    // palette was neither.
+    // PIXEL BANK ONLY. The frame-global risk is bounded there: the worst case is
+    // a material gated OFF this frame being lit as though it were ON, which is
+    // visible and reversible. A sprayed matrix palette was neither.
   }
   // The census, flushed once. Two calls reproduce exactly what 1024 per-dword
   // calls produced: population = clean + fired, fires = fired.
@@ -588,15 +550,13 @@ uint32_t FillMaterialGate(uint32_t* bank, uint32_t bank_regs,
   //   load_written[d]  the shader published this dword itself. Its value is
   //                    authoritative even when it is zero. This is the guard
   //                    that was missing when the fill lived inside
-  //                    OverlayNonFinite: there it ran BEFORE the load table and
-  //                    was overwritten for terrain while surviving on materials
-  //                    the table did not cover.
+  //                    OverlayNonFinite: there it ran BEFORE the load table.
   //   bank[d] != 0     something already supplied a value. We only ever fill a
   //                    hole, never replace.
   //
   // The window is pixel c84..c87 -- guest c340..c343, the material block PM4
   // publishes as a unit. It is NOT an array, which is why the frame-global
-  // staleness of g_file that tore the vertex matrix palette apart does not apply.
+  // staleness that tore the vertex matrix palette apart does not apply.
   if (!bank || !load_written) return 0;
   uint32_t filled = 0;
   std::lock_guard<std::mutex> lk(g_mu);
@@ -605,14 +565,11 @@ uint32_t FillMaterialGate(uint32_t* bank, uint32_t bank_regs,
   // backwards, not from observing a published value. If PM4's own c85.w is 0 or
   // unpublished then this fill can never set it, ordering or no ordering.
   {
-    // SAMPLED LATE, NOT ONCE. The first cut fired on the first call and reported
-    // the whole window `unpub:0` -- true at startup and says nothing, because
-    // PM4 has not published anything yet. The guard census showed 209,629 fills
-    // out of 2,663,216 window dwords in the same run, so the window IS published
-    // later and the snapshot was simply taken before it.
-    //
-    // Now: report the first time anything in the window is actually published,
-    // and again every 200k calls.
+    // SAMPLED LATE, NOT ONCE. Firing on the first call reports the whole window
+    // `unpub:0` -- true at startup and saying nothing, because PM4 has not
+    // published anything yet -- while the guard census showed 209,629 fills out
+    // of 2,663,216 window dwords in the same run. Now: report the first time
+    // anything in the window is actually published, and again every 200k calls.
     static uint64_t s_calls = 0;
     static bool s_sawPublished = false;
     bool any_published = false;
@@ -661,19 +618,16 @@ uint32_t FillMaterialGate(uint32_t* bank, uint32_t bank_regs,
       //
       // c85.w -- the component the terrain shader gates on -- is UNPUBLISHED.
       // PM4 never carries it, at any point in the frame, so no amount of
-      // reordering against the shader load table could have supplied it. Three
-      // changes to delivery were all downstream of a source that does not hold
-      // the value.
+      // reordering against the shader load table could have supplied it.
       //
       // Worse, the ONE dword PM4 does publish in this window is a denormal whose
       // bit pattern is ~1481 -- an INTEGER read as a float, so the Type-0 capture
-      // is recording a register that is not an ALU constant. With the
-      // substitution live it injected that denormal into c85.y on ~94,000 draws
-      // a run.
+      // is recording a register that is not an ALU constant, and the live
+      // substitution injected it into c85.y on ~94,000 draws a run.
       //
-      // The Note() above STAYS: the window keeps reporting, so if PM4 ever does
-      // publish here the census says so. Do not restore the assignment without
-      // first showing c85.w published with a plausible value.
+      // The Note() above STAYS, so if PM4 ever does publish here the census says
+      // so. Do not restore the assignment without first showing c85.w published
+      // with a plausible value.
       if (!eligible) continue;
       ++filled;
       ++g_materialGateFilled;
@@ -693,12 +647,10 @@ uint32_t FillMaterialGate(uint32_t* bank, uint32_t bank_regs,
 std::string FileValues(const uint32_t* consts, size_t n) {
   // The LIVE contents of g_file, deliberately not the shape the removed
   // WouldFillValues report had: that one snapshotted values the zero-fill
-  // DECLINED, and its pass skipped `v == 0`, so it structurally could not report
-  // a zero and kept printing the last non-zero it ever saw -- it went on saying
-  // c32 = (1,1,1,1) for thirty seconds after the fill had stopped firing.
-  //
-  // `unpub:` marks a component PM4 has never written, which is a different state
-  // from a published 0.0 and must not print the same.
+  // DECLINED and skipped `v == 0`, so it structurally could not report a zero
+  // and went on saying c32 = (1,1,1,1) for thirty seconds after the fill had
+  // stopped firing. `unpub:` marks a component PM4 has never written, which is a
+  // different state from a published 0.0.
   std::lock_guard<std::mutex> lk(g_mu);
   std::string out;
   for (size_t k = 0; k < n; ++k) {
@@ -794,17 +746,15 @@ void XenosGpuState::ApplyType3Packet(const pm4::Pm4Packet& pkt) {
     // register in the low bits of rmw_info.
     //
     // This used to treat rmw_info as a base and the two operands as a RUN of
-    // register values. The comment that stood here called the case dead -- "the
-    // Type3 histogram has no 0x21" -- and that was wrong: it fires 23 times in a
-    // menu run, in BOTH native and plugin mode, because this parser does not sit
-    // behind the D3D9 passthrough. A claim that a branch cannot fire is worth as
-    // little here as a counter that cannot fire.
+    // register values, and the comment that stood here called the case dead --
+    // "the Type3 histogram has no 0x21". It fires 23 times in a menu run, in
+    // BOTH modes, because this parser does not sit behind the D3D9 passthrough.
     //
     // The damage was nil, which is why it survived: every register it reaches is
     // scanout, not 3D (D1GRPH_CONTROL, D1GRPH_LUT_10BIT_BYPASS_CNTL,
-    // XDVO_FORCE_OUTPUT_CNTL, XDVO_FORCE_DATA). Nothing downstream reads any of
-    // them, so this fix should change no pixel -- if a frame moves, something
-    // reads a display register and THAT is the finding.
+    // XDVO_FORCE_OUTPUT_CNTL, XDVO_FORCE_DATA). This fix should change no pixel
+    // -- if a frame moves, something reads a display register and THAT is the
+    // finding.
     case 0x21: {
       if (pkt.body.size() < 3) break;
       const uint32_t rmw_info = pkt.body[0];
@@ -820,10 +770,8 @@ void XenosGpuState::ApplyType3Packet(const pm4::Pm4Packet& pkt) {
       //
       // The address field really is 13 bits, and that is NOT an array clamp:
       // Xenia's own register file is 0x5003 entries, so it could address more
-      // and deliberately does not. An earlier version masked 0xFFFF on the
-      // reasoning that the register table runs to 0x8D07; that was wrong, and
-      // the two masks happen to agree on all observed traffic, which is exactly
-      // why it would not have shown up.
+      // and deliberately does not. An earlier mask of 0xFFFF agrees with this on
+      // all observed traffic, which is exactly why it would not have shown up.
       const uint32_t reg = rmw_info & 0x1FFFu;
       const uint32_t and_mask = ((rmw_info >> 31) & 1u)
                                     ? ReadRegister(and_operand & 0x1FFFu)

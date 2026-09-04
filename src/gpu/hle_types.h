@@ -38,8 +38,7 @@ enum class HostTextureFormat : uint8_t {
   // TEX_FORMAT_COMP decides how identical bytes are read. The reference uses one
   // typeless resource with a UNORM and an SNORM view; we create the resource
   // with a concrete format, so the choice moves here. Safe per-texture only
-  // because HleTextureKey hashes the sign fields too, so the same guest memory
-  // bound both ways decodes into two cached textures.
+  // because HleTextureKey hashes the sign fields too.
   kRg16Float,
   kRg16Unorm,
   kRg16Snorm,
@@ -49,8 +48,7 @@ enum class HostTextureFormat : uint8_t {
   // k_2_10_10_10 (and k_2_10_10_10_AS_16_16_16_16, which GetBaseFormat folds
   // onto it). Three 10-bit channels and a 2-bit alpha in one dword — the same
   // 32bpp passthrough as kRgba8, so nothing in the decode path needs to know
-  // about it beyond the DXGI format. Appended rather than inserted: the enum
-  // is compared by value across the hooks/renderer boundary.
+  // about it beyond the DXGI format.
   kRgb10A2Unorm,
   // k_16 signed. This is the TERRAIN HEIGHTMAP: read as UNORM its small negative
   // heights come back near 1.0.
@@ -95,12 +93,10 @@ struct HleTexturePayload {
   uint8_t clamp_x = 0;
   uint8_t clamp_y = 0;
   bool linear_filter = true;
-  // The guest's per-texture LOD bias, already scaled into LOD units.
-  //
-  // Applied in the SHADER via xe_texinv[slot].w rather than on the sampler, as
-  // the reference does (xenia d3d12_texture_cache.cc:1043). Not cosmetic: the
-  // terrain's virtual-texture page tables carry +7.0, which looks the page table
-  // up seven levels coarser than the raw derivative. Levels 5-9 are fully
+  // The guest's per-texture LOD bias, already scaled into LOD units. Applied in
+  // the SHADER via xe_texinv[slot].w rather than on the sampler, as the
+  // reference does (xenia d3d12_texture_cache.cc:1043). Not cosmetic: the
+  // terrain's virtual-texture page tables carry +7.0, levels 5-9 are fully
   // populated and 0-4 sparse, so without the bias the lookup misses and reads
   // the not-available sentinel -- one atlas tile repeated 1024x.
   float lod_bias = 0.0f;
@@ -116,11 +112,8 @@ struct HleTexturePayload {
   // path compares a freshly sampled fingerprint against it. The consequence is
   // that a SPARSE guest write leaves it identical, so re-decodes forced by the
   // flat-retry backoff were computed, cached, and then discarded at the GPU
-  // boundary -- the resource kept the bytes of the very first decode.
-  //
-  // This is a hash of the DECODED BYTES, so it changes exactly when the uploaded
-  // copy would differ. Zero means "not computed": blank and Bink payloads never
-  // set it, and they are uploaded once and never refilled.
+  // boundary. This is a hash of the DECODED BYTES, so it changes exactly when
+  // the uploaded copy would differ. Zero means "not computed".
   uint32_t upload_version = 0;
   // The guest's mip chain, decoded from its own allocation. 1 means base level
   // only. `data` is LEVEL-MAJOR with the slices inside each level, matching the
@@ -184,9 +177,9 @@ constexpr bool IsPrimitivePolygonal(uint32_t prim_type) {
   }
 }
 
-// Host topology, carried on DrawCall so the renderer stays a dumb consumer.
-// The values are deliberately the D3D_PRIMITIVE_TOPOLOGY ones so the renderer
-// can cast rather than translate; d3d12_game.cpp static_asserts that they still
+// Host topology, carried on DrawCall so the renderer stays a dumb consumer. The
+// values are deliberately the D3D_PRIMITIVE_TOPOLOGY ones so the renderer can
+// cast rather than translate; d3d12_game.cpp static_asserts that they still
 // match. Declaring them here rather than including <d3dcommon.h> keeps this
 // header usable from translator_test.cpp.
 enum class HostTopology : uint32_t {
@@ -249,8 +242,8 @@ struct DrawCall {
   //
   // MRT SLOT 1, and only slot 1. The guest's terrain tile pass binds two 256x256
   // targets and resolves the SECOND into the texture its tile shader samples;
-  // rendering only slot 0 left that resolve without a source and the tile
-  // untextured. Slots 2 and 3 never appear in this title.
+  // rendering only slot 0 left that resolve without a source. Slots 2 and 3
+  // never appear in this title.
   uint32_t render_target1_object = 0;
   uint32_t render_target1_color_info = 0;
   uint32_t render_target1_width = 0;
@@ -279,8 +272,7 @@ struct DrawCall {
   // the guest's own clear emitter (sub_8255A510): Flags & 0x10 sets the depth
   // bit, Flags & 0x20 sets the stencil bit AND writes RB_STENCILREFMASK. All
   // three combinations are issued -- 0x1F colour+depth with no stencil, 0x20
-  // stencil alone, 0x30 both. Clearing stencil whenever depth is cleared would
-  // wipe a mask the guest deliberately carried across a depth clear.
+  // stencil alone, 0x30 both.
   bool clear_stencil_target = false;
   uint8_t clear_stencil = 0;
   // Resolve flag 0x100 clears the source after copying and takes a float4
@@ -313,7 +305,7 @@ struct DrawCall {
   // one: it is a guest surface with its own object identity, and Resolve names
   // it by that identity (source slot 4). Offscreen colour targets used to be
   // rendered with no depth attachment at all, so a depth resolve had nothing to
-  // copy -- measured as 224 misses on one surface in a single menu run.
+  // copy -- 224 misses on one surface in a single menu run.
   uint32_t depth_target_object = 0;
   uint32_t depth_target_width = 0;
   uint32_t depth_target_height = 0;
@@ -325,21 +317,16 @@ struct DrawCall {
   // not immutable guest-memory content.
   uint32_t sampled_render_target_object = 0;
   // The D3D9 texture object the pixel fetch selected, when that texture was
-  // populated by a resolve.
-  //
-  // The source object alone cannot identify WHICH resolve result to bind: one
-  // guest surface is shared scratch that the scene and every video render into
-  // in turn, so keying host storage by the source target makes them all alias
-  // one resource. This field is what tells them apart.
+  // populated by a resolve. The source object alone cannot identify WHICH
+  // resolve result to bind: one guest surface is shared scratch that the scene
+  // and every video render into in turn, so keying host storage by the source
+  // target makes them all alias one resource.
   uint32_t sampled_texture_object = 0;
   // A resolve event rather than a draw. Carries no geometry: `dest_texture` is
   // the D3D9 texture the guest resolved into and `source_object` the render
-  // target it copied out of.
-  //
-  // It rides the same ordered queue as draws because a resolve is only
-  // meaningful in sequence -- it snapshots the target as of that moment, and
-  // every draw recorded after it must see the snapshot, not the surface's later
-  // contents.
+  // target it copied out of. It rides the same ordered queue as draws because a
+  // resolve is only meaningful in sequence -- it snapshots the target as of that
+  // moment, and every draw recorded after it must see the snapshot.
   uint32_t resolve_dest_texture = 0;
   uint32_t resolve_source_object = 0;
   // The source was the DEPTH-STENCIL surface (Resolve source slot 4), not a
@@ -379,8 +366,7 @@ struct DrawCall {
   // The host snapshot must be this size. Sizing it to the covered region is
   // right for a banded resolve and wrong for an ATLAS: a 2048x2048 atlas filled
   // by repeated 256x256 sub-rect resolves would be created at 256x256, and the
-  // shader's normalized UVs map [0,1] across that, so every fetch lands at 1/8
-  // scale and anything outside the top-left corner is unreachable.
+  // shader's normalized UVs map [0,1] across that.
   uint32_t resolve_dest_width = 0;
   uint32_t resolve_dest_height = 0;
   // The guest's texture address mode for the sampled texture, straight off the
@@ -402,16 +388,14 @@ struct DrawCall {
   // Null means it did not, and the draw keeps the `tex * col` stand-in.
   //
   // A shared_ptr to one cached string rather than by value: the source is
-  // emitted once per shader handle but a frame issues ~158 draws, so copying it
-  // per draw would dominate the translation it exists to enable. The renderer
+  // emitted once per shader handle but a frame issues ~158 draws. The renderer
   // compiles it once per handle and keys its PSO cache on `pixel_shader_handle`.
   uint32_t pixel_shader_handle = 0;
   std::shared_ptr<const std::string> pixel_shader_hlsl;
   // The compiled DXBC of pixel_shader_hlsl, when the persisted content-keyed
   // cache held it (or the first compile wrote it). Carried so the renderer can
-  // build the PSO without an FXC compile of its own — FXC is the expensive
-  // part, measured at 18-145ms per shader at O0 on this machine. Null means
-  // "compile from hlsl", the pre-cache behaviour.
+  // build the PSO without an FXC compile of its own — FXC is the expensive part,
+  // 18-145ms per shader at O0. Null means "compile from hlsl".
   std::shared_ptr<const std::vector<uint8_t>> pixel_shader_dxbc;
   // Zero when SQ_PROGRAM_CNTL.param_gen is disabled; otherwise one plus
   // SQ_CONTEXT_MISC.param_gen_pos. The bias leaves zero as the disabled value
@@ -429,8 +413,7 @@ struct DrawCall {
   // declares them: slot i is the texture the shader reads as xe_texi. This is
   // what lets a shader with more than one texture run at all -- binding only one
   // sent every multi-sampler shader to the stand-in, which picks a single
-  // arbitrary fetch (a rider sampling diffuse + normal + detail rendered
-  // whichever it happened to be).
+  // arbitrary fetch.
   //
   // A slot may instead name a resolved render target, for the post-process
   // chain. The two are parallel arrays because a slot has exactly one or the
@@ -442,35 +425,28 @@ struct DrawCall {
   std::array<uint32_t, kMaxPixelTextures> pixel_sampled_objects = {};
   // Per compact slot: the fetch constant's four TextureSign values, already
   // permuted into host component order (SwizzleTextureSigns), two bits per
-  // component. 0 means plain unsigned, which is the overwhelming majority.
-  // Per-BINDING state, not per-texture -- the same guest memory is bound with
-  // different sign modes by different draws.
+  // component. 0 means plain unsigned. Per-BINDING state, not per-texture -- the
+  // same guest memory is bound with different sign modes by different draws.
   std::array<uint8_t, kMaxPixelTextures> pixel_sampler_signs = {};
   // Per compact slot: the fetch constant's SWIZZLE, for slots served by a
   // resolve SNAPSHOT rather than a decoded texture (the decoded path carries its
-  // swizzle on the payload).
-  //
-  // Without a carrier the renderer bound every snapshot with an identity
-  // component mapping: slots asking for 03012, the BGRA->RGBA correction,
-  // sampled red and blue swapped, and slots asking for 05510 read real channels
-  // where the guest wants constant 1.0. 0 means "not a snapshot slot".
+  // swizzle on the payload). Without a carrier the renderer bound every snapshot
+  // with an identity mapping: slots asking for 03012, the BGRA->RGBA correction,
+  // sampled red and blue swapped. 0 means "not a snapshot slot".
   std::array<uint16_t, kMaxPixelTextures> pixel_sampled_swizzles = {};
 
   // The VERTEX stage's samplers, in the same shape as the pixel ones above and
-  // resolved by the same code.
-  //
-  // A vertex shader that fetches a texture -- terrain displacement is the case
-  // that made this necessary -- used to be refused the GPU vertex path outright,
-  // and the CPU interpreter it fell back to has no texture fetch at all, so its
-  // samples came out as zeros and the positions were silently wrong.
+  // resolved by the same code. A vertex shader that fetches a texture -- terrain
+  // displacement is the case that made this necessary -- used to be refused the
+  // GPU vertex path outright, and the CPU interpreter it fell back to has no
+  // texture fetch at all.
   //
   // A SEPARATE descriptor range from the pixel ones (t17+/s16+, see
   // HlslShader::kVertexTextureBaseRegister): the two stages are translated and
   // cached independently, so their compact slot 0 means different guest samplers.
   //
   // FREEROAM content only. Every --force_load=NAT_Farm run measured has ZERO
-  // vertex shaders with samplers, so that configuration cannot exercise this
-  // path at all.
+  // vertex shaders with samplers.
   uint32_t vertex_sampler_count = 0;
   uint32_t vertex_sampler_array_mask = 0;
   std::array<std::shared_ptr<const HleTexturePayload>, kMaxPixelTextures>
@@ -480,21 +456,17 @@ struct DrawCall {
   // The vertex stage's half of pixel_sampled_swizzles above.
   std::array<uint16_t, kMaxPixelTextures> vertex_sampled_swizzles = {};
   // The interpolators the translated pixel shader reads, one float4 per linkage
-  // slot per vertex, in a buffer parallel to `vertices`.
-  //
-  // A second vertex stream rather than a wider vertex: `vertices` is built at a
-  // fixed stride the stand-in pipeline depends on, and widening it would change
-  // the layout of the path that currently renders the game to serve the path
-  // that does not yet.
+  // slot per vertex, in a buffer parallel to `vertices`. A second vertex stream
+  // rather than a wider vertex: `vertices` is built at a fixed stride the
+  // stand-in pipeline depends on, and widening it would change the layout of the
+  // path that currently renders the game.
   std::vector<uint8_t> interpolators;
 
   // The guest VERTEX shader, translated to HLSL, and the raw attribute stream
   // the emitted `XeVsIn` consumes. Null/empty means this draw keeps the CPU
-  // interpreter.
-  //
-  // Only populated when BOTH stages translate: a GPU vertex stage feeding the
-  // stand-in pixel shader would also have to reproduce everything the CPU path
-  // derives on the side, the param_gen UV reconstruction above all.
+  // interpreter. Only populated when BOTH stages translate: a GPU vertex stage
+  // feeding the stand-in pixel shader would also have to reproduce everything
+  // the CPU path derives on the side, the param_gen UV reconstruction above all.
   uint32_t vertex_shader_handle = 0;
   std::shared_ptr<const std::string> vertex_shader_hlsl;
   // The compiled DXBC of vertex_shader_hlsl — same contract as
@@ -508,8 +480,7 @@ struct DrawCall {
   //
   // Keyed by REGISTER, not by attribute: 5.4% of draws have two vfetch
   // attributes writing one register with complementary destination swizzles, and
-  // one element per attribute would declare that register twice and let the
-  // second clobber the first.
+  // one element per attribute would declare that register twice.
   static constexpr uint32_t kMaxVertexInputs = 32;
   std::array<uint8_t, kMaxVertexInputs> vertex_input_regs = {};
   uint32_t vertex_input_count = 0;
@@ -525,10 +496,9 @@ struct DrawCall {
   // The guest's own vertex streams, raw and still big-endian, concatenated into
   // one buffer for the translated vertex shader to decode for itself. Merged
   // rather than bound separately so a shader reading up to kMaxStreams of them
-  // still needs one root SRV and no descriptor at all.
-  //
-  // A copy rather than a pointer: the guest may overwrite its vertex buffer
-  // before the render thread submits this draw.
+  // still needs one root SRV and no descriptor at all. A copy rather than a
+  // pointer: the guest may overwrite its vertex buffer before the render thread
+  // submits this draw.
   std::vector<uint8_t> raw_vertex_bytes;
 
   // Per emitted vfetch, in the shader's program order, matching
@@ -539,11 +509,9 @@ struct DrawCall {
   //
   // `limit` is the exclusive byte offset one past this stream's valid region,
   // and it is what makes reading the merged buffer safe: the buffer reaches the
-  // GPU as a ROOT SRV, which carries a virtual address and no size, so the
-  // hardware bounds-checks nothing. Per stream rather than per buffer because
-  // the regions are packed with no gap, so a buffer-wide bound would still let
-  // one stream read the next one's vertices. Beyond `limit` the shader reads
-  // zero, which is what the hardware and the reference do.
+  // GPU as a ROOT SRV, which carries a virtual address and no size. Per stream
+  // rather than per buffer because the regions are packed with no gap. Beyond
+  // `limit` the shader reads zero, which is what the hardware does.
   struct RawFetch {
     uint32_t base = 0;
     uint32_t stride = 0;
@@ -564,18 +532,15 @@ struct DrawCall {
   // ALU constants 256-511, read from device+0x1780 -- a different bank from the
   // vertex one at device+0x780. D3DDevice_DrawVertices flushes them separately,
   // passing Xenos register base 0x4000 for the vertex bank and 0x4400 for this
-  // one. The rebase happens here, at capture, so the emitted shader can index
-  // its own bank from 0.
+  // one. The rebase happens here, at capture.
   std::vector<uint32_t> pixel_constants;
 
   // The Bink frame composite binds several textures at once -- Y at full
   // resolution, Cr and Cb at half, plus an optional alpha plane, every plane k_8
-  // -- which the single `texture` above cannot express.
-  //
-  // These deliberately bypass the g_hleCpuTextures cache: the planes are new
-  // guest memory every video frame, so caching them by payload key would grow
-  // the cache and the descriptor heap without bound. They are decoded fresh per
-  // frame into reusable host textures.
+  // -- which the single `texture` above cannot express. These deliberately
+  // bypass the g_hleCpuTextures cache: the planes are new guest memory every
+  // video frame, so caching them by payload key would grow the cache and the
+  // descriptor heap without bound.
   static constexpr uint32_t kMaxPlanes = 4;
   std::array<std::shared_ptr<const HleTexturePayload>, kMaxPlanes> planes;
   uint32_t plane_count = 0;
@@ -594,8 +559,7 @@ struct DrawCall {
     // The default, and deliberately NOT kNone: TranscodeVertices has several
     // early exits (no position attribute, an unconfirmed position format) that
     // return before any colour is resolved, and folding those into kNone would
-    // inflate the population. These draws keep the guest stride and the
-    // renderer's stride-28 gate drops them.
+    // inflate the population.
     kNotTranscoded = 0,
     kNone,          // no colour attribute — seeded {1,1,1,1}, a modulation
                     // identity for the textured shader, not a colour
@@ -612,17 +576,12 @@ struct DrawCall {
   // -- graphics_system passes `(colour_mask & 0xF) != 0` and the renderer sets
   // RenderTargetWriteMask to ALL or 0, so a guest mask of 0x1 makes us write
   // four channels. A 199,000-draw histogram measured that widening firing
-  // exactly once: 0x0 66518 (depth-only passes), 0xF 132481, 0x7 one. Do not
-  // suspect it for anything that happens per frame.
-  //
-  // Still missing is the alpha test, which D3D12 has no fixed-function
-  // equivalent for; blend factors and depth enable/write are read.
+  // exactly once: 0x0 66518 (depth-only passes), 0xF 132481, 0x7 one.
   uint32_t colour_mask = 0;    // RB_COLOR_MASK    0x2104, bits 0-3 = RGBA of RT0
   uint32_t depth_control = 0;  // RB_DEPTHCONTROL  0x2200
   // The other two registers the stencil state needs, captured beside
   // depth_control so all three describe the SAME draw. Reading them later, in
-  // the renderer, would read whatever the device holds by then -- which for a
-  // deferred draw is the end of the frame.
+  // the renderer, would read whatever the device holds by then.
   //
   //   RB_STENCILREFMASK  ref bits 0-7, read mask 8-15, write mask 16-23
   //   RB_MODECONTROL     edram_mode is the low 3 bits
@@ -630,31 +589,26 @@ struct DrawCall {
   // edram_mode is carried rather than pre-judged because it gates the WHOLE
   // depth-stencil register: outside kColorDepth(4) and kDepthOnly(5) the
   // hardware ignores depth and stencil alike and the reference returns a zeroed
-  // RB_DEPTHCONTROL (draw_util.cc:90). A draw can have the enable bit set and
-  // mean nothing by it.
-  //
-  // 0xFFFFFFFF means the register could not be read, and cannot collide with a
-  // real value: edram_mode is 3 bits.
+  // RB_DEPTHCONTROL (draw_util.cc:90). 0xFFFFFFFF means the register could not
+  // be read, and cannot collide with a real value: edram_mode is 3 bits.
   uint32_t stencil_ref_mask = 0xFFFFFFFFu;  // RB_STENCILREFMASK 0x210D
   uint32_t edram_mode = 0xFFFFFFFFu;        // RB_MODECONTROL    0x2208, low 3
 
   // PA_SU_SC_MODE_CNTL 0x2205: cull_front +0, cull_back +1, face +2 (0 = front
-  // is CCW, 1 = CW). Raw, like the three above. Zero means the register was
-  // unreadable, which decodes as "cull nothing".
+  // is CCW, 1 = CW). Raw, like the three above; zero means unreadable, which
+  // decodes as "cull nothing".
   //
-  // Both PSO paths hardcoded D3D12_CULL_MODE_NONE before this existed, so the
-  // guest's cull mode was never read. Nearly invisible for opaque solids, whose
-  // back faces are hidden by the depth test anyway, and catastrophic for a
-  // closed volume that CONTAINS the camera: every visible face is then a back
-  // face, so the console culls the whole primitive and we rasterise its
-  // interior. That is the menu background.
+  // Both PSO paths hardcoded D3D12_CULL_MODE_NONE before this existed. Nearly
+  // invisible for opaque solids, whose back faces are hidden by the depth test,
+  // and catastrophic for a closed volume that CONTAINS the camera: every visible
+  // face is then a back face, so the console culls the whole primitive and we
+  // rasterise its interior. That is the menu background.
   uint32_t pa_su_sc_mode_cntl = 0;  // PA_SU_SC_MODE_CNTL 0x2205
 
   // Alpha blending from RB_BLENDCONTROL0. Raw for the same reason as the two
   // above: keeping the guest's Xenos numbers means a wrong mapping shows up as a
   // wrong number rather than as a plausible blend nobody asked for. Everything
-  // was drawn opaque before this, so the front end's fullscreen overlays painted
-  // flat over the whole scene.
+  // was drawn opaque before this.
   uint32_t blend_enable = 0;   // equation differs from ONE/ZERO/ADD
   uint32_t src_blend = 0;      // Xenos color source factor
   uint32_t dest_blend = 0;     // Xenos color destination factor
@@ -669,8 +623,7 @@ struct DrawCall {
   // shadow, which covers eight output-merger leaves and has no alpha entries.
   // D3DDevice_DrawVertices' own flush names both blocks -- m_ControlPacket at
   // device+0x2934 for register base 0x2200, m_ValuesPacket at device+0x28CC for
-  // base 0x2100 -- so 0x2202 sits at device+0x293C and 0x210E at device+0x2904,
-  // both inside the packet sizes the IDB's D3DDevice type gives.
+  // base 0x2100 -- so 0x2202 sits at device+0x293C and 0x210E at device+0x2904.
   uint32_t colour_control = 0;
   float alpha_ref = 0.0f;      // RB_ALPHA_REF 0x210E
   bool alpha_state_seen = false;
@@ -697,8 +650,7 @@ struct DrawCall {
   // this draw was finalized; bit i is register i in the order listed. WITHOUT
   // THIS THE VALUES ABOVE ARE UNREADABLE: the translator is Clear()ed once per
   // frame and the context shadow zeroed, so a register the guest set once at
-  // init and never re-set reads zero in every frame we look at -- and a colour
-  // mask of zero is exactly the kind of finding this is used to hunt.
+  // init and never re-set reads zero in every frame we look at.
   uint32_t om_seen = 0;
 };
 
@@ -708,11 +660,10 @@ struct DrawCall {
 // (639.5, -0.5, 1, w=1) in a 1280x720 window. That is why BuildViewportMvp
 // exists and why the renderer applies the viewport inverse.
 //
-// The classifier that established it was removed 2026-08-17 as dead code. Three
-// rules it baked in, worth knowing if the question is reopened: test degenerate
-// (0,0,0,w=0) FIRST, since it sits inside both regions; on a tie clip wins, not
-// window; and the window extent comes from the viewport, not a hardcoded
-// 1280x720.
+// The classifier that established it was removed as dead code. Three rules it
+// baked in, worth knowing if the question is reopened: test degenerate
+// (0,0,0,w=0) FIRST, since it sits inside both regions; on a tie clip wins; and
+// the window extent comes from the viewport, not a hardcoded 1280x720.
 //===========================================================================
 
 //===========================================================================
@@ -729,8 +680,8 @@ struct DrawCall {
 HostTopology MapTopology(uint32_t prim_type);
 
 // Rewrite a RectangleList draw into a triangle list in place. Each group of 3
-// vertices gives three corners of a rectangle, and WHICH three is not fixed:
-// the longest edge picks the arrangement, the triple is permuted so the diagonal
+// vertices gives three corners of a rectangle, and WHICH three is not fixed: the
+// longest edge picks the arrangement, the triple is permuted so the diagonal
 // runs from the second vertex to the third, and the fourth corner is
 // v1 + v2 - v0 over the permuted triple, on every float of the vertex. Returns
 // the number of rectangles expanded, 0 if the draw could not be.
@@ -754,9 +705,8 @@ uint32_t ExpandQuadList(DrawCall& dc);
 // The guest's adaptation pass (sub_82AFB8A8) does not sample this value, it
 // LOADS it: `lwz r4, 0x20(r5); clrrwi r3, r4, 12; lhz r11, 0(r3)` reads the
 // destination texture's own bytes out of guest memory as a 16-bit half. Our
-// resolves only fill host textures, so the guest read zero, computed its
-// exposure as a division by that zero, and wrote +Infinity into pixel constant
-// 100 -- which turned the composite's output to NaN and the frame white.
+// resolves only fill host textures, so the guest read zero and wrote +Infinity
+// into pixel constant 100, which turned the composite's output to NaN.
 //
 // The renderer publishes and the D3D9 layer consumes, because only the renderer
 // can read the GPU and only the hooks can address guest memory. `seq` is bumped
@@ -778,17 +728,14 @@ extern std::atomic<uint32_t> g_luminanceReadbackSeq;
 
 // SMALL RESOLVE DESTINATIONS THE GUEST READS FROM MEMORY rather than samples --
 // see [[guest-reads-resolves-from-memory]]. The luminance 1x1 above is one; the
-// terrain's 64x64 virtual-texture FEEDBACK BUFFER is the other. The GPU writes
-// page IDs and the CPU reads them to decide which tiles to stream, so a resolve
-// landing only in a host snapshot leaves the guest never learning which pages
-// the camera needs -- a uniform index map and 3 of 64 atlas tiles resident.
+// terrain's 64x64 virtual-texture FEEDBACK BUFFER is the other, where the GPU
+// writes page IDs and the CPU reads them to decide which tiles to stream.
 //
 // 64x64x4 is the cap: it covers the feedback buffer and excludes the only other
 // never-sampled destination in the census, a 1280x720 scene target that reaches
-// the screen by another path and would cost a megabyte a frame. Raising it to
-// 128 KB to deliver the 129x129 terrain height snapshot was tried and reverted
-// -- nothing reads that snapshot, and delivering it took the feedback buffer
-// down to 1 win in 2162.
+// the screen by another path. Raising it to 128 KB to deliver the 129x129
+// terrain height snapshot was tried and reverted -- nothing reads that snapshot,
+// and delivering it took the feedback buffer down to 1 win in 2162.
 inline constexpr uint32_t kMaxSurfaceReadbackBytes = 64 * 64 * 4;
 struct SurfaceReadback {
   uint32_t destObject = 0;
@@ -809,18 +756,16 @@ struct SurfaceReadback {
   uint8_t bytes[kMaxSurfaceReadbackBytes] = {};
   // NON-ZERO AND MONOTONIC once this slot has ever been filled. A consumer
   // remembers the seq it last acted on PER SLOT, which is what lets several
-  // destinations be delivered in the same frame: a single global "have I read
-  // the latest" flag let whichever destination matched first mark the frame
-  // consumed and silently skip the others.
+  // destinations be delivered in the same frame: a single global flag let
+  // whichever destination matched first mark the frame consumed.
   uint32_t seq = 0;
 };
 // MORE THAN ONE READBACK IN FLIGHT. One slot was right while the VT feedback
-// buffer was the only destination; with the terrain deformation also landing the
-// feedback buffer went from served to starved, and the renderer put 711 of 1,922
-// opportunities in lost-busy. Rotating one slot would share the starvation
-// instead of ending it: the feedback buffer is per-frame state driving page
-// streaming, while the deformation ACCUMULATES and tolerates gaps. Four covers
-// the three destinations seen with room for one more.
+// buffer was the only destination; with the terrain deformation also landing,
+// the renderer put 711 of 1,922 opportunities in lost-busy. Rotating one slot
+// would share the starvation instead of ending it: the feedback buffer is
+// per-frame state driving page streaming, while the deformation ACCUMULATES and
+// tolerates gaps.
 inline constexpr uint32_t kSurfaceReadbackSlots = 4;
 extern std::mutex g_surfaceReadbackMutex;
 extern SurfaceReadback g_surfaceReadback[kSurfaceReadbackSlots];

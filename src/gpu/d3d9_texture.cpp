@@ -17,12 +17,10 @@ namespace tu = rex::graphics::texture_util;
 
 // The 3D tiled address, TRANSCRIBED from xenia-edge (texture_util.cc:473, itself
 // "reconstructed from disassembly of XGRAPHICS::TileVolume"), not re-derived and
-// not taken from the rexglue SDK.
-//
-// The SDK declares GetTiledOffset3D and would link, but its xenos layer is known
-// to lag xenia-edge and there is no way to read its implementation from here. A
-// wrong address function does not fail loudly -- it produces a plausible garbage
-// image -- so the version that can be diffed against its source wins.
+// not taken from the rexglue SDK -- whose xenos layer is known to lag and whose
+// implementation cannot be read from here. A wrong address function does not
+// fail loudly, it produces a plausible garbage image, so the version that can be
+// diffed against its source wins.
 //
 // A tile is 32x32x4 BLOCKS. Note xenos.h:1204: "3D tiled texture slices 0:3 and
 // 4:7 are stored separately in memory, in non-overlapping ranges, but addressing
@@ -59,13 +57,11 @@ int32_t TiledOffset3D(int32_t x, int32_t y, int32_t z, uint32_t pitch,
 }
 
 // Xenia-edge's own GetTiledOffset2D (texture_util.cc:455), transcribed so the
-// SDK's version can be DIFFED against it rather than trusted.
-//
-// Every tiled 2D texture in the game is addressed by the SDK's
-// tu::GetTiledOffset2D and nothing has ever checked it against anything. The mip
-// self-check cannot: it compares level n against a box-filtered level n-1, so an
-// addressing error applied CONSISTENTLY to both scrambles them identically and
-// still passes. It is a relative check; this is the absolute one.
+// SDK's version can be DIFFED against it rather than trusted. Every tiled 2D
+// texture in the game is addressed by the SDK's tu::GetTiledOffset2D and nothing
+// has ever checked it: the mip self-check cannot, because it compares level n
+// against a box-filtered level n-1, so an addressing error applied CONSISTENTLY
+// to both scrambles them identically and still passes.
 int32_t XeniaTiledOffset2D(int32_t x, int32_t y, uint32_t pitch,
                            uint32_t bytes_per_block_log2) {
   constexpr uint32_t kTile = 32;
@@ -81,11 +77,9 @@ int32_t XeniaTiledOffset2D(int32_t x, int32_t y, uint32_t pitch,
 
 // One sweep, once per run, comparing the SDK's tiled addressing against the
 // transcription above. Silent when they agree; a single line naming the first
-// disagreement when they do not.
-//
-// Cheap enough to be unconditional (a few thousand integer ops at startup), and
-// it must be unconditional: a mismatch would mean every tiled texture in the
-// game is being read from the wrong bytes.
+// disagreement when they do not. Cheap enough to be unconditional, and it must
+// be: a mismatch would mean every tiled texture in the game is being read from
+// the wrong bytes.
 HleTiledAddressCheck g_tiledCheck;
 HleOneDCensus g_oneDCensus;
 
@@ -150,8 +144,7 @@ void SwapBlock(uint8_t* p, uint32_t bytes, xenos::Endian endian) {
 //
 // THE NIBBLE ORDER IS PINNED, not assumed. The sibling transform
 // XeR4G4B4A4ToA4R4G4B4 -- `((t & 0x0FFF) << 4) | ((t & 0xF000) >> 12)` -- only
-// maps source to destination self-consistently if these names read LSB->MSB,
-// i.e. R4G4B4A4 really does put R in the low nibble.
+// maps source to destination self-consistently if these names read LSB->MSB.
 //
 // WHY THIS WAS PREVIOUSLY DECLINED, and why that reasoning does not hold. The
 // note above k_4_4_4_4 argued the guest is ARGB4444 from two observations:
@@ -161,13 +154,12 @@ void SwapBlock(uint8_t* p, uint32_t bytes, xenos::Endian endian) {
 //     it is evidence FOR the swap: the guest's red nibble 0xA is arriving in
 //     blue.
 //   * "UI texture 6933 decodes to a clean greyscale mask, every value R==G==B".
-//     A greyscale texture CANNOT detect a red<->blue swap. That check was
-//     vacuous for the question it was asked.
+//     A greyscale texture CANNOT detect a red<->blue swap.
 //
 // What made it visible is a texture that is not greyscale and whose channels are
-// read as numbers rather than looked at: the terrain page table (1024x1024,
-// fetch swizzle 03012, so the shader's .z is guest component 0). It was being
-// handed guest BLUE where the lookup wanted guest RED.
+// read as numbers: the terrain page table (1024x1024, fetch swizzle 03012, so
+// the shader's .z is guest component 0) was being handed guest BLUE where the
+// lookup wanted guest RED.
 void ConvertBlockChannels(uint8_t* p, uint32_t guest_format, uint32_t bytes) {
   if (bytes != 2 ||
       guest_format != uint32_t(xenos::TextureFormat::k_4_4_4_4))
@@ -239,12 +231,11 @@ void DescribeHleMipChain(const xenos::xe_gpu_texture_fetch_t& fetch,
     return;
   }
   // kBaseMap is the guest saying it never wants to minify past level 0, so the
-  // cheapest way to honour it is to not decode a chain it will not sample.
-  //
-  // The reference keeps the chain and clamps the SAMPLER instead, because a
-  // shader's own tfetch can override the fetch constant's mip filter. Our HLSL
-  // emitter does not model that override at all, so the two are equivalent today
-  // -- but if it ever does, this has to move back into the sampler.
+  // cheapest way to honour it is to not decode a chain it will not sample. The
+  // reference keeps the chain and clamps the SAMPLER instead, because a shader's
+  // own tfetch can override the fetch constant's mip filter; our HLSL emitter
+  // does not model that override, so the two are equivalent today -- but if it
+  // ever does, this has to move back into the sampler.
   static_assert(uint8_t(xenos::TextureFilter::kBaseMap) == kMipFilterBaseMap,
                 "the renderer's copy of kBaseMap has drifted from the SDK's");
   if (fetch.mip_filter == xenos::TextureFilter::kBaseMap) {
@@ -256,9 +247,7 @@ void DescribeHleMipChain(const xenos::xe_gpu_texture_fetch_t& fetch,
   // mip_min_level != 0 means the base level is not meant to be sampled at all,
   // and the reference responds by zeroing base_page and turning the level into
   // the sampler's MinLOD. We do neither yet, so the honest thing is to leave
-  // such a texture exactly as it decoded before and count it -- if the counter
-  // stays at zero the case does not arise, and if it does not, it gets handled
-  // with a real population to size the fix against.
+  // such a texture exactly as it decoded before and count it.
   if (mip_min) {
     g_mipMinLevel.fetch_add(1, std::memory_order_relaxed);
     return;
@@ -407,17 +396,14 @@ bool HleTextureHasNonzeroData(const HleTexturePayload& texture,
 
 bool HleTextureIsConstant(const HleTexturePayload& texture, uint8_t* value) {
   // The same question as HleTextureHasNonzeroData, asked for the case that test
-  // is blind to. All-zero is not the only meaningless decode: guest memory the
-  // CPU never writes can just as easily read back all-0xFF, and that passes the
-  // nonzero test as though it were real data.
+  // is blind to: all-zero is not the only meaningless decode, because guest
+  // memory the CPU never writes can just as easily read back all-0xFF.
   //
   // Measured: the terrain heightmap is a GPU resolve destination, so nothing
   // ever CPU-writes its backing store. Decoding it yielded a uniformly WHITE
   // 2048x2048, the vertex stage read a constant 1.0 for every texel, and the
   // whole terrain came out flat at world Y = 1 against a camera at Y = 616. No
   // `bound-zero` line was ever printed for it, because it is not zero.
-  //
-  // Level 0 only, for the reason above.
   const size_t base_bytes =
       texture.level_count > 1
           ? std::min<size_t>(texture.levels[1].offset, texture.data.size())
@@ -461,18 +447,15 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
   //
   // CUBE and STACKED textures are the same thing in memory as several 2D ones:
   // six faces, or stack_depth+1 slices, each an ordinary 2D image, each starting
-  // 4 KB-aligned from the last. So they are described as a 2D texture plus a
-  // slice count and stride, decoded by running the 2D untile once per slice, and
-  // bound as a Texture2DArray. Only true 3D volumes, whose slices interleave
+  // 4 KB-aligned from the last. Only true 3D volumes, whose slices interleave
   // INSIDE a tile, need a resource type we do not build.
   const bool one_d = fetch.dimension == xenos::DataDimension::k1D;
   const bool cube = fetch.dimension == xenos::DataDimension::kCube;
   if (one_d) {
     ++g_oneDCensus.seen;
     // xenia-edge treats both of these as "completely wrong" for a 1D texture and
-    // drops the binding entirely (texture_cache.cc:1067, :1078), which makes the
-    // sampler read zero. We used to carry both flags into the 2D path instead,
-    // and neither is harmless there:
+    // drops the binding entirely (texture_cache.cc:1067, :1078). We used to
+    // carry both flags into the 2D path instead, and neither is harmless there:
     //
     //   tiled -- 2D tiling arranges 32x32 blocks. Applied to a single row it
     //     scatters the row across tiles that hold no data for it.
@@ -481,9 +464,8 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
     //     sub-rect offset applied to it.
     //
     // The reference's LOG says "ignoring", but its code sets is_invalid_1d and
-    // returns with the key still invalid, so the binding is dropped rather than
-    // the flag. Matching the code, not the message: sample_as_zero tells the
-    // caller to bind zero and keep the draw.
+    // returns with the key still invalid. Matching the code, not the message:
+    // sample_as_zero tells the caller to bind zero and keep the draw.
     if (fetch.tiled) {
       ++g_oneDCensus.tiled;
       out.sample_as_zero = true;
@@ -511,8 +493,7 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
   }
   // A TRUE VOLUME. Its slices interleave inside the tile rather than sitting a
   // stride apart -- but only the ADDRESSING differs. Decoded slice by slice into
-  // the same tightly-packed output and bound as the same Texture2DArray, so
-  // nothing downstream changes.
+  // the same tightly-packed output and bound as the same Texture2DArray.
   //
   // Refusing this was the red gameplay screen: guest pixel shader 0x216012A0 is
   // a full-screen pass with three samplers, one a volume; the refusal failed its
@@ -542,15 +523,15 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
                       ((uint32_t(fetch.sign_y) & 3u) << 2) |
                       ((uint32_t(fetch.sign_z) & 3u) << 4) |
                       ((uint32_t(fetch.sign_w) & 3u) << 6));
-  // "At least one component is two's complement", the reference's
-  // IsAnySignSigned (texture_util.h:347) spelled out: XOR each 2-bit field
-  // against kSigned(01) and a field that was kSigned becomes 00, so the fold
-  // below finds a zero field exactly when one component was signed.
+  // "At least one component is two's complement", the reference's IsAnySignSigned
+  // (texture_util.h:347) spelled out: XOR each 2-bit field against kSigned(01)
+  // and a field that was kSigned becomes 00, so the fold below finds a zero field
+  // exactly when one component was signed.
   //
   // The RAW signs, not the swizzled ones. The swizzle decides which host channel
-  // receives which guest component -- and can substitute a literal 0 or 1, which
-  // SwizzleTextureSigns rightly calls unsigned -- but whether the STORED bits
-  // are two's complement is a property of the guest components themselves.
+  // receives which guest component -- and can substitute a literal 0 or 1 --
+  // while whether the STORED bits are two's complement is a property of the
+  // guest components themselves.
   const uint32_t sign_xor = uint32_t(out.signs) ^ 0b01010101u;
   const bool any_component_signed =
       ((sign_xor | (sign_xor >> 1)) & 0b01010101u) != 0b01010101u;
@@ -568,11 +549,10 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
     // rejected descriptor leaves the slot with no resource, so the sampler reads
     // zero rather than failing visibly.
     //
-    // One case covers both spellings precisely because the fold already
-    // happened. The reference gives both rows R10G10B10A2_UNORM with load shader
-    // 32bpb and an identity RGBA host swizzle, so this is a straight copy, and
-    // being four-channel it does NOT inherit the RGGG divergence written up at
-    // k_8_8 below.
+    // One case covers both spellings precisely because the fold already happened.
+    // The reference gives both rows R10G10B10A2_UNORM with load shader 32bpb and
+    // an identity RGBA host swizzle, and being four-channel it does NOT inherit
+    // the RGGG divergence written up at k_8_8 below.
     case xenos::TextureFormat::k_2_10_10_10:
       out.host_format = HostTextureFormat::kRgb10A2Unorm;
       break;
@@ -601,24 +581,18 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
       break;
     // RED AND BLUE ARE SWAPPED IN THE LOAD -- see ConvertBlockChannels, which
     // carries the nibble table and how the order was pinned. What follows is the
-    // argument for NOT swapping, kept because it stood for three days and should
-    // not be re-derived: both of its observations are compatible with the swap,
-    // and its decisive check used a greyscale texture, which cannot see a
-    // red<->blue swap at all.
+    // argument for NOT swapping, kept because it stood for three days: both of
+    // its observations are compatible with the swap, and its decisive check used
+    // a greyscale texture, which cannot see a red<->blue swap at all.
     //
     // The reference appears to disagree: d3d12_texture_cache.h:303 pairs
     // B4G4R4A4_UNORM with kLoadShaderIndexRGBA4ToBGRA4 -- "Red and blue swapped
-    // in the load shader for simplicity" -- and the same holds for every packed
-    // format. I added that swap and then took it back out, because the capture
-    // says the guest format is ARGB4444, not RGBA4444:
+    // in the load shader for simplicity". I added that swap and then took it back
+    // out, because the capture seemed to say the guest format is ARGB4444:
     //
     //   The index map stores host word 0xF00A and RenderDoc reads it as
     //   (R=0, G=0, B=0xA, A=0xF), pinning the HOST layout to A,R,G,B. UI texture
-    //   6933 then decodes to a clean greyscale mask with alpha exactly 0 or 255,
-    //   which is what UI art looks like; under the RGBA4 reading the SAME bytes
-    //   would be a pinkish semi-transparent texture with no clean alpha.
-    //
-    // D3DFMT_A4R4G4B4 is also the format a D3D9 title would actually ask for.
+    //   6933 then decodes to a clean greyscale mask with alpha exactly 0 or 255.
     //
     // Why the reference still swaps: Xenia binds a FIXED host swizzle and
     // corrects channels in the load shader, while we apply the GUEST fetch
@@ -634,28 +608,22 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
       out.host_format = HostTextureFormat::kR8;
       break;
     // Two 8-bit channels, 1x1 blocks, 2 bytes -- the reference's own entry is
-    // R8G8_UNORM loaded by the plain 16bpb copy shader, so nothing but the
-    // accept-list entry is needed. Component 0 is the LOW half of the 16-bit
-    // texel, and SwapBlock's 2-byte case already turns the guest's big-endian
-    // pair into that order.
+    // R8G8_UNORM loaded by the plain 16bpb copy shader. Component 0 is the LOW
+    // half of the 16-bit texel, and SwapBlock's 2-byte case already turns the
+    // guest's big-endian pair into that order.
     //
     // WHERE WE STILL DIVERGE -- read this before adding another two-channel
     // format. The reference gives EVERY two-component row the host swizzle RGGG,
     // replicating the last real channel into z and w, because a Xenos fetch of a
     // two-channel texture returns y there rather than 0/1. We apply the guest
     // swizzle raw against an identity host swizzle, so a shader asking for .z or
-    // .w reads what DXGI supplies for the missing channels -- 0 and 1 -- not y.
+    // .w reads what DXGI supplies -- 0 and 1 -- not y.
     //
     // The affected population is FOUR formats: k_8_8 here, and k_16_16,
-    // k_16_16_FLOAT and k_32_32_FLOAT below. (k_16_16_16_16 is RGBA and is NOT
-    // affected.) The composition is
-    // GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(key)) -- the guest
-    // selector INDEXES the host swizzle, so a guest .z on an RGGG format
-    // resolves to G rather than passing through.
-    //
-    // Still not fixed here, for the original reason: the composition affects kR8
-    // (the glyph format) as well, so it is its own change with its own
-    // screenshot, and every observed use of a two-channel texture reads .xy.
+    // k_16_16_FLOAT and k_32_32_FLOAT below. Still not fixed, because the
+    // composition GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(key))
+    // affects kR8 (the glyph format) as well, so it is its own change with its
+    // own screenshot -- and every observed use of a two-channel texture reads .xy.
     case xenos::TextureFormat::k_8_8:
       out.host_format = HostTextureFormat::kRg8;
       break;
@@ -675,13 +643,11 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
     // one is a surface the deferred passes render into and then sample.
     //
     // Sampling one usually takes the resolve-snapshot branch and never reaches
-    // this function, so these entries matter on the snapshot MISS path -- a real
-    // population, and until now every miss on these four failed the slot fill
-    // and dropped the draw to a stand-in.
+    // this function, so these entries matter on the snapshot MISS path -- until
+    // now every miss on these four failed the slot fill and dropped the draw.
     //
-    // Straight passthrough, all four: 1x1 blocks of 4 or 8 bytes whose bytes are
-    // the host's once SwapBlock has run. THREE of the four are two-channel and
-    // so inherit the RGGG host-swizzle divergence written up at k_8_8 above.
+    // Straight passthrough, all four. THREE of them are two-channel and so
+    // inherit the RGGG host-swizzle divergence written up at k_8_8 above.
     case xenos::TextureFormat::k_16_16_FLOAT:
       out.host_format = HostTextureFormat::kRg16Float;
       break;
@@ -692,20 +658,15 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
     // side of these same formats uses.
     //
     // The justification here USED to be "the pixel shader already divides by 32
-    // on the write path". That is no longer true and was never the reason: the
-    // 1/32 was Xenia's SNORM-target hack, it had no inverse on our half-float
-    // targets, and it was removed.
+    // on the write path". That was never the reason: the 1/32 was Xenia's
+    // SNORM-target hack, it had no inverse on our half-float targets, and it was
+    // removed.
     //
-    // The mapping below stands on its own reason: this is the TEXTURE format
-    // table, and TextureFormat k_16_16 / k_16_16_16_16 are normalized fixed
-    // point by the fetch's own sign bits, which is a different question from
-    // what ColorRenderTargetFormat 4 and 5 mean. A surface written as an RT and
-    // sampled back does not come through here at all -- it takes the
-    // resolve-snapshot branch, which views the host resource directly.
-    //
-    // UNORM or SNORM by the fetch's own sign bits, exactly as the reference does
-    // it -- see the note on kRg16Unorm in hle_types.h for why the choice lives
-    // here rather than in a typeless resource.
+    // The mapping stands on its own reason: this is the TEXTURE format table, and
+    // TextureFormat k_16_16 / k_16_16_16_16 are normalized fixed point by the
+    // fetch's own sign bits, which is a different question from what
+    // ColorRenderTargetFormat 4 and 5 mean. A surface written as an RT and
+    // sampled back takes the resolve-snapshot branch instead.
     case xenos::TextureFormat::k_16_16:
       out.host_format = any_component_signed ? HostTextureFormat::kRg16Snorm
                                              : HostTextureFormat::kRg16Unorm;
@@ -717,8 +678,7 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
     // Depth sampled as a texture. This was the ONLY format rejected across whole
     // runs while it was rejected once per run -- a shader read it, gave up, and
     // the draw fell back. Once the pixel shaders that sample depth started
-    // translating it became 29,240 rejections in a single run, the largest
-    // texture rejection by far.
+    // translating it became 29,240 rejections in a single run.
     //
     // Carried as R32Float rather than a depth format: the guest samples this as
     // ordinary colour data, and a host DSV-backed SRV would drag format
@@ -769,10 +729,10 @@ bool DescribeHleTexture2D(const uint32_t fetch_words[6],
 
   // The base level of a small texture is inside the packed mip tail, not at the
   // origin. GetPackedMipOffset reports false for anything whose base is stored
-  // plainly, so this is self-gating: only textures with a dimension of 16 or
-  // less come back packed. Gated on the fetch constant's flag as well, because
-  // the tail only exists if the guest asked for one (xenos.h:1265, packed_mips
-  // at bit +11).
+  // plainly, so this is self-gating: only textures with a dimension of 16 or less
+  // come back packed. Gated on the fetch constant's flag as well, because the
+  // tail only exists if the guest asked for one (xenos.h:1265, packed_mips at
+  // bit +11).
   if (fetch.packed_mips) {
     uint32_t px = 0, py = 0, pz = 0;
     if (tu::GetPackedMipOffset(out.width, out.height, 1, format, /*mip=*/0, px,
@@ -844,8 +804,7 @@ bool DecodeHleTexture2D(const HleTextureSource& source,
   // Where each level lands in the output. The host wants every subresource
   // TIGHTLY packed -- that is what GetCopyableFootprints will be handed -- which
   // is not how the guest stores anything: guest slices are 4 KB-aligned, levels
-  // sit at their own offsets in a second allocation, and both may be tiled. So
-  // the gaps are source-side strides on the way in and nothing on the way out.
+  // sit at their own offsets in a second allocation, and both may be tiled.
   //
   // Level-major, slices inside each level, matching the guest's own nesting.
   // D3D12 nests the other way round, so the upload walks this table.
@@ -996,17 +955,14 @@ bool DecodeHleTexture2D(const HleTextureSource& source,
 
   // Depth is the one accepted format whose BYTES are not already the host's.
   // Every other entry is a straight copy plus an endian swap, so this is the
-  // only place a value conversion happens, and it is done after the swap so it
-  // reads host-order words.
+  // only place a value conversion happens, and it is done after the swap.
   //
   // k_24_8 packs 24 bits of depth above 8 bits of stencil. The shader wants the
   // depth as it wrote it, in [0,1], so the stencil is dropped and the integer is
   // normalised -- NOT reinterpreted as a float, which would produce denormals
-  // and NaNs from ordinary depth values.
-  //
-  // k_24_8_FLOAT shares the layout but stores a float depth; it is converted the
-  // same way, which is wrong in the last bits of precision and right in range.
-  // Called out rather than hidden: it has never been observed in this title.
+  // and NaNs from ordinary depth values. k_24_8_FLOAT shares the layout but
+  // stores a float depth; it is converted the same way, which is wrong in the
+  // last bits of precision and right in range, and has never been observed here.
   if (source.guest_format == uint32_t(xenos::TextureFormat::k_24_8) ||
       source.guest_format == uint32_t(xenos::TextureFormat::k_24_8_FLOAT)) {
     if (source.bytes_per_block != 4) return reject("24_8 block is not 4 bytes");

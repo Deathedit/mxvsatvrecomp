@@ -2,19 +2,14 @@
 //
 // NOT a public header. It exists so the guest entry points can live in
 // hooks_d3d9_entry.cpp while the state and draw-building machinery they drive
-// stay in hooks_d3d9.cpp -- one 9,000-line translation unit was the largest file
-// in the project and the one every rendering change has to be made in.
-//
-// The split point is the only cheap one the file has: measured, a cut at the
-// entry points costs 62 shared symbols where every other candidate boundary cost
-// 68 to 173, and the entry points were already outside the namespace because
-// REX_FUNC is extern "C".
+// stay in hooks_d3d9.cpp. The split point is the only cheap one the file has:
+// measured, a cut at the entry points costs 62 shared symbols where every other
+// candidate boundary cost 68 to 173, and the entry points were already outside
+// the namespace because REX_FUNC is extern "C".
 //
 // Keep this list SHORT. Anything added here is state two translation units can
 // reach, and the reason the original file was hard to reason about is that ~150
-// counters were reachable from anywhere in it. If a new entry point needs
-// something not already here, prefer giving it a function to call over
-// exporting another variable.
+// counters were reachable from anywhere in it.
 #pragma once
 
 #include <array>
@@ -43,13 +38,12 @@ using mx::hle::kMaxElements;   // refuses to walk a runaway array
 // no Release hook, so an entry is only ever added. 256 was a silent cliff --
 // RecordDeclaration returned -1 past it, which made every draw using a later
 // declaration look like one with no declaration bound, which BuildHleDraw
-// refuses as kNoLayout and the hook then drops with a bare `return`. Assets
+// refuses as kNoLayout and the hook then drops with a bare `return`, so assets
 // streamed in later stopped rendering with no report of any kind.
 //
-// Raised, and exhaustion is now reported by name at the point it happens. The
-// table is flat arrays scanned linearly by KnownDeclId, so this trades a larger
-// scan for not losing draws; the scan is once per CreateVertexDeclaration and
-// per draw, not per vertex.
+// Raised, and exhaustion is now reported by name. The table is flat arrays
+// scanned linearly by KnownDeclId, so this trades a larger scan for not losing
+// draws; the scan is once per CreateVertexDeclaration and per draw.
 constexpr int kMaxTrackedDecls = 4096;
 constexpr int kMaxDeclsLogged = 512;
 constexpr int kMaxDrawsLogged = 16;
@@ -104,8 +98,7 @@ struct ResolvedTargetByAddress {
   // it: the 2048x2048 menu atlas receives exactly ONE resolve in a whole
   // session, a 256x256 blit at (0,0) -- 1.5% of its area -- and the address
   // match then claimed it permanently, handing every draw a surface that is
-  // 98.5% clear colour and suppressing the CPU decode that would have re-read
-  // guest memory.
+  // 98.5% clear colour.
   //
   // Reached extent, not summed area: repeated full-surface resolves must not add
   // up past 100%, and a corner blit must not be mistaken for coverage because it
@@ -115,23 +108,17 @@ struct ResolvedTargetByAddress {
   uint32_t resolves = 0;
 
   // REAL COVERAGE, because `reached` is a BOUNDING BOX and a bounding box is not
-  // coverage.
-  //
-  // reached_x/reached_y are max(dx+w) and max(dy+h), chosen so repeated
-  // full-surface resolves cannot sum past 100% and a repeated corner blit is not
-  // mistaken for coverage -- both correct. What it cannot survive is resolves
-  // SCATTERED across the surface: the terrain deformation buffer takes 39 blits
-  // of 128x32, 3.8% of its 2048x2048, whose bounding box is 29.0%. It cleared
-  // the 25% threshold, was claimed, and the 96% no resolve ever touched then
-  // sampled 0 where the guest had written the NEUTRAL 0x80 -- dropping the whole
-  // terrain by 512/255 = 2.008 world units. That is the floating bike.
+  // coverage. What it cannot survive is resolves SCATTERED across the surface:
+  // the terrain deformation buffer takes 39 blits of 128x32, 3.8% of its
+  // 2048x2048, whose bounding box is 29.0%. It cleared the 25% threshold, was
+  // claimed, and the 96% no resolve ever touched then sampled 0 where the guest
+  // had written the NEUTRAL 0x80 -- dropping the whole terrain by 512/255 =
+  // 2.008 world units. That is the floating bike.
   //
   // A bitmask answers both questions at once: overlap saturates instead of
-  // summing, and a scatter reports the area it actually covers.
-  //
-  // 64x64 cells, one bit each: 512 bytes per destination, ~25 KB for a level's
-  // worth. Sized so a cell is 32x32 texels on a 2048 surface -- fine enough that
-  // the 128x32 deform blits register their true area.
+  // summing, and a scatter reports the area it actually covers. 64x64 cells, one
+  // bit each: 512 bytes per destination, sized so a cell is 32x32 texels on a
+  // 2048 surface -- fine enough that the 128x32 deform blits register.
   static constexpr uint32_t kCoverageGrid = 64;
   static constexpr uint32_t kCoverageWords = kCoverageGrid * kCoverageGrid / 64;
   uint64_t coverage[kCoverageWords] = {};
@@ -161,11 +148,11 @@ struct ResolvedTargetByAddress {
 
   // Mark every cell the rect [x0,x1) x [y0,y1) covers FULLY.
   //
-  // Fully, not "touches". Rounding outward is what produced this bug in the
-  // first place, and a threshold deciding whether to trust a snapshot must not
-  // round in favour of trusting it. Rounding inward would normally cost the far
-  // edge, but the clamps below give the last cell back to a resolve that reaches
-  // the surface edge, so a full-surface resolve still reads exactly 100%.
+  // Fully, not "touches". Rounding outward is what produced this bug in the first
+  // place, and a threshold deciding whether to trust a snapshot must not round in
+  // favour of trusting it. Rounding inward would normally cost the far edge, but
+  // the clamps below give the last cell back to a resolve that reaches the
+  // surface edge.
   void MarkCoverage(uint32_t x0, uint32_t y0, uint32_t x1, uint32_t y1) {
     const uint32_t nx = cells_x(), ny = cells_y();
     if (!nx || !ny) return;
@@ -201,24 +188,21 @@ struct ResolvedTargetByAddress {
     const uint32_t total = total_cells();
     return total ? uint32_t(uint64_t(covered_cells) * 100u / total) : 0u;
   }
-  // How many times the guest handed this destination BACK to SetTexture.
-  //
-  // A resolve that is produced and never consumed has two completely different
+  // How many times the guest handed this destination BACK to SetTexture. A
+  // resolve that is produced and never consumed has two completely different
   // causes, and they need opposite fixes:
   //
   //   binds > 0   the guest does ask for it and OUR binding path loses it -- a
   //               fetch constant we describe wrongly, a slot we resolve to
   //               something else, a draw we drop. Fixable here.
-  //   binds == 0  the guest never asks for it at all. Nothing in the host
-  //               renderer can make an unrequested texture appear.
+  //   binds == 0  the guest never asks for it at all.
   //
   // Counted at SetTexture rather than at draw time on purpose: it must measure
   // whether the GUEST asked, independently of whether our slot resolution then
-  // succeeded. A draw-time counter conflates the two.
+  // succeeded.
   uint64_t set_texture_binds = 0;
   // What the DRAW path then did with it. set_texture_binds says the guest asked;
-  // these three say whether we honoured the ask, and they are the only way to
-  // tell a binding we lost from one we never received.
+  // these three say whether we honoured the ask.
   //
   //   slot_seen      reached ResolvePixelSlotTexture as a known destination
   //   slot_snapshot  ...and was bound to the live host target (the good path)
@@ -233,8 +217,7 @@ struct ResolvedTargetByAddress {
   // exactly two causes and these separate them:
   //
   //   the sampler is one no translated shader fetches from -- the draw loop
-  //     iterates the SHADER's declared samplers, so a texture bound to a sampler
-  //     nobody reads is never looked up; or
+  //     iterates the SHADER's declared samplers; or
   //   the bind landed on a different D3DDevice than the one draws are built for,
   //     in which case DeviceState() at draw time never sees it.
   //
@@ -243,12 +226,10 @@ struct ResolvedTargetByAddress {
   uint32_t bind_sampler_mask = 0;
   uint32_t last_bind_device = 0;
   // Draws built while this destination was still bound to a sampler, and which
-  // guest samplers those draws' shaders actually FETCH from.
-  //
-  // The slot loop cannot measure this: it walks the shader's samplers, so a
-  // destination bound to a sampler no shader reads is never looked up and
-  // produces no failure, no counter and no log line. These three close that
-  // blind spot for a `bind>0 seen0` row:
+  // guest samplers those draws' shaders actually FETCH from. The slot loop cannot
+  // measure this: it walks the shader's samplers, so a destination bound to a
+  // sampler no shader reads produces no failure, no counter and no log line.
+  // These three close that blind spot for a `bind>0 seen0` row:
   //
   //   draws_while_bound == 0        the bind is transient -- something rebinds
   //                                 the sampler before any draw is built.
@@ -258,20 +239,19 @@ struct ResolvedTargetByAddress {
   uint64_t draws_while_bound = 0;
   uint64_t draws_no_translation = 0;
   uint32_t declared_sampler_mask = 0;
-  // The guest thread that last bound this destination.
-  //
-  // DeviceState() is `static thread_local` -- deliberately, because the guest's
-  // three record workers each drive their own D3D9 device on their own thread.
-  // So a SetTexture on thread A is invisible to a draw built on thread B, by
-  // design. `bind>0 draws0` is exactly what that looks like, and this field
-  // against the draw-thread list below is what proves or disproves it.
+  // The guest thread that last bound this destination. DeviceState() is `static
+  // thread_local` -- deliberately, because the guest's three record workers each
+  // drive their own D3D9 device on their own thread -- so a SetTexture on thread
+  // A is invisible to a draw built on thread B. `bind>0 draws0` is exactly what
+  // that looks like, and this field against the draw-thread list below is what
+  // proves or disproves it.
   uint32_t last_bind_thread = 0;
   // Guest Draw calls issued while this destination sat on a sampler, summed over
-  // every bind window, and how many windows that was. D3D9DrawCounter() is
-  // bumped at the guest's Draw entry points before any of our filtering, so
-  // `spanned == 0` over many windows means the GUEST never draws with it -- our
-  // draw path is not losing anything. `spanned > 0` with slot_seen == 0 means it
-  // does, and we drop those draws before the slot loop.
+  // every bind window, and how many windows that was. D3D9DrawCounter() is bumped
+  // at the guest's Draw entry points before any of our filtering, so
+  // `spanned == 0` over many windows means the GUEST never draws with it.
+  // `spanned > 0` with slot_seen == 0 means it does, and we drop those draws
+  // before the slot loop.
   uint64_t guest_draws_spanned = 0;
   uint64_t bind_windows = 0;
 };
@@ -445,12 +425,11 @@ extern uint64_t g_luminanceFloored;
 // same asset in both fields; FE_Smoke names `1280_720_VideoRenderTarget` as its
 // material and `Smoke_VideoRenderTarget` (1280x430) as its target. The existing
 // RESOLVE CONSUMPTION census cannot answer this, because it is keyed on resolve
-// DESTINATIONS and the material's texture need never be one -- a different
-// population, which is the trap this file has fallen into twice.
+// DESTINATIONS and the material's texture need never be one.
 //
 // So this is keyed by the texture's BASE ADDRESS and reports every row. 1280x720
-// is also the scene render-target shape, so a row at that shape is NOT
-// self-evidently the video asset; the address is what distinguishes them.
+// is also the scene render-target shape, so the address is what distinguishes
+// them.
 void NoteVideoShapeBind(uint32_t sampler, uint32_t object, const uint32_t* fetch,
                         bool fetch_valid, uint32_t device);
 void NoteVideoShapeSlot(const uint32_t* fetch, bool fetch_valid);
@@ -469,15 +448,13 @@ extern uint64_t g_decls;
 extern uint64_t g_patchCalls;
 // ATOMIC because the glyph cache is reached from more than one thread, and the
 // guest says so itself: sub_828ADA78 wraps BuildLineGlyphs and the flush in
-// RtlEnterCriticalSection(glyphCache + 2540). Scaleform does not pay for a
-// critical section on a single-threaded path.
+// RtlEnterCriticalSection(glyphCache + 2540).
 //
 // g_glyphCacheGeneration is the one that matters for correctness rather than
 // reporting: a lost increment leaves the generation unchanged, so
 // TextureContentStale says false, the atlas is never re-decoded, and the host
-// keeps serving the previous atlas contents. Stale glyphs, and silent -- the
-// flush counter would lose the same update, so the diagnostic under-reports in
-// exactly the runs where it happened.
+// keeps serving the previous atlas contents -- silently, because the flush
+// counter would lose the same update.
 extern std::atomic<uint32_t> g_glyphCacheGeneration;
 
 
@@ -496,8 +473,7 @@ extern std::atomic<uint32_t> g_glyphCacheGeneration;
 // (DrawBitmaps, one site at 0x829E1314) and a SHAPE path, and only the bitmap
 // one has ever shown up. Everything missing from the menu is a shape -- panels,
 // bar backgrounds, the star widget, and the MASK SHAPE itself -- while
-// everything present is a bitmap. If no 0x829Exxxx site appears on the indexed
-// path either, GFx never draws a shape at all.
+// everything present is a bitmap.
 void NoteUpDrawCaller(uint32_t lr, uint32_t verts, uint32_t kind);
 void ReportUpDrawCallers();
 
@@ -520,10 +496,7 @@ void NoteGlyphCacheGeometry(uint32_t width, uint32_t height);
 // so it reads zero under --gpu_plugin=xenos and the two modes cannot be compared
 // on it. That comparison is the one that matters: plugin mode renders the
 // main-menu backdrop and native does not, and native measures 339 guest draw
-// calls per frame against a Xenia reference frame carrying far more. Either the
-// guest issues the same work in both -- in which case our 339 draws produce the
-// wrong image and nothing is missing -- or it issues less under our hooks, which
-// would mean this layer is changing guest behaviour upstream of the renderer.
+// calls per frame against a Xenia reference frame carrying far more.
 //
 // Incremented before the passthrough return, so it is the guest's own call count
 // and nothing else. Atomic because the three record workers drive it and there

@@ -61,19 +61,17 @@ inline uint32_t RdIndex32(const uint8_t* p) {
 // A stream that ends before the vertex does is NOT a reason to lose the draw.
 // This used to `return false`, which became kVertexOutOfRange and discarded the
 // whole draw -- 27713 of 172500, 16% of every frame, and the single largest
-// reason draws never reached the renderer. It is also why those draws were
-// invisible in a GPU capture: they were thrown away before one existed.
+// reason draws never reached the renderer, invisible in a GPU capture because
+// they were thrown away before one existed.
 //
 // The guest binds streams whose fetch-constant size is smaller than the range a
 // draw indexes, and our snapshot of that constant AGREES with the device's, so
 // the size is not misread -- the hardware tolerates the overrun and returns
-// zero, which is what the reference does too. Zero-filling reproduces that: the
-// position reads 0 and the primitive collapses, exactly as on hardware.
+// zero, which is what the reference does too.
 //
 // `stream_index` exists only for the census below. The overrun is far larger
 // than "a few vertices at the tail" -- 304 million fills in one run -- so the
-// open question is WHICH stream is short and by how much. Three hypotheses died
-// to reasoning about that without data.
+// open question is WHICH stream is short and by how much.
 bool CopyVertex(const HleStream& s, uint32_t index, uint8_t* dst,
                 uint32_t dst_bytes, uint32_t stream_index) {
   const uint64_t byte_off =
@@ -192,13 +190,12 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
 
   // The declaration states which element is the position. No inference, no
   // fallback -- the single biggest difference from the PM4 path, where
-  // PickPositionAttribute has to trace the microcode to the position export and
-  // guesses when that fails.
+  // PickPositionAttribute has to trace the microcode to the position export.
   //
   // Colour and the first texcoord set are optional: a declaration without a
   // colour seeds the modulation identity (a factor, not a colour), and a missing
   // texcoord defaults to (0,0). Both are dropped rather than fatal when their
-  // stream is unusable, because neither is worth losing the geometry over.
+  // stream is unusable.
   const HleInputElement *pos = nullptr, *col = nullptr, *tex = nullptr;
   if (!ResolveTranscodeElements(in, pos, col, tex, skip)) return false;
 
@@ -224,9 +221,8 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
     // Condition each index exactly as the hardware does before it reaches the
     // vertex fetch. Doing none of this is what lost the terrain: a single 0xFFFF
     // restart index put vmax at 65535, which made the referenced range 65536
-    // vertices wide, which ran past the stream and refused the draw.
-    // kRestartSlot is not a valid 24-bit index, so it cannot collide with a real
-    // one.
+    // vertices wide, ran past the stream and refused the draw. kRestartSlot is
+    // not a valid 24-bit index, so it cannot collide with a real one.
     constexpr uint32_t kRestartSlot = 0xFFFFFFFFu;
     uint32_t vmin = 0xFFFFFFFFu, vmax = 0;
     std::vector<uint32_t> raw(in.count);
@@ -247,9 +243,8 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
       // into VGT_INDX_OFFSET, so they are the same number arriving by two routes
       // -- adding both double-counts it, pushes every index past the real range,
       // and the clamp below then squashes the draw onto index_max. That erased
-      // the terrain a second time after the restart fix. index_offset is read
-      // and reported so the equality can be checked rather than assumed, but is
-      // deliberately NOT added here.
+      // the terrain a second time after the restart fix. index_offset is read and
+      // reported so the equality can be checked rather than assumed.
       const int64_t adjusted = int64_t(v) + in.base_vertex;
       if (adjusted < 0) { skip = HleSkip::kVertexOutOfRange; return false; }
       v = uint32_t(adjusted) & 0xFFFFFFu;
@@ -291,17 +286,15 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
     if (!any_restart) {
       for (uint32_t i = 0; i < in.count; ++i) emit(raw[i]);
     } else {
-      // A restart cannot be expressed AS an index, and substituting one -- which
-      // is what this did first -- does not end a strip. It welds the last
-      // vertices of one patch to the first of the next, and since consecutive
-      // patches sit anywhere on the map, those welds were the flat sheets
-      // stretching across the terrain and up over the horizon.
+      // A restart cannot be expressed AS an index, and substituting one does not
+      // end a strip: it welds the last vertices of one patch to the first of the
+      // next, and since consecutive patches sit anywhere on the map, those welds
+      // were the flat sheets stretching across the terrain.
       //
       // D3D12 can cut a strip in the IA (IBStripCutValue), but that is a PSO
-      // property, and these indices are rebased onto the draw's own vertex
-      // window where 0xFFFF is a legal vertex -- the cut value would collide
-      // with real geometry. So the cut is resolved here instead: the strip is
-      // walked into a list, a form no marker has to survive into.
+      // property, and these indices are rebased onto the draw's own vertex window
+      // where 0xFFFF is a legal vertex. So the cut is resolved here instead: the
+      // strip is walked into a list, a form no marker has to survive into.
       ++HleRestartCutDraws();
       switch (topo) {
         case HostTopology::kTriangleStrip:
@@ -390,13 +383,10 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip) {
   if (in.defer_transcode) {
     // The caller predicts this draw fetches on the GPU. Leave the host vertices
     // unbuilt -- but reproduce, in O(1), every condition under which the loop
-    // below would have REFUSED the draw, so a deferred draw is dropped in
-    // exactly the cases an eager one is. Otherwise turning the prediction on
-    // would silently start rendering geometry that used to be discarded.
-    //
-    // All three are constant or monotone across the range: the stride bound and
-    // the position format do not vary per vertex, and the buffer overrun is
-    // worst at the highest index.
+    // below would have REFUSED the draw, so a deferred draw is dropped in exactly
+    // the cases an eager one is. All three are constant or monotone across the
+    // range: the stride bound and the position format do not vary per vertex, and
+    // the buffer overrun is worst at the highest index.
     const HleStream& s = in.streams[pos->stream];
     if (s.stride > 256) {
       skip = HleSkip::kZeroStride;
@@ -465,10 +455,9 @@ bool TranscodeHleVertices(const HleDrawInputs& in, DrawCall& out,
 
   // A stream whose fetch the shader indexes by a computed register carries no
   // value this path can read: `src_index` is the vertex, and the row the shader
-  // would have addressed is a different one entirely. Reading it anyway yields
-  // an unrelated vertex -- plausible, wrong, and invisible. The attribute keeps
-  // its default instead, which is what an out-of-range fetch already produces
-  // here, and is counted so the gap is visible.
+  // would have addressed is a different one entirely. Reading it anyway yields an
+  // unrelated vertex -- plausible, wrong, and invisible. The attribute keeps its
+  // default instead, which is what an out-of-range fetch already produces here.
   const auto unknowable = [&](uint32_t stream) {
     return ((in.computed_index_streams >> stream) & 1u) != 0;
   };
@@ -499,18 +488,15 @@ bool TranscodeHleVertices(const HleDrawInputs& in, DrawCall& out,
     // no COLOR element this is what passes the texture through unchanged.
     //
     // Measured: setting this to {0,0,0,0} made the logo disappear and left the
-    // frame at the clear colour, because it multiplies every texture by zero. Do
-    // not do it again. The reasoning that motivated it was sound about the guest
-    // and wrong about us -- D3D9 really does answer an unmatched interpolator by
-    // NOPing instructions (sub_82565278 writes kRetainPrev / kMax with both
-    // write masks clear). But that is about a shader we do not run; here the
-    // value is a factor in someone else's multiply, and 1 is its identity.
+    // frame at the clear colour. The reasoning that motivated it was sound about
+    // the guest and wrong about us -- D3D9 really does answer an unmatched
+    // interpolator by NOPing instructions (sub_82565278 writes kRetainPrev / kMax
+    // with both write masks clear) -- but that is about a shader we do not run.
     //
     // The shader it patches is the VERTEX shader, not the pixel shader as this
-    // once said: sub_82565278 eliminates vertex EXPORTS the pixel shader does
-    // not read, and sub_82565348 rewrites an export's register to the one the
-    // pixel shader expects. The direction matters if anyone revisits
-    // interpolator linkage -- a remap keyed the other way is a no-op, measured.
+    // once said: sub_82565278 eliminates vertex EXPORTS the pixel shader does not
+    // read, and sub_82565348 rewrites an export's register to the one the pixel
+    // shader expects. A remap keyed the other way is a no-op, measured.
     //
     // The white overpaint is therefore NOT this constant. It is the untextured
     // path, where `col` is the output rather than a factor.
@@ -676,24 +662,18 @@ HleZeroFillCensusData& HleZeroFillCensus() {
 // the viewport inverse the PM4 path uses today. A vertex counts as in-clip when
 // |x| <= w, |y| <= w, 0 <= z <= w with w > 0 and everything finite.
 //
-// **Scored per draw, not per run.** The first version pooled every position and
-// ranked candidates over the total, which asks "which single matrix transforms
-// this game" -- and the constant dump says that question has no answer. Draw 1
-// carries positions at (-1, 1, 0) with c0..c3 identity while c4..c7 hold a
-// perspective projection: the population is a mix of pre-transformed 2D and 3D
-// geometry. Pooling produced a top candidate at 45% that changed between
-// reports, which is what "no single answer" looks like when you insist on one.
+// **Scored per draw, not per run.** Pooling every position and ranking over the
+// total asks "which single matrix transforms this game", and the constant dump
+// says that question has no answer: draw 1 carries positions at (-1, 1, 0) with
+// c0..c3 identity while c4..c7 hold a perspective projection. Pooling produced a
+// top candidate at 45% that changed between reports.
 //
 // So each draw votes for its own best candidate, and the report is a histogram
-// of winners plus how many draws any candidate could explain at all. That
-// distinguishes "the matrix is somewhere we are not looking" from "there are
-// several matrices".
+// of winners plus how many draws any candidate could explain at all.
 //
-// The trap this is built around: **(0,0,0) passes every candidate**. A
-// degenerate position sits inside the clip volume under any matrix whatsoever,
-// so a draw full of them would score 100% for all 128 candidates. Degenerate
-// inputs are excluded from the denominator and counted separately.
-//===========================================================================
+// The trap this is built around: **(0,0,0) passes every candidate**. A degenerate
+// position sits inside the clip volume under any matrix whatsoever, so
+// degenerate inputs are excluded from the denominator and counted separately.
 namespace {
 
 constexpr uint32_t kCandidateBases = kHleProbeRegs - 3;   // need 4 registers
@@ -719,12 +699,12 @@ uint64_t g_probeAllDegenerate = 0; // draws with nothing else in them
 bool     g_probeSawViewport = false;
 
 // Winner per bound vertex shader. The question a run-wide histogram cannot
-// answer: is the register a property of the shader? If it is, each handle has
-// one dominant winner and the spread across the run is just the shader changing.
+// answer: is the register a property of the shader? If it is, each handle has one
+// dominant winner and the spread across the run is just the shader changing.
 //
 // Keyed by microcode CONTENT, not by handle -- see ScoreHleTransform in the
 // header for why. g_shaderHandles carries the handles each shader wore so the
-// recycling is visible in the report instead of silently folded away.
+// recycling is visible in the report.
 std::map<std::pair<uint64_t, uint32_t>, uint32_t> g_shaderWins;
 std::map<uint64_t, uint32_t> g_shaderDraws;
 std::map<uint64_t, std::set<uint32_t>> g_shaderHandles;
@@ -733,12 +713,11 @@ std::map<uint64_t, std::set<uint32_t>> g_shaderHandles;
 // exactly the way the handle keying did.
 uint64_t g_shaderNoContent = 0;
 
-// The probe runs on the DRAW PATH and this game draws from several guest
-// threads: one run shows the report itself emitted from two of them two seconds
-// apart. These are std::map and std::set, so concurrent insert is undefined
-// behaviour, not merely a racy count.
-//
-// A plain mutex is free in practice: everything below is behind hle_diag.
+// The probe runs on the DRAW PATH and this game draws from several guest threads:
+// one run shows the report itself emitted from two of them two seconds apart.
+// These are std::map and std::set, so concurrent insert is undefined behaviour,
+// not merely a racy count. A plain mutex is free in practice: everything below is
+// behind hle_diag.
 std::mutex g_probeMu;
 
 // A candidate "explains" a draw when it puts at least this much of it in the
@@ -766,9 +745,9 @@ inline bool InClip(const float o[4]) {
 // Distinct positions must stay distinct. **A matrix that collapses everything
 // onto one point sits inside the clip volume no matter what you feed it**, so
 // without this the ranking is won by whichever candidate is closest to rank 1 --
-// the (0,0,0) trap moved from the input to the transform, and exactly what the
-// first per-draw run produced: one candidate explaining all 10,266 draws while
-// both controls explained none.
+// the (0,0,0) trap moved from the input to the transform, which is what the first
+// per-draw run produced: one candidate explaining all 10,266 draws while both
+// controls explained none.
 constexpr float kSpreadEpsilon = 1e-4f;
 
 const char* CandidateName(uint32_t c, char* buf, size_t n) {
@@ -948,13 +927,9 @@ void ReportHleTransform() {
   }
 
   // And the same winners cut by bound shader. A shader whose draws agree on one
-  // register is evidence the register belongs to the shader; a shader whose
-  // draws scatter means the scoring is fitting noise, and no table built from it
-  // would be worth anything.
-  //
-  // The unattributed count is the denominator for the rows below, printed even
-  // at zero: "no rows" and "rows covering only part of the population" look
-  // identical otherwise.
+  // register is evidence the register belongs to the shader; a shader whose draws
+  // scatter means the scoring is fitting noise. The unattributed count is the
+  // denominator for the rows below, printed even at zero.
   REXLOG_INFO("d3d9: stage3    {} distinct shader(s) by microcode; {} "
               "explained draw(s) had no content id and are in none of the "
               "rows below",

@@ -2,7 +2,7 @@
 // log when --gpu_plugin=xenos and otherwise fall straight through to the guest
 // original; sub_8253AA40 logs in both modes.
 //
-// Note the mid-ASM hooks that skip these call sites are unconditional, so a hook
+// The mid-ASM hooks that skip these call sites are unconditional, so a hook
 // being silent means its call site is jumped, not that the mode is wrong.
 
 #include "hooks/hook_common.h"
@@ -27,13 +27,12 @@
 
 // force_load is GONE, cvar and implementation both. It named a scene to request
 // from the AssetDB once the loader went idle, by calling the guest's own
-// sub_82534980(AssetDB, name, flags) from the LoadStateMachine hook below.
+// sub_82534980(AssetDB, name, flags).
 //
 // The observation behind it still stands and is still unexplained: the loader
 // reaches state 2 (IdleClearRenderBusy) and parks, because nothing in the game
 // ever calls sub_82534980. That same idle AssetDB is why UI_World never loads,
-// and it is the root of the 0x8234CE20 crash. Neither lever ever explained WHY
-// nothing asks.
+// and it is the root of the 0x8234CE20 crash.
 
 // Every string setting the guest reads comes from MXRegistry.bxml through one
 // function, sub_825487C8(registry, key, out, size, 0). `registry_override` takes
@@ -50,8 +49,7 @@ REXCVAR_DEFINE_STRING(registry_override, "", "Debug",
 // and call the original silently in native, which hid the number that found the
 // frame-pacing bug: `f1` arriving here was exactly 0.00 in native and varied
 // under the plugin. **A one-sided probe was read as evidence that native behaved
-// the same.** Most Transition-thread probes in this file are still plugin-only,
-// so their absence from a native log means nothing.
+// the same.** Most Transition-thread probes in this file are still plugin-only.
 REX_IMPORT(__imp__sub_82B34998, orig_RendererDispatch, void());
 extern "C" REX_FUNC(sub_82B34998) {
   const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
@@ -75,12 +73,9 @@ extern "C" REX_FUNC(sub_82B34998) {
 //
 // It was labelled "lazy-init alloc (hangs in Transition thread in native)". Both
 // halves are wrong: it allocates nothing, and a load / branch / return cannot
-// hang. The label predates the D3D9 HLE layer and was never re-derived. Measured
-// as well as decompiled: called twice, returns 0x212859A0 both times, assert
-// path never taken.
-//
-// Kept, and mode-neutral, for the one thing worth watching: whether
-// dword_830BE190 is ever null.
+// hang. Measured as well as decompiled -- called twice, returns 0x212859A0 both
+// times, assert path never taken. Kept, and mode-neutral, for the one thing
+// worth watching: whether dword_830BE190 is ever null.
 REX_IMPORT(__imp__sub_82B3C7D0, orig_GetEngineGlobal, void());
 extern "C" REX_FUNC(sub_82B3C7D0) {
   static int li = 0;
@@ -111,8 +106,6 @@ extern "C" REX_FUNC(sub_82B3C7D0) {
 //     exactly that FLT_MAX sentinel, so the guest disables the spin itself.
 //   - "a1+32 is an unbounded store offset". It is a bounded 5-entry ring at
 //     a1+36..a1+52, guarded by `if (*(a1+28))`.
-//
-// No cvar to restore the stub. It was wrong, not a trade-off; git has it.
 REX_IMPORT(__imp__sub_82B70370, orig_Timing, void());
 extern "C" REX_FUNC(sub_82B70370) {
   static int tm = 0;
@@ -153,15 +146,14 @@ extern "C" REX_FUNC(sub_82B6D230) {
 // sub_8253AA40 — AssetDB_LoadStateMachine (LoaderTick's gate, 12-state)
 REX_IMPORT(__imp__sub_8253AA40, orig_LoadStateMachine, void());
 // Logs in BOTH modes. The note that used to sit here -- "in native this is
-// unreachable, so its absence from the log is itself the signal" -- is STALE.
-// Every mid-ASM hook in mx_config.toml is commented out, so LoaderTick's vt[6]
-// gate runs and this fires continuously (1600 calls in a two-minute native run).
-// Its absence would now mean something is wrong, not something is skipped.
+// unreachable, so its absence from the log is itself the signal" -- is STALE:
+// every mid-ASM hook in mx_config.toml is commented out, so LoaderTick's vt[6]
+// gate runs and this fires continuously. Its absence would now mean something is
+// wrong, not something is skipped.
 //
-// What that run showed: the machine goes 0 -> 1 -> 2 and then stays at 2.
-// State 2 is idle-awaiting-a-request -- sub_82534980 is what moves it 2 -> 3,
-// and in a front-end-only run nothing calls it. The AssetDB is healthy and
-// unasked, which is why UI_World never loads.
+// What that run showed: the machine goes 0 -> 1 -> 2 and then stays at 2. State
+// 2 is idle-awaiting-a-request -- sub_82534980 is what moves it 2 -> 3, and in a
+// front-end-only run nothing calls it.
 extern "C" REX_FUNC(sub_8253AA40) {
   const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
   static int sm = 0;
@@ -169,9 +161,8 @@ extern "C" REX_FUNC(sub_8253AA40) {
   uint32_t a1 = ctx.r3.u32;
   // The state is *(a1+28) — a 0..11 selector. Derived from the recompiled body:
   // mx_recomp.31.cpp:36836 `lwz r11,28(r31)` (r31 = a1, never reassigned) feeds
-  // the 12-entry jump table at :36862. The `+110796` this used to read came
-  // from pm4_pipeline.md and is a guest heap pointer, not the enum, so every
-  // "state=" line logged before 2026-08-02 was meaningless.
+  // the 12-entry jump table at :36862. The `+110796` this used to read came from
+  // pm4_pipeline.md and is a guest heap pointer, not the enum.
   uint32_t state_in = a1 ? REX_LOAD_U32(a1 + 28) : 0xFFFFFFFF;
   // Every store to *(a1+28) I could find is inside this function, but that was
   // a grep of mx_recomp.31.cpp only and would miss a write through a computed
@@ -198,8 +189,7 @@ extern "C" REX_FUNC(sub_8253AA40) {
   // State 6 parks. Exactly one predicate is responsible: loc_8253B504 reads
   // *(a1+110328) and, finding it zero, goes to loc_8253B560, which reads the
   // listener at *(a1+110788) and calls its vt[2]. A zero return jumps to an
-  // early return that leaves the selector at 6. The per-player loop and the
-  // `state = 7` write are both downstream of that gate.
+  // early return that leaves the selector at 6.
   //
   // The listener is the same object sub_82534980 notifies via vt[0], and it is
   // assigned once in the AssetDB constructor -- so it is never null and the
@@ -233,8 +223,7 @@ extern "C" REX_FUNC(sub_8253AA40) {
 // sub_82352AE0, which builds the scene name from a registry lookup and is itself
 // a method with five callers. Nothing in this chain has ever been observed to
 // run in native mode -- the point of these hooks is to find out how far up
-// execution actually reaches, so entry-only logging is enough for everything
-// except sub_82534980 itself.
+// execution actually reaches.
 //=============================================================================
 
 namespace {
@@ -391,11 +380,10 @@ extern "C" REX_FUNC(sub_825487C8) {
   orig_RegistryGetString(ctx, base);
 
   // First sighting per distinct key, capped so a per-frame reader cannot flood
-  // the log. `out` is only meaningful when the lookup succeeded.
-  //
-  // `lr` is the point of this line as much as the value is. Native reads exactly
-  // one string key in a whole run and the plugin reads four, so the callers of
-  // the three extra ones are the boundary native stops short of.
+  // the log. `out` is only meaningful when the lookup succeeded. `lr` is the
+  // point of this line as much as the value is: native reads exactly one string
+  // key in a whole run and the plugin reads four, so the callers of the three
+  // extra ones are the boundary native stops short of.
   static std::vector<std::string> s_seen;
   if (s_seen.size() < 40 && std::find(s_seen.begin(), s_seen.end(), key) == s_seen.end()) {
     s_seen.push_back(key);
@@ -515,8 +503,7 @@ extern "C" REX_FUNC(sub_8253CF80) {
 //   [110] SwitchToUIWorld
 //
 // `StartWorldLoad` is sub_824CD280 -- the function that reaches sub_82534980.
-// So nothing requests a scene because **no script ever calls StartWorldLoad**,
-// and the question is whether the script environment runs at all.
+// So nothing requests a scene because **no script ever calls StartWorldLoad**.
 //
 // These four probes sit at different depths: ExecuteScriptAsset is "does any
 // script run", the two UI loaders are "does the front end's content arrive", and
@@ -524,11 +511,10 @@ extern "C" REX_FUNC(sub_8253CF80) {
 // fire names the break.
 //=============================================================================
 
-// The script call's Nth argument, when it is a Lua string.
-//
-// Every script probe logged only `a1`, which is the lua_State -- the SAME
-// pointer for every call in the run, so `LoadUIAssetPackage #1..#4` could not
-// say WHICH packages were asked for.
+// The script call's Nth argument, when it is a Lua string. Every script probe
+// logged only `a1`, which is the lua_State -- the SAME pointer for every call in
+// the run, so `LoadUIAssetPackage #1..#4` could not say WHICH packages were
+// asked for.
 //
 // The layout is not guessed. sub_82AA7638 (luaD_precall) is decoded at the
 // bottom of this file and reads a StkId as `tt` at +8 and the GC pointer at +0,
@@ -539,8 +525,7 @@ extern "C" REX_FUNC(sub_8253CF80) {
 //
 // Every read is range-checked against the real mapping. A script argument is
 // guest data of whatever type the script passed, and this file has already paid
-// once for treating a plausible-looking value as a pointer: a range test
-// admitted the ASCII "Litl" and the process died dereferencing it.
+// once for treating a plausible-looking value as a pointer.
 std::string ScriptArgString(uint8_t* base, uint32_t L, uint32_t index) {
   constexpr uint32_t kTValueStride = 16;
   constexpr uint32_t kTValueType = 8;
@@ -629,15 +614,13 @@ MX_SCRIPT_PROBE(sub_824D0F18, orig_SwitchToUIWorld, "SwitchToUIWorld")
 //           Engine.LoadUIAssetPackage( "FrontEndShared" );
 //
 // Only the LoadUIAssetPackage family was probed, so a whole run looked like
-// "UIAnimations is never requested" -- concluded, wrongly, from an instrument
-// that could not see the call. FrontEndShared and FrontEnd DO appear in the log
-// and sit inside the same if-block three lines below, which is the proof the
-// block runs and the UIAnimations lines with it.
+// "UIAnimations is never requested" -- concluded from an instrument that could
+// not see the call. FrontEndShared and FrontEnd DO appear in the log and sit
+// inside the same if-block three lines below.
 //
 // UIAnimations holds exactly three assets, and RiderUI_Final_C_350 is the movie
 // whose null asset is the 0x8234CE20 crash. So the question is no longer "is it
-// asked for" but "what does asking return". Both args and the return value,
-// because a load binding that fails quietly is exactly what this looks like.
+// asked for" but "what does asking return".
 //=============================================================================
 REX_IMPORT(__imp__sub_824AF3C0, orig_LoadAssetDB, void());
 extern "C" REX_FUNC(sub_824AF3C0) {
@@ -667,21 +650,18 @@ extern "C" REX_FUNC(sub_824AF3C0) {
 // Everything upstream is confirmed good: both bindings fire with exactly those
 // arguments, and UIAnimations.xenon.database declares a package "Rider" holding
 // RiderUI_Final_C_350. So either the DB open under "Database\" fails, or the
-// package lookup inside it does.
-//
-// The two load families use DIFFERENT asset-manager methods: the working UI path
-// goes through vt[44], this one through vt[36]/vt[28]/vt[72]. "The UI packages
-// load fine" says nothing about this path.
+// package lookup inside it does. The two load families use DIFFERENT
+// asset-manager methods -- the working UI path goes through vt[44], this one
+// through vt[36]/vt[28]/vt[72].
 //=============================================================================
-// 0x82BA91C0 -- AssetManager::Find(type, name), assetMgr->vt[0x78]. Hooked for
-// ONE reason: to capture the manager `this`, which AcquirePlayer's re-resolve
-// needs and cannot afford a plausible-but-wrong value for. It IS derivable --
-// engine = *(0x830BE400), manager = *(engine + 8) -- but that walk has already
-// been got wrong once in this file. Any call at all hands us the correct value.
+// 0x82BA91C0 -- AssetManager::Find(type, name), assetMgr->vt[0x78]. Hooked to
+// capture the manager `this`, which AcquirePlayer's re-resolve needs and cannot
+// afford a plausible-but-wrong value for. It IS derivable -- engine =
+// *(0x830BE400), manager = *(engine + 8) -- but that walk has been got wrong
+// once in this file already.
 //
 // The address had to come from the running game: the IDB gives 0x82BA8D40 for
-// that slot, which is the middle of another function, while the live vtable
-// holds 0x82BA91C0.
+// that slot, which is the middle of another function.
 REX_IMPORT(__imp__sub_82BA91C0, orig_AssetFind, void());
 std::atomic<uint32_t> g_assetManager{0};
 
@@ -712,12 +692,10 @@ extern "C" REX_FUNC(sub_82BA91C0) {
 // looked at again. Re-resolving here asks the same question the guest asked,
 // with the same manager, name and type, at a time when the answer exists.
 //
-// WHY NOT SKIP THE CALL. That was tried and made things worse: returning early
+// WHY NOT SKIP THE CALL: that was tried and made things worse -- returning early
 // left this->player null and the fault moved downstream, correlated 3-for-3.
 // Nothing is skipped here, and on the path where the repair fails the original
-// runs exactly as it does today -- so this hook can restore behaviour, never
-// degrade it. Reads and writes ONE dword of guest state, the one the guest
-// wrote itself.
+// runs exactly as it does today.
 REX_IMPORT(__imp__sub_8234CE20, orig_AcquirePlayer, void());
 extern "C" REX_FUNC(sub_8234CE20) {
   const uint32_t self = ctx.r3.u32;
@@ -782,11 +760,8 @@ extern "C" REX_FUNC(sub_8234CE20) {
 // view-projection. The graphics path is exonerated: the terrain height reaching
 // the renderer is correct, the props are correctly seated on that same terrain,
 // and the bike's own transform reads out sane. What is left is a ~2-unit
-// constant in the bike's RESTING HEIGHT, which is guest logic.
-//
-// IDA could not reach it -- no named terrain/height/suspension functions, the
-// terrain manager's xrefs are all VT streaming, and a constant search for the
-// height range landed in the save-game string pool.
+// constant in the bike's RESTING HEIGHT, which is guest logic, and IDA could not
+// reach it.
 //
 // So make the caller name itself. The skinned vehicle shader indexes its bone
 // palette as cb0[bone + 85/86/87], so the root bone lands in vertex constant
@@ -795,11 +770,9 @@ extern "C" REX_FUNC(sub_8234CE20) {
 // NOT HOOKED BEFORE, DELIBERATELY, and that reasoning still stands for its own
 // purpose -- hooks_d3d9.cpp reads device+0x780 rather than hooking this setter,
 // because the device holds the live value whichever path wrote it. That is about
-// READING STATE. This wants the CALLER, which the device field cannot give at
-// any price. If the bike's transform arrives by the state-block path this probe
-// sees nothing -- a silent probe here means "not this path", not "no writes".
-//
-// Cheap on the hot path: one range compare before anything else happens.
+// READING STATE; this wants the CALLER. If the bike's transform arrives by the
+// state-block path this probe sees nothing -- a silent probe here means "not
+// this path", not "no writes". Cheap on the hot path: one range compare first.
 
 REX_IMPORT(__imp__sub_82550320, orig_SetVertexShaderConstantF, void());
 extern "C" REX_FUNC(sub_82550320) {
@@ -829,10 +802,8 @@ extern "C" REX_FUNC(sub_82550320) {
   //
   // A count of ZERO here says the terrain never sets them this way; a non-zero
   // count with a device pointer different from the bike's says the value is real
-  // but on another device, which is a much easier fix.
-  //
-  // Placed BEFORE the register-85 early-out, which would otherwise reject every
-  // one of these calls unseen.
+  // but on another device. Placed BEFORE the register-85 early-out, which would
+  // otherwise reject every one of these calls unseen.
   if (count && start <= 204u && 204u < start + count) {
     static std::atomic<uint64_t> s_hits{0};
     const uint64_t n = s_hits.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -879,11 +850,10 @@ extern "C" REX_FUNC(sub_82550320) {
   uint32_t idx = 0;
   for (; idx < s_siteCount; ++idx) {
     if (s_sites[idx].lr != lr) continue;
-    // RE-REPORTED PERIODICALLY, not once. First-sighting only is what the
-    // first cut did, and every line it produced came from the menu at startup:
-    // translations near 97.8 while the bike in a level sits at world Y ~611.6.
-    // A caller that writes every frame needs sampling over the run, or the one
-    // value it prints is the least interesting one it ever wrote.
+    // RE-REPORTED PERIODICALLY, not once. First-sighting only produced lines
+    // that all came from the menu at startup: translations near 97.8 while the
+    // bike in a level sits at world Y ~611.6. A caller that writes every frame
+    // needs sampling over the run.
     report = (++s_sites[idx].calls % 4096u) == 0;
     break;
   }
@@ -929,7 +899,7 @@ extern "C" REX_FUNC(sub_824F8E20) {
       // engine as `dword_830BE400` and the manager as `*(dword_830BE400 + 8)`,
       // which reads as an offset off the symbol's ADDRESS and is not: the engine
       // is *(0x830BE400) and the manager is *(engine + 8). Reading 0x830BE408
-      // directly gave 0, which is what the first version of this dump printed.
+      // directly gave 0.
       const uint32_t eng = GuestRangeReadable(base, 0x830BE400u, 4)
                                ? REX_LOAD_U32(0x830BE400u)
                                : 0;
@@ -980,15 +950,11 @@ MX_SCRIPT_PROBE(rex_MXRavage_Xenon_00cb, orig_ScriptBindingRegister, "BindingReg
 // one. It now has a dedicated hook at the bottom of this file.
 
 // The script layer is a Lua VM, so ask it directly whether it threw.
-//
 // sub_82AA7638 is the call handler and carries the usual strings -- it calls
 // sub_82AA9D48(L, "stack overflow"). sub_82A9F4F8 is the luaL_error-style
 // reporter, used by ExecuteScriptAsset itself for argument mismatches, so its r4
-// is a format string.
-//
-// A root script that dies on its third statement looks, from outside, exactly
-// like the two-libraries-then-silence pattern that is actually observed. These
-// two hooks distinguish "stopped" from "crashed".
+// is a format string. A root script that dies on its third statement looks, from
+// outside, exactly like the two-libraries-then-silence pattern observed.
 REX_IMPORT(__imp__sub_82A9F4F8, orig_LuaError, void());
 extern "C" REX_FUNC(sub_82A9F4F8) {
   static uint64_t s_count = 0;
@@ -1009,11 +975,11 @@ extern "C" REX_FUNC(sub_82AA9D48) {
   orig_LuaRunError(ctx, base);
 }
 
-// The asset names themselves. `ExecuteScriptAsset` (sub_824AF838) validates
-// that it got exactly one `char const*`, resolves it with the VM's string
-// accessor, and passes the result to `sub_824F91E8` — so that function's r3 is
-// the script asset name, in plain guest memory, before any VM indirection.
-// Read out of the binding's own body, not inferred from the call shape.
+// The asset names themselves. `ExecuteScriptAsset` (sub_824AF838) validates that
+// it got exactly one `char const*`, resolves it with the VM's string accessor,
+// and passes the result to `sub_824F91E8` — so that function's r3 is the script
+// asset name, in plain guest memory, before any VM indirection. Read out of the
+// binding's own body, not inferred from the call shape.
 REX_IMPORT(__imp__sub_824F91E8, orig_RunScriptAsset, void());
 extern "C" REX_FUNC(sub_824F91E8) {
   const uint32_t name_ptr = ctx.r3.u32;
@@ -1035,11 +1001,8 @@ extern "C" REX_FUNC(sub_824F91E8) {
 //
 // These are the XDK wrappers around the import thunks, not the thunks -- the
 // thunks are defined in the runtime library and cannot be redefined here, but
-// the wrappers are ordinary recompiled functions, each a register shuffle
-// followed by a tail branch to the import.
-//
-// If all five stay silent, audio and input are downstream of "there is no menu"
-// and are not a second bug.
+// the wrappers are ordinary recompiled functions. If all five stay silent, audio
+// and input are downstream of "there is no menu" and are not a second bug.
 
 REX_IMPORT(__imp__sub_82C08EC0, orig_XInputGetState, void());
 extern "C" REX_FUNC(sub_82C08EC0) {
@@ -1112,11 +1075,8 @@ extern "C" REX_FUNC(sub_82C87B98) {
 // 8064 bytes, has sub_82C87950 fill a buffer at r1+1888, and passes that to
 // __imp__XAudioSubmitRenderDriverFrame. 8064-1888 = 6176 bytes of room, and a
 // 360 render-driver frame is 256 samples x 6 channels x float32 = 6144, so the
-// fill target is the frame buffer itself.
-//
-// Hooking the fill is the only way to see the samples: the import thunk is
-// defined in the runtime library. This separates "the SDK is dropping our audio"
-// from "the game is playing nothing".
+// fill target is the frame buffer itself. Hooking the fill is the only way to
+// see the samples: the import thunk is defined in the runtime library.
 REX_IMPORT(__imp__sub_82C87950, orig_AudioMixFrame, void());
 extern "C" REX_FUNC(sub_82C87950) {
   const uint32_t dst = ctx.r4.u32;
@@ -1211,10 +1171,7 @@ namespace {
 // condition, so a table that grows cannot silently truncate.
 //
 // Layouts taken field for field out of sub_824A9358 (members) and sub_824A9500
-// (bases), then checked against the live struct at 0x82D1B260. That array is
-// what docs/guest_binary.md used to call "a second table around 0x82D1B21C" of
-// unestablished bounds -- it is one class's methods, bounded by a terminator
-// like every other SWIG array.
+// (bases), then checked against the live struct at 0x82D1B260:
 //
 //   swig_type_info      +16 clientdata -> swig_lua_class*
 //   swig_lua_class      +0 name  +8 constructor  +16 methods  +20 attributes
@@ -1280,7 +1237,7 @@ std::string SwigAttributeName(uint8_t* base, uint32_t table, uint32_t fn,
 // folding means several trivial bindings share one address (0x829E8FA8 is a bare
 // `return 0` with hundreds of xrefs), and a first-match scan hands back whichever
 // it reaches first. A name here is a name for the ADDRESS, not proof of which
-// binding ran. Do not treat a folded hit as an identification.
+// binding ran.
 std::string BindingName(uint8_t* base, uint32_t fn) {
   if (!fn) return {};
   for (const SwigHelper& h : kSwigHelpers) {
@@ -1315,8 +1272,7 @@ std::string BindingName(uint8_t* base, uint32_t fn) {
 // The dispatch lines used to report `lr` and nothing else, and that number is
 // worthless as a caller: 0x82AABA74 is the `bl` to this function inside
 // luaV_execute, so lr=0x82AABA78 is the interpreter's OP_CALL and EVERY
-// script-level call in the game reports it. luaD_precall has four call sites, so
-// the only thing an lr distinguishes is "from a script" versus "from C".
+// script-level call in the game reports it.
 //
 // The CallInfo can name the caller, and the offsets are not carried over from
 // the Lua 5.1 headers: sub_82AA9B70 is this title's `addinfo` and performs
@@ -1343,8 +1299,7 @@ std::string BindingName(uint8_t* base, uint32_t fn) {
 // distinct names. Anything in that 82 and absent here never executed.
 //
 // Keyed by PROTO address, not by name: one chunk has many Protos and the name
-// resolution is a guest string walk, so this is one map lookup per dispatch and
-// one string build per distinct function per run.
+// resolution is a guest string walk.
 std::mutex g_chunkCensusMu;
 std::map<uint32_t, std::string> g_chunkCensus;
 
@@ -1358,9 +1313,8 @@ std::string ProtoSource(uint8_t* base, uint32_t p) {
   // A chunk name is NOT always a name. Lua uses the loaded string itself as the
   // chunkname for a loadstring() chunk, and this title leans on that: the UI
   // instantiates every page with `FE_Background_33 = FE_Background:New()` and
-  // that whole snippet arrives here as the "source". Some carry comment text and
-  // EMBEDDED NEWLINES, which put one log entry across many lines and break every
-  // grep the log is read with.
+  // that whole snippet arrives here as the "source". Some carry EMBEDDED
+  // NEWLINES, which put one log entry across many lines.
   for (char& c : s)
     if (c == '\n' || c == '\r' || c == '\t') c = ' ';
   if (s.size() > 72) s = s.substr(0, 69) + "...";
@@ -1389,12 +1343,11 @@ void NoteChunk(uint8_t* base, uint32_t proto) {
 //
 // Not academic -- it produced a wrong reading. The first-caller list was read as
 // "FE_Background loads and instantiates but calls no binding, unlike FE_Home",
-// and that asymmetry was an ARTIFACT. Playing the credits proves it: FE_Credits
-// is plainly active and on screen and is absent from the list too, because
-// everything it calls was already first-seen elsewhere.
+// and that asymmetry was an ARTIFACT: FE_Credits is plainly active and on screen
+// and is absent too, because everything it calls was already first-seen
+// elsewhere.
 //
-// So count binding calls PER CALLING CHUNK, keyed by the caller's Proto so the
-// hot path is 5 guest loads and one map lookup.
+// So count binding calls PER CALLING CHUNK, keyed by the caller's Proto.
 std::mutex g_callerCensusMu;
 std::map<uint32_t, uint64_t> g_callerCensus;  // caller Proto -> binding calls
 
@@ -1446,8 +1399,7 @@ std::string LuaCallerSite(uint8_t* base, uint32_t L) {
 //
 // The 5-second sampler below cannot answer "did this binding ever fire". A
 // one-shot call like SwitchToUIWorld fires once in a run and has no meaningful
-// chance of landing on a sampling boundary, so its absence has never been
-// evidence of anything.
+// chance of landing on a sampling boundary.
 //
 // One line the first time each distinct C binding is seen, plus a periodic
 // roll-up with counts, keyed by guest function address so the roll-up is ordered
@@ -1459,13 +1411,11 @@ std::string LuaCallerSite(uint8_t* base, uint32_t L) {
 // binding again on each report. Do not move BindingName onto the per-call path.
 //
 // The precall fires on at least three guest threads, so the map needs the lock.
-// Do not "optimise" it away.
 std::mutex g_bindingCensusMu;
 // The call site is kept from the FIRST sighting only. A binding called from two
 // places would hide the second, and that is the deliberate trade: the open
 // question is which script reaches a binding at all, and a per-site breakdown
-// costs a set per binding on the dispatch path. Widen it when a binding is
-// known to have two callers, not before.
+// costs a set per binding on the dispatch path.
 struct BindingCensusEntry {
   uint64_t count = 0;
   std::string first_caller;

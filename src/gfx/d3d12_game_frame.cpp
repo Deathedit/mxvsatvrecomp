@@ -3,8 +3,7 @@
 //
 // Split verbatim out of d3d12_game.cpp. RenderGameFrame is ~1900 lines and
 // AddGameDraw ~600; both moved WHOLE, because splitting a function body is a
-// behaviour risk rather than a move. That is the floor on this file's size until
-// someone deliberately restructures those two.
+// behaviour risk rather than a move.
 #include "gfx/d3d12_renderer.h"
 
 #include "gfx/d3d12_game_internal.h"
@@ -51,17 +50,13 @@ void D3D12Renderer::RenderGameFrame() {
   // This frame in flight takes its own slice of the descriptor blocks, so the
   // window resets every host frame rather than only when the guest hands off a
   // new draw list. High-water is taken BEFORE the reset, so it measures the
-  // frame that just ended -- without it the ring's headroom is unfalsifiable
-  // from a log, which is how "eight times the measured demand" survived into a
-  // scene submitting seven times that.
+  // frame that just ended.
   //
   // The base comes from m_translatedBlockLimit, NOT m_frameIndex: by here
   // m_frameIndex has advanced to the frame about to be recorded while
   // m_translatedBlockNext still points into the one that ended, so deriving the
-  // base from the new index reads across the wrap. The first run printed "16726
-  // of 8192 per frame at peak" when the true figure was 342 -- a high-water mark
-  // exceeding its own limit is how that got caught. Keep the impossible value
-  // impossible.
+  // base from the new index reads across the wrap and prints a high-water mark
+  // exceeding its own limit.
   {
     const uint32_t prevBase = m_translatedBlockLimit >= m_translatedBlocksPerFrame
                                   ? m_translatedBlockLimit -
@@ -87,10 +82,10 @@ void D3D12Renderer::RenderGameFrame() {
   // QueueLuminanceReadback.
   uint32_t oneByOneSeen = 0;
   uint32_t boundTargetObject = 0;  // zero is the final m_gameRT.
-  // The scissor last handed to the command list. Tracked so the per-draw
-  // scissor costs one comparison rather than a state change per draw, and so
-  // the target-binding blocks below no longer own the scissor at all -- they
-  // set the viewport, this owns the rectangle.
+  // The scissor last handed to the command list. Tracked so the per-draw scissor
+  // costs one comparison rather than a state change per draw, and so the
+  // target-binding blocks below no longer own the scissor at all -- they set the
+  // viewport, this owns the rectangle.
   D3D12_RECT boundScissor = {-1, -1, -1, -1};
   // Zero means "no DSV bound", which is a distinct state from any depth object.
   uint32_t boundDepthObject = 0;
@@ -118,9 +113,8 @@ void D3D12Renderer::RenderGameFrame() {
   // resolve finds no offscreen entry and copies nothing.
   //
   // History is the right basis because these are properties of a surface's ROLE,
-  // which is stable. Cost is bounded and visible: more surfaces qualify for an
-  // offscreen target, capped by the same budget, and the "refused: budget"
-  // figure on the routing line says if it bites.
+  // which is stable. Cost is bounded by the same budget, and the "refused:
+  // budget" figure on the routing line says if it bites.
   for (uint32_t object : resolveSources) m_everResolveSource.insert(object);
   for (uint32_t object : sampledTargets) m_everSampledTarget.insert(object);
   for (const auto& d : m_gameDraws)
@@ -134,10 +128,9 @@ void D3D12Renderer::RenderGameFrame() {
   uint32_t fullSizeDraws = 0;
   // Per surface, in the order first drawn into. "Two surfaces, 8 draws" cannot
   // say whether one is the scene and the other a one-draw overlay -- and
-  // presenting the LAST one written is only right in the first case. The order
-  // matters as much as the counts: a compositor writes its output last, a UI
-  // layer is written last over a scene finished earlier, and those want opposite
-  // choices.
+  // presenting the LAST one written is only right in the first case. A
+  // compositor writes its output last, a UI layer is written last over a scene
+  // finished earlier, and those want opposite choices.
   std::vector<std::pair<uint32_t, uint32_t>> fullSizeOrder;
   for (const auto& d : m_gameDraws) {
     // A SURFACE BIND: the guest named this surface as an attachment. Create host
@@ -149,11 +142,8 @@ void D3D12Renderer::RenderGameFrame() {
     // created by the first DRAW naming a surface, so the menu's shadow atlas --
     // bound depth-only, resolved 287 times in one run -- was never instantiated,
     // its resolve found no source, and every draw sampling the result was
-    // discarded. Xenia has no equivalent failure because it creates render
-    // targets from register state with depth as an equal peer of colour, not as
-    // a passenger on it (render_target_cache.cc:888).
-    //
-    // Draws nothing.
+    // discarded. Xenia creates render targets from register state with depth as
+    // an equal peer of colour (render_target_cache.cc:888).
     if (d.surfaceBind) {
       if (!d.surfaceBindIsDepth)
         LogGuestColorFormat(d.targetObject, d.targetWidth, d.targetHeight,
@@ -213,9 +203,8 @@ void D3D12Renderer::RenderGameFrame() {
         m_commandList->ClearRenderTargetView(rtv, kEmpty, 0, nullptr);
       }
       // everDrawn stays FALSE on purpose. A resolve out of a surface nothing
-      // drew into is exactly what m_snapshotBlankSource counts, and it should
-      // keep counting it -- the surface now exists, which is a different claim
-      // from the surface having contents.
+      // drew into is exactly what m_snapshotBlankSource counts, and the surface
+      // now existing is a different claim from the surface having contents.
       continue;
     }
     // A resolve: snapshot the source target as it stands right now, so draws
@@ -223,21 +212,19 @@ void D3D12Renderer::RenderGameFrame() {
     // shared surface holds by the end of the frame. Draws nothing.
     if (d.resolveDest) {
       // What KIND of image this destination holds, recorded before any of the
-      // branching below can refuse the resolve.
-      //
-      // A slot naming a destination we have no snapshot for used to fail the
-      // whole draw, and could not do better because nothing said whether the
-      // missing image was depth or colour -- so the only substitute available
-      // was a blanket one, which is what put white over the Bink logo. Recorded
-      // for EVERY resolve that arrives, including ones dropped for a missing
-      // source, because those are precisely the destinations that end up with no
+      // branching below can refuse the resolve. A slot naming a destination we
+      // have no snapshot for used to fail the whole draw, with nothing to say
+      // whether the missing image was depth or colour -- so the only substitute
+      // available was a blanket one, which put white over the Bink logo.
+      // Recorded for EVERY resolve, including ones dropped for a missing source,
+      // because those are precisely the destinations that end up with no
       // snapshot.
       m_resolveDestIsDepth[d.resolveDest] = d.resolveSourceIsDepth;
-      // Where the source actually rendered. Resolve sources are routed
-      // offscreen (isResolveSource, below), so this normally finds a surface of
-      // the source's own — which is the point: offscreen targets are only
-      // cleared when something draws into them, so they carry their contents
-      // across frames. A resolve needs exactly that.
+      // Where the source actually rendered. Resolve sources are routed offscreen
+      // (isResolveSource, below), so this normally finds a surface of the
+      // source's own -- which is the point: offscreen targets are only cleared
+      // when something draws into them, so they carry their contents across
+      // frames, and a resolve needs exactly that.
       ID3D12Resource* srcRes = nullptr;
       GameRenderTarget* srcEntry = nullptr;
       uint32_t srcWidth = 0, srcHeight = 0;
@@ -246,11 +233,11 @@ void D3D12Renderer::RenderGameFrame() {
       // R32_FLOAT, not RGBA8, for CopyTextureRegion to accept it.
       DXGI_FORMAT snapFormat = kBackBufferFormat;
       // Gather the EDRAM bands of a depth resolve BEFORE looking for a target of
-      // the source's own, because the two are in competition. Since surfaces are
-      // created when the guest binds them, the whole surface a banded pass
-      // resolves out of is in the depth pool too, so the direct lookup would
-      // succeed and quietly copy a surface nothing rendered into. Bands win, but
-      // only when something has been drawn into them.
+      // the source's own, because the two are in competition: surfaces are
+      // created when the guest binds them, so the whole surface a banded pass
+      // resolves out of is in the depth pool too and the direct lookup would
+      // quietly copy a surface nothing rendered into. Bands win, but only when
+      // something has been drawn into them.
       //
       // Excluding the resolve's OWN object from the band set is load-bearing:
       // the 768x1024 atlas matches the band filter on width and base as well as
@@ -264,7 +251,6 @@ void D3D12Renderer::RenderGameFrame() {
         // surfaces were looked at. Four things can drop a candidate -- it is the
         // resolve source object, it has no resource yet, its width differs, or
         // its base is below the resolve -- and they need different repairs.
-        // Guessing between them cost a wrong fix already.
         for (auto& [obj, t] : m_gameDepthTargets) {
           const char* why = nullptr;
           if (obj == d.resolveSource) why = "is-resolve-source";
@@ -300,14 +286,12 @@ void D3D12Renderer::RenderGameFrame() {
         uint32_t total = 0;
         for (const GameRenderTarget* b : depthBands) total += b->height;
         // Anything that is not an exact cover of the destination, starting at
-        // the resolve's own base, is not a banding of this surface.
-        //
-        // WHICH of the three refuses, and with what numbers. Without this the
-        // only evidence is a BLANK-SOURCE count, which cannot say whether the
-        // stitch was unavailable, mis-shaped or simply not yet drawn -- three
-        // different repairs. The exact-cover test is the fragile one by
-        // construction: it sums EVERY same-width target at or above the base, so
-        // one extra aliasing surface makes the total overshoot.
+        // the resolve's own base, is not a banding of this surface. WHICH of the
+        // three refuses, and with what numbers: a BLANK-SOURCE count alone
+        // cannot say whether the stitch was unavailable, mis-shaped or simply
+        // not yet drawn. The exact-cover test is the fragile one by construction
+        // -- it sums EVERY same-width target at or above the base, so one extra
+        // aliasing surface makes the total overshoot.
         const uint32_t candidates = uint32_t(depthBands.size());
         uint32_t refusal = 0;  // 0 = accepted
         if (depthBands.size() < 2)
@@ -345,17 +329,13 @@ void D3D12Renderer::RenderGameFrame() {
       // the deferred light bands, which only READ. The shadow map band is
       // WRITTEN: 553 (768x1024) is cleared, copied into 554 (768x384), the
       // casters put 38 draws into 554, and then the resolve reads 553 -- which
-      // still holds nothing but the clear. That is why the shadow map resolved
+      // still holds nothing but the clear, so the shadow map resolved
       // min = max = 1.0 and every lookup said "unshadowed".
       //
       // This carries the band back, for bands of THIS resolve source that have
-      // actually been drawn into.
-      //
-      // WHICH condition rejects a band, counted. The write-back has fired ZERO
-      // times in every run on record -- including runs taken right after it
-      // shipped, when shadows were confirmed back. So it is NOT what fixed them
-      // (the band row arithmetic in the same commit was), and a mechanism that
-      // never runs cannot be reasoned about from its absence.
+      // actually been drawn into. It has fired ZERO times in every run on record
+      // -- including runs taken right after it shipped, when shadows were
+      // confirmed back -- so it is NOT what fixed them.
       static std::atomic<uint64_t> s_wbNoOwner{0}, s_wbOwnerDrawn{0},
           s_wbNotOurBand{0}, s_wbBandNotDrawn{0}, s_wbWidth{0}, s_wbRow{0},
           s_wbAccepted{0}, s_wbResolves{0};
@@ -384,17 +364,13 @@ void D3D12Renderer::RenderGameFrame() {
           LogInfo(wb);
         }
         if (have_owner && !oit->second.drawnSinceClear) {
-          // ONLY into an owner nothing has drawn into.
-          //
-          // Without this the write-back also fires for the deferred LIGHT bands,
-          // which are bands of the 1280x720 scene depth -- and the 1280x80 band
-          // at base 0x280 is its bottom 80 rows, so copying it back overwrote
-          // the bottom of the scene depth buffer. That is exactly what the first
-          // cut of this shipped.
-          //
-          // The case this exists for is the opposite: an owner holding NOTHING
-          // but its clear while the real content sits in a band, which is the
-          // shadow map.
+          // ONLY into an owner nothing has drawn into. Without this the
+          // write-back also fires for the deferred LIGHT bands, which are bands
+          // of the 1280x720 scene depth, and the 1280x80 band at base 0x280 is
+          // its bottom 80 rows: copying it back overwrote the bottom of the
+          // scene depth buffer. The case this exists for is the opposite -- an
+          // owner holding NOTHING but its clear while the real content sits in a
+          // band, which is the shadow map.
           GameRenderTarget& owner = oit->second;
           for (auto& [bobj, band] : m_gameDepthTargets) {
             if (bobj == d.resolveSource) continue;
@@ -451,10 +427,10 @@ void D3D12Renderer::RenderGameFrame() {
             m_commandList->ResourceBarrier(2, back);
             band.state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
             owner.state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-            // NOT owner.everDrawn = true. That was self-referential: it made
-            // the owner look drawn to the stitcher and to the guard above, so
-            // the second write-back of a frame saw a "drawn" owner it had
-            // marked itself.
+            // NOT owner.everDrawn = true. That was self-referential: it made the
+            // owner look drawn to the stitcher and to the guard above, so the
+            // second write-back of a frame saw a "drawn" owner it had marked
+            // itself.
             ++m_depthBandWriteBacks;
           }
         }
@@ -472,11 +448,11 @@ void D3D12Renderer::RenderGameFrame() {
         snapFormat = srcEntry->format;
       } else if (auto dit = m_gameDepthTargets.find(d.resolveSource);
                  dit != m_gameDepthTargets.end() && !depthBandsDrawn) {
-        // A DEPTH resolve. The guest reads its depth buffer back as a texture
-        // to reconstruct world position in the deferred lighting pass, and
-        // Resolve names the depth surface by object exactly as it names a
-        // colour one (source slot 4). Looking only in the colour map is what
-        // made every one of these miss.
+        // A DEPTH resolve. The guest reads its depth buffer back as a texture to
+        // reconstruct world position in the deferred lighting pass, and Resolve
+        // names the depth surface by object exactly as it names a colour one
+        // (source slot 4). Looking only in the colour map is what made every one
+        // of these miss.
         srcEntry = &dit->second;
         srcRes = srcEntry->resource.Get();
         srcWidth = srcEntry->width;
@@ -500,19 +476,15 @@ void D3D12Renderer::RenderGameFrame() {
       //
       // Two passes, exact before containment. Exact is one allocation named
       // twice at one size. Containment is the MULTISAMPLE case: a 640x360 source
-      // with 4x MSAA in its surface word against a 640x720 at 1x, both at base
-      // 0x2D0, where only the 640x720 is ever drawn into. We render everything
-      // at 1x, so the samples the guest would resolve down are not there, and
-      // taking the top rows of the surface that IS drawn is the closest thing we
-      // hold. PROVISIONAL: the one step here not established from evidence.
+      // with 4x MSAA against a 640x720 at 1x, both at base 0x2D0, where only the
+      // 640x720 is ever drawn into -- we render everything at 1x, so the samples
+      // the guest would resolve down are not there. PROVISIONAL: the one step
+      // here not established from evidence.
       //
       // HOLDING A SURFACE IS NOT HOLDING ITS CONTENTS. This used to run only
-      // when the object lookup found nothing, and so never ran at all. The
-      // failing case is not a missing resource, it is a resource nothing ever
-      // rendered into: we had a blank surface for the object the resolve named,
-      // bound it, and copied its zeros -- which the auto-exposure ladder then
-      // measured, giving luminance 0 and an exposure that climbs until the frame
-      // saturates.
+      // when the object lookup found nothing, and so never ran at all: the
+      // failing case is not a missing resource but a resource nothing rendered
+      // into, whose zeros the auto-exposure ladder then measured.
       GameRenderTarget* msaaPartner = nullptr;
       uint32_t srcScale = 1;
       // Why the substitution search below did or did not save a blank source.
@@ -532,11 +504,10 @@ void D3D12Renderer::RenderGameFrame() {
         // render everything at 1x, so the partner IS the image the guest would
         // have resolved down.
         //
-        // Matched on FORMAT as well as extent, which the first attempt got
-        // wrong: searching on base and width alone found a 640x720 RGBA8 from an
-        // unrelated pass, and 1120 "contained" matches later the exposure was
-        // still diverging. At base 0x2D0 the drawn RGBA16F is 1280x720, exactly
-        // twice the source in both axes, and that is the HDR scene.
+        // Matched on FORMAT as well as extent: searching on base and width alone
+        // found a 640x720 RGBA8 from an unrelated pass, and 1120 "contained"
+        // matches later the exposure was still diverging. At base 0x2D0 the
+        // drawn RGBA16F is 1280x720, exactly twice the source in both axes.
         for (auto& [obj, t] : m_gameRenderTargets) {
           if (!t.resource || t.edramBase != d.resolveSourceBase) continue;
           // Counted before any shape test: "nothing shares this EDRAM base" and
@@ -575,8 +546,8 @@ void D3D12Renderer::RenderGameFrame() {
           srcEntry = hit;
           srcRes = hit->resource.Get();
           // The partner is twice the size in each axis, so the guest's source
-          // rectangle -- in the 1x coordinates it thinks it resolved -- has to
-          // be doubled. The snapshot then comes out at full resolution and the
+          // rectangle -- in the 1x coordinates it thinks it resolved -- has to be
+          // doubled. The snapshot then comes out at full resolution and the
           // shader's normalized UVs map [0,1] across it exactly as before.
           srcScale = hit == msaaPartner ? 2u : 1u;
           srcWidth = d.resolveSourceWidth * srcScale;
@@ -598,10 +569,8 @@ void D3D12Renderer::RenderGameFrame() {
       // shadow pass renders 768x1024 as two EDRAM bands -- 768x640 at base 0x580
       // and 768x384 at 0x710 -- and resolves the whole image through a THIRD
       // surface object that aliases band 0's base and that no draw ever binds.
-      //
       // Stitch them by EDRAM base, which is the only thing that says which band
-      // is on top. The gather and its exact-cover test live above, beside the
-      // source lookup they compete with; `depthBands` is empty unless it passed.
+      // is on top; the gather and its exact-cover test live above.
       if (!srcRes && !depthBands.empty()) {
         const std::vector<GameRenderTarget*>& bands = depthBands;
         GameRenderTarget* snap =
@@ -668,10 +637,9 @@ void D3D12Renderer::RenderGameFrame() {
       // render targets from the resolve's EDRAM info without consulting whether
       // a draw was ever seen (render_target_cache.cc:1393).
       //
-      // Only for a DEPTH source with an extent to build from. A colour source is
-      // deliberately left to the refusal below: it has an aliased-source matcher
-      // above that is measured and works, and an invented empty colour target
-      // would compete with it.
+      // Only for a DEPTH source with an extent to build from: a colour source
+      // has the aliased-source matcher above, which is measured and works, and
+      // an invented empty colour target would compete with it.
       if (!srcRes && d.resolveSourceIsDepth && d.resolveSourceWidth &&
           d.resolveSourceHeight) {
         if (GameRenderTarget* made = EnsureGameDepthTarget(
@@ -712,25 +680,20 @@ void D3D12Renderer::RenderGameFrame() {
         // Do NOT copy from m_gameRT as a fallback. It is cleared every frame and
         // accumulates every logical surface, so it does not hold the source's
         // contents at resolve time: 25 of 33 resolves in a frame have sources
-        // with no draws at all that frame. Copying from it was tried and
-        // captured the clear colour.
-        //
-        // Refusing leaves the draw on the old aliased path, which is wrong but
-        // is what it had before. A steady non-zero count here means targets are
-        // being refused offscreen surfaces upstream.
+        // with no draws at all that frame, and copying from it captures the
+        // clear colour. Refusing leaves the draw on the old aliased path, which
+        // is wrong but is what it had before.
         ++m_snapshotMissingSource;
         // Which sources, and how often. Counted rather than logged on first
         // sighting: the first miss for any source happens in the opening frames
         // before anything has drawn into it, so a once-per-source line reports
-        // startup state as the steady state -- which is exactly the mistake that
-        // produced a confident and wrong "never a draw target".
+        // startup state as the steady state.
         ++m_missingSourceCounts[d.resolveSource];
         // The guest asked for this image to be refreshed and it was not. Any
         // snapshot already held is now a stale earlier frame; mark it so the
         // sampling path refuses it rather than blitting a previous frame over
-        // this one. Measured as the intro overlap: ~600 dropped refreshes per
-        // sample window with ZERO offscreen refusals, so these are sources we
-        // have no entry for at all, not budget drops.
+        // this one. ~600 dropped refreshes per sample window with ZERO offscreen
+        // refusals, so these are sources we have no entry for at all.
         if (auto st = m_gameSnapshots.find(d.resolveDest);
             st != m_gameSnapshots.end()) {
           st->second.stale = true;
@@ -738,16 +701,15 @@ void D3D12Renderer::RenderGameFrame() {
         continue;
       }
       // Snapshotting a target nothing has ever drawn into copies a blank
-      // surface. The copy still happens — refusing it would freeze the previous
-      // snapshot, which is worse — but it is counted, because a large number
+      // surface. The copy still happens -- refusing it would freeze the previous
+      // snapshot, which is worse -- but it is counted, because a large number
       // here means compositor quads are painting blanks over the frame and the
-      // real defect is upstream, in whatever should have rendered that target.
+      // real defect is upstream.
       if (srcEntry && !srcEntry->everDrawn) {
         ++m_snapshotBlankSource;
         // The population behind that count. Keyed by SOURCE extent, so one line
         // describes a surface instead of an event, and carrying the frame range
-        // because the whole question is whether these are boot-only (the legal /
-        // loading / start screens) or ongoing.
+        // because the whole question is whether these are boot-only.
         auto& b = m_blankSourceByExtent[(uint64_t(d.resolveSourceWidth) << 32) |
                                         d.resolveSourceHeight];
         if (!b.count) b.firstFrame = m_gameFrame;
@@ -768,13 +730,12 @@ void D3D12Renderer::RenderGameFrame() {
       // the coordinates of the full image, not of the band's own surface, so a
       // band at y 640..720 arrives as a rectangle our 1280x80 source cannot
       // contain. Clamping and then falling back to the whole source makes both
-      // conventions land correctly: a genuine sub-rectangle survives the clamp,
-      // an out-of-range band one does not and takes its whole surface.
+      // conventions land correctly.
       uint32_t sx = 0, sy = 0, copyW = srcWidth, copyH = srcHeight;
       // Scaled by srcScale, which is 1 for every source but a multisample
-      // partner. The guest states its rectangle in the resolution it believes
-      // it rendered; taking it unscaled off a 2x partner would copy the
-      // top-left quarter of the scene and call it the whole image.
+      // partner. The guest states its rectangle in the resolution it believes it
+      // rendered; taking it unscaled off a 2x partner would copy the top-left
+      // quarter of the scene and call it the whole image.
       if (d.resolveSrcX2 > d.resolveSrcX1 && d.resolveSrcY2 > d.resolveSrcY1 &&
           uint32_t(d.resolveSrcX2) * srcScale <= srcWidth &&
           uint32_t(d.resolveSrcY2) * srcScale <= srcHeight &&
@@ -787,14 +748,11 @@ void D3D12Renderer::RenderGameFrame() {
       const uint32_t dx = d.resolveDestX > 0 ? uint32_t(d.resolveDestX) : 0;
       const uint32_t dy = d.resolveDestY > 0 ? uint32_t(d.resolveDestY) : 0;
       // The snapshot must be the size of the DESTINATION TEXTURE, not of the
-      // region this resolve happens to cover.
-      //
-      // Covering was right for a banded resolve, which eventually fills the
-      // whole image, and wrong for an atlas, which never does: the menu scene's
-      // 2048x2048 atlas is built from repeated 256x256 sub-rect resolves, so the
-      // first one created a 256x256 snapshot and normalized UVs then mapped
-      // [0,1] across it -- every fetch at 1/8 scale, anything outside the
-      // top-left corner unreachable.
+      // region this resolve happens to cover. Covering was right for a banded
+      // resolve, which eventually fills the whole image, and wrong for an atlas,
+      // which never does: the menu scene's 2048x2048 atlas is built from
+      // repeated 256x256 sub-rect resolves, so the first one created a 256x256
+      // snapshot and normalized UVs then mapped [0,1] across it.
       //
       // The covered region is still the floor, so a destination whose extent we
       // could not decode behaves exactly as before rather than shrinking.
@@ -817,9 +775,9 @@ void D3D12Renderer::RenderGameFrame() {
       m_commandList->ResourceBarrier(2, pre);
       // A placed region copy, not CopyResource. CopyResource demands identical
       // dimensions, so it could only ever express "this band IS the whole
-      // texture" — and the snapshot had to be resized to the band to satisfy
-      // it, which is the bug. Copying the band to its own offset lets the two
-      // bands of a tiled resolve assemble into one image.
+      // texture" -- and the snapshot had to be resized to the band to satisfy
+      // it. Copying the band to its own offset lets the two bands of a tiled
+      // resolve assemble into one image.
       D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
       dstLoc.pResource = snap->resource.Get();
       dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -837,8 +795,7 @@ void D3D12Renderer::RenderGameFrame() {
       // shader-resource and be transitioned again on demand, but m_gameRT must
       // return to RENDER_TARGET: the rest of the frame keeps drawing into it,
       // and PresentGameFrame's own RT->COPY_SOURCE barrier declares that as the
-      // before-state. The snapshot goes to shader-resource either way -- being
-      // sampled is all it exists for.
+      // before-state.
       D3D12_RESOURCE_BARRIER post[2] = {pre[0], pre[1]};
       post[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
       post[0].Transition.StateAfter =
@@ -877,12 +834,10 @@ void D3D12Renderer::RenderGameFrame() {
       // And the same for any destination whose COPIED REGION is small enough to
       // travel, whatever the destination's own extent: the VT feedback buffer is
       // 64x64 resolved to (0,0), and the terrain deformation is a 128x32 tile
-      // resolved into a 2048x2048 accumulation at a destpoint.
-      //
-      // The destpoint goes with it, AND the region's extent. Both were omitted
-      // while the feedback buffer was the only caller -- it resolves 64x64 to
-      // the origin of a 64x64 destination, so both were indistinguishable from
-      // the defaults.
+      // resolved into a 2048x2048 accumulation at a destpoint. The destpoint
+      // goes with it, AND the region's extent -- both were omitted while the
+      // feedback buffer was the only caller, where they were indistinguishable
+      // from the defaults.
       QueueSurfaceReadback(snap, d.resolveDest, d.resolveDestWidth,
                            d.resolveDestHeight, dx, dy, copyW, copyH);
       continue;
@@ -982,9 +937,9 @@ void D3D12Renderer::RenderGameFrame() {
         clearTarget->usedThisFrame = true;
         clearTarget->everDrawn = true;
         // The clear is where this becomes false: whatever the surface held
-        // before, it now holds only the clear value. everDrawn does NOT
-        // reset here, which is why it cannot answer "does this surface have
-        // real content".
+        // before, it now holds only the clear value. everDrawn does NOT reset
+        // here, which is why it cannot answer "does this surface have real
+        // content".
         clearTarget->drawnSinceClear = false;
       }
       // Clear does not bind through the normal draw path. Force the following
@@ -995,27 +950,25 @@ void D3D12Renderer::RenderGameFrame() {
     }
 
     // Keep only the unsampled final 1280x720 surface on m_gameRT so
-    // PresentGameFrame remains an exact-size copy. A full-size scene target
-    // that a later compositor samples is still offscreen and needs its own SRV;
-    // classifying solely by dimensions made that target alias m_gameRT and
-    // left the final draw with nothing it could legally sample.
+    // PresentGameFrame remains an exact-size copy. A full-size scene target that
+    // a later compositor samples is still offscreen and needs its own SRV;
+    // classifying solely by dimensions made that target alias m_gameRT and left
+    // the final draw with nothing it could legally sample.
     GameRenderTarget* drawTarget = nullptr;
     // Declared out here because the depth-state decision below needs it.
     GameRenderTarget* depthTarget = nullptr;
     const bool feedsLaterDraw =
         d.targetObject && sampledTargets.contains(d.targetObject);
-    // A resolve source needs storage that outlives the frame. Measured: of 33
-    // resolves in one frame, 25 had sources with no draws at all that frame --
-    // their contents were established earlier. m_gameRT is cleared every frame
-    // so it can never hold them at resolve time, which is why snapshotting from
-    // it produced the clear colour. Offscreen targets are cleared only when
-    // something draws into them, so they carry contents forward, which is
-    // exactly the semantics a resolve source needs.
+    // A resolve source needs storage that outlives the frame: of 33 resolves in
+    // one frame, 25 had sources with no draws at all that frame, their contents
+    // established earlier. m_gameRT is cleared every frame so it can never hold
+    // them at resolve time, while offscreen targets are cleared only when
+    // something draws into them.
     //
     // Bisected off twice, and neither time was it the cause: a white-screen
     // regression traced to exempting sampled_render_target_object from the
-    // colourless filter, and a 3s/frame stall traced to a descriptor leak in the
-    // snapshot path (measured with routing off and the stall still present).
+    // colourless filter, and a 3s/frame stall to a descriptor leak in the
+    // snapshot path.
     const bool isResolveSource =
         d.targetObject && resolveSources.contains(d.targetObject);
     // A DEPTH-ONLY pass has no colour target at all -- the shadow map is
@@ -1023,12 +976,12 @@ void D3D12Renderer::RenderGameFrame() {
     // every one of its draws fell through to the main render target. Two
     // measured consequences: the shadow geometry overpainted the backbuffer, and
     // the depth surface was never created, so the guest's depth resolve out of
-    // it found no source. That missing snapshot discarded every draw sampling
-    // the shadow map at s15 -- 396 of them, the whole 320x180 luminance pass,
-    // which is why the exposure divides by zero.
+    // it found no source and every draw sampling the shadow map at s15 was
+    // discarded -- including the whole 320x180 luminance pass, which is why the
+    // exposure divides by zero.
     //
     // Route it like any other offscreen pass, keyed by the DEPTH object, with a
-    // scratch colour target at the same extent. The scratch target is not
+    // scratch colour target at the same extent. That scratch target is not
     // wasted: every PSO declares NumRenderTargets = 1, so binding no RTV would
     // be invalid work against a pipeline that expects one.
     const bool depthOnlyPass =
@@ -1063,9 +1016,8 @@ void D3D12Renderer::RenderGameFrame() {
         m_presentSourceObject = d.targetObject;
         // Present shows the LAST guest-backbuffer-sized surface written this
         // frame, which is only correct if there is exactly one. Seven 1280x720
-        // surfaces are live, and if the guest builds the scene across several
-        // and composites them, presenting one shows a single layer. Count the
-        // distinct ones per frame rather than assume either way.
+        // surfaces are live, and if the guest composites the scene across
+        // several, presenting one shows a single layer.
         if (fullSizeTargets.insert(d.targetObject).second)
           fullSizeOrder.emplace_back(d.targetObject, 0);
         for (auto& e : fullSizeOrder)
@@ -1074,9 +1026,9 @@ void D3D12Renderer::RenderGameFrame() {
       }
     }
     // The three populations, kept apart on purpose. A draw that never wanted an
-    // offscreen target and one that wanted it and was refused both end up on
-    // the main render target, and a single "drew on main" count cannot tell
-    // them apart — but only the second is a silent regression to overpainting.
+    // offscreen target and one that wanted it and was refused both end up on the
+    // main render target, and a single "drew on main" count cannot tell them
+    // apart -- but only the second is a silent regression to overpainting.
     if (!wantsOffscreen) ++m_rtDrawsMain;
     else if (drawTarget) ++m_rtDrawsOffscreen;
     else ++m_rtDrawsOverpaint;
@@ -1107,11 +1059,6 @@ void D3D12Renderer::RenderGameFrame() {
       // on an exact extent match keeps that honest: a stale pairing skips depth
       // for that draw rather than binding a DSV whose size disagrees with the
       // RTV.
-      //
-      // This removed the resize churn entirely (13 -> 0) and let 3423 depth
-      // resolves run from 4 surfaces. The frame still collapses to ~125
-      // offscreen draws, identically to the first attempt -- so neither the
-      // churn nor depth testing is the cause, and routing is what falls.
       depthTarget = (d.depthObject && d.depthWidth == drawTarget->width &&
                      d.depthHeight == drawTarget->height)
                         ? EnsureGameDepthTarget(d.depthObject, d.depthWidth,
@@ -1121,10 +1068,9 @@ void D3D12Renderer::RenderGameFrame() {
       // takes a copy of the owner's rows before its first draw of the frame --
       // see GameRenderTarget::bandDepthOwner for why it copies rather than
       // shares. Without this the band tests against its own creation clear,
-      // which for the menu's second light band meant a far plane and, through
-      // the depth-driven volume count, every light in those rows discarded.
-      // Depth plane only: the stencil plane belongs to the guest's own per-light
-      // clears.
+      // which for the menu's second light band meant a far plane and every light
+      // in those rows discarded. Depth plane only: the stencil plane belongs to
+      // the guest's own per-light clears.
       if (depthTarget && depthTarget->bandDepthOwner &&
           !depthTarget->bandDepthSynced) {
         depthTarget->bandDepthSynced = true;
@@ -1173,10 +1119,9 @@ void D3D12Renderer::RenderGameFrame() {
           owner.state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
           depthTarget->state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
           // The band now holds real geometry, so NEITHER clear may wipe it back
-          // to the far plane. usedThisFrame is the one that matters and setting
-          // only needsInitialClear was not enough: the per-frame clear below is
-          // gated on usedThisFrame alone, so it fired straight after this copy
-          // and put the far plane back.
+          // to the far plane. usedThisFrame is the one that matters: the
+          // per-frame clear below is gated on it alone, so setting only
+          // needsInitialClear left it firing straight after this copy.
           depthTarget->needsInitialClear = false;
           depthTarget->usedThisFrame = true;
           depthTarget->everDrawn = true;
@@ -1201,8 +1146,7 @@ void D3D12Renderer::RenderGameFrame() {
       // colour target. Gating the rebind on the colour object alone let two
       // consecutive draws onto the same colour target keep the first one's depth
       // binding -- including the case where the first bound no DSV at all and
-      // the second runs a depth-enabled PSO against it, which is invalid work
-      // and hangs the device.
+      // the second runs a depth-enabled PSO against it, which hangs the device.
       const uint32_t wantDepthObject = depthTarget ? d.depthObject : 0;
       if (boundTargetObject != targetObject ||
           boundDepthObject != wantDepthObject) {
@@ -1216,12 +1160,9 @@ void D3D12Renderer::RenderGameFrame() {
         // MRT SLOT 1. The guest's terrain tile pass binds two 256x256 targets
         // and resolves the SECOND; rendering only slot 0 left slot 1 never
         // drawn, its resolve dropped for want of a source, and the tile shader's
-        // texture bind failing.
-        //
-        // The second target is ensured the same way the first is, and a failure
-        // falls back to single-target binding rather than dropping the draw --
-        // half the output beats none, and the PSO key is built from what was
-        // actually bound so the two cannot disagree.
+        // texture bind failing. A failure to ensure it falls back to
+        // single-target binding rather than dropping the draw, and the PSO key
+        // is built from what was actually bound so the two cannot disagree.
         GameRenderTarget* drawTarget1 = nullptr;
         if (d.target1Object) {
           // HostColorFormat, exactly as the first target does it -- the
@@ -1364,25 +1305,18 @@ void D3D12Renderer::RenderGameFrame() {
         // docs/strict_mode.md rather than merely measured.
         //
         // It cleared a target to kOffscreenClear on its first use in a frame,
-        // which nothing in the guest asked for. Correct for a target the guest
-        // refills every frame and WRONG for an accumulation buffer: the terrain
-        // deformation ping-pong writes a Laplacian DELTA which only integrates
-        // if the previous contents survive, so cleared every frame it stayed at
-        // zero forever -- min = max = 0 on the 512x512 every terrain draw
-        // samples.
+        // which nothing in the guest asked for: correct for a target the guest
+        // refills every frame and WRONG for an accumulation buffer, since the
+        // terrain deformation ping-pong writes a Laplacian DELTA that only
+        // integrates if the previous contents survive.
         //
-        // WHY DELETE RATHER THAN DEFAULT-OFF. With the preserve path forced on,
+        // WHY DELETE RATHER THAN DEFAULT-OFF: with the preserve path forced on,
         // the guard was given 27,316 opportunities and needed NONE of them,
-        // while the run still rendered 1720 frames at 797 guest draws accepted,
-        // 0 refused, and the 512x512 went from blank to content surviving across
-        // frames as the ping-pong requires. A guard reading 0/N with N that
-        // large has no fallback role left.
-        //
-        // The guest issues its own clears -- colour through AddGameClear and,
-        // since the depth-clear commit, depth too -- so there is no gap left to
-        // cover. `m_targetCarriedContent` is KEPT and counts what it always
-        // measured: targets whose previous-frame content survives. That is a
-        // fact about the workload, and how a reintroduced clear would be spotted.
+        // while the run still rendered 1720 frames at 797 guest draws accepted
+        // and 0 refused. The guest issues its own colour and depth clears, so
+        // there is no gap left to cover. `m_targetCarriedContent` is KEPT and
+        // counts what it always measured -- targets whose previous-frame content
+        // survives -- which is how a reintroduced clear would be spotted.
         if (drawTarget->everDrawn) {
           ++m_targetCarriedContent;
           static std::unordered_set<uint32_t> s_carried;
@@ -1404,7 +1338,7 @@ void D3D12Renderer::RenderGameFrame() {
             m_gameDepthDsvHeap->GetCPUDescriptorHandleForHeapStart();
         dsv.ptr += SIZE_T(depthTarget->rtvIndex) * m_gameDsvDescriptorSize;
         // DEPTH ONLY. This is our per-frame schedule, not the guest's, and the
-        // stencil plane belongs to the guest's own clears. The creation-time
+        // stencil plane belongs to the guest's own clears; the creation-time
         // clear at the needsInitialClear sites gives stencil its first value.
         //
         // MEASURED, so nobody has to try it twice: adding
@@ -1435,18 +1369,15 @@ void D3D12Renderer::RenderGameFrame() {
       boundDepthObject = 0;
     }
 
-    // THE GUEST'S SCISSOR.
-    //
-    // Ignoring it drew the compass strip across the whole frame: the guest clips
-    // it to a window in the middle of the screen. Anything else the guest clips
-    // to a sub-rectangle was equally unclipped, so this is not one widget's bug.
+    // THE GUEST'S SCISSOR. Ignoring it drew the compass strip across the whole
+    // frame, and anything else the guest clips to a sub-rectangle was equally
+    // unclipped.
     //
     // The guest rectangle is in its own render-target pixels. Off-screen targets
     // are created at the guest's dimensions so it maps 1:1 there; the main
     // target is letterboxed by m_viewport, so the same linear map is applied
     // here. Both are then INTERSECTED with the full-target rectangle rather than
-    // replacing it, which makes a stale scissor from a larger target harmless:
-    // it can only shrink what is already allowed, never open the letterbox bars.
+    // replacing it, which makes a stale scissor from a larger target harmless.
     {
       const D3D12_RECT full =
           drawTarget ? D3D12_RECT{0, 0, LONG(drawTarget->width),
@@ -1472,10 +1403,9 @@ void D3D12Renderer::RenderGameFrame() {
         want.top = std::max(full.top, t);
         want.right = std::min(full.right, r);
         want.bottom = std::min(full.bottom, b);
-        // An empty or inverted rectangle is not a reason to draw everything.
-        // The guest asking for nothing means nothing, and D3D12 rejects a
-        // rectangle whose right is below its left, so it is collapsed rather
-        // than widened.
+        // An empty or inverted rectangle is not a reason to draw everything. The
+        // guest asking for nothing means nothing, and D3D12 rejects a rectangle
+        // whose right is below its left, so it is collapsed rather than widened.
         if (want.right < want.left) want.right = want.left;
         if (want.bottom < want.top) want.bottom = want.top;
         if (want.left != full.left || want.top != full.top ||
@@ -1501,16 +1431,15 @@ void D3D12Renderer::RenderGameFrame() {
       // The lookup deliberately runs even when the draw's own target is the one
       // that was resolved from. The old `sampled != target` guard existed
       // because a resource cannot be read and written in the same draw -- but a
-      // snapshot is a separate resource captured earlier, so that hazard is
-      // gone, and the guard was rejecting the common case: one shared scratch
-      // surface is both what the draw renders into and what it samples a
-      // previous resolve of. With the guard in place this measured hits 0.
+      // snapshot is a separate resource captured earlier, so that hazard is gone
+      // and the guard was rejecting the common case: one shared scratch surface
+      // that is both what the draw renders into and what it samples a previous
+      // resolve of. With the guard in place this measured hits 0.
       //
       // The fallback keeps the old live-surface path under the old guard,
       // because that IS still a read-write hazard. It is wrong whenever more
       // than one texture resolves out of that target, but it beats binding
-      // nothing. A large steady m_snapshotFallbacks means resolves are being
-      // dropped upstream.
+      // nothing.
       GameRenderTarget* sampledPtr = nullptr;
       // A STALE snapshot is refused outright: it holds a complete earlier frame
       // at full screen size, so binding it does not degrade the draw, it
@@ -1518,13 +1447,11 @@ void D3D12Renderer::RenderGameFrame() {
       //
       // A DEPTH snapshot is not a colour source. The tex*col stand-in has one
       // texture and multiplies it by the vertex colour, so an R32_FLOAT depth
-      // image gives (depth, 0, 0, 1) * white -- a flat red sheet, which is
-      // exactly what appeared over the menu the first time depth resolves
-      // started succeeding.
+      // image gives (depth, 0, 0, 1) * white -- the flat red sheet that appeared
+      // over the menu the first time depth resolves started succeeding.
       //
       // Both fall through to the fabricated-colour gate, which shows what is
-      // underneath: incomplete, but not a previous frame or a depth buffer
-      // painted over the current one.
+      // underneath.
       const bool depthSnapshot =
           [&] {
             auto s = m_gameSnapshots.find(d.sampledTextureObject);
@@ -1552,11 +1479,10 @@ void D3D12Renderer::RenderGameFrame() {
         }
       } else if (d.sampledTextureObject && !depthSnapshot &&
                  m_gameSnapshots.count(d.sampledTextureObject)) {
-        // Not counted for a depth snapshot: that refusal has its own counter
-        // and is deliberate, whereas STALE-REFUSED means a resolve was dropped
-        // and the image is a known-wrong earlier frame. Letting the depth
-        // refusals fall through here made both read 233 and made a healthy
-        // number look like 233 lost refreshes.
+        // Not counted for a depth snapshot: that refusal has its own counter and
+        // is deliberate, whereas STALE-REFUSED means a resolve was dropped and
+        // the image is a known-wrong earlier frame. Letting the depth refusals
+        // fall through here made a healthy number look like 233 lost refreshes.
         ++m_snapshotStaleRefused;
       } else if (d.sampledTargetObject != d.targetObject) {
         if (auto it = m_gameRenderTargets.find(d.sampledTargetObject);
@@ -1612,41 +1538,34 @@ void D3D12Renderer::RenderGameFrame() {
     // {1,1,1,1}. That seed is correct as a MODULATION IDENTITY -- kGameTexturePS
     // computes tex * col, and zeroing it killed the logo -- but when the
     // multiply never happens it is emitted literally, as opaque white over a
-    // geometrically exact fullscreen quad.
+    // geometrically exact fullscreen quad. ("Binding nothing turns such draws
+    // black" is false; colourless means white, which is why this read as an
+    // overpaint problem for so long.)
     //
-    // The gate is the FABRICATION, not the reason the texture is missing. A
-    // first attempt keyed on sampledTargetObject and was too narrow by an order
-    // of magnitude: of 94 untextured draws on the presented surface, only ~4 per
-    // frame carry a sampled target. kPacked and kFallback colours are real
-    // vertex data and are left alone; only kNone is invented here.
-    //
-    // Note "binding nothing turns such draws black" is false -- colourless means
-    // white -- which is why this read as an overpaint problem for so long.
+    // The gate is the FABRICATION, not the reason the texture is missing: keying
+    // on sampledTargetObject was too narrow by an order of magnitude. kPacked
+    // and kFallback colours are real vertex data and are left alone; only kNone
+    // is invented here.
     //
     // Decided here, applied below once it is known whether the guest's own
     // shader will run. Applying the skip HERE cost the menu its whole
-    // post-processing chain: every skipped draw was translated, 76 of them aimed
-    // at the 320x180 luminance target, which left it cleared and never drawn
-    // into -- so the guest measured luminance zero, computed exposure as key/0,
-    // and the composite turned the frame to NaN.
+    // post-processing chain: 76 skipped draws were aimed at the 320x180
+    // luminance target, which left it cleared and never drawn into, so the guest
+    // computed exposure as key/0 and the composite turned the frame to NaN.
     //
     // TWO EXEMPTIONS. A depth-only pass has no colour source and no texture BY
-    // DESIGN, and skipping it would leave the depth surface empty. And a draw
-    // with its COLOUR MASK OFF -- the clause the two earlier reverts were
-    // missing, because both exempted draws by WHY they lost their translation,
-    // which says nothing about what they paint. That population is the guest's
-    // depth passes: null pixel shader, binding a colour target so they fail
-    // depthOnlyPass, but RB_COLOR_MASK 0 for every one measured. Skipping them
-    // threw away their DEPTH write and the scene draws that test against it
-    // rendered wrong. Fabricating white requires writing colour; these cannot.
+    // DESIGN. And a draw with its COLOUR MASK OFF -- the clause two earlier
+    // reverts were missing, because both exempted draws by WHY they lost their
+    // translation, which says nothing about what they paint. That population is
+    // the guest's depth passes: null pixel shader, binding a colour target so
+    // they fail depthOnlyPass, but RB_COLOR_MASK 0 for every one measured.
+    // Fabricating white requires writing colour; these cannot.
     //
     // Below: CULL census at PSO-SELECTION time rather than where cullMode is
     // stored. The guest-side probe already proves the register reads cull_back
     // for the draw that blacks out the menu background; what it cannot show is
     // whether the value survives graphics_system -> AddGameDraw -> the PSO key.
-    // Counts the PACKED bits, because those are what the key carries. Reported
-    // unconditionally, all eight buckets, so an all-zero histogram is
-    // distinguishable from no report.
+    // Counts the PACKED bits, all eight buckets, reported unconditionally.
     {
       static std::atomic<uint64_t> s_cullBuckets[8]{};
       static std::atomic<uint64_t> s_cullDraws{0};
@@ -1668,8 +1587,8 @@ void D3D12Renderer::RenderGameFrame() {
       }
       // The one draw this is all about, named on its own line. The aggregate
       // above can be healthy while THIS draw still arrives with cullMode 0, and
-      // an aggregate cannot show that -- 128 draws a frame would drown it.
-      // One line per distinct (raw register, packed bits, translated) tuple.
+      // 128 draws a frame would drown it. One line per distinct (raw register,
+      // packed bits, translated) tuple.
       if (d.indexCount == 35) {
         static std::mutex s_mu;
         static std::set<uint64_t> s_seen;
@@ -1714,7 +1633,7 @@ void D3D12Renderer::RenderGameFrame() {
     // missing keeps the tex*col stand-in rather than rendering a guess.
     //
     // The topology group is computed once, above the split, so the translated
-    // and stand-in paths cannot disagree about it -- a disagreement here is
+    // and stand-in paths cannot disagree about it -- a disagreement there is
     // invisible except as a draw that does not appear.
     const D3D12_PRIMITIVE_TOPOLOGY_TYPE topoType = TopologyTypeOf(d.topology);
 
@@ -1774,19 +1693,16 @@ void D3D12Renderer::RenderGameFrame() {
     // invented colour" but a draw we chose to discard. They are exactly an
     // invented colour -- no colour source and no texture, so the stand-in paints
     // white -- and letting the 354 such draws on the scene target through turned
-    // the whole menu backdrop white and buried the rider and bike. WHITE-SKIPPED
-    // fell 451 -> 76 and the picture got worse; the counter was measuring draws
-    // starting to render, not starting to render correctly.
+    // the whole menu backdrop white. WHITE-SKIPPED fell 451 -> 76 while the
+    // picture got worse: the counter was measuring draws starting to render, not
+    // starting to render correctly.
     //
-    // NARROW EXEMPTION, for the terrain tile pass. Those draws are not on the
-    // scene target: they render into a 256x256 offscreen surface that is
-    // resolved into the 2048x2048 terrain atlas, and skipping them is why that
-    // atlas is empty on all 64 tiles and the ground is black -- three skipped
-    // draws, three resolves. So exempt ONLY small offscreen targets, which
-    // cannot be a scene band, and count them separately. A fabricated-white TILE
-    // is wrong too -- the real fix is upstream, in whatever makes the texture
-    // bind fail -- but a white ground and a black one are both wrong and only
-    // one of them proves the chain.
+    // NARROW EXEMPTION, for the terrain tile pass. Those draws render into a
+    // 256x256 offscreen surface resolved into the 2048x2048 terrain atlas, and
+    // skipping them is why that atlas is empty on all 64 tiles. So exempt ONLY
+    // small offscreen targets, which cannot be a scene band, and count them
+    // separately. A fabricated-white TILE is wrong too -- the real fix is
+    // upstream, in whatever makes the texture bind fail.
     if (!translatedPso && fabricatedWhite && d.translated &&
         d.targetWidth <= 512 && d.targetHeight <= 512) {
       ++m_whiteAllowedOffscreen;
@@ -1815,17 +1731,13 @@ void D3D12Renderer::RenderGameFrame() {
       e.object = d.targetObject;
       if (d.translated) ++e.translated;
       if (d.pixelSamplerCount) ++e.wantedSlots;
-      // PROBE: WHICH draws are still being skipped on the two scene bands.
-      //
-      // After the colorWrite clause the menu goes to zero on 1280x640 / 1280x80
-      // but freeroam keeps 65-79 per interval, and the counters cannot say what
-      // they are: the guest-side probe reports the whole null-PS colour
-      // population as already exempt. A colorMaskKnown flag was tried on the
-      // theory that the mask was simply unobserved for them; it changed nothing,
-      // because "mask unreadable 0" had already ruled that out.
-      //
-      // One line per distinct (target, shader), so a handful of lines names the
-      // population instead of 65 copies of one draw.
+      // PROBE: WHICH draws are still being skipped on the two scene bands. After
+      // the colorWrite clause the menu goes to zero on 1280x640 / 1280x80 but
+      // freeroam keeps 65-79 per interval, and the counters cannot say what they
+      // are: the guest-side probe reports the whole null-PS colour population as
+      // already exempt, and a colorMaskKnown flag changed nothing because "mask
+      // unreadable 0" had already ruled that out. One line per distinct (target,
+      // shader).
       {
         static std::mutex s_mu;
         static std::set<uint64_t> s_seen;
@@ -1863,17 +1775,15 @@ void D3D12Renderer::RenderGameFrame() {
       // menu.rdc shows a fullscreen quad stamping the mask and the very next
       // fullscreen quad being rejected by it -- and a fullscreen fill that is
       // entirely rejected is doing nothing, which the guest would not have
-      // issued. So the question is whether the WRITER and the READER agree.
-      //
-      // Nothing else in this tree can show that: RenderDoc's pipeline JSON has
-      // no depthStencilState field at all, and the census reports configurations
+      // issued. So the question is whether the WRITER and the READER agree, and
+      // nothing else in this tree can show that: RenderDoc's pipeline JSON has
+      // no depthStencilState field, and the census reports configurations
       // without their order.
       //
       // Draw ORDINAL is logged so the lines can be matched against a capture's
       // draw order, and the SURFACE, because the stencil plane is per depth
       // OBJECT and menu.rdc shows the incrementing geometry and the testing fill
-      // running against different EDRAM bases. First frame only: the sequence
-      // repeats, and one frame of it is the whole question.
+      // running against different EDRAM bases. First frame only.
       static uint32_t s_seq = 0;
       if (s_seq < 120) {
         ++s_seq;
@@ -1907,9 +1817,9 @@ void D3D12Renderer::RenderGameFrame() {
       m_commandList->SetPipelineState(translatedPso);
       // b0 vertex. Two different buffers for the two vertex stages, at the one
       // register each declares: the guest's own VERTEX constant bank when its
-      // shader is running, and the per-draw transform when the passthrough
-      // stage is — that one does not read b0 at all, but the root signature
-      // requires a bound CBV either way.
+      // shader is running, and the per-draw transform when the passthrough stage
+      // is — that one does not read b0 at all, but the root signature requires a
+      // bound CBV either way.
       const D3D12_GPU_VIRTUAL_ADDRESS tcb =
           d.gpuVertex ? d.vscb.gpu
           : d.cb      ? d.cb.gpu
@@ -1927,10 +1837,8 @@ void D3D12Renderer::RenderGameFrame() {
         m_commandList->SetGraphicsRootDescriptorTable(3, samp);
       // The vertex stage's own tables, at t17+/s16+. Bound only when its shader
       // samples: root parameters a shader does not reference need no binding.
-      //
-      // Both must succeed or neither is bound. A shader that declares textures
-      // with only its samplers bound reads undefined descriptors, which is the
-      // confident-wrong-answer failure the slot fill is all-or-nothing to avoid.
+      // Both must succeed or neither is bound -- a shader that declares textures
+      // with only its samplers bound reads undefined descriptors.
       if (d.vertexSamplerCount) {
         D3D12_GPU_DESCRIPTOR_HANDLE vsSrv = {};
         D3D12_GPU_DESCRIPTOR_HANDLE vsSamp = {};
@@ -1953,9 +1861,9 @@ void D3D12Renderer::RenderGameFrame() {
         ++m_gpuVertexFetchDraws;
       } else if (d.gpuVertex) {
         // One stream: the guest's raw attributes. No stand-in vertex and no
-        // interpolator stream, because neither exists for this draw — the
-        // vertex shader produces the position and the rasterizer interpolates
-        // what it exports.
+        // interpolator stream, because neither exists for this draw — the vertex
+        // shader produces the position and the rasterizer interpolates what it
+        // exports.
         m_commandList->IASetVertexBuffers(0, 1, &d.vsvbv);
         ++m_gpuVertexDraws;
       } else {
@@ -1987,25 +1895,19 @@ void D3D12Renderer::RenderGameFrame() {
       // COUNTED SEPARATELY, because the census cannot answer this. Both the
       // translated path and this one record "guard did not fire", so a census
       // reading of 0 is ambiguous between "no stand-ins existed" and "N were
-      // suppressed" -- and knowing WHAT was removed is the entire point of
-      // strict mode.
+      // suppressed".
       ++m_standInStrictSkipped;
       continue;
     }
     mx::gpu::guard::Note(mx::gpu::guard::Guard::kStandInDraw, true);
     ++m_standInDraws;
 
-    // WHICH stand-in draws actually PAINT, named by target and shader.
-    //
-    // The complement of WHITE-SKIP WHO above: that one names the draws the gate
-    // discards, this one the draws it lets through, and only the second can put
-    // wrong colour on screen. Most stand-in draws are the guest's null-PS depth
+    // WHICH stand-in draws actually PAINT, named by target and shader -- the
+    // complement of WHITE-SKIP WHO above, and only this half can put wrong
+    // colour on screen. Most stand-in draws are the guest's null-PS depth
     // passes, which carry RB_COLOR_MASK 0 and paint nothing, so filtering on
-    // colorWrite separates the noise from the suspects.
-    //
-    // This is what named the red gameplay screen -- one line carrying a guest
-    // shader handle a capture could not give -- and the same probe going quiet
-    // is how the fix was confirmed.
+    // colorWrite separates the noise from the suspects. This is what named the
+    // red gameplay screen, and the same probe going quiet confirmed the fix.
     if (d.colorWrite && d.targetObject) {
       static std::mutex s_mu;
       static std::set<uint64_t> s_seen;
@@ -2063,9 +1965,9 @@ void D3D12Renderer::RenderGameFrame() {
     m_commandList->SetPipelineState(pipeline);
     // The reference value is NOT pipeline state -- it is set per draw, which is
     // why configs differing only in ref share one pipeline. Set unconditionally
-    // when this draw has stencil so it cannot inherit the previous draw's ref;
-    // a stale ref is the kind of fault that only shows on the second draw of a
-    // pair and reads as a geometry bug.
+    // when this draw has stencil so it cannot inherit the previous draw's ref; a
+    // stale ref only shows on the second draw of a pair and reads as a geometry
+    // bug.
     if (d.stencilIndex) m_commandList->OMSetStencilRef(d.stencil.ref);
     // Each translated draw brings its own transform; a draw whose cb failed to
     // allocate falls back to the identity matrix rather than being dropped.
@@ -2106,12 +2008,10 @@ void D3D12Renderer::RenderGameFrame() {
   }
 
   // Cumulative, every 20 frames that drew anything, with distinct live targets
-  // beside the cap -- the two together say whether the budget is comfortable or
-  // about to be exhausted; the count alone does not.
-  //
-  // Twenty, not 100. Frames cost ~0.5s here, so a 100-frame interval is ~50
-  // seconds and a watched session produces exactly ONE print, from frame 1,
-  // before anything has been drawn or resolved.
+  // beside the cap -- together they say whether the budget is comfortable or
+  // about to be exhausted; the count alone does not. Twenty, not 100: frames
+  // cost ~0.5s here, so a 100-frame interval produces exactly ONE print in a
+  // watched session, from frame 1, before anything has been drawn.
   static uint32_t s_rtFrame = 0;
   if (!m_gameDraws.empty() && (++s_rtFrame % 20) == 1) {
     // 512, not 300: the stand-in line below carries eight counters now, and a
@@ -2132,9 +2032,8 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_rtRejectBudget),
                   static_cast<unsigned long long>(m_rtRejectResized),
                   // Incremented since the format branch was written and never
-                  // printed anywhere -- grep found exactly one occurrence in
-                  // the tree. A counter nothing reads cannot answer a question,
-                  // and this is the one that says whether a snapshot's
+                  // printed anywhere. A counter nothing reads cannot answer a
+                  // question, and this is the one that says whether a snapshot's
                   // accumulated content was thrown away.
                   static_cast<unsigned long long>(m_snapshotFormatChanged),
                   static_cast<unsigned long long>(m_whiteAllowedOffscreen),
@@ -2148,10 +2047,10 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_gameTextureEvictions),
                   static_cast<unsigned long long>(m_gameTextureEvictBlocked));
     LogInfo(message);
-    // The figure that says whether the guest's own shaders are actually
-    // carrying the picture. Translated against stand-in, because the translated
-    // count alone cannot distinguish "the frame runs guest shaders" from "four
-    // draws in a corner do".
+    // The figure that says whether the guest's own shaders are actually carrying
+    // the picture. Translated against stand-in, because the translated count
+    // alone cannot distinguish "the frame runs guest shaders" from "four draws
+    // in a corner do".
     std::snprintf(message, sizeof(message),
                   "guest shaders: %llu draws TRANSLATED (%llu of them running "
                   "the guest VERTEX shader too, %llu of those fetching their "
@@ -2178,10 +2077,9 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_scissorUnreadable));
     LogInfo(message);
     // Which of the four bind failures sent a translatable draw to the stand-in.
-    // The counts are what decide the next move: block-exhausted means the ring
-    // is undersized or not being reset, no-snapshot means the draw wants a
-    // resolve result we never captured, and the texture ones point upstream at
-    // the hooks rather than at anything here.
+    // The counts decide the next move: block-exhausted means the ring is
+    // undersized or not being reset, no-snapshot means the draw wants a resolve
+    // result we never captured, and the texture ones point upstream at the hooks.
     std::snprintf(message, sizeof(message),
                   "translated bind failures: block-exhausted %llu, "
                   "no-snapshot %llu (depth %llu, colour %llu, "
@@ -2208,13 +2106,11 @@ void D3D12Renderer::RenderGameFrame() {
                   m_translatedBlockHighWater, m_translatedBlocksPerFrame);
     LogInfo(message);
     // PER-CHUNK CLIPMAP LEVEL. How many distinct 129x129 height snapshots the
-    // terrain chunks bound, and how the draws divide between them. One level for
+    // terrain chunks bound, and how the draws divide between them: one level for
     // every chunk means the seams in the terrain normal buffer are NOT a LOD
-    // boundary; several means adjacent chunks really are on different levels.
-    //
-    // Draws-per-level is printed, not just the count: "8 levels, 7 of them with
-    // one draw" and "8 levels evenly used" are different situations and only one
-    // is a clipmap working as intended.
+    // boundary. Draws-per-level is printed, not just the count, because "8
+    // levels, 7 of them with one draw" and "8 levels evenly used" are different
+    // situations.
     {
       std::string levels;
       uint32_t shown = 0;
@@ -2237,11 +2133,8 @@ void D3D12Renderer::RenderGameFrame() {
     // silently POINT-sampled" is a question no existing counter answers, and the
     // terrain tile atlas is the one it is asked about: it binds through the
     // PARTIAL-snapshot path by design, and a partial bind that leaves the
-    // sampler word zero keeps the POINT filter that path has always had.
-    //
-    // no-word is the DEFECT column; guest-asked is correct behaviour. Printed
-    // even when both are zero, because "never fired" and "never measured" are
-    // the distinction this line exists to make.
+    // sampler word zero keeps that path's POINT filter. no-word is the DEFECT
+    // column; guest-asked is correct behaviour. Printed even when both are zero.
     std::snprintf(message, sizeof(message),
                   "snapshot slot filtering: %llu binds, %llu with a sampler "
                   "word (%.1f%%) | POINT taken: %llu NO-WORD (silent), %llu "
@@ -2409,16 +2302,15 @@ void D3D12Renderer::RenderGameFrame() {
                   static_cast<unsigned long long>(m_standInStrictSkipped));
     LogInfo(message);
     // GUARD CENSUS -- phase 1 of docs/strict_mode.md. One line, every class-B
-    // guard, fires beside the population they are a fraction of. A guard
-    // reading 0/N with N large is reached constantly and never needed: that is
-    // a guard that can be deleted, and it is the cheapest win here.
+    // guard, fires beside the population they are a fraction of. A guard reading
+    // 0/N with N large is reached constantly and never needed: that is a guard
+    // that can be deleted.
     std::snprintf(message, sizeof(message), "  GUARD CENSUS --%s",
                   mx::gpu::guard::Report().c_str());
     LogInfo(message);
     // Guest depth clears. Printed unconditionally, zero included: "the guest
-    // never asked" and "it asked and we could not place it" are the two
-    // outcomes this change exists to tell apart, and a missing line looks like
-    // neither.
+    // never asked" and "it asked and we could not place it" are the two outcomes
+    // this change exists to tell apart, and a missing line looks like neither.
     std::snprintf(message, sizeof(message),
                   "  GUEST DEPTH CLEARS %llu honoured, %llu with no host "
                   "depth surface",
@@ -2481,8 +2373,7 @@ void D3D12Renderer::RenderGameFrame() {
     // ends early is a boot-time screen whose backdrop never arrived. `rescue`
     // says why the substitution search did not save it: no-cand = nothing else
     // sits at that EDRAM base, all-blank = something does but nothing was ever
-    // drawn into it either (the defect is upstream), n/a = depth source or no
-    // base to search from.
+    // drawn into it either, n/a = depth source or no base to search from.
     for (const auto& [extent, b] : m_blankSourceByExtent) {
       std::snprintf(message, sizeof(message),
                     "  BLANK-SOURCE %ux%u src 0x%08X base 0x%03X fmt %u -> dest "
@@ -2520,8 +2411,7 @@ void D3D12Renderer::RenderGameFrame() {
     // (base 0x2D0, pitch 640, 4x MSAA in its surface word) has no host target of
     // its own, while a 640x720 surface sits at the same base and pitch at 1x.
     // Whether that 640x720 is drawn into decides whether the 640x360 resolve
-    // should take a region of it or whether the pass that fills it is being lost
-    // somewhere else.
+    // should take a region of it or whether the pass that fills it is lost.
     for (const auto& [object, t] : m_gameRenderTargets) {
       std::snprintf(message, sizeof(message),
                     "  COLOUR pool obj 0x%08X %ux%u base 0x%03X fmt %u "
@@ -2530,10 +2420,10 @@ void D3D12Renderer::RenderGameFrame() {
                     uint32_t(t.format), t.everDrawn ? "Y" : "N");
       LogInfo(message);
     }
-    // DIAG: what the depth pool actually holds. The
-    // shadow resolve names a 768x1024 depth surface while the pass appears to
-    // render two EDRAM bands (768x640 at base 0x580, 768x384 at base 0x710),
-    // so the object the resolve asks for may be one no draw ever bound.
+    // DIAG: what the depth pool actually holds. The shadow resolve names a
+    // 768x1024 depth surface while the pass appears to render two EDRAM bands
+    // (768x640 at base 0x580, 768x384 at base 0x710), so the object the resolve
+    // asks for may be one no draw ever bound.
     for (const auto& [object, t] : m_gameDepthTargets) {
       std::snprintf(message, sizeof(message),
                     "  DEPTH pool obj 0x%08X %ux%u drawn:%s", object, t.width,
@@ -2579,8 +2469,7 @@ void D3D12Renderer::RenderGameFrame() {
     LogInfo(message);
     // Name the no-handle population. Sorted by count, worst first, and the
     // DISTINCT key count printed alongside so "one shader does all 1906" and
-    // "1906 shaders do one each" are distinguishable -- they mean completely
-    // different things and the total cannot tell them apart.
+    // "1906 shaders do one each" are distinguishable.
     {
       std::vector<std::pair<uint64_t, uint64_t>> worst;  // count, key
       worst.reserve(m_standInNoHandleBy.size());
@@ -2597,15 +2486,14 @@ void D3D12Renderer::RenderGameFrame() {
         line += one;
       }
       // PER FRAME, beside the cumulative total, and that is the point of this
-      // line. These counters are cumulative, so on a 2800-frame run this printed
-      // "2744" and read as a 2744-draw defect. It is ONE DRAW PER FRAME, and
-      // that number was carried as an open item for most of a session on the
-      // strength of the total alone. Print the denominator with the numerator.
+      // line: on a 2800-frame run this printed "2744" and read as a 2744-draw
+      // defect. It is ONE DRAW PER FRAME, and that number was carried as an open
+      // item for most of a session on the strength of the total alone.
       //
-      // What the residual actually is on this title, measured in a capture: the
-      // frame's FIRST draw, a screen-space quad over roughly the top-left 40% x
-      // 35%, issued before the guest has bound any shader and CLEARED five
-      // events later by the frame's own clear. It never reaches the screen.
+      // What the residual actually is, measured in a capture: the frame's FIRST
+      // draw, a screen-space quad over roughly the top-left 40% x 35%, issued
+      // before the guest has bound any shader and CLEARED five events later by
+      // the frame's own clear. It never reaches the screen.
       const double perFrame =
           m_gameFrame ? double(m_standInNoHandle) / double(m_gameFrame) : 0.0;
       std::snprintf(message, sizeof(message),
@@ -2720,11 +2608,10 @@ void D3D12Renderer::RenderGameFrame() {
   }
 }
 
-// Suballocate one per-draw range from the upload ring.
-//
-// Three ways this can be satisfied, cheapest first: bump the page already being
-// filled, reset a page the GPU has finished with, or grow the ring. Only the
-// third calls into the driver, and in steady state it never happens.
+// Suballocate one per-draw range from the upload ring. Three ways this can be
+// satisfied, cheapest first: bump the page already being filled, reset a page
+// the GPU has finished with, or grow the ring. Only the third calls into the
+// driver, and in steady state it never happens.
 bool D3D12Renderer::AllocUpload(UploadAlloc& out, uint32_t bytes) {
   out = {};
   if (!bytes || !m_device) return false;
@@ -2807,11 +2694,9 @@ void D3D12Renderer::ClearGameDraws() {
   // to the fenced retirement list to be destroyed a frame or two later, and the
   // destruction cost as much as the creation: 743ms of an 1815ms menu tick,
   // against 1031ms to create them. Neither exists now -- a range of a page is
-  // not a resource, and a page is reset rather than freed.
-  //
-  // The fence protection moved rather than went away: a page carries the
-  // submission it was last read under and cannot be reset until that passes.
-  // `live` is the separate condition and this is what clears it.
+  // not a resource, and a page is reset rather than freed. The fence protection
+  // moved rather than went away: a page carries the submission it was last read
+  // under, and `live` is the separate condition this clears.
   //
   // Done before the empty check on purpose. AddGameDraw can allocate and then
   // fail out before appending, so pages can be live with no draw referencing
@@ -2888,13 +2773,9 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   // What it cost, measured before the change: a steady-state main menu tick of
   // 1815ms spent 1031ms creating those resources and 743ms destroying them --
   // 97.7% of the tick -- against 17ms to record the frame and 0ms waiting for
-  // the GPU. The guest was blocked in SetDrawCalls behind all of it, which is
-  // what its 1.75s frames actually were.
-  //
-  // This comment used to claim D3D12's command-list tracking keeps the
-  // underlying memory alive until the GPU is done with it. That is FALSE -- it
-  // was a D3D11 guarantee. Lifetime is the application's job and is now the
-  // ring's.
+  // the GPU. This comment used to claim D3D12's command-list tracking keeps the
+  // underlying memory alive until the GPU is done with it; that is FALSE, it was
+  // a D3D11 guarantee, and lifetime is now the ring's job.
   //
   // A fetch draw brings no host vertex buffer at all: its geometry arrives in
   // vertexStage->rawBytes and the shader reads it through the root SRV, so a
@@ -2944,8 +2825,6 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
     // there; leaving it white would make the video ignore c0 entirely.
     //
     // Host layout: position float4 @0, color float4 @16, uv float2 @32.
-    // Multiplying the seeded color by c0 is algebraically identical to the guest
-    // shader and avoids a second constant-buffer binding for this path.
     if (planes && planeCount >= 3 && pixelConstants &&
         pixelConstDwords >= 4 && vtxStride >= 32) {
       float modulation[4];
@@ -3025,12 +2904,10 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   // term is a 512x512 that reads min = max = 0. The guest's own
   // `ps_hft_deform_copy` copies the heightfield into it, but only for tiles a
   // track segment has reached, so on an untouched map the buffer has to be
-  // filled at level load. Either those draws never reach us, or they do and
-  // something eats them.
+  // filled at level load.
   //
   // ONE LINE PER FRAME THAT HAS ANY, not per draw: a level load is thousands of
-  // frames and the interesting ones are the handful that draw here at all. The
-  // cap is on LINES, and the running total keeps counting after it.
+  // frames and the interesting ones are the handful that draw here at all.
   if (targetWidth == targetHeight && targetWidth >= 128 &&
       (targetWidth & (targetWidth - 1)) == 0) {
     static std::mutex s_mu;
@@ -3091,9 +2968,8 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   // and zero translated draws in a run where 36,064 qualified.
   //
   // Two valid shapes, and a fetch stage has NONE of the input-element fields by
-  // design -- its only input is SV_VertexID. Requiring them unconditionally
-  // dropped every fetch draw here, measured as a frame going from 339 draws to
-  // 28.
+  // design -- its only input is SV_VertexID -- so requiring them unconditionally
+  // took a frame from 339 draws to 28.
   const bool hasVertexCommon = vertexStage && vertexStage->handle &&
                                vertexStage->hlsl && vertexStage->constants &&
                                vertexStage->constDwords;
@@ -3116,24 +2992,19 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   //
   // WHICH of the six conditions sent this draw to the stand-in. Without it the
   // only numbers available are measured at two different points -- ~475k D3D9
-  // draw attempts against ~52k submitted draws -- so they describe different
-  // populations and cannot be subtracted.
+  // draw attempts against ~52k submitted draws -- so they cannot be subtracted.
   //
   // no-HANDLE is tested FIRST, and the order is the whole point: a draw with no
   // pixel shader has no handle AND no HLSL, so the other way round every one was
   // counted as no-hlsl and `no-handle 0` could never be anything but zero. That
-  // cost a session -- "no-handle 0, no-hlsl 28257" was read as "every stand-in
-  // draw has a shader whose translation is missing", sending the search into a
-  // translator that was working fine.
+  // cost a session, sending the search into a translator that was working fine.
   //
   // A guest DEPTH pass -- a translated VERTEX stage and no pixel shader at all
   // -- needs none of the four things demanded of a normal translated draw,
   // because kTranslatedDepthOnlyPS reads nothing and its output is discarded by
   // a zero write mask. What it DOES need is the vertex stage, without which it
   // runs on the software interpreter. `!colorWrite` is the load-bearing term and
-  // is checked here as well as on the hooks side: the two decide it from the
-  // same guest register in different processes' worth of code, and this is the
-  // one the write mask is actually built from.
+  // is checked here as well as on the hooks side.
   const bool depthOnlyStandIn =
       !pixelShaderHlsl && hasVertexStage && !colorWrite;
   d.depthOnlyStandIn = depthOnlyStandIn;
@@ -3162,10 +3033,9 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
     // xe_texsign[slots], xe_param_gen and xe_alphatest, so the buffer must cover
     // all five -- sizing it to the constant bank alone leaves the shader reading
     // past the end of the resource for every unnormalized fetch. Rounded up to
-    // 256 bytes, the constant-buffer granularity.
-    //
-    // Zero for a depth pass, which brings no constant bank. The three payloads
-    // after it still have to exist because the cbuffer is declared with them.
+    // 256 bytes, the constant-buffer granularity. Zero for a depth pass, which
+    // brings no constant bank; the three payloads after it still have to exist
+    // because the cbuffer is declared with them.
     const uint32_t bankBytes = depthOnlyStandIn ? 0u : pixelConstDwords * 4;
     const uint32_t texInvBytes = kTranslatedSamplerSlots * 16;
     const uint32_t texSignBytes = kTranslatedSamplerSlots * 16;
@@ -3202,19 +3072,18 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
         // extent would produce infinity -- left zero, an unnormalized fetch
         // reads texel 0 rather than something plausible.
         //
-        // EVERY slot, not just the first. This was filled at index 0 only, so an
-        // unnormalized fetch on any slot above the first multiplied its
-        // coordinate by ZERO -- sampling texel 0 and painting that one texel
-        // flat across the primitive, which on a full-screen quad is a wash.
+        // EVERY slot, not just the first. Filled at index 0 only, an
+        // unnormalized fetch on any higher slot multiplied its coordinate by
+        // ZERO, sampling texel 0 and painting it flat across the primitive.
         // Slot 0 falls back to d.texture because the single-texture path
         // populates that and not the array.
         //
         // A slot bound to a RESOLVE SNAPSHOT has no CPU payload at all, so
         // filling only from d.pixelTextures left those slots at zero -- the same
-        // defect surviving in the one case that never carries a payload. That is
+        // defect surviving in the one case that never carries a payload, and
         // what the menu rider looks like: its material samples the scene
-        // composite at s13, that slot is a snapshot, and an unnormalized fetch
-        // times zero reads texel (0,0) and paints it flat over 21753 indices.
+        // composite at s13, that slot is a snapshot, and the fetch reads texel
+        // (0,0) flat over 21753 indices.
         //
         // .z is the LAYER COUNT, not a reciprocal, and the one component that
         // scales up: a 3D/stacked fetch with normalized coordinates delivers W
@@ -3223,27 +3092,25 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
         //
         // SNAPSHOT FIRST, because that is the order the DESCRIPTOR uses --
         // BindTranslatedTextures tests stageSampledObjects[i] before anything
-        // else. This fill used to test the payload first, so a snapshot slot
-        // could be NORMALIZED by a different texture's extent.
+        // else -- and testing the payload first let a snapshot slot be
+        // NORMALIZED by a different texture's extent.
         //
         // The shadowing texture is usually `d.texture`, NOT d.pixelTextures[s],
         // and that distinction cost a revert: inside ResolvePixelSlotTexture the
-        // object and payload outputs are mutually exclusive, so "slot has both"
-        // looks impossible and a census keyed on d.pixelTextures[s] reads a
-        // structural ZERO. `d.texture` is a SEPARATE field with its own
-        // producer, and slot 0 falls back to it.
+        // object and payload outputs are mutually exclusive, so a census keyed
+        // on d.pixelTextures[s] reads a structural ZERO.
         for (uint32_t s = 0; s < kTranslatedSamplerSlots; ++s) {
           uint32_t w = 0, h = 0, layers = 0;
           // .w of xe_texinv is the guest's per-texture LOD BIAS, in LOD units.
           // See HleTexturePayload::lod_bias for why it matters.
           //
-          // SET ONLY ON THE NON-SNAPSHOT PATH, and that is not a detail. The
-          // first cut resolved the bias from d.pixelTextures[s] for EVERY slot,
-          // including snapshot slots -- where a shadowing payload routinely
-          // exists and describes a DIFFERENT texture. That is exactly
-          // texinv-shadowed-by-payload, the defect fixed at the top of this same
-          // file, reintroduced one field over. A snapshot has no fetch constant
-          // behind it, so 0.0 is both correct and what it had before.
+          // SET ONLY ON THE NON-SNAPSHOT PATH, and that is not a detail:
+          // resolving the bias from d.pixelTextures[s] for EVERY slot includes
+          // snapshot slots, where a shadowing payload routinely exists and
+          // describes a DIFFERENT texture. That is texinv-shadowed-by-payload,
+          // the defect fixed at the top of this same file, reintroduced one
+          // field over. A snapshot has no fetch constant behind it, so 0.0 is
+          // correct.
           float lodBias = 0.0f;
           const uint32_t object =
               s < d.pixelSampledObjects.size() ? d.pixelSampledObjects[s] : 0;
@@ -3252,9 +3119,9 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
             if (snap != m_gameSnapshots.end()) {
               w = snap->second.width;
               h = snap->second.height;
-              // What the OLD ordering would have used instead. Counted only
-              // when the extents actually DIFFER -- a shadowing texture that
-              // happens to match normalized correctly by accident. Includes the
+              // What the OLD ordering would have used instead. Counted only when
+              // the extents actually DIFFER -- a shadowing texture that happens
+              // to match normalized correctly by accident. Includes the
               // d.texture fallback, which is the whole point: without it this
               // reads zero while the defect is live.
               const auto& shadowed =
@@ -3280,18 +3147,16 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
           //
           // The floating-bike defect is here. A capture A/B proved the terrain
           // height-tile shader computes sample(tex3) * 4 - 2, so a slot that
-          // samples BLACK subtracts exactly 2.008 from every height in the tile.
-          //
-          // The two captures differ in exactly one thing: xe_texinv[3].z, 1 in
-          // the good run and 0 in the bad one. Only the payload branch sets .z,
-          // so .z == 0 means the slot took the SNAPSHOT branch -- same
+          // samples BLACK subtracts exactly 2.008 from every height in the tile,
+          // and the two captures differ in exactly one thing: xe_texinv[3].z, 1
+          // in the good run and 0 in the bad one. Only the payload branch sets
+          // .z, so .z == 0 means the slot took the SNAPSHOT branch -- same
           // 2048x2048 texture, resolved two mutually exclusive ways.
           //
           // So this counts, per slot: snapshot-with-a-resource, snapshot whose
           // object has NO entry in the map (the case that samples black), and
           // payload. A slot that flips between columns run to run is the defect;
-          // a slot that sits in one is fine. Per slot rather than totalled,
-          // because a total cannot show a flip in slot 3 against 15 stable slots.
+          // a total cannot show a flip in slot 3 against 15 stable slots.
           {
             const uint32_t kind = !object ? 2u : (w && h ? 0u : 1u);
             const uint32_t si = s < kTranslatedSamplerSlots ? s : 0;
@@ -3300,15 +3165,14 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
             // produced "slot 3: snap 3926, NO-MAP 37, payload 194649", which
             // cannot say whether those 37 were the draws that matter. The
             // terrain height tile is a 129x129 target and nothing else in the
-            // frame is. 37 NO-MAP out of 198k draws is noise; 37 out of ~40
+            // frame is: 37 NO-MAP out of 198k draws is noise, 37 out of ~40
             // height tiles is the entire defect.
             if (d.targetWidth == 129 && d.targetHeight == 129) {
               ++m_texSlotPathTile[si][kind];
               // Name the object on the slot that matters. Recorded for BOTH
               // object outcomes -- with a snapshot entry and without -- because
               // the dominant case turned out to be "has a resource and it is
-              // black", not "no entry", and a probe that only logged the
-              // missing case would have reported nothing at all.
+              // black", not "no entry".
               if (si == 3 && object) {
                 uint32_t k = 0;
                 for (; k < m_tileSlot3Count; ++k)
@@ -3344,10 +3208,9 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
         // shader must expand [0,1] to [-1,1]. The shader pairs it with an offset
         // of 1-scale, so 1.0 is the identity.
         //
-        // Written for EVERY slot and component, unconditionally. The buffer was
+        // Written for EVERY slot and component, unconditionally: the buffer was
         // memset to zero above, and a zero scale here does not mean "unsigned",
-        // it means the fetch becomes v*0 + 1 -- every texture sampling as solid
-        // white.
+        // it means the fetch becomes v*0 + 1 -- solid white.
         for (uint32_t s = 0; s < kTranslatedSamplerSlots; ++s) {
           const uint8_t signs = d.pixelSamplerSigns[s];
           const float sc[4] = {
@@ -3373,12 +3236,10 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                     pg, sizeof(pg));
         // xe_alphatest follows xe_param_gen. RB_COLORCONTROL is decoded here
         // rather than in the shader so the shader carries no knowledge of the
-        // register layout, and so a wrong bit assignment is one edit away from
-        // the comment that justifies it (hle_types.h, DrawCall::colour_control).
-        //
-        // The reference is passed as raw bits through a uint4 rather than
-        // converted: it is a float, and rounding it through an integer member
-        // would quietly move every threshold.
+        // register layout (hle_types.h, DrawCall::colour_control). The reference
+        // is passed as raw bits through a uint4 rather than converted: it is a
+        // float, and rounding it through an integer member would quietly move
+        // every threshold.
         uint32_t refBits = 0;
         std::memcpy(&refBits, &d.alphaRef, 4);
         const uint32_t at[4] = {d.alphaControl & 7u,
@@ -3392,8 +3253,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
         // ONLY these two. Format 7 (k_16_16_16_16_FLOAT) is a genuine half float
         // and shares R16G16B16A16_FLOAT with format 5, so scaling it too would
         // divide a correct HDR buffer by 32. The guest nibble is the only thing
-        // that separates them, which is why it is carried per draw rather than
-        // inferred from the host format.
+        // that separates them, which is why it is carried per draw.
         //
         // This USED to write 1/32, which was half of Xenia's hack -- and the
         // half that does not apply to us. Xenia biases the write down by 5
@@ -3401,16 +3261,8 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
         // -32...32, and pairs that with the exact inverse at resolve. We map
         // both formats to a HALF FLOAT target, which holds the whole range, so
         // the divide had no counterpart and every consumer of a fixed-point
-        // target read values 32x too small. On console the round trip is
-        // identity.
-        //
-        // Measured: the deferred light accumulation buffer is guest format 5,
-        // and the bike accumulated 0.0016 of light against an ambient of
-        // 0.00065 -- the whole deferred chain ran a factor of 32 down.
-        //
-        // Kept as a named flag and still counted, because the population is not
-        // marginal (262,970 draws in a menu run) and a regression here needs to
-        // be attributable.
+        // target read values 32x too small: the deferred light accumulation
+        // buffer is guest format 5, and the whole deferred chain ran 32x down.
         const bool fixed16 =
             d.targetColorFormat == 4u || d.targetColorFormat == 5u;
         // .y and .z carry the range the GUEST format can represent, and are 0
@@ -3431,22 +3283,15 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
         const float cs[4] = {1.0f,
                              float7e3 ? 31.875f : 0.0f,
                              float7e3 ? 1.0f : 0.0f, 0.0f};
-        // NOT A GUARD, and removed from the census. It read 24.7% freeroam /
-        // 24.3% menu -- the top entry -- and does not belong there at all.
-        //
-        // docs/strict_mode.md classifies by what a thing DOES: class A refuses
-        // to act on bad input and models reality; class B manufactures a value
-        // we do not have. This is neither. It applies the GUEST FORMAT'S OWN
-        // RANGE -- a 7e3 target physically cannot store a negative or a value at
-        // or above 32, so clamping is what the hardware storage does, exactly as
-        // formats 0/1/2/10 get for free from their UNORM host formats. We do it
-        // in the shader only because our half-float target would otherwise keep
-        // values the guest buffer never could.
-        //
-        // So 24.7% is not a guard rate, it is the share of draws that render to
-        // a 7e3 target. Leaving it in the census would have made correct format
-        // modelling look like the largest source of invented output in the
-        // renderer. m_float7e3Clamped still counts it, on the format line.
+        // NOT A GUARD, and removed from the census, where it read 24.7% and was
+        // the top entry. docs/strict_mode.md classifies by what a thing DOES:
+        // class A refuses to act on bad input, class B manufactures a value we
+        // do not have. This is neither -- it applies the GUEST FORMAT'S OWN
+        // RANGE, since a 7e3 target physically cannot store a negative or a
+        // value at or above 32, exactly as formats 0/1/2/10 get for free from
+        // their UNORM host formats. So 24.7% is the share of draws that render
+        // to a 7e3 target, not a guard rate. m_float7e3Clamped still counts it,
+        // on the format line.
         if (float7e3) ++m_float7e3Clamped;
         std::memcpy(static_cast<uint8_t*>(p) + bankBytes + texInvBytes +
                         texSignBytes + paramGenBytes + alphaTestBytes,
@@ -3469,8 +3314,7 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   // The guest's own vertex shader, on the GPU. Only offered for a draw whose
   // pixel shader also translated -- the hooks side enforces that, and it is
   // re-checked here through `d.translated` because the two conditions are
-  // decided in different processes' worth of code and a mismatch would show up
-  // as geometry rather than as a message.
+  // decided in different processes' worth of code.
   //
   // Everything the CPU path derives on the side is REPLACED rather than lost:
   // the position buffer is what this stage produces, the interpolator copy is
@@ -3481,14 +3325,11 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
     // only) uint4 xe_vf[kMaxVertexFetches], float4 xe_texsign[slots] and float4
     // xe_ndc_offset. The buffer has to cover ALL of it: the shader declares
     // every member unconditionally, so anything left out of the size is a read
-    // past the end of the resource.
-    //
-    // Sized for the fetch variant unconditionally -- the tail is zeroed either
-    // way and 512 spare bytes per draw is not worth a second size.
+    // past the end of the resource. Sized for the fetch variant unconditionally
+    // -- the tail is zeroed either way.
     //
     // xe_texsign and xe_ndc_offset are LAST on purpose: the renderer writes
-    // xe_vf at a fixed offset computed from the two members before it, so
-    // appending is the only way to add here without moving that.
+    // xe_vf at a fixed offset computed from the two members before it.
     const uint32_t vsConstBytes =
         ((vertexStage->constDwords * 4 + kTranslatedSamplerSlots * 16 +
           mx::hle::HlslShader::kMaxVertexFetches * 16 +
@@ -3569,17 +3410,16 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   d.destBlend = destBlend;
   d.blendOp = blendOp;
   d.cullMode = cullMode;
-  // Bit 0 has PA_SU_VTX_CNTL::PIX_CENTER's meaning -- 0 is Direct3D 9 centres
-  // at .0 and needs the offset, 1 is the host's own .5 and does not -- but the
-  // value is assumed rather than read: the register is not locatable and this
-  // is a D3D9 title, so 0 is what it would hold. Keeping the
-  // decode identical means the register drops straight in when it is found.
+  // Bit 0 has PA_SU_VTX_CNTL::PIX_CENTER's meaning -- 0 is Direct3D 9 centres at
+  // .0 and needs the offset, 1 is the host's own .5 and does not -- but the
+  // value is assumed rather than read: the register is not locatable and this is
+  // a D3D9 title, so 0 is what it would hold. Keeping the decode identical means
+  // the register drops straight in when it is found.
   d.edramCopy = edramCopy;
   // Interned HERE rather than at draw time: StencilIndexFor mutates the intern
   // table, and the draw loop runs on the render thread while this runs on the
-  // submitting one. Doing it at submission also means the index is fixed by the
-  // time the draw is queued, so a state that arrives later cannot renumber a
-  // draw already in the list.
+  // submitting one. Doing it at submission also fixes the index by the time the
+  // draw is queued, so a state that arrives later cannot renumber a queued draw.
   if (stencil && stencil->enable) {
     d.stencil = *stencil;
     d.stencilIndex = StencilIndexFor(*stencil);
@@ -3700,8 +3540,8 @@ bool D3D12Renderer::CreateGameRenderTargets() {
 void D3D12Renderer::PresentGameFrame() {
   if (!m_gameRT) return;
 
-  // Blit path: the finished scene lives in a guest-sized offscreen target, so
-  // it has to be scaled to the backbuffer rather than copied. m_viewport already
+  // Blit path: the finished scene lives in a guest-sized offscreen target, so it
+  // has to be scaled to the backbuffer rather than copied. m_viewport already
   // carries the pillarbox, so drawing through it puts the image in the same
   // place the copy path did.
   if (m_hasGamePipeline && m_presentVB) {
@@ -3812,8 +3652,7 @@ void D3D12Renderer::PresentGameFrame() {
   // Reverse barriers: leave m_gameRT in PIXEL_SHADER_RESOURCE so the next
   // BeginFrame's PSR→RT barrier is valid; leave backbuf in RENDER_TARGET so
   // EndFrame's RT→PRESENT barrier is valid. Previous code left m_gameRT in RT
-  // (next BeginFrame's PSR→RT would have been an invalid barrier) and backbuf
-  // in PRESENT (EndFrame's RT→PRESENT would also have been invalid).
+  // and backbuf in PRESENT, making both of those barriers invalid.
   barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
   barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
 

@@ -39,8 +39,7 @@ inline constexpr uint32_t kMaxDrawPlanes = 4;
 //
 // SHARED because it was not, and the two stages disagreed: the pixel path wrote
 // a 1-BIT-PER-COMPONENT "is biased" mask while FillVertexTextureSigns read the
-// same byte as 2 BITS PER COMPONENT, so a vertex fetch of a biased texture
-// either missed the correction or applied it to the wrong component.
+// same byte as 2 BITS PER COMPONENT.
 //
 // The value is what the shader multiplies by, with the offset implied as
 // 1-scale, EXCEPT gamma, which cannot ride a scale and uses 3.0 purely as a
@@ -82,17 +81,12 @@ class D3D12Renderer {
 // Append one translated draw to this frame's list. `mvp` is the 16-float
 // row-major transform the PM4 translator recovered; pass nullptr for identity.
 // `topology` is a D3D_PRIMITIVE_TOPOLOGY value, matching mx::hle::HostTopology.
-//
-// This replaced SetGameDrawData, which held exactly one draw -- so however many
-// draws a frame translated, at most one could ever be submitted.
+// This replaced SetGameDrawData, which held exactly one draw.
 
 // The guest vertex stage, when this draw runs it on the GPU. Grouped into a
 // struct rather than six more positional arguments to a call that already takes
-// thirty: `AddGameDraw(..., nullptr, 0, nullptr, 0, ...)` is not something a
-// reader can check.
-//
-// All-or-nothing. A null pointer, or any member missing, keeps the draw on the
-// CPU interpreter.
+// thirty. All-or-nothing: a null pointer, or any member missing, keeps the draw
+// on the CPU interpreter.
 struct GpuVertexStage {
   uint32_t handle = 0;
   std::shared_ptr<const std::string> hlsl;
@@ -129,9 +123,9 @@ struct GpuVertexStage {
   // --- textures this stage samples -----------------------------------------
   //
   // Zero for almost every draw. A vertex shader that samples is terrain
-  // displacement and similar; those used to be refused the GPU path outright
-  // and fell to an interpreter with no texture fetch at all, so their samples
-  // came back as zeros and their positions were silently wrong.
+  // displacement and similar; those used to be refused the GPU path outright and
+  // fell to an interpreter with no texture fetch at all, so their samples came
+  // back as zeros and their positions were silently wrong.
   uint32_t samplerCount = 0;
   uint32_t samplerArrayMask = 0;
   const std::shared_ptr<const mx::hle::HleTexturePayload>* textures = nullptr;
@@ -148,31 +142,23 @@ struct GpuVertexStage {
 //   bit  2    frontCounterClockwise
 //
 // Packed rather than passed as two fields because the translated path keys its
-// pipelines on a uint8_t `flags` with bits 0-4 already taken, and the stand-in
-// path keys on a variant index that must stay inside the low 8 bits. Three bits
-// fit both exactly.
+// pipelines on a uint8_t `flags` with bits 0-4 already taken and the stand-in
+// path on a variant index that must stay inside 8 bits.
 //
 // Xenos `face` is 0 for "front is CCW" and 1 for "front is CW", measured in
 // screen space with Y down -- the same convention as D3D12's
-// FrontCounterClockwise, so this is a direct mapping and not a flip. The
-// window->clip transform negates Y and D3D12's viewport transform negates it
-// back, so screen-space winding is preserved end to end.
+// FrontCounterClockwise, so this is a direct mapping and not a flip.
 //
-// cull_front AND cull_back together has no D3D12 equivalent -- the hardware
-// would draw nothing. It does not occur in this title, and mapping it to BACK
-// rather than inventing a discard keeps this a pure state translation;
-// DrawCall::pa_su_sc_mode_cntl carries the raw value if that needs revisiting.
+// cull_front AND cull_back together has no D3D12 equivalent. It does not occur
+// in this title, and mapping it to BACK keeps this a pure state translation;
+// DrawCall::pa_su_sc_mode_cntl carries the raw value.
 inline uint32_t PackCullBits(uint32_t paSuScModeCntl) {
-  // A raw 0 means the register could not be read, and must decode to exactly
-  // the state every draw had before this was plumbed: CULL_NONE with
-  // FrontCounterClockwise FALSE, i.e. packed bits 0.
-  //
-  // Not merely tidiness. Falling through would set frontIsCw false and return 4,
-  // which flips FrontCounterClockwise (and so SV_IsFrontFace, the PARAM_GEN face
-  // input the pixel stage reads) AND makes the packed bits non-zero, pushing
-  // every such draw off the 32 prebuilt m_gamePSOs onto the on-demand path.
-  // Every value this title actually programs has high bits set, so a genuine 0
-  // does not occur.
+  // A raw 0 means the register could not be read, and must decode to exactly the
+  // state every draw had before this was plumbed: CULL_NONE with
+  // FrontCounterClockwise FALSE, i.e. packed bits 0. Falling through would set
+  // frontIsCw false and return 4, flipping FrontCounterClockwise (and so
+  // SV_IsFrontFace) AND pushing every such draw off the 32 prebuilt m_gamePSOs.
+  // Every value this title actually programs has high bits set.
   if (paSuScModeCntl == 0) return 0;
   const bool cullFront = (paSuScModeCntl & 1u) != 0;
   const bool cullBack = (paSuScModeCntl & 2u) != 0;
@@ -190,16 +176,14 @@ inline void ApplyCullBits(uint32_t bits, D3D12_RASTERIZER_DESC& rs) {
   rs.FrontCounterClockwise = (bits & 4u) != 0 ? TRUE : FALSE;
 }
 
-// The guest's stencil state for one draw, already decoded.
-//
-// A STRUCT, not eleven more scalars on AddGameDraw, for the reason that
-// signature already states about the scissor: a call site reading
-// `..., 0, 0, 0, 0)` cannot be checked by eye.
+// The guest's stencil state for one draw, already decoded. A STRUCT, not eleven
+// more scalars on AddGameDraw, for the reason that signature already states
+// about the scissor.
 //
 // Guest -> D3D12 for both enums is `+ 1`, verified against the reference rather
 // than assumed (xenos.h:677 CompareFunction kNever=0..kAlways=7 against D3D12
 // NEVER=1..ALWAYS=8, and :688 StencilOp kKeep=0..kDecrementWrap=7 against D3D12
-// KEEP=1..DECR=8). Both orderings match element for element.
+// KEEP=1..DECR=8).
 struct GameStencil {
   bool enable = false;
   uint8_t readMask = 0xFF;
@@ -260,10 +244,9 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  uint32_t depthHeight = 0, uint32_t depthBase = 0,
                  uint32_t targetBase = 0, uint32_t targetColorFormat = 0,
                  // {left, top, right, bottom} in guest render-target pixels, or
-                 // null when the guest's scissor register could not be read.
-                 // One pointer rather than four more scalars, for the same
-                 // reason GpuVertexStage is a struct: a call site reading
-                 // `..., 0, 0, 0, 0)` cannot be checked by eye.
+                 // null when the guest's scissor register could not be read. One
+                 // pointer rather than four more scalars, for the same reason
+                 // GpuVertexStage is a struct.
                  const int32_t* scissor = nullptr,
                  // RB_COLORCONTROL as read from the guest's register shadow:
                  // bits 0-2 the comparison, bit 3 its enable. Zero means the
@@ -274,7 +257,7 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  // cull_front bit 0, cull_back bit 1, face bit 2 (0 = front is
                  // CCW). Zero means the register was unreadable, which decodes
                  // as CULL_NONE -- the behaviour every draw had before this was
-                 // plumbed, so an unreadable register cannot make things worse.
+                 // plumbed.
                  uint32_t cullMode = 0,
                  // PA_SU_VTX_CNTL. UINT32_MAX means the register could not be
                  // read, which leaves the draw on the pre-existing path.
@@ -292,13 +275,12 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
 
 // Append a resolve to this frame's list, in order with the draws around it.
 //
-// D3DDevice_Resolve copies a render target into a texture. It used to be
-// recorded as a relationship only, which left every draw sampling any texture
-// resolved out of a given target bound to that target's single live surface --
-// and one guest surface is a shared scratch buffer that the scene and every
-// video render into in turn (six distinct textures measured resolving from one
-// target in a single run). Ordering is the whole point: the snapshot is the
-// target's contents at this position in the frame.
+// D3DDevice_Resolve copies a render target into a texture. Recorded as a
+// relationship only, it left every draw sampling any texture resolved out of a
+// given target bound to that target's single live surface -- and one guest
+// surface is a shared scratch buffer that the scene and every video render into
+// in turn. Ordering is the whole point: the snapshot is the target's contents at
+// this position in the frame.
 //
 // SetGameDrawSecondTarget attaches MRT slot 1 to the draw AddGameDraw just
 // pushed, separate so that signature does not grow by five.
@@ -339,15 +321,11 @@ void AddGameSurface(uint32_t object, uint32_t width, uint32_t height,
 void ClearGameDraws();
 
 // Hand this tick's AddGameDraw cost to the phase breakdown reported at the end
-// of EndFrame.
-//
-// Every figure we have had about the render tick was inferred from how far apart
-// two periodic log lines landed, and two hypotheses built that way were both
-// wrong. This is the one phase the renderer cannot time for itself: the loop
-// runs in the render thread's own function, before BeginFrame is called.
-//
-// `draws` is the number of AddGameDraw calls, not the number that survived them,
-// so a per-call figure can be taken from it.
+// of EndFrame. This is the one phase the renderer cannot time for itself: the
+// loop runs in the render thread's own function, before BeginFrame is called,
+// and every earlier figure was inferred from how far apart two periodic log
+// lines landed (twice wrongly). `draws` is the number of AddGameDraw calls, not
+// the number that survived them.
 void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
 
   [[nodiscard]] ID3D12Device* GetDevice() const noexcept { return m_device.Get(); }
@@ -379,26 +357,23 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // measurement decision with a short shelf life. Uncapping Present does NOT buy
   // frames here: the render thread does ~16ms of work and then idles waiting for
   // the guest, which spends ~40-60ms per frame in the D3D9 hooks. What it does
-  // buy is tearing, since the swap chain is created with ALLOW_TEARING whenever
-  // the adapter reports it.
-  //
-  // Put it back to 1 once the guest-side cost is the thing being worked on.
+  // buy is tearing. Put it back to 1 once the guest-side cost is the subject.
   static constexpr UINT kPresentSyncInterval = 0;
   // The offscreen game depth buffer's format. Named because it has to appear in
   // three places that must agree -- the resource, its clear value, and the PSO's
   // DSVFormat -- and the PSO's copy was the one that got left out.
   //
   // D32_FLOAT_S8X24 rather than D32_FLOAT, to give the guest's stencil a plane:
-  // half of every level frame asks for stencil (141,960 of 284,794 draws, 15
-  // configurations). The depth half is deliberately UNCHANGED so this can be
-  // judged on "nothing moved". Xenia maps the guest's kD24FS8 the same way.
+  // half of every level frame asks for stencil. The depth half is deliberately
+  // UNCHANGED so this can be judged on "nothing moved". Xenia maps the guest's
+  // kD24FS8 the same way.
   static constexpr DXGI_FORMAT kGameDepthFormat =
       DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
   // A depth resource is planar and its views are not interchangeable: typeless
   // so one allocation carries both a DSV and an SRV, plus an SRV of the depth
-  // plane alone. The RESOURCE format is also the depth snapshot's, because
-  // depth resolves are a CopyTextureRegion and D3D12 wants one typeless family
-  // on both ends.
+  // plane alone. The RESOURCE format is also the depth snapshot's, because depth
+  // resolves are a CopyTextureRegion and D3D12 wants one typeless family on both
+  // ends.
   static constexpr DXGI_FORMAT kGameDepthResourceFormat =
       DXGI_FORMAT_R32G8X24_TYPELESS;
   static constexpr DXGI_FORMAT kGameDepthSrvFormat =
@@ -409,12 +384,10 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   //
   // PER-FRAME depth refresh: DEPTH ONLY, deliberately. Our first-use clear
   // exists so depth does not accumulate across frames -- that is our schedule,
-  // not the guest's, and applying it to STENCIL was wrong. The guest clears
-  // stencil at points it chooses (Flags 0x20, 0x30) and deliberately WITHHOLDS
-  // it at others (0x1F is depth with no stencil, and it issues that), so wiping
-  // the plane whenever a depth surface is first touched destroys a mask the
-  // guest built and expects to survive. Invisible until something tested the
-  // plane; it broke the TERRAIN the moment d3d9_stencil_test went live.
+  // not the guest's, and applying it to STENCIL destroys a mask the guest built
+  // and expects to survive. The guest clears stencil at points it chooses (Flags
+  // 0x20, 0x30) and deliberately WITHHOLDS it at others (0x1F). It broke the
+  // TERRAIN the moment d3d9_stencil_test went live.
   //
   // kGameDepthClearFlags below keeps BOTH planes and is for CREATION only, where
   // the stencil contents really are undefined.
@@ -434,10 +407,8 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   //   kSamplerBaseMap  mip_filter == kBaseMap: sample level 0 and never minify
   //                    past it, pinning MaxLOD back to MinLOD.
   //   kSamplerMipPoint mip_filter == kPoint: nearest level rather than blending
-  //                    two. 3,455 of 8,990 chains in one freeroam run -- 38%,
-  //                    which is why it is a variant bit and not a rounding
-  //                    error. Only meaningful where a chain exists, so it is set
-  //                    only then.
+  //                    two -- 38% of chains in one freeroam run. Only meaningful
+  //                    where a chain exists, so it is set only then.
   static constexpr uint32_t kSamplerClampU = 1;
   static constexpr uint32_t kSamplerClampV = 2;
   static constexpr uint32_t kSamplerPoint = 4;
@@ -452,12 +423,9 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // signature's sampler range is that wide and a table must be contiguous.
   //
   // The two used to share one width, which worked only while the variants
-  // happened to fit in a block. The fifth variant bit broke that tie, so they
-  // are sized independently: 32 + 16 * 126 is still exactly 2048, and no run has
-  // ever used more than 24 blocks.
-  //
-  // Blocks are CACHED by their slot configuration rather than allocated per
-  // draw: this game uses a handful of distinct ones.
+  // happened to fit in a block. They are sized independently now: 32 + 16 * 126
+  // is still exactly 2048, and no run has ever used more than 24 blocks. Blocks
+  // are CACHED by their slot configuration rather than allocated per draw.
   static constexpr uint32_t kSamplerBlockSlots = 16;
   static constexpr uint32_t kSamplerReservedSlots = kSamplerVariantCount;
   static constexpr uint32_t kSamplerBlockCount = 126;
@@ -479,8 +447,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // PresentGameFrame, so nothing outside this class should ever invoke them:
   // PresentGameFrame's barriers are directional and a second call declares a
   // StateBefore the first one already moved away from. These were public, and
-  // the render thread was calling both a second time between BeginFrame and
-  // EndFrame.
+  // the render thread was calling both a second time.
   void RenderGameFrame();
   void PresentGameFrame();
 
@@ -509,10 +476,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // into the four descriptors reserved at the head of the heap. Separate from
   // EnsureGameTexture because these planes are new content every video frame:
   // the keyed cache would grow without bound, and the descriptor heap with it.
-  //
-  // Returns the descriptor index the draw's table must point at. That block is
-  // per frame-in-flight and per composite draw, and never reused inside the
-  // window the GPU may still be reading.
+  // Returns the descriptor index the draw's table must point at.
   struct GameDraw;
   bool EnsureYuvPlanes(const GameDraw& draw, uint32_t& descriptorBase);
   bool EnsureGameTexture(const std::shared_ptr<const mx::hle::HleTexturePayload>& texture,
@@ -525,9 +489,9 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
 
   // What distinguishes one pooled offscreen surface from another. Everything
   // else about creating one — the heap properties, the resource desc, claiming
-  // an SRV descriptor only AFTER the resource exists, and building the view —
-  // is identical for colour targets, resolve snapshots and depth surfaces, and
-  // had grown two verbatim copies before this was extracted.
+  // an SRV descriptor only AFTER the resource exists, and building the view — is
+  // identical for colour targets, resolve snapshots and depth surfaces, and had
+  // grown two verbatim copies before this was extracted.
   struct PooledSurfaceSpec {
     DXGI_FORMAT resourceFormat = kBackBufferFormat;
     // Separate from the resource format so a depth surface can be created
@@ -553,11 +517,9 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   void RetireResource(Microsoft::WRL::ComPtr<ID3D12Resource>&& res);
   // Drop resolve snapshots that nothing has sampled for a long time, returning
   // their SRV slots to the free list. m_gameSnapshots is keyed by GUEST OBJECT
-  // ADDRESS and had no eviction at all. Across a map unload the guest frees
-  // those textures and allocates the next map's at different addresses, so every
-  // previous map's snapshots stayed resident forever -- four loads reached 108 of
-  // 128 live with 17540 budget refusals and 49162 draws left with no snapshot to
-  // bind, which is the missing water and the unlit terrain wedge.
+  // ADDRESS and had no eviction at all, so across a map unload every previous
+  // map's snapshots stayed resident forever -- four loads reached 108 of 128 live
+  // with 17540 budget refusals and 49162 draws left with no snapshot to bind.
   //
   // Returns how many entries it freed, so the caller can tell an ordinary no-op
   // sweep from one that failed at the hard cap.
@@ -565,8 +527,8 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // The same reclamation for offscreen colour targets, which had the same
   // defect: keyed by guest object address, and the code said outright that it
   // "is never evicted, so once this trips it stays tripped". After a few map
-  // loads it sat at 256/256 with 4845 budget refusals and 1730 draws OVERPAINTING
-  // the main scene -- the exact failure offscreen routing exists to prevent.
+  // loads it sat at 256/256 with 1730 draws OVERPAINTING the main scene -- the
+  // exact failure offscreen routing exists to prevent.
   uint32_t EvictGameRenderTargets();
 
   void WaitForGpu();
@@ -610,14 +572,13 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, 32> m_gamePSOs;
   // The same 32 opaque variants for a NON-RGBA8 render target, built on demand
   // and keyed (format << 8) | variant. The guest's HDR chain -- the 320x180 and
-  // 160x90 luminance targets are k_2_10_10_10_FLOAT, the reduction down to 1x1
-  // is k_16_16_FLOAT -- cannot be drawn by a pipeline that declares RGBA8, and
+  // 160x90 luminance targets are k_2_10_10_10_FLOAT, the reduction to 1x1 is
+  // k_16_16_FLOAT -- cannot be drawn by a pipeline that declares RGBA8, and
   // drawing it into an RGBA8 surface clamped the log-average to [0,1].
   //
   // m_stencilStates interns distinct stencil states. Index 0 is always "no
   // stencil", so a zero index needs no lookup and every pre-stencil call site
-  // keeps its meaning. Bounded by what the guest programs -- the census says 18
-  // configurations, of which those differing only in ref collapse.
+  // keeps its meaning.
   std::vector<GameStencil> m_stencilStates{GameStencil{}};
   std::unordered_map<uint64_t, uint32_t> m_stencilStateIndex;
   // Intern a stencil state and return its dense index. 0 for disabled.
@@ -655,12 +616,10 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // ColorRenderTargetFormat (RB_COLOR_INFO bits [16:19]).
   static DXGI_FORMAT HostColorFormat(uint32_t guestColorFormat);
 
-  // Blended draws, built on demand and keyed by the state they need.
-  //
-  // Not more bits in the array above: src factor, dest factor and op are three
-  // guest enums, and enumerating their product up front would be thousands of
-  // pipelines to cover the handful a frame uses. Blend modes repeat heavily
-  // within a frame, so a cache converges after the first few.
+  // Blended draws, built on demand and keyed by the state they need. Not more
+  // bits in the array above: src factor, dest factor and op are three guest
+  // enums, and enumerating their product up front would be thousands of
+  // pipelines to cover the handful a frame uses.
   struct BlendKey {
     uint32_t pso_index = 0;   // the five bits above
     uint32_t src = 0;         // D3DBLEND
@@ -715,12 +674,10 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   //
   // A guest pixel shader that EmitShaderHlsl accepted arrives on the draw as
   // HLSL source, compiled and turned into a pipeline once per shader handle and
-  // cached here -- a frame issues ~158 draws across a few dozen shaders.
-  //
-  // Deliberately a SEPARATE root signature from m_gameRootSig. The emitted
-  // shaders declare their own resource layout -- a constant bank at b1 and one
-  // texture/sampler pair per guest sampler slot -- which does not fit the
-  // stand-in pipeline's four-plane table.
+  // cached here. Deliberately a SEPARATE root signature from m_gameRootSig: the
+  // emitted shaders declare their own resource layout -- a constant bank at b1
+  // and one texture/sampler pair per guest sampler slot -- which does not fit
+  // the stand-in pipeline's four-plane table.
   //=========================================================================
   // kTranslatedSamplerSlots is the width of the translated pipeline's texture
   // and sampler tables. Must equal mx::hle::HlslShader::kMaxSamplerSlots: the
@@ -732,7 +689,6 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // precisely so this stays narrow -- binding at the guest index would make a
   // 14-fetch shader's s8-s12 need a thirteen-wide table to deliver five
   // textures, and one block that size per draw exhausts the heap within a frame.
-  // Every block costs this many descriptors, so it multiplies into the heap size.
   static constexpr uint32_t kTranslatedSamplerSlots = 16;
   static_assert(kTranslatedSamplerSlots == kSamplerBlockSlots,
                 "one sampler per texture slot, in one contiguous table");
@@ -740,20 +696,16 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // the emitted pixel shader declares its input struct with that many
   // interpolators, and a vertex stage offering a different count produces two
   // signatures that cannot link -- CreateGraphicsPipelineState then fails with
-  // no message at all, which is exactly how this first went wrong.
-  //
-  // Restated rather than included: this header deliberately does not include the
-  // hle headers. d3d12_game.cpp static_asserts that the two agree.
+  // no message at all. Restated rather than included, because this header
+  // deliberately does not include the hle headers; d3d12_game.cpp static_asserts
+  // that the two agree.
   static constexpr uint32_t kTranslatedInterpolators = 8;
-  // Bounded for the same reason as m_blendPSOs: a shader set that grew without
-  // limit would otherwise grow this without limit.
-  //
-  // The bound was 256 and was never sized against a loaded level. The menu and
-  // intro fit inside it, freeroam does not: the 256th pipeline is built at level
-  // load, and from that instant every draw whose key is new falls back to the
-  // stand-in -- 331,785 of 1,312,382 draws, 25% of the level, drawn flat for the
-  // rest of the run. That is not a memory bound doing its job, it is a silent
-  // 25% correctness hole that looks exactly like "assets are not loading".
+  // Bounded for the same reason as m_blendPSOs. The bound was 256 and was never
+  // sized against a loaded level: the menu and intro fit inside it, freeroam
+  // does not, so the 256th pipeline is built at level load and from that instant
+  // every draw whose key is new falls back to the stand-in -- 331,785 of
+  // 1,312,382 draws drawn flat for the rest of the run, which looks exactly like
+  // "assets are not loading".
   //
   // The key is (ps handle, vs handle, blend src/dest/op, flags, rtv format,
   // topology), so the working set is a shader set times its output-merger
@@ -767,11 +719,9 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     bool failed = false;  // compiled or created badly; do not retry every draw
   };
   // Keyed on the shader AND the output-merger state, not the shader alone.
-  //
-  // Keying on the shader alone is what turned every translated overlay into an
-  // opaque rectangle: the pipeline was built with the default blend state, so a
-  // blended draw -- text, UI, anything alpha -- painted its whole quad. The
-  // stand-in path has always honoured this state via BlendedPSO.
+  // Keying on the shader alone turned every translated overlay into an opaque
+  // rectangle: the pipeline was built with the default blend state, so a blended
+  // draw -- text, UI, anything alpha -- painted its whole quad.
   struct TranslatedKey {
     uint32_t handle = 0;
     // The guest vertex shader paired with it, or 0 for the passthrough stage
@@ -860,10 +810,9 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
 
   // Draws whose guest scissor actually clips something, and draws whose scissor
   // register could not be read. `clipped` at zero means honouring the scissor
-  // changed nothing on screen -- a finding, not a silence, so it is reported
-  // either way. `unreadable` must stay at zero: a draw with no readable scissor
-  // is drawn unclipped, which is the old behaviour and the bug this pair exists
-  // to detect the return of.
+  // changed nothing on screen -- a finding, not a silence. `unreadable` must stay
+  // at zero: a draw with no readable scissor is drawn unclipped, which is the
+  // old behaviour and the bug this pair exists to detect the return of.
   uint64_t m_scissorClipped = 0;
   uint64_t m_scissorUnreadable = 0;
 
@@ -881,32 +830,24 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // [f*m_translatedBlocksPerFrame, (f+1)*m_translatedBlocksPerFrame). The ring
   // used to be one shared range reset in ClearGameDraws, which runs only when
   // the guest hands off a new draw list -- while blocks are consumed by
-  // RenderGameFrame, which runs every HOST frame and replays the previous list.
-  // Blocks accumulated across every replay, exhausting 2048 after roughly
-  // sixteen frames. Slicing per frame lets the window reset every host frame
-  // while still only rewriting blocks the GPU finished with kFrameCount frames
-  // ago.
+  // RenderGameFrame, which runs every HOST frame and replays the previous list,
+  // so blocks accumulated across every replay.
   //
-  // SIZED AT RUNTIME FROM THE DEVICE'S RESOURCE BINDING TIER, because the old
-  // fixed 3072 was not enough and the reason it looked like enough is
-  // instructive. Its justification -- "eight times the measured per-frame demand
-  // of ~125" -- was measured on a MENU frame. Freeroam submits 699-839 guest
-  // draws a frame and the vertex and pixel stages claim a block EACH, so demand
-  // is the same order as the per-frame slice. The ring then survives some frames
-  // and not others, and every draw after it runs dry falls to the stand-in; the
-  // UI is drawn last, so the UI is what strobes.
-  //
-  // The 3072 was pinned by assuming Resource Binding Tier 1, whose
-  // shader-visible heap caps at 65536 descriptors. That assumption is what
-  // actually cost us: Tier 2 and Tier 3 raise the cap to about a million, and
-  // Tier 1 hardware predates anything this port targets. kMaxTranslatedBlocksTier1
-  // is retained as the floor for a device that really does report Tier 1.
+  // SIZED AT RUNTIME FROM THE DEVICE'S RESOURCE BINDING TIER. The old fixed 3072
+  // was justified as "eight times the measured per-frame demand of ~125" --
+  // measured on a MENU frame. Freeroam submits 699-839 guest draws a frame and
+  // the vertex and pixel stages claim a block EACH, so demand is the same order
+  // as the per-frame slice: the ring survives some frames and not others, and
+  // the UI is drawn last, so the UI is what strobes. The 3072 also assumed
+  // Resource Binding Tier 1, whose heap caps at 65536 descriptors; Tier 2 and 3
+  // raise that to about a million, and Tier 1 hardware predates anything this
+  // port targets. kMaxTranslatedBlocksTier1 remains the floor for a device that
+  // really does report Tier 1.
   static constexpr uint32_t kMaxTranslatedBlocksTier1 = 3072;
   // What Tier 2+ gets. 24576 * 16 = 393216 descriptors, comfortably inside the
   // ~1,000,000 those tiers allow, and 8192 blocks per frame in flight against a
-  // measured freeroam demand under 1700. Descriptors cost 32 bytes each here, so
-  // this is ~12 MB of descriptor heap, which is not a meaningful budget item
-  // next to the render targets.
+  // measured freeroam demand under 1700. At 32 bytes each that is ~12 MB of
+  // descriptor heap.
   static constexpr uint32_t kMaxTranslatedBlocksTier2 = 24576;
   // Resolved in CreateTranslatedRootSignature, before the heap is created.
   uint32_t m_maxTranslatedBlocks = kMaxTranslatedBlocksTier1;
@@ -939,8 +880,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   //
   // FillVertexTexinv writes xe_texsign for the VERTEX stage into the tail of its
   // constant buffer, defaulting to 1.0 rather than the surrounding memset's 0,
-  // which the shader would apply as "sample becomes constant white". Not static:
-  // it resolves snapshot extents through m_gameSnapshots.
+  // which the shader would apply as "sample becomes constant white".
   void FillVertexTexinv(const GameDraw& d, uint8_t* cb, uint32_t cbBytes,
                         uint32_t constDwords);
   // The D3D9 half-pixel correction, as an NDC offset on the vertex
@@ -955,13 +895,11 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
                               D3D12_GPU_DESCRIPTOR_HANDLE& out,
                               bool vertex = false);
   // Points `out` at a block holding one sampler per texture slot, matching the
-  // per-slot filter and address mode the guest asked for.
-  //
-  // The translated root signature's sampler range has always been
-  // kTranslatedSamplerSlots wide, but the bind pointed at a four-descriptor heap
-  // offset by a single per-draw variant index -- so slot 1 of any multi-sampler
-  // shader read the next variant along, and slot 4 onwards read off the end of
-  // the heap entirely.
+  // per-slot filter and address mode the guest asked for. The translated root
+  // signature's sampler range has always been kTranslatedSamplerSlots wide, but
+  // the bind pointed at a four-descriptor heap offset by a single per-draw
+  // variant index -- so slot 1 of any multi-sampler shader read the next variant
+  // along, and slot 4 onwards read off the end of the heap.
   bool BindTranslatedSamplers(const GameDraw& d,
                               D3D12_GPU_DESCRIPTOR_HANDLE& out,
                               bool vertex = false);
@@ -969,38 +907,32 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // descriptor tables could not both be bound.
   uint64_t m_vertexSampledDraws = 0;
   uint64_t m_vertexSampleBindFailed = 0;
-  // Sampler blocks, keyed by their slot configuration. Distinct configurations,
-  // not draws: the cache is what keeps 16-wide blocks inside a 2048-descriptor
-  // heap.
+  // Sampler blocks, keyed by their slot configuration -- distinct
+  // configurations, not draws, which is what keeps 16-wide blocks inside a
+  // 2048-descriptor heap.
   //
-  // The key is the variants themselves rather than a packing of them. It was
-  // three bits per slot in a uint64_t, which stopped fitting at five bits across
-  // sixteen slots. Hashing them down would have reintroduced the possibility of
-  // two configurations colliding onto one block -- silently giving a draw
-  // someone else's filter -- so the whole tuple is the key.
+  // The key is the variants themselves rather than a packing of them: three bits
+  // per slot in a uint64_t stopped fitting at five bits across sixteen slots,
+  // and hashing them down would reintroduce the possibility of two
+  // configurations colliding onto one block.
   std::map<std::array<uint8_t, kSamplerBlockSlots>, uint32_t> m_samplerBlocks;
   uint32_t m_samplerBlockNext = 0;
   uint64_t m_samplerBlockExhausted = 0;
 
   // SNAPSHOT SLOT FILTERING, counted because the code path that decides it has a
   // documented failure mode and no measurement of whether it fires.
-  //
   // BindTranslatedSamplers takes POINT for a snapshot slot in two very different
   // cases: the guest asked for it (bit 14), or the sampler word was never
-  // written at all (bit 15 clear), which is what the PARTIAL-snapshot binds used
-  // to do. The second is a silent defect -- the terrain tile atlas is sampled
-  // minified, and nearest-neighbour on a 2048x2048 atlas is hard corduroy
-  // aliasing across every dune.
-  //
-  // Counted on EVERY snapshot slot bind so the denominator is structural:
-  // `no-word 0` and `never asked` must not look alike.
+  // written at all (bit 15 clear). The second is a silent defect -- the terrain
+  // tile atlas is sampled minified, and nearest-neighbour on a 2048x2048 atlas
+  // is hard corduroy aliasing. Counted on EVERY snapshot slot bind so the
+  // denominator is structural.
   //
   // PER-CHUNK CLIPMAP LEVEL. Which 129x129 height snapshot each terrain chunk
   // binds at vertex slot 0 -- that object IS the clipmap level, and adjacent
   // chunks landing on different levels is the standing explanation for the seams
   // in the terrain normal buffer. The SLOT CENSUS cannot answer this: it fires
   // ONCE PER SHADER HANDLE, and every terrain chunk runs the same vertex shader.
-  // Capped, because the objects are per-frame allocations.
   static constexpr size_t kClipmapCensusCap = 64;
   std::map<uint32_t, uint64_t> m_clipmapLevelDraws;
   uint64_t m_clipmapDraws = 0;
@@ -1020,11 +952,8 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // offscreen targets, the final scene is 1280x720 and the backbuffer is
   // window-sized, so PresentGameFrame can no longer be a CopyTextureRegion --
   // that requires matching dimensions. It becomes a fullscreen triangle drawn
-  // through the ordinary game pipeline, which is already a textured-quad
-  // pipeline with an MVP root CBV and an SRV at t0.
-  //
-  // Three vertices, not four: a triangle that overhangs the viewport covers it
-  // with no seam down the diagonal.
+  // through the ordinary game pipeline. Three vertices, not four: a triangle
+  // that overhangs the viewport covers it with no seam down the diagonal.
   Microsoft::WRL::ComPtr<ID3D12Resource> m_presentVB;
   D3D12_VERTEX_BUFFER_VIEW m_presentVbv = {};
   // The final full-backbuffer colour resolve before VdSwap is the guest's
@@ -1050,11 +979,11 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // out of their own buffer, so they cannot share one.
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kFrameCount> upload;
     uint32_t descriptorIndex = 0;
-    // The payload upload_version this resource was last filled from -- a hash
-    // of the decoded bytes, not the guest-memory sample content_version holds.
-    // A mismatch means the guest rewrote the texture under a stable key and the
-    // resource is showing stale bytes -- see HleTexturePayload::upload_version
-    // for why the two cannot be the same field.
+    // The payload upload_version this resource was last filled from -- a hash of
+    // the decoded bytes, not the guest-memory sample content_version holds. A
+    // mismatch means the guest rewrote the texture under a stable key and the
+    // resource is showing stale bytes; see HleTexturePayload::upload_version for
+    // why the two cannot be the same field.
     uint32_t uploadedVersion = 0;
     // m_fenceValue when this texture was last bound. The LRU stamp for
     // eviction, and the guard that stops a texture in use by the frame being
@@ -1064,8 +993,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // Every surface object ever seen as a resolve source, and ever sampled by a
   // later draw. Historical rather than per frame because the offscreen routing
   // decision is taken when a surface is drawn into, which is usually an earlier
-  // frame than the resolve or sample that proves it needed the storage. See the
-  // note at the top of the draw loop.
+  // frame than the resolve or sample that proves it needed the storage.
   std::unordered_set<uint32_t> m_everResolveSource;
   std::unordered_set<uint32_t> m_everSampledTarget;
   // Every object ever named as a draw's render target. A resolve source that
@@ -1081,21 +1009,17 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   uint64_t m_standInNoHlsl = 0;
   uint64_t m_standInNoHandle = 0;
   // WHAT the no-handle draws are, keyed (vertexShaderHandle << 32 | indexCount).
-  //
   // The count on its own says a population exists and nothing about it, and that
   // population is the last unexplained one in the frame: a draw with no pixel
   // shader that still writes colour. Keyed by vertex shader AND index count
-  // because either alone merges unrelated draws -- and the vertex handle can be
-  // matched against logs/hlsldump to say what the geometry is.
-  //
-  // Handles are addresses and vary per run, so this is only readable WITHIN a
-  // run. Do not compare these keys across logs.
+  // because either alone merges unrelated draws, and the vertex handle can be
+  // matched against logs/hlsldump. Handles are addresses and vary per run, so
+  // this is only readable WITHIN a run.
   std::map<uint64_t, uint64_t> m_standInNoHandleBy;
-  // ...of which carry YUV planes, i.e. ARE the Bink composite and render
-  // through BindYuvPlanes rather than painting a stand-in colour. If this
-  // equals m_standInNoHandle the whole population is video and nothing in it is
-  // a lost draw. Counted rather than inferred from "they are all 4-index
-  // quads", which is a resemblance and not a measurement.
+  // ...of which carry YUV planes, i.e. ARE the Bink composite and render through
+  // BindYuvPlanes rather than painting a stand-in colour. If this equals
+  // m_standInNoHandle the whole population is video and nothing in it is a lost
+  // draw. Counted rather than inferred from "they are all 4-index quads".
   uint64_t m_standInNoHandlePlanes = 0;
   // EnsureYuvPlanes' three refusals. All were bare `return false` -- a composite
   // draw dropped there produces no video and no evidence, the same symptom as
@@ -1104,13 +1028,13 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // EDRAM ALIASING. How often several guest OBJECTS name one EDRAM allocation.
   // Measured because it is the mechanism behind the missing videos: the Bink
   // composites draw into object 0x2175DC60 while the 1280x430 resolve reads out
-  // of 0x2123C1D8, and both are 1280x720 at base 0x2D0. We key host surfaces by
-  // object, so the resolve copies a surface the video was never drawn into.
+  // of 0x2123C1D8, and both are 1280x720 at base 0x2D0, so the resolve copies a
+  // surface the video was never drawn into.
   //
-  // The counters exist to size the fix before writing it. The bounded repair --
+  // The counters exist to size the fix before writing it: the bounded repair --
   // copy the previous owner's contents forward when a new object takes over a
-  // base -- only works for a takeover at the SAME EXTENT, and only needs a
-  // format conversion when the formats differ, so those two cases are split out.
+  // base -- only works at the SAME EXTENT, and only needs a format conversion
+  // when the formats differ.
   struct EdramOwner {
     uint32_t object = 0;
     uint32_t width = 0;
@@ -1131,7 +1055,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // physical memory, so the new owner inherits what the old one left; here they
   // are separate D3D12 textures and it inherits nothing. Consumed once, at the
   // new owner's first use in a frame, where the copy takes the place of the
-  // clear that would otherwise wipe exactly the contents being inherited.
+  // clear that would otherwise wipe the contents being inherited.
   std::map<uint32_t, uint32_t> m_edramPendingSource;
   uint64_t m_edramTransfers = 0;
   // First-use clears that discarded content the target carried out of an
@@ -1146,11 +1070,11 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   uint64_t m_yuvRefusedTooFewPlanes = 0;
   uint64_t m_yuvRefusedBudget = 0;
   uint64_t m_yuvPrepared = 0;
-  // The other two record types that share this list and are NOT draws:
-  // an ordered full-surface clear, and an ordered surface bind. Both legitimately
+  // The other two record types that share this list and are NOT draws: an
+  // ordered full-surface clear, and an ordered surface bind. Both legitimately
   // carry no shaders, so both land in the no-handle bucket and inflate it. What
   // is left after subtracting all three is the only part that could be a lost
-  // draw -- and that residue is the number to look at, not the total.
+  // draw, and that residue is the number to look at.
   uint64_t m_standInNoHandleClear = 0;
   // Draws removed by hle_strict bit 0 rather than painted with a tex*col
   // stand-in. Separate from the census because both the translated path and the
@@ -1178,20 +1102,16 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // m_nextGameSrvDescriptor is a pure bump allocator and the heap is a one-way
   // ratchet: the cache key is an FNV-1a hash over all six fetch-constant dwords
   // INCLUDING base_address, so the same artwork streamed to a different guest
-  // allocation is a new key and burns another slot forever. Measured 53 -> 740
+  // allocation is a new key and burns another slot forever -- measured 53 -> 740
   // of 1024 in five minutes of swapping riders. On exhaustion EnsureGameTexture
-  // returns false and every texture after it renders as vertex colour,
-  // permanently.
+  // returns false and every texture after it renders as vertex colour.
   std::vector<uint32_t> m_freeGameSrvDescriptors;
   // Evict down to this before the heap is exhausted rather than at the wall.
-  // Hitting the cap is not a soft failure -- it is untextured for the rest of
-  // the process.
-  //
-  // Verified by temporarily forcing this to 96, which made eviction run
+  // Hitting the cap is not a soft failure -- it is untextured for the rest of the
+  // process. Verified by temporarily forcing this to 96, which made eviction run
   // continuously instead of never: 656 evictions, srv flat at 230/1024, the free
-  // list cycling 2..16, evict-blocked 0, no device-removed and no page fault. At
-  // the real threshold a menu session peaks around 293 cached and this never
-  // fires -- which is why it had to be tested at a value that does.
+  // list cycling 2..16, evict-blocked 0, no device-removed. At the real threshold
+  // a menu session peaks around 293 cached and this never fires.
   static constexpr uint32_t kGameTextureHighWater = kMaxGameTextures * 7 / 8;
   uint64_t m_gameTextureEvictions = 0;
   uint64_t m_gameTextureEvictBlocked = 0;
@@ -1206,11 +1126,8 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // because the planes are new resources whenever the video's dimensions change
   // -- and rewriting a descriptor the GPU may still be reading is undefined in
   // D3D12. It read as zero on this hardware, so the composite sampled black from
-  // four correctly-populated textures. Cached textures never hit this: their
-  // descriptor is written once and never touched again.
-  //
-  // Frame-index striping is the same guarantee the per-frame upload buffers rely
-  // on -- MoveToNextFrame waits out the frame kFrameCount ago.
+  // four correctly-populated textures. Frame-index striping is the same
+  // guarantee the per-frame upload buffers rely on.
   static constexpr uint32_t kYuvPlaneDescriptorBase = 0;
   static constexpr uint32_t kMaxYuvDrawsPerFrame = 4;
   static constexpr uint32_t kYuvPlaneDescriptorCount =
@@ -1235,13 +1152,10 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   //
   // MEASURED, steady-state main menu: a 1815ms render tick spent 1031ms creating
   // per-draw buffers and 743ms destroying them -- 97.7% of the tick -- for 1476
-  // CreateCommittedResource calls at ~683us each, 4.3 per draw. The GPU waited
-  // 0ms. The frame cost was never the rendering; it was the allocator, and the
-  // guest sat in SetDrawCalls behind all of it.
-  //
-  // A committed resource is its own kernel-mode video-memory allocation, so a few
-  // hundred microseconds each is simply what it costs. The fix is not to make the
-  // call cheaper but to stop making it.
+  // CreateCommittedResource calls at ~683us each, while the GPU waited 0ms. A
+  // committed resource is its own kernel-mode video-memory allocation, so a few
+  // hundred microseconds each is simply what it costs; the fix is not to make
+  // the call cheaper but to stop making it.
   struct UploadAlloc {
     D3D12_GPU_VIRTUAL_ADDRESS gpu = 0;
     uint8_t* cpu = nullptr;  // inside a persistently mapped page
@@ -1303,8 +1217,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // Half a pixel when the guest asks for Direct3D 9 pixel centres, otherwise
     // zero. Applied to the VIEWPORT ORIGIN rather than to the position in the
     // shader: the reference adds it to the vertex as `ndc_offset * w`, which
-    // after the perspective divide is exactly a screen-space translation, so
-    // doing it on the viewport needs no new shader constant.
+    // after the perspective divide is exactly a screen-space translation.
     float halfPixel = 0.0f;
     // What the guest programmed into PA_CL_VPORT, for comparison against the
     // target extent this renderer hands D3D12. Zero means unreadable.
@@ -1339,11 +1252,10 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     uint32_t target1ColorFormat = 0;
     uint32_t targetWidth = 0;
     uint32_t targetHeight = 0;
-    // EDRAM tile base of the colour target. The guest gives one EDRAM
-    // allocation several surface OBJECTS -- 0x2653FDA0 is drawn into and
-    // 0x2653FF20 is resolved out of, both 129x129 at base 0x2D0 -- so object
-    // identity alone cannot connect a resolve to the surface that holds its
-    // contents.
+    // EDRAM tile base of the colour target. The guest gives one EDRAM allocation
+    // several surface OBJECTS -- 0x2653FDA0 is drawn into and 0x2653FF20 is
+    // resolved out of, both 129x129 at base 0x2D0 -- so object identity alone
+    // cannot connect a resolve to the surface that holds its contents.
     uint32_t targetBase = 0;
     // Guest ColorRenderTargetFormat for that target, RB_COLOR_INFO[16:19].
     uint32_t targetColorFormat = 0;
@@ -1351,12 +1263,12 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     bool colorClear = false;
     // depthClear means "this draw is a guest depth/stencil clear". WHICH plane
     // it clears is the pair below -- the guest issues depth-only, stencil-only
-    // and both, and clearing the stencil plane whenever depth is cleared would
-    // wipe a mask the guest meant to keep.
+    // and both, and clearing stencil whenever depth is cleared would wipe a mask
+    // the guest meant to keep.
     //
     // The stencil state's pipeline variant is INTERNED rather than packed into
     // the PSO key: the key is already tight (rtv format at bit 8, topology at
-    // bit 28) and the state is 41 bits, which does not fit anywhere in it.
+    // bit 28) and the state is 41 bits.
     GameStencil stencil;
     uint32_t stencilIndex = 0;  // 0 == no stencil
     bool depthClear = false;
@@ -1371,7 +1283,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // host storage is created when the guest NAMES a surface rather than when a
     // draw first targets one. Reuses targetObject/Width/Height/Base and
     // targetColorFormat above, since a bind describes the same thing a draw's
-    // target does. See DrawCall::surface_bind for why this record exists.
+    // target does.
     bool surfaceBind = false;
     bool surfaceBindIsDepth = false;
     // The guest's depth surface for this draw, by object identity. Offscreen
@@ -1405,7 +1317,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // EDRAM tile base of the resolve source. The shadow pass renders two depth
     // bands (768x640 at base 0x580, 768x384 at base 0x710) and then resolves the
     // whole 768x1024 through a THIRD object that aliases band 0's base and that
-    // no draw ever binds -- so an object-identity lookup misses it. Base ordering
+    // no draw ever binds, so an object-identity lookup misses it. Base ordering
     // is what puts the bands back in the right vertical order.
     uint32_t resolveSourceBase = 0;
     uint32_t resolveSourceWidth = 0;
@@ -1439,9 +1351,8 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     std::shared_ptr<const std::vector<uint8_t>> pixelShaderDxbc;
     // The guest interpolator stream, as a second vertex buffer, and the guest's
     // pixel constant bank. Both are required for the translated path: without
-    // them the shader would read undefined inputs and compute from zeros, which
-    // is a confident wrong answer rather than a visible failure. `translated`
-    // is only set once every piece is present.
+    // them the shader would read undefined inputs and compute from zeros.
+    // `translated` is only set once every piece is present.
     UploadAlloc ivb;
     D3D12_VERTEX_BUFFER_VIEW ivbv = {};
     UploadAlloc pscb;
@@ -1464,10 +1375,9 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     std::array<uint8_t, kTranslatedSamplerSlots> pixelSamplerSigns = {};
 
     // The VERTEX stage's samplers, same shape as the pixel ones above. Bound
-    // through a SEPARATE descriptor range (t17+/s16+) because the two stages
-    // are translated and cached independently, so their compact slot 0 names
-    // different guest samplers. Zero for the overwhelming majority of draws --
-    // a vertex shader that samples is terrain displacement and similar.
+    // through a SEPARATE descriptor range (t17+/s16+) because the two stages are
+    // translated and cached independently, so their compact slot 0 names
+    // different guest samplers. Zero for the overwhelming majority of draws.
     uint32_t vertexSamplerCount = 0;
     uint32_t vertexSamplerArrayMask = 0;
     std::array<std::shared_ptr<const mx::hle::HleTexturePayload>,
@@ -1498,12 +1408,8 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // The guest VERTEX shader on the GPU. `gpuVertex` is only set once every
     // piece is present, on the same all-or-nothing rule as `translated`: a
     // vertex stage missing its attribute stream or its constant bank computes
-    // from undefined inputs, which is a confident wrong answer rather than a
-    // visible failure.
-    //
-    // When set, `vsvb` REPLACES the CPU-transformed `vb` at slot 0 and the
-    // interpolator stream at slot 1 is not bound at all -- the rasterizer
-    // interpolates what the vertex stage exports.
+    // from undefined inputs. When set, `vsvb` REPLACES the CPU-transformed `vb`
+    // at slot 0 and the interpolator stream at slot 1 is not bound at all.
     uint32_t vertexShaderHandle = 0;
     std::shared_ptr<const std::string> vertexShaderHlsl;
     // Precompiled bytecode for vertexShaderHlsl (fetch or inputs form,
@@ -1526,32 +1432,27 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     UploadAlloc rawvb;
     bool gpuVertexFetch = false;
   };
-  // Bounded because each entry costs three CreateCommittedResource calls.
-  //
-  // Raised from 256 once resolves began sharing this list. They are interleaved
-  // through the stream and mostly land in its tail, so an overrunning frame lost
-  // them first: 340 resolves dropped in one run, which froze every snapshot at
-  // its last contents while draws went on sampling them.
+  // Bounded because each entry costs three CreateCommittedResource calls. Raised
+  // from 256 once resolves began sharing this list: they are interleaved through
+  // the stream and mostly land in its tail, so an overrunning frame lost them
+  // first -- 340 resolves dropped in one run, which froze every snapshot at its
+  // last contents while draws went on sampling them.
   static constexpr size_t kMaxGameDraws = 4096;
   std::vector<GameDraw> m_gameDraws;
 
   // Resources whose last GPU use was in the frame that signalled `fence`.
   //
-  // A D3D12 command list does not reference-count the resources it references --
-  // recording a draw against a buffer keeps nothing alive. ClearGameDraws used to
-  // release every draw's vb/ib/cb directly, once per frame, while the previous
-  // frame's command list was still in flight, so the GPU could be reading
-  // UPLOAD-heap memory the CPU had already freed. Resources now move here and
-  // are released only once m_fence has passed the value signalled for the
-  // submission that last used them.
+  // A D3D12 command list does not reference-count the resources it references.
+  // ClearGameDraws used to release every draw's vb/ib/cb directly, once per
+  // frame, while the previous frame's command list was still in flight, so the
+  // GPU could be reading UPLOAD-heap memory the CPU had already freed.
   struct RetiredFrame {
     uint64_t fence = 0;
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> res;
     // Game-texture SRV slots freed with this batch. A descriptor is not safe to
     // overwrite the moment its texture is evicted: it lives in a SHADER-VISIBLE
     // heap, and any command list already submitted may still dereference it.
-    // Carried on the same fence as the resources for exactly that reason --
-    // same lifetime question, same answer.
+    // Same lifetime question as the resources, so the same fence.
     std::vector<uint32_t> srv;
   };
   std::deque<RetiredFrame> m_retired;
@@ -1564,9 +1465,8 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // The render tick is the whole of the frame cost: the guest's own VdSwap never
   // once exceeded 50ms, its translation work is ~470ms of `FRAME COST`, and the
   // remaining ~3.7s is the guest parked in SetDrawCalls waiting for this thread.
-  // Yet nothing here was ever timed, so which of the four phases spends it was
-  // unknown -- and the spacing-of-log-lines estimates that stood in for a
-  // measurement produced two hypotheses that were both wrong.
+  // Nothing here was ever timed, and the spacing-of-log-lines estimates that
+  // stood in for a measurement produced two hypotheses that were both wrong.
   //
   // Microseconds, accumulated for one tick and reset when reported. The four are
   // disjoint and, with the sleep, sum to the tick period, so a phase that fails
@@ -1585,13 +1485,11 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // that died on a failed Close still reports where it had got to.
   void ReportTickPhases();
 
-  // CreateCommittedResource, counted and timed.
-  //
-  // The leading suspect for the growth is the upload-heap churn in AddGameDraw:
-  // ~4,800 committed resources created and retired per guest frame, ~1.4 million
-  // over a session. The call COUNT is fixed by the draw count and is not the
-  // question; whether each call gets slower as the driver's allocator fragments
-  // is. Reported as a mean per call so that is legible directly.
+  // CreateCommittedResource, counted and timed. The leading suspect for the
+  // growth is the upload-heap churn in AddGameDraw: ~4,800 committed resources
+  // created and retired per guest frame. The call COUNT is fixed by the draw
+  // count and is not the question; whether each call gets slower as the driver's
+  // allocator fragments is. Reported as a mean per call.
   uint64_t m_committedCalls = 0;
   uint64_t m_committedUs = 0;
   HRESULT CreateTimedCommittedResource(const D3D12_HEAP_PROPERTIES* heap,
@@ -1607,28 +1505,22 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_gameDsvHeap;
   uint32_t m_gameRtvDescriptorSize = 0;
   // 64 was a bring-up number sized against the front end, which uses 22. A
-  // LOADED LEVEL does not fit: measured with --force_load=NAT_Farm, this pinned
-  // at 64/64 with 5530 draws refused and OVERPAINT climbing to 2765, against the
-  // "OVERPAINT 0, refusals 0, 22/64" a menu-only run reports.
+  // LOADED LEVEL does not fit: with --force_load=NAT_Farm this pinned at 64/64
+  // with 5530 draws refused and OVERPAINT climbing to 2765, against the
+  // "OVERPAINT 0, refusals 0, 22/64" a menu-only run reports. A refused draw
+  // falls back to the MAIN target and paints over the scene, and once a level
+  // pushes past the cap it stays past it for the rest of the run.
   //
-  // A refused draw falls back to the MAIN target and paints over the scene, and
-  // m_gameRenderTargets is never evicted -- so once a level pushes past the cap
-  // it stays past it for the rest of the run, silently apart from that counter.
-  //
-  // Same defect and fix as kMaxGameSnapshots below: a cap sized against the
-  // menu, met by scene content. RTV descriptors are non-shader-visible and cost
-  // nothing to reserve, and the real bound is the SRV budget. Raised to 4x the
-  // point of failure rather than uncapped, so a runaway allocator is caught.
+  // Same defect and fix as kMaxGameSnapshots below. RTV descriptors are
+  // non-shader-visible and cost nothing to reserve, and the real bound is the
+  // SRV budget; raised to 4x the point of failure rather than uncapped.
   static constexpr uint32_t kMaxGameRenderTargets = 256;
   // Snapshots get their OWN cap, and it is not this one. 64 bounds the RTV heap,
   // and a snapshot has no RTV -- EnsureGameSnapshot sets rtvIndex = 0. Charging
   // snapshots against the RTV budget anyway broke the 129x129 post-process
   // chain: 50 targets + 33 snapshots = 83 against 64, so every NEW resolve
-  // destination past that point was refused, its resolve dropped, and the six
-  // draws that sampled those destinations fell to the tex*col stand-in.
-  //
-  // 128 rather than uncapped: the observed steady state is 33, so ~4x headroom.
-  // The real bound is the SRV budget, checked on the same line.
+  // destination past that point was refused and the draws sampling it fell to
+  // the stand-in. 128 rather than uncapped: the observed steady state is 33.
   static constexpr uint32_t kMaxGameSnapshots = 128;
   // Offscreen render-target routing counters. Reported by RenderGameDraws.
   // m_rtDrawsOverpaint is the one that matters: a draw that asked for its own
@@ -1660,8 +1552,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // Snapshot eviction. m_snapshotEvictBlocked is the one that matters: a sweep
   // that ran AT THE HARD CAP and freed nothing means every live snapshot is
   // genuinely in use, so the cap rather than the lifetime wants revisiting.
-  // Sweeps above the high water that free nothing are ordinary and uncounted --
-  // counting those would make this climb constantly and mean nothing.
+  // Sweeps above the high water that free nothing are ordinary and uncounted.
   uint64_t m_snapshotEvictions = 0;
   uint64_t m_snapshotEvictBlocked = 0;
   // How many frames a snapshot may go unsampled before it is evictable. Deliberately
@@ -1670,19 +1561,16 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // image that is sampled rarely must survive. At 60fps this is four seconds.
   static constexpr uint64_t kSnapshotIdleFrames = 240;
   // Sweep at a HIGH WATER mark, not at the hard cap -- the same shape as
-  // EvictGameTexturesToHighWater. Sweeping only when the cap is reached measured
-  // as a sawtooth: the map sat at 112 of 128 for a whole run, sweeping once to
-  // 60. That works, but it spends its life at 87% full, so the first map that
-  // legitimately wants a burst of new snapshots meets the wall anyway.
+  // EvictGameTexturesToHighWater. Sweeping only at the cap measured as a
+  // sawtooth: the map sat at 112 of 128 for a whole run, sweeping once to 60,
+  // which works but spends its life at 87% full.
   static constexpr uint32_t kSnapshotHighWater = kMaxGameSnapshots * 3 / 4;
   static constexpr uint32_t kTargetHighWater = kMaxGameRenderTargets * 3 / 4;
-  // RTV slots freed by eviction, and the bump allocator behind them.
-  //
-  // This pair REPLACES `rtvIndex = m_gameRenderTargets.size() + 1`, which was
-  // correct only for as long as the map never shrank. Evicting with that formula
-  // still in place would hand two live targets the same RTV slot and corrupt
-  // both -- strictly worse than the exhaustion it was meant to fix. Descriptor 0
-  // is the final 1280x720 target, so real targets start at 1.
+  // RTV slots freed by eviction, and the bump allocator behind them. This pair
+  // REPLACES `rtvIndex = m_gameRenderTargets.size() + 1`, which was correct only
+  // for as long as the map never shrank: evicting with that formula still in
+  // place would hand two live targets the same RTV slot. Descriptor 0 is the
+  // final 1280x720 target, so real targets start at 1.
   std::vector<uint32_t> m_freeGameRtvIndices;
   uint32_t m_nextGameRtvIndex = 1;
   uint64_t m_rtEvictions = 0;
@@ -1694,10 +1582,9 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // run on every one of those calls.
   uint64_t m_snapshotSweepFrame = UINT64_MAX;
   // Resolve snapshots. m_snapshotFallbacks is the one that matters: a draw that
-  // wanted a snapshot, found none, and fell back to sampling the source
-  // target's live surface — which is the old aliasing behaviour, so a large
-  // steady count means resolves are being dropped upstream rather than that the
-  // fix is working.
+  // wanted a snapshot, found none, and fell back to sampling the source target's
+  // live surface — the old aliasing behaviour, so a large steady count means
+  // resolves are being dropped upstream rather than that the fix is working.
   uint64_t m_snapshotCopies = 0;
   uint64_t m_snapshotHits = 0;
   uint64_t m_snapshotFallbacks = 0;
@@ -1708,12 +1595,9 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // Draws whose guest alpha test is ENABLED, split by whether the path they
   // actually took can honour it. The discard lives in the translated pixel
   // shader, so a draw that fell to the stand-in gets no test at all and still
-  // paints its masked-away pixels.
-  //
-  // Two counters rather than one because the second is the only thing that says
-  // whether this change is finished: `honoured` rising on its own proves the
-  // plumbing works, and only `standIn` staying at zero proves there is no second
-  // population still rendering as filled quads.
+  // paints its masked-away pixels. Two counters rather than one because
+  // `honoured` rising proves the plumbing works, and only `standIn` staying at
+  // zero proves there is no second population rendering as filled quads.
   uint64_t m_alphaTestHonoured = 0;
   uint64_t m_alphaTestStandIn = 0;
   // Draws whose colour output was remapped from the guest's -32...32 fixed
@@ -1722,14 +1606,14 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   uint64_t m_fixed16Scaled = 0;
   // Draws whose guest colour format is 7e3 (3 or 12) and so had their pixel
   // output clamped to [0, 31.875] RGB / [0, 1] alpha, the range the console's
-  // ROP enforces on the write. Counted because the defect it fixes is
-  // invisible from outside: a negative in an R16G16B16A16_FLOAT target looks
-  // like ordinary data until it reaches the luminance reduction.
+  // ROP enforces on the write. Counted because the defect it fixes is invisible
+  // from outside: a negative in an R16G16B16A16_FLOAT target looks like ordinary
+  // data until it reaches the luminance reduction.
   uint64_t m_float7e3Clamped = 0;
   // Slots where the DESCRIPTOR bound a resolve snapshot while a DIFFERENT
-  // texture -- usually `d.texture`, the single-texture path's field -- would
-  // have supplied the extent under the old ordering, and disagreed about it.
-  // Counted per slot, only when the extents actually differ. It MUST include the
+  // texture -- usually `d.texture`, the single-texture path's field -- would have
+  // supplied the extent under the old ordering, and disagreed about it. Counted
+  // per slot, only when the extents actually differ. It MUST include the
   // d.texture fallback: a version that looked only at d.pixelTextures[s] read a
   // structural zero and got a working fix reverted.
   uint64_t m_texinvSlotMismatch = 0;
@@ -1737,11 +1621,9 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   //   [0] snapshot WITH a resource   [1] snapshot object with NO map entry
   //   [2] payload texture
   //
-  // Index [1] is the one that matters. That slot keeps a stale texinv and the
-  // descriptor behind it samples black -- and the terrain height-tile shader
+  // Index [1] is the one that matters: that slot keeps a stale texinv and the
+  // descriptor behind it samples black, and the terrain height-tile shader
   // computes sample*4-2, so a black slot 3 writes every height 2.008 units low.
-  // That is the whole floating-bike defect, proven by a capture A/B.
-  //
   // Per slot, not totalled: the signal is one slot FLIPPING between columns
   // across runs while the other fifteen sit still.
   uint64_t m_texSlotPath[16][3] = {};
@@ -1754,10 +1636,8 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // the snapshot map had an entry for it. 800 of 16507 tile draws took the
   // object path and their sample measured 0.0 -- naming the object is what turns
   // "a snapshot is black" into something fixable, because the address is
-  // greppable against the resolve and texture logs.
-  //
-  // Small and fixed: the expectation is ONE object, and seeing two would itself
-  // be the finding.
+  // greppable against the resolve and texture logs. Small and fixed: the
+  // expectation is ONE object, and seeing two would itself be the finding.
   struct TileSlotObject {
     uint32_t object = 0;
     uint32_t width = 0, height = 0;
@@ -1778,11 +1658,10 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // produce is blank by construction.
   uint64_t m_snapshotBlankSource = 0;
   // ...and WHICH ones, because the bare count above has been quoted for three
-  // days without anyone able to say what it covers. Measured: it reads 353 in a
-  // two-minute menu-only run AND 353 in a nine-minute run that also loaded a
-  // level -- identical, so the whole population lands during
-  // boot/legal/loading/start and never grows. That is the same set of screens
-  // reported as having no background.
+  // days without anyone able to say what it covers. It reads 353 in a two-minute
+  // menu-only run AND 353 in a nine-minute run that also loaded a level, so the
+  // whole population lands during boot/legal/loading/start -- the same set of
+  // screens reported as having no background.
   //
   // Keyed by resolve-source extent so one line covers a surface rather than an
   // event. `rescue*` record why the substitution search failed to find a drawn
@@ -1831,8 +1710,8 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // Age histogram of FULL-SCREEN snapshots (>= half the presented width) at the
   // moment a draw samples one: refreshed this frame, last frame, 2-9, 10-99,
   // 100+ frames ago. A large 100+ bucket means whole leftover frames are being
-  // composited over the current one. Small snapshots are excluded because
-  // static compositor content is legitimately old and would swamp the signal.
+  // composited over the current one. Small snapshots are excluded because static
+  // compositor content is legitimately old and would swamp the signal.
   uint64_t m_snapshotAge[5] = {};
   uint64_t m_snapshotMissingSource = 0;
   // Resolves lost because the frame's draw list was already full, and snapshot
@@ -1864,9 +1743,8 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // guest MRT pass is still half-rendered.
   uint64_t m_mrtDrawsBound = 0;
   uint64_t m_mrtSecondTargetMissing = 0;
-  // The 1x1 auto-exposure result on its way back to the guest. The guest reads
-  // the resolve destination's bytes out of its own memory rather than sampling
-  // them, so the value has to make the round trip through host memory.
+  // The 1x1 auto-exposure result on its way back to the guest, which reads the
+  // resolve destination's bytes out of its own memory rather than sampling them.
   //
   // One buffer per frame in flight, drained at the top of the frame that reuses
   // the slot: MoveToNextFrame has already waited out the frame kFrameCount ago,
@@ -1898,10 +1776,8 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // virtual-texture feedback buffer. Separate from the luminance path rather
   // than widened into it: that one carries luminance SEMANTICS (never hand the
   // guest a zero, write every known 1x1 destination, one quantity sampled
-  // repeatedly) and none of it is true of a page-ID buffer.
-  //
-  // 64 KB is the placement-aligned round-up of the 64x64x4 VT feedback buffer,
-  // which is the caller that actually has a reader.
+  // repeatedly) and none of it is true of a page-ID buffer. 64 KB is the
+  // placement-aligned round-up of the 64x64x4 VT feedback buffer.
   //
   // RAISING IT FOR THE TERRAIN HEIGHT BUFFER WAS TRIED AND REVERTED. The 129x129
   // R32_FLOAT height snapshot is 99,072 bytes once D3D12 aligns its rows, so it
@@ -1964,15 +1840,14 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   uint64_t m_surfaceReadbacks = 0;
   uint64_t m_surfaceReadbackRefused = 0;
   uint64_t m_surfaceReadbackTooBig = 0;
-  // PER-DESTINATION OUTCOMES.
-  //
-  // The census could only say "queued / refused-busy / refused-too-big", which
-  // cannot tell a destination that LOSES THE RACE for the single slot from one
-  // that is never eligible at all. Worse, one eligibility exit -- the footprint
-  // exceeding the GPU buffer -- returned without counting anything, so the
-  // terrain deformation was absent from every number this path printed and its
-  // silence read as "never called". Every exit now lands in exactly one of
-  // ineligible / lostBusy / won, with `seen` as the structural denominator.
+  // PER-DESTINATION OUTCOMES. The census could only say "queued / refused-busy /
+  // refused-too-big", which cannot tell a destination that LOSES THE RACE for
+  // the single slot from one that is never eligible at all. Worse, one
+  // eligibility exit -- the footprint exceeding the GPU buffer -- returned
+  // without counting anything, so the terrain deformation was absent from every
+  // number this path printed and its silence read as "never called". Every exit
+  // now lands in exactly one of ineligible / lostBusy / won, with `seen` as the
+  // structural denominator.
   struct SurfaceReadbackTally {
     uint32_t destObject = 0;
     uint32_t width = 0;
@@ -2008,8 +1883,8 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // EDRAM BAND at a row offset inside another surface. A band whose base sits
     // ABOVE its owner's cannot simply share the owner's resource the way a
     // base-aligned one can: its rows start partway down, while the guest gives
-    // it a 0-based viewport and its own colour target at origin. Offsetting the
-    // viewport would move colour too, off the end of that target.
+    // it a 0-based viewport and its own colour target at origin, and offsetting
+    // the viewport would move colour too.
     //
     // So the band keeps its own surface and we COPY the owner's rows into it,
     // depth plane only, once per frame before its first draw. The light pass
@@ -2032,28 +1907,25 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // cleared on the GPU. Pooled surfaces are RECYCLED, so a fresh entry's
     // contents are whatever the previous tenant left behind -- which is why the
     // everDrawn comment above ("holds only its creation clear") was aspirational
-    // rather than true: nothing performed that clear. A surface the guest binds
-    // and resolves without ever drawing into must read as its documented
-    // creation value -- the far plane for depth, transparent black for colour.
+    // rather than true. A surface the guest binds and resolves without ever
+    // drawing into must read as its documented creation value.
     bool needsInitialClear = true;
     // Snapshots only. Set when the guest asked to resolve into this texture and
     // we could not perform the copy, so the contents are a KNOWN-WRONG earlier
     // frame rather than merely an old one. Snapshots legitimately persist across
-    // frames -- static compositor content is resolved once and sampled for many
-    // -- so age is not evidence of staleness, but a dropped refresh is. Binding
-    // one paints a whole previous frame over the current one.
+    // frames, so age is not evidence of staleness, but a dropped refresh is:
+    // binding one paints a whole previous frame over the current one.
     bool stale = false;
     // Snapshots only: the frame counter value at the last successful copy into
     // this snapshot. Age at sample time is the measurement that separates a
-    // static compositor image -- resolved once, sampled for many frames, and
-    // legitimately old -- from a leftover full-screen frame that nothing has
-    // refreshed and that a draw is about to paint over the current one.
+    // static compositor image -- resolved once, sampled for many frames -- from
+    // a leftover full-screen frame that nothing has refreshed.
     uint64_t lastCopyFrame = 0;
-    // Snapshots only: the frame counter value at the last time this snapshot
-    // was BOUND for sampling. Distinct from lastCopyFrame, and it has to be:
-    // static compositor content is resolved once and sampled for many frames,
-    // so copy age says nothing about whether anything still wants it. Sample
-    // age does, and it is what EvictGameSnapshots evicts on.
+    // Snapshots only: the frame counter value at the last time this snapshot was
+    // BOUND for sampling. Distinct from lastCopyFrame, and it has to be: static
+    // compositor content is resolved once and sampled for many frames, so copy
+    // age says nothing about whether anything still wants it. Sample age does,
+    // and it is what EvictGameSnapshots evicts on.
     uint64_t lastUsedFrame = 0;
     // Depth targets only: the EDRAM tile base this surface was rendered at.
     uint32_t edramBase = 0;
@@ -2097,20 +1969,17 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   uint64_t m_depthBandWriteBacks = 0;
   // A band that wanted its owner's rows and could not have them -- owner gone,
   // never drawn into, or no longer tall enough. Counted apart from the copies
-  // because "band handled" and "band handled CORRECTLY" are different claims:
-  // a skipped copy leaves the band on its own creation clear, which is the
-  // exact failure this whole path exists to remove.
+  // because a skipped copy leaves the band on its own creation clear, which is
+  // the exact failure this whole path exists to remove.
   uint64_t m_depthBandCopySkipped = 0;
   GameRenderTarget* EnsureGameDepthTarget(uint32_t object, uint32_t width,
                                           uint32_t height, uint32_t edramBase);
   // Descriptor 0 stays the main-target depth created by CreateGameRenderTargets;
-  // the rest are stable slots for guest depth-surface identities.
-  //
-  // 16 was sized against the four depth surfaces a DRAW ever named. Surfaces are
-  // now created when the guest BINDS them, and the menu run binds twelve
-  // distinct ones -- close enough to the old cap that a busier scene would start
-  // losing them to m_rtRejectBudget, which fails silently and looks exactly like
-  // the missing-surface bug this change exists to fix.
+  // the rest are stable slots for guest depth-surface identities. 16 was sized
+  // against the four depth surfaces a DRAW ever named; surfaces are now created
+  // when the guest BINDS them, and the menu run binds twelve distinct ones --
+  // close enough that a busier scene would start losing them to
+  // m_rtRejectBudget, which fails silently.
   static constexpr uint32_t kMaxGameDepthTargets = 32;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_gameDepthDsvHeap;
   uint32_t m_gameDsvDescriptorSize = 0;
