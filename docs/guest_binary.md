@@ -505,6 +505,44 @@ contradicts. See AGENTS.md for that story.)
 
 `sub_82B34998` is RendererDispatch; its `f1` is the frame delta argument.
 
+### The KPCR — `r13`
+
+`r13` is the per-thread KPCR pointer, and guest code indexes it directly, so
+these offsets turn up in ordinary decompiled functions rather than in anything
+that looks like kernel code.
+
+| Offset | What | Read out of |
+|---|---|---|
+| `+0x00` | pointer to this thread's TLS block | the device lookup below |
+| `+0x70` | stack base | written per thread by the runtime |
+| `+0x74` | stack end (`stack_end_ptr`) | `rex/ppc/stack.h stack_limit_from_pcr` |
+| `+0x100` | pointer to the thread block holding the Win32 last-error slot | `sub_82C01100` / `sub_82C01138` |
+| `+0x150` | non-zero suppresses the last-error read and write | the same pair |
+
+`*(*(r13 + 0x100) + 0x160)` is the last-error value itself: `sub_82C01100` is
+`SetLastError(RtlNtStatusToDosError(status))` and `sub_82C01138` is
+`GetLastError`, both gated on `+0x150`.
+
+**The current D3D device is thread-local**, and this is the guest's own idiom
+for fetching it — four sites use it verbatim (`sub_82B70760` MainLoop,
+`sub_82B70290`, `sub_82B70300`, `sub_82B70BE8`):
+
+```c
+dev = *(*(r13) + 0x579C);            // this thread's TLS block, +0x579C
+if (!dev) dev = *(dword_830B08C0 + 0x4C);   // global fallback
+```
+
+Hex-Rays renders `*(r13)` as an uninitialised local (`int v6; // r13`), because
+nothing in the function writes r13 — read the disassembly, not the pseudocode:
+`lwz r11, 0(r13)` / `li r10, 0x579C` / `lwzx r31, r10, r11`.
+
+Under recompilation r13 is set per thread and is never 0: `XThread::Create`
+allocates a 0x2D8-byte block per thread and hands it to `ThreadState`, whose
+constructor writes it into that thread's own `PPCContext::r13` (offset 104;
+`r1` is offset 16). Only `XThread::Create` and `XThread::Restore` construct a
+`ThreadState`, and `rex/hook.h` and `rex/ppc/function.h` propagate r13 into
+hook and nested-call frames.
+
 ### Other named functions
 
 - `sub_82B70760` MainLoop → `sub_82B70578` RenderPipeline → `sub_82AFE978` →
@@ -519,10 +557,14 @@ contradicts. See AGENTS.md for that story.)
   `XAudioRegisterRenderDriverClient`, `sub_82C87B98` →
   `XAudioSubmitRenderDriverFrame`, `sub_82C4C268` → `XMACreateContext`. Input is
   polled from `sub_82B6DB28` (`lr=0x82B6DBD4`).
-- `sub_82BFBF48` tail-calls `sub_82C01138`, which decompiles to a pure CRT
-  thread-block read — `r13+336 ? 0 : *(*(r13+256) + 352)`, an errno-style
-  pointer accessor. It has **156 call sites**. `sub_82BFB748` is the
-  `NtSetEvent` wrapper.
+- `sub_82BFBF48` tail-calls `sub_82C01138`, a pure thread-block read —
+  `r13+336 ? 0 : *(*(r13+256) + 352)`. It is `GetLastError` (see the KPCR
+  section; the paired writer is `sub_82C01100`), it has no side effects, and it
+  has **156 call sites**. `sub_82BFB748` is the `NtSetEvent` wrapper, returning
+  1 on success. So the idiom `if (!sub_82BFB748(h)) sub_82BFBF48();`, which the
+  frame and teardown paths are full of, is `if (!SetEvent(h)) GetLastError();`
+  — the code is fetched and dropped, an assert compiled out of retail. It is
+  **not** an error handler, and naming it one has now misled twice.
 
 ### Known external blockers
 

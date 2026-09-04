@@ -42,13 +42,16 @@ extern "C" REX_FUNC(sub_82BFB740) { orig_Wait(ctx, base); }
 // called the original unconditionally in both modes.
 
 //=============================================================================
-// sub_82BFBF48 -- CRT per-thread errno accessor (no longer stubbed)
+// sub_82BFBF48 -- GetLastError (no longer stubbed)
 //=============================================================================
 // Named "error recovery" and stubbed to nothing. That name was a guess and it
-// was wrong: the function tail-calls sub_82C01138, a pure read of the CRT thread
+// was wrong: the function tail-calls sub_82C01138, a pure read of the thread
 // block -- `r13+336 ? 0 : *(*(r13+256) + 352)` -- with no side effects and no
 // GPU dependency. Stubbing it did not "skip error recovery"; it left r3 holding
 // whatever the caller had, at 156 call sites. UNSTUBBED.
+//
+// It is GetLastError; the paired writer sub_82C01100 is
+// SetLastError(RtlNtStatusToDosError(status)). See docs/guest_binary.md.
 
 REX_IMPORT(__imp__sub_82BFBF48, orig_CrtErrnoPtr, void());
 extern "C" REX_FUNC(sub_82BFBF48) { orig_CrtErrnoPtr(ctx, base); }
