@@ -1,30 +1,26 @@
 // UNLOCKING THE GUEST'S OWN DEBUG FACILITIES.
 //
-// Split out of hooks_plugin_diag.cpp 2026-08-30. Everything here has the same
-// shape and it is not the shape of that file: these hooks do not observe the
-// guest, they CHANGE an answer it gives itself, to switch on code the shipping
-// build compiled in and then gated off. Diagnostics belong next to the
-// subsystem they measure; these belong together.
+// Split out of hooks_plugin_diag.cpp because everything here has the same shape
+// and it is not that file's: these hooks do not observe the guest, they CHANGE
+// an answer it gives itself, to switch on code the shipping build compiled in
+// and then gated off.
 //
-// The game ships a complete developer build behind three separate gates, and
-// they are independent -- flipping one does not reach the others:
+// The game ships a complete developer build behind three independent gates --
+// flipping one does not reach the others:
 //
 //   debug_menu    the LUA gate. DEFINE_BuildConfig is pushed as "RELEASE";
 //                 MXUI/UI_Helper.lua tests it for inequality in
 //                 AllowDebugMenu(), and FE_Title.lua puts the dev menu on the
-//                 title screen from the same test. Reaches the UI scripts and
-//                 nothing else.
+//                 title screen from the same test. Reaches the UI scripts only.
 //   debug_native  a `return 0;` the engine tests in places. NOT a single
-//                 predicate -- see the correction at its cvar. Per call site,
-//                 and each site needs checking before it is flipped.
+//                 predicate -- see the correction at its cvar. Per call site.
 //   debug_binds   the INPUT gate, which is really an absence: the engine
 //                 registers a full debug action set that the shipped
 //                 ControllerPresets.bxml binds to nothing.
 //
-// What each unlocks, and what it does not, is documented at each cvar. The
-// short version: the dev menu works and loads levels; the debug camera has no
-// "enter" action and its native gate has not been found; DebugOverlay is the
-// ASSERT SCREEN rather than a HUD, so it has no toggle to find.
+// The short version of what each unlocks: the dev menu works and loads levels;
+// the debug camera has no "enter" action and its native gate has not been found;
+// DebugOverlay is the ASSERT SCREEN rather than a HUD, so it has no toggle.
 
 #include "hooks/hook_common.h"
 #include "hooks/hooks_d3d9.h"  // GuestRangeReadable
@@ -42,86 +38,59 @@
 #include <vector>
 
 // debug_native -- the engine's own "is this a debug build" predicate, which
-// ships compiled to a constant false.
+// ships compiled to a constant false:
 //
 //     int sub_829E8FA8() { return 0; }
 //
-// It has 40+ call sites across asset loading, UI, render and audio, and it is
-// the NATIVE counterpart of the Lua DEFINE_BuildConfig that debug_menu flips.
-// The two are unrelated: debug_menu only reaches Lua and the UI scripts, so it
-// cannot switch on anything the C++ gates -- which is why the dev menu appears
-// but the debug camera does not.
+// It is the NATIVE counterpart of the Lua DEFINE_BuildConfig that debug_menu
+// flips. The two are unrelated: debug_menu only reaches Lua, which is why the
+// dev menu appears but the debug camera does not.
 //
 // Two known consumers, both found while chasing the debug overlay:
 //
-//   sub_82AB6300  the DebugOverlay constructor. It loads the
-//                 EngineDependencies database and package, resolves the
-//                 DebugOverlay material, lays out seven HUD cells, and then
-//                 sets its enabled field from this predicate:
-//                     a1[217] = sub_829E8FA8();
-//                 so the overlay builds itself and then marks itself off.
-//   sub_82AB58F8  a screen/state poller, whose second branch is
-//                     if (sub_829E8FA8() && sub_82B6F070(&unk_830C1140, 1, i))
-//                 -- though with the folding below, that call may be a
-//                 different stub that merely shares the address.
+//   sub_82AB6300  the DebugOverlay constructor. It loads its database and
+//                 package, resolves the material, lays out seven HUD cells, and
+//                 then sets its enabled field from this predicate --
+//                 `a1[217] = sub_829E8FA8();` -- so the overlay builds itself
+//                 and then marks itself off.
+//   sub_82AB58F8  a screen/state poller whose second branch tests it.
 //
-// CORRECTION, 2026-08-30: sub_829E8FA8 IS NOT ONE FUNCTION.
+// CORRECTION: sub_829E8FA8 IS NOT ONE FUNCTION. It is the shared body of every
+// `return 0;` in the image, folded together by the linker. The proof is that its
+// callers cannot all be the same function -- one address cannot simultaneously
+// be a Lua C function registered as `print`, a boolean predicate, and a stored
+// flag. So the "40+ call sites" the census reports are every STUBBED-OUT
+// function in the binary sharing one body, not forty debug checks.
 //
-// It is the shared body of every `return 0;` in the image, folded together by
-// the linker (identical COMDAT folding). The proof is that its callers cannot
-// all be the same function -- one address cannot simultaneously be:
-//
-//     a Lua C function, registered as `print` in sub_82500760:
-//         push "print"; push C closure sub_829E8FA8; set global
-//     a boolean predicate:      if (sub_829E8FA8() && ...)
-//     a stored flag:            a1[217] = sub_829E8FA8();
-//
-// Those are three incompatible signatures. So the "40+ call sites" the census
-// reports are every STUBBED-OUT function in the binary sharing one body, not
-// forty debug checks.
-//
-// This also corrects why `all` crashes. The first explanation here was
-// "40 paths retail never executes" -- wrong. It crashes because it returns 1
-// to callers that expect 0 from unrelated stubs, Lua's `print` among them.
+// That also corrects why `all` crashes: not "40 paths retail never executes",
+// but returning 1 to callers that expect 0 from unrelated stubs, Lua's `print`
+// among them.
 //
 // A consequence worth knowing: the guest's `print()` is that stub, so every
-// print() in the shipped Lua discards its output. Nothing is being lost on our
-// side. The same is true of the debug printing the dev menu leans on --
-// Engine.DebugPrintTable (sub_824B31B0) and Engine.DebugPrintRows
-// (sub_824B2700) fully validate their arguments (`Rdb::Table *`, `RdbRows *`,
-// arg counts, type-mismatch messages) and then call nullsub_1. Measured: 7
-// calls in one run, zero output. They are stubs, not a TTY channel we fail to
-// capture.
+// print() in the shipped Lua discards its output. The same is true of
+// Engine.DebugPrintTable and Engine.DebugPrintRows, which fully validate their
+// arguments and then call nullsub_1. They are stubs, not a TTY channel we fail
+// to capture.
 //
-// PER CALL SITE, and CHECK THE SITE FIRST. "census" reports which sites ask
-// without changing an answer; decompile a site's caller before flipping it,
-// because the census cannot tell a debug check from any other stub.
-// 0x82AB6638 is verified: it is `a1[217] = sub_829E8FA8()` inside the
-// DebugOverlay constructor.
+// PER CALL SITE, and CHECK THE SITE FIRST -- the census cannot tell a debug
+// check from any other stub. 0x82AB6638 is verified.
 //
-//   debug_native=census        answer FALSE, report the distinct callers
-//   debug_native=0x82AB6638    answer TRUE for that site only (verified)
-//   debug_native=all           answer TRUE everywhere; crashes, see above
-// ONE SWITCH FOR ALL OF IT.
-//
-// These started as four cvars because they were found one at a time. They are
-// one feature -- "turn on the developer build" -- and four flags to spell that
-// is worse than one, so `dev` takes comma-separated tokens:
+// ONE SWITCH FOR ALL OF IT. These started as four cvars because they were found
+// one at a time; `dev` takes comma-separated tokens instead:
 //
 //   menu                     the Lua gate: DEFINE_BuildConfig -> "DEBUG"
 //   print                    capture the guest print() to logs/guest_print.log
 //   native:census            report the stub callers, change nothing
 //   native:<hex>             answer 1 for that ONE return address. REPEATABLE
-//   native:all               answer 1 everywhere. Crashes; see the note below
+//   native:all               answer 1 everywhere. Crashes; see above
 //   bind:<Button>=<Action>   add one debug binding. REPEATABLE, and OFF unless
 //                            asked for -- the debug camera has no way to be
-//                            entered yet, so the bindings do nothing useful
+//                            entered yet
 //
 //   --dev=menu,print,native:0x82AB6638
 //
-// native: and bind: are repeatable rather than comma-lists of their own,
-// because the token separator is already a comma and nesting one inside a
-// value is how a config format becomes unparseable.
+// native: and bind: are repeatable rather than comma-lists of their own, because
+// the token separator is already a comma.
 REXCVAR_DEFINE_STRING(dev, "", "Debug",
                       "Developer switches, comma separated: menu, print, "
                       "native:census|<hex>|all. See hooks_debug_unlock.cpp");
@@ -172,12 +141,12 @@ void NoteGuestPrint(const std::string& text);
 
 // A Lua string argument, read straight off the stack.
 //
-// Deliberately a local copy of the reader in hooks_plugin_diag.cpp rather than
-// a shared symbol: it is twenty guarded lines, and the alternative is this
-// file depending on the internals of the diagnostics file it was just split
-// out of. Every field is range-checked, because the argument is guest data of
-// whatever type the script happened to pass -- this project has already killed
-// the process once by dereferencing a plausible-looking value.
+// Deliberately a local copy of the reader in hooks_plugin_diag.cpp rather than a
+// shared symbol: it is twenty guarded lines, and the alternative is this file
+// depending on the internals of the diagnostics file it was just split out of.
+// Every field is range-checked, because the argument is guest data of whatever
+// type the script passed -- this project has already killed the process once by
+// dereferencing a plausible-looking value.
 std::string LuaArgString(uint8_t* base, uint32_t L, uint32_t index) {
   constexpr uint32_t kTValueStride = 16, kTValueType = 8, kLuaTString = 4;
   constexpr uint32_t kTStringLen = 12, kTStringChars = 16;
@@ -204,16 +173,14 @@ std::string LuaArgString(uint8_t* base, uint32_t L, uint32_t index) {
 REX_IMPORT(__imp__sub_829E8FA8, orig_IsDebugBuild, void());
 extern "C" REX_FUNC(sub_829E8FA8) {
   const uint32_t lr = uint32_t(ctx.lr);
-  // THE GUEST'S print(), CAUGHT HERE. Lua binds print to this same folded stub
-  // (sub_82500760 pushes "print", then this address as the C closure), and Lua
-  // calls a C function with r3 = lua_State -- so this is the one call site
-  // where the argument list is reachable. The dispatcher is not: its r3 is its
-  // own first parameter, not the state, which is what the first attempt got
+  // THE GUEST'S print(), CAUGHT HERE. Lua binds print to this same folded stub,
+  // and Lua calls a C function with r3 = lua_State -- so this is the one call
+  // site where the argument list is reachable. The dispatcher is not: its r3 is
+  // its own first parameter, not the state, which is what the first attempt got
   // wrong and why the capture came back empty.
   //
   // Every other caller of this stub passes something that is not a lua_State,
   // and LuaArgString range-checks its way to an empty string on all of them.
-  // A non-empty result is a string argument on a real Lua stack.
   NoteGuestPrint(LuaArgString(base, ctx.r3.u32, 0));
   orig_IsDebugBuild(ctx, base);
   const std::vector<std::string> sites = DevOptions("native");
@@ -254,17 +221,11 @@ extern "C" REX_FUNC(sub_829E8FA8) {
 // presets leave empty.
 //
 // sub_8230EB48 registers a full set of debug input ACTIONS by name --
-// DebugCamera{Forward,Backward,Up,Down,ZoomIn,ZoomOut,EnableAccel,
-// EnableTracking,EnableWorldAlignedMovement}, DebugEject{Active,
-// AirGroundToggle}, DebugBarBangModifier1-4, DebugWreckAvoidanceModifier1-3,
-// plus Spec{Next,Prev}Player, SwapToyVehicle, PreviewPerformance,
-// QuitUIActivity, Replay{PlayPause,Rewind,FastForward} and
-// UserCamQuick{Back,Right}.
-//
-// NONE of them is bound. assets/ControllerPresets.bxml ships six presets that
-// between them reference only 20 gameplay actions, and eight inputs are empty
-// in ALL six: Button7, Button14, Button15, Button16 and the four Sensor axes.
-// The actions survived in code; the bindings were stripped from the data.
+// DebugCamera{Forward,Backward,Up,Down,ZoomIn,ZoomOut,...}, DebugEject*,
+// DebugBarBangModifier1-4, Spec{Next,Prev}Player, Replay* and more. NONE is
+// bound: ControllerPresets.bxml ships six presets referencing only 20 gameplay
+// actions, and eight inputs are empty in ALL six. The actions survived in code;
+// the bindings were stripped from the data.
 //
 // THE TABLE, from the parser at sub_82308300:
 //
@@ -279,14 +240,12 @@ extern "C" REX_FUNC(sub_829E8FA8) {
 //
 // Button indices are LEARNED, not assumed: sub_82B69BA8 maps a button name to
 // its index and the parser calls it for every Input element, so hooking it
-// records the real mapping. Guessing indices from XML order would be an
-// assumption about a table this file cannot see.
+// records the real mapping.
 //
-// Two safety properties. A slot is written ONLY if the guest left it empty, so
-// a real binding can never be clobbered. And the layout is VERIFIED before any
+// Two safety properties. A slot is written ONLY if the guest left it empty, so a
+// real binding can never be clobbered. And the layout is VERIFIED before any
 // write: a known shipped binding is read back and must match, or nothing is
-// written and the log says so. Getting 780/25/260 wrong would otherwise
-// scribble over the input table.
+// written and the log says so.
 namespace {
 
 constexpr uint32_t kPresetTable = 0x82DAA740u;
@@ -392,8 +351,7 @@ extern "C" REX_FUNC(sub_82308300) {
 // source.
 //
 // sub_82500760 registers the engine's Lua globals. In disassembly (Hex-Rays
-// renders this function as a __noreturn stub and truncates the rest, so it has
-// to be read as asm):
+// renders this function as a __noreturn stub and truncates the rest):
 //
 //     addi r4, r10, aRelease@l          ; "RELEASE"
 //     bl   sub_82A9F468                 ; lua_pushstring(L, "RELEASE")
@@ -406,18 +364,15 @@ extern "C" REX_FUNC(sub_82308300) {
 //     function AllowDebugMenu()                       -- MXUI/UI_Helper.lua
 //        if( DEFINE_BuildConfig ~= "RELEASE" ) then return TRUE else return FALSE end
 //
-// FE_Title.lua enables the dev menu on the same test, and RSLibrary.lua
-// installs DebugPrintTable on it. The assets are all still in the packages:
-// MXUI has DB_Menu (.lua/.layer.xml/.swfx), DB_UnitTests.lua and
-// DB_GraphicsTest.swfx, EngineDependencies has DebugOverlay and DebugGraphics.
+// The assets are all still in the packages: MXUI has DB_Menu, DB_UnitTests.lua
+// and DB_GraphicsTest.swfx; EngineDependencies has DebugOverlay and
+// DebugGraphics.
 //
-// SWAPPED AT THE PUSH, not by rewriting the global afterwards. "RELEASE"
-// (0x820468E0) has exactly ONE xref in the binary -- this push -- so an
-// equality test on the pointer cannot touch anything else, and it lands before
-// the setfield rather than racing whatever reads the global first. "DEBUG"
-// (0x8204E1E4) is an existing guest string, so no memory has to be written
-// into the guest to supply the value. The scripts test for inequality against
-// "RELEASE", so any other value would do.
+// SWAPPED AT THE PUSH, not by rewriting the global afterwards. "RELEASE" has
+// exactly ONE xref in the binary -- this push -- so an equality test on the
+// pointer cannot touch anything else, and it lands before the setfield rather
+// than racing whatever reads the global first. "DEBUG" is an existing guest
+// string, so no memory has to be written into the guest.
 REX_IMPORT(__imp__sub_82A9F468, orig_LuaPushString, void());
 extern "C" REX_FUNC(sub_82A9F468) {
   if (DevFlag("menu") && ctx.r4.u32 == 0x820468E0u) {
@@ -435,27 +390,21 @@ extern "C" REX_FUNC(sub_82A9F468) {
 // guest_print_log -- the guest's own print() output, which the retail build
 // throws away.
 //
-// Lua's `print` is registered in sub_82500760 as a C closure whose function is
-// sub_829E8FA8 -- the folded `return 0;` body. So every print() in the shipped
-// scripts formats nothing and returns, and there is no TTY channel to capture:
-// the output was never produced. The scripts print a lot (chunk load banners,
-// "FE_Title:OnMovieStart - <state>", routing decisions in
-// SH_FrontEndLoading:Route), and all of it is lost.
+// Lua's `print` is registered as a C closure whose function is the folded
+// `return 0;` body, so every print() in the shipped scripts formats nothing and
+// returns. The scripts print a lot -- chunk load banners, state transitions,
+// routing decisions -- and all of it is lost.
 //
 // Captured at the SCRIPT DISPATCHER rather than at the stub, because the
-// dispatcher is where the lua_State and the argument list are both in hand.
-// The stub itself is folded and shared, so a hook there would have neither.
+// dispatcher is where the lua_State and the argument list are both in hand. The
+// stub itself is folded and shared, so a hook there would have neither.
 //
 // The cfunc match is on that folded address, so a call to any OTHER stubbed
 // binding lands here too. That is why only calls with a non-empty STRING first
-// argument are written: a stub that is not print does not take one, and a
-// print with nothing to say is not worth a line. The file is self-evidencing
-// either way -- if the contents read like the game's own log messages, it is
-// print; if they read like nothing, the heuristic is wrong and it is visible
-// immediately.
+// argument are written. The file is self-evidencing either way -- if the
+// contents read like the game's own log messages, it is print.
 //
-// Its own file, so the main log stays readable and the guest's voice is not
-// interleaved with ours.
+// Its own file, so the main log stays readable.
 namespace {
 std::mutex g_printMu;
 std::ofstream g_printFile;

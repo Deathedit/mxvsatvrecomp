@@ -3,27 +3,23 @@
 // Write every decoded guest texture to logs/texdump as a PNG, so a texture can
 // be LOOKED AT rather than reasoned about.
 //
-// The dump sits at the D3D9 stage, immediately after DecodeHleTexture2D, so
-// what lands on disk is exactly the bytes the shader samples: guest memory,
-// untiled, endian-swapped, mip level 0, with the fetch constant's swizzle
-// applied the same way the SRV applies it. Nothing here re-derives geometry --
-// it walks HleTexturePayload::levels, which the decoder already filled.
+// The dump sits at the D3D9 stage, immediately after DecodeHleTexture2D, so what
+// lands on disk is exactly the bytes the shader samples: guest memory, untiled,
+// endian-swapped, mip level 0, with the fetch constant's swizzle applied the
+// same way the SRV applies it.
 //
 // WHAT IT CANNOT SEE. A texture only reaches this path when it is BOUND TO A
 // SAMPLER. A resolve destination the guest renders into and never samples --
 // which is what the menu backdrop is believed to be -- produces no binding and
-// therefore no file. A missing texture in this dump means "never sampled", not
-// "never produced".
+// therefore no file. A missing texture here means "never sampled", not "never
+// produced".
 //
-// Bink's video planes are deliberately NOT dumped. They are new guest memory
+// Bink's video planes are deliberately NOT dumped: they are new guest memory
 // every video frame under a per-frame key, so dumping them would write four
-// files 30 times a second and reach the cap before the menu appears -- and Bink
-// has already been ruled out as the missing content.
+// files 30 times a second and reach the cap before the menu appears.
 //
-// Off unless `texture_dump = true` in mx.toml (or --texture_dump=true). It
-// encodes on the calling thread and will hitch on the first draw that binds a
-// texture it has not seen; that is acceptable for a one-shot diagnostic and is
-// the reason it is not on by default.
+// Off unless `texture_dump = true`. It encodes on the calling thread and will
+// hitch on the first draw that binds a texture it has not seen.
 
 #include <cstdint>
 

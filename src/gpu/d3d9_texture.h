@@ -79,56 +79,52 @@ struct HleTextureSource {
   //
   // So this selects the address function in DecodeHleTexture2D, and
   // slice_stride_bytes stays 0 for a volume. The host resource is a
-  // Texture2DArray either way -- see the note on the layer axis in
-  // shader_hlsl.cpp's 3D fetch.
+  // Texture2DArray either way.
   bool volume = false;
   // Set alongside a REJECT to say which kind of reject it was: the fetch
   // constant is not merely a shape we do not support, it is one the reference
   // itself calls invalid. Xenia's response is to drop the BINDING and keep
   // drawing -- an invalid key samples zero -- so a caller that would otherwise
-  // fail the whole draw should bind zero instead and let the guest's shader
-  // run. The distinction matters: refusing the draw discards every other
-  // slot's correct shading over one slot the shader may not even read.
+  // fail the whole draw should bind zero instead. Refusing the draw discards
+  // every other slot's correct shading over one slot the shader may not read.
   bool sample_as_zero = false;
   // PACKED MIP TAIL. A texture whose width OR height is 16 or smaller does not
   // store its BASE level plainly at base_address: the level lives inside a mip
-  // tail, offset by these block counts. From the SDK,
-  // rex/graphics/pipeline/texture/util.h:77 -- "the mip tail can be used both
-  // for the base level and mips (1...) if the entire texture has width or
-  // height of 16 or smaller", and the game's own tiling routine checks only the
-  // packed flag, never the level.
+  // tail, offset by these block counts. From the SDK (pipeline/texture/util.h:77
+  // -- "the mip tail can be used both for the base level and mips (1...) if the
+  // entire texture has width or height of 16 or smaller"), and the game's own
+  // tiling routine checks only the packed flag, never the level.
   //
-  // The offsets are not decorative. Measured against the SDK for an 8x8 DXT1
-  // the base sits at x=4 blocks, and for an 8x8 k_8_8_8_8 at x=16 -- so reading
-  // from the origin returns a whole texture's worth of unrelated bytes. Zero
-  // for anything larger than 16, and zero when the fetch constant does not set
-  // packed_mips.
+  // The offsets are not decorative: for an 8x8 DXT1 the base sits at x=4 blocks
+  // and for an 8x8 k_8_8_8_8 at x=16, so reading from the origin returns a whole
+  // texture's worth of unrelated bytes. Zero for anything larger than 16, and
+  // zero when the fetch constant does not set packed_mips.
   uint32_t packed_offset_x_blocks = 0;
   uint32_t packed_offset_y_blocks = 0;
-  // THE MIP CHAIN. The guest allocates it SEPARATELY from the base level, at
-  // its own address (xenos.h:1249-1266: mip_address is stored >> 12 like
-  // base_address, and the levels run mip_min_level..mip_max_level). Measured
-  // over 460,000 binds in a level: 29% carry a chain, at a readable address,
-  // up to twelve levels deep, and every one of them sets packed_mips.
+  // THE MIP CHAIN. The guest allocates it SEPARATELY from the base level, at its
+  // own address (xenos.h:1249: mip_address is stored >> 12 like base_address,
+  // and the levels run mip_min_level..mip_max_level). Measured over 460,000
+  // binds in a level: 29% carry a chain, at a readable address, up to twelve
+  // levels deep, and every one sets packed_mips.
   //
   // mip_address is zero when there is no chain, and that ZERO WINS over a
   // non-zero mip_max_level -- 81,934 binds in that run declare levels with no
-  // address, which the reference collapses to a single level
-  // (xenia/gpu/texture_util.cc:82). The fields below are the raw fetch values;
-  // level_count is what survived that normalisation.
+  // address, which the reference collapses to a single level. The fields below
+  // are the raw fetch values; level_count is what survived that normalisation.
   uint32_t mip_address = 0;
   uint32_t mip_min_level = 0;
   uint32_t mip_max_level = 0;
-  // The fetch constant's LOD bias, RAW and signed -- the 10-bit field at bit
-  // 12 of dword 4, not yet scaled. The scale is 1/32, per the reference
-  // (xenia sampler_info.cc:45), NOT the 1/16 the INSTRUCTION's bias uses. This
-  // stays raw so the unit lives at exactly one call site instead of being
-  // baked into a field name that was wrong once already.
-  // COUNTED for a long time (MIP CHAIN's `lod_bias N`) and never carried, so
-  // there was no way to ask whether a PARTICULAR texture has one. Recorded now
-  // because which mip a texture samples is the live question for the terrain
-  // page table, and this is the one per-texture control over it that we do not
-  // implement -- D3D12_SAMPLER_DESC::MipLODBias appears nowhere in the tree.
+  // The fetch constant's LOD bias, RAW and signed -- the 10-bit field at bit 12
+  // of dword 4, not yet scaled. The scale is 1/32 per the reference (sampler_
+  // info.cc:45), NOT the 1/16 the INSTRUCTION's bias uses. Kept raw so the unit
+  // lives at exactly one call site instead of being baked into a field name that
+  // was wrong once already.
+  //
+  // COUNTED for a long time and never carried, so there was no way to ask
+  // whether a PARTICULAR texture has one. Recorded now because which mip a
+  // texture samples is the live question for the terrain page table, and this is
+  // the one per-texture control over it that we do not implement --
+  // D3D12_SAMPLER_DESC::MipLODBias appears nowhere in the tree.
   int32_t lod_bias_raw = 0;
   // TextureFilter: kPoint(0), kLinear(1), kBaseMap(2). kBaseMap means the guest
   // never wants to minify past level 0, and we honour it by not building a
@@ -158,10 +154,9 @@ const char* GuestTextureFormatName(uint32_t guest_format);
 //
 // This has to be permuted because the swizzle is applied by the SRV's component
 // mapping, not in the shader: by the time the shader sees a texel, component c
-// holds guest component swizzle[c], so it needs guest component swizzle[c]'s
-// sign. A swizzle entry of 4 or 5 forces a literal 0 or 1, which carries no
-// guest component and is therefore unsigned. Mirrors the reference's
-// SwizzleSigns (pipeline/texture/util.h:309).
+// holds guest component swizzle[c], so it needs that component's sign. A swizzle
+// entry of 4 or 5 forces a literal 0 or 1, which carries no guest component and
+// is therefore unsigned. Mirrors the reference's SwizzleSigns.
 //
 // Returns two bits per host component in XYZW order, same packing as
 // HleTextureSource::signs.
@@ -204,8 +199,8 @@ HleMipCensus HleMipChainStats();
 // Nothing has ever asked. Every tiled 2D texture in the game goes through
 // tu::GetTiledOffset2D, and the mip self-check cannot cover it: that compares
 // level n against a box-filtered level n-1, so an addressing error applied
-// consistently to both levels scrambles them identically and still passes. It is
-// a relative check; this is the absolute one.
+// consistently to both scrambles them identically and still passes. It is a
+// relative check; this is the absolute one.
 //
 // Run once per process over a coordinate sweep at every block size, against a
 // transcription of xenia-edge's own implementation. `mismatched == 0` is the
@@ -249,9 +244,9 @@ bool HleTextureHasNonzeroData(const HleTexturePayload& texture,
 // Returns true when every byte of the decoded base mip is the same value, and
 // reports it. The companion to the test above for the case it cannot see: guest
 // memory the CPU never writes reads back all-0xFF as readily as all-zero, and
-// only the zero form is "empty" to HleTextureHasNonzeroData. Callers should use
-// this ONLY where a better source exists to fall back to -- a uniform decode is
-// suspicious, not proof, and a genuinely flat texture is legal.
+// only the zero form is "empty" to HleTextureHasNonzeroData. Use this ONLY where
+// a better source exists to fall back to -- a uniform decode is suspicious, not
+// proof, and a genuinely flat texture is legal.
 bool HleTextureIsConstant(const HleTexturePayload& texture,
                           uint8_t* value = nullptr);
 

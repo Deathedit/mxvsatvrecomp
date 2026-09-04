@@ -19,12 +19,11 @@ void ReportHostPageQueryStats();
 
 // Guest D3D9 draw calls so far, counted in BOTH native and plugin mode.
 //
-// Every other draw counter in this layer sits after
-// MX_D3D9_PLUGIN_PASSTHROUGH and so reads zero under --gpu_plugin=xenos, which
-// makes the two modes incomparable on the one number that decides where the
-// missing main-menu backdrop lives. See the note at its definition in
-// hooks_d3d9_internal.h. Exposed as a function rather than the atomic itself
-// because hooks_frame.cpp cannot include the internal header.
+// Every other draw counter in this layer sits after MX_D3D9_PLUGIN_PASSTHROUGH
+// and so reads zero under --gpu_plugin=xenos, which makes the two modes
+// incomparable on the one number that decides where the missing main-menu
+// backdrop lives. Exposed as a function rather than the atomic itself because
+// hooks_frame.cpp cannot include the internal header.
 uint64_t GuestDrawCalls();
 
 // The exits that make FRAME DRAWS' `guest` exceed `accepted + refused`. Without
@@ -40,36 +39,30 @@ std::string UnbuiltSkipBreakdown();
 // HLE draws this layer ACCEPTED into the frame draw list and REFUSED, both
 // cumulative.
 //
-// Counted in FinishHleDraw, which is where a built draw becomes one the
-// renderer will issue. The first cut of this used the DEFERRED queue
-// (g_pendingQueued) and reported `queued 0` on a native run whose capture
-// contains 340 host draws -- that queue only holds draws with no shader code
-// yet, waiting on the frame's PM4 packets, and is legitimately zero on a normal
-// frame. It sits at a push_back, which is what made it look like the draw
-// submission point. Check a counter against something already known to be true
-// before drawing a conclusion from it.
+// Counted in FinishHleDraw, where a built draw becomes one the renderer will
+// issue. The first cut used the DEFERRED queue and reported `queued 0` on a
+// native run whose capture contains 340 host draws -- that queue only holds
+// draws with no shader code yet, and is legitimately zero on a normal frame. It
+// sits at a push_back, which is what made it look like the submission point.
 //
 // The pair exists to be compared against GuestDrawCalls() in the same run and
-// the same counter family. mxmenu.rdc showed the menu backdrop is not a draw we
-// render wrongly -- it is not in the frame at all -- and the open question is
-// whether the guest ever submitted it. Three outcomes:
+// the same counter family. A capture showed the menu backdrop is not a draw we
+// render wrongly -- it is not in the frame at all -- so:
 //
-//   guest == accepted           the guest never submits the background, and
-//                               the defect is guest-state, not translation.
+//   guest == accepted           the guest never submits the background, and the
+//                               defect is guest-state, not translation.
 //   guest >  accepted+refused   guest draws vanish before BuildAndQueueDraw.
 //   refused > 0                 we build them and throw them away; the skip
 //                               histogram says which gate.
 //
-// Do NOT compare either of these against FRAME COST. That line counts
-// shader-output ATTEMPTS and only prints on cost-gated frames; pitting it
-// against a guest-entry counter across two modes is the exact cross-counter
-// error recorded in backdrop-is-not-missing-draws. These two and
-// GuestDrawCalls() are one family: all three count whole draws, all three are
-// cumulative, and the only difference is how far down the pipe the draw got.
+// Do NOT compare either against FRAME COST. That line counts shader-output
+// ATTEMPTS and only prints on cost-gated frames; pitting it against a
+// guest-entry counter across two modes is the exact cross-counter error
+// recorded in backdrop-is-not-missing-draws. These three are one family: all
+// count whole draws, all cumulative, differing only in how far down the pipe.
 //
-// Plain uint64_t behind a function, like GuestDrawCalls: written on guest draw
-// threads without a lock, so a read can lag by a draw or two. Fine for a
-// per-frame delta, and not worth an atomic on the draw path.
+// Plain uint64_t behind a function, written on guest draw threads without a
+// lock, so a read can lag by a draw or two. Fine for a per-frame delta.
 uint64_t HleDrawsAccepted();
 uint64_t HleDrawsRefused();
 
@@ -77,13 +70,11 @@ uint64_t HleDrawsRefused();
 // many of those carried rects, and how many GetTexture calls failed.
 //
 // Declared here rather than in hooks_d3d9_internal.h because the caller is the
-// frame hook, which does not include the internal header -- and must not start
-// to, given that header's include-order requirement.
+// frame hook, which does not include that header and must not start to.
 //
-// The reason it is a separate reporter and not another line inside the flush
-// hook: the thing being diagnosed is a run with ZERO flushes, and a line that
-// prints only when a flush happens renders that case as silence. Call it on a
-// swap cadence so every one of these being zero is itself a readable result.
+// A separate reporter rather than another line inside the flush hook because
+// the thing being diagnosed is a run with ZERO flushes, and a line that prints
+// only when a flush happens renders that case as silence.
 void ReportGlyphCache();
 
 // PHASE 1 CHECK for the stencil plumbing. Call from the CONSUMER of a DrawCall,

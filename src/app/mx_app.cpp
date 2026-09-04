@@ -19,17 +19,15 @@ namespace {
 // Which recompiled guest function does a host RIP land in?
 //
 // A host RVA on its own is unusable: the release build ships no PDB, so the
-// first fault of this kind cost an afternoon of PE archaeology — parse the
-// section table, find PPCFuncMappings by its shape, binary-search it by hand —
-// to turn one address into the guest function to open in IDA. The recompiler
-// already publishes that table; the handler may as well read it.
+// first fault of this kind cost an afternoon of PE archaeology to turn one
+// address into a guest function to open in IDA. The recompiler already publishes
+// that table.
 //
 // PPCFuncMappings is sorted by GUEST address, not by host, so this is a linear
 // sweep for the greatest host entry at or below the RIP, plus the smallest
-// above it. Those two bracket the function, which is what makes the answer a
-// containment result rather than a nearest-neighbour guess: a RIP outside
-// [best, next) is not in recompiled code at all, and saying so is the point.
-// Linear is fine — this runs once, on the way down.
+// above it. Those two bracket the function, which makes the answer a containment
+// result rather than a nearest-neighbour guess: a RIP outside [best, next) is
+// not in recompiled code at all, and saying so is the point.
 struct GuestFuncHit {
   uint32_t guest = 0;
   uint64_t host = 0;
@@ -106,11 +104,11 @@ LONG CALLBACK CrashReporter(EXCEPTION_POINTERS* info) {
   // CONTINUE_EXECUTION, because Windows has already cleared the guard bit for
   // the faulting page and the instruction will now succeed.
   //
-  // The discriminator that makes this probe worth anything is here: the faulting
-  // RIP is resolved against PPCFuncMappings, and the access only counts as the
-  // GUEST's when it lands inside recompiled code. Our own writeback writes this
-  // buffer and the texture fingerprint reads it, so without that test the watch
-  // would answer its own question with our own traffic.
+  // The discriminator that makes this probe worth anything: the faulting RIP is
+  // resolved against PPCFuncMappings, and the access only counts as the GUEST's
+  // when it lands inside recompiled code. Our own writeback writes this buffer
+  // and the texture fingerprint reads it, so without that test the watch would
+  // answer its own question with our own traffic.
   if (rec->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) {
     const uint64_t fault = static_cast<uint64_t>(rec->ExceptionInformation[1]);
     const uint64_t modbase_watch =
@@ -124,17 +122,16 @@ LONG CALLBACK CrashReporter(EXCEPTION_POINTERS* info) {
       const GuestFuncHit hit = ResolveGuestFunction(rip);
       // THE FULL ATTRIBUTION RULE, not just containment.
       //
-      // The first cut of this used `hit.guest && (!hit.next_host || rip <
-      // next_host)` and immediately reported our OWN writeback as "FROM GUEST
-      // CODE" -- at +0x9014E5C5C past a 0x60-byte function, i.e. 38 GB. When
-      // next_host is 0 (a RIP above every mapping, which is where host code
-      // lives) that test accepts anything.
+      // The first cut used `hit.guest && (!hit.next_host || rip < next_host)`
+      // and immediately reported our OWN writeback as "FROM GUEST CODE" -- at
+      // +0x9014E5C5C past a 0x60-byte function, i.e. 38 GB. When next_host is 0
+      // (a RIP above every mapping, which is where host code lives) that test
+      // accepts anything.
       //
-      // A probe that answers its own question with our own traffic is worse
-      // than no probe, and this file already documents the two signals that
-      // catch it -- see the crash report below: the host/guest size ratio, and
-      // the absence of a PPCContext in the argument registers, which every
-      // recompiled function has. Both are required here.
+      // A probe that answers its own question with our own traffic is worse than
+      // no probe. Both signals the crash report already documents are required
+      // here: the host/guest size ratio, and the absence of a PPCContext in the
+      // argument registers, which every recompiled function has.
       const uint64_t off = hit.guest ? rip - hit.host : 0;
       const bool implausible =
           !hit.guest_size || off > uint64_t(hit.guest_size) * 24ull;
@@ -183,31 +180,27 @@ LONG CALLBACK CrashReporter(EXCEPTION_POINTERS* info) {
 
     // WHERE THE FAULT IS, AND HOW MUCH THAT CLAIM IS WORTH.
     //
-    // The containment test below is `rip < next_host`, and next_host is the
-    // next mapped function in HOST order. That is not a bound on THIS
-    // function's body: anything the linker placed in the gap -- runtime
-    // helpers, host code, padding -- is inside [host, next_host) and gets
-    // attributed here anyway. So a RIP well past the end of a small function
-    // still reported as "in" it, confidently and wrongly.
+    // The containment test is `rip < next_host`, and next_host is the next
+    // mapped function in HOST order. That is not a bound on THIS function's
+    // body: anything the linker placed in the gap -- runtime helpers, host code,
+    // padding -- is inside [host, next_host) and gets attributed here anyway.
     //
-    // That is not hypothetical. The recurring UI-thread fault in this build
-    // (read at guest 0x4C69746C, "Litl" in ASCII -- a string being used as a
-    // pointer) reported for its entire history as
+    // Not hypothetical. The recurring UI-thread fault in this build (a read at
+    // guest 0x4C69746C, "Litl" in ASCII -- a string used as a pointer) reported
+    // for its entire history as
     //
     //     -> in recompiled guest function 0x8236EB30 (+0x1078 of host code)
     //
-    // while 0x8236EB30 is 0x7C guest bytes long. 0x1078 of host code for 0x7C
-    // of guest is ~34 host bytes per guest BYTE, an order out. And the
-    // register dump below never printed for it, meaning GuestContextFrom found
-    // no PPCContext in the argument registers -- which recompiled functions
-    // always have. Two independent signals that the RIP was not in recompiled
-    // code at all, and the line asserted otherwise across 17 crashes.
+    // while that function is 0x7C guest bytes long: ~34 host bytes per guest
+    // BYTE, an order out. And the register dump never printed for it, meaning
+    // GuestContextFrom found no PPCContext -- which recompiled functions always
+    // have. Two independent signals that the RIP was not in recompiled code at
+    // all, and the line asserted otherwise across 17 crashes.
     //
-    // So the claim now carries its evidence: the offset is reported against
-    // the function's guest size, and the absence of a PPCContext is stated
-    // rather than left as a missing line. An honest "I do not know" is worth
-    // more than a plausible function name, because the name sends you into
-    // IDA after the wrong code.
+    // So the claim now carries its evidence: the offset is reported against the
+    // function's guest size, and the absence of a PPCContext is stated rather
+    // than left as a missing line. An honest "I do not know" is worth more than
+    // a plausible function name.
     const GuestFuncHit hit = ResolveGuestFunction(rip);
     const PPCContext* ctx = GuestContextFrom(info->ContextRecord, gbase);
     if (hit.guest && (!hit.next_host || rip < hit.next_host)) {

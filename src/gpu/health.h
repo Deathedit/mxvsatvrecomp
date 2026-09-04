@@ -2,19 +2,16 @@
 
 // HEALTH CHECKS -- the expectation lives next to the number, not in a comment.
 //
-// THE PROBLEM THIS SOLVES. A run emits ~250 log lines and every one of them is
-// [info]. 393 REXLOG_INFO call sites against 3 REXLOG_WARN, so severity says
-// nothing and there is no way to ask "is anything wrong". Meanwhile 33 places
-// in this tree state an expectation in a COMMENT beside the line that prints
-// the number -- "must stay at 0", "both must read 0", "must match". The log
-// prints the fact; the expectation is three lines up in the source; and the
-// join happens in the reader's head, every time, for every line.
+// THE PROBLEM THIS SOLVES. A run emits ~250 log lines and every one is [info]:
+// 393 REXLOG_INFO call sites against 3 REXLOG_WARN, so severity says nothing and
+// there is no way to ask "is anything wrong". Meanwhile 33 places in this tree
+// state an expectation in a COMMENT beside the line that prints the number --
+// "must stay at 0", "both must read 0", "must match" -- and the join happens in
+// the reader's head, every time.
 //
 // It does not survive contact. `decl-source ... unknown=N` carries the comment
-// "must stay at 0 or the field is not what SetVertexDeclaration writes". It has
-// never been 0 in any run anyone looked at, and nothing ever said so.
-//
-// So: state the expectation HERE, in code, and let the line classify itself.
+// "must stay at 0"; it has never been 0 in any run anyone looked at, and nothing
+// ever said so.
 //
 // THREE VERDICTS, AND THE THIRD IS THE POINT.
 //
@@ -23,28 +20,19 @@
 //   UNMEASURED  the population was zero -- nothing was asked, so nothing is
 //               known
 //
-// UNMEASURED IS NEVER ok. That distinction is the whole reason this exists.
-// This project has lost multiple sessions to a zero that meant "never had the
-// chance to fire" being read as "healthy":
+// UNMEASURED IS NEVER ok. This project has lost multiple sessions to a zero that
+// meant "never had the chance to fire" being read as "healthy": a reason-code
+// chain with an unreachable branch; menu-only runs reporting every resource cap
+// healthy when a level needs 67 of a 64 cap; "VFETCH coverage: 30573 of 42".
 //
-//   - a reason-code chain ordered so that one branch was unreachable; its 0
-//     was read as a measurement and cost a session
-//   - menu-only runs reporting every resource cap healthy, because a level was
-//     never loaded; the cap was 64 and a level needs 67
-//   - "VFETCH coverage: 30573 of 42", a count divided by a population it was
-//     never counting
-//
-// A fourth state, STALE, catches the other half of the same failure: a check
-// that stopped being evaluated at all. Report() runs on a fixed cadence and
-// stamps a cycle number; a check that did not update this cycle is reported as
-// STALE rather than repeating its last verdict forever. A site that has been
-// compiled out, gated off, or moved behind an early return goes loud instead of
-// freezing at its last good answer.
+// A fourth state, STALE, catches the other half: a check that stopped being
+// evaluated at all. Report() runs on a fixed cadence and stamps a cycle number,
+// so a site compiled out, gated off or moved behind an early return goes loud
+// instead of freezing at its last good answer.
 //
 // WHAT IS NOT HERE. No thresholds invented for lines that have no defensible
 // expectation. A check exists only where the source already asserted one in
-// prose; converting a merely informational counter into a check would mean
-// choosing a bound nobody has justified, which is how a report starts lying.
+// prose; inventing a bound nobody has justified is how a report starts lying.
 
 #include <cstddef>
 #include <cstdint>
@@ -64,12 +52,12 @@ enum class Verdict : uint8_t {
 // inline, at the end of the line that carries the number.
 const char* Tag(Verdict v);
 
-// The four shapes that cover every expectation currently written in a comment
-// in this tree. Each returns its verdict so the caller can print it on its own
-// line as well as have it counted.
+// The four shapes that cover every expectation currently written in a comment in
+// this tree. Each returns its verdict so the caller can print it on its own line
+// as well as have it counted.
 //
-// `name` must be stable and greppable: "decl-source.unknown", not a sentence.
-// It is the key, so reusing one name for two quantities silently merges them.
+// `name` must be stable and greppable: "decl-source.unknown", not a sentence. It
+// is the key, so reusing one name for two quantities silently merges them.
 
 // "this must read 0". `population` is what it was counted OUT OF -- the number
 // of opportunities the zero is a claim about. Pass it honestly: a zero out of
@@ -99,16 +87,15 @@ Verdict AtMost(const char* name, uint64_t value, uint64_t population,
 // pass and from one place.
 std::string Report();
 
-// Checks that turned BAD since the last call, rendered ready to log, and
-// cleared by the call. This module deliberately does not log: keeping it free
-// of the SDK's logging dependency is what lets it be built and tested on its
-// own, the same arrangement guard_census.cpp uses. The caller emits these at
-// WARN so severity finally distinguishes a finding from a fact.
+// Checks that turned BAD since the last call, rendered ready to log, and cleared
+// by the call. This module deliberately does not log: keeping it free of the
+// SDK's logging dependency is what lets it be built and tested on its own. The
+// caller emits these at WARN so severity finally distinguishes a finding from a
+// fact.
 //
 // Only the TRANSITION into BAD is reported, not every cycle a check stays bad:
 // reports run several times a minute and a stuck check would bury everything
-// else. Nothing is hidden by that -- Report() carries every check's current
-// verdict on every pass.
+// else. Nothing is hidden -- Report() carries every check's current verdict.
 std::vector<std::string> DrainNewlyBad();
 
 // How many checks this build declares. The report's total is this plus any

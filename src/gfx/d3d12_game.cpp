@@ -1,19 +1,18 @@
-// D3D12Renderer — game pipeline, offscreen game render target, and present.
+// D3D12Renderer -- game pipeline, offscreen game render target, and present.
 //
 // The game PSO takes a position+color+uv vertex layout with an MVP constant
-// buffer. It draws the guest's own vertex/index data as fed to AddGameDraw —
-// every draw the frame produced, each with its own transform and topology.
-// Geometry renders into a dedicated 1280x720 render target + D32 depth buffer,
-// which PresentGameFrame copies to the current swapchain backbuffer.
+// buffer, and draws the guest's own vertex/index data as fed to AddGameDraw.
+// Geometry renders into a dedicated 1280x720 target + D32 depth buffer, which
+// PresentGameFrame copies to the current swapchain backbuffer.
 //
-// CreateGamePipeline used to bake in a placeholder triangle, drawn until the
-// guest produced geometry of its own. It was a startup output check and is gone
-// as of 2026-08-07; a frame with nothing to draw now shows the clear colour.
+// CreateGamePipeline used to bake in a placeholder triangle drawn until the
+// guest produced geometry of its own; it is gone, and a frame with nothing to
+// draw now shows the clear colour.
 //
 // Note the PSO leaves DepthStencilState zeroed, so depth test is off and guest
-// geometry at z = 1.0 is not rejected. DSVFormat is set anyway, to match the
-// DSV BeginFrame binds — leaving it UNKNOWN while a D32_FLOAT view is bound is
-// a debug-layer error, and the two must agree before depth can be turned on.
+// geometry at z = 1.0 is not rejected. DSVFormat is set anyway, to match the DSV
+// BeginFrame binds -- leaving it UNKNOWN while a D32_FLOAT view is bound is a
+// debug-layer error, and the two must agree before depth can be turned on.
 
 #include "gfx/d3d12_renderer.h"
 
@@ -71,14 +70,13 @@ using mx::gfx::LogInfo;
 // One sampler variant, from the three bits that describe it: clamp on U, clamp
 // on V, and point rather than linear filtering. Xenos has more address modes
 // than these; every mode that is not plain repeat is treated as clamp-to-edge,
-// which is the distinction that matters at a surface edge. Mirror and border
-// are not modelled.
+// which is the distinction that matters at a surface edge. Mirror and border are
+// not modelled.
 //
-// MaxLOD used to be pinned to 0 because only the base mip was ever uploaded, so
-// there was no chain for a filter to select from. Now there is, and the pin
-// survives only for kSamplerBaseMap -- the guest's own "never minify past level
-// 0", which the reference expresses the same way (MaxLOD = MinLOD, see
-// xenia/gpu/d3d12/d3d12_texture_cache.cc:1086).
+// MaxLOD used to be pinned to 0 because only the base mip was ever uploaded.
+// Now there is a chain, and the pin survives only for kSamplerBaseMap -- the
+// guest's own "never minify past level 0", which the reference expresses the
+// same way (MaxLOD = MinLOD).
 D3D12_SAMPLER_DESC D3D12Renderer::SamplerVariantDesc(uint32_t variant) {
   variant &= kSamplerClampU | kSamplerClampV | kSamplerPoint | kSamplerBaseMap |
              kSamplerMipPoint;
@@ -158,16 +156,15 @@ bool D3D12Renderer::CreateGamePipeline() {
   srvRange.OffsetInDescriptorsFromTableStart = 0;
 
   // The sampler is chosen PER DRAW, from a heap, rather than baked in as a
-  // static one. The guest's address mode is per texture: d3d9_texture.cpp
-  // decodes clamp_x/clamp_y off the fetch constant and carries them all the way
-  // to HleTexturePayload, and the renderer used to discard them and sample
-  // everything WRAP. A fullscreen post-process pass reaching a hair past the
-  // edge then wrapped to the opposite side and linearly blended across the
-  // seam - measured as a symmetric ramp to black over the last 13 of 720 rows.
+  // static one. The guest's address mode is per texture and the renderer used to
+  // discard it and sample everything WRAP: a fullscreen post-process pass
+  // reaching a hair past the edge then wrapped to the opposite side and blended
+  // across the seam -- measured as a symmetric ramp to black over the last 13 of
+  // 720 rows.
   //
   // A descriptor table costs one root parameter and keeps the pixel shader and
-  // the PSO table untouched; encoding the mode as PSO bits would have
-  // multiplied an already 32-entry table that is built up front.
+  // the PSO table untouched; encoding the mode as PSO bits would have multiplied
+  // an already 32-entry table built up front.
   D3D12_DESCRIPTOR_RANGE samplerRange = {};
   samplerRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
   samplerRange.NumDescriptors = 1;
@@ -455,21 +452,17 @@ bool D3D12Renderer::CreatePresentQuad() {
 
 // An HRESULT with its name where there is one.
 //
-// Every D3D12 creation failure in this file used to log the fact and discard
-// the code, which makes a bare "creation failed" indistinguishable between
+// Every D3D12 creation failure in this file used to log the fact and discard the
+// code, which makes a bare "creation failed" indistinguishable between
 // out-of-memory, an invalid format combination and a device that has already
 // gone. That cost a session: a depth-format change removed the device, and the
-// only evidence was `resolve snapshot: creation FAILED for 64x64` with no code
-// and 40,000 lines of downstream noise after it.
+// only evidence was `resolve snapshot: creation FAILED for 64x64` with no code.
 //
 // An earlier version of this comment claimed the debug layer and DRED were
-// unavailable here because one run logged `D3D12GetDebugInterface HR=0x80004002`.
-// That was WRONG and is corrected rather than deleted, because the wrong version
-// was used to argue that guessing was the only option. Graphics Tools IS
-// installed (d3d12SDKLayers.dll is in System32), a standalone probe gets
-// ID3D12Debug, ID3D12Debug1 and both DRED settings interfaces with S_OK, and a
-// later run logged "DRED enabled". Read the CURRENT run's DRED line before
-// concluding anything about what is available.
+// unavailable here, and that was WRONG -- corrected rather than deleted, because
+// the wrong version was used to argue that guessing was the only option.
+// Graphics Tools IS installed and a later run logged "DRED enabled". Read the
+// CURRENT run's DRED line before concluding anything about what is available.
 //
 // The HRESULT still earns its place: the debug layer is off by default in a
 // release build (MX_D3D12_DEBUG=1, or 2 for GPU-based validation), so an
@@ -501,23 +494,20 @@ std::string HrText(HRESULT hr) {
 
 // A resource's format expressed as one a shader-resource view can use.
 //
-// Most formats view as themselves and pass straight through. TYPELESS ones
-// cannot: CreateShaderResourceView rejects them and D3D12 removes the device
-// with DXGI_ERROR_INVALID_CALL.
+// Most formats view as themselves. TYPELESS ones cannot: CreateShaderResourceView
+// rejects them and D3D12 removes the device with DXGI_ERROR_INVALID_CALL.
 //
 // That failure is worth describing because it does not look like what it is.
 // The removal is triggered by an invalid CPU-side call, so there is no faulting
-// GPU work and DRED reports "every command list completed; no faulting op" with
-// no page fault — which reads as though the device died for no reason. Every
-// later Create* call then returns DEVICE_REMOVED, so the first error in the log
-// is some unrelated innocent allocation. Only the debug layer names it
-// (MX_D3D12_DEBUG=1), and it is off by default.
+// GPU work and DRED reports "every command list completed; no faulting op" --
+// which reads as though the device died for no reason. Every later Create* call
+// then returns DEVICE_REMOVED, so the first error in the log is some unrelated
+// innocent allocation. Only the debug layer names it, and it is off by default.
 //
 // The depth entries are the ones that matter here: the game depth surface is
-// R32G8X24_TYPELESS so that one allocation can carry both a DSV and an SRV, and
-// its depth plane views as R32_FLOAT_X8X24_TYPELESS. R32_TYPELESS/R24G8 are
-// included because the same rule governs them and a future format change
-// should not have to rediscover this.
+// R32G8X24_TYPELESS so one allocation can carry both a DSV and an SRV, and its
+// depth plane views as R32_FLOAT_X8X24_TYPELESS. R32_TYPELESS/R24G8 are included
+// because the same rule governs them.
 DXGI_FORMAT SrvFormatForResource(DXGI_FORMAT resourceFormat) {
   switch (resourceFormat) {
     case DXGI_FORMAT_R32G8X24_TYPELESS:
@@ -535,15 +525,14 @@ DXGI_FORMAT SrvFormatForResource(DXGI_FORMAT resourceFormat) {
 //
 // These are the Xenos hardware values, NOT the PC D3D9 D3DBLEND enum. Measured:
 // the front end sets src 6, dest 7, op 0. Under the PC enum that reads
-// INVSRCALPHA / DESTALPHA / an op that does not exist — D3DBLENDOP starts at 1,
+// INVSRCALPHA / DESTALPHA / an op that does not exist -- D3DBLENDOP starts at 1,
 // so a zero op alone rules that enum out. Under the Xenos values it is
-// SRC_ALPHA / ONE_MINUS_SRC_ALPHA / ADD, which is ordinary UI alpha blending
-// and what the overlays plainly want.
+// SRC_ALPHA / ONE_MINUS_SRC_ALPHA / ADD, ordinary UI alpha blending.
 //
 // Returns false for anything not listed rather than substituting a default: a
 // wrong blend factor still draws, so a silent fallback would be a visible bug
 // with nothing in the log pointing at it. An unmapped factor leaves the draw
-// opaque — what it was before blending existed — and is counted.
+// opaque and is counted.
 bool ToD3D12Blend(uint32_t guest, bool alpha_channel, D3D12_BLEND& out) {
   switch (guest) {
     case 0:  out = D3D12_BLEND_ZERO; return true;
@@ -590,7 +579,7 @@ uint64_t g_blendBudget = 0;     // draws refused because the cache was full
 //
 // Separate from the stand-in pipeline in every respect that matters: its own
 // root signature, its own vertex shader, its own input layout. That separation
-// is the point — the stand-in path renders the game today, and the translated
+// is the point -- the stand-in path renders the game today, and the translated
 // path is not allowed to change the layout it depends on in order to exist.
 //===========================================================================
 bool D3D12Renderer::CreateTranslatedRootSignature() {
@@ -615,11 +604,9 @@ bool D3D12Renderer::CreateTranslatedRootSignature() {
   //
   // Not a collision: ShaderVisibility scopes a register to a stage, so a
   // VERTEX-visible table at s0 and a PIXEL-visible one at s0 are different bind
-  // points and each stage reads its own descriptors. Separate root parameters
-  // rather than making the pixel tables ALL-visible, because the two shaders
-  // are cached independently and their compact slot 0 IS a different guest
-  // sampler -- one shared table would hand the vertex stage the pixel stage's
-  // textures.
+  // points. Separate root parameters rather than making the pixel tables
+  // ALL-visible, because the two shaders are cached independently and their
+  // compact slot 0 IS a different guest sampler.
   //
   // These cannot be moved to higher registers to "keep them apart": vs_5_0 has
   // exactly 16 sampler slots, so anything at s16+ is not a register and FXC
@@ -659,15 +646,15 @@ bool D3D12Renderer::CreateTranslatedRootSignature() {
   params[3].DescriptorTable.pDescriptorRanges = &ranges[1];
   params[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
-  // t16, vertex: the guest's raw vertex buffer, for a vertex shader that
-  // fetches and decodes its own attributes instead of reading input elements
-  // the CPU unpacked.
+  // t16, vertex: the guest's raw vertex buffer, for a vertex shader that fetches
+  // and decodes its own attributes instead of reading input elements the CPU
+  // unpacked.
   //
   // A ROOT SRV, not a table: it needs no descriptor heap slot, takes an upload
   // heap's GPU virtual address directly, and so leaves BindTranslatedTextures
-  // and its block ring completely untouched. t16 because the pixel table
-  // occupies t0..t15 — a register space would have been cleaner but needs
-  // shader model 5.1 and this compiles vs_5_0.
+  // and its block ring untouched. t16 because the pixel table occupies t0..t15
+  // -- a register space would have been cleaner but needs shader model 5.1 and
+  // this compiles vs_5_0.
   params[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
   params[4].Descriptor.ShaderRegister = 16;
   params[4].Descriptor.RegisterSpace = 0;
@@ -712,12 +699,11 @@ bool D3D12Renderer::CreateTranslatedRootSignature() {
     return false;
   }
 
-  // The passthrough vertex shader. The guest vertex shader is not on the GPU
-  // yet — the CPU interpreter still transforms every vertex — so this stage
-  // only forwards the position and the interpolators the interpreter already
-  // computed. Its output signature is exactly the XeInterpolants struct
-  // EmitShaderHlsl declares for the pixel stage, which is what makes the two
-  // link: same order, same count, same semantics.
+  // The passthrough vertex shader. The guest vertex shader is not on the GPU yet
+  // -- the CPU interpreter still transforms every vertex -- so this stage only
+  // forwards the position and the interpolators the interpreter computed. Its
+  // output signature is exactly the XeInterpolants struct EmitShaderHlsl
+  // declares for the pixel stage, which is what makes the two link.
   std::string vs =
       "struct XeInterpolants {\n"
       "  float4 pos : SV_Position;\n";
@@ -838,7 +824,7 @@ uint32_t D3D12Renderer::StencilIndexFor(const GameStencil& st) {
   // unbounded stencil table would reach that cap and start silently dropping
   // draws to their opaque pipeline, which is a wrong picture and not an error.
   //
-  // Past the cap a draw renders WITHOUT stencil rather than being dropped. That
+  // Past the cap a draw renders WITHOUT stencil rather than being dropped, which
   // is the same trade the rest of this file makes, and it is counted.
   constexpr size_t kMaxStencilStates = 64;
   if (m_stencilStates.size() >= kMaxStencilStates) {
@@ -910,15 +896,14 @@ ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
   // The vertex stage, and the input layout that feeds it.
   //
   // Two shapes, because the migration is per draw. With the guest's own vertex
-  // shader, one stream of float4s — one per register the shader reads, at
+  // shader, one stream of float4s -- one per register the shader reads, at
   // TEXCOORD<register>, which is the semantic EmitShaderHlsl declares. Without
   // it, the passthrough stage over two streams: slot 0 the stand-in vertex read
-  // only for its CPU-transformed position, slot 1 the interpolator stream the
-  // interpreter filled.
+  // only for its CPU-transformed position, slot 1 the interpolator stream.
   //
-  // The second shape keeps the stand-in vertex layout untouched, which is why
-  // it was two streams to begin with: interleaving would have meant rebuilding
-  // the vertex the working path depends on.
+  // The second shape keeps the stand-in vertex layout untouched, which is why it
+  // was two streams to begin with: interleaving would have meant rebuilding the
+  // vertex the working path depends on.
   ID3DBlob* vsBlob = m_translatedVsBlob.Get();
   std::vector<D3D12_INPUT_ELEMENT_DESC> layout;
   if (key.vsHandle) {
@@ -997,9 +982,9 @@ ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
   pso.DepthStencilState.DepthWriteMask =
       depthWrite ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
   pso.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
-  // THE PATH THAT ACTUALLY MATTERS. Phases 2 and 3 wired stencil into the
-  // opaque and blended builders and left this one alone, and in a level nearly
-  // every draw is translated -- so the whole thing was inert. The mutation test
+  // THE PATH THAT ACTUALLY MATTERS. Phases 2 and 3 wired stencil into the opaque
+  // and blended builders and left this one alone, and in a level nearly every
+  // draw is translated -- so the whole thing was inert. The mutation test
   // (--d3d9_stencil_force_never) is what exposed it: 99,571 draws forced to
   // NEVER, which cannot pass a fragment, and the screen did not change.
   //
@@ -1089,14 +1074,14 @@ ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
 
 // Xenos ColorRenderTargetFormat -> the host format that can hold it.
 //
-// Read from RB_COLOR_INFO bits [16:19] at draw time. Every offscreen target
-// used to be created RGBA8 regardless, which is correct for the scene (format
-// 0) and destroys anything HDR: the menu's luminance chain is format 3 at
-// 320x180/160x90 and format 6 from 64x64 down to 1x1, so the log-average
-// luminance was being clamped to [0,1] and quantised to 8 bits.
+// Read from RB_COLOR_INFO bits [16:19] at draw time. Every offscreen target used
+// to be created RGBA8 regardless, which is correct for the scene (format 0) and
+// destroys anything HDR: the menu's luminance chain is format 3 at 320x180 and
+// format 6 from 64x64 down to 1x1, so the log-average luminance was being
+// clamped to [0,1] and quantised to 8 bits.
 //
-// 2_10_10_10_FLOAT has no host equivalent and takes RGBA16F, which is what
-// Xenia does: wider than the guest, so nothing is lost.
+// 2_10_10_10_FLOAT has no host equivalent and takes RGBA16F, which is what Xenia
+// does: wider than the guest, so nothing is lost.
 DXGI_FORMAT D3D12Renderer::HostColorFormat(uint32_t guestColorFormat) {
   switch (guestColorFormat) {
     case 0:   // k_8_8_8_8
@@ -1109,24 +1094,21 @@ DXGI_FORMAT D3D12Renderer::HostColorFormat(uint32_t guestColorFormat) {
     case 12:  // k_2_10_10_10_FLOAT_AS_16_16_16_16
     case 7:   // k_16_16_16_16_FLOAT
       return DXGI_FORMAT_R16G16B16A16_FLOAT;
-    // SIGNED FIXED POINT, -32...32 -- not UNORM. From the SDK, xenos.h:305 and
-    // :308 label both of these "Fixed point -32...32", and xenos.h:566 says a
-    // resolve out of them is NOT bitwise equivalent to the texture format:
-    // "k_16_16 and k_16_16_16_16 render target formats, which are signed and
-    // also have a different range, are not equivalent to the respective texture
-    // formats". IsColorResolveFormatBitwiseEquivalent returns false for both.
+    // SIGNED FIXED POINT, -32...32 -- not UNORM. The SDK labels both of these
+    // "Fixed point -32...32" (xenos.h:305, :308) and says a resolve out of them
+    // is NOT bitwise equivalent to the texture format (:566);
+    // IsColorResolveFormatBitwiseEquivalent returns false for both.
     //
     // We resolve with a plain CopyTextureRegion, which IS bitwise -- so calling
     // these UNORM meant the guest wrote values across -32...32, we stored the
     // bits as if they spanned 0...1, and the copy carried the pattern into a
-    // snapshot that a shader then sampled. Measured: the menu's tonemap read
-    // 32736.0 out of the scene colour and produced 40.09, which the 8-bit
-    // target clamped to saturated cyan on the bike.
+    // snapshot a shader then sampled. Measured: the menu's tonemap read 32736.0
+    // out of the scene colour and produced 40.09, which the 8-bit target clamped
+    // to saturated cyan on the bike.
     //
     // A half-float host target holds the whole -32...32 range, keeps the copy
-    // inside one typeless family, and needs no shader-side scale. It trades
-    // some mantissa -- 11 bits against the guest's 16 -- which is the right way
-    // round: a little banding beats a 32x error and a sign flip.
+    // inside one typeless family, and needs no shader-side scale. It trades some
+    // mantissa -- 11 bits against the guest's 16 -- which is the right way round.
     case 4:   // k_16_16
       return DXGI_FORMAT_R16G16_FLOAT;
     case 5:   // k_16_16_16_16
@@ -1134,36 +1116,30 @@ DXGI_FORMAT D3D12Renderer::HostColorFormat(uint32_t guestColorFormat) {
     case 6:   // k_16_16_FLOAT
       return DXGI_FORMAT_R16G16_FLOAT;
     // 14 and 15, NOT 15 and 16. These were off by one against
-    // ColorRenderTargetFormat (xenia-edge xenos.h:315,
-    // `k_32_FLOAT = 14, k_32_32_FLOAT = 15`), so guest 14 fell through to the
-    // RGBA8 default and 15 took the single-channel format. There is no guest
-    // format 16; that arm was dead.
+    // ColorRenderTargetFormat (xenos.h:315, `k_32_FLOAT = 14,
+    // k_32_32_FLOAT = 15`), so guest 14 fell through to the RGBA8 default and 15
+    // took the single-channel format. There is no guest format 16.
     //
-    // What the old values cost: the terrain clipmap renders its heightmap
-    // tiles into 129x129 targets declared k_32_FLOAT, and world height is
-    // metres, not a fraction. Caught with pixel_history at event 17410 -- the
-    // tile shader writes 611.71 and the RGBA8 target stores 1.0. That is the
-    // constant world Y in terrain-is-depth-rejected ("every one of 4225
-    // vertices solves back to world Y = 1.000 against a camera at Y = 616"),
-    // measured across four sessions and never explained. It was a UNORM8
-    // clamp. 15 of a run's targets carry format 14, so this is the terrain,
-    // not a decorative surface.
+    // What the old values cost: the terrain clipmap renders its heightmap tiles
+    // into 129x129 targets declared k_32_FLOAT, and world height is metres.
+    // Caught with pixel_history -- the tile shader writes 611.71 and the RGBA8
+    // target stores 1.0. That is the constant world Y measured across four
+    // sessions and never explained. It was a UNORM8 clamp, and 15 of a run's
+    // targets carry format 14.
     //
-    // KNOWN OPEN CONSEQUENCE, and the reason this looks like a regression on
-    // screen: with real heights the clipmap writes correct near depth (0.876),
-    // and the irregular meshes that actually PAINT the ground are then behind
-    // it -- every one depthTestFailed, so the ground renders as the ambient
-    // term only. Those meshes take their whole world Y from three texture
-    // samples (their vertex buffer carries only grid X and Z) and their
-    // dominant term is a 512x512 that reads min = max = 0.
+    // KNOWN OPEN CONSEQUENCE, and why this looks like a regression on screen:
+    // with real heights the clipmap writes correct near depth (0.876), and the
+    // irregular meshes that actually PAINT the ground are then behind it --
+    // every one depthTestFailed. Those meshes take their whole world Y from
+    // three texture samples and their dominant term is a 512x512 that reads
+    // min = max = 0.
     //
     // Kept anyway: this table states what Xenos does, and the old values were
-    // only ever cancelling that second bug by putting the terrain 600 units
+    // only cancelling that second bug by putting the terrain 600 units
     // underground. Ruled out for the second half, in order: a missing seed,
-    // resolve writeback, a disabled feature (dword_82D55078 = 1), an unhooked
-    // draw entry (sub_82555B88 IS hooked), the wrong depth target, and the
-    // tiled resolve (destpoint is honoured). Unchased lead: vs 0x26E72FE0
-    // slot 0 samples a 2048x2048 at 0x11647000 that none of those three are.
+    // resolve writeback, a disabled feature, an unhooked draw entry, the wrong
+    // depth target, and the tiled resolve. Unchased lead: vs 0x26E72FE0 slot 0
+    // samples a 2048x2048 that none of those three are.
     case 14:  // k_32_FLOAT
       return DXGI_FORMAT_R32_FLOAT;
     case 15:  // k_32_32_FLOAT
@@ -1176,21 +1152,19 @@ DXGI_FORMAT D3D12Renderer::HostColorFormat(uint32_t guestColorFormat) {
 // The guest colour-format nibble, reported once per (object, extent, format).
 //
 // HostColorFormat is many-to-one and the collision matters: guest 5
-// (k_16_16_16_16, signed fixed point -32...32) and guest 7
-// (k_16_16_16_16_FLOAT, a genuine half float) both become
-// R16G16B16A16_FLOAT, so nothing downstream -- not the resource desc, not a
-// RenderDoc capture -- can say which one the guest asked for. That question is
-// load-bearing: if the scene target is 5, values in it carry the -32...32
-// range and a shader reading 0.296 is reading a guest 9.48.
+// (k_16_16_16_16, signed fixed point -32...32) and guest 7 (k_16_16_16_16_FLOAT,
+// a genuine half float) both become R16G16B16A16_FLOAT, so nothing downstream --
+// not the resource desc, not a RenderDoc capture -- can say which the guest
+// asked for. That question is load-bearing: if the scene target is 5, a shader
+// reading 0.296 is reading a guest 9.48.
 //
 // It came up chasing the rider's gear rendering green: its shader computes
-// rcp(luminance(scene snapshot)) and saturates, and the saturate pins at 1 --
-// killing the red channel -- unless that luminance exceeds 3.42. Measured 0.296.
-// Whether that is an 11x error or the correct value depends entirely on this
-// nibble, and there was no way to ask.
+// rcp(luminance(scene snapshot)) and saturates, killing the red channel unless
+// that luminance exceeds 3.42. Measured 0.296. Whether that is an 11x error or
+// the correct value depends entirely on this nibble.
 //
 // Deduplicated because it is called per draw. The set is small: one entry per
-// distinct target, which is tens across a run, not thousands.
+// distinct target, tens across a run.
 void LogGuestColorFormat(uint32_t object, uint32_t width, uint32_t height,
                          uint32_t guestColorFormat) {
   if (!object) return;
@@ -1210,12 +1184,12 @@ void LogGuestColorFormat(uint32_t object, uint32_t width, uint32_t height,
 
 // Which topology GROUP a PSO must declare for this topology to be legal against
 // it. Not a nicety: a LINESTRIP draw submitted to a PSO built for TRIANGLE is
-// refused outright by the runtime —
+// refused outright by the runtime --
 //
 //   D3D12 ERROR [id 611]: DrawIndexedInstanced: The primitive topology does not
 //   belong to the appropriate group specified by the current pipeline state.
 //
-// — and the draw renders nothing. Every PSO here was hardcoded to TRIANGLE, so
+// -- and the draw renders nothing. Every PSO here was hardcoded to TRIANGLE, so
 // all 944 D3DPT_LINESTRIP draws per 170,000 were silently discarded.
 D3D12_PRIMITIVE_TOPOLOGY_TYPE TopologyTypeOf(D3D12_PRIMITIVE_TOPOLOGY topo) {
   switch (topo) {
@@ -1240,10 +1214,10 @@ ID3D12PipelineState* D3D12Renderer::OpaquePSO(
     D3D12_PRIMITIVE_TOPOLOGY_TYPE topoType, uint32_t stencilIndex) {
   // m_gamePSOs is the 32 eagerly-built variants, indexed by the low five bits.
   // Cull lives in bits 5-7 and is NOT part of that array: growing it to 256
-  // would build eight times the pipelines at startup to serve a state most
-  // draws do not use. Bits 5-7 == 0 is exactly "cull nothing, front is CW",
-  // which is the fixed state those 32 were built with, so an unculled draw
-  // still takes the array untouched and everything else goes on demand below.
+  // would build eight times the pipelines at startup to serve a state most draws
+  // do not use. Bits 5-7 == 0 is exactly "cull nothing, front is CW", which is
+  // the fixed state those 32 were built with, so an unculled draw still takes
+  // the array untouched and everything else goes on demand below.
   const uint32_t cullBits = (variant >> 5) & 7u;
   const uint32_t baseVariant = variant & 0x1Fu;
   // The 32 eagerly-built pipelines carry no stencil, so a draw that wants

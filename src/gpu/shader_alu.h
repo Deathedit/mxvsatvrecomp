@@ -3,17 +3,16 @@
 // Executes a Xenos vertex shader's ALU on the CPU, far enough to produce the
 // clip-space position it exports to register 62.
 //
-// Why an interpreter and not a translation to HLSL: everything needed is
-// already in hand on the CPU side — the microcode (IM_LOAD_IMMEDIATE/IM_LOAD),
-// the fetched attributes (shader_ucode.h), and the ALU constant file — and the
-// transcode already walks every vertex on the CPU. Emitting HLSL would mean a
-// runtime compiler, a PSO per shader, and a rewrite of the draw path, none of
-// which is needed to answer whether the positions come out right.
+// Why an interpreter and not a translation to HLSL: everything needed is already
+// in hand on the CPU side -- the microcode, the fetched attributes and the ALU
+// constant file -- and the transcode already walks every vertex. Emitting HLSL
+// would mean a runtime compiler, a PSO per shader, and a rewrite of the draw
+// path, none of which is needed to answer whether the positions come out right.
 //
-// The export-62 decode established *which* attribute is the position. It did
-// not help, because for the majority of draws that attribute is compressed
-// model space which the shader expands with a per-object scale and bias. This
-// is the code that applies that expansion.
+// The export-62 decode established *which* attribute is the position. It did not
+// help, because for most draws that attribute is compressed model space which
+// the shader expands with a per-object scale and bias. This applies that
+// expansion.
 //
 // SDK-free header, same as shader_ucode.h, so the unit test needs no SDK.
 
@@ -36,16 +35,14 @@ enum class AluStatus {
   kUnsupportedScalarOp,
   // aL-relative constant index. aL is the loop counter, and we deliberately walk
   // every exec block once rather than unrolling loops, so there is no value to
-  // give it. Distinct from a0-relative addressing, which *is* modelled — keeping
-  // them apart is what lets the failure histogram show whether that work landed.
+  // give it. Distinct from a0-relative addressing, which *is* modelled.
   //
-  // Expect this to be ~0 for this game. kUnsupportedCf is 0 across every sample
-  // taken, which means no shader here contains a loop, which means nothing sets
-  // aL. So the two counts are a cross-check on each other: a non-zero
-  // kLoopRelative with a zero kUnsupportedCf is not a shader that loops, it is a
-  // decode error. That combination is precisely what an inverted a0/aL selector
-  // looked like, and it went unnoticed for a round because the number was
-  // large and plausible rather than impossible.
+  // Expect ~0 for this game: kUnsupportedCf is 0 across every sample, so no
+  // shader here contains a loop and nothing sets aL. The two counts cross-check
+  // each other -- a non-zero kLoopRelative with a zero kUnsupportedCf is not a
+  // shader that loops, it is a decode error. That combination is precisely what
+  // an inverted a0/aL selector looked like, and it went unnoticed for a round
+  // because the number was large and plausible rather than impossible.
   kLoopRelative,
   kInstructionCap,
 };
@@ -63,12 +60,11 @@ struct AluResult {
   // of a single opaque failure count.
   uint32_t blocking_opcode = 0;
 
-  // What this execution read out of the constant file. Recorded because a
-  // shader that executes perfectly and exports (0,0,0,w=0) has computed nothing
-  // from something, and the question is whether the constants it asked for were
+  // What this execution read out of the constant file. Recorded because a shader
+  // that executes perfectly and exports (0,0,0,w=0) has computed nothing from
+  // something, and the question is whether the constants it asked for were
   // there. `const_zero_reads` counts reads that came back all-zero; the index
-  // range says *which* slots it wanted, which is what names the gap when the
-  // answer is that they were empty.
+  // range says *which* slots it wanted.
   //
   // Counters rather than a callback, so this header stays SDK-free and
   // standalone-testable. min > max means no constant was read at all.

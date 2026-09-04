@@ -50,10 +50,10 @@ constexpr uint32_t kPixelDepthExportRegister = 61;
 constexpr uint32_t kMaxColorTargets = 4;
 
 //===========================================================================
-// The exec accessors. Address/count/sequence sit at the same bit offsets in
-// all three exec structs but are distinct union members, so the dispatch is
-// copied from shader_alu.cpp deliberately rather than shared: these three are
-// the load-bearing part of the walk, and a shared helper that drifted would
+// The exec accessors. Address/count/sequence sit at the same bit offsets in all
+// three exec structs but are distinct union members, so the dispatch is copied
+// from shader_alu.cpp deliberately rather than shared: these three are the
+// load-bearing part of the walk, and a shared helper that drifted would
 // desynchronise the emitter from the interpreter silently.
 //===========================================================================
 uint32_t ExecAddress(const uc::ControlFlowInstruction& cf) {
@@ -159,20 +159,17 @@ class Emitter {
   // These two masks are set in different places on purpose. `color_mask` is set
   // as soon as an export names a colour target, BEFORE the write-mask check --
   // and an export whose vector, scalar, constant-0 and constant-1 masks are all
-  // empty legitimately assigns nothing. Per the reference (xenia-edge
-  // ucode.h:2053): "vector_write_mask 0, scalar_write_mask 0 / scalar_dest_rel 0
-  // - unchanged". Returning without assigning is correct.
+  // empty legitimately assigns nothing (ucode.h:2053: "vector_write_mask 0,
+  // scalar_write_mask 0 ... unchanged").
   //
   // What is NOT obviously correct is still reporting the shader as producing
   // that target. If every export to colour 0 has an empty mask, `xe_color0`
   // keeps its float4(0,0,0,0) initialiser and we emit `o0 = xe_color0`, which
   // the compiler folds to `mov o0.xyzw, l(0,0,0,0)` -- a shader that opaquely
   // paints black. That is the exact body of the pixel shader on the 35-index
-  // draw that erases the menu background (menu1.rdc event 8324), whose guest
-  // blend is ONE/ZERO and colour mask 0xF, so the black lands.
+  // draw that erases the menu background.
   //
-  // Measured, not acted on: "unchanged" may also be the guest's intent, and
-  // the two readings are told apart by the count, not by argument.
+  // Measured, not acted on: "unchanged" may also be the guest's intent.
   uint32_t color_assigned_mask = 0;
   bool writes_position = false;
   bool writes_depth = false;
@@ -183,11 +180,9 @@ class Emitter {
   // setp_* instructions -- the ops that WRITE p0.
   //
   // The name is historical and the field is deliberately not renamed; see
-  // HlslShader::unhonoured_predicate_ops, which carries the full note and
-  // explains why a dump from before the change still lines up on it. It was
-  // accurate while nothing read xe_p0. Since per-instruction predication
-  // landed, p0 written here IS obeyed: by every following ALU instruction
-  // carrying the `(p0)` bit (PredicateBlock in EmitAlu), by predicated
+  // HlslShader::unhonoured_predicate_ops. It was accurate while nothing read
+  // xe_p0. Since per-instruction predication landed, p0 written here IS obeyed:
+  // by every following ALU instruction carrying the `(p0)` bit, by predicated
   // fetches, and in the vertex stage by cond_exec_pred as well.
   uint32_t unhonoured_predicate_ops = 0;
   // ALU instructions carrying their own predicate bits, now emitted inside
@@ -252,22 +247,18 @@ class Emitter {
   bool pixel() const { return stage_ == HlslStage::kPixel; }
 
   // How this stage is allowed to spell a texture fetch. `Sample` needs implicit
-  // derivatives, and only a pixel shader has them — FXC answers it in vs_5_0
-  // with "X4532: cannot map expression to vs_5_0 instruction set", which is
-  // what rejected VS 0x26EFD9A0 whole (mx_1030). SampleLevel at an explicit LOD
-  // of 0 is the vertex-stage form; the Xenos fetch carries no gradient either
-  // way, so nothing is lost by naming the level.
+  // derivatives, and only a pixel shader has them -- FXC answers it in vs_5_0
+  // with "X4532: cannot map expression to vs_5_0 instruction set", which
+  // rejected one whole vertex shader. SampleLevel at an explicit LOD of 0 is the
+  // vertex-stage form; the Xenos fetch carries no gradient either way.
   //
-  // A VERTEX shader that samples is a real shape in this game, not a curiosity:
-  // the engine binds the bone-matrix palette as a texture rather than as a
-  // constant array (see the VS census in hooks_d3d9.cpp).
+  // A VERTEX shader that samples is a real shape in this game: the engine binds
+  // the bone-matrix palette as a texture rather than as a constant array.
   //
   // A fetch that names its LOD in a register (`use_reg_lod`, written by a
   // preceding setTexLOD) needs SampleLevel in EITHER stage: the point of the
-  // instruction is that the shader chooses the level rather than the hardware's
-  // derivatives, so answering it with an implicit-derivative Sample discards it.
-  // That is what used to happen to every pixel shader carrying one, because
-  // setTexLOD was classified as a vertex fetch and never reached the emitter.
+  // instruction is that the shader chooses the level, so answering it with an
+  // implicit-derivative Sample discards it.
   bool ExplicitLod(const uc::TextureFetchInstruction& tf) const {
     return tf.use_register_lod() || !pixel();
   }
@@ -286,29 +277,20 @@ class Emitter {
     return BiasedLod(tf) ? ".SampleBias(" : ".Sample(";
   }
   // Paired with SampleOp: the extra argument SampleLevel takes and Sample does
-  // not. Emitted immediately before the closing paren of the fetch.
+  // not, emitted immediately before the closing paren of the fetch.
   //
   // The level is the register value plus the instruction's own bias, in the
   // D3D11.3 accumulation order the reference uses
-  // (dxbc_shader_translator_fetch.cc:1541-1556). The FETCH CONSTANT's bias is
-  // the third term there and is NOT applied: it is runtime state that would have
-  // to ride in a cbuffer, and no fetch constant reaches this emitter. A shader
-  // whose guest bias is non-zero therefore samples a level too sharp or too soft
-  // by that amount — stated because it is the one term of the three missing.
+  // (dxbc_shader_translator_fetch.cc:1541). lod_bias is a 7-bit signed field
+  // scaled by 1/16, so every value it can take has at most four decimal places
+  // and std::to_string reproduces it exactly.
   //
-  // lod_bias is a 7-bit signed field scaled by 1/16, so every value it can take
-  // has at most four decimal places and std::to_string reproduces it exactly.
-  // The FETCH CONSTANT's bias, per slot, in LOD units. Arrives in the spare .w
-  // of xe_texinv, which was written as 0.0 and read by nothing.
-  //
-  // This used to be the missing third term. The comment above SampleLod said
-  // outright that "the FETCH CONSTANT's bias is the third term there and is NOT
-  // applied: it is runtime state that would have to ride in a cbuffer, and no
-  // fetch constant reaches this emitter". A cbuffer slot was already there.
-  //
-  // It cost the terrain: the virtual-texture page tables carry +7.0, the guest
-  // populates only the levels that bias makes it read, and without it every
-  // lookup landed seven levels too fine and missed.
+  // ConstantLodBias is the third term: the FETCH CONSTANT's bias, per slot, in
+  // LOD units, arriving in the spare .w of xe_texinv. This used to be missing on
+  // the grounds that "no fetch constant reaches this emitter" -- a cbuffer slot
+  // was already there. It cost the terrain: the virtual-texture page tables
+  // carry +7.0, the guest populates only the levels that bias makes it read, and
+  // without it every lookup landed seven levels too fine and missed.
   std::string ConstantLodBias(uint32_t slot) const {
     return "xe_texinv[" + std::to_string(slot) + "].w";
   }
@@ -338,22 +320,19 @@ class Emitter {
   }
 
   // setTexLOD: store the level this shader wants its later fetches to sample at.
-  //
-  // The operand is one component, selected by the source swizzle's first slot —
+  // The operand is one component, selected by the source swizzle's first slot --
   // the same absolute two-bits-per-component encoding a tfetch coordinate uses,
-  // not the component-relative ALU form. The reference is
-  // dxbc_shader_translator_fetch.cc:608-616, which moves
-  // `LoadOperand(operands[0], 0b0001).SelectFromSwizzled(0)` into the LOD slot.
-  // getGradients (kGetTextureGradients): the screen-space derivatives of a
-  // 2-component coordinate.
+  // not the component-relative ALU form (dxbc_shader_translator_fetch.cc:608).
+  //
+  // getGradients: the screen-space derivatives of a 2-component coordinate.
   //
   // THIS WAS THE VIRTUAL-TEXTURE FEEDBACK PASS. It sat in the not-implemented
-  // bucket below with "skipped, destination left holding whatever it had", and
-  // the comment in the header even named its one caller as harmless -- "the one
-  // pixel shader that uses getGradients and compiles fine without it". It
-  // compiles, and it computes a constant.
+  // bucket with "skipped, destination left holding whatever it had", and the
+  // header even named its one caller as harmless -- "the one pixel shader that
+  // uses getGradients and compiles fine without it". It compiles, and it
+  // computes a constant.
   //
-  // ps_hft_fback is the terrain's VT feedback shader. Its whole job is
+  // ps_hft_fback is the terrain's VT feedback shader, and its whole job is
   //
   //     getGradients r1, r0.wz, tf8
   //     mul r1, r1.zxyw, c196.yxxy      scale by the feedback/screen ratio
@@ -361,26 +340,21 @@ class Emitter {
   //     add r0.__zw, r1.yyyx, r1.wwwz   two squared lengths
   //     sqrt / max / log                -> the LOD it is asking for
   //
-  // With the op skipped, r1 kept the INTERPOLATOR it happened to hold, whose
-  // zw are the constant 2048, so the log fed on constants and every pixel
-  // requested LOD 8. The guest then populated only mips 6-8 of its page table
-  // and the composite, which samples the fine levels, read the not-available
-  // sentinel everywhere. That is the terrain banding.
+  // With the op skipped, r1 kept the INTERPOLATOR it happened to hold, whose zw
+  // are the constant 2048, so every pixel requested LOD 8. The guest then
+  // populated only mips 6-8 of its page table and the composite read the
+  // not-available sentinel everywhere -- the terrain banding.
   //
-  // LAYOUT IS THE REFERENCE'S, NOT INFERRED. rex/graphics/format/ucode.h:634 --
-  // "Source is 2-component. XZ = ddx(source.xy), YW = ddy(source.xy)." Reading
-  // the guest's own use of the result suggested xy=ddx / zw=ddy instead, and
-  // that reading is self-consistent too, which is exactly why it is not
-  // evidence. See [[sdk-is-the-reference]].
+  // LAYOUT IS THE REFERENCE'S, NOT INFERRED (ucode.h:634 -- "Source is
+  // 2-component. XZ = ddx(source.xy), YW = ddy(source.xy)"). Reading the guest's
+  // own use of the result suggested xy=ddx / zw=ddy instead, and that reading is
+  // self-consistent too, which is exactly why it is not evidence.
   //
   // ddx/ddy rather than the _coarse forms: the same header notes the texture
-  // unit computes this per quad and that FXC lowers ddx/ddy to
-  // deriv_rtx/rty_coarse at SM5 anyway, so the plain form is both what the
-  // reference implies and what the compiler emits.
+  // unit computes this per quad and that FXC lowers ddx/ddy to _coarse at SM5.
   //
-  // Pixel stage only -- a derivative has no meaning in a vertex shader, and
-  // HLSL rejects it there. A vertex shader carrying one keeps the old skip and
-  // stays counted.
+  // Pixel stage only -- a derivative has no meaning in a vertex shader and HLSL
+  // rejects it there. A vertex shader carrying one keeps the old skip.
   void EmitGetGradients(const uc::TextureFetchInstruction& tf) {
     if (!pixel()) {
       ++unhonoured_fetch_ops;
@@ -423,11 +397,10 @@ class Emitter {
 
   // A constant read, in the shader's OWN stage bank. The vertex bank is ALU
   // constants 0-255 at device+0x780 and the pixel bank is 256-511 at
-  // device+0x1780 — proven from D3DDevice_DrawVertices' own flush, which passes
-  // Xenos register base 0x4000 for the first and 0x4400 for the second
-  // (0x4400 = 0x4000 + 1024 dwords = constant 256). The shader indexes its bank
-  // from 0 either way, so the base is the caller's job at upload time and this
-  // emits a direct index.
+  // device+0x1780 -- proven from D3DDevice_DrawVertices' own flush, which passes
+  // Xenos register base 0x4000 for the first and 0x4400 for the second. The
+  // shader indexes its bank from 0 either way, so the base is the caller's job
+  // at upload time.
   std::string Const(uint32_t index) {
     reads_constants = true;
     if (index > max_const_index) max_const_index = index;
@@ -537,19 +510,16 @@ class Emitter {
         r = "(XeMul(" + a + ", " + b + ") + " + Src(alu, 3) + ")";
         break;
       // A true select. This was a lerp, on the reasoning that a selector of
-      // exactly 0 or 1 makes lerp exact -- which holds only for finite
-      // operands. FXC expands lerp(x, y, s) to x + s * (y - x), so the
-      // UNSELECTED operand stays in the arithmetic: with s = 0 and y = +INF
-      // that is 0 * INF = NaN, and the result is NaN whichever way the
-      // condition went. kRcp legitimately produces +INF for 1/0, and this
-      // title's shaders divide by possibly-zero quantities constantly, so a
-      // cnd guarding such a value is exactly the shape that breaks.
+      // exactly 0 or 1 makes lerp exact -- which holds only for finite operands.
+      // FXC expands lerp(x, y, s) to x + s * (y - x), so the UNSELECTED operand
+      // stays in the arithmetic: with s = 0 and y = +INF that is 0 * INF = NaN.
+      // kRcp legitimately produces +INF for 1/0, and this title's shaders divide
+      // by possibly-zero quantities constantly.
       //
-      // Both Xenia backends select (DXBC OpEq + OpMovC, SPIR-V OpSelect) and
-      // so does our own interpreter, so the lerp was also an
-      // emitter/interpreter split of the kind the LegacyMul note warns about.
-      // HLSL's ?: on vectors is component-wise, and FXC compiles it to a
-      // single movc -- three slots against lerp's seven.
+      // Both Xenia backends select and so does our own interpreter, so the lerp
+      // was also an emitter/interpreter split. HLSL's ?: on vectors is
+      // component-wise and FXC compiles it to a single movc -- three slots
+      // against lerp's seven.
       case Op::kCndEq:
         r = "(" + a + " == 0.0 ? " + b + " : " + Src(alu, 3) + ")";
         break;
@@ -574,8 +544,8 @@ class Emitter {
         r = "float4(1.0, XeMul((" + a + ").y, (" + b + ").y), (" + a + ").z, (" +
             b + ").w)";
         break;
-      // Cube map coordinate generation. Transcribed from the hardware
-      // definition in ucode.h (kCube), not approximated:
+      // Cube map coordinate generation. Transcribed from the hardware definition
+      // in ucode.h (kCube), not approximated:
       //
       //   dest.x = T, dest.y = S, dest.z = 2 * major axis, dest.w = FaceID
       //
@@ -587,8 +557,8 @@ class Emitter {
       //
       // which is where the indices below come from. src1 carries the same three
       // values in a different order and is redundant once src0 is unpacked; it
-      // is still evaluated, because the hardware reads it and because an
-      // operand skipped here would corrupt the constant-read accounting.
+      // is still evaluated, because the hardware reads it and because an operand
+      // skipped here would corrupt the constant-read accounting.
       //
       // Emitted as statements rather than one expression: the three-way major
       // axis selection does not fold into anything readable, and readability is
@@ -639,24 +609,21 @@ class Emitter {
         break;
       }
       // The setp_*_push family, opcodes 20..23. The comment that used to sit in
-      // `default` said these "have not appeared in a shader captured here".
-      // That was true when it was written and is not any more: in mx_1270,
-      // ps 0x267C2620 is the ONLY untranslated pixel shader in the run (175 of
-      // 176 translate), it is refused for exactly this opcode, and it is aimed
-      // at the 1280x720 scene target 1785 times -- every one of those draws
-      // then dropped by the fabricated-white guard because an untranslated
-      // draw has no colour source.
+      // `default` said these "have not appeared in a shader captured here". It
+      // is not true any more: one pixel shader is the ONLY untranslated one in a
+      // run, refused for exactly this opcode, and aimed at the 1280x720 scene
+      // target 1785 times -- every one of those draws then dropped by the
+      // fabricated-white guard.
       //
-      // Transcribed from ucode.h (kSetpEqPush..kSetpGePush), which specifies
-      // both halves exactly:
+      // Transcribed from ucode.h (kSetpEqPush..kSetpGePush):
       //
       //   p0   = (src0.w == 0.0 && src1.w CMP 0.0)
       //   dest = (src0.x == 0.0 && src1.x CMP 0.0) ? 0.0 : src0.x + 1.0
       //
       // CMP is ==, !=, > or >= per opcode. Note the asymmetry: the src0 side is
       // ALWAYS "== 0.0" and only the src1 comparison varies -- these count a
-      // predicate chain rather than compare two operands, so mirroring the
-      // kill family's `a CMP b` shape here would be wrong.
+      // predicate chain rather than compare two operands, so mirroring the kill
+      // family's `a CMP b` shape here would be wrong.
       case Op::kSetpEqPush:
       case Op::kSetpNePush:
       case Op::kSetpGtPush:
@@ -667,13 +634,9 @@ class Emitter {
                                                   : ">=";
         const std::string c = std::string(" ") + cmp + " 0.0";
         // The predicate write is emitted as a statement, and FIRST, because it
-        // is the side effect: it has to survive an empty write mask. The
-        // has_vector gate below was extended for that; the SDK's operand table
-        // agrees, still reading .w for these when the result is unused
-        // (ucode.h: `components = used_result_components ? 0b1001 : 0b1000`).
-        //
-        // p0 is set but not yet read, same as the scalar setp_* family above --
-        // counted so the two report through one number.
+        // is the side effect: it has to survive an empty write mask. The SDK's
+        // operand table agrees, still reading .w for these when the result is
+        // unused (`components = used_result_components ? 0b1001 : 0b1000`).
         Line("xe_p0 = (((" + a + ").w == 0.0) && ((" + b + ").w" + c + "));");
         ++unhonoured_predicate_ops;
         r = "(((" + a + ").x == 0.0) && ((" + b + ").x" + c + ") ? 0.0 : (" + a +
@@ -694,11 +657,10 @@ class Emitter {
 
   // The mulsc/addsc/subsc family, opcodes 42..47. These do not use the normal
   // operand encoding: src3 names a constant register directly and the temp
-  // register is scattered, with one bit in the opcode field itself — which is
-  // why each operation has a _0 and a _1 form. The constant is selected with
-  // the W-relative src3 swizzle and the temporary with the X-relative src3
-  // swizzle (the Xenos AB = WX scalar convention). abs_constants and src3
-  // negate apply to both operands.
+  // register is scattered, with one bit in the opcode field itself -- which is
+  // why each operation has a _0 and a _1 form. The constant is selected with the
+  // W-relative src3 swizzle and the temporary with the X-relative one (the Xenos
+  // AB = WX scalar convention). abs_constants and src3 negate apply to both.
   bool ConstRegScalarOp(const uc::AluInstruction& alu, std::string& out) {
     using Op = uc::AluScalarOpcode;
     const Op op = alu.scalar_opcode();
@@ -757,9 +719,8 @@ class Emitter {
       // The LIT-emulation form (ucode.h:kMulsPrev2): guards the specular term so
       // a non-positive or non-finite exponent collapses to -FLT_MAX rather than
       // producing a NaN. Not seen in this title's shaders, but it is the last
-      // scalar opcode without a handler, and the default: arm below refuses the
-      // whole shader — a cost the mask no longer hides now that the scalar half
-      // always runs.
+      // scalar opcode without a handler and the `default:` arm refuses the whole
+      // shader.
       case Op::kMulsPrev2:
         r = "((xe_ps == -3.402823466e+38 || !isfinite(xe_ps) || !isfinite(" +
             b + ") || " + b + " <= 0.0) ? -3.402823466e+38 : XeMul(" + a +
@@ -770,38 +731,36 @@ class Emitter {
       case Op::kTruncs: r = "trunc(" + a + ")"; break;
       case Op::kFloors: r = "floor(" + a + ")"; break;
       case Op::kExp: r = "exp2(" + a + ")"; break;
-      // No abs() on the operand. Direct3D 9 defines ITS log/rsq as operating
-      // on |src|, but Xenos does not: the operand carries an abs MODIFIER,
-      // which Src() already honours, and the Xbox 360 compiler sets that bit
-      // itself wherever the D3D9 semantic calls for it. All 115 rsq sites
-      // across the 150 dumped shaders arrive with it already set, so the
-      // hardcoded abs was a second, unconditional application -- and it masked
-      // the three log sites that deliberately have it clear. ucode.h, both
-      // Xenia backends and Xenia's interpreter all apply the operation bare.
+      // No abs() on the operand. Direct3D 9 defines ITS log/rsq as operating on
+      // |src|, but Xenos does not: the operand carries an abs MODIFIER, which
+      // Src() already honours, and the Xbox 360 compiler sets that bit itself
+      // wherever the D3D9 semantic calls for it. All 115 rsq sites across the
+      // 150 dumped shaders arrive with it already set, so the hardcoded abs was
+      // a second unconditional application -- and it masked the three log sites
+      // that deliberately have it clear. ucode.h, both Xenia backends and
+      // Xenia's interpreter all apply the operation bare.
       //
-      // logc saturates -INF to -FLT_MAX and ONLY -INF: log2(+INF) stays +INF
-      // on the hardware, and a NaN stays NaN. The max() folded both.
+      // logc saturates -INF to -FLT_MAX and ONLY -INF: log2(+INF) stays +INF on
+      // the hardware and a NaN stays NaN. The max() folded both.
       case Op::kLog: r = "log2(" + a + ")"; break;
       case Op::kLogc: r = "XeClampNegInf(log2(" + a + "))"; break;
-      // The three reciprocal forms differ ONLY on what they do with an
-      // infinity, and that difference is the whole of this game's black main
-      // menu. From the SDK (ucode.h:1082-1114):
+      // The three reciprocal forms differ ONLY on what they do with an infinity,
+      // and that difference is the whole of this game's black main menu. From
+      // the SDK (ucode.h:1082):
       //
       //   RECIP_IEEE  (kRcp)   1/0 = +INF
       //   RECIP_CLAMP (kRcpc)  +INF -> +FLT_MAX, -INF -> -FLT_MAX
       //   RECIP_FF    (kRcpf)  +INF ->  0.0,     -INF -> -0.0
       //
       // kRcpf was emitted as a plain rcp, so it produced +Inf where the console
-      // produces zero. Traced in a RenderDoc capture of the menu: the rider's
-      // material samples a texture, takes its Rec.709 luminance, and divides by
-      // it. The luminance is 0, RECIP_FF should hand back 0 and the term
-      // vanishes; instead we handed back +Inf, the next instruction computed
-      // 0 * Inf = NaN, and every pixel of the rider and bike came out NaN. NaN
-      // then poisoned the composite and blacked out the whole 3D layer.
+      // produces zero. The rider's material samples a texture, takes its Rec.709
+      // luminance, and divides by it: the luminance is 0, RECIP_FF should hand
+      // back 0 and the term vanishes, but we handed back +Inf, the next
+      // instruction computed 0 * Inf = NaN, and NaN poisoned the composite and
+      // blacked out the whole 3D layer.
       //
-      // "Fast-forward" is the fixed-function-emulation form and it exists
-      // precisely so a shader can divide by a possibly-zero quantity without
-      // guarding it. A title relies on that.
+      // "Fast-forward" is the fixed-function-emulation form and exists precisely
+      // so a shader can divide by a possibly-zero quantity without guarding it.
       case Op::kRcp: r = "rcp(" + a + ")"; break;
       case Op::kRcpf: r = "XeFlushInf(rcp(" + a + "))"; break;
       case Op::kRcpc: r = "XeClampInf(rcp(" + a + "))"; break;
@@ -822,25 +781,21 @@ class Emitter {
         r = "XeMax(" + a + ", " + b + ")";
         break;
       case Op::kRetainPrev: r = "xe_ps"; break;
-      // The predicate-set family. BOTH halves of these matter and both are
-      // honoured.
+      // The predicate-set family. BOTH halves matter and both are honoured.
       //
       // p0 is WRITTEN here and READ downstream: a following ALU instruction
       // carrying the `(p0)` bit is emitted inside `if (xe_p0 == ...)` by
       // EmitAlu's PredicateBlock, a predicated fetch gates its destination
-      // write, and in the vertex stage cond_exec_pred gates a whole block.
-      // This comment used to say the opposite -- that nothing read xe_p0 and
-      // that predicated issue was unimplemented -- which stopped being true
-      // when per-instruction predication landed. Left stale it is worse than
-      // absent: it sends a reader auditing a shadow-mask shader off hunting a
-      // dropped predicate that the emitter in fact gets right.
+      // write, and in the vertex stage cond_exec_pred gates a whole block. This
+      // comment used to say the opposite, which left stale is worse than absent:
+      // it sends a reader auditing a shadow-mask shader off hunting a dropped
+      // predicate the emitter in fact gets right.
       //
       // The second half is the VALUE, which lands in ps for a following *_prev
-      // to read. Refusing the shader over either half would drop the draw to
-      // the stand-in.
+      // to read. Refusing the shader over either half would drop the draw.
       //
-      // Note the polarity, from the SDK (ucode.h:1140-1226): the predicate being
-      // TRUE writes 0.0 to the destination, not 1.0.
+      // Note the polarity, from the SDK (ucode.h:1140): the predicate being TRUE
+      // writes 0.0 to the destination, not 1.0.
       case Op::kSetpEq: case Op::kSetpNe: case Op::kSetpGt: case Op::kSetpGe: {
         const char* cmp = op == Op::kSetpEq   ? "=="
                           : op == Op::kSetpNe ? "!="
@@ -860,12 +815,11 @@ class Emitter {
         Line("xe_p0 = ((" + a + " - 1.0) <= 0.0);");
         // A select, matching Xenia's OpGE + OpMovC, so this reads the way the
         // interpreter does. It does NOT change the compiled DXBC: FXC folds
-        // `(x <= 0) ? 0 : x` straight back to `max(x, 0)`, because one arm
-        // equals the constant being compared against. Verified with
+        // `(x <= 0) ? 0 : x` straight back to `max(x, 0)`, verified with
         // fxc /T ps_5_0. The NaN divergence therefore survives here -- and is
         // unobservable, because setp_pop appears in 0 of this title's 150
-        // shaders. Left as a select rather than fought, so that if the opcode
-        // ever does turn up, the source already says what it means.
+        // shaders. Left as a select so that if the opcode ever does turn up, the
+        // source already says what it means.
         r = "((" + a + " - 1.0) <= 0.0 ? 0.0 : " + a + " - 1.0)";
         ++unhonoured_predicate_ops;
         break;
@@ -937,23 +891,19 @@ class Emitter {
     //     21  (p0) mul  r2.w, r2.wwww, r0.xxxx
     //
     // runs 18 and 21 only where p0 holds, and elsewhere r2.w keeps the alpha
-    // instruction 10 put there. Running them regardless makes alpha the
-    // constant 0 -- `-|x| > 0` is never true -- which is exactly what happened:
-    // the intro logo's quad rasterised correctly, output white, and blended to
-    // nothing because its alpha had been forced to zero.
+    // instruction 10 put there. Running them regardless makes alpha the constant
+    // 0 -- `-|x| > 0` is never true -- which is what happened: the intro logo's
+    // quad rasterised correctly, output white, and blended to nothing.
     //
     // Emitted as real flow control, which the exec-level path deliberately
-    // refuses to do in the pixel stage. That refusal does not apply here: an
-    // ALU instruction never samples. `.Sample()` needs derivatives and is
-    // illegal in varying flow control, but fetches are a separate instruction
-    // type emitted by EmitTextureFetch, so nothing inside this block can want a
-    // gradient. Predicated FETCHES are a different question and are counted,
-    // not honoured -- see EmitTextureFetch.
+    // refuses in the pixel stage. That refusal does not apply here: an ALU
+    // instruction never samples, and fetches are a separate instruction type, so
+    // nothing inside this block can want a gradient. Predicated FETCHES are a
+    // different question and are counted, not honoured.
     //
     // Skipping the whole instruction, rather than selecting over its result, is
-    // also what gets the side effects right: a0, p0, ps and the kill discard
-    // are suppressed exactly where the console suppressed them. A select on the
-    // destination alone would still have written all four.
+    // also what gets the side effects right: a0, p0, ps and the kill discard are
+    // suppressed exactly where the console suppressed them.
     PredicateBlock pred(this, alu.is_predicated(),
                         alu.predicate_condition(), &predicated_alu_ops);
 
@@ -967,35 +917,30 @@ class Emitter {
 
     // maxa/maxas/maxasf exist to load the address register, and a shader that
     // wants only that side effect leaves the write mask empty. A mask test is
-    // therefore the wrong gate for them: it skipped the instruction outright
-    // and with it the a0 assignment, leaving xe_a0 at its initial 0 for the
-    // whole invocation.
+    // therefore the wrong gate: it skipped the instruction outright and with it
+    // the a0 assignment, leaving xe_a0 at 0 for the whole invocation.
     //
     // That is what un-posed the rider. Four-influence skinning is
     //   mova a0, index.z ; r = weight.z * c[85+a0]
     //   mova a0, index.y ; r += weight.y * c[85+a0]   ... and so on
     // so with a0 pinned at 0 all four influences read the SAME matrix and the
-    // mesh renders rigid at the palette base. The torso sits near that base
-    // and looked right; the arms and hands, which are what the other bones are
-    // for, stayed in bind pose with the arms straight out.
+    // mesh renders rigid at the palette base -- the torso looked right and the
+    // arms stayed in bind pose.
     //
-    // The SDK tags exactly these with kAluOpChangedStateAddressRegister, but
-    // its kAluScalarOpcodeInfos/kAluVectorOpcodeInfos tables are declared
-    // extern in the header and defined in a translation unit the runtime does
-    // not ship, so naming the opcodes is the only way to ask the question and
-    // still link. Keep this list in step with that flag: an a0-setting opcode
-    // missing here is silently dropped, which is precisely the bug above.
+    // The SDK tags exactly these with kAluOpChangedStateAddressRegister, but its
+    // opcode-info tables are declared extern in the header and defined in a
+    // translation unit the runtime does not ship, so naming the opcodes is the
+    // only way to ask the question and still link. Keep this list in step with
+    // that flag: an a0-setting opcode missing here is silently dropped.
     const bool vector_sets_a0 =
         alu.vector_opcode() == uc::AluVectorOpcode::kMaxA;
     const bool scalar_sets_a0 =
         alu.scalar_opcode() == uc::AluScalarOpcode::kMaxAs ||
         alu.scalar_opcode() == uc::AluScalarOpcode::kMaxAsf;
 
-    // a0 is NOT the only side effect that outlives an empty write mask, and the
-    // list above is not the whole rule -- it only ever named the a0 flag. The
-    // SDK's operand table states the other two outright, by keeping operand
-    // components live when the result is unused (ucode.h, the switch on
-    // vector_opcode in the operand-components helper):
+    // a0 is NOT the only side effect that outlives an empty write mask. The SDK's
+    // operand table states the other two outright, by keeping operand components
+    // live when the result is unused:
     //
     //   setp_*_push  components = used_result_components ? 0b1001 : 0b1000
     //                             -- .w still read with no result: it feeds p0
@@ -1003,8 +948,7 @@ class Emitter {
     //                             -- unconditional: the side effect is discard
     //
     // Both were absent here, so either one with an empty write mask was skipped
-    // outright and took its side effect with it. That is the same shape as the
-    // a0 bug described above, which cost the rider its pose.
+    // outright and took its side effect with it.
     const bool vector_sets_p0 =
         alu.vector_opcode() == uc::AluVectorOpcode::kSetpEqPush ||
         alu.vector_opcode() == uc::AluVectorOpcode::kSetpNePush ||
@@ -1042,25 +986,21 @@ class Emitter {
     // the destination register, so gating the ps update on it silently deletes
     // the one thing a mask-less scalar op exists to produce.
     //
-    // Shaders lean on that. Xenia's dump of this title (85 of our microcode
-    // blobs pair to it by exact SHA-1) has 47 such instructions across 20
-    // shaders, every one immediately consumed by an adds_prev/muls_prev:
+    // Shaders lean on that. Xenia's dump of this title has 47 such instructions
+    // across 20 shaders, every one immediately consumed by an adds_prev/muls_prev:
     //
     //     15   dp3_sat r1._y__, r3.wyzz, c158.zxyy
     //      +   maxs r0._, -r5.yy          <- empty mask, issued only for ps
     //     16   dp3 r5._y__, r2.wyzz, r3.wyzz
     //      +   muls_prev r5.__z_, c255.y  <- reads that ps
     //
-    // We emitted no line at all for 15, so 16 multiplied by instruction 14's
-    // leftover ps. Three vertex shaders in that set feed the stale value
-    // straight into an interpolator (`adds_prev o1.__z_, -r2.w`).
+    // We emitted no line for 15, so 16 multiplied by instruction 14's leftover
+    // ps, and three vertex shaders feed the stale value straight into an
+    // interpolator. Same error as the maxa/maxas/maxasf one above, one register
+    // over: a write mask is not a statement about side effects.
     //
-    // This is the same error as the maxa/maxas/maxasf one above, one register
-    // over — that gated a0 on the write mask and un-posed the rider. A write
-    // mask is not a statement about side effects.
-    //
-    // kRetainPrev exists precisely to NOT disturb ps, and stays correct here
-    // because it yields xe_ps: the assignment is a self-assignment.
+    // kRetainPrev exists precisely to NOT disturb ps, and stays correct because
+    // it yields xe_ps: the assignment is a self-assignment.
     Line("xe_s = " + sexpr + "; xe_ps = xe_s;");
 
     if (is_export) {
@@ -1080,14 +1020,13 @@ class Emitter {
         target = "xe_o" + std::to_string(dest);
       } else {
         // An export we do not link: a point size, a misc output, or an
-        // interpolator past the agreed linkage width. Dropped, not faked — but
+        // interpolator past the agreed linkage width. Dropped, not faked -- but
         // the ALU side effects above have already been emitted.
         //
         // Recorded rather than discarded silently. A draw was investigated at
         // length whose pixel shader read three interpolators the vertex stage
         // never supplied, and from outside the emitter there was no way to tell
-        // whether the walk had seen those exports and rejected them here or had
-        // never reached them at all.
+        // whether the walk had rejected those exports here or never reached them.
         if (dest < 32) dropped_export_mask |= 1u << dest;
         // MEMORY EXPORT (dest 32..37) is dropped like the rest, but counted --
         // the mask above cannot hold it, so without this a shader that writes
@@ -1148,13 +1087,12 @@ class Emitter {
       blocking_opcode = uint32_t(tf.opcode());
       return;
     }
-    // 1D joins 2D: a single-row texture samples correctly through an ordinary
-    // 2D binding, so it needs no new resource type -- only the v coordinate
-    // pinned to the row, below.
+    // 1D joins 2D: a single-row texture samples correctly through an ordinary 2D
+    // binding, so it needs no new resource type -- only the v coordinate pinned
+    // to the row, below.
     //
     // CUBE joins them through a Texture2DArray, because the guest has already
-    // done the cube projection in software before it gets here. The hardware
-    // sequence is
+    // done the cube projection in software:
     //
     //     cube       r0, source.zzxy, source.yxz   // (T, S, 2*majoraxis, face)
     //     rcp        r0.z, r0_abs.z
@@ -1163,33 +1101,28 @@ class Emitter {
     //
     // so tfetchCube receives three scalars, never a direction vector -- which is
     // the whole reason `cube` exists as an ALU opcode. Binding a real TextureCube
-    // would mean UNDOING that projection so the hardware could redo it; an array
-    // consumes the guest's output as it stands. Faces are six ordinary 2D images
-    // at 4 KB-aligned strides in guest memory, so the decode is the 2D one run
-    // six times. Xenos does not filter across face edges either, so the one thing
-    // this gives up costs nothing against the console.
+    // would mean UNDOING that projection so the hardware could redo it. Faces
+    // are six ordinary 2D images at 4 KB-aligned strides, so the decode is the
+    // 2D one run six times, and Xenos does not filter across face edges either.
     //
-    // 3D/STACKED joins the array path too, for the same reason cube does. One
-    // opcode serves two storage layouts -- ucode.h: "3D (used for both 3D and
-    // stacked 2D texture): U, V, W" -- and they are told apart by the FETCH
-    // CONSTANT's DataDimension, not by the instruction. A stacked texture is
-    // stack_depth+1 ordinary 2D images at 4 KB-aligned strides, which is
-    // exactly what DescribeHleTexture2D already produces and the binder already
-    // views as a TEXTURE2DARRAY. So the stacked case costs nothing new here.
+    // 3D/STACKED joins the array path for the same reason. One opcode serves two
+    // storage layouts (ucode.h: "3D (used for both 3D and stacked 2D texture)")
+    // and they are told apart by the FETCH CONSTANT's DataDimension, not by the
+    // instruction. A stacked texture is stack_depth+1 ordinary 2D images at
+    // 4 KB-aligned strides, which DescribeHleTexture2D already produces.
     //
     // A true 3D volume interleaves its slices INSIDE a tile and does need a
     // resource type we do not build; DescribeHleTexture2D refuses those by name
-    // ("texture is a 3D volume") and the draw falls back, which is the same
-    // outcome as today minus the shader-wide refusal that also cost the stacked
-    // case. Refusing at the texture, where the dimension is actually known,
-    // rather than at the instruction, where it is not, is the whole change.
+    // and the draw falls back. Refusing at the texture, where the dimension is
+    // actually known, rather than at the instruction, where it is not, is the
+    // whole change.
     //
     // The reference reaches the same two destinations by declaring BOTH a
     // Texture3D and a Texture2DArray and branching per-fetch on fetch constant
-    // word 5 bits 9:10 (dxbc_shader_translator_fetch.cc:903). It needs the
-    // branch because its shaders are cached against fetch constants it has not
-    // resolved at translate time; we resolve the binding per draw, so the
-    // branch collapses into which resource the binder hands us.
+    // word 5 bits 9:10. It needs the branch because its shaders are cached
+    // against fetch constants it has not resolved at translate time; we resolve
+    // the binding per draw, so the branch collapses into which resource the
+    // binder hands us.
     using Dim = rex::graphics::xenos::FetchOpDimension;
     const bool is_cube = tf.dimension() == Dim::kCube;
     const bool is_3d = tf.dimension() == Dim::k3DOrStacked;
@@ -1216,10 +1149,10 @@ class Emitter {
     // dimension would contradict whichever declaration the preamble writes, so
     // the shader is refused rather than emitted with a descriptor that cannot
     // match both of its fetches.
+    //
     // Compared against is_ARRAY, not is_cube: cube and 3D/stacked both declare
     // Texture2DArray, so a slot fetched both ways is still served by one
-    // declaration and one descriptor. Only array-versus-plain-2D is a real
-    // contradiction.
+    // declaration. Only array-versus-plain-2D is a real contradiction.
     const uint32_t slot_bit = 1u << slot;
     if ((slot_fetched_mask & slot_bit) &&
         bool(slot_array_mask & slot_bit) != is_array) {
@@ -1241,15 +1174,15 @@ class Emitter {
     if (!is_1d) uv += kComponent[(swiz >> 2) & 3];
 
     if (is_cube) {
-      // The third source component is the face index the `cube` op produced,
-      // 0-5 in D3DCUBEMAP_FACES order — which is also the array slice order the
+      // The third source component is the face index the `cube` op produced, 0-5
+      // in D3DCUBEMAP_FACES order -- which is also the array slice order the
       // guest stores the faces in, so it indexes the array directly.
       //
       // ST arrive biased into [1,2) by the `mad ..., 1.5` above: that bias is
       // what the hardware fetch expects, not a shader idiom, so subtracting one
       // is decoding the operand rather than guessing at a convention.
       //
-      // xe_texinv is deliberately NOT applied. It normalises TEXEL coordinates,
+      // xe_texinv is deliberately NOT applied: it normalises TEXEL coordinates,
       // and these are already face-relative.
       const std::string src = Temp(tf.src());
       const std::string face = std::string(1, kComponent[(swiz >> 4) & 3]);
@@ -1263,12 +1196,12 @@ class Emitter {
 
     std::string coord = Temp(tf.src()) + "." + uv;
     if (tf.unnormalized_coordinates()) {
-      // `tx_coord_denorm` means the guest addresses this texture in TEXELS;
-      // the host sampler wants normalized coordinates, so this divides by the
+      // `tx_coord_denorm` means the guest addresses this texture in TEXELS; the
+      // host sampler wants normalized coordinates, so this divides by the
       // extent. It arrives pre-reciprocated as xe_texinv, both to keep the
       // divide off the per-pixel path and so that "no texture bound" can be
-      // encoded as 0 — which reads texel 0, rather than the infinity a
-      // division by a zero extent would produce.
+      // encoded as 0 -- which reads texel 0, rather than the infinity a division
+      // by a zero extent would produce.
       //
       // This used to MULTIPLY by the extent, leaving every unnormalized fetch
       // wrong by the square of the texture size.
@@ -1284,30 +1217,21 @@ class Emitter {
       // W selects the slice. Which units it arrives in is the SAME question the
       // reference answers with a runtime branch, and it has a static answer:
       //
-      //   unnormalized -- W is already a layer index (`tx_coord_denorm` means
-      //     the guest addresses this texture in texels, and the layer axis has
-      //     no sub-texel meaning for a stack), so it passes through.
+      //   unnormalized -- W is already a layer index (the layer axis has no
+      //     sub-texel meaning for a stack), so it passes through.
       //   normalized -- W is a fraction of the stack, so it scales by the layer
-      //     COUNT to become an index. That count rides in xe_texinv[slot].z,
-      //     which was previously left zero.
+      //     COUNT, which rides in xe_texinv[slot].z.
       //
-      // Scaling by a count rather than count-1 matches the hardware's own
-      // treatment of the stack as a texel axis, and the sampler clamps the top
-      // slice, so the last layer is reachable without the coordinate running
-      // off the end.
-      //
-      // A zero .z (no texture bound at this slot) collapses every fetch to
-      // slice 0 rather than producing a NaN coordinate -- the same reason
-      // xe_texinv is stored reciprocated for the 2D case.
+      // Scaling by a count rather than count-1 matches the hardware's treatment
+      // of the stack as a texel axis, and the sampler clamps the top slice. A
+      // zero .z (no texture bound) collapses every fetch to slice 0.
       //
       // KNOWN DIVERGENCE, and the reason a real Texture3D is still worth
       // building later: Xenos filters BETWEEN stack layers under VolMagFilter /
       // VolMinFilter, and ucode.h names colour correction as the use for it. A
-      // Texture2DArray slice index does not filter -- D3D clamps it and picks
-      // one slice. So a graded frame comes out with quantised steps along the
-      // LUT's third axis rather than smooth ones. Correct hues, visible
-      // banding; a straight improvement on not drawing the pass at all, and
-      // deliberately not hidden by rounding the index.
+      // Texture2DArray slice index does not filter, so a graded frame comes out
+      // with quantised steps along the LUT's third axis. Correct hues, visible
+      // banding, and deliberately not hidden by rounding the index.
       const std::string src = Temp(tf.src());
       const std::string w =
           src + "." + std::string(1, kComponent[(swiz >> 4) & 3]);
@@ -1324,47 +1248,36 @@ class Emitter {
     // not per-texture: the same guest memory is bound with different sign modes
     // by different draws, so baking it into the decode would poison a cache
     // keyed on content. 2*c-1 is also unrepresentable in the UNORM8 the decode
-    // produces. The reference does the same thing for the same reasons -- see
-    // texture_swizzled_signs in dxbc_translator.h.
+    // produces. The reference does the same, for the same reasons.
     //
     // xe_texsign carries a per-component SCALE, already permuted into host
     // component order by SwizzleTextureSigns because the SRV applies the fetch
-    // swizzle before the shader ever sees a texel. The offset is not carried:
-    // for the two modes that reach here it is exactly 1-scale, since unsigned
-    // is (1, 0) and kUnsignedBiased is (2, -1).
+    // swizzle before the shader sees a texel. The offset is not carried: for the
+    // two modes that reach here it is exactly 1-scale.
     //
     // kSigned needs the texture's bits reinterpreted and so is a host-side
-    // decode, not this -- it is applied by picking a SNORM host view, and
-    // arrives here as an identity scale.
-    //
-    // kGamma cannot ride a scale, so 3.0 is a SELECTOR rather than a scale: the
+    // decode -- it is applied by picking a SNORM host view and arrives here as
+    // an identity scale. kGamma cannot ride a scale, so 3.0 is a SELECTOR: the
     // decode below turns it back into an identity scale and applies the
-    // piecewise-linear curve instead. Encoded in the existing value rather than
-    // in a new cbuffer region because the modes are mutually exclusive per
-    // component, so one float already carries all four.
+    // piecewise-linear curve instead.
     //
-    // THE BRANCH DOES NOT ACTUALLY SKIP THE CURVE, and this is measured, not
-    // assumed. `any(xe_gam)` reads a constant buffer, so it is uniform across
-    // the wave and should be a real branch -- but fxc flattens it and computes
-    // the curve unconditionally. `[branch]` does not change that: over the 81
-    // shaders in logs/hlsldump it altered the output of ZERO of them, so it is
-    // not written here rather than being written and believed.
+    // THE BRANCH DOES NOT ACTUALLY SKIP THE CURVE, and this is measured.
+    // `any(xe_gam)` reads a constant buffer, so it is uniform across the wave and
+    // should be a real branch -- but fxc flattens it. `[branch]` altered the
+    // output of ZERO of the 81 shaders in logs/hlsldump, so it is not written
+    // here rather than being written and believed.
     //
-    // What that costs, compiled with fxc /O3 and counting only instructions
-    // outside any branch (what a draw with NO gamma bound still executes):
+    // What that costs, fxc /O3, counting only instructions outside any branch:
     //
     //     51 of 81 shaders   no change at all
     //     aggregate          6194 -> 6977 slots, +12.6%
     //     worst, ps_215F0020    41 ->  284, +243   (19 fetch sites, tiny base)
     //
-    // So it is ~13 slots per fetch SITE, paid whether or not gamma is bound.
-    // Worth knowing before this is blamed for a frame time: the alternative is
-    // a shader permutation keyed on the sign modes, which the cache-by-handle
-    // design deliberately avoids.
+    // So ~13 slots per fetch SITE, paid whether or not gamma is bound. The
+    // alternative is a shader permutation keyed on the sign modes, which the
+    // cache-by-handle design deliberately avoids.
     //
-    // Both stages. xe_texsign is declared for the vertex stage too (at the end
-    // of its cbuffer, past xe_vf), so a sampling vertex shader gets the same
-    // correction rather than silently reading a biased texture as unsigned.
+    // Both stages: xe_texsign is declared for the vertex stage too.
     Line("{");
     Line("  float4 xe_sgn = xe_texsign[" + s + "];");
     Line("  float4 xe_gam = saturate(xe_sgn - 2.0);");
@@ -1382,19 +1295,15 @@ class Emitter {
   // format decode and this destination swizzle, at 0.48us a vertex over 289,000
   // vertices a frame. Everything the decode needs -- format, offset, dest and
   // dest swizzle -- comes from the INSTRUCTION, so the generated HLSL stays a
-  // pure function of the shader handle. Only the buffer base, the stride and
-  // the endian mode are runtime state, and those ride in xe_vf[].
+  // pure function of the shader handle. Only the buffer base, the stride and the
+  // endian mode are runtime state, and those ride in xe_vf[].
   //
-  // The index is SV_VertexID. Censused over a full run: every vfetch in this
-  // game reads r0.x with is_index_rounded false, so the vertex ID is what r0.x
-  // holds. A shader that indexed by anything else would need the ALU value and
-  // is refused below.
-  // `src_reg`/`src_swizzle`/`rounded` are the EFFECTIVE index operand,
-  // which for a vfetch_mini is the preceding vfetch_full's. The SDK is
-  // explicit: "the source is applicable only to vfetch_full (the address
-  // from vfetch_full is reused in vfetch_mini)", and the same holds for
-  // is_index_rounded and stride. Reading them off a mini instruction gets
-  // garbage, so the caller tracks them across the pair.
+  // `src_reg`/`src_swizzle`/`rounded` are the EFFECTIVE index operand, which for
+  // a vfetch_mini is the preceding vfetch_full's. The SDK is explicit: "the
+  // source is applicable only to vfetch_full (the address from vfetch_full is
+  // reused in vfetch_mini)", and the same holds for is_index_rounded and stride.
+  // Reading them off a mini instruction gets garbage, so the caller tracks them
+  // across the pair.
   void EmitVertexFetch(const uc::VertexFetchInstruction& vf,
                        uint32_t fetch_ordinal, uint32_t src_reg,
                        uint32_t src_swizzle, bool rounded) {
@@ -1444,28 +1353,23 @@ class Emitter {
     const std::string n = std::to_string(fetch_ordinal);
     const std::string base = "xe_vf[" + n + "]";
     // offset() is in dwords, like stride().
-    // The INDEX REGISTER the guest named, not SV_VertexID.
     //
-    // This was `xe_vid` unconditionally, which is only correct while
-    // every vfetch indexes by r0.x -- the note below called that
-    // assumption unchecked, and run mx_1829 produced the
-    // counter-example: three shaders fetch a 48-byte per-object stream
-    // with `src r0.y` while fetching a FOUR-entry, 64-byte corner table
-    // with `src r0.x`. Xenia writes the vertex index to GPR 0 `.x` ONLY
-    // (StartVertexShader_LoadVertexIndex, mask 0b0001), so r0.y holds a
-    // value the shader computed. Substituting the vertex ID for it
-    // addressed that table at 8984..15443 instead of 0..6777, which is
-    // what every dropped fetch region in a run actually was.
+    // The INDEX REGISTER the guest named, not SV_VertexID. This was `xe_vid`
+    // unconditionally, which is only correct while every vfetch indexes by r0.x:
+    // three shaders fetch a 48-byte per-object stream with `src r0.y` while
+    // fetching a FOUR-entry corner table with `src r0.x`. Xenia writes the
+    // vertex index to GPR 0 `.x` ONLY, so r0.y holds a value the shader
+    // computed, and substituting the vertex ID addressed that table at
+    // 8984..15443 instead of 0..6777 -- which is what every dropped fetch region
+    // in a run actually was.
     //
     // Xenos keeps the index in a float register, so convert here.
     //
     // FLOOR, both ways -- matching Xenia (dxbc_shader_translator_fetch.cc:74):
     // OpRoundNI on the index, and OpAdd 0.5 first when is_index_rounded. NOT
-    // trunc and NOT HLSL round(): round() is half-to-even, which the SDK calls
-    // out as meaningless for addressing since 1.5 and 2.5 would both give 2.
-    // trunc and floor agree for the non-negative indices this title produces,
-    // so this changes nothing measurable today -- it is conformance, not a
-    // fix, and is recorded as such.
+    // trunc and NOT HLSL round(), which is half-to-even and so meaningless for
+    // addressing. trunc and floor agree for the non-negative indices this title
+    // produces, so this is conformance, not a fix.
     Line("uint xe_vfi = (uint)" +
          std::string(rounded ? "floor(0.5 + " : "floor(") + "r[" +
          std::to_string(src_reg) + "]." +
@@ -1479,32 +1383,25 @@ class Emitter {
 
     // Bounds. xe_vb is bound as a ROOT SRV, which carries a virtual address and
     // no size, so nothing here is bounds-checked by the hardware: a read past
-    // this stream's region takes the next stream's vertices, then another
-    // draw's suballocation in the same upload page, then undefined memory.
+    // this stream's region takes the next stream's vertices, then another draw's
+    // suballocation in the same upload page, then undefined memory.
     //
-    // `.w` is one past this stream's valid bytes (DrawCall::RawFetch::limit).
-    // Past it the fetch yields zero, which is what the hardware and the
-    // reference do with an over-long fetch rather than dropping the draw. The
-    // decode below then runs on zeros, so an out-of-range attribute reaches the
-    // shader as (0,0,0,1) exactly as ReadVertexAttributeAs leaves it.
+    // `.w` is one past this stream's valid bytes. Past it the fetch yields zero,
+    // which is what the hardware and the reference do with an over-long fetch
+    // rather than dropping the draw. This also covers a fetch whose xe_vf[] slot
+    // was never filled: limit is 0 there.
     //
-    // This also covers a fetch whose xe_vf[] slot was never filled: limit is 0
-    // there, so it reads zero rather than whatever address 0 happens to hold.
-    //
-    // The add cannot wrap in practice -- xe_vfa is an offset into a buffer the
-    // upload allocator caps well below 2^32 -- and is written this way rather
-    // than as `xe_vfa <= .w - N` precisely because THAT form underflows when a
-    // stream's region is shorter than one attribute.
+    // The add cannot wrap in practice, and is written this way rather than as
+    // `xe_vfa <= .w - N` precisely because THAT form underflows when a stream's
+    // region is shorter than one attribute.
     //
     // The ADDRESS is clamped, not just the result. `?:` around the Load itself
-    // would not be enough: HLSL does not guarantee short-circuit evaluation,
-    // and fxc routinely evaluates both sides of a select, which would issue the
-    // out-of-range Load regardless. A root SRV has no size for the hardware to
-    // clamp against, so that load is not merely garbage-but-discarded -- it can
-    // cross a page and fault. Loading from 0 instead is always in bounds: the
-    // suballocator rounds every region up to 256 bytes and the fetch stage is
-    // only taken when rawByteCount is non-zero, so the first 16 bytes always
-    // exist. The value is then discarded anyway.
+    // would not be enough: HLSL does not guarantee short-circuit evaluation and
+    // fxc routinely evaluates both sides of a select, and a root SRV has no size
+    // for the hardware to clamp against -- so that load can cross a page and
+    // fault. Loading from 0 instead is always in bounds: the suballocator rounds
+    // every region up to 256 bytes and the fetch stage is only taken when
+    // rawByteCount is non-zero.
     std::string zeros = uty + "(0u";
     for (uint32_t i = 1; i < dwords; ++i) zeros += ", 0u";
     zeros += ")";
@@ -1515,12 +1412,12 @@ class Emitter {
 
     // Endian, exactly as ApplyFetchEndianFor does it on the CPU: reverse fixed
     // width units across the attribute, 4-byte units for mode 2 and 2-byte for
-    // mode 1, WITHOUT consulting the format. A 4-byte reversal of a dword
-    // holding two 16-bit components both swaps each component and exchanges the
-    // pair, and that is the hardware's real behaviour -- the guest compiler
-    // compensates for it in the destination swizzle, so narrowing the unit by
-    // format would be wrong. Mode 2 is 7335 of 8772 fetches here and mode 1
-    // never occurs, but both are emitted rather than assumed away.
+    // mode 1, WITHOUT consulting the format. A 4-byte reversal of a dword holding
+    // two 16-bit components both swaps each component and exchanges the pair,
+    // and that is the hardware's real behaviour -- the guest compiler compensates
+    // for it in the destination swizzle, so narrowing the unit by format would be
+    // wrong. Mode 2 is 7335 of 8772 fetches here and mode 1 never occurs, but
+    // both are emitted rather than assumed away.
     Line("if (" + base + ".z == 2u) xe_vr = XeSwap8in32(xe_vr);");
     Line("else if (" + base + ".z == 1u) xe_vr = XeSwap8in16(xe_vr);");
 
@@ -1649,34 +1546,27 @@ class Emitter {
     }
   }
 
-  // A predicated TEXTURE fetch. The `if` goes around the destination write
-  // ONLY -- the .Sample() above has already been emitted, outside it.
+  // A predicated TEXTURE fetch. The `if` goes around the destination write ONLY
+  // -- the .Sample() above has already been emitted, outside it.
   //
   // That is what makes this legal where the exec-block form is not. .Sample()
   // needs implicit derivatives and cannot appear in varying flow control, but a
   // fetch's only effect is writing its destination register, so sampling
   // unconditionally and gating the WRITE is observationally identical: where p0
-  // is clear the destination keeps its previous value, which is exactly what
-  // not fetching achieves.
+  // is clear the destination keeps its previous value.
   //
-  // Nothing is reordered. Both statements sit at the same point in the
-  // instruction stream -- the sample was simply never inside the `if` -- so
-  // there is no hoist, and no question about what the coordinate register held
-  // in between.
+  // Nothing is reordered -- both statements sit at the same point in the
+  // instruction stream, the sample was simply never inside the `if`.
   //
-  // The guest agrees, in the encoding: every predicated fetch in this title
-  // that carries the attribute sets FetchValidOnly=false, which ucode.h defines
-  // as "whether the data should be fetched only for pixels inside the current
-  // primitive in a 2x2 quad (must be set to false if the result itself is used
-  // to calculate gradients)". The guest is telling the hardware NOT to make
-  // these fetches lane-conditional, so sampling across the whole quad is the
-  // faithful translation rather than a shortcut around one.
+  // The guest agrees, in the encoding: every predicated fetch in this title that
+  // carries the attribute sets FetchValidOnly=false, which ucode.h defines as
+  // "whether the data should be fetched only for pixels inside the current
+  // primitive in a 2x2 quad". The guest is telling the hardware NOT to make
+  // these fetches lane-conditional.
   //
-  // Xenia instead wraps the fetch itself and pays for it with explicit
-  // gradients everywhere (dxbc_shader_translator_fetch.cc has no implicit
-  // OpSample at all, only OpSampleD). It needs that because it wraps whole exec
-  // blocks, where a skipped fetch has to interact with memexport and kill. For
-  // a standalone predicated fetch this is equivalent and far less machinery.
+  // Xenia instead wraps the fetch itself and pays for it with explicit gradients
+  // everywhere. It needs that because it wraps whole exec blocks, where a
+  // skipped fetch has to interact with memexport and kill.
   //
   // EXEC-BLOCK predication is NOT solved by this and must not be assumed to be:
   // a fetch inside a p0-gated block would need its coordinate computed outside
@@ -1780,19 +1670,17 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   // Which register COMPONENTS the shader has written before the current
   // instruction. 32 registers x 4 components.
   //
-  // r0.x holds the vertex index at ENTRY and nothing else does -- but a
-  // shader is free to overwrite it, and the billboard shaders do:
+  // r0.x holds the vertex index at ENTRY and nothing else does -- but a shader
+  // is free to overwrite it, and the billboard shaders do:
   //
   //   r0.x = vid % 4        corner index, fetched from a 4-entry table
   //   r0.x = floor(vid / 4) instance index, into a 6778-entry table
   //
-  // Both fetches then read `src r0.x`, so testing the register NUMBER
-  // classifies them as vertex-indexed, windows their streams at
-  // first_vertex, and drops every region -- which collapsed 3360 billboard
-  // quads to the origin and is why the vegetation was invisible.
-  //
-  // What actually matters is whether the value is still the vertex index,
-  // i.e. whether that component is unwritten at the point of the fetch.
+  // Both fetches then read `src r0.x`, so testing the register NUMBER classifies
+  // them as vertex-indexed, windows their streams at first_vertex, and drops
+  // every region -- which collapsed 3360 billboard quads to the origin. What
+  // matters is whether the value is still the vertex index, i.e. whether that
+  // component is unwritten at the point of the fetch.
   uint32_t written_comp[32] = {};
 
   for (uint32_t i = 0; i + 2 < max_cf_dword; i += 3) {
@@ -1830,41 +1718,29 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
       }
 
       // HONOUR the predicate where it is safe to, which today means the vertex
-      // stage only. Xenia emits a plain `if` on p0 for these
-      // (dxbc_shader_translator.cc, UpdateExecConditionalsAndEmitDisassembly)
-      // and gets away with it because it emits DXBC directly and its fetches
-      // carry an explicit LOD. Ours emit HLSL, and the two stages differ:
+      // stage only. Xenia emits a plain `if` on p0 for these and gets away with
+      // it because it emits DXBC directly and its fetches carry an explicit LOD.
+      // Ours emit HLSL, and the two stages differ:
       //
-      //   VERTEX  — ExplicitLod() is `use_register_lod() || !pixel()`, so every
-      //             vertex fetch is already SampleLevel. No implicit gradient,
-      //             so an `if` around it is legal, and a vertex stage has no
-      //             discard to be skipped either. SAFE.
-      //   PIXEL   — the body spells `.Sample()`, which needs derivatives and is
-      //             illegal in varying flow control; FXC rejects it, and a
-      //             rejected shader falls to a stand-in, which is a VISIBLE
-      //             regression (this is how the water was lost once already).
-      //             `[flatten]` is worse, not better: both of this game's
-      //             affected pixel shaders contain `discard`, and flattening
-      //             would execute it unconditionally and kill pixels the
-      //             console kept. UNSAFE until fetches inside a predicated
-      //             region are emitted gradient-free (SampleGrad with the
-      //             derivatives taken before the branch, or hoisted).
+      //   VERTEX  every vertex fetch is already SampleLevel, so no implicit
+      //           gradient, an `if` around it is legal, and a vertex stage has
+      //           no discard to be skipped. SAFE.
+      //   PIXEL   the body spells `.Sample()`, illegal in varying flow control;
+      //           FXC rejects it and a rejected shader falls to a stand-in,
+      //           which is a VISIBLE regression (this is how the water was lost
+      //           once already). `[flatten]` is worse: both affected pixel
+      //           shaders contain `discard`, and flattening would execute it
+      //           unconditionally. UNSAFE until fetches inside a predicated
+      //           region are emitted gradient-free.
       //
-      // NOT half-done, and NOT a correctness gap -- corrected 2026-08-26.
-      //
-      // This `if` is a WAVEFRONT SKIP, not per-lane correctness. ucode.h on
-      // kCondExecPred: "if any of the invocations passes the predicate check,
-      // all of them will enter the exec". Lanes whose p0 is clear enter the
-      // block regardless, so the block gate never gated a lane. Per-lane
-      // correctness comes from the instruction predicates, which is exactly why
-      // "the compiler makes the ALU and fetch instructions themselves inside a
-      // predicated exec predicated as well".
-      //
-      // Measured over this title's three heavily predicated pixel shaders: 194
-      // ALU and 46 fetch instructions sit inside cond_exec_pred blocks and ALL
-      // 240 carry their own (p0). Those are honoured, so skipping the block
-      // buys speed and nothing else -- and in the pixel stage it is not even
-      // available. Left counted so the population stays visible.
+      // NOT a correctness gap. This `if` is a WAVEFRONT SKIP, not per-lane
+      // correctness -- ucode.h on kCondExecPred: "if any of the invocations
+      // passes the predicate check, all of them will enter the exec". Per-lane
+      // correctness comes from the instruction predicates, which is why "the
+      // compiler makes the ALU and fetch instructions themselves inside a
+      // predicated exec predicated as well". Measured over this title's three
+      // heavily predicated pixel shaders: 194 ALU and 46 fetch instructions
+      // inside cond_exec_pred blocks and ALL 240 carry their own (p0).
       const bool honour_p0 = p0_gated && stage != HlslStage::kPixel;
       if (honour_p0) {
         ++out.honoured_pred_exec_blocks;
@@ -1893,17 +1769,15 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
           // kGetTextureComputedLod=17, kGetTextureGradients=18,
           // kGetTextureWeights=19, kSetTextureLod=20,
           // kSetTextureGradientsHorz=21, kSetTextureGradientsVert=22}, so a
-          // two-way split on `!= kTextureFetch` sends all seven of the high
-          // opcodes down the VERTEX branch. There they were memcpy'd into a
-          // VertexFetchInstruction and read as one: for a vertex shader, word
-          // 1 bits 13:18 landed in exp_adjust as garbage and refused the whole
-          // shader — measured as `VFETCH coverage: 114 of 115 ... vertex fetch
-          // exp_adjust=1`, one shader, ~89k-100k draws a run kept off the GPU
-          // fetch path. The shader in question carries a plain setTexLOD and
-          // has an exp_adjust of 0 on every one of its four real vfetches.
+          // two-way split on `!= kTextureFetch` sends all seven high opcodes
+          // down the VERTEX branch. There they were memcpy'd into a
+          // VertexFetchInstruction and read as one: word 1 bits 13:18 landed in
+          // exp_adjust as garbage and refused the whole shader -- one shader,
+          // ~89k-100k draws a run kept off the GPU fetch path, over a plain
+          // setTexLOD whose four real vfetches all have exp_adjust 0.
           //
           // Test each opcode for what it IS. The high ops are skipped and
-          // counted rather than refused; see HlslShader::unhonoured_fetch_ops.
+          // counted rather than refused.
           const uint32_t fetch_op = dwords[at] & 0x1F;
           if (fetch_op == uint32_t(uc::FetchOpcode::kVertexFetch)) {
             // A vertex fetch. Without emit_vertex_fetch the host input assembler
@@ -1975,14 +1849,12 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
             std::memcpy(&tf, dwords + at, sizeof(tf));
             em.EmitGetGradients(tf);
           } else {
-            // getCompTexLOD / getWeights / getBCF and the two setGradients.
-            // Not implemented; skipped with the destination left holding
-            // whatever it had, which is what already happened to these in a
-            // pixel shader. Counted so the population stays visible rather
-            // than being silently approximated.
-            //
-            // getGradients WAS in this list and is now honoured above -- it
-            // was not harmless, see EmitGetGradients.
+            // getCompTexLOD / getWeights / getBCF and the two setGradients. Not
+            // implemented; skipped with the destination left holding whatever it
+            // had, which is what already happened to these in a pixel shader.
+            // Counted so the population stays visible rather than being silently
+            // approximated. getGradients WAS in this list and is now honoured
+            // above -- it was not harmless.
             ++em.unhonoured_fetch_ops;
           }
         } else {
@@ -2059,31 +1931,27 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
     // reference as raw float bits (the cbuffer member is uint4, so it is
     // reinterpreted in the shader rather than stored twice).
     //
-    // DRAW STATE, not a shader permutation, for the same reason xe_param_gen
-    // is: host shaders are cached by guest shader handle, and making the test
-    // part of the key would compile the same shader once per alpha state.
+    // DRAW STATE, not a shader permutation, for the same reason xe_param_gen is:
+    // host shaders are cached by guest shader handle, and making the test part
+    // of the key would compile the same shader once per alpha state.
     src += "  uint4 xe_alphatest;\n";
     // Colour output scale, .x only. 1/32 for a k_16_16 / k_16_16_16_16 target,
     // 1.0 for everything else.
     //
     // Those two RENDER TARGET formats are signed fixed point -32...32, and a
     // resolve out of them is NOT bitwise equivalent to the texture format
-    // (SDK xenos.h:566). We resolve with CopyTextureRegion, which IS bitwise,
-    // so the range has to be applied somewhere else -- and the reference puts
-    // it here, on the write, rather than on the copy:
-    //
-    //   "Remap from -32...32 to -1...1, getting the full range."
-    //   color_exp_bias -= 5;        (d3d12_command_processor.cc:4243)
-    //
-    // -5 as an exponent bias is exactly this 1/32. Doing it on the write keeps
-    // the host target holding -1...1, which makes both the resolve and any
+    // (xenos.h:566). We resolve with CopyTextureRegion, which IS bitwise, so the
+    // range has to be applied somewhere else -- and the reference puts it here,
+    // on the write, rather than on the copy: "Remap from -32...32 to -1...1",
+    // color_exp_bias -= 5, which is exactly this 1/32. Doing it on the write
+    // keeps the host target holding -1...1, which makes both the resolve and any
     // direct sample of the target correct without a scaling blit.
     src += "  float4 xe_colorscale;\n";
   }
   // One entry per emitted vertex fetch: .x the byte offset of this attribute's
   // stream within the merged raw buffer (with first_vertex already folded in),
   // .y the stream stride, .z the endian mode. Everything else the decode needs
-  // came from the instruction and is already baked into the code below.
+  // came from the instruction.
   //
   // Always declared for the vertex stage, even at zero fetches, so the constant
   // buffer this shader is handed has one layout rather than two.
@@ -2091,17 +1959,15 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
     src += "  uint4 xe_vf[" + std::to_string(HlslShader::kMaxVertexFetches) +
            "];\n";
     // AFTER xe_vf, deliberately. The renderer writes xe_vf at a FIXED byte
-    // offset computed as constDwords*4 + kMaxSamplerSlots*16 (d3d12_game.cpp,
-    // the vfOffset in the fetch path), so anything inserted between xe_texinv
-    // and xe_vf silently moves the vertex fetch table and corrupts every
-    // GPU-fetched attribute. Appending leaves that offset exactly where it was
-    // and puts the new member somewhere nothing indexes by hand.
+    // offset computed as constDwords*4 + kMaxSamplerSlots*16, so anything
+    // inserted between xe_texinv and xe_vf silently moves the vertex fetch table
+    // and corrupts every GPU-fetched attribute.
     //
     // The comment this replaces said the vertex stage needed no texture sign
     // "because no vertex shader in this game samples anything". That was
-    // measured false: 230,720 draws in mx_1038 were refused the GPU vertex path
+    // measured false: 230,720 draws in one run were refused the GPU vertex path
     // for having a sampler, and the interpreter they fell to has no texture
-    // fetch at all -- so their vertex positions came out as silent zeros.
+    // fetch at all.
     src += "  float4 xe_texsign[" +
            std::to_string(HlslShader::kMaxSamplerSlots) + "];\n";
     // THE D3D9 HALF-PIXEL OFFSET, in NDC, already scaled for this draw's
@@ -2110,27 +1976,25 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
     // D3D9 centres pixels at .0 and the host rasterises at .5, so a guest quad
     // covering the whole target lands half a pixel short and its last row and
     // column clamp -- one anomalous line on the bottom and right edges of every
-    // full-screen pass, which is what shows on the start and loading screens.
+    // full-screen pass.
     //
-    // APPLIED HERE, NOT TO THE HOST VIEWPORT. Shifting viewport.TopLeftX/Y
-    // moves rasterisation without moving anything else, so a texel-exact pass
-    // then samples BETWEEN texels: that is what blew the 160x90 luminance
-    // downsample and drove the whole scene white. The reference folds the same
-    // +0.5 into the viewport offset in the GUEST's space and emits it as an NDC
-    // offset on the vertex position (draw_util.cc:389), which is what this is.
+    // APPLIED HERE, NOT TO THE HOST VIEWPORT. Shifting viewport.TopLeftX/Y moves
+    // rasterisation without moving anything else, so a texel-exact pass then
+    // samples BETWEEN texels: that is what blew the 160x90 luminance downsample
+    // and drove the whole scene white. The reference folds the same +0.5 into
+    // the viewport offset in the GUEST's space and emits it as an NDC offset on
+    // the vertex position (draw_util.cc:389).
     //
-    // LAST in the cbuffer, for the reason the note above gives: the renderer
-    // writes xe_vf at a fixed offset computed from the members before it, so
-    // appending is the only way to add one without moving that.
+    // LAST in the cbuffer, for the reason above: the renderer writes xe_vf at a
+    // fixed offset computed from the members before it.
     src += "  float4 xe_ndc_offset;\n";
   }
   src += "};\n";
   // RECIP_FF / RECIPSQ_FF: an infinity becomes a signed zero. See the note at
   // the kRcpf case -- these are the "fast-forward" forms a title uses when it
-  // wants to divide by a possibly-zero quantity and have the term vanish
-  // instead of poisoning the result. Emitted unconditionally: it is four lines,
-  // and gating it on whether the shader happens to use one is a way for the two
-  // to drift apart.
+  // wants to divide by a possibly-zero quantity and have the term vanish.
+  // Emitted unconditionally: it is four lines, and gating it on whether the
+  // shader happens to use one is a way for the two to drift apart.
   //
   // `isinf` rather than a comparison against FLT_MAX: rcp of a denormal can
   // overflow to infinity without the input being zero, and the hardware flushes
@@ -2142,9 +2006,8 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   // The clamping forms (rcpc, rsqc, logc) saturate an infinity to the finite
   // extreme and leave EVERYTHING else alone, NaN included. Done the way Xenia
   // does it, on the integer representation: 0x7F800000 - 1 is 0x7F7FFFFF and
-  // 0xFF800000 - 1 is 0xFF7FFFFF, which are exactly +-FLT_MAX. clamp() and
-  // min() folded NaN to FLT_MAX -- the same swallowing the Shader Model 3
-  // min/max change removed from the vector ops.
+  // 0xFF800000 - 1 is 0xFF7FFFFF, exactly +-FLT_MAX. clamp() and min() folded
+  // NaN to FLT_MAX.
   src +=
       "float XeClampInf(float v) {\n"
       "  return (asuint(v) & 0x7FFFFFFFu) == 0x7F800000u\n"
@@ -2154,24 +2017,18 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
       "float XeClampNegInf(float v) {\n"
       "  return asuint(v) == 0xFF800000u ? -3.402823466e+38 : v;\n"
       "}\n";
-  // TextureSign::kGamma. Xenos gamma is a FOUR-PIECE PIECEWISE LINEAR curve,
-  // NOT sRGB, so a *_UNORM_SRGB host view is the wrong curve and not merely a
-  // cheaper one. Transcribed from the reference's PWLGammaToLinear -- the
-  // scalar form in xenos.cc:23 and the shader form in
-  // dxbc_shader_translator.cc:225, which agree.
+  // TextureSign::kGamma. Xenos gamma is a FOUR-PIECE PIECEWISE LINEAR curve, NOT
+  // sRGB, so a *_UNORM_SRGB host view is the wrong curve and not merely a
+  // cheaper one. Transcribed from the reference's PWLGammaToLinear.
   //
   // step() rather than a ternary chain because step(edge, x) is exactly
   // `x >= edge` and yields a float4 mask directly, and because a NaN input
-  // compares false everywhere and so selects the lowest piece -- which is what
-  // the reference documents it relies on, the value being saturated to 0
-  // afterwards anyway.
-  //
-  // The pieces nest (top implies mid implies low), which is what lets the
+  // compares false everywhere and so selects the lowest piece -- which the
+  // reference documents it relies on. The pieces nest, which is what lets the
   // selection be a lerp chain instead of four compares.
   //
-  // Emitted unconditionally, like XeFlushInf above and for the same reason: the
-  // sign mode is per-BINDING, so it is not known when the shader is translated,
-  // and gating on it is a way for the two to drift apart.
+  // Emitted unconditionally, like XeFlushInf above: the sign mode is
+  // per-BINDING, so it is not known when the shader is translated.
   src +=
       "float4 XePWLGammaToLinear(float4 g) {\n"
       "  float4 low = step(64.0 / 255.0, g);\n"
@@ -2192,49 +2049,36 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   //
   //   Direct3D 9 rules (like in GCN v_*_legacy_f32 instructions) for
   //   multiplication (+-0 or denormal * anything = +0) wherever it's present
-  //   (mul, mad, dp, etc.) [...] It's very important to respect this rule for
-  //   multiplication, as games often rely on it in vector normalization (rcp
-  //   and mul), Infinity * 0 resulting in NaN breaks a lot of things in games
-  //   - causes white screen [...], white specular on characters [...]. The
-  //   result is always positive zero in this case, no matter what the signs of
-  //   the other operands are.
+  //   (mul, mad, dp, etc.) [...] Infinity * 0 resulting in NaN breaks a lot of
+  //   things in games - causes white screen [...], white specular on characters
+  //   [...]. The result is always positive zero in this case, no matter what the
+  //   signs of the other operands are.
   //
   // That is this game's menu exactly. The light-prepass materials sample the
   // screen-space light buffer, take its Rec.709 luminance, `rcp` it, and scale
-  // colour*colour by the result -- the standard light-prepass specular
-  // reconstruction. Where the light buffer is black the hardware computes
-  // 0 * INF = +0 and the specular term simply vanishes; we computed NaN and
-  // every pixel of the rider and the bike came out NaN.
+  // colour*colour by the result. Where the light buffer is black the hardware
+  // computes 0 * INF = +0 and the specular term vanishes; we computed NaN.
   //
-  // DENORMALS COUNT AS ZERO, and this is not a refinement -- it is the rule as
-  // the SDK states it: "+-0 OR DENORMAL * anything = +0". An earlier version of
-  // this comment argued that testing exact zero was enough because the hardware
-  // flushes denormal inputs before the multiply. That conflated two different
-  // things: the input flush is about how an operand is READ, while this rule is
-  // about what the PRODUCT is. A denormal times a large value, or times an
-  // infinity, is a finite +0 on this hardware and an INF or a NaN under IEEE.
+  // DENORMALS COUNT AS ZERO, and this is the rule as the SDK states it. An
+  // earlier version of this comment argued that testing exact zero was enough
+  // because the hardware flushes denormal inputs before the multiply. That
+  // conflated two things: the input flush is about how an operand is READ, while
+  // this rule is about what the PRODUCT is.
   //
-  // This is a CORRECTNESS fix and nothing more. It is deliberately not credited
-  // with any visible defect: it was written while chasing the rider's black
-  // lower body, where a trace showed NaN appearing at instruction 3 out of an
-  // all-zero register -- but that same NaN appears in the runs where the rider
-  // renders correctly, so it is not what distinguishes them, and the build
-  // carrying this change left the lower body exactly as black as before.
+  // A CORRECTNESS fix and nothing more, deliberately not credited with any
+  // visible defect: it was written while chasing the rider's black lower body,
+  // but the NaN it removes also appears in the runs where the rider renders
+  // correctly.
   //
-  // The comparison is against FLT_MIN, the smallest NORMAL float: anything
-  // below it in magnitude is a denormal or a zero, which is exactly the set
-  // this rule collapses. abs() rather than two comparisons so a negative
-  // denormal is caught, and the returned zero is positive in every case, per
-  // "The result is always positive zero [...] no matter what the signs of the
-  // other operands are".
+  // The comparison is against FLT_MIN, the smallest NORMAL float: anything below
+  // it in magnitude is a denormal or a zero. abs() rather than two comparisons
+  // so a negative denormal is caught, and the returned zero is always positive.
   //
-  // NaN is deliberately NOT caught here: abs(NaN) < FLT_MIN is false, so a NaN
-  // operand still propagates through the multiply, which is what the hardware
-  // does. Only zeros and denormals are collapsed.
+  // NaN is deliberately NOT caught: abs(NaN) < FLT_MIN is false, so a NaN
+  // operand still propagates, which is what the hardware does.
   //
   // mad stays unfused and is emitted as XeMul(a, b) + c rather than as a select
-  // on c -- per the same note, +0 + -0 is +0, so a zero multiplicand must still
-  // go through the add.
+  // on c -- +0 + -0 is +0, so a zero multiplicand must still go through the add.
   src +=
       "float XeMul(float a, float b) {\n"
       "  return (abs(a) < 1.175494351e-38 || abs(b) < 1.175494351e-38)\n"
@@ -2254,26 +2098,20 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
       // ---- Shader Model 3 min/max ------------------------------------------
       // `a op b ? a : b`, NOT the HLSL intrinsics. The difference is NaN and
       // only NaN: D3D min/max return the NON-NaN operand, so max(5, NaN) is 5,
-      // while the SM3 form asks `5 >= NaN`, which is false, and yields NaN.
-      // The console propagates; the intrinsic swallows.
+      // while the SM3 form asks `5 >= NaN`, which is false, and yields NaN. The
+      // console propagates; the intrinsic swallows.
       //
-      // The same reference note that carries the legacy-multiply rule above
-      // ends "and for NaN in min/max. It is very important to respect"
-      // (ucode.h:975), and Xenia implements it deliberately in BOTH of its
-      // translators -- "Shader Model 3 NaN behavior (a op b ? a : b, not
-      // fmax/fmin)" at dxbc_shader_translator_alu.cc:131, :631, :761, :880 and
-      // spirv_shader_translator_alu.cc:452, :1160.
+      // The same reference note that carries the legacy-multiply rule ends "and
+      // for NaN in min/max. It is very important to respect" (ucode.h:975), and
+      // Xenia implements it deliberately in BOTH of its translators.
       //
-      // This closes an EMITTER/INTERPRETER DIVERGENCE, which is the precise
-      // hazard the XeMul note warns about: shader_alu.cpp has always used the
-      // SM3 form (:308, :309, :447, :448), so one draw could change colour
-      // depending on which path served it, and a debug_pixel trace would
-      // disagree with the interpreter.
+      // This closes an EMITTER/INTERPRETER DIVERGENCE, the precise hazard the
+      // XeMul note warns about: shader_alu.cpp has always used the SM3 form, so
+      // one draw could change colour depending on which path served it.
       //
       // A helper rather than an inline ternary because the operands are
-      // expression STRINGS, some large (`-(abs(r[0].xxxx))`), and expanding
-      // each twice per min/max would bloat every shader against
-      // kInstructionCap for no benefit.
+      // expression STRINGS, some large, and expanding each twice per min/max
+      // would bloat every shader against kInstructionCap.
       //
       // Deliberately NOT applied to: kLogc/kRsqc, whose max/min against
       // +-FLT_MAX is part of those opcodes' own clamped semantics; the
@@ -2357,12 +2195,12 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   // Declared for EVERY slot up to sampler_count, contiguously from this stage's
   // base register, so the registers match a descriptor table of exactly that
   // width. Both stages base at t0/s0 and are kept apart by the root signature's
-  // ShaderVisibility — see HlslShader::kVertexTextureBaseRegister.
+  // ShaderVisibility.
   //
   // A slot fetched as a cube is declared Texture2DArray: the guest projects the
   // direction to (S, T, face) itself, so an array indexed by face is what its
   // operands already describe. BindTranslatedTextures must give that slot a
-  // TEXTURE2DARRAY SRV to match — see HlslShader::sampler_array_mask.
+  // TEXTURE2DARRAY SRV to match.
   const uint32_t tex_base = stage == HlslStage::kPixel
                                 ? HlslShader::kPixelTextureBaseRegister
                                 : HlslShader::kVertexTextureBaseRegister;
@@ -2408,9 +2246,9 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
     // input layout from input_mask, in this same order.
     //
     // With it, the shader fetches for itself out of xe_vb and the only input is
-    // the vertex ID. input_mask is then normally empty — a register still in it
+    // the vertex ID. input_mask is then normally empty -- a register still in it
     // is one the body reads that no vfetch writes, which reads zero on hardware
-    // too, so it needs no element either.
+    // too.
     if (emit_vertex_fetch) {
       src += "XeInterpolants main(uint xe_vid : SV_VertexID) {\n";
     } else {
@@ -2428,14 +2266,13 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   src += "  float4 r[" + std::to_string(kNumTemps) + "];\n";
   src += "  [unroll] for (int xe_i = 0; xe_i < " + std::to_string(kNumTemps) +
          "; ++xe_i) r[xe_i] = float4(0, 0, 0, 0);\n";
-  // r0.x IS the vertex index on Xenos, and nothing set it here before.
-  // Xenia does exactly this in StartVertexShader_LoadVertexIndex: the index
-  // goes to GPR 0 with write mask 0b0001, converted to float (OpUToF at the
-  // end of RemapAndConvertVertexIndices). It was invisible while the fetch
-  // hard-coded SV_VertexID, because nothing else read the register -- but
-  // now that each fetch indexes by the register it names, an r0.x fetch
-  // reads this, and any shader reading r0.x for its own arithmetic was
-  // silently getting 0 all along.
+  // r0.x IS the vertex index on Xenos, and nothing set it here before. Xenia
+  // does exactly this in StartVertexShader_LoadVertexIndex: the index goes to
+  // GPR 0 with write mask 0b0001, converted to float. It was invisible while the
+  // fetch hard-coded SV_VertexID, because nothing else read the register -- but
+  // now that each fetch indexes by the register it names, an r0.x fetch reads
+  // this, and any shader reading r0.x for its own arithmetic was silently
+  // getting 0 all along.
   if (emit_vertex_fetch) src += "  r[0].x = (float)xe_vid;\n";
   src += "  float4 xe_v = float4(0, 0, 0, 0);\n";
   src += "  float xe_s = 0.0, xe_ps = 0.0;\n";
@@ -2447,14 +2284,13 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   // reads the register before any setTexLOD has run gets level 0, which is the
   // level that stage sampled at before register LOD was honoured at all.
   if (em.uses_reg_lod) src += "  float xe_lod = 0.0;\n";
-  // Written by setp_*, and since 2026-08-17 READ by cond_exec_pred in the
-  // vertex stage — `if (xe_p0 == …)` around the block the console gated. Still
+  // Written by setp_*, and READ by cond_exec_pred in the vertex stage. Still
   // unread in the pixel stage, where `.Sample()` inside varying flow control is
   // illegal; see the safety note at the emit site and
   // HlslShader::honoured_pred_exec_blocks for the seen-vs-obeyed split.
   //
-  // Declared here, ahead of `src += em.body`, so every block the walk emitted
-  // is downstream of it.
+  // Declared here, ahead of `src += em.body`, so every block the walk emitted is
+  // downstream of it.
   src += "  bool xe_p0 = false;\n";
   src += "  int xe_a0 = 0;\n";
   if (em.uses_cube) {
@@ -2474,9 +2310,8 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
     // Floor before abs so sample-rate positions and derivative helper quads
     // retain the Xenos integer-pixel behavior. The X face flag applies only to
     // polygon primitives; points are always front-facing and lines have their
-    // own flag in Z.
-    // Point-sprite z/w coordinates need point expansion that this renderer
-    // does not yet provide, while non-point geometry uses neutral zero there.
+    // own flag in Z. Point-sprite z/w coordinates need point expansion that this
+    // renderer does not yet provide, while non-point geometry uses zero there.
     src +=
         "  if (xe_param_gen.x != 0) {\n"
         "    uint xe_pg_reg = xe_param_gen.x - 1;\n"
@@ -2507,16 +2342,14 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
   src += em.body;
 
   if (stage == HlslStage::kPixel) {
-    // The alpha test, as a discard. D3D12 has no fixed-function equivalent --
-    // it is the one piece of Xenos output-merger state with nowhere else to go,
-    // and the reference implementation puts it here too
-    // (dxbc_shader_translator_om.cc). Ignoring it is why alpha-cutout geometry
-    // rendered as filled quads: brake rotors as solid discs, and UI plates the
-    // guest masks away entirely as opaque rectangles over the scene.
+    // The alpha test, as a discard. D3D12 has no fixed-function equivalent -- it
+    // is the one piece of Xenos output-merger state with nowhere else to go, and
+    // the reference puts it here too (dxbc_shader_translator_om.cc). Ignoring it
+    // is why alpha-cutout geometry rendered as filled quads: brake rotors as
+    // solid discs, and UI plates the guest masks away as opaque rectangles.
     //
     // Against colour target 0's alpha only, which is the only one the hardware
-    // tests. A shader that writes no target 0 has no alpha to test, so the test
-    // cannot be emitted for it -- xe_color0 does not exist there.
+    // tests. A shader that writes no target 0 has no alpha to test.
     //
     // kNotEqual is spelled `!=` rather than `<` combined with `>`: it must pass
     // for NaN, and the pair of comparisons does not.
@@ -2542,8 +2375,7 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
     // AFTER the alpha test, never before. RB_ALPHA_REF is in the guest's own
     // colour units, so the test has to compare against the unscaled alpha --
     // scaling first would divide every fragment's alpha by 32 and compare it
-    // against an unscaled reference, which fails or passes essentially every
-    // pixel depending on the function.
+    // against an unscaled reference.
     //
     // Scaling here rather than in the emitted ALU also keeps it linear with
     // respect to blending: every factor the guest uses is linear in the source
@@ -2558,28 +2390,25 @@ bool EmitShaderHlsl(const uint32_t* dwords, uint32_t dword_count,
     // Guest format 3 (k_2_10_10_10_FLOAT) is 7e3, and the reference states its
     // range outright: "7e3 [0, 32) RGB, unorm alpha" (xenos.h:301). It is
     // UNSIGNED. We map it to R16G16B16A16_FLOAT, which is signed, so a shader
-    // returning a negative has that negative STORED where the console ROP
-    // would have clamped it to 0 on the write.
+    // returning a negative has that negative STORED where the console ROP would
+    // have clamped it to 0 on the write.
     //
-    // Xenia performs exactly this clamp before packing
-    // (dxbc_shader_translator_om.cc:3516, UnclampedFloat32To7e3):
-    //     max(x, 0.0)  then  min(x, 31.875)
-    // The max/min ORDER matters for NaN: D3D min/max return the non-NaN
-    // operand, so NaN becomes 0 instead of propagating. That is hardware
-    // behaviour, not convenience -- which is why this is min(max(..)) and not
-    // clamp(), since clamp(NaN, lo, hi) would yield lo.
+    // Xenia performs exactly this clamp before packing: max(x, 0.0) then
+    // min(x, 31.875). The max/min ORDER matters for NaN: D3D min/max return the
+    // non-NaN operand, so NaN becomes 0 instead of propagating. That is hardware
+    // behaviour, which is why this is min(max(..)) and not clamp(), since
+    // clamp(NaN, lo, hi) would yield lo.
     //
-    // Measured, not assumed: menu2.rdc holds (0.236, 0.159, -0.071) in the
-    // scene target at (900,400), written by the pixel shader of event 8338, and
-    // that negative propagates into the 320x180 luminance target RT 619 as
-    // (0.217, 0.142, -0.081). RT 619 drives auto-exposure, so a value the
-    // console cannot represent is feeding the gain for the entire frame.
+    // Measured: the scene target holds (0.236, 0.159, -0.071) at one pixel and
+    // that negative propagates into the 320x180 luminance target, which drives
+    // auto-exposure -- so a value the console cannot represent feeds the gain
+    // for the entire frame.
     //
     // Gated on xe_colorscale.y, which the renderer sets to the RGB maximum for
-    // the clamped formats and leaves 0 for every other one. A uniform branch,
-    // so draws on any other format stay byte-identical -- deliberately NOT an
-    // unconditional clamp against +-FLT_MAX, which reads like a no-op but
-    // would turn NaN into -FLT_MAX on every draw in the game.
+    // the clamped formats and leaves 0 for every other one. A uniform branch, so
+    // draws on any other format stay byte-identical -- deliberately NOT an
+    // unconditional clamp against +-FLT_MAX, which reads like a no-op but would
+    // turn NaN into -FLT_MAX on every draw in the game.
     if (em.color_mask) {
       src += "  if (xe_colorscale.y > 0.0) {\n";
       for (uint32_t t = 0; t < kMaxColorTargets; ++t) {

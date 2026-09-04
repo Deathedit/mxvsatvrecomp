@@ -56,17 +56,15 @@ float4 main(float4 pos : SV_POSITION, float4 col : COLOR) : SV_TARGET {
 // The pixel stage for a guest DEPTH pass, paired with a translated vertex stage.
 //
 // SetPixelShader(NULL) is legal on the console for a pass that writes only
-// depth, and this game uses it heavily — measured 70,000 such draws in mx_1142,
-// every single one of which binds RB_COLOR_MASK 0 ("WOULD PAINT 0, masked off
-// 54428"). Without a pixel stage to pair with, the whole draw used to fall back
-// to the software vertex interpreter; with this it keeps its GPU vertex stage
-// and its depth write.
+// depth, and this game uses it heavily -- 70,000 such draws in one run, every
+// one binding RB_COLOR_MASK 0. Without a pixel stage to pair with, the whole
+// draw used to fall back to the software vertex interpreter.
 //
 // Returning zero is not a colour decision. TranslatedPSO already sets
-// RenderTargetWriteMask to 0 for these draws (key.flags bit 2, from
-// d.colorWrite), so nothing this returns can reach the target — and the hooks
-// side only routes a draw here when it has established exactly that. If this
-// shader's output is ever visible, the gate upstream is wrong, not this value.
+// RenderTargetWriteMask to 0 for these draws, so nothing this returns can reach
+// the target -- and the hooks side only routes a draw here when it has
+// established exactly that. If this output is ever visible, the gate upstream is
+// wrong, not this value.
 //
 // Declaring only SV_Position is deliberate: a pixel shader's input signature
 // must be a SUBSET of the vertex stage's output, and every translated vertex
@@ -76,24 +74,21 @@ inline constexpr const char* kTranslatedDepthOnlyPS = R"(
 float4 main(float4 pos : SV_Position) : SV_TARGET { return 0; }
 )";
 
-// Bink's frame composite. The guest binds three single-channel planes — Y at
-// full resolution, Cr and Cb at half — and optionally a fourth alpha plane,
-// then runs its own YUV->RGB shader. Measured 3/3 runs; see
-// docs/guest_binary.md for the guest side.
+// Bink's frame composite. The guest binds three single-channel planes -- Y at
+// full resolution, Cr and Cb at half -- and optionally a fourth alpha plane,
+// then runs its own YUV->RGB shader.
 //
 // All four planes sample with the same normalized uv: the chroma planes being
-// half-size is handled by the sampler, not by scaling the coordinates.
+// half-size is handled by the sampler, not by scaling the coordinates. That
+// holds only because PrepareBinkPlanes crops the chroma planes to exactly half
+// the luma extent first -- the guest rounds their allocation up, and sampling
+// the padding rows gave zero chroma, which the conversion turns into a saturated
+// green line along the bottom edge of every video. Do not remove that crop
+// without scaling the chroma uv here instead.
 //
-// That holds only because PrepareBinkPlanes crops the chroma planes to exactly
-// half the luma extent first. The guest rounds their allocation up — half of a
-// 216-row luma arrives as a 320x112 descriptor — and sampling the padding rows
-// gave zero chroma, which the conversion below turns into a saturated green
-// line along the bottom edge of every video. Do not remove that crop without
-// scaling the chroma uv here instead.
-//
-// BT.601 with the usual 16-235 luma and 16-240 chroma ranges, which is what
-// Bink encodes. If video comes out washed out or too contrasty, this range
-// handling is the first suspect, not the coefficients.
+// BT.601 with the usual 16-235 luma and 16-240 chroma ranges, which is what Bink
+// encodes. If video comes out washed out or too contrasty, this range handling
+// is the first suspect, not the coefficients.
 inline constexpr const char* kGameYuvPS = R"(
 Texture2D    g_y     : register(t0);
 Texture2D    g_cr    : register(t1);

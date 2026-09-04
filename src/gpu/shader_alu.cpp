@@ -88,13 +88,12 @@ uint32_t ExecSequence(const uc::ControlFlowInstruction& cf) {
   }
 }
 
-// Control flow we refuse rather than approximate. The decoder can afford to
-// walk every exec once and over-approximate the attribute set, because a
-// superset of the fetches is still a correct layout. Execution cannot: taking
-// a branch that the real shader would not, or running a loop body once when it
-// runs eight times, produces a confidently wrong position. Every shader
-// captured from this game so far is a straight run of execs, so refusing costs
-// nothing today and stays honest if that changes.
+// Control flow we refuse rather than approximate. The decoder can afford to walk
+// every exec once and over-approximate the attribute set, because a superset of
+// the fetches is still a correct layout. Execution cannot: taking a branch the
+// real shader would not, or running a loop body once when it runs eight times,
+// produces a confidently wrong position. Every shader captured from this game so
+// far is a straight run of execs.
 bool IsUnsupportedCf(uc::ControlFlowOpcode op) {
   switch (op) {
     case uc::ControlFlowOpcode::kCondJmp:
@@ -127,22 +126,19 @@ class Interpreter {
   AluStatus status = AluStatus::kOk;
   uint32_t blocking_opcode = 0;
 
-  // Every constant read in the shader passes through here — plain indexed
-  // reads, a0-relative ones, and the mulsc/addsc/subsc family alike — so it is
+  // Every constant read in the shader passes through here -- plain indexed
+  // reads, a0-relative ones, and the mulsc/addsc/subsc family alike -- so it is
   // the one place that can say what the shader asked the constant file for.
   //
   // The index is relative to whatever region the vertex stage is based at.
-  // SQ_VS_CONST names that base and the caller is responsible for applying it
-  // before handing `alu_consts` over; this reads from the pointer it is given.
-  // Out of range reads zero rather than failing: an unwritten constant really
-  // is zero on the hardware, and a shader that indexes past its region reads
-  // zero rather than faulting.
+  // SQ_VS_CONST names that base and the caller applies it before handing
+  // `alu_consts` over. Out of range reads zero rather than failing: an unwritten
+  // constant really is zero on the hardware.
   //
   // The counters exist because a shader can execute perfectly and still export
-  // (0,0,0,w=0) — 19% of them do — and that is computing nothing *from
-  // something*. Whether the something was there is the question, and which
-  // slots it wanted is what names the gap if it was not. Counters are mutable
-  // so this stays a read accessor.
+  // (0,0,0,w=0) -- 19% of them do -- and that is computing nothing *from
+  // something*. Whether the something was there is the question, and which slots
+  // it wanted is what names the gap if it was not.
   Vec4 Const(uint32_t index) const {
     Vec4 r;
     const uint32_t base = index * 4;
@@ -163,14 +159,14 @@ class Interpreter {
     return r;
   }
 
-  // Whether a constant read should be counted. NOT whether it happens — the
+  // Whether a constant read should be counted. NOT whether it happens -- the
   // value is still produced, this only governs the instrumentation.
   //
   // An operand the opcode does not consume still has a register field, holding
   // whatever the assembler left there, and 0xFF is common. Counting those is
   // what produced a long-running "this shader reads c255 and gets zero" signal:
-  // c255 is genuinely unwritten (nothing publishes it, see AGENTS.md), so every
-  // unused operand looked like a real read returning zero.
+  // c255 is genuinely unwritten, so every unused operand looked like a real read
+  // returning zero.
   mutable bool counting_ = true;
   mutable uint32_t const_reads = 0;
   mutable uint32_t const_zero_reads = 0;
@@ -203,22 +199,21 @@ class Interpreter {
       if (alu.src_const_is_addressed(i)) {
         // Relative to a0 or to aL, and the instruction says which. The accessor
         // name is the decoder: "address register relative" means relative to
-        // *the address register*, which is a0. AddressingMode spells the
-        // mapping out — kAbsolute = 1 = c[a0 + n], kRelative = 0 = c[aL + n]
-        // (ucode.h:191-199).
+        // *the address register*, which is a0. AddressingMode spells the mapping
+        // out -- kAbsolute = 1 = c[a0 + n], kRelative = 0 = c[aL + n]
+        // (ucode.h:191).
         //
-        // This condition used to be written without the '!', which is exactly
-        // backwards: it refused every a0 read — the case this interpreter
-        // implements — and applied a0_ to every aL read, a case that never
-        // occurs in this game. The a0 arithmetic below was therefore never once
-        // executed, which is why modelling a0 measured as converting zero
-        // failures. That null was the bug, not a fact about the game.
+        // This condition used to be written without the negation, which is
+        // exactly backwards: it refused every a0 read -- the case this
+        // interpreter implements -- and applied a0_ to every aL read, a case
+        // that never occurs in this game. The a0 arithmetic below was therefore
+        // never once executed, which is why modelling a0 measured as converting
+        // zero failures. That null was the bug, not a fact about the game.
         //
         // aL is the loop counter, and we walk every exec block once rather than
-        // unrolling, so there is no honest value for it. Refused, not guessed.
-        // Expect this to fire ~0 times here: kUnsupportedCf is 0 across every
-        // sample taken, meaning no shader in this game contains a loop at all.
-        // The two counts cross-check each other and should move together.
+        // unrolling, so there is no honest value for it. Refused, not guessed;
+        // expect this to fire ~0 times, since no shader in this game contains a
+        // loop at all.
         if (!alu.is_const_address_register_relative()) {
           status = AluStatus::kLoopRelative;
           return base;
@@ -274,10 +269,9 @@ class Interpreter {
 
   // Direct3D 9 legacy multiply: a zero OR DENORMAL multiplicand yields +0
   // regardless of the other operand, so 0 * INF is +0 and not NaN. Every
-  // multiplying operation on this hardware behaves this way -- see the note
-  // above AluScalarOpcode in the SDK's ucode.h ("+-0 or denormal * anything =
-  // +0"), and the matching XeMul in shader_hlsl.cpp, which carries the longer
-  // explanation of why denormals belong here. Titles rely on this for vector
+  // multiplying operation on this hardware behaves this way -- see ucode.h ("+-0
+  // or denormal * anything = +0") and the matching XeMul in shader_hlsl.cpp,
+  // which carries the longer explanation. Titles rely on this for vector
   // normalisation written as rcp-then-mul.
   //
   // Keep the two in step. They have the same contract and a divergence between
@@ -384,9 +378,8 @@ class Interpreter {
   // The mulsc/addsc/subsc family, opcodes 42..47. These do not use the normal
   // operand encoding, so they must not go through Src(): src3 names a constant
   // *register* directly, and the temp register it multiplies against is
-  // scattered — one bit lives in the opcode field itself, which is why each
-  // operation has a _0 and a _1 form. The SDK reassembles it for us in
-  // scalar_const_reg_op_src_temp_reg().
+  // scattered -- one bit lives in the opcode field itself, which is why each
+  // operation has a _0 and a _1 form.
   //
   // The constant is selected with the W-relative src3 swizzle and the temporary
   // with the X-relative src3 swizzle (the Xenos AB = WX scalar convention).
@@ -473,16 +466,14 @@ class Interpreter {
         r = std::log2(a);
         if (op == Op::kLogc && r == -INFINITY) r = -3.402823466e+38f;
         break;
-      // The three forms differ only on an infinity, and treating the FF form
-      // as IEEE is what blacked out the menu on the HLSL side -- see the note
-      // beside kRcpf in shader_hlsl.cpp. Corrected here too so the interpreter
-      // and the emitter cannot disagree about a shader they both run.
+      // The three forms differ only on an infinity, and treating the FF form as
+      // IEEE is what blacked out the menu on the HLSL side. Corrected here too
+      // so the interpreter and the emitter cannot disagree about a shader they
+      // both run.
       //   RECIP_IEEE  +INF          RECIP_CLAMP  +/-FLT_MAX   RECIP_FF  +/-0.0
       // The `a == 0` special cases are gone: 1/0 is +INF and 1/-0 is -INF
-      // already, and forcing +INF for both lost the sign that kRcpf then
-      // flushes -- it handed back +0.0 where the hardware gives -0.0. The
-      // emitter's rcp()/rsqrt() never had that bug, so this was one more
-      // emitter/interpreter split. rsqc clamps both signs, as Xenia does.
+      // already, and forcing +INF for both lost the sign that kRcpf then flushes
+      // -- it handed back +0.0 where the hardware gives -0.0.
       case Op::kRcp: case Op::kRcpc: case Op::kRcpf:
         r = 1.0f / a;
         if (op == Op::kRcpc && std::isinf(r)) r = r > 0 ? 3.402823466e+38f : -3.402823466e+38f;
@@ -549,13 +540,14 @@ class Interpreter {
 
     // Evaluate both halves. They read the register file before either writes,
     // which is the co-issue semantics.
+    //
     // maxa/maxas/maxasf are issued for their address-register side effect and
     // routinely leave the write mask empty, so a mask test skips the a0 load
-    // along with the instruction. See the same fix in shader_hlsl.cpp: this is
-    // what pinned a0 at 0 and rendered skinned meshes rigid at the palette
-    // base. The SDK's kAluOpChangedStateAddressRegister flag names exactly this
-    // set, but its opcode-info tables are extern-declared and never defined in
-    // anything the runtime links, so the opcodes are named directly here and in
+    // along with the instruction. That pinned a0 at 0 and rendered skinned
+    // meshes rigid at the palette base. The SDK's
+    // kAluOpChangedStateAddressRegister flag names exactly this set, but its
+    // opcode-info tables are extern-declared and never defined in anything the
+    // runtime links, so the opcodes are named directly here and in
     // shader_hlsl.cpp. The two lists must stay identical.
     const bool vector_sets_a0 =
         alu.vector_opcode() == uc::AluVectorOpcode::kMaxA;
@@ -579,12 +571,11 @@ class Interpreter {
       counting_ = in_counting;
     }
     // The scalar half ALWAYS runs. ScalarOp updates ps_ on its way out, and the
-    // hardware writes ps on every scalar issue — the write mask says only
+    // hardware writes ps on every scalar issue -- the write mask says only
     // whether the result is ALSO committed to a register. Gating this on the
     // mask meant a `maxs` issued purely for its ps side effect never ran, and
     // the following `muls_prev` multiplied by a stale ps. Same class of error as
-    // the a0 one above; see the long note in shader_hlsl.cpp for the measurement
-    // against Xenia's dump of this title.
+    // the a0 one above.
     //
     // Operands still are not counted when nothing consumes the value: sres is
     // read only under `smask & bit`.
@@ -693,23 +684,18 @@ AluResult ExecuteVertexShader(
 
   // Seed the register file from the vertex fetches. This is what makes the
   // interpreter worth running: the shader reads its inputs from exactly the
-  // registers its vfetch instructions named, and the export-62 decode already
-  // proved those are the registers the position is built from.
-  // Seed the fetched attributes, honouring each vfetch's destination swizzle.
+  // registers its vfetch instructions named.
   //
   // Writing all four components unconditionally is wrong, and wrong in a way
   // that hides: two vfetches are allowed to target the SAME register and fill
-  // different components of it, which is exactly what a position-plus-texcoord
-  // vertex does. The second fetch then overwrote the first outright. Measured
-  // in NAT_Farm: attr[1] fmt=31 -> r0 = (22.969, -16.234, 0, 1), a real
-  // texcoord, immediately replaced by attr[2] fmt=6 -> r0 = (0, 0, 0, 0). The
-  // shader then exported a zero UV and the draw sampled one texel.
+  // different components of it, which is what a position-plus-texcoord vertex
+  // does. The second fetch then overwrote the first outright -- measured, a real
+  // texcoord immediately replaced by (0, 0, 0, 0), after which the shader
+  // exported a zero UV and the draw sampled one texel.
   //
   // ucode.h FetchDestinationSwizzle, three bits per destination component:
-  //   0..3 = x/y/z/w of the fetched value, 4 = 0.0, 5 = 1.0, 7 = keep (do not
-  //   write this component).
-  // kKeep is the mechanism that lets two fetches share a register, so ignoring
-  // it is what produced the clobber.
+  //   0..3 = x/y/z/w of the fetched value, 4 = 0.0, 5 = 1.0, 7 = keep.
+  // kKeep is the mechanism that lets two fetches share a register.
   for (size_t i = 0; i < attrs.size() && i < attr_values.size(); ++i) {
     Vec4& d = in.temps[attrs[i].dest_reg & (kNumTemps - 1)];
     const uint32_t swiz = attrs[i].dest_swizzle;

@@ -28,37 +28,34 @@
 // offset 28, so 36 bytes. See the gate in RenderThreadFunc.
 static constexpr uint32_t kSupportedStride = mx::hle::kHostVertexStride;
 
-// hide_colorless_draws and hide_colored_draws were two halves of one
-// diagnostic, splitting the frame by colour source so a screenshot could show
-// the scene without the colourless overpaint, or the overpaint on its own. Both
-// are gone (2026-08-07): every draw is submitted regardless of colour source.
+// hide_colorless_draws and hide_colored_draws were two halves of one diagnostic,
+// splitting the frame by colour source so a screenshot could show the scene
+// without the colourless overpaint, or the overpaint alone. Both are gone: every
+// draw is submitted regardless of colour source.
 //
 // What retired them: they hid a defect rather than fixing it. Draws with no
 // colour attribute are written opaque white and paint *over* textured draws
 // instead of substituting for missing ones, so `hide_colorless_draws=true` was
 // passed on every run and the shipped default was the untested configuration.
-// Keeping the filter would have made that permanent.
 //
-// The overpaint is NOT a transform bug, though this comment claimed it was
-// until the claim was measured (46404e1). Colourless draws are 4-vertex
-// fullscreen quads with a raw NDC extent of 2.01 and none outside the cube —
-// geometrically exact, not "small geometry smeared across the viewport". 91.5%
-// of them sample a render target: they are compositor passes whose colour was
-// always going to come from that target, and they paint white because the
-// target is empty. The fix is the resolve snapshot, not anything here.
+// The overpaint is NOT a transform bug, though this comment claimed it was until
+// the claim was measured. Colourless draws are 4-vertex fullscreen quads with a
+// raw NDC extent of 2.01 and none outside the cube -- geometrically exact. 91.5%
+// sample a render target: they are compositor passes whose colour was always
+// going to come from that target, and they paint white because the target is
+// empty. The fix is the resolve snapshot, not anything here.
 
 // The D3D9 -> D3D12 path describes every draw from the API calls that produced
 // it, rather than reconstructing it from the PM4 ring.
 //
-// hle_render and pm4_translate were the cvars that selected between the two
-// sources. Both are gone with the translator (2026-08-06): the D3D9 description
-// is the only source of draws, so there is nothing to select and no fallback.
+// hle_render and pm4_translate selected between the two sources. Both are gone
+// with the translator: the D3D9 description is the only source of draws.
 //
-// What retired them: with pm4_translate=false the HLE path held 87.66-87.67%
-// applied and 309.3 verts/draw against PM4-on's 87.71%/308.9, and the one
-// dependency that gate missed — the pixel shader CF offset — was replaced by
-// the field the guest's own emitter reads (sub_82565928), which decodes more
-// shaders than the ring ever did (40/49 against 37/61, 0 ambiguous).
+// What retired them: with pm4_translate=false the HLE path held 87.66% applied
+// and 309.3 verts/draw against PM4-on's 87.71%/308.9, and the one dependency
+// that gate missed -- the pixel shader CF offset -- was replaced by the field
+// the guest's own emitter reads, which decodes more shaders than the ring ever
+// did (40/49 against 37/61, 0 ambiguous).
 
 // Capture only: no PSOs, no uploads, no shader translation, nothing submitted.
 // It gates the per-draw scoring, the coverage report and the dump — including
@@ -75,54 +72,43 @@ REXCVAR_DEFINE_BOOL(hle_capture, false, "Debug",
 // and guard_census.h. 0 is the shipping behaviour.
 //
 // Bit N is Guard(N) -- and DO NOT TRUST THIS COMMENT for which N. Deleting a
-// guard shifts every bit below it, and that has already cost one run: this said
-// "bit 4 = constant NaN" from the pre-deletion enum when it had moved to bit 3,
-// so --hle_strict=16 quietly toggled an inert guard instead. The GUARD CENSUS
-// log line prints each guard's bit, computed from the same enum the switch is.
-// Read it there.
+// guard shifts every bit below it, and that has already cost one run. The GUARD
+// CENSUS log line prints each guard's bit, computed from the same enum the
+// switch is. Read it there.
 //
 // Only a few are switchable at all; the rest are structurally unswitchable and
-// Strict() refuses them regardless of the bit. See guard_census.h.
+// Strict() refuses them regardless of the bit.
 REXCVAR_DEFINE_INT32(hle_strict, 0, "Debug",
                      "Bitmask of inventing guards to disable, so the defect "
                      "underneath shows instead of a plausible substitute.");
 
 // PHASE 3 of docs/stencil_plan.md: honour the guest's stencil COMPARISON, not
-// just its writes.
-//
-// DEFAULT ON. Honouring the guest's stencil comparison is the correct
-// behaviour and half of every level frame asks for it.
+// just its writes. DEFAULT ON -- it is the correct behaviour and half of every
+// level frame asks for it.
 //
 // It was briefly defaulted OFF because it broke the terrain, and that was worth
-// doing: the comparison was innocent the whole time -- terrain.rdc showed the
-// terrain draw passing, no stencilTestFailed anywhere, and the pipeline
-// carrying exactly the state the guest programmed. The test was reading a
-// buffer we had corrupted. TWO of our own clear defects, and it needed both:
+// doing: the comparison was innocent the whole time -- the terrain draw passed,
+// no stencilTestFailed anywhere, and the pipeline carried exactly the state the
+// guest programmed. The test was reading a buffer WE had corrupted, through two
+// of our own clear defects, and it needed both:
 //
 //   1. our per-frame first-use clear wiped DEPTH AND STENCIL on OUR schedule.
 //      The guest clears stencil where it wants to (0x20, 0x30) and withholds it
 //      where it does not (0x1F is depth with no stencil). Fixed by splitting
-//      kGameDepthClearFlags, which is now creation-only, from
-//      kGameDepthFrameClearFlags.
+//      kGameDepthClearFlags, now creation-only, from kGameDepthFrameClearFlags.
 //   2. the Clear hook dropped every 0x60 -- 13,370 of 20,000 calls -- reading
 //      the 0x40 bit as an alternative to the stencil clear when it is only a
 //      modifier of it. Those calls are "clear stencil to 1", and without them
 //      the plane sat at 0 all frame so a terrain testing NotEqual-0 failed
 //      everywhere.
 //
-// Fixing either alone was not enough. Verified by A/B: terrain correct with the
-// test on once both landed.
+// Kept switchable: the failure mode of a wrong stencil buffer is geometry
+// VANISHING rather than degrading, and the TERRAIN is the regression test.
 //
-// Kept switchable. The failure mode of a wrong stencil buffer is geometry
-// VANISHING rather than degrading, so an A/B without a rebuild is worth having,
-// and the TERRAIN is the regression test -- it is the thing that broke, and it
-// broke visibly.
-// NOT a clean test/write split, and the old wording here said it was.
-//
-// Forcing the comparison to ALWAYS means the stencil test never FAILS, so
-// StencilFailOp becomes unreachable and only the pass and depth-fail ops ever
-// run. The writes are therefore NOT preserved -- one of the three op paths is
-// removed with them. Anything this flag exonerates, it exonerates as a pair.
+// NOT a clean test/write split, and the old wording here said it was. Forcing
+// the comparison to ALWAYS means the test never FAILS, so StencilFailOp becomes
+// unreachable and only the pass and depth-fail ops run. Anything this flag
+// exonerates, it exonerates as a pair.
 REXCVAR_DEFINE_BOOL(d3d9_stencil_test, true, "Graphics",
                     "Honour the guest's stencil comparison. Off forces every "
                     "test to ALWAYS, which cannot reject a fragment -- and so "
@@ -131,20 +117,15 @@ REXCVAR_DEFINE_BOOL(d3d9_stencil_test, true, "Graphics",
 
 // MUTATION TEST for the stencil path. Diagnostic only, never for normal play.
 //
-// Phase 3 went live with 44,749 draws carrying a comparison that can reject,
-// and the picture did not change. That has two explanations and they want
-// opposite work: the masks are correct and this scene looks the same either
-// way, OR our stencil state never reaches the GPU and the comparison is inert.
-// The counter proves we BUILT the state; it proves nothing about whether D3D12
-// applied it.
+// Phase 3 went live with 44,749 draws carrying a comparison that can reject, and
+// the picture did not change. That has two explanations wanting opposite work:
+// the masks are correct and this scene looks the same either way, OR our stencil
+// state never reaches the GPU and the comparison is inert. The counter proves we
+// BUILT the state; it proves nothing about whether D3D12 applied it.
 //
-// So: force kNever on every stencil draw. NEVER rejects every fragment, so all
-// ~118,000 stencil draws must disappear. If the screen does NOT change, the
-// stencil state is not reaching the pipeline and every result from Phase 2 and
-// 3 is vacuous.
-//
-// A test that has only ever passed is not yet a test. See docs and the
-// "prove the test can fail" rule this tree keeps re-learning.
+// So: force kNever on every stencil draw, and all ~118,000 must disappear. If
+// the screen does NOT change, every result from Phase 2 and 3 is vacuous. A test
+// that has only ever passed is not yet a test.
 REXCVAR_DEFINE_BOOL(d3d9_stencil_force_never, false, "Debug",
                     "DIAGNOSTIC: force every stencil comparison to NEVER. The "
                     "screen MUST lose all stencil geometry; if it does not, the "
@@ -159,30 +140,21 @@ REXCVAR_DEFINE_BOOL(d3d12_edram_takeover_copy, false, "Graphics",
 //
 // Measured at the point the viewport is set: match 47665, MISMATCH 1676,
 // unreadable 0, and every mismatch is one shape -- guest 640x360 rendered
-// through a 640x720 target, so that geometry is stretched 2x vertically.
+// through a 640x720 target.
 //
-// CORRECTION to the commit that added this (3c9b2fb): the target is NOT
-// oversized by our doing, and EnsureGameRenderTarget does not grow to a union
-// -- it REPLACES on any extent or format change. The union growth is the
-// SNAPSHOT path, a different function, and attributing it here was wrong.
+// CORRECTION to the commit that added this: the target is NOT oversized by our
+// doing, and EnsureGameRenderTarget does not grow to a union -- it REPLACES on
+// any extent or format change. The union growth is the SNAPSHOT path.
 //
 // The extent is the guest's own D3D9 surface size, straight from RB_COLOR_INFO,
 // and a 640x360 viewport on a 640x720 surface is legitimate: those are two of
-// ELEVEN surface objects aliasing one EDRAM base.
+// ELEVEN surface objects aliasing one EDRAM base. EDRAM is a fixed 10MB scratch
+// and the guest makes many surface views onto it, so there is nothing to fix in
+// the extent.
 //
-//   edram base 0x2D0: 11 owners
-//     0x2123C1D8 1280x720 fmt28   0x2123C9BC 640x720 fmt28
-//     0x2123CA94 1280x640 fmt10   0x2123CAC4 1280x80 fmt10
-//     0x21768560 1280x720 fmt10   0x2653D320 640x360 fmt10  ...
-//
-// EDRAM is a fixed 10MB scratch and the guest makes many surface views onto it,
-// binding whichever it needs. So there is nothing to fix in the extent, and
-// nothing wrong with the mismatch. Using the guest's viewport is still the more
-// faithful thing to do -- it is what the hardware transforms into -- which is
-// why this stays available.
-//
-// Default off because it demonstrably changes nothing: A/B'd, taken-from-guest
-// matched MISMATCH exactly, and there was no visual difference.
+// Using the guest's viewport is still the more faithful thing to do, which is
+// why this stays available. Default off because it demonstrably changes nothing:
+// A/B'd, taken-from-guest matched MISMATCH exactly, no visual difference.
 REXCVAR_DEFINE_BOOL(d3d9_guest_viewport, false, "Graphics",
                     "Set the host viewport from the guest's PA_CL_VPORT "
                     "registers rather than the render target extent, when they "
@@ -191,18 +163,16 @@ REXCVAR_DEFINE_BOOL(d3d9_guest_viewport, false, "Graphics",
 // The Direct3D 9 half-pixel offset, as an A/B switch.
 //
 // The reference applies +0.5 pixels to every vertex whenever
-// PA_SU_VTX_CNTL::PIX_CENTER is kD3DZero -- Direct3D 9 pixel centres at .0
-// against a host that rasterises at .5 -- and its own documentation says
-// omitting it "may significantly break post-processing in some games".
+// PA_SU_VTX_CNTL::PIX_CENTER is kD3DZero -- D3D9 pixel centres at .0 against a
+// host that rasterises at .5 -- and its own documentation says omitting it "may
+// significantly break post-processing in some games".
 //
 // We cannot read that register: 0x2302 is not at the offset the 0x22xx block
-// rule extrapolates to (that address holds an object with a vtable and a "REX"
-// tag, not registers), and two guesses at it were both wrong.
+// rule extrapolates to, and two guesses at it were both wrong.
 //
-// So this is settled by experiment instead, which is self-validating. If the
-// guest wants .0 centres, turning this on corrects a half-pixel error. If it
-// already wants .5, turning it on puts everything a FULL pixel out, which is
-// unmistakable. Default off: the burden is on the change to show it helps.
+// So this is settled by experiment, which is self-validating. If the guest wants
+// .0 centres, turning this on corrects a half-pixel error; if it already wants
+// .5, turning it on puts everything a FULL pixel out, which is unmistakable.
 REXCVAR_DEFINE_BOOL(hle_diag, false, "Debug",
                     "Per-draw and per-vertex HLE diagnostics: the transform "
                     "probe, the prim-type and vfetch censuses, and the vertex "
@@ -245,85 +215,69 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
     if (m_renderer) {
       // Hand any PM4 geometry the VdSwap hook translated this frame to the game
       // pipeline. GetDrawCalls moves-and-clears, so a tick with no VdSwap since
-      // the last one gets an empty list — see the note below on why that must
-      // re-present the previous frame rather than clear.
+      // the last one gets an empty list -- see below on why that must re-present
+      // the previous frame rather than clear.
       //
-      // DrawCall::mvp is the window-space -> NDC transform Pm4Translator built
-      // from the guest's PA_CL_VPORT_* registers. It used to be the ALU
-      // constant block, which this game never writes — so it was identically
-      // zero and collapsed every vertex to the origin.
+      // DrawCall::mvp is the window-space -> NDC transform built from the
+      // guest's PA_CL_VPORT_* registers. It used to be the ALU constant block,
+      // which this game never writes, so it was identically zero and collapsed
+      // every vertex to the origin.
       auto draws = native::NativeGraphics::Get().GetDrawCalls();
 
       // This loop no longer ticks on a fixed sleep: an idle tick parks on the
-      // mailbox cv and wakes exactly when the guest posts a frame (bottom of
-      // the loop).
+      // mailbox cv and wakes exactly when the guest posts a frame.
       //
       // Expect the two counters below to run at ROUGHLY 1:1, not with the empty
-      // side at zero — measured 7517 with draws / 6606 empty over mx_1270. That
-      // ratio is structural rather than waste: a tick that rendered loops
-      // straight back without waiting, so it always finds an empty list on the
-      // next pass, re-presents, and only THEN parks. One empty tick per
-      // productive one is the design. A count that climbs far past the
-      // productive side means the guest is posting lists nobody consumed; the
-      // millions-of-empties reading the fixed-sleep version produced is not
-      // reachable here, because there is no longer a clock to spin against.
+      // side at zero -- measured 7517 with draws against 6606 empty. That ratio
+      // is structural rather than waste: a tick that rendered loops straight back
+      // without waiting, so it always finds an empty list on the next pass,
+      // re-presents, and only THEN parks. A count that climbs far past the
+      // productive side means the guest is posting lists nobody consumed.
       //
-      // A tick that finds nothing
-      // must still re-present the last frame we did get, not a cleared screen:
-      // GetDrawCalls moves-and-clears, so an unconditional ClearGameDraws here
-      // threw away the only geometry we had every time the two rates disagreed.
-      // Combined with the placeholder-triangle fallback that used to sit in
-      // RenderGameFrame, that made the post-load screen alternate between guest
-      // geometry and the placeholder — invisible while the render target
-      // accumulated, a visible flash once the clear was fixed. The placeholder
-      // is gone; the re-present rule below is not, and still carries the frame.
+      // A tick that finds nothing must still re-present the last frame we did
+      // get, not a cleared screen: GetDrawCalls moves-and-clears, so an
+      // unconditional ClearGameDraws here threw away the only geometry we had
+      // every time the two rates disagreed.
       static uint64_t s_ticksWithDraws = 0, s_ticksEmpty = 0;
       if (draws.empty()) ++s_ticksEmpty; else ++s_ticksWithDraws;
 
       uint32_t submitted = 0, skipped = 0;
-      // kSupportedStride (36) is the input layout the game PSO declares —
-      // POSITION float3 @0, COLOR float4 @12, TEXCOORD float2 @28 — and
-      // anything else would be reinterpreted as that layout and drawn as noise,
-      // so it is still counted rather than drawn.
+      // kSupportedStride (36) is the input layout the game PSO declares --
+      // POSITION float3 @0, COLOR float4 @12, TEXCOORD float2 @28 -- and
+      // anything else would be reinterpreted as that layout and drawn as noise.
       //
-      // What changed is what reaches here: the translator now transcodes guest
+      // What changed is what reaches here: the translator transcodes guest
       // vertices into this layout using the shader's own declared formats, so a
-      // draw arriving at stride 28 is one that was *converted* to it, not one
-      // that happened to be it. A draw still arriving at some other stride is
-      // one the transcode could not handle — no shader bound, no identifiable
-      // position attribute, or a vertex format not implemented — and the
-      // histogram below is now a list of those gaps rather than of the guest's
-      // strides.
+      // draw arriving at some other stride is one the transcode could not handle
+      // -- no shader bound, no identifiable position attribute, or a vertex
+      // format not implemented. The histogram is a list of those gaps rather
+      // than of the guest's strides.
       static std::map<uint32_t, uint32_t> s_skippedStrides;
       static uint64_t s_skippedUntransformable = 0;
       // Filter first, bind second. The renderer's list is only replaced once we
-      // know the new frame has something in it — a frame whose draws were all
+      // know the new frame has something in it -- a frame whose draws were all
       // skipped for stride would otherwise blank the screen just as surely as a
       // frame that never arrived.
-      // STRICT MODE -- docs/strict_mode.md phase 2. A BITMASK, not a bool:
-      // all-off is a black screen, which is one bit of information, and a
-      // bitmask lets you binary-search which guard holds which defect up.
-      // Pushed once per frame so the draw path reads an atomic rather than a
-      // cvar, and so src/gpu keeps no cvar dependency.
+      //
+      // STRICT MODE -- a BITMASK, not a bool: all-off is a black screen, which
+      // is one bit of information, and a bitmask lets you binary-search which
+      // guard holds which defect up. Pushed once per frame so the draw path
+      // reads an atomic rather than a cvar, and so src/gpu keeps no cvar
+      // dependency.
       //
       // Only three are switchable -- see guard_census.h for why the other four
-      // are structurally unswitchable rather than merely risky. The GUARD
-      // CENSUS line prints every guard's bit number and marks the ones strict
-      // mode is currently suppressing, so the mapping cannot go stale in a
-      // comment the way it already did once.
+      // are structurally unswitchable. The GUARD CENSUS line prints every
+      // guard's bit number, so the mapping cannot go stale in a comment the way
+      // it already did once.
       mx::gpu::guard::SetStrictMask(
           static_cast<uint32_t>(REXCVAR_GET(hle_strict)));
       std::vector<const mx::hle::DrawCall*> submittable;
       for (const auto& d : draws) {
         // A resolve, a clear and a surface bind are not draws. None has
-        // geometry, so every gate below would reject them — the first one
-        // silently, without even counting it — and a dropped resolve leaves a
-        // stale snapshot, which looks like a partial fix rather than a failure.
-        // They keep their slots in `submittable` because each is only
-        // meaningful in sequence: the snapshot must be taken at this point in
-        // the draw order rather than at the end of the frame, and a bind that
-        // arrives after a resolve must not create the surface the resolve
-        // wanted.
+        // geometry, so every gate below would reject them -- the first one
+        // silently -- and a dropped resolve leaves a stale snapshot, which looks
+        // like a partial fix rather than a failure. They keep their slots in
+        // `submittable` because each is only meaningful in sequence.
         if (d.resolve_dest_texture || d.clear_color_target ||
             d.clear_depth_target || d.clear_stencil_target ||
             d.surface_bind) {
@@ -361,14 +315,12 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
           ++s_skippedStrides[d.vertex_stride];
           continue;
         }
-        // RETIRED 2026-08-12: hle_main_viewport_only, which dropped any draw
-        // whose viewport was not 1280x720. It was a stand-in for modelling
-        // render targets from D3D9 state, from when a frame's ~16 guest colour
-        // surfaces all landed on one host target and whichever pass ran last
-        // decided what was on screen. Render targets ARE modelled now
-        // (EnsureGameRenderTarget routes each surface to its own), so the
-        // filter's own help text already called it superseded — and it was
-        // off by default, so no run has ever used it.
+        // RETIRED: hle_main_viewport_only, which dropped any draw whose viewport
+        // was not 1280x720. It was a stand-in for modelling render targets from
+        // D3D9 state, from when a frame's ~16 guest colour surfaces all landed
+        // on one host target. Render targets ARE modelled now, so the filter's
+        // own help text already called it superseded -- and it was off by
+        // default, so no run ever used it.
         submittable.push_back(&d);
         ++submitted;
       }
@@ -376,9 +328,8 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       // A non-empty handoff is a real guest frame even when every draw is
       // filtered, so the previous frame is retired here rather than inside the
       // submittable check below. Otherwise a frame whose draws were all skipped
-      // — for stride, or for the viewport gate — leaves the host replaying the
-      // previous frame's draw list while the guest swaps, which reads as a
-      // frozen picture rather than as an empty one.
+      // leaves the host replaying the previous frame's draw list while the guest
+      // swaps, which reads as a frozen picture rather than an empty one.
       if (!draws.empty()) {
         m_renderer->ClearGameDraws();
       }
@@ -474,18 +425,16 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
           ++addDrawCalls;
           const int32_t scissor[4] = {d->scissor_left, d->scissor_top,
                                       d->scissor_right, d->scissor_bottom};
-          // COLOUR MASK census. RB_COLOR_MASK bits 0-3 are per-channel RGBA,
-          // but every consumer of it collapses to a boolean -- the argument
-          // below is `(colour_mask & 0xF) != 0`, and the renderer then sets
-          // RenderTargetWriteMask to ALL or 0. A guest mask of, say, 0x1
-          // (red only) makes us write all four channels.
+          // COLOUR MASK census. RB_COLOR_MASK bits 0-3 are per-channel RGBA, but
+          // every consumer collapses to a boolean -- the argument below is
+          // `(colour_mask & 0xF) != 0`, and the renderer then sets
+          // RenderTargetWriteMask to ALL or 0, so a guest mask of 0x1 makes us
+          // write all four channels.
           //
-          // Whether that ever HAPPENS has never been measured, and could not
-          // be read off any existing log: the one census on record split draws
-          // into "colour_mask 0" (175) and "want colour" (4024), which is the
-          // same collapse -- a partial mask counts as "want colour" and is
-          // invisible. So this histograms the raw 4-bit value, all sixteen
-          // buckets, rather than asking the yes/no question again.
+          // Whether that ever HAPPENS could not be read off any existing log:
+          // the one census on record split draws into "colour_mask 0" and "want
+          // colour", which is the same collapse. So this histograms the raw
+          // 4-bit value, all sixteen buckets.
           //
           // Reported unconditionally, including the all-zero case, so "no
           // partial masks exist" and "the census never ran" stay distinct.
@@ -512,30 +461,23 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                           n, partial, hist.empty() ? " (none)" : hist);
             }
           }
-          // DEPTH / CULL census, keyed by RENDER TARGET EXTENT as well as
-          // state.
+          // DEPTH / CULL census, keyed by RENDER TARGET EXTENT as well as state.
           //
-          // The extent is in the key because tree.rdc showed the vegetation
+          // The extent is in the key because a capture showed the vegetation
           // atlases being sampled only by 256x256 billboard-BAKE passes and a
-          // 129x129 clipmap pass, never by the 1280x720 scene. A state
-          // histogram pooled over every pass would average those together and
-          // could not answer "what state does the SCENE draw vegetation with",
-          // which is the question. One row per (extent, state) keeps them
-          // apart.
+          // 129x129 clipmap pass, never by the 1280x720 scene. A histogram
+          // pooled over every pass would average those together and could not
+          // answer "what state does the SCENE draw vegetation with".
           //
-          // zfunc is the reason this is worth logging at all: all four PSO
-          // builders hardcode DepthFunc = LESS_EQUAL, so the guest's zfunc is
-          // carried through hle_types and then dropped on the floor. Xenos
-          // numbering is 0 NEVER, 1 LESS, 2 EQUAL, 3 LEQUAL, 4 GREATER,
-          // 5 NOTEQUAL, 6 GEQUAL, 7 ALWAYS -- so 3 is the only value we
-          // actually honour and every other value is a draw we depth-test
-          // differently from the console. The line reports that count directly
-          // rather than leaving it to be totted up by eye.
+          // zfunc is the reason this is worth logging: all four PSO builders
+          // hardcode DepthFunc = LESS_EQUAL, so the guest's zfunc is carried
+          // through hle_types and then dropped. Xenos numbering is 0 NEVER,
+          // 1 LESS, 2 EQUAL, 3 LEQUAL, 4 GREATER, 5 NOTEQUAL, 6 GEQUAL,
+          // 7 ALWAYS -- so 3 is the only value we honour.
           //
-          // `seen` is carried, not filtered on: a draw whose RB_DEPTHCONTROL
-          // was never read decodes as z_enable 0, which is indistinguishable
-          // from a draw that genuinely disabled the test unless the flag says
-          // which it was.
+          // `seen` is carried, not filtered on: a draw whose RB_DEPTHCONTROL was
+          // never read decodes as z_enable 0, indistinguishable from a draw that
+          // genuinely disabled the test.
           {
             static std::mutex s_dcMutex;
             static std::map<uint64_t, uint64_t> s_dcHist;
@@ -606,13 +548,12 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
           // PHASE 2: the guest's stencil state, gated exactly as the census
           // defines "effective". The enable bit ALONE over-counts -- outside
           // edram_mode kColorDepth(4)/kDepthOnly(5) the hardware ignores the
-          // whole register, so a draw can set the bit and mean nothing by it.
+          // whole register.
           //
           // Blanket-enabling was the first draft and it was wrong: the guest
           // leaves the bit CLEAR on about half of all draws, and enabling
-          // stencil on those applies their fail/zpass/zfail ops, which WRITE.
-          // That would stamp the mask from every draw the console never lets
-          // touch it -- corrupting the buffer Phase 3 then tests against.
+          // stencil on those applies their fail/zpass/zfail ops, which WRITE --
+          // stamping the mask from every draw the console never lets touch it.
           D3D12Renderer::GameStencil sten;
           const bool mode_honours =
               d->edram_mode == 4u || d->edram_mode == 5u;
@@ -638,12 +579,10 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                               : sten.frontPass);
             sten.backZFail = uint8_t(two_sided ? (dcb >> 29) & 7u
                                                : sten.frontZFail);
-            // PHASE 3. The guest's real comparison, or ALWAYS when the test
-            // is switched off -- which reproduces Phase 2 exactly, since
-            // ALWAYS cannot reject a fragment.
-            //
-            // Read from the SAME bits the census reports, so a config that
-            // shows as `func 4` there is func 4 here and the two cannot drift.
+            // PHASE 3. The guest's real comparison, or ALWAYS when the test is
+            // switched off -- which reproduces Phase 2 exactly, since ALWAYS
+            // cannot reject a fragment. Read from the SAME bits the census
+            // reports, so the two cannot drift.
             if (REXCVAR_GET(d3d9_stencil_force_never)) {
               // Checked FIRST so it cannot be masked by the test switch: the
               // whole point is to answer "does any of this reach the GPU",
@@ -721,30 +660,25 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   d->scissor_seen ? scissor : nullptr,
                                   // Only when the register shadow was actually
                                   // readable. `alpha_state_seen` false means we
-                                  // could not read it, not that the test is
-                                  // off, and passing a zeroed control would
-                                  // spell that unreadable state as a decoded
-                                  // "disabled" — which is the same thing here,
-                                  // but only by accident, and would stop being
-                                  // so the moment the enable bit's polarity or
-                                  // position is ever revisited.
+                                  // could not read it, not that the test is off,
+                                  // and passing a zeroed control spells that
+                                  // unreadable state as a decoded "disabled" --
+                                  // the same thing here only by accident.
                                   d->alpha_state_seen ? d->colour_control : 0u,
                                   d->alpha_state_seen ? d->alpha_ref : 0.0f,
-                                  // Face culling applies only to primitives
-                                  // that HAVE faces. Passing 0 for the rest
-                                  // decodes to CULL_NONE with
-                                  // FrontCounterClockwise FALSE, which is both
-                                  // what the reference does for them and the
-                                  // state they had before cull was plumbed.
+                                  // Face culling applies only to primitives that
+                                  // HAVE faces. Passing 0 for the rest decodes
+                                  // to CULL_NONE with FrontCounterClockwise
+                                  // FALSE, which is what the reference does and
+                                  // the state they had before cull was plumbed.
                                   mx::hle::IsPrimitivePolygonal(d->prim_type)
                                       ? d->pa_su_sc_mode_cntl
                                       : 0u,
-                                  // PA_SU_VTX_CNTL::PIX_CENTER, same
-                                  // encoding: 0 is D3D9 centring at .0
-                                  // and needs the correction. The
-                                  // register is not locatable in the
-                                  // device shadow and this is a D3D9
-                                  // title, so 0 is what it would read.
+                                  // PA_SU_VTX_CNTL::PIX_CENTER, same encoding: 0
+                                  // is D3D9 centring at .0 and needs the
+                                  // correction. The register is not locatable in
+                                  // the device shadow and this is a D3D9 title,
+                                  // so 0 is what it would read.
                                   0u,
                                   d->guest_vp_width, d->guest_vp_height,
                                   REXCVAR_GET(d3d9_guest_viewport),
@@ -793,47 +727,33 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       }
       // BeginFrame and EndFrame own the whole frame: BeginFrame opens the
       // command list, transitions and clears the targets and then calls
-      // RenderGameFrame itself; EndFrame calls
-      // PresentGameFrame and then swaps. This loop used to call
-      // RenderGameFrame and PresentGameFrame again in between, which was not a
-      // harmless repeat — PresentGameFrame's barriers are directional. Its
-      // first call leaves m_gameRT in PIXEL_SHADER_RESOURCE, so EndFrame's
-      // call then declared StateBefore = RENDER_TARGET for a resource that was
-      // not in it, an invalid transition, on top of drawing and copying the
-      // whole frame twice.
+      // RenderGameFrame itself; EndFrame calls PresentGameFrame and swaps. This
+      // loop used to call both again in between, which was not a harmless
+      // repeat: PresentGameFrame's barriers are directional, so its first call
+      // leaves m_gameRT in PIXEL_SHADER_RESOURCE and EndFrame's then declares
+      // StateBefore = RENDER_TARGET for a resource not in it.
       //
       // Nothing new from the guest means the frame this would draw is the one
-      // already on screen, byte for byte: m_gameDraws is unchanged, so is every
-      // texture it samples, and RenderGameFrame is deterministic in them. Skip
-      // it whole.
-      //
-      // MEASURED, mx_1034: 713 ticks with new draws against 813 without, and an
-      // empty tick still spent 25-37ms re-recording ~340 draws, ~50 snapshot
-      // copies and ~50 clears to arrive at the same image. Once the upload ring
-      // took the allocator out of the tick, that re-recording was the largest
-      // phase left in it -- and over half of it was thrown away.
+      // already on screen, byte for byte, so skip it whole. MEASURED: 713 ticks
+      // with new draws against 813 without, and an empty tick still spent
+      // 25-37ms re-recording ~340 draws to arrive at the same image.
       //
       // NOT PRESENTING is what re-presents. The swapchain is flip-discard, so
       // the last presented back buffer stays on screen until another Present
-      // replaces it; the note above about a tick with no new draws having to
-      // "re-present the last frame we did get, not a cleared screen" still holds,
-      // it is just satisfied by doing nothing rather than by drawing it again.
+      // replaces it.
       //
-      // Skipping the pair rather than only RenderGameFrame is deliberate.
-      // BeginFrame clears the targets, and every resource state either side of
-      // these two is directional -- m_gameRT ends in PIXEL_SHADER_RESOURCE for
-      // the next BeginFrame's barrier, the back buffer ends in PRESENT for the
-      // next transition. Running half the pair would leave those disagreeing;
-      // running neither leaves them exactly where the last full tick put them,
-      // which is the state BeginFrame already expects to find.
+      // Skipping the PAIR rather than only RenderGameFrame is deliberate.
+      // BeginFrame clears the targets, and every resource state either side is
+      // directional; running half the pair leaves those disagreeing, running
+      // neither leaves them where the last full tick put them.
       //
       // GetDrawCalls above is NOT skipped, so a guest blocked in SetDrawCalls is
-      // still released every tick. This shortens that wait rather than extending
-      // it: the release no longer sits behind a frame nobody needed.
+      // still released every tick -- this shortens that wait rather than
+      // extending it.
       //
-      // The exception is a tick with nothing to replay. That is startup, before
-      // the first guest frame arrives -- it has to run, or the window is never
-      // cleared and shows whatever was behind it.
+      // The exception is a tick with nothing to replay: that is startup, before
+      // the first guest frame arrives, and it has to run or the window is never
+      // cleared.
       static bool s_rendered = false;
       static uint64_t s_ticksSkippedRender = 0;
       if (draws.empty() && s_rendered) {
@@ -851,11 +771,9 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
       }
     }
     // Replaces the fixed-tick sleep. The guest's SetDrawCalls already applies
-    // backpressure (it blocks until the list is consumed), so an idle tick
-    // parks on the mailbox cv and wakes exactly when a frame is posted — no
-    // spin, no log flood, and the core goes back to the compute-bound guest.
-    // A tick that just rendered loops straight back to consume the next
-    // frame; Shutdown() releases the wait and m_running ends the loop.
+    // backpressure (it blocks until the list is consumed), so an idle tick parks
+    // on the mailbox cv and wakes exactly when a frame is posted -- no spin, no
+    // log flood, and the core goes back to the compute-bound guest.
     if (idle || !m_renderer) {
       native::NativeGraphics::Get().WaitForDrawsOrShutdown();
     }

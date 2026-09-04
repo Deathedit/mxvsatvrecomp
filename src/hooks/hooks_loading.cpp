@@ -1,30 +1,26 @@
-// Loading-path hooks — SetupRenderer, Transition, LoaderTick.
+// Loading-path hooks -- SetupRenderer, Transition, LoaderTick.
 //
-// This is the part of the boot sequence mid-ASM hooks used to carve into.
-// **NO MID-ASM HOOK IS ACTIVE ANY MORE**, checked 2026-08-28: mx_asm.toml is
-// 107 of 116 lines commented with nothing live, and mx_config.toml has no
-// mid-ASM section at all. The stubs in midasm_stubs.cpp are referenced only
-// from commented mx_asm.toml lines.
+// This is the part of the boot sequence mid-ASM hooks used to carve into. **NO
+// MID-ASM HOOK IS ACTIVE ANY MORE**: mx_asm.toml is 107 of 116 lines commented
+// with nothing live, mx_config.toml has no mid-ASM section, and the stubs in
+// midasm_stubs.cpp are referenced only from commented lines.
 //
 // This header used to say "only hook #6 is left, and it skips exactly one
-// instruction — the `bl sub_82B34998` renderer dispatch at 0x82B70EF4". That is
-// no longer true and had not been for some time: nothing is skipped, the
-// dispatch RUNS, and it is observed by a plain function hook on sub_82B34998 in
-// hooks_plugin_diag.cpp which calls its original in both modes.
+// instruction". That had not been true for some time: nothing is skipped, the
+// dispatch RUNS, and it is observed by a plain function hook on sub_82B34998.
 //
-// Comments in this file below still describe hook #6's behaviour in the past
-// tense; read them as history, not as the current configuration.
+// Comments below still describe hook #6's behaviour in the past tense; read them
+// as history, not as the current configuration.
 
 #include "hooks/hook_common.h"
 
 //=============================================================================
-// GPU renderer shim (Path 2) — DIAGNOSTIC HOOKS DISABLED.
+// GPU renderer shim (Path 2) -- DIAGNOSTIC HOOKS DISABLED.
 //
 // Three hooks were trialed during Path 1/2 experimentation: sub_82B2C9D0 (TLS
-// gate), sub_82B307D8 (NULL-deref bypass), and a SetupRenderer pre-population
-// of dword_830BE190. They are NOT needed in the baseline — mid-ASM hook #6
-// skips sub_82B34998 entirely. Findings preserved in AGENTS.md "PATH 1
-// EXPERIMENT" and "Path 2" sections. Re-enabling requires codegen.
+// gate), sub_82B307D8 (NULL-deref bypass), and a SetupRenderer pre-population of
+// dword_830BE190. They are NOT needed in the baseline. Findings preserved in
+// AGENTS.md; re-enabling requires codegen.
 //=============================================================================
 
 //=============================================================================
@@ -77,19 +73,16 @@ extern "C" REX_FUNC(sub_82B71148) {
   orig_SetupRenderer(ctx, base);
   REXLOG_INFO("native: SetupRenderer RETURNED");
 
-  // DORMANT fallback. SetupRenderer's vt[17] (sub_82B43AC8 @ 0x82B71310) writes
-  // `*(eng+8) = assetdb_block` — the 545KB block allocated at 0x82B712D8 by
-  // sub_82AB73C0(0x85280) and initialized by AssetDB_InnerCtor_VtableInstall at
-  // 0x82B712EC. This block existed because mid-ASM hook #4 used to skip vt[17],
-  // leaving eng+8 NULL.
+  // DORMANT fallback. SetupRenderer's vt[17] writes `*(eng+8) = assetdb_block`
+  // -- the 545KB block allocated and initialized alongside it. This block
+  // existed because mid-ASM hook #4 used to skip vt[17], leaving eng+8 NULL.
   //
-  // Hook #4 is disabled, so vt[17] runs and eng+8 is populated for real — the
-  // branch below is not taken (log line: "eng+8 already populated"). Kept as a
-  // fallback in case #4 is ever re-enabled.
+  // Hook #4 is disabled, so vt[17] runs and eng+8 is populated for real; the
+  // branch below is not taken. Kept as a fallback in case #4 is ever re-enabled.
   //
-  // If it does run it re-allocates the block and calls the inner ctor to install
-  // the same vtable, but SKIPS vt[17]'s secondary sub_82526D10 call (18-subsystem
-  // AssetDB registration) — so it is not a faithful substitute.
+  // If it does run it re-allocates the block and installs the same vtable, but
+  // SKIPS vt[17]'s secondary sub_82526D10 call (18-subsystem AssetDB
+  // registration) -- so it is not a faithful substitute.
   uint32_t eng = REX_LOAD_U32(0x830BE400);
   if (eng && !REX_LOAD_U32(eng + 8)) {
     REXLOG_INFO("native: eng+8 is NULL — replicating vt[17] write from C++");
@@ -181,11 +174,10 @@ extern "C" REX_FUNC(sub_82B710D0) {
 
     // --- Renderer-block probe -----------------------------------------------
     // Describes 0x82B70EC8..0x82B710BC. Hook #6 used to delete this band
-    // wholesale, then narrowed to skipping only the `bl sub_82B34998` dispatch
-    // at 0x82B70EF4. It is disabled now along with every other mid-ASM hook, so
-    // the whole band runs including that dispatch. These reads established that
-    // the band's inputs were real before the narrowing; they stay as a
-    // regression check.
+    // wholesale, then narrowed to skipping only the `bl sub_82B34998` dispatch.
+    // It is disabled now along with every other mid-ASM hook, so the whole band
+    // runs. These reads established that the band's inputs were real before the
+    // narrowing; they stay as a regression check.
 
     // Lazy-init at 0x82B70EE8 is `bctrl` through dword_82D5648C. When #6 was
     // last disabled execution stalled right here (midasm_stubs.cpp:33) — but

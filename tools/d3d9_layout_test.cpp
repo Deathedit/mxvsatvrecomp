@@ -4,21 +4,17 @@
 //   clang++ -std=c++23 -I src -I C:/rexglue-sdk/include \
 //       -o d3d9_layout_test.exe tools/d3d9_layout_test.cpp src/gpu/d3d9_layout.cpp
 //
-// The fixtures are the 23 vertex declarations this title created in a 165s
-// run, transcribed verbatim from d3d9_dump_decls.txt — real elements the game
-// handed to D3DDevice_CreateVertexDeclaration, not synthesised. They were
-// reproduced byte-identically across 100s, 140s and 165s runs.
+// The fixtures are the 23 vertex declarations this title created in a 165s run,
+// transcribed verbatim from d3d9_dump_decls.txt and reproduced byte-identically
+// across three runs.
 //
 // The central assertion is not "the decode returns something". It is that
 // **each element's decoded size equals the distance to the next element's
 // offset in the same stream**, and that the resulting stride matches what the
-// PM4 translator independently measured for the two declarations where it has
-// a number (28 and 36). The offsets come from the game, the sizes come from
-// the runtime's own table at 0x8204E188, and the strides come from a different
-// pipeline; three sources agreeing is the evidence. A packing, endianness or
-// field-position error shows up here in a second instead of costing a run.
-//
-// See tools/ucode_test.cpp for the same pattern applied to the microcode.
+// PM4 translator independently measured for the two declarations where it has a
+// number (28 and 36). The offsets come from the game, the sizes from the
+// runtime's own table at 0x8204E188, and the strides from a different pipeline;
+// three sources agreeing is the evidence.
 
 #include <cstdio>
 #include <cstdint>
@@ -50,11 +46,9 @@ void CheckU32(const char* what, uint32_t got, uint32_t want) {
 }
 
 //===========================================================================
-// The fixtures.
-//
-// Twelve bytes per element, exactly as dumped. Byte 11 is padding and is left
-// at whatever the capture held (FF, 7C, 3B, 60 ...) rather than zeroed — if
-// the decode ever started reading it, these would catch it.
+// The fixtures. Twelve bytes per element, exactly as dumped. Byte 11 is padding
+// and is left at whatever the capture held rather than zeroed -- if the decode
+// ever started reading it, these would catch it.
 //===========================================================================
 struct Fixture {
   int id;                      // decl # in the dump
@@ -328,7 +322,7 @@ void RunFixture(const Fixture& f) {
 //
 // Everything above checks that a declaration *describes* a layout correctly.
 // These check that the described layout then reads the right numbers out of
-// real vertex bytes — which is what Stage 2 does per vertex, per draw.
+// real vertex bytes.
 //
 // The pair that matters most is COLOR and BLENDINDICES: identical bits,
 // identical format 6, differing only in the two Type bits, and one must come
@@ -462,26 +456,22 @@ void CheckVertexDecode() {
   }
 
   // The 8-in-32 swap over a 16-bit format exchanges the component pair, and
-  // that exchange is the HARDWARE, not a defect. Reversing all four bytes of a
-  // dword holding two halves byte-swaps each and swaps their order; the vfetch
-  // destination swizzle is what puts them back, and the guest compiler emits
-  // exactly that permutation for exactly these formats. See the note on
-  // ApplyFetchEndianFor: over 1851 fetches every 16-bit format asks for the
-  // pairwise exchange (fmt 32 and 26 -> 0x4C1, fmt 31 -> 0xFC1) and no 32-bit
-  // format does.
+  // that exchange is the HARDWARE, not a defect. The vfetch destination swizzle
+  // is what puts them back, and the guest compiler emits exactly that
+  // permutation for exactly these formats -- over 1851 fetches every 16-bit
+  // format asks for the pairwise exchange and no 32-bit format does.
   //
   // This test USED TO assert the swapped-then-unswizzled read came out already
-  // ordered, using a synthetic element carrying swizzle 0xA88 -- an identity,
-  // 32-bit-unit shape that no real fmt-32 fetch carries. That is the narrowing
-  // that was tried, shipped, and reverted; the test outlived the revert because
-  // it stopped compiling at the mx::pm4 -> mx::hle rename and nobody ran it.
+  // ordered, using a synthetic element carrying an identity 32-bit-unit swizzle
+  // that no real fmt-32 fetch carries. That is the narrowing that was tried,
+  // shipped and reverted; the test outlived the revert because it stopped
+  // compiling at a rename and nobody ran it.
   //
-  // What is checked now is the PAIR composing, which is the thing that has to
-  // hold: the raw read exchanges, the swizzle undoes it, and the position comes
-  // out homogeneous with w last.
+  // What is checked now is the PAIR composing: the raw read exchanges, the
+  // swizzle undoes it, and the position comes out homogeneous with w last.
   //
-  // Bytes are vertex 0 of shader 0x22D4B320 (NAT_Farm, mx_257.log) in guest
-  // order, with the endian=2 its stream fetch constant carries.
+  // Bytes are vertex 0 of a real shader in guest order, with the endian=2 its
+  // stream fetch constant carries.
   {
     const uint8_t pos16x4[8] = {0x31, 0xED, 0x34, 0x37, 0x32, 0x72, 0x3C, 0x00};
 
@@ -601,10 +591,10 @@ const char* LayoutErrorTextOrNull(const mx::hle::LayoutError& e) {
 // The transcode reads POSITION0, COLOR0 and TEXCOORD0 and nothing else, so an
 // element it cannot describe that is none of those costs nothing to leave out.
 // This used to return false on the first such element, which nulled the layout
-// for every draw that used the declaration and dropped them all as kNoLayout.
-// A NORMAL in k_11_11_10 -- no DXGI equivalent, and the ordinary way foliage
-// packs a normal -- therefore erased geometry whose position and texcoord
-// decode exactly.
+// for every draw that used the declaration and dropped them all as kNoLayout. A
+// NORMAL in k_11_11_10 -- no DXGI equivalent, and the ordinary way foliage packs
+// a normal -- therefore erased geometry whose position and texcoord decode
+// exactly.
 //===========================================================================
 
 // type dword: format in [5:0], signed at bit 8, INTEGER at bit 9 (so a clear

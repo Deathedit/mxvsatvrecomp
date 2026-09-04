@@ -4,15 +4,11 @@
 //   clang++ -std=c++23 -I src -I C:/rexglue-sdk/include \
 //       -o ucode_test.exe tools/ucode_test.cpp src/gpu/shader_ucode.cpp
 //
-// The fixtures are verbatim IM_LOAD_IMMEDIATE (0x2B) payloads captured in
-// pm4_dump_native_frame_600.txt — real microcode this game submitted, not
-// synthesised. Their expected decodes were worked out by hand against the bit
-// layouts in rex/graphics/format/ucode.h before any of this was written, which
-// is the whole point: it catches packing, endianness and bit-offset errors in
-// seconds instead of costing a 75-second game run each.
-//
-// translator_test.cpp is deliberately not extended — its includes still name
-// the pre-gpu/ file layout and it does not build.
+// The fixtures are verbatim IM_LOAD_IMMEDIATE (0x2B) payloads captured from a
+// real frame -- microcode this game submitted, not synthesised. Their expected
+// decodes were worked out by hand against the bit layouts in ucode.h before any
+// of this was written, which is the point: it catches packing, endianness and
+// bit-offset errors in seconds instead of costing a 75-second game run each.
 
 #include <algorithm>
 #include <cmath>
@@ -74,7 +70,7 @@ void CheckPickedPosition(const std::vector<mx::hle::VertexAttribute>& attrs,
 }
 
 // ---------------------------------------------------------------------------
-// Fixture 1 — the cnt=29 blob. body[0]=0 (vertex shader), body[1]=0x1B (27
+// Fixture 1 -- the cnt=29 blob. body[0]=0 (vertex shader), body[1]=0x1B (27
 // dwords), then the microcode below. Hand decode:
 //
 //   30052003 00001200 C4000000  kExec addr=3 count=2 seq=0x005 | kAlloc
@@ -83,16 +79,15 @@ void CheckPickedPosition(const std::vector<mx::hle::VertexAttribute>& attrs,
 //   30081000 00393A88 00000007  vfetch_full slot 0 fmt 57 off 0  stride 7 dw
 //   00080000 40263688 00000300  vfetch_mini        fmt 38 off 3
 //   C80F8000 00000000 E2000000  ALU export
-//   ...
 //
-// Lowest exec address is 3, so the CF section is dwords [0, 9) — three lines,
-// six CF instructions. Sequence 0x005 marks instructions 3 and 4 as fetches.
+// Lowest exec address is 3, so the CF section is dwords [0, 9). Sequence 0x005
+// marks instructions 3 and 4 as fetches.
 //
-// That is pos3 @0 + colour4 @12, stride 28 — byte for byte the layout the raw
-// vertex hex dump confirmed empirically a round ago, now read from the shader
-// instead of guessed. Note position lands in dest_reg 1 and colour in dest_reg
-// 0: anything picking the position attribute must key on offset and format,
-// never on destination register.
+// That is pos3 @0 + colour4 @12, stride 28 -- byte for byte the layout the raw
+// vertex hex dump confirmed empirically, now read from the shader instead of
+// guessed. Note position lands in dest_reg 1 and colour in dest_reg 0: anything
+// picking the position attribute must key on offset and format, never on
+// destination register.
 constexpr uint32_t kFixturePosColor28[] = {
     0x30052003, 0x00001200, 0xC4000000,
     0x00001005, 0x00001200, 0xC2000000,
@@ -106,15 +101,14 @@ constexpr uint32_t kFixturePosColor28[] = {
 };
 
 // ---------------------------------------------------------------------------
-// Fixture 2 — the cnt=26 blob, body[1]=0x18 (24 dwords). Same CF shape, a
-// different layout: slot 95 (const_index 31, sel 2 -> 31*3+2), stride 5 dwords
-// = 20 bytes, pos3 float @0 plus a float2 @12. 20 is one of the strides the
-// renderer currently *skips*, which makes this the more valuable fixture of the
-// two — it is the case the heuristic gets no chance to validate.
+// Fixture 2 -- the cnt=26 blob, body[1]=0x18 (24 dwords). Same CF shape, a
+// different layout: slot 95, stride 5 dwords = 20 bytes, pos3 float @0 plus a
+// float2 @12. 20 is one of the strides the renderer *skips*, which makes this
+// the more valuable fixture -- the case the heuristic gets no chance to
+// validate.
 //
 // Its vfetch_mini carries stride 5 in its own field rather than 0, unlike
-// fixture 1's, which reads 0. Inheriting from the preceding full is correct
-// either way and agrees with the populated value here.
+// fixture 1's. Inheriting from the preceding full is correct either way.
 constexpr uint32_t kFixturePosUv20[] = {
     0x30052003, 0x00001200, 0xC2000000,
     0x00001005, 0x00001200, 0xC4000000,
@@ -276,12 +270,11 @@ void TestNoPositionExport() {
 //
 // That shader's export to 62 is `C80F803E 00000000 E2010100`: vector opcode 2
 // (kMax) with src1 and src2 both naming temp register 1 and both swizzles zero
-// — max(r1, r1), the idiomatic Xenos move. Its vector write mask is 0xF and its
-// scalar write mask is 0, so all four exported components come from the vector
-// half. So whatever is seeded into r1 must come back out unchanged, which is a
-// weak-looking assertion that in fact exercises the whole chain: CF bounding,
-// sequence decoding, operand swizzling, the co-issue evaluation and the export
-// write-mask scheme.
+// -- max(r1, r1), the idiomatic Xenos move. Its vector write mask is 0xF and
+// its scalar write mask 0, so all four exported components come from the vector
+// half. Whatever is seeded into r1 must come back unchanged, which is a
+// weak-looking assertion that in fact exercises CF bounding, sequence decoding,
+// operand swizzling, co-issue evaluation and the export write-mask scheme.
 void TestAluPassthrough() {
   std::printf("fixture 1 executes: export 62 = max(r1,r1) = the fetched pos\n");
   std::vector<mx::hle::VertexAttribute> attrs;
@@ -364,8 +357,8 @@ void TestAluNoPosition() {
 // Synthetic ALU fixtures.
 //
 // The two blobs above are real microcode, but neither uses a0-relative
-// addressing or the const-register scalar ops, so neither can test them. These
-// are hand-assembled against the bit layout in rex/graphics/format/ucode.h:
+// addressing or the const-register scalar ops. These are hand-assembled against
+// the bit layout in ucode.h:
 //
 //   word0: vector_dest:6 vector_dest_rel:1 abs_constants:1 scalar_dest:6
 //          scalar_dest_rel:1 export_data:1 vector_write_mask:4
@@ -376,10 +369,9 @@ void TestAluNoPosition() {
 //   word2: src3_reg:8 src2_reg:8 src1_reg:8 vector_opc:5
 //          src{3,2,1}_sel:1 each   (sel 1 = temp register, 0 = constant)
 //
-// They reuse fixture 1's control flow verbatim — exec 3 count 2 (the two
-// vfetches), then three single-instruction execs at 5, 6 and 7 — and only
-// replace the three ALU slots. That keeps the CF encoding, which is already
-// proven by the real fixtures, out of the thing under test.
+// They reuse fixture 1's control flow verbatim and replace only the three ALU
+// slots, which keeps the CF encoding -- already proven by the real fixtures --
+// out of the thing under test.
 constexpr size_t kAluSlot0 = 15;  // instruction index 5
 constexpr size_t kAluSlot1 = 18;  // instruction index 6, the position export
 constexpr size_t kAluSlot2 = 21;  // instruction index 7
@@ -498,8 +490,8 @@ void TestAddressRegister() {
   exp.src1_reg = 0; exp.src1_temp = false;
   exp.src2_reg = 0; exp.src2_temp = false;
   exp.const_0_rel_abs = true;  // src1/src2 constant index is relative at all
-  // ...and *which* register it is relative to. The polarity is the thing this
-  // test exists to pin, because it reads backwards: the bit is named "address
+  // ...and *which* register it is relative to. The polarity is what this test
+  // exists to pin, because it reads backwards: the bit is named "address
   // register relative", and the address register is a0, so
   //   true  = c[a0 + n]   (AddressingMode::kAbsolute = 1, ucode.h:196)
   //   false = c[aL + n]   (AddressingMode::kRelative = 0, ucode.h:193)
@@ -542,22 +534,18 @@ void TestAddressRegister() {
 //   scalar_const_reg_op_src_temp_reg() =
 //       (scalar_opc & 1) | (src3_sel << 1) | (src3_swiz & 0x3C)
 //
-// so bits [5:2] are the TEMP REGISTER, which leaves [1:0] and [7:6] as
-// swizzles. They are RELATIVE swizzles -- GetSwizzledComponentIndex is
-//   ((swizzle >> (2 * i)) + i) & 3
-// -- and the scalar half uses the Xenos AB = WX convention, so the CONSTANT
-// is selected W-relative out of bits [7:6] and the TEMP X-relative out of
-// bits [1:0].
+// so bits [5:2] are the TEMP REGISTER, leaving [1:0] and [7:6] as swizzles.
+// They are RELATIVE swizzles -- ((swizzle >> (2 * i)) + i) & 3 -- and the
+// scalar half uses the Xenos AB = WX convention, so the CONSTANT is selected
+// W-relative out of bits [7:6] and the TEMP X-relative out of bits [1:0].
 //
-// This test used to set src3_swiz = 0 and call bits [1:0] the constant s
-// component. Under the real rule that reads the constant W-relative:
-// ((0 >> 6) + 3) & 3 = 3, so it read c7.w -- and because only c7.x was
-// seeded, every case came back off by exactly the constant. It could not
-// report that, having stopped compiling at the mx::pm4 -> mx::hle rename.
+// This test used to set src3_swiz = 0 and call bits [1:0] the constant
+// component. Under the real rule that reads c7.w, and because only c7.x was
+// seeded, every case came back off by exactly the constant -- and it could not
+// report that, having stopped compiling at a rename.
 //
 // The constant now has DISTINCT values in every component, so selecting the
-// wrong one is a loud wrong number rather than a zero that reads like an
-// absent operand.
+// wrong one is a loud wrong number rather than a zero that reads as absent.
 void TestConstRegScalarOps() {
   std::printf("mulsc/addsc/subsc read one constant and one temp\n");
   uint32_t consts[2048] = {};

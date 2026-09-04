@@ -135,9 +135,8 @@ extern "C" REX_FUNC(sub_82ABB838) {
   // The crash reporter needs this to tell a guest address from a host pointer,
   // so it is set in BOTH modes and before the original runs -- a fault inside
   // orig_Bootstrap should still classify. EngineInit used to own this; that hook
-  // was deleted 2026-08-16 and took the only writer with it, which left
-  // `in_guest` false for every address until 2026-08-17. Bootstrap is the
-  // earliest hook here that runs unconditionally at boot.
+  // was deleted and took the only writer with it, which left `in_guest` false
+  // for every address until Bootstrap picked it up.
   mx::native::NativeGraphics::Get().SetGuestMemory(base);
   if (mx::native::g_plugin_mode) {
     LogEngSlot8(base, "Bootstrap ENTER");
@@ -199,27 +198,25 @@ extern "C" REX_FUNC(sub_82AEBF40) {
       gpu_base);
   }
 }
-// The sub_82BA7F58 (EngineInit) hook is REMOVED 2026-08-16, having run disabled
-// for ~3-4 hours of sessions covering boot, menu, level load and level exit.
+// The sub_82BA7F58 (EngineInit) hook is REMOVED, having run disabled for ~3-4
+// hours of sessions covering boot, menu, level load and level exit.
 //
 // It did three things, and the middle one is why it could not stay:
 //
 //   NativeGraphics::SetGuestMemory(base) -- and that was the ONLY caller.
 //
-//     CORRECTED 2026-08-17. This block used to continue "GetGuestMemory() was
-//     already called by nobody, [so] the accessor pair and the member are
-//     therefore dead". **That was wrong.** app/mx_app.cpp calls GetGuestMemory()
-//     in the crash reporter to decide whether a faulting address lies inside
-//     guest memory. Deleting this hook set m_guest_base to nobody, so gbase was
-//     0, so `in_guest` was false for EVERY address and guest faults were
-//     reported as host-side pointers for a day. The Bootstrap hook above now
-//     sets it. The claim was made by grepping src/hooks/ instead of the whole
-//     tree -- scope a deadness check to the repo, never to a directory.
+//     CORRECTED: this block used to continue "GetGuestMemory() was already
+//     called by nobody, [so] the accessor pair and the member are therefore
+//     dead". **That was wrong.** app/mx_app.cpp calls GetGuestMemory() in the
+//     crash reporter to decide whether a faulting address lies inside guest
+//     memory, so deleting this hook made `in_guest` false for EVERY address and
+//     guest faults were reported as host-side pointers for a day. The claim was
+//     made by grepping src/hooks/ instead of the whole tree -- scope a deadness
+//     check to the repo, never to a directory.
 //
 //   `for (;;) ::Sleep(16);` after calling the original -- it parked the guest's
-//     init thread forever to keep the process alive. That is a bring-up scaffold
-//     from before the render thread owned the frame loop, and it means this hook
-//     never returned.
+//     init thread forever to keep the process alive, a bring-up scaffold from
+//     before the render thread owned the frame loop. This hook never returned.
 //
 //   Two log lines and the eng+8 slot dump.
 //

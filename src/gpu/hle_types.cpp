@@ -14,13 +14,14 @@ HostTopology MapTopology(uint32_t prim_type) {
     case PrimitiveType::kLineStrip:     return HostTopology::kLineStrip;
     case PrimitiveType::kTriangleList:  return HostTopology::kTriangleList;
     case PrimitiveType::kTriangleStrip: return HostTopology::kTriangleStrip;
-    // RectangleList and QuadList are not topologies, they are expansions —
+    // RectangleList and QuadList are not topologies, they are expansions --
     // ExpandRectangleList and ExpandQuadList rewrite them to triangle lists and
     // set the topology themselves.
-    // TriangleFan has no D3D12 equivalent either, and is still not handled: it
-    // is dropped and counted. Unlike the other two that is not a backlog item
-    // for now — it does not appear once in a prim_type histogram of a full run,
-    // so there is no measured population to justify the code.
+    //
+    // TriangleFan has no D3D12 equivalent either and is still not handled: it is
+    // dropped and counted. Unlike the other two that is not a backlog item -- it
+    // does not appear once in a prim_type histogram of a full run, so there is
+    // no measured population to justify the code.
     default:                            return HostTopology::kUndefined;
   }
 }
@@ -31,29 +32,25 @@ namespace {
 // vertex buffer: three supplied vertices per rect, permuted so the diagonal is
 // first, plus a synthesized fourth.
 //
-// This exists because the vertex buffer was not the only per-vertex stream.
-// The GPU vertex stage's input registers (dc.vertex_inputs) and the CPU path's
-// interpolator stream (dc.interpolators) are both built BEFORE topology
-// finalisation, sized to the incoming vertex_count of 3 -- so after expansion
-// the index buffer referenced a fourth vertex whose registers did not exist.
-// The vertex stage read zeros, the position came out (0,0,0,0), and the second
-// triangle of every rectangle collapsed to a point at the screen centre.
+// This exists because the vertex buffer was not the only per-vertex stream. The
+// GPU vertex stage's input registers and the CPU path's interpolator stream are
+// both built BEFORE topology finalisation, sized to the incoming vertex_count of
+// 3 -- so after expansion the index buffer referenced a fourth vertex whose
+// registers did not exist. The vertex stage read zeros, the position came out
+// (0,0,0,0), and the second triangle of every rectangle collapsed to a point.
 //
-// Measured in capture-ask.rdc at the 320x180 luminance pass: post-transform
-// v3 = (0,0) where it should be (1,-1), and the target was covered by a single
-// triangle with its bottom-right corner missing. Every full-screen post pass in
-// this game is a RECTLIST, so each reduction stage lost half its area and the
-// chain drove the average luminance toward zero.
+// Measured at the 320x180 luminance pass: post-transform v3 = (0,0) where it
+// should be (1,-1). Every full-screen post pass in this game is a RECTLIST, so
+// each reduction stage lost half its area and the chain drove the average
+// luminance toward zero.
 //
-// Every register here is affine across the rectangle -- position, colour, UV
-// and any other interpolant alike -- so the same rule that gives the fourth
-// corner gives the fourth vertex's registers.
+// Every register here is affine across the rectangle, so the same rule that
+// gives the fourth corner gives the fourth vertex's registers.
 //
 // `starts` is the per-rect permutation ExpandRectangleList chose from the
-// POSITIONS. It has to be passed in rather than recomputed, because this
-// stream may not contain a position at all: choosing independently would let
-// the interpolators be permuted differently from the vertices they belong to,
-// which is worse than either choice made consistently.
+// POSITIONS. It has to be passed in rather than recomputed, because this stream
+// may not contain a position at all: choosing independently would let the
+// interpolators be permuted differently from the vertices they belong to.
 void ExpandRectStream(std::vector<uint8_t>& stream, uint32_t stride,
                       uint32_t rects, const std::vector<uint8_t>& starts) {
   if (stream.empty() || !stride) return;
@@ -130,8 +127,8 @@ uint32_t ExpandRectangleList(DrawCall& dc) {
 
     // Three corners of a rectangle arrive, and which three is NOT fixed: the
     // right-angle corner can be any of them, so the diagonal can be any edge.
-    // Transcribed from xenia-edge `spirv_builtin_geometry_shader.cc:671`,
-    // which mirrors a vertex across the LONGEST edge:
+    // Transcribed from xenia-edge spirv_builtin_geometry_shader.cc:671, which
+    // mirrors a vertex across the LONGEST edge:
     //
     //   0---1        1---2        2---0
     //   |  /|        |  /|        |  /|
@@ -143,15 +140,14 @@ uint32_t ExpandRectangleList(DrawCall& dc) {
     //
     // and in every case the fourth corner is v_i1 + v_i2 - v_i0 over the
     // PERMUTED triple. This code used to assume the first arrangement always,
-    // which is why the formula has been flipped once before on the evidence of
-    // a single menu quad — a case-dependent rule tuned to one case. The other
-    // two arrangements built a quad from the wrong corner: one triangle a
-    // wedge, the other folded away off-screen.
+    // which is why the formula has been flipped once before on the evidence of a
+    // single menu quad. The other two arrangements built a quad from the wrong
+    // corner: one triangle a wedge, the other folded away off-screen.
     //
     // Squared lengths, x/y only and no perspective divide, exactly as the
     // reference does it. These positions are the guest vertex shader's own
-    // clip-space exports (FinalizeHleTopology runs after execution), so this
-    // measures the same space the reference's geometry stage measures.
+    // clip-space exports, so this measures the same space the reference's
+    // geometry stage measures.
     auto pos = [&](uint32_t v, uint32_t c) {
       float f;
       std::memcpy(&f, src + size_t(v) * stride + c * 4, 4);

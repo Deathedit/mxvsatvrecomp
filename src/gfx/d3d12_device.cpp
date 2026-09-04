@@ -1,10 +1,10 @@
-// D3D12Renderer — device, swapchain and per-frame lifecycle.
+// D3D12Renderer -- device, swapchain and per-frame lifecycle.
 //
 // Owns everything that exists once for the lifetime of the window: the DXGI
 // factory/adapter, the device, the direct command queue, the flip-discard
-// swapchain and its RTVs, the command allocators/list, and the frame fence.
-// The video pipeline lives in d3d12_video.cpp, the game pipeline and the game
-// render target in d3d12_game.cpp.
+// swapchain and its RTVs, the command allocators/list, and the frame fence. The
+// video pipeline lives in d3d12_video.cpp, the game pipeline and the game render
+// target in d3d12_game.cpp.
 
 #include "gfx/d3d12_renderer.h"
 
@@ -17,12 +17,12 @@
 #include <dxgidebug.h>
 #pragma comment(lib, "dxguid.lib")
 
-// clear_magenta and native_res_viewport were bring-up cvars and are gone
-// (2026-08-07). The magenta clear existed to tell "nothing was drawn at all"
-// apart from "something was drawn over the whole target in black", which look
-// identical against the dark blue; nobody ran it, and the two clears below make
-// the same distinction by keeping the bars black. native_res_viewport was on by
-// default throughout, so the 1:1 path it selected is simply what this does now.
+// clear_magenta and native_res_viewport were bring-up cvars and are gone. The
+// magenta clear existed to tell "nothing was drawn at all" apart from "something
+// was drawn over the whole target in black", which look identical against the
+// dark blue; nobody ran it, and the two clears below make the same distinction
+// by keeping the bars black. native_res_viewport was on by default throughout,
+// so the 1:1 path it selected is simply what this does now.
 
 using mx::gfx::kAdapterNamePrefix;
 using mx::gfx::LogError;
@@ -78,9 +78,9 @@ const char* BreadcrumbOpName(D3D12_AUTO_BREADCRUMB_OP op) {
 //
 // The breadcrumb count is what the GPU *finished*; the op at that index is the
 // one it was executing when it died, which is the single most useful fact
-// available. Only nodes that did not finish are printed -- a completed list
-// says nothing about the fault, and a level's worth of them would bury the one
-// that matters.
+// available. Only nodes that did not finish are printed -- a completed list says
+// nothing about the fault, and a level's worth of them would bury the one that
+// matters.
 void ReportDred(ID3D12Device* device) {
   if (!device) return;
   Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedData> dred;
@@ -193,11 +193,11 @@ bool D3D12Renderer::Initialize(HWND hwnd) {
   }
 
   // The debug layer used to be reachable only in a _DEBUG build, and a debug
-  // build of this emulator is too slow to reach the menu — so the one tool that
+  // build of this emulator is too slow to reach the menu -- so the one tool that
   // names an invalid-work bug exactly was unavailable for the only scenes where
   // such bugs appear. MX_D3D12_DEBUG=1 turns it on in a release build;
-  // MX_D3D12_DEBUG=2 adds GPU-based validation, which is far slower again but
-  // catches descriptor and resource-state errors the basic layer misses.
+  // MX_D3D12_DEBUG=2 adds GPU-based validation, far slower again but catching
+  // descriptor and resource-state errors the basic layer misses.
   uint32_t debugLevel = 0;
 #if defined(_DEBUG)
   debugLevel = 2;
@@ -228,26 +228,25 @@ bool D3D12Renderer::Initialize(HWND hwnd) {
     }
   }
 
-  // DRED — Device Removed Extended Data.
+  // DRED -- Device Removed Extended Data.
   //
-  // GetDeviceRemovedReason only ever answers DEVICE_HUNG, which names a symptom
-  // and nothing else. Three theories were argued from that one word and two of
-  // them were wrong: a long frame crossing the TDR threshold (disproved -- runs
-  // survived 3.7s frames and hung on a 0.77s one) and a driver left unstable by
-  // an earlier reset (disproved -- Windows logged no display reset at all).
+  // GetDeviceRemovedReason only ever answers DEVICE_HUNG, which names a symptom.
+  // Three theories were argued from that one word and two were wrong: a long
+  // frame crossing the TDR threshold (disproved -- runs survived 3.7s frames and
+  // hung on a 0.77s one) and a driver left unstable by an earlier reset
+  // (disproved -- Windows logged no display reset at all).
   //
-  // DRED records the breadcrumb trail of commands the GPU actually completed,
-  // so the first UNFINISHED op is the one that faulted, plus the faulting
-  // address and which allocation owned it. That is the difference between
-  // reading the fault and guessing at it.
+  // DRED records the breadcrumb trail of commands the GPU actually completed, so
+  // the first UNFINISHED op is the one that faulted, plus the faulting address
+  // and which allocation owned it.
   //
   // MUST be set before device creation: afterwards the settings object still
   // hands back S_OK and changes nothing.
   //
-  // On by default. Auto-breadcrumbs cost a small write per command-list op,
-  // and the bug being chased appears only after minutes of play -- an
-  // instrument that has to be armed in advance is one that will not be armed
-  // when it matters. MX_D3D12_DRED=0 turns it off for timing runs.
+  // On by default. Auto-breadcrumbs cost a small write per command-list op, and
+  // the bug being chased appears only after minutes of play -- an instrument
+  // that has to be armed in advance is one that will not be armed when it
+  // matters. MX_D3D12_DRED=0 turns it off for timing runs.
   {
     bool dred = true;
     char value[8] = {};
@@ -263,12 +262,12 @@ bool D3D12Renderer::Initialize(HWND hwnd) {
         dredSettings->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
         LogInfo("DRED enabled (auto-breadcrumbs + page fault).");
       } else {
-        // Logged loudly rather than skipped. The first build of this reported
-        // only on success, so a failure looked exactly like a run where the
-        // fault never happened -- an instrument that cannot say "I am not
-        // armed" is worse than none. 0x887E0003 is DXGI_ERROR_SDK_COMPONENT_
-        // MISSING: D3D12GetDebugInterface needs the "Graphics Tools" optional
-        // Windows feature, which is not installed by default.
+        // Logged loudly rather than skipped. The first build reported only on
+        // success, so a failure looked exactly like a run where the fault never
+        // happened -- an instrument that cannot say "I am not armed" is worse
+        // than none. 0x887E0003 is DXGI_ERROR_SDK_COMPONENT_MISSING:
+        // D3D12GetDebugInterface needs the "Graphics Tools" optional Windows
+        // feature, which is not installed by default.
         char buf[160] = {};
         std::snprintf(buf, sizeof(buf),
                       "DRED NOT ENABLED: D3D12GetDebugInterface HR=0x%08lX%s",
@@ -424,16 +423,15 @@ void D3D12Renderer::BeginFrame() {
   D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = {};
   if (m_gameDepth) {
     dsvHandle = m_gameDsvHeap->GetCPUDescriptorHandleForHeapStart();
-    // Clear depth each frame: DSV was bound but never cleared, so without
-    // this, depth accumulates across frames and real geometry would
-    // depth-fail against random initial values.
+    // Clear depth each frame: the DSV was bound but never cleared, so without
+    // this depth accumulates across frames and real geometry depth-fails against
+    // random initial values.
     //
     // DEPTH ONLY after the first frame. Stencil is the guest's -- it clears the
     // plane where it wants to and withholds the clear where it does not, and
     // wiping it every frame on our schedule destroys the mask it built. This
     // surface has no needsInitialClear of its own, so the first frame gives
-    // stencil its one defined value and every frame after refreshes depth
-    // alone. See kGameDepthFrameClearFlags.
+    // stencil its one defined value and every frame after refreshes depth alone.
     m_commandList->ClearDepthStencilView(
         dsvHandle,
         m_gameDepthStencilInitialised ? kGameDepthFrameClearFlags
@@ -454,23 +452,17 @@ void D3D12Renderer::BeginFrame() {
   // sets m_hasGamePipeline true and Initialize hard-fails if it does not, so in
   // any renderer that started successfully the middle arm always won and the
   // clear was dead code. m_gameRT had therefore been accumulating every frame
-  // ever drawn — which is what the control screenshot was showing when it
-  // displayed the startup placeholder triangle (since removed) and a guest quad
-  // from different frames at the same time. No screenshot before 2026-08-02
-  // showed a single frame.
+  // ever drawn -- which is what a control screenshot was showing when it
+  // displayed the startup placeholder triangle and a guest quad from different
+  // frames at the same time.
   //
   // This cannot fight the guest's own clear. That arrives as a RectangleList
-  // *draw*, lands in m_gameDraws, and is replayed inside RenderGameFrame — so
+  // *draw*, lands in m_gameDraws, and is replayed inside RenderGameFrame -- so
   // it runs after this clear, not instead of it.
-  // rtvHandle is m_gameRT when it exists and the backbuffer otherwise; both
-  // want clearing, so this is not conditioned on which one it is.
   //
   // Two clears, not one. GameClearColor is *our* debug colour, not the guest's,
-  // and a single full-window clear painted it into the pillarbox bars as well —
-  // so the bars came out dark blue and read as part of the image rather than as
-  // dead space beside it. Black bars are the letterbox convention precisely
-  // because they cannot be mistaken for content.
-  //
+  // and a single full-window clear painted it into the pillarbox bars as well,
+  // so the bars read as part of the image rather than as dead space beside it.
   // The scoped clear uses m_scissorRect, which CreateViewportAndScissor already
   // fitted to the guest's 16:9, so the two cannot drift apart.
   static const float kBars[4] = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -512,10 +504,9 @@ void D3D12Renderer::EndFrame() {
     // fence never advanced, so DrainRetired released nothing and the per-draw
     // upload buffers accumulated without bound.
     //
-    // Measured in mx_881: one Close failure at frame 43, then 521 consecutive
-    // dead frames at 4-5 SECONDS of wall clock each. That is what 0.40 fps in
-    // the menu actually is -- not the vertex path, which by then was not
-    // rendering at all.
+    // Measured: one Close failure at frame 43, then 521 consecutive dead frames
+    // at 4-5 SECONDS of wall clock each. That is what 0.40 fps in the menu
+    // actually is -- not the vertex path, which by then was not rendering at all.
     char buf[192] = {};
     std::snprintf(buf, sizeof(buf),
                   "EndFrame: Close failed HR=0x%08lX removed=0x%08lX", hr,
@@ -698,9 +689,9 @@ bool D3D12Renderer::CreateDevice() {
   // Route the debug layer's messages into OUR log. Without this the layer is
   // enabled and silent from the caller's point of view: its output goes to the
   // debugger via OutputDebugString, and this process is normally run from a
-  // shell with no debugger attached. Breaking on corruption and error also
-  // stops AT the offending call rather than at the device hang it causes some
-  // frames later, which is the difference between a name and a guess.
+  // shell with no debugger attached. Breaking on corruption and error also stops
+  // AT the offending call rather than at the device hang it causes some frames
+  // later, which is the difference between a name and a guess.
   Microsoft::WRL::ComPtr<ID3D12InfoQueue> infoQueue;
   if (SUCCEEDED(m_device.As(&infoQueue))) {
     infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, FALSE);
@@ -866,12 +857,11 @@ bool D3D12Renderer::CreateCommandList() {
 
 // Discard the command list and build a new one, after a Close that failed.
 //
-// D3D12 offers no way to return an indeterminate list to a usable state — the
-// runtime's own guidance is to abandon it — so the only recovery is a fresh
-// one. The GPU is drained first because we do not know how much of the
-// abandoned frame, if any, is still referencing resources; after that wait
-// nothing is, which is also the one moment the retirement list can be emptied
-// outright.
+// D3D12 offers no way to return an indeterminate list to a usable state -- the
+// runtime's own guidance is to abandon it -- so the only recovery is a fresh
+// one. The GPU is drained first because we do not know how much of the abandoned
+// frame is still referencing resources; after that wait nothing is, which is
+// also the one moment the retirement list can be emptied outright.
 void D3D12Renderer::RecoverCommandList() {
   WaitForGpu();
   m_commandList.Reset();
@@ -921,18 +911,18 @@ bool D3D12Renderer::CreateFence() {
 void D3D12Renderer::CreateViewportAndScissor() {
   // Pillarbox to the guest's aspect rather than stretching to the window's.
   //
-  // The guest renders 1280x720 — its own viewport registers read xs=640,
-  // ys=-360, and it never learns the host window size because none of
-  // VdQueryVideoMode, XGetVideoMode or VdGetCurrentDisplayInformation is
-  // hooked. The transcode then normalises to clip [-1,1], which carries no
-  // aspect information at all. So stretching clip space across the full client
-  // area scales x and y by different factors: on a 3440x1440 window that is
-  // 2.389 against the guest's 1.778, and everything drawn came out 1.34x too
-  // wide. Every screenshot taken before this was distorted.
+  // The guest renders 1280x720 -- its own viewport registers read xs=640,
+  // ys=-360 -- and it never learns the host window size because none of
+  // VdQueryVideoMode, XGetVideoMode or VdGetCurrentDisplayInformation is hooked.
+  // The transcode then normalises to clip [-1,1], which carries no aspect
+  // information at all, so stretching clip space across the full client area
+  // scales x and y by different factors: on a 3440x1440 window that is 2.389
+  // against the guest's 1.778, and everything came out 1.34x too wide. Every
+  // screenshot taken before this was distorted.
   //
   // The render target stays window-sized on purpose. PresentGameFrame copies it
-  // to the backbuffer with CopyTextureRegion, which requires matching
-  // dimensions — fitting the image is the viewport's job, not the resource's.
+  // to the backbuffer with CopyTextureRegion, which requires matching dimensions
+  // -- fitting the image is the viewport's job, not the resource's.
   const float win_w = static_cast<float>(m_width);
   const float win_h = static_cast<float>(m_height);
   float draw_w = win_w;
@@ -947,18 +937,16 @@ void D3D12Renderer::CreateViewportAndScissor() {
   // The guest's image fills the pillarboxed region at whatever size the window
   // is, rather than being pinned to 1280x720 in the middle of a larger one.
   //
-  // It used to be pinned, so that nothing was stretched or resampled and a
-  // screenshot pixel mapped to a guest pixel — which was the right trade while
-  // every question was "what exact colour did this draw write", and it is worth
-  // knowing that trade is now gone: at a larger window a screenshot pixel no
-  // longer corresponds to a guest pixel, so pixel-exact work belongs in a
-  // capture rather than in a screenshot.
+  // It used to be pinned so that a screenshot pixel mapped to a guest pixel,
+  // which was the right trade while every question was "what exact colour did
+  // this draw write". That trade is now gone: at a larger window a screenshot
+  // pixel no longer corresponds to a guest pixel, so pixel-exact work belongs in
+  // a capture rather than in a screenshot.
   //
   // This is only the VIEWPORT. Geometry rasterises at the larger size because
   // the main target is window-sized, but every guest-allocated render target,
-  // resolve and snapshot is still 1280x720 — so the post chain and anything
-  // sampled through it is unchanged. This is a bigger window, not a resolution
-  // scale.
+  // resolve and snapshot is still 1280x720 -- so the post chain is unchanged.
+  // This is a bigger window, not a resolution scale.
 
   const float off_x = (win_w - draw_w) * 0.5f;
   const float off_y = (win_h - draw_h) * 0.5f;
@@ -1035,9 +1023,9 @@ void D3D12Renderer::MoveToNextFrame() {
     }
   }
 
-  // Release the per-draw upload buffers the GPU has now finished with. Done
-  // here rather than in ClearGameDraws because this is the only place that
-  // knows the fence has moved.
+  // Release the per-draw upload buffers the GPU has now finished with. Done here
+  // rather than in ClearGameDraws because this is the only place that knows the
+  // fence has moved.
   //
   // Timed because releasing ~4,800 committed resources is the other half of
   // creating them, and a driver allocator that has become slow to allocate is

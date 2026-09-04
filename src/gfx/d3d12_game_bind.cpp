@@ -25,39 +25,33 @@ using mx::gfx::CompileShader;
 using mx::gfx::LogError;
 using mx::gfx::LogInfo;
 
-// xe_texsign for the VERTEX stage, which lives at the very end of that stage's
-// cbuffer -- after xe_vf, so that the fixed vfOffset the fetch path writes to
-// does not move. See the declaration in EmitShaderHlsl.
+// xe_texsign for the VERTEX stage, at the very end of that stage's cbuffer --
+// after xe_vf, so the fixed vfOffset the fetch path writes to does not move.
 //
 // The default is 1.0, NOT the 0 the surrounding memset leaves. The shader
 // computes `v * xe_texsign + (1 - xe_texsign)`, so a zero scale turns every
-// sample into a constant 1.0 -- white -- rather than into an unmodified sample.
-// A plain unsigned fetch needs a scale of exactly one.
-// THE D3D9 HALF-PIXEL OFFSET, as an NDC offset on the vertex position.
+// sample into a constant 1.0 -- white -- rather than an unmodified sample.
 //
-// D3D9 centres pixels at .0, the host rasterises at .5. Without the correction
-// a guest full-screen shape sits half a pixel up and to the left: measured on
-// the start screen, the UI border at event 2542 spans NDC y -0.998598..1.00138
-// -- exactly 720 pixels tall but centred half a pixel high -- so it misses the
-// bottom row entirely and leaves the row beneath it showing through.
+// FillVertexNdcOffset is THE D3D9 HALF-PIXEL OFFSET, as an NDC offset on the
+// vertex position. D3D9 centres pixels at .0, the host rasterises at .5, so
+// without the correction a guest full-screen shape sits half a pixel up and to
+// the left: measured on the start screen, a UI border spans NDC y
+// -0.998598..1.00138 -- exactly 720 pixels tall but centred half a pixel high --
+// so it misses the bottom row entirely.
 //
-// NOT a host viewport shift. Moving viewport.TopLeftX/Y moves rasterisation
-// and nothing else, so a texel-exact pass then samples BETWEEN texels: that is
-// what blew the 160x90 luminance downsample and drove the whole scene white.
-// The reference folds the same +0.5 into the viewport offset in the GUEST's
-// space (draw_util.cc:389) and hands it to the shader as an NDC offset, which
-// is what this is.
+// NOT a host viewport shift. Moving viewport.TopLeftX/Y moves rasterisation and
+// nothing else, so a texel-exact pass then samples BETWEEN texels: that is what
+// blew the 160x90 luminance downsample and drove the whole scene white. The
+// reference folds the same +0.5 into the viewport offset in the GUEST's space
+// (draw_util.cc:389) and hands it to the shader as an NDC offset.
 //
 // A pixel spans 2/extent in NDC, so half a pixel is 1/extent. Y is negated
-// because NDC runs up and the screen runs down. PER DRAW, because at 160x90
-// half a pixel is eight times what it is at 1280x720 and one global value
-// cannot serve both.
+// because NDC runs up and the screen runs down. PER DRAW, because at 160x90 half
+// a pixel is eight times what it is at 1280x720.
 //
 // THE EXTENT FALLS BACK TO THE TARGET. The first cut used only guestVpWidth /
-// guestVpHeight and read ZERO on the UI draws -- which are exactly the ones
-// that show the defect -- so the correction was emitted into the shader and
-// then multiplied by nothing. The target extent is what the host viewport is
-// actually set from, so it is the right second answer rather than a guess.
+// guestVpHeight and read ZERO on the UI draws -- exactly the ones that show the
+// defect -- so the correction was emitted and then multiplied by nothing.
 void D3D12Renderer::FillVertexNdcOffset(const GameDraw& d, uint8_t* cb,
                                         uint32_t cbBytes,
                                         uint32_t constDwords) {
@@ -99,29 +93,22 @@ void D3D12Renderer::FillVertexTextureSigns(const GameDraw& d, uint8_t* cb,
 //
 // The emitter declares `float4 xe_texinv[kTranslatedSamplerSlots]` in BOTH
 // stages and the vertex path already sized the cbuffer for it, zeroed it, and
-// skipped over it to place xe_vf at the offset just past it. It simply never
-// filled it. Confirmed in floating.rdc at event 19719, the terrain draw:
-// every one of xe_texinv[0..15] read [0,0,0,0] in the vertex shader while the
-// pixel stage of the same frame had its slots populated.
+// skipped over it to place xe_vf just past it. It simply never filled it: in one
+// capture every one of xe_texinv[0..15] read [0,0,0,0] in the vertex shader
+// while the pixel stage of the same frame had its slots populated.
 //
-// Two things ride in there and both were dead for every vertex fetch in the
-// game:
+// Three things ride in there and all were dead for every vertex fetch:
 //
 //   .xy  1/extent, which an unnormalized fetch multiplies its TEXEL coordinate
-//        by. Zero collapses any such fetch to texel 0 -- one texel's value
-//        spread flat across the primitive.
-//   .w   the guest's per-texture LOD bias in LOD units. The fetch-constant bias
-//        landed for the pixel stage only, so every VS sample_l has been taking
-//        its LOD from a zero.
-//
+//        by. Zero collapses any such fetch to texel 0.
 //   .z   layer count, for a 3D fetch's slice index.
+//   .w   the guest's per-texture LOD bias. The fetch-constant bias landed for
+//        the pixel stage only, so every VS sample_l took its LOD from a zero.
 //
-// The pixel path's equivalent lives in d3d12_game_frame.cpp and carries a
-// warning this must not repeat: resolve the bias ONLY on the non-snapshot
-// branch. A snapshot slot routinely has a shadowing payload describing a
-// DIFFERENT texture, and reading the bias from it is texinv-shadowed-by-payload
-// one field over. A snapshot has no fetch constant behind it, so no bias is
-// both correct and what it had before.
+// The pixel path's equivalent carries a warning this must not repeat: resolve
+// the bias ONLY on the non-snapshot branch. A snapshot slot routinely has a
+// shadowing payload describing a DIFFERENT texture, and reading the bias from it
+// is texinv-shadowed-by-payload one field over.
 void D3D12Renderer::FillVertexTexinv(const GameDraw& d, uint8_t* cb,
                                      uint32_t cbBytes, uint32_t constDwords) {
   const uint32_t at = constDwords * 4;
@@ -173,11 +160,11 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
   const auto& stageSampledSwizzles =
       vertex ? d.vertexSampledSwizzles : d.pixelSampledSwizzles;
   // A shader that fetches NO texture is allowed through. It used to be refused
-  // here and at the translated gate, purely because the count was zero -- which
-  // is exactly backwards: a shader sampling nothing is the one case that needs
-  // no texture, and the tex*col stand-in it fell back to is the one thing that
-  // does. The descriptor range still has to be filled, with null descriptors;
-  // the shader declares no Texture2D at all, so nothing reads them.
+  // here and at the translated gate purely because the count was zero -- exactly
+  // backwards: a shader sampling nothing is the one case that needs no texture,
+  // and the tex*col stand-in it fell back to is the one thing that does. The
+  // descriptor range still has to be filled, with null descriptors; the shader
+  // declares no Texture2D at all, so nothing reads them.
   if (!m_translatedSrvHeap) return false;
   if (m_translatedBlockNext >= m_translatedBlockLimit) {
     ++m_translatedBlockExhausted;
@@ -209,28 +196,22 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
       if (it == m_gameSnapshots.end() || !it->second.resource) {
         // TRIED AND REMOVED: binding a 1x1 far-plane (white) stand-in here
         // instead of failing the draw. The intent was that a depth resolve can
-        // never produce a snapshot -- a depth surface is never a colour draw
-        // target -- so one permanently unsatisfiable slot was discarding whole
-        // draws under the all-or-nothing slot fill.
+        // never produce a snapshot, so one permanently unsatisfiable slot was
+        // discarding whole draws under the all-or-nothing slot fill.
         //
-        // It was measured and it does not work. 1143 of 1160 missing snapshots
-        // were depth-sourced (mx_766), so gating on depth barely narrowed it:
-        // this was a blanket substitution, not a targeted one, and blanket
-        // substitution is what put white over the Bink logo composite. The menu
-        // scene did not come back either. Removed rather than left in as a
-        // plausible-looking no-op.
-        // CLASSIFY, do not substitute. What the missing image would have held
-        // is recorded by the resolve (m_resolveDestIsDepth) and is worth
-        // counting, because it corrected a wrong reading: "no-snapshot 378"
-        // sitting near "stand-in depth refused 384" in mx_958 looked like the
-        // missing snapshots being overwhelmingly depth-sourced, and they are
-        // not. mx_960 split 613 into depth 165 and never-resolved 448, so the
-        // question is why those resolves never arrive, not what to bind in
-        // their place.
+        // Measured, and it does not work. 1143 of 1160 missing snapshots were
+        // depth-sourced, so gating on depth barely narrowed it: this was a
+        // blanket substitution, and blanket substitution is what put white over
+        // the Bink logo composite.
         //
-        // Binding a substitute was tried here and reverted with the
-        // fabricatedWhite change it depended on -- see that gate. Leave the
-        // draw failing, which is what keeps it out of the stand-in and off the
+        // CLASSIFY, do not substitute. What the missing image would have held is
+        // recorded by the resolve and is worth counting, because it corrected a
+        // wrong reading: "no-snapshot 378" sitting near "stand-in depth refused
+        // 384" looked like the missing snapshots being overwhelmingly
+        // depth-sourced, and a later run split 613 into depth 165 and
+        // never-resolved 448. The question is why those resolves never arrive.
+        //
+        // Leave the draw failing, which keeps it out of the stand-in and off the
         // screen as white.
         const auto kind = m_resolveDestIsDepth.find(object);
         const char* kindName = "never-resolved";
@@ -277,9 +258,9 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
       // recorded (stageSampledSwizzles, printed by SLOT MAP) but deliberately
       // NOT applied here.
       //
-      // TRIED AND REVERTED 2026-08-14, with a screenshot: applying it turned the
-      // menu's yellow rider gear and bike CYAN -- a clean red<->blue swap, which
-      // is precisely what the 03012 slots ask for. The swizzle was not being
+      // TRIED AND REVERTED, with a screenshot: applying it turned the menu's
+      // yellow rider gear and bike CYAN -- a clean red<->blue swap, which is
+      // precisely what the 03012 slots ask for. The swizzle was not being
       // dropped by accident; identity is already right for these slots.
       //
       // Why: a snapshot is a host render-target COPY, already in host channel
@@ -288,21 +269,17 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
       // channel order, so applying it on top double-applies the correction. This
       // is exactly the composition Xenia does with GetHostFormatSwizzle -- guest
       // swizzle composed THROUGH the host format's own swizzle, not applied raw
-      // -- and we have no host-format swizzle table. Until we do, identity is
-      // the correct behaviour for a snapshot and the recorded swizzle is a
-      // diagnostic only.
+      // -- and we have no host-format swizzle table.
       //
-      // The decoded-texture branch below is different and unaffected: it uploads
-      // guest bytes in guest channel order, so the guest swizzle applies raw.
+      // The decoded-texture branch below is unaffected: it uploads guest bytes
+      // in guest channel order, so the guest swizzle applies raw.
       continue;
     }
     // The other two ways a slot refuses. These used to increment a counter and
     // return with no line at all, which is a worse silence than the snapshot
     // case above: the bind is ALL-OR-NOTHING, so one unsatisfiable slot drops
     // the stage's whole table, and an aggregate "bind failed N" cannot say
-    // which shader, which slot, or which of the three reasons. Same bounded
-    // distinct-tuple shape as the snapshot line, so a steady state costs
-    // nothing.
+    // which shader, which slot, or which of the three reasons.
     const auto refused = [&](const char* why) {
       static std::unordered_set<std::string> s_refusedLinks;
       const std::string link = fmt::format(
@@ -371,39 +348,34 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
     }
   }
 
-  // SLOT CENSUS. The menu's deferred lighting shader declares three textures
-  // and its third sample returns (0,0,0,1) -- the exact pattern of a
-  // single-channel read of zero, or of a null descriptor. Which one it is
-  // cannot be told from a capture: RenderDoc reports the slot by NAME, so
-  // mapping slot to resource there means brute-forcing every resource in the
-  // frame. It is one line from this side, where both halves are in hand.
+  // SLOT CENSUS. The menu's deferred lighting shader declares three textures and
+  // its third sample returns (0,0,0,1) -- the exact pattern of a single-channel
+  // read of zero, or of a null descriptor. Which one it is cannot be told from a
+  // capture: RenderDoc reports the slot by NAME, so mapping slot to resource
+  // there means brute-forcing every resource in the frame. It is one line from
+  // this side, where both halves are in hand.
   //
-  // Once per shader handle, bounded, so it costs nothing after the first
-  // sighting of each. What it answers: whether the stage's sampler count agrees
-  // with what the shader declares, and for every slot, whether it came from a
-  // resolve snapshot or a CPU texture, and at what format and extent.
+  // Once per shader handle, bounded. What it answers: whether the stage's
+  // sampler count agrees with what the shader declares, and for every slot,
+  // whether it came from a resolve snapshot or a CPU texture, at what format and
+  // extent.
   //
   // Keyed on the handle of the stage BEING FILLED. It used to key on
   // `d.pixelShaderHandle` for both stages, which made it silent for exactly the
-  // draws that needed it: the terrain depth prepass runs the depth-only
-  // pixel stand-in and carries no pixel handle, so its VERTEX slot -- the
-  // heightmap the whole terrain's world Y comes from -- was censused zero
-  // times. That heightmap reads a constant 1.0 (measured in gameplay-8.rdc:
-  // every one of 4225 vertices solves back to world Y = 1.000 against a camera
-  // at Y = 616), and naming the resource actually bound is the one thing this
-  // side can answer that a capture cannot. Two separate caps so a flood of
-  // pixel shaders cannot starve the vertex ones.
+  // draws that needed it: the terrain depth prepass runs the depth-only pixel
+  // stand-in and carries no pixel handle, so its VERTEX slot -- the heightmap
+  // the whole terrain's world Y comes from -- was censused zero times. Two
+  // separate caps so a flood of pixel shaders cannot starve the vertex ones.
   const uint32_t censusHandle =
       vertex ? d.vertexShaderHandle : d.pixelShaderHandle;
   if (censusHandle) {
     static std::unordered_set<uint32_t> s_censusedPs, s_censusedVs;
     auto& censused = vertex ? s_censusedVs : s_censusedPs;
-    // 64 was a menu-sized cap and it SATURATED before a level's shaders
-    // ever bound: mx_1420 printed 68 census lines, all of them menu, and
-    // the terrain material -- the one under investigation -- was censused
-    // zero times. Same shape as measure-with-a-level-loaded. A run
-    // translates ~300 shaders, so 512 covers a level with headroom and
-    // still cannot run away.
+    // 64 was a menu-sized cap and it SATURATED before a level's shaders ever
+    // bound: one run printed 68 census lines, all of them menu, and the terrain
+    // material -- the one under investigation -- was censused zero times. A run
+    // translates ~300 shaders, so 512 covers a level with headroom and still
+    // cannot run away.
     if (censused.size() < 512 && censused.insert(censusHandle).second) {
       std::string slotDesc;
       for (uint32_t i = 0; i < stageSamplerCount && i < kTranslatedSamplerSlots;
@@ -433,11 +405,9 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
         // Every previous attempt to name this resource went through RenderDoc's
         // resource list, and twice picked the wrong one of two same-size
         // same-format candidates -- once an all-zero texture whose alpha of 0
-        // renders WHITE in the exporter, which is exactly the trap
-        // rdc-png-alpha-reads-as-white records. The guest address, the swizzle
-        // and the sampled value are all known from the two sides of this
-        // question; only the bytes in between were ever inferred. This closes
-        // that, and it is the last inference in the chain.
+        // renders WHITE in the exporter. The guest address, the swizzle and the
+        // sampled value are all known from the two sides of this question; only
+        // the bytes in between were ever inferred.
         //
         // Four texels spread across the base level, printed as raw bytes in
         // decoded order (BEFORE the SRV swizzle, which the census prints
@@ -463,8 +433,7 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
               // than left to be matched against a capture afterwards. The probe
               // bytes and the sampled value were previously measured in
               // DIFFERENT runs, which is not a comparison at all -- addresses
-              // and handles differ per run. Applying the slot's own swizzle to
-              // the slot's own bytes states the answer in one line.
+              // and handles differ per run.
               const uint32_t sx = (slots[i].swizzle >> 0) & 7u;
               if (sx >= 6u) probe += "->x:KEEP";
               else if (sx == 5u) probe += "->x:ONE";
@@ -523,7 +492,7 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
     // TEXTURE2D descriptor is undefined, not merely wrong-looking.
     //
     // The two can disagree -- the shader is translated from the microcode while
-    // the texture is decoded from the fetch constant, and a cube-sampling shader
+    // the texture is decoded from the fetch constant, so a cube-sampling shader
     // can be handed a plain 2D texture. That case is safe without a stand-in
     // resource: a one-slice array view over a DepthOrArraySize=1 resource is
     // legal, and D3D clamps the slice index, so every face reads slice 0. Wrong
@@ -543,12 +512,11 @@ bool D3D12Renderer::BindTranslatedTextures(const GameDraw& d,
     // Guest GPUSWIZZLE values are 0-3 = XYZW, 4 = constant 0, 5 = constant 1,
     // 7 = KEEP (fetch instructions only). D3D12_SHADER_COMPONENT_MAPPING defines
     // only 0-5, so 6 and 7 are undefined here and were being handed to the
-    // driver raw. Xenia sanitises them the same way, and says why:
+    // driver raw. Xenia sanitises them the same way and says why:
     //
     //   // Get rid of 6 and 7 values (to prevent host GPU errors if the game has
     //   // something broken) the simple way - by changing them to 4 (0) and 5 (1).
     //   host_swizzle_component = guest_swizzle_component & 0b101;
-    //       -- texture_cache.cc, TextureCache::GuestToHostSwizzle
     //
     // `& 5` maps 6 -> 4 and 7 -> 5 and leaves 0-5 alone. Note what that means
     // for a KEEP component: it becomes a forced 1.0, on Xenia as much as here.
@@ -591,6 +559,7 @@ bool D3D12Renderer::BindTranslatedSamplers(const GameDraw& d,
   // repeat slot 0, matching how BindTranslatedTextures fills the SRV table --
   // the range covers all sixteen whether or not the shader samples them, so
   // every one needs a defined descriptor.
+  //
   // The variants ARE the key. They used to be packed a few bits each into a
   // uint64_t, which ran out at five bits across sixteen slots.
   std::array<uint8_t, kSamplerBlockSlots> key{};
@@ -603,13 +572,13 @@ bool D3D12Renderer::BindTranslatedSamplers(const GameDraw& d,
     // -- ResolvePixelSlotTexture reads that fetch constant for the swizzle --
     // and the first half is true only for a full-screen post-process copy.
     //
-    // The terrain ATLAS comes through here too, and it is sampled with computed
-    // UVs that both wrap and MINIFY, so both halves of the hardcode hurt it:
+    // The terrain ATLAS comes through here too, sampled with computed UVs that
+    // both wrap and MINIFY, so both halves of the hardcode hurt it:
     //
     //   clamp   tile index 10 gives U = 1.283, pinned to the right edge, which
     //           read an empty tile -- the black ground.
     //   point   nearest-neighbour on a minified 2048x2048 atlas -- the hard
-    //           corduroy aliasing across every dune in ground-tiles-2.rdc.
+    //           corduroy aliasing across every dune.
     //
     // Both now come from the guest's own fetch constant, packed into the top
     // bits of the swizzle word: 12 clamp U, 13 clamp V, 14 point filter. For a

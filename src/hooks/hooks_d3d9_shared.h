@@ -5,11 +5,9 @@
 //
 // This surface is deliberately small in the part that matters. The file holds
 // 224 mutable globals, and a naive split published NINETEEN of them here.
-// Grouping the families that cross this boundary into five structs first
-// brought that to six objects. Types, functions and constants in a header are
-// ordinary; loose mutable globals are the smell, and six is the number to watch.
-//
-// Anything used by only one side does not belong here.
+// Grouping the families that cross this boundary into five structs first brought
+// that to six objects. Types, functions and constants in a header are ordinary;
+// loose mutable globals are the smell, and six is the number to watch.
 
 #pragma once
 
@@ -53,14 +51,14 @@ namespace xn = rex::graphics::xenos;
 
 // Why PrepareBinkPlanes refused. Every one of these used to be a bare
 // `return false` -- no counter, no log -- so a run in which the composite never
-// happened looked identical to one in which it was never asked for. Measured
-// 2026-08-17: 54,000 calls, 0 successes, and not one line to say which of the
-// five walls they hit.
+// happened looked identical to one in which it was never asked for. Measured:
+// 54,000 calls, 0 successes, and not one line to say which of the five walls
+// they hit.
 //
-// `no_fetch` is the one to read first: it is the only refusal that does not
-// come from the texture itself but from the DEVICE's live fetch registers,
-// which is a different source from the DeviceState texture bindings a draw
-// probe prints. Those two agreeing was assumed once and never checked.
+// `no_fetch` is the one to read first: it is the only refusal that does not come
+// from the texture itself but from the DEVICE's live fetch registers, a
+// different source from the DeviceState texture bindings a draw probe prints.
+// Those two agreeing was assumed once and never checked.
 struct BinkPlaneRefusals {
   uint64_t calls = 0;
   uint64_t ok = 0;
@@ -106,8 +104,8 @@ struct TexDecodeSite {
 // rather than a few kilobytes of text each.
 //
 // Defined here rather than beside the emitter probe that fills it because
-// ApplyShaderOutputs — which is further up the file — now reads the vertex
-// stage's input_mask to build the GPU vertex layout.
+// ApplyShaderOutputs -- further up the file -- now reads the vertex stage's
+// input_mask to build the GPU vertex layout.
 struct TranslatedShader {
   std::shared_ptr<const std::string> source;  // null unless emitted AND compiled
   uint32_t input_mask = 0;
@@ -125,12 +123,12 @@ struct TranslatedShader {
   // source itself, which is the pre-cache behaviour.
   std::shared_ptr<const std::vector<uint8_t>> dxbc;
 
-  // The same vertex shader emitted a second way: performing its own vfetches
-  // out of the raw guest vertex buffer, indexed by SV_VertexID. Null when that
+  // The same vertex shader emitted a second way: performing its own vfetches out
+  // of the raw guest vertex buffer, indexed by SV_VertexID. Null when that
   // variant refused or did not compile, in which case the draw stays on the CPU
   // vertex path and `source` above is what runs.
   //
-  // Both are kept because they are not interchangeable — the fetch variant has
+  // Both are kept because they are not interchangeable -- the fetch variant has
   // an empty input layout and needs xe_vf[], the other needs an input layout
   // built from input_mask.
   std::shared_ptr<const std::string> fetch_source;
@@ -150,29 +148,21 @@ struct TranslatedShader {
   std::shared_ptr<const std::vector<uint8_t>> fetch_dxbc;
 };
 
-// INSIDE the texture bucket. The note above says a finer breakdown is worth
-// having only once one bucket is known to dominate -- it now is: texture runs
-// 156-182ms against 29-35ms for the whole vertex path, about 80% of a steady
-// frame, and 215us per draw is far more than a cache hit should ever cost.
+// INSIDE the texture bucket. A finer breakdown is worth having only once one
+// bucket is known to dominate -- it now is: texture runs 156-182ms against
+// 29-35ms for the whole vertex path, about 80% of a steady frame, and 215us per
+// draw is far more than a cache hit should cost.
 //
 // Split so the answer cannot be argued: a hit that is expensive points at the
-// staleness fingerprint, and a miss that is expensive points at copy + decode.
-// The two have completely different fixes, and guessing between them is how the
-// page-probe theory ate a measurement before the existing VirtualQuery counter
-// disproved it in one line.
+// staleness fingerprint, a miss that is expensive points at copy + decode. The
+// two have completely different fixes.
 //
-// `scan` is the pair of whole-buffer passes that follow every decode
-// (HleTextureHasNonzeroData, then HleTextureIsConstant). Counted separately
-// from the decode because they are OURS, not the guest's, and a 2048x2048 BC1
-// gets walked twice by them on top of being untiled.
+// `scan` is the pair of whole-buffer passes that follow every decode. Counted
+// separately from the decode because they are OURS, not the guest's, and a
+// 2048x2048 BC1 gets walked twice by them on top of being untiled.
+//
 // Grouped into one object rather than eleven loose globals, so that splitting
-// this file publishes ONE symbol instead of eleven. Nothing else changes: the
-// fields keep their meanings and their values, only the spelling of a reference
-// moves from `g_tex.decodeUs` to `g_tex.decodeUs`.
-//
-// g_tex.phaseUs joined as `phaseUs`. It is the texture bucket of the frame
-// cost and the only phase timer the texture code touches, so leaving it behind
-// would have meant publishing a second symbol for one counter.
+// this file publishes ONE symbol instead of eleven.
 struct TextureStats {
   uint64_t describeUs = 0, staleUs = 0, copyUs = 0;
   uint64_t decodeUs = 0, scanUs = 0;

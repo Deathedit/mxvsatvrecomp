@@ -25,14 +25,14 @@ struct Check {
   // A FIXED TOLERANCE DOES NOT WORK, and shipping one proved it inside an hour:
   // the d3d9 report pass runs ~3x a second and the frame pass every ~4 seconds,
   // so the frame check updates once per ~12 cycles and a 4-cycle rule reported
-  // it permanently STALE. That is a false alarm in the one mechanism whose
-  // entire job is to be believed, which is worse than not having it.
+  // it permanently STALE. A false alarm in the one mechanism whose entire job is
+  // to be believed is worse than not having it.
   //
   // So each check calibrates itself: `max_gap` is the largest interval it has
   // ever been seen to take, and staleness is a multiple of that. The maximum
   // only ever grows, so the bound only ever loosens -- it cannot start crying
-  // wolf because one pass ran late, and it still catches a site that has
-  // stopped entirely, just later.
+  // wolf because one pass ran late, and it still catches a site that has stopped
+  // entirely, just later.
   uint64_t updates = 0;      // how many times it has reported
   uint64_t max_gap = 0;      // widest observed cycle gap between updates
 };
@@ -51,22 +51,18 @@ std::map<std::string, Check>& Checks() {
 
 uint64_t g_cycle = 0;
 
-// EVERY CHECK THIS BUILD CONTAINS. This array is the DENOMINATOR, and it is the
-// reason it exists: a check only appeared in the report once it had been
-// evaluated, so one that never ran was ABSENT rather than unmeasured -- exactly
-// the "a zero you never took is not a healthy zero" failure this module was
-// written to stop, committed inside the module.
+// EVERY CHECK THIS BUILD CONTAINS. This array is the DENOMINATOR, and that is
+// why it exists: a check only appeared in the report once it had been evaluated,
+// so one that never ran was ABSENT rather than unmeasured -- exactly the "a zero
+// you never took is not a healthy zero" failure this module was written to stop,
+// committed inside the module.
 //
-// It was not hypothetical. Run mx_1900 printed "(of 11)" against twelve wired
-// checks: gpu_fetch.address_mismatch sits behind the g_diag gate and needs 400
-// qualifying draws, so its self-check line never printed and the check silently
-// did not exist. Nothing in the report could have said so.
+// Not hypothetical: one run printed "(of 11)" against twelve wired checks,
+// because gpu_fetch.address_mismatch sits behind the g_diag gate and needs 400
+// qualifying draws, so it silently did not exist.
 //
 // Report() now materialises every name below, so a check that never ran is
-// listed as UNMEASURED and NAMED. Adding a check means adding its name here;
-// forgetting to costs nothing but the guarantee, and a name here that no call
-// site ever updates is reported as unmeasured forever, which is the correct
-// answer for a check that is compiled in and never reached.
+// listed as UNMEASURED and NAMED. Adding a check means adding its name here.
 constexpr const char* kDeclared[] = {
     "decl.addr_reused",
     "decl.layout_refused",
@@ -93,9 +89,8 @@ std::vector<std::string>& NewlyBad() {
 //
 // A SEPARATE FILE BECAUSE THE MAIN LOG ROTATES. logs/mx_NNNN.log holds only the
 // last ~30 seconds and its segments are overwritten while a run is still going
-// -- three empty greps over a rotated segment nearly became a false theory
-// once. Findings have to outlive the window they were found in, so they go
-// somewhere nothing overwrites for the life of the process.
+// -- three empty greps over a rotated segment nearly became a false theory once.
+// Findings have to outlive the window they were found in.
 std::ofstream& File() {
   static std::ofstream f = [] {
     // Overridable so the unit test cannot truncate a real run's findings just
@@ -221,17 +216,15 @@ std::string Report() {
   std::lock_guard<std::mutex> lock(Mu());
   // OPEN THE FILE EVEN IF NOTHING IS WRONG.
   //
-  // File() is a static local, so it used to be created on the first BAD -- and
-  // a run with no BAD never opened it at all, which left the PREVIOUS run's
+  // File() is a static local, so it used to be created on the first BAD -- and a
+  // run with no BAD never opened it at all, which left the PREVIOUS run's
   // failures sitting in logs/health.txt with the previous run's timestamp,
-  // reading as current. Run mx_1908 was the first clean run and it inherited
-  // mx_1907's line verbatim.
+  // reading as current. The first clean run inherited its predecessor's line
+  // verbatim.
   //
-  // That is stale data reading as live, in the one file whose job is to say
-  // what went wrong -- the same shape of defect as a zero that was never
-  // measured reading as healthy, and it was committed here twice over. Opening
-  // on the first report makes a clean run leave a header and nothing else,
-  // which is what the header already promises.
+  // That is stale data reading as live, in the one file whose job is to say what
+  // went wrong. Opening on the first report makes a clean run leave a header and
+  // nothing else.
   (void)File();
   // Materialise the full set first, so the total is structural rather than
   // "whatever happened to run". A name inserted here and never updated keeps
@@ -242,19 +235,17 @@ std::string Report() {
   std::string bad_list, unmeasured_list, stale_list;
 
   for (auto& [name, c] : Checks()) {
-    // A check that has stopped updating is not answering any more. Reporting
-    // its last verdict would be reporting a measurement no longer being taken,
-    // which is the same defect as a counter that cannot fire -- so it is
-    // called out rather than repeated.
+    // A check that has stopped updating is not answering any more. Reporting its
+    // last verdict would be reporting a measurement no longer being taken, which
+    // is the same defect as a counter that cannot fire.
     //
     // The bound is the check's OWN measured cadence, not a constant -- see the
-    // note on Check::max_gap for why a constant cannot work here.
+    // note on Check::max_gap.
     //
     // A check is never called stale until it has reported at least twice,
-    // because until then there is no cadence to compare against and every
-    // slow check would be stale during warm-up. "Not enough information yet"
-    // is not a finding, and reporting it as one is the same error as reading a
-    // zero out of zero as healthy.
+    // because until then there is no cadence to compare against and every slow
+    // check would be stale during warm-up. "Not enough information yet" is not a
+    // finding.
     constexpr uint64_t kStaleSlack = 4;
     const uint64_t tolerance = 2 * c.max_gap + kStaleSlack;
     const bool fresh =

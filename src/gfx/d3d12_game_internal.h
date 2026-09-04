@@ -2,14 +2,12 @@
 //
 // These five functions and two counters used to sit in an anonymous namespace in
 // d3d12_game.cpp. Splitting that file put their definitions and their callers in
-// different TUs, and internal linkage does not cross a TU -- HrText is called
-// from the resource file, SrvFormatForResource from both the bind and resource
-// files, ToD3D12Blend from the PSO code. So they are declared here and defined,
-// once, in d3d12_game.cpp.
+// different TUs, and internal linkage does not cross a TU. So they are declared
+// here and defined, once, in d3d12_game.cpp.
 //
-// This is the ONLY linkage change the d3d12_game split required; everything else
-// moved verbatim. Checked before making it: none of these seven names appears
-// anywhere else in src/, so giving them external linkage collides with nothing.
+// This is the ONLY linkage change the split required; everything else moved
+// verbatim. Checked before making it: none of these seven names appears anywhere
+// else in src/.
 
 #pragma once
 

@@ -1,17 +1,16 @@
 #pragma once
 
-// Decodes Xenos vertex shader microcode far enough to recover the vertex
-// layout: which fetch slot each attribute comes from, at what offset, in what
-// format, and — the reason this exists — the real stride.
+// Decodes Xenos vertex shader microcode far enough to recover the vertex layout:
+// which fetch slot each attribute comes from, at what offset, in what format,
+// and -- the reason this exists -- the real stride.
 //
-// Until now the stride was inferred by dividing the vertex buffer size by the
+// The stride used to be inferred by dividing the vertex buffer size by the
 // vertex count and accepting exact divisions in 8..64, because the vertex fetch
-// constant does not carry it. That guess is why only stride-28 draws are drawn
-// and ~230 draws per frame are skipped. The shader has always carried the
-// answer; the microcode arrives inline in the PM4 ring as IM_LOAD_IMMEDIATE
-// (0x2B), 68 per frame.
+// constant does not carry it. That guess is why only stride-28 draws were drawn
+// and ~230 draws per frame were skipped. The shader has always carried the
+// answer.
 //
-// This header deliberately includes no SDK header — it exposes plain data, so a
+// This header deliberately includes no SDK header -- it exposes plain data, so a
 // test can include it without the SDK on its path. The bit layouts live in
 // shader_ucode.cpp, which uses the SDK's own structs rather than hand-rolled
 // shifts; their static_assert_size means a packing disagreement fails the build
@@ -65,26 +64,25 @@ struct PixelTextureBinding {
   bool unnormalized = false;
 };
 
-// Walk the executable clauses of a pixel shader and enumerate every 2D
-// texture fetch in program order. This is the evidence/diagnostic decoder: it
-// does not impose the renderer's current one-texture limit. Relative fetches
-// still reject the blob because their sampler/coordinate linkage cannot be
-// represented by PixelTextureBinding without guessing.
+// Walk the executable clauses of a pixel shader and enumerate every 2D texture
+// fetch in program order. This is the evidence/diagnostic decoder: it does not
+// impose the renderer's current one-texture limit. Relative fetches still reject
+// the blob because their sampler/coordinate linkage cannot be represented
+// without guessing.
 //
 // A non-2D fetch is SKIPPED, not fatal. It used to reject the whole blob, which
-// threw away every 2D binding already decoded: measured in run 1439, 34 of the
-// 35 shaders refused for a non-2D fetch had decoded 3 to 7 good 2D fetches
-// first, and one cube refusal discarded 15. Those shaders are ordinary 2D
-// material shaders carrying one extra fetch of another kind, and losing all of
-// their textures over it is far worse than losing the one we cannot represent.
-// `skipped_out`, if given, receives how many were passed over. When anything
-// was skipped, *fail carries the skipped kind EVEN ON SUCCESS -- it reads as a
-// diagnostic note there, not a failure, and callers test the return value.
+// threw away every 2D binding already decoded: 34 of the 35 shaders refused for
+// a non-2D fetch had decoded 3 to 7 good 2D fetches first, and one cube refusal
+// discarded 15. Those are ordinary 2D material shaders carrying one extra fetch
+// of another kind.
+//
+// `skipped_out`, if given, receives how many were passed over. When anything was
+// skipped, *fail carries the skipped kind EVEN ON SUCCESS -- a diagnostic note
+// there, not a failure, and callers test the return value.
 //
 // Appends to `out` (does not clear it). Returns false only when NO 2D fetch
-// survives, and sets *fail to a static reason string -- naming the skipped kind
-// when that is why nothing survived, so "the fetches were all cube" stays
-// distinguishable from "there were no fetches".
+// survives, naming the skipped kind when that is why nothing survived, so "the
+// fetches were all cube" stays distinguishable from "there were no fetches".
 bool DecodePixelTextureFetches(const uint32_t* dwords, uint32_t dword_count,
                                std::vector<PixelTextureBinding>& out,
                                const char** fail = nullptr,
@@ -106,15 +104,13 @@ inline constexpr uint32_t kPositionExportRegister = 62;
 // fetch, in program order. Appends to `out` (does not clear it).
 //
 // Also tracks, through the shader's ALU instructions, which fetched attributes
-// reach the position export — setting `feeds_position` on those. If
+// reach the position export -- setting `feeds_position` on those. If
 // `out_saw_position_export` is non-null it receives whether an export to
 // register 62 was seen at all, which distinguishes "the shader exports a
-// position that no fetch feeds" (computed from constants) from "this blob has
-// no position export" (not a vertex shader, or decode stopped early).
+// position that no fetch feeds" from "this blob has no position export".
 //
 // Returns false and sets *fail to a static reason string on a malformed blob.
 // Never throws, never loops unbounded, never reads outside [dwords, +count).
-// `fail` and `out_saw_position_export` may be null.
 bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
                                std::vector<VertexAttribute>& out,
                                const char** fail,
@@ -123,9 +119,9 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
 // Exact vertex-shader identity comparison across the two representations D3D9
 // creates: an unpatched template and the PM4-ready copy after
 // PatchVertexShaderToMatchVertexDeclaration. Control flow, ALU instructions and
-// every non-patched vfetch bit must agree. Only fields proven to be rewritten
-// by that D3D9 routine (fetch slot/coalescing, format/number interpretation,
-// swizzle, offset and stride) are ignored. Returns false for malformed code.
+// every non-patched vfetch bit must agree. Only fields proven to be rewritten by
+// that D3D9 routine (fetch slot/coalescing, format/number interpretation,
+// swizzle, offset and stride) are ignored.
 struct VertexShaderStructureStats {
   uint32_t equal_dwords = 0;       // after masking proven patch fields
   uint32_t fetch_mismatches = 0;   // retained bits differ in a vfetch
@@ -152,42 +148,36 @@ float HalfToFloat(uint16_t h);
 //
 // The mode is applied literally, and the format is deliberately not consulted.
 // Reversing all four bytes of a dword that holds *two* 16-bit components does
-// byte-swap each component **and exchange the pair** — but that exchange is the
-// hardware's real behaviour, not a defect, and the shader compiler already
-// compensates for it in the vfetch destination swizzle.
+// byte-swap each component **and exchange the pair** -- but that exchange is the
+// hardware's real behaviour, and the shader compiler already compensates for it
+// in the vfetch destination swizzle.
 //
 // This once narrowed the unit to 2 for the 16-bit formats to suppress the
-// exchange. That was wrong, and cost several rounds. The narrowing was derived
-// from staring at the decoded attribute — which does read (y, x, 1, z) for a
-// (x, y, z, 1) position — without following it through the swizzle that comes
-// next. What settles it is the swizzle each format actually carries, counted
-// over a front-end run:
+// exchange. That was wrong, and cost several rounds. What settles it is the
+// swizzle each format actually carries, counted over a front-end run:
 //
 //   16-bit units:  fmt 32 -> 0x4C1 (x935), fmt 26 -> 0x4C1, fmt 31 -> 0xFC1
 //                  (x913). All pairwise exchanges.
 //   32-bit units:  fmt 37 -> 0xB08 (x2322), fmt 7 -> 0xE88 (x1718),
 //                  fmt 57 -> 0xA88, fmt 38 -> 0x688. All identity.
 //
-// 1851 fetches, no exceptions: every 16-bit format asks for the pair to be
-// exchanged back, and no 32-bit format does. The compiler emits that permutation
-// for one reason. Suppress the swap and the swizzle scrambles good data instead
-// of restoring it — which is what put the homogeneous 1 in slot z and left the
-// model matrix's w row reading the model-space z.
+// 1851 fetches, no exceptions. Suppress the swap and the swizzle scrambles good
+// data instead of restoring it -- which is what put the homogeneous 1 in slot z.
 //
-// Applied per attribute rather than once over the vertex only because the read
-// works on one attribute at a time; the width no longer depends on the format.
+// Applied per attribute only because the read works on one attribute at a time;
+// the width no longer depends on the format.
 void ApplyFetchEndianFor(uint8_t* data, size_t bytes, uint32_t endian);
 
 // How a format's raw bits are interpreted. The layout of a format says how many
 // bits each component gets; this says what they mean, and the two are
-// independent — k_8_8_8_8 is D3DCOLOR under kUnorm and a bone index under
+// independent -- k_8_8_8_8 is D3DCOLOR under kUnorm and a bone index under
 // kUint, with identical bits.
 //
 // On the PM4 path this is not selectable: a vfetch does carry the two bits, but
 // ReadVertexAttribute was written before they were decoded and hardcodes one
 // choice per format. The D3D9 path does have them, from the declaration's Type
-// dword, and losing that distinction is exactly the failure the HLE route
-// exists to avoid.
+// dword, and losing that distinction is exactly the failure the HLE route exists
+// to avoid.
 enum class NumFormat : uint8_t {
   kUnorm = 0,   // and every float format, where it does not apply
   kSnorm,
@@ -198,10 +188,9 @@ enum class NumFormat : uint8_t {
 // Decode one attribute of one vertex to up to 4 floats. `vertex_base` points at
 // the start of the vertex **in guest byte order**; `endian` is the fetch
 // constant's swap mode and is applied here, at the format's own unit width,
-// because only here is the format known. Pass 0 for bytes already in host
-// order. Unwritten components are left as (0,0,0,1). Returns false for a format
-// not handled, leaving `out` untouched, so callers can count the gap instead of
-// rendering a guess.
+// because only here is the format known. Pass 0 for bytes already in host order.
+// Unwritten components are left as (0,0,0,1). Returns false for a format not
+// handled, leaving `out` untouched, so callers can count the gap.
 bool ReadVertexAttributeAs(const uint8_t* vertex_base, uint32_t vertex_bytes,
                            uint32_t format, uint32_t offset_bytes,
                            uint32_t size_bytes, NumFormat num, uint32_t endian,
@@ -213,19 +202,15 @@ bool ReadVertexAttribute(const uint8_t* vertex_base, uint32_t vertex_bytes,
                          const VertexAttribute& attr, uint32_t endian,
                          float out[4]);
 
-// Pick the position attribute. Prefers an attribute the decoder proved feeds
-// the position export; falls back, only when none does, to the old guess — the
+// Pick the position attribute. Prefers an attribute the decoder proved feeds the
+// position export; falls back, only when none does, to the old guess -- the
 // lowest-offset attribute carrying at least two components in a format that
-// could hold coordinates. Returns null if nothing qualifies.
+// could hold coordinates. `out_from_export`, if non-null, receives which of the
+// two answered, so callers can gate on the difference.
 //
-// If `out_from_export` is non-null it receives whether the answer came from the
-// shader or from the fallback guess, so callers can gate on the difference
-// rather than trusting both equally.
-//
-// Explicitly NOT by destination register alone — both ground-truth shaders put
+// Explicitly NOT by destination register alone -- both ground-truth shaders put
 // position in dest_reg 1 and the second attribute in dest_reg 0, so keying on
-// dest_reg 0 would pick colour every time. The export trace is what says *which*
-// register the position is in.
+// dest_reg 0 would pick colour every time.
 const VertexAttribute* PickPositionAttribute(
     const std::vector<VertexAttribute>& attrs,
     bool* out_from_export = nullptr);

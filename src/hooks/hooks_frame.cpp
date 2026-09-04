@@ -2,24 +2,23 @@
 //
 // VdSwap is the interesting one: it is the frame boundary. The guest's PM4
 // command ring is still parsed and applied to the Xenos register shadow here,
-// but purely as diagnostics — the translation to draw calls is gone, and the
-// frame's draws now come from the D3D9 HLE path. The rest are the guest's
-// Begin/End frame entry points. Those used to be stubbed out natively because
-// "there is no Xenos GPU behind them"; that predates the D3D9 HLE layer and
-// four of the five were unhooked on 2026-08-16 — see the GPU-call-stubs block
-// below. Only the frame-pending poll still returns a fabricated value.
+// but purely as diagnostics -- the translation to draw calls is gone, and the
+// frame's draws come from the D3D9 HLE path. The rest are the guest's Begin/End
+// frame entry points, four of which were unhooked once the D3D9 HLE layer made
+// "there is no Xenos GPU behind them" false; only the frame-pending poll still
+// returns a fabricated value.
 //
 // Two ranges, and the distinction matters more than anything else in this file:
 //
-//   frame range  [prev_after, write_before)  — everything the guest wrote since
-//                                              the last swap. This is the frame.
-//   swap range   [write_before, write_after) — what VdSwap itself emits.
+//   frame range  [prev_after, write_before)  -- everything the guest wrote since
+//                                               the last swap. This is the frame.
+//   swap range   [write_before, write_after) -- what VdSwap itself emits.
 //
-// Until 2026-08-02 only the swap range was parsed, so every "zero DRAW_*"
-// result in this effort was measured over a present sequence: DISPLAY_TIMING,
-// DISP_TG_CTL, EVENT_WRITE_SHD, and a SET_LOOP_CONST whose first data word is
-// 0x53574150 — ASCII "SWAP". A draw could not have appeared there. The frame
-// range ran ~11552 bytes per frame at boot and was never looked at.
+// Only the swap range used to be parsed, so every "zero DRAW_*" result in this
+// effort was measured over a present sequence: DISPLAY_TIMING, DISP_TG_CTL,
+// EVENT_WRITE_SHD, and a SET_LOOP_CONST whose first data word is ASCII "SWAP".
+// A draw could not have appeared there. The frame range ran ~11552 bytes per
+// frame at boot and was never looked at.
 
 #include <filesystem>
 #include <system_error>
@@ -46,14 +45,13 @@
 #include "gpu/xenos_gpu_state.h"
 
 //=============================================================================
-// sub_82566B58 — D3D9's swap, NOT VdSwap itself
+// sub_82566B58 -- D3D9's swap, NOT VdSwap itself
 //
-// The kernel VdSwap is the import thunk at 0x82CE9F98 and is already named by
-// the recompiler as __imp__VdSwap. sub_82566B58 *calls* it: the call site
-// returns to 0x82566E1C, and the next function after 0x82566B58 is 0x825671E0,
-// so it is inside this body. D3D9 is statically linked into the XEX and nothing
-// but D3D9's present path calls VdSwap, which makes this a confirmed anchor
-// inside the D3D9 library block — see the D3D9 note in AGENTS.md.
+// The kernel VdSwap is the import thunk at 0x82CE9F98, already named by the
+// recompiler. sub_82566B58 *calls* it: the call site returns to 0x82566E1C and
+// the next function after 0x82566B58 is 0x825671E0, so it is inside this body.
+// D3D9 is statically linked into the XEX and nothing but its present path calls
+// VdSwap, which makes this a confirmed anchor inside the D3D9 library block.
 //
 // Hooking here is still right: it is the frame boundary with the ring buffer
 // state we need. Only the name was wrong.
@@ -62,11 +60,10 @@
 namespace {
 
 // logs/pm4dump, emptied once per process before the first dump of the run.
-// Mirrors EnsureHlslDumpDir in hooks_d3d9.cpp, and for the same reason: these
-// filenames are (tag, swap_count) and repeat every run, so a short run leaves
-// the high frame numbers of a longer earlier run sitting in the directory,
-// where they read as belonging to the current one. Cleared lazily at the first
-// dump so a run that dumps nothing leaves the previous run's files readable.
+// Mirrors EnsureHlslDumpDir, and for the same reason: these filenames are
+// (tag, swap_count) and repeat every run, so a short run leaves the high frame
+// numbers of a longer earlier run sitting in the directory, where they read as
+// belonging to the current one.
 void EnsurePm4DumpDir() {
   static const bool s_cleared = [] {
     std::error_code ec;
@@ -123,59 +120,45 @@ struct SwapTimer {
 
 // FRAME PACING -- the console's swap blocks on vsync and ours never did.
 //
-// On hardware sub_82566B58 calls VdSwap, which does not return until the
-// scanout flips. The whole title is written against that: its script threads,
-// UI transitions and timers all advance once per swap, and the fastest that
-// can ever happen on a 360 is 60 Hz. We present with sync interval 0, so the
-// guest free-runs at whatever the host can manage.
+// On hardware sub_82566B58 calls VdSwap, which does not return until the scanout
+// flips. The whole title is written against that: its script threads, UI
+// transitions and timers all advance once per swap, and the fastest that can
+// ever happen on a 360 is 60 Hz. We present with sync interval 0, so the guest
+// free-runs at whatever the host can manage.
 //
-// MEASURED 2026-08-28 on the user's main PC: the legal screen runs at
-// **400+ fps**, against 100 fps in the dev VM and 60 on the console. So the
-// guest's frame-driven logic is advancing nearly SEVEN TIMES faster than any
-// hardware it was ever tested on, and it crashes there "randomly" while the
-// slower VM mostly survives. This project has already lost one crash to
-// exactly that shape -- 0x8234CE20 was a race the guest script thread lost by
-// 0.9s when our shader compilation stalled it, and the note on it warns the
-// race "will resurface on any machine or build whose startup timing shifts".
-// A 4x faster machine is a timing shift.
+// MEASURED on the user's main PC: the legal screen runs at **400+ fps**, against
+// 100 in the dev VM and 60 on the console. So the guest's frame-driven logic
+// advances nearly SEVEN TIMES faster than any hardware it was tested on, and it
+// crashes there "randomly" while the slower VM mostly survives. This project has
+// already lost one crash to exactly that shape -- 0x8234CE20 was a race the
+// guest script thread lost by 0.9s when our shader compilation stalled it.
 //
-// So this is not a frame-rate limiter for comfort. It is the missing half of
-// the swap's semantics, and running without it puts the guest in a state the
-// title never had to work in.
+// So this is not a frame-rate limiter for comfort. It is the missing half of the
+// swap's semantics.
 //
 // NOT VSYNC. Present's sync interval would pace to the MONITOR -- 144 Hz still
 // runs the guest 2.4x too fast, and the rate would depend on whose desktop it
-// is. This paces the guest's own swap to a fixed period instead, so the number
-// is the same everywhere.
+// is. This paces the guest's own swap to a fixed period instead.
 //
-// Set to 0 to restore the old free-running behaviour. 60 is the ceiling rather
-// than a target: a frame that takes longer is simply not delayed, and no
-// attempt is made to catch up by running a burst afterwards, because a burst
-// of uncapped frames is the exact condition being avoided.
-// Frames between the per-swap diagnostic lines -- FRAME DRAWS, UNBUILT WHY,
-// UNBUILT SKIPS BY REASON, RING vs HLE and ALU LOAD.
+// 60 is a ceiling rather than a target: a frame that takes longer is simply not
+// delayed, and no attempt is made to catch up afterwards, because a burst of
+// uncapped frames is the exact condition being avoided.
 //
-// Measured over run mx_1784: 0.894 KB a frame between them, printed once per
-// swap, 15% of the log. They are the last unthrottled reports of their size.
+// d3d9_diag_frame_every is frames between the per-swap diagnostic lines -- FRAME
+// DRAWS, UNBUILT WHY, UNBUILT SKIPS BY REASON, RING vs HLE and ALU LOAD. They
+// were 0.894 KB a frame, printed once per swap, 15% of the log.
 //
-// NOTHING IS LOST TO THE SAMPLING, and that is the whole design. FRAME DRAWS
-// and RING vs HLE carry PER-FRAME DELTAS, so a plain modulus would silently
-// drop the draws in every skipped frame. Instead the deltas ACCUMULATE across
-// the interval and the line reports the sum with the frame span it covers: 30
-// frames' worth on one line rather than one frame's worth on every thirtieth.
-// The cumulative reports (UNBUILT, ALU LOAD) are totals and lose nothing to
-// cadence by construction.
+// NOTHING IS LOST TO THE SAMPLING, and that is the whole design. FRAME DRAWS and
+// RING vs HLE carry PER-FRAME DELTAS, so a plain modulus would silently drop the
+// draws in every skipped frame. Instead the deltas ACCUMULATE across the
+// interval and the line reports the sum with the frame span it covers.
 //
-// READ THIS BEFORE LOWERING IT TO A PLAIN MODULUS. FRAME DRAWS has been gated
-// or modulus-sampled before and gave a WRONG ANSWER every time: a native run
-// ending at 424 swaps logged only #1..#3 while a plugin run reaching 760
-// logged #600, which reads as a divergence in the guest's frame lifecycle and
-// was purely the modulus. Two things keep that from returning -- the first
-// five swaps always print, so the start of a run is never a gap, and every
-// throttled line NAMES its interval and frame span, so a reader can never
-// mistake sampling for stopping.
-//
-// 0 or 1 = every swap, the old behaviour.
+// READ THIS BEFORE LOWERING IT TO A PLAIN MODULUS. FRAME DRAWS has been gated or
+// modulus-sampled before and gave a WRONG ANSWER every time: a native run ending
+// at 424 swaps logged only #1..#3 while a plugin run reaching 760 logged #600,
+// which reads as a divergence in the guest's frame lifecycle and was purely the
+// modulus. Two things keep that from returning -- the first five swaps always
+// print, and every throttled line NAMES its interval and frame span.
 REXCVAR_DEFINE_INT32(d3d9_diag_frame_every, 30, "Debug",
                      "Frames between the per-swap diagnostic lines. Per-frame "
                      "deltas accumulate across the gap rather than being "
@@ -254,12 +237,11 @@ extern "C" REX_FUNC(sub_82566B58) {
     s_last = now;
   }
 
-  // FRAME DRAWS. One line per swap, in BOTH modes, from the same counter
-  // family: guest entry calls, HLE draws ACCEPTED into the frame list, and HLE
-  // draws REFUSED.
+  // FRAME DRAWS. One line per swap, in BOTH modes: guest entry calls, HLE draws
+  // ACCEPTED into the frame list, and HLE draws REFUSED.
   //
   // This is the measurement that decides where the missing menu backdrop lives.
-  // mxmenu.rdc established the backdrop is not a draw we shade wrongly -- no 2D
+  // A capture established the backdrop is not a draw we shade wrongly -- no 2D
   // draw touches a backdrop pixel at all -- so the question is whether the guest
   // ever submits it:
   //
@@ -272,17 +254,12 @@ extern "C" REX_FUNC(sub_82566B58) {
   // `accepted` is counted in FinishHleDraw, the point a built draw joins the
   // frame's draw list. The first cut used the DEFERRED queue instead and
   // reported `queued 0` on a native run whose capture holds 340 host draws --
-  // that queue only carries draws with no shader code yet, waiting on this
-  // frame's PM4 packets, and is legitimately zero on a normal frame.
+  // that queue only carries draws with no shader code yet.
   //
-  // Printed EVERY swap and never sampled. Every previous attempt at this number
-  // was gated or modulus-sampled and gave a wrong answer -- a native run ending
-  // at 424 swaps logged only #1..#3 while a plugin run reaching 760 logged #600,
-  // which reads as a divergence in the guest's frame lifecycle and is purely the
-  // modulus. VdSwap is the one signal that ticks once per present in both modes.
-  //
-  // The tag is `native`/`plugin`, so the two runs are told apart by the line
-  // itself rather than by remembering which log is which.
+  // Printed EVERY swap and never sampled: every previous attempt at this number
+  // was gated or modulus-sampled and gave a wrong answer. VdSwap is the one
+  // signal that ticks once per present in both modes. The tag is
+  // `native`/`plugin`, so the two runs are told apart by the line itself.
   {
     // The deltas are taken EVERY swap and held; only the printing is sampled.
     // Summing them across the interval is what makes the cadence lossless --
@@ -347,9 +324,8 @@ extern "C" REX_FUNC(sub_82566B58) {
   // Glyph cache, on a fixed swap cadence. Deliberately NOT printed from inside
   // the flush hook: the case being diagnosed is a run with ZERO flushes, and a
   // line that only prints when a flush happens reports that as silence. Two
-  // freeroam runs (mx_1354, mx_1354.1 -- 190 and 592 frames at ~900 draws)
-  // logged no flush at all, and there was no way to tell whether the guest
-  // never reached the upload or its atlas was already warm.
+  // freeroam runs logged no flush at all, and there was no way to tell whether
+  // the guest never reached the upload or its atlas was already warm.
   if (swap_count == 1 || (swap_count % 250) == 0)
     ReportGlyphCache();
 
@@ -365,12 +341,11 @@ extern "C" REX_FUNC(sub_82566B58) {
 
   // Ring bounds are not established. The fields this code used to read as base
   // and end (+44 and +52) logged 0x00000000 and 0xBEBA0000 at swap #1, but
-  // packets parse at 0xBEBB3260 and later swaps write at 0xBED0653C — so
+  // packets parse at 0xBEBB3260 and later swaps write at 0xBED0653C -- so
   // neither means what was assumed, and the old wrap arithmetic
   // (ring_size = end - base) was garbage. Dump the struct once so the real
   // fields can be identified by matching them against the observed span, and
-  // until then refuse to parse a wrapped range rather than fabricate packets
-  // from wrong bounds.
+  // until then refuse to parse a wrapped range rather than fabricate packets.
   if (swap_count == 1) {
     for (uint32_t off = 0; off <= 96; off += 16) {
       REXLOG_INFO("{}: VdSwap dev+{:3} = 0x{:08X} 0x{:08X} 0x{:08X} 0x{:08X}",
@@ -405,17 +380,14 @@ extern "C" REX_FUNC(sub_82566B58) {
   // GUEST DRAWS per frame, reported HERE rather than from BeginFrame, and the
   // reason is a measurement that was nearly read as a finding.
   //
-  // The first cut printed this from sub_82ABF828 (BeginFrame) at
-  // `bf <= 3 || bf % 600 == 0`. A native run ended at 424 swaps and so logged
-  // only #1..#3, while a plugin run reached 760 and logged #600 -- which reads
-  // as "BeginFrame fires 3 times natively and 600 times under the plugin" and
-  // is nothing of the sort. It is the modulus. VdSwap is the right site: it
-  // ticks once per present in BOTH modes, unlike almost everything else in this
-  // file, and the interval is short enough that a run reaching the menu always
-  // produces several lines.
+  // The first cut printed this from BeginFrame at `bf <= 3 || bf % 600 == 0`. A
+  // native run ended at 424 swaps and so logged only #1..#3, while a plugin run
+  // reached 760 and logged #600 -- which reads as "BeginFrame fires 3 times
+  // natively and 600 times under the plugin" and is nothing of the sort. VdSwap
+  // is the right site: it ticks once per present in BOTH modes.
   //
-  // What the number decides, and it is the whole reason it exists: plugin mode
-  // renders the main-menu backdrop and native does not, so
+  // What the number decides: plugin mode renders the main-menu backdrop and
+  // native does not, so
   //
   //   same per-frame count in both -> the guest submits the same work and our
   //                                   draws produce the wrong image; the defect
@@ -498,26 +470,24 @@ extern "C" REX_FUNC(sub_82566B58) {
     auto& swap_packets = swap_parser.Packets();
 
     // Feed the ALU constant file on EVERY parsed swap, deliberately outside the
-    // gate below. That gate exists to keep the noisy per-packet logging and the
+    // gate below. That gate keeps the noisy per-packet logging and the
     // register-diff dump off the hot path, and it only lets swaps <= 20 plus
-    // three checkpoints through — so anything hung off it stops updating ~20
-    // frames into a run. A constant file that stale is worse than none.
+    // three checkpoints through -- so anything hung off it stops updating ~20
+    // frames into a run. A constant file that stale is worse than none. Cheap by
+    // construction: one range test per Type0 packet.
     //
-    // Cheap by construction: one range test per Type0 packet, and only ALU
-    // constants (0x4000..0x47FF) are stored. See mx::gpu::alu.
     // RING vs HLE CENSUS, added to test one premise before building per-draw
-    // constant ordering on it: that a draw's position in the RING can be
-    // matched to a draw in the D3D9 HLE path. Ordering by index is only
-    // meaningful if the two counts track each other.
-    //
-    // Counted in the same walk that already runs every swap, so it costs one
-    // switch per packet and nothing else.
+    // constant ordering on it: that a draw's position in the RING can be matched
+    // to a draw in the D3D9 HLE path. Ordering by index is only meaningful if
+    // the two counts track each other. Counted in the same walk that already
+    // runs every swap.
     //
     // The Type3 constant opcodes are counted for a separate reason. The ALU
-    // constant file is fed ONLY from Type0 writes (NoteType0Write below), but
-    // SET_CONSTANT, SET_SHADER_CONSTANTS and LOAD_ALU_CONSTANT are Type3 -- if
-    // the guest publishes constants through those, we never record them at all
-    // and the "finite zero we decline to fill" story has a second cause.
+    // constant file is fed ONLY from Type0 writes, but SET_CONSTANT,
+    // SET_SHADER_CONSTANTS and LOAD_ALU_CONSTANT are Type3 -- if the guest
+    // publishes constants through those, we never record them at all and the
+    // "finite zero we decline to fill" story has a second cause.
+    //
     // MEASUREMENT ONLY: nothing here changes what is recorded or drawn.
 
     uint32_t ring_draws = 0, t3_set_const = 0, t3_set_shader = 0, t3_load_alu = 0;
@@ -543,21 +513,19 @@ extern "C" REX_FUNC(sub_82566B58) {
               // carrying constants we recorded none of.
               //
               // Body layout and the index arithmetic are Xenia's, from
-              // ExecutePacketType3_LOAD_ALU_CONSTANT and WriteALURangeFromMem
-              // (pm4_command_processor_implement.h:1525, command_processor.cc:
-              // 966). Reproduced rather than guessed:
+              // ExecutePacketType3_LOAD_ALU_CONSTANT and WriteALURangeFromMem.
+              // Reproduced rather than guessed:
               //
               //   body[0] address     & 0x3FFFFFFF
               //   body[1] offset_type -> index = & 0x7FF, type = >> 16 & 0xFF
               //   body[2] size_dwords & 0xFFF          (a REGISTER count)
-              //   ALU registers live at 0x4000 + index, which is our
-              //   kAluRegBase -- the two agree exactly.
+              //   ALU registers live at 0x4000 + index, which is our kAluRegBase
               //
               // The packet carries an ADDRESS, not values: the constants sit in
               // guest memory, so this reads them the same way
-              // OverlayShaderConstants already reads a shader's own table.
-              // p.body is host-order (the parser byte-swaps on the way in);
-              // guest memory is not, hence REX_LOAD_U32.
+              // OverlayShaderConstants reads a shader's own table. p.body is
+              // host-order (the parser byte-swaps on the way in); guest memory
+              // is not, hence REX_LOAD_U32.
               //
               // ONLY type 0 (ALU) is applied. 1=FETCH, 2=BOOL, 3=LOOP,
               // 4=REGISTERS are counted and skipped -- FETCH in particular is
@@ -603,15 +571,14 @@ extern "C" REX_FUNC(sub_82566B58) {
       }
     }
     {
-      // The HLE side of the comparison, as a per-frame delta on the same
-      // counter FRAME DRAWS reports, so the two lines can be read together.
+      // The HLE side of the comparison, as a per-frame delta on the same counter
+      // FRAME DRAWS reports, so the two lines can be read together.
       //
-      // Both sides ACCUMULATE across the reporting interval. The whole point of
-      // the line is whether the two counts track each other, and a modulus that
-      // sampled one frame in thirty would compare two numbers drawn from a
-      // single frame while the other twenty-nine went unexamined -- the counts
-      // could diverge for a whole second and the line would never say so.
-      // Summed over the span they still track if and only if they track.
+      // Both sides ACCUMULATE across the reporting interval. The whole point is
+      // whether the two counts track each other, and a modulus that sampled one
+      // frame in thirty would compare two numbers drawn from a single frame
+      // while the other twenty-nine went unexamined. Summed over the span they
+      // still track if and only if they track.
       static uint64_t s_prev_ring_guest = 0;
       static uint64_t s_accRing = 0, s_accHle = 0;
       static uint64_t s_ringSpanFrom = 1;
@@ -646,14 +613,13 @@ extern "C" REX_FUNC(sub_82566B58) {
                             swap_count == 1000 ||
                             (swap_count >= 1200 && (swap_count % 500 == 0));
     if (should_dump_file) {
-      // Into logs/pm4dump/, with every other dump directory (hlsldump,
-      // constdump, texpng). These used to land next to the executable and had
-      // accumulated 137 files in the project root before anyone noticed —
-      // they are gitignored, so nothing ever complained. 2026-08-17.
+      // Into logs/pm4dump/, with every other dump directory. These used to land
+      // next to the executable and had accumulated 137 files in the project root
+      // before anyone noticed -- they are gitignored, so nothing complained.
       //
       // Wiped once per process, same reason as EnsureHlslDumpDir: the names
-      // repeat every run, so a short run leaves a long run's high frame
-      // numbers behind and they read as belonging to the current one.
+      // repeat every run, so a short run leaves a long run's high frame numbers
+      // behind and they read as belonging to the current one.
       EnsurePm4DumpDir();
       char dumpfname[96];
       snprintf(dumpfname, sizeof(dumpfname), "logs/pm4dump/%s_frame_%02d.txt", tag, swap_count);
@@ -695,16 +661,13 @@ extern "C" REX_FUNC(sub_82566B58) {
     // This is the last route left from a D3D9 shader handle to its microcode.
     // The direct ones are all closed: the blob at +0x368 is not the code (23%
     // agreement against what the ring loaded), SH_pPhysical reads as zeros at
-    // bind time, and its address is not the ring key (33 handles landed on a
-    // key at +0x1040 and none of them read back that microcode). But the ring
-    // does load 41 shaders *by address*, so the code is in guest memory — only
-    // the mapping is missing.
+    // bind time, and its address is not the ring key. But the ring does load 41
+    // shaders *by address*, so the code is in guest memory -- only the mapping
+    // is missing.
     //
     // If each frame's ring draw count equals its D3D9 draw count, the Nth ring
-    // draw is the Nth D3D9 draw, and the shader the ring bound for it is the
-    // one this handle means. If they differ, that correspondence is not there
-    // and saying so is the result — which is why this counts before assuming
-    // rather than assuming and checking later.
+    // draw is the Nth D3D9 draw. If they differ, that correspondence is not
+    // there and saying so is the result.
     //
     // Counted from the *raw draw packets*, not from DrawCalls(): the translator
     // drops draws it cannot build, so its output would understate the ring and
@@ -778,18 +741,18 @@ extern "C" REX_FUNC(sub_82566B58) {
     // Always propagate, even when empty: empty list clears the renderer's stale
     // draw data so frames without a VdSwap don't replay the last captured draws.
     if (!is_plugin) {
-      // Drains draws parked with ShaderApplyResult::kNoCode. This used to be
-      // the retry that mattered: TranslatePackets had just populated
+      // Drains draws parked with ShaderApplyResult::kNoCode. This used to be the
+      // retry that mattered: TranslatePackets had just populated
       // CapturedShaders() from the ring, so a draw that preceded its shader's
-      // IM_LOAD could be resolved here. That route is gone, and the code now
-      // comes from CapturePatchedCode inside the PatchVertexShader hook, which
-      // runs before the draw it patches.
+      // IM_LOAD could be resolved here. That route is gone -- the code now comes
+      // from CapturePatchedCode inside the PatchVertexShader hook, which runs
+      // before the draw it patches.
       //
       // Kept as a drain, not as a working retry: `skipped no-code` reads 0 and
-      // the deferred-draw line never prints across mx_434-436, so the queue is
-      // empty every time. It stays because kNoCode is still reachable and a
-      // parked draw with nothing to drain it would leak, not because it is
-      // known to recover anything.
+      // the deferred-draw line never prints, so the queue is empty every time.
+      // It stays because kNoCode is still reachable and a parked draw with
+      // nothing to drain it would leak.
+      //
       // Same lock the D3D9 hooks take: FinalizePendingD3D9Draws drains
       // g_pendingHleDraws and reads the shader caches, all of which a record
       // worker may be writing at this instant.
@@ -822,7 +785,7 @@ extern "C" REX_FUNC(sub_82BFBF30) {
   //   if (use_count && sub_82559A70(cmdbuf))
   //     do sub_82BFBF30(0); while (sub_82559A70(cmdbuf));
   //
-  // and sub_82559A70 -> sub_825599E0 (0x825599E0) decides "still in flight" as
+  // and sub_82559A70 -> sub_825599E0 decides "still in flight" as
   //
   //   device = *(*VdGlobalDevice)              ; 0x820007DC
   //   return (*(device+0x2A9C) - fence)        ; CPU-submitted fence
@@ -830,17 +793,15 @@ extern "C" REX_FUNC(sub_82BFBF30) {
   //
   // *(device+0x2A90) points at the counter the Xenos writes as it consumes
   // command buffers. There is no Xenos here, so it never moves: the first time
-  // the 12-slot ring (dword_830B3354 % 0xC) wraps back onto a slot that has
-  // been used once, the fence sits ahead of it and the test is true forever.
-  // The worker spins — no wait, no log — and the main thread parks in the join
-  // at 0x82AC8BCC waiting on three done-events that will never be set. That is
-  // the freeroam hang: the menu never submits enough to wrap the ring, and
-  // freeroam wraps it within a second or two of entry.
+  // the 12-slot ring wraps back onto a slot used once, the fence sits ahead of
+  // it and the test is true forever. The worker spins -- no wait, no log -- and
+  // the main thread parks in the join waiting on three done-events that will
+  // never be set. That is the freeroam hang: the menu never submits enough to
+  // wrap the ring, and freeroam wraps it within a second or two of entry.
   //
-  // Our HLE consumes each draw list synchronously at handoff, so by the time
-  // the guest asks, the work really is done — retiring to the submitted value
-  // is the honest answer, not an optimistic one. The store above is kept as it
-  // was; it writes a different pair of globals and predates this.
+  // Our HLE consumes each draw list synchronously at handoff, so by the time the
+  // guest asks, the work really is done -- retiring to the submitted value is
+  // the honest answer, not an optimistic one.
   const uint32_t device_slot = REX_LOAD_U32(0x820007DC);
   if (!device_slot) return;
   const uint32_t device = REX_LOAD_U32(device_slot);
@@ -858,27 +819,26 @@ extern "C" REX_FUNC(sub_82BFBF30) {
 }
 
 //=============================================================================
-// GPU call stubs — UNHOOKED 2026-08-16
+// GPU call stubs -- UNHOOKED
 //
 // These four ran an empty body in native mode and the guest original only under
 // the plugin. That divergence is now closed: all four call the original in both
 // modes, and the only thing left mode-specific is the log tag.
 //
-// Why: the plugin path loads `UI_World` — the 3D level the UI system owns, and
-// the main menu's stadium backdrop — and native does not. Native issues exactly
-// one AssetDB_RequestLoad in a whole run (`FR_Dunes`) and never asks for
-// `UI_World` at all, while submitting every draw the guest gives it (1,709,357
-// translated, 0 dropped). So the divergence is upstream of the renderer, and
-// these were the only native-only overrides left in the frame path.
+// Why: the plugin path loads `UI_World` -- the 3D level the UI system owns, and
+// the main menu's stadium backdrop -- and native does not. Native issues exactly
+// one AssetDB_RequestLoad in a whole run and never asks for `UI_World` at all,
+// while submitting every draw the guest gives it (1,709,357 translated, 0
+// dropped). So the divergence is upstream of the renderer, and these were the
+// only native-only overrides left in the frame path.
 //
 // The stubs date from before the D3D9 HLE layer, when "there is no Xenos GPU
-// behind them" was true of the whole backend. It is not any more.
+// behind them" was true of the whole backend.
 //
 // If this reintroduces a hang or an access violation, the two to suspect are
 // BeginFrame (sub_82ABF828), which reaches XenonRenderer at gs+80, and
-// GpuStateXenos, whose original had not run past call #3 in native since it was
-// written. Revert per-hook rather than wholesale — knowing WHICH one is the
-// point of the change.
+// GpuStateXenos, whose original had not run past call #3 in native. Revert
+// per-hook rather than wholesale -- knowing WHICH one is the point.
 //=============================================================================
 
 REX_IMPORT(__imp__sub_8255D430, orig_BeginFrameXenos, void());
@@ -908,11 +868,10 @@ extern "C" REX_FUNC(sub_8255D520) {
 }
 
 //=============================================================================
-// sub_82ABF828 — Begin frame. UNHOOKED 2026-08-16, see the block above.
-//
-// The old comment read "(stubbed — accesses XenonRenderer at gs+80)". That is
-// still the hazard to watch: if this faults, gs+80 is where to look, and this
-// is the first of the four to put back.
+// sub_82ABF828 -- Begin frame. UNHOOKED, see the block above. The old comment
+// read "(stubbed -- accesses XenonRenderer at gs+80)", and that is still the
+// hazard to watch: if this faults, gs+80 is where to look, and this is the first
+// of the four to put back.
 //=============================================================================
 
 REX_IMPORT(__imp__sub_82ABF828, orig_BeginFrame, void());
@@ -945,16 +904,16 @@ extern "C" REX_FUNC(sub_82ABF930) {
 }
 
 //=============================================================================
-// sub_8255CFE0 — GPU frame-pending poll (spin loop in VdSwap at 0x82567178).
-// Without GPU, the counter never advances → infinite spin. Stub to return 0
-// ("not pending") to break the loop and let EndFrame #2+ complete.
+// sub_8255CFE0 -- GPU frame-pending poll (spin loop in VdSwap at 0x82567178).
+// Without a GPU the counter never advances, so the spin is infinite. Stubbed to
+// return 0 ("not pending").
 //
-// DELIBERATELY NOT UNHOOKED with the other four on 2026-08-16. This one is not
-// an empty body that discards work — it returns a value the guest spins on, and
-// the counter it would poll is a Xenos GPU register that our D3D12 backend does
-// not advance. Passing it through hangs VdSwap on the second frame rather than
-// telling us anything. If the other four turn out not to be the UI_World lever,
-// this needs the counter written from the host first, not the guard removed.
+// DELIBERATELY NOT UNHOOKED with the other four. This one is not an empty body
+// that discards work -- it returns a value the guest spins on, and the counter
+// it would poll is a Xenos GPU register our D3D12 backend does not advance.
+// Passing it through hangs VdSwap on the second frame rather than telling us
+// anything. If the other four turn out not to be the UI_World lever, this needs
+// the counter written from the host first, not the guard removed.
 //=============================================================================
 REX_IMPORT(__imp__sub_8255CFE0, orig_FramePendingPoll, int());
 extern "C" REX_FUNC(sub_8255CFE0) {
@@ -964,15 +923,15 @@ extern "C" REX_FUNC(sub_8255CFE0) {
 }
 
 //=============================================================================
-// Parallel command-buffer recording — fork / worker / join
+// Parallel command-buffer recording -- fork / worker / join
 //=============================================================================
-// The freeroam hang (2026-08-08) is the guest main thread parked forever in
-// sub_82AC8B68 at 0x82AC8BCC: Wait(unk_830B0C34[i], INFINITE) for i in 0..2.
-// That is the JOIN of a three-way parallel scene record:
+// The freeroam hang is the guest main thread parked forever in sub_82AC8B68 at
+// 0x82AC8BCC: Wait(unk_830B0C34[i], INFINITE) for i in 0..2. That is the JOIN of
+// a three-way parallel scene record:
 //
-//   sub_82AC8A18  fork    allocates 5 D3D9 command buffers (sub_8254B970 x4,
-//                         sub_8254B9B8), clears each done-event, then
-//                         NtSetEvent(dword_830B0C28[i]) to release worker i
+//   sub_82AC8A18  fork    allocates 5 D3D9 command buffers, clears each
+//                         done-event, then NtSetEvent(dword_830B0C28[i]) to
+//                         release worker i
 //   sub_82AC8CC8  worker  Wait(dword_830B0C28[i], INFINITE), record, signal
 //                         done-event unk_830B0C34[i]
 //   sub_82AC8B68  join    Wait(unk_830B0C34[i], INFINITE) x3, release buffers
@@ -981,11 +940,9 @@ extern "C" REX_FUNC(sub_8255CFE0) {
 // survives and freeroam does not: the parallel path only engages once the scene
 // has content to record.
 //
-// The stall watchdog showed NO thread waiting at the worker's own go-event
-// (that would report lr=0x82AC8CF8), so the workers were released and are
-// blocked or lost inside the work rather than waiting for a kick. These probes
-// are pure passthrough — they establish which of the three halves runs and
-// which worker fails to come back, and nothing else.
+// The stall watchdog showed NO thread waiting at the worker's own go-event, so
+// the workers were released and are blocked or lost inside the work rather than
+// waiting for a kick. These probes are pure passthrough.
 
 REX_IMPORT(__imp__sub_82AC8A18, orig_RecordFork, void());
 extern "C" REX_FUNC(sub_82AC8A18) {

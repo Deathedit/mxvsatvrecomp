@@ -349,10 +349,9 @@ int main() {
           "a zero offset is the identity");
   }
 
-  // THE MIP CHAIN. A 256x256 k_8_8_8_8 with packed mips, which is the shape
-  // that matters: log2_ceil(256) - 4 == 4, so levels 1..3 have their own
-  // storage and levels 4..8 share the packed tail. Both addressing paths in one
-  // case.
+  // THE MIP CHAIN. A 256x256 k_8_8_8_8 with packed mips, the shape that matters:
+  // log2_ceil(256) - 4 == 4, so levels 1..3 have their own storage and levels
+  // 4..8 share the packed tail. Both addressing paths in one case.
   //
   // The guest side is placed using GetGuestTextureLayout -- the same function
   // the describe path reads -- so this does not re-verify the SDK's layout. It
@@ -361,17 +360,16 @@ int main() {
   // level-major packing of the output.
   //
   // The dimensions are chosen so the test can FAIL. Two ways this went wrong
-  // while being written, both found by mutating the decode and watching the
-  // test still pass:
+  // while being written, both found by mutating the decode and watching the test
+  // still pass:
   //
-  //  - At 64 texels wide, LINEAR proves nothing. A linear mip's pitch is
-  //    rounded up to 256 bytes, which for a 64-wide RGBA8 texture lands exactly
-  //    on the base pitch -- so a decode that used the base pitch for every
-  //    level was indistinguishable from a correct one.
-  //  - At 64 texels wide, TILED proves nothing either. Level 1 is then 32x32,
-  //    a single tile, and GetTiledOffset2D only consults the pitch across tile
-  //    boundaries -- (y >> 5) * (pitch >> 5). Inside one tile any pitch gives
-  //    the same address. 256 makes level 1 a 4x4 grid of tiles.
+  //  - At 64 texels wide, LINEAR proves nothing. A linear mip's pitch is rounded
+  //    up to 256 bytes, which for a 64-wide RGBA8 texture lands exactly on the
+  //    base pitch -- so a decode using the base pitch for every level was
+  //    indistinguishable from a correct one.
+  //  - At 64 texels wide, TILED proves nothing either. Level 1 is then 32x32, a
+  //    single tile, and GetTiledOffset2D only consults the pitch across tile
+  //    boundaries. 256 makes level 1 a 4x4 grid of tiles.
   for (int tiled_case = 0; tiled_case < 2; ++tiled_case) {
     namespace xg = rex::graphics::xenos;
     namespace tu = rex::graphics::texture_util;

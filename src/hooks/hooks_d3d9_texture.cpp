@@ -1,10 +1,8 @@
 // The texture and pixel-binding half of the D3D9 HLE: the guest texture cache,
 // the glyph-cache special case, blank/swizzle/sign/mip censuses, the Bink plane
-// path, pixel slot resolution and PrepareDrawTexture.
-//
-// Split verbatim out of hooks_d3d9.cpp. Nothing was renamed or reordered. The
-// shared surface is hooks_d3d9_shared.h, and it is small on purpose -- see the
-// note there about why the counters were grouped into structs first.
+// path, pixel slot resolution and PrepareDrawTexture. Split verbatim out of
+// hooks_d3d9.cpp; nothing was renamed or reordered. The shared surface is
+// hooks_d3d9_shared.h.
 
 #include "hooks/hook_common.h"
 
@@ -66,20 +64,18 @@ struct ResolvedPixelBinding {
 std::map<uint32_t, ResolvedPixelBinding> g_resolvedPixelBindings;
 std::map<uint64_t, std::shared_ptr<const mx::hle::HleTexturePayload>>
     g_hleCpuTextures;
-// Keys whose decode came out entirely zero. This used to be a set-and-forget
-// flag, which made "blank" permanent: a texture sampled once while the guest
-// was still streaming into it could never be reconsidered, because the key
-// hashes the six fetch dwords -- where the texture lives and what shape it is
-// -- and never its contents.
+// Keys whose decode came out entirely zero. Not a set-and-forget flag, which
+// made "blank" permanent: the key hashes the six fetch dwords -- where the
+// texture lives and what shape it is -- never its contents, so a texture
+// sampled while the guest was still streaming into it could never be
+// reconsidered.
 //
-// Retrying is what lets a streamed texture appear, but it cannot be free.
-// Measured on the attract sequence, the blank set is three FMT_8_8_8_8
-// surfaces, one 2048x2048 and two at 1280x720 -- the game's render resolution,
-// so they are surfaces the GPU rendered into whose guest copy is legitimately
-// empty and will never fill in. Re-untiling ~9 MB of those every frame forever
-// is pure waste, so each retry that comes back blank doubles the wait before
-// the next one, up to a cap. A texture that is about to arrive is retried
-// almost immediately; one that never arrives settles into costing nothing.
+// Retrying cannot be free. The blank set is three FMT_8_8_8_8 surfaces at the
+// game's render resolution -- surfaces the GPU rendered into whose guest copy is
+// legitimately empty and never fills in -- so re-untiling ~9 MB of those every
+// frame is pure waste. Each blank retry doubles the wait, up to a cap: a texture
+// about to arrive is retried almost immediately, one that never arrives settles
+// into costing nothing.
 struct BlankState {
   uint64_t last_frame = 0;
   uint32_t strikes = 0;
@@ -106,104 +102,77 @@ bool BlankRetryDue(uint64_t key) {
 // Scaleform's raster glyph cache, and why a texture cache keyed on the fetch
 // constant cannot see it change.
 //
-// The UI is Scaleform GFx 3.x ("Warning: Increase raster glyph cache capacity
-// - TextureConfig." at 0x820D98D8). It keeps ONE 512x512 FMT_8 atlas per font
-// and repacks it at runtime as strings appear and disappear -- dumping the
-// decoded payload three times in one run caught it holding "Loading" /
-// "Press START", then "PHOENIX...", then nearly empty mid-rewrite.
+// The UI is Scaleform GFx 3.x. It keeps ONE 512x512 FMT_8 atlas per font and
+// repacks it at runtime as strings appear and disappear.
 //
 // The guest side, from the IDB:
 //
-//   sub_8293E720  rasterises one glyph into the cache. It writes rows straight
-//                 into the cache buffer -- `sub_82BDB3C0(row, 0, w)` to clear
-//                 and `sub_82BDAAF0(dst, src, w)` to copy, addressed as
-//                 `(y)*tex[5] + tex[6]` where tex = *(cache+696), [5] is the
-//                 pitch and [6] the base -- then records a dirty rect through
-//                 sub_8293DA08.
-//   sub_8293C778  FLUSHES those rects: it walks the texture slots at +56
-//                 (stride 5, matching sub_8293A888's `cache[5*i + 14]`),
-//                 gathers the rects belonging to each, calls the texture's
-//                 vtable slot 3 -- GTexture::Update(level, n, rects, image) --
-//                 and then clears the count at +28.
+//   sub_8293E720  rasterises one glyph into the cache, writing rows straight
+//                 into the cache buffer addressed as `(y)*tex[5] + tex[6]`
+//                 (tex = *(cache+696), [5] pitch, [6] base), then records a
+//                 dirty rect through sub_8293DA08.
+//   sub_8293C778  FLUSHES those rects: walks the texture slots at +56 (stride
+//                 5), gathers each one's rects, calls the texture's vtable slot
+//                 3 -- GTexture::Update -- and clears the count at +28.
 //
 // So sub_8293C778 is the exact moment the atlas contents change, and the
-// pending-rect count at +28 says whether this call will change anything. That
-// is the signal, and it costs nothing on frames where no glyph moved -- which
-// is why it is worth decompiling for rather than hashing every texture every
-// frame.
+// pending-rect count at +28 says whether this call will change anything. It
+// costs nothing on frames where no glyph moved.
 //
-// It does NOT say which host texture changed, only that the glyph atlases did,
-// so the invalidation has to name them some other way.
+// It does NOT say which host texture changed, so the invalidation has to name
+// them some other way -- by GEOMETRY, learned from the cache object rather than
+// assumed. sub_8293A888 creates each atlas with InitTexture(cache[0], cache[1],
+// ...), so the flush hook registers that pair here and a kR8 texture is a glyph
+// atlas only if its extent matches one the guest actually built.
 //
-// It used to name them by FORMAT alone -- every cached kR8 texture -- on the
-// stated grounds that "the only other kR8 textures in a run are two 32x32
-// ones". Measured 2026-08-16, that is wrong by three orders of magnitude. The
-// kR8 population in a loaded pause frame is 5.00 MB: four 512x512 glyph atlases
-// and one 2048x2048 that is not a glyph atlas at all (30 binds, swizzle
-// 0o05000). In the menu and event captures it also sweeps in the Bink Y/U/V
-// planes (640x216, 320x108 x2), a 1024x512 and two 512x256. Every one of those
-// re-decoded on every flush, and mx_1189 alone logged 8 flushes.
-//
-// Worse than the waste: routing a texture here ALSO routes it away from
-// GuestTextureFingerprint, so those same non-glyph textures were never
-// content-checked at all. A 2048x2048 R8 restreamed without a glyph flush was
-// invisible to us.
-//
-// So name them by GEOMETRY, learned from the cache object rather than assumed.
-// sub_8293A888 creates each atlas with InitTexture(cache[0], cache[1], ...), so
-// the flush hook reads those two dwords and registers the pair here. A kR8
-// texture is a glyph atlas only if its extent matches one the guest actually
-// built; everything else falls through to the fingerprint, which is the right
-// test for it and the test it should have been getting all along.
+// Naming them by FORMAT alone was wrong by three orders of magnitude: the kR8
+// population in a loaded frame is 5 MB, including a 2048x2048 that is not an
+// atlas and the Bink Y/U/V planes. Worse than the waste, routing a texture here
+// ALSO routes it away from GuestTextureFingerprint, so those textures were never
+// content-checked at all.
 //
 // Before the first flush the set is empty, so a glyph atlas decoded that early
-// stores a fingerprint. Once the geometry registers it compares against the
-// generation instead, mismatches once, and re-decodes into the right regime.
-// Self-correcting, and it costs one decode.
+// stores a fingerprint, then mismatches once and re-decodes into the right
+// regime. Self-correcting, at the cost of one decode.
 //===========================================================================
-// Counted in both modes -- see the note in hooks_d3d9_internal.h.
 std::atomic<uint64_t> g_guestDrawCalls{0};
 
-// Atomic for the reason spelled out at the extern in hooks_d3d9_internal.h:
-// the guest guards this cache with its own critical section, so the flush hook
-// can run on more than one thread. The generation is published with RELEASE and
-// read with ACQUIRE, which is the part a plain atomic would still get wrong --
-// the bump has to publish the atlas bytes orig_GlyphCacheFlush just wrote, or a
-// reader can observe the new generation and then re-decode the old pixels.
+// Atomic for the reason spelled out at the extern in hooks_d3d9_internal.h: the
+// guest guards this cache with its own critical section, so the flush hook can
+// run on more than one thread. The generation is published with RELEASE and read
+// with ACQUIRE -- the bump has to publish the atlas bytes orig_GlyphCacheFlush
+// just wrote, or a reader can observe the new generation and re-decode the old
+// pixels.
 std::atomic<uint32_t> g_glyphCacheGeneration{1};
 
 
 // sub_8293A888 is GetTexture: it hands back the atlas texture for a slot,
 // creating it through OUR renderer's vtable on first use. It is the one refusal
-// point in the glyph chain that runs through our code rather than the guest's.
+// point in the glyph chain that runs through our code.
 //
 // A failure there is not recoverable and not retried. sub_8293C778 clears the
 // slot's dirty flag OUTSIDE the success test:
 //
 //     if (v5[4]) { if (sub_8293A888(...)) { ...Update... } v5[4] = 0; }
 //
-// so a failed create silently DISCARDS that slot's pending rects for the life
-// of the cache. That is the exact shape of "some letters never appear".
+// so a failed create silently DISCARDS that slot's pending rects for the life of
+// the cache -- the exact shape of "some letters never appear".
 
 // PIN-MODE CENSUS -- see the read site in hooks_d3d9_entry.cpp for the offset
-// derivation, which is the part that is easy to get wrong.
+// derivation, which is the part that is easy to get wrong. BOTH arms are counted
+// on purpose: a census with only the "held" arm cannot tell "the pin is always
+// held" from "we never managed to read the byte".
+
+
+// sub_828A8C40 returning 0 is a glyph the guest asked for and did not get --
+// the failure itself rather than a proxy, so REFUSED at zero exonerates the
+// raster cache outright. Calls is the denominator that makes that zero readable.
 //
-// BOTH arms are counted on purpose. A census with only the "held" arm cannot
-// tell "the pin is always held" from "we never managed to read the byte", and
-// those are opposite conclusions. See [[a-total-without-a-denominator]].
-
-
-// sub_828A8C40 returning 0 is a glyph the guest asked for and did not get.
-// This is the failure itself rather than a proxy for it, so REFUSED at zero
-// exonerates the raster cache outright and moves the search upstream into
-// composition. Calls is the denominator that makes that zero readable.
-// The one that can actually fire on this game's path: sub_828A8C40 returned
-// SUCCESS but left out+20 (the atlas texture) null, so sub_828AC620 emits no
-// quad. A lost glyph that never touches the return value.
-// sub_828AC620's own per-line verdict. DROPPED is the guest saying it emitted
-// fewer glyphs than the line asked for -- the last measurable point before the
-// vertex buffer. UNREAD keeps a zero in DROPPED honest.
-// Font loads, and how many came back with the silent truncation latch set.
+// Also counted: the case that can actually fire on this game's path --
+// sub_828A8C40 returned SUCCESS but left out+20 (the atlas texture) null, so
+// sub_828AC620 emits no quad; sub_828AC620's own per-line DROPPED verdict, the
+// last measurable point before the vertex buffer, with UNREAD keeping a zero in
+// it honest; and font loads with the silent truncation latch set.
 
 
 
@@ -244,29 +213,26 @@ bool IsGlyphCacheTexture(mx::hle::HostTextureFormat format, uint32_t width,
   return g_glyphGeometries.contains(key);
 }
 
-// Fingerprint of the GUEST BYTES behind a texture, so the caches can notice
-// that an address has been refilled with different artwork.
+// Fingerprint of the GUEST BYTES behind a texture, so the caches can notice that
+// an address has been refilled with different artwork.
 //
-// The cache key is FNV-1a over the six fetch dwords -- where the texture lives
-// and what shape it is, never what it contains. Swapping riders streams new
-// gear into the SAME allocation at the same dimensions and format, so the key
-// does not change and BOTH caches keep serving the previous rider: the decoded
-// payload in g_hleCpuTextures (whose emplace never overwrites) and the GPU
-// resource in m_gameTextures. That is the wrong-livery and wrong-gear defect,
-// and it is why it looked order-dependent -- the only thing that ever
-// invalidated anything was a Scaleform font repack, which is unrelated and
-// happened to fire sometimes.
+// The cache key is FNV-1a over the six fetch dwords, never what the texture
+// contains. Swapping riders streams new gear into the SAME allocation at the
+// same dimensions and format, so BOTH caches keep serving the previous rider --
+// the decoded payload in g_hleCpuTextures (whose emplace never overwrites) and
+// the GPU resource in m_gameTextures. That is the wrong-livery defect, and why
+// it looked order-dependent: the only thing that ever invalidated anything was
+// an unrelated Scaleform font repack.
 //
 // Bounded so it can run on every bind. Textures of 4 KB or less are hashed
 // WHOLE; larger ones are sampled at 32 fixed offsets, ~2 KB against the ~580
-// binds a frame this title makes. Hashing everything in full would be ~100 MB
-// a frame. The sampled form could in principle miss artwork that is
-// byte-identical at all 32 offsets; the whole-hash cutoff covers the small
-// textures where that is most plausible, and for real art it does not happen.
+// binds a frame this title makes -- hashing everything in full would be ~100 MB
+// a frame. The sampled form could in principle miss artwork byte-identical at
+// all 32 offsets; the whole-hash cutoff covers the small textures where that is
+// most plausible.
 //
 // Returns 0 for memory it cannot read, which callers treat as "no opinion"
-// rather than as a change -- a texture mid-stream must not be invalidated on
-// the strength of a failed read.
+// rather than as a change.
 uint32_t GuestTextureFingerprint(const mx::hle::HleTextureSource& source,
                                  uint8_t* base) {
   const uint32_t bytes = source.source_bytes;
@@ -298,14 +264,13 @@ uint32_t GuestTextureFingerprint(const mx::hle::HleTextureSource& source,
 
   bool ok = true;
   // The readability probe is memoised PER PAGE. Every slice used to cost two
-  // HostPageReadable calls, and that function is not free: an atomic counter
-  // plus a linear scan of a 64-entry thread-local region cache. 32 slices x 2
-  // probes x ~2800 slot calls is ~180k calls a frame, several ms of it.
+  // HostPageReadable calls, and that function is not free (an atomic plus a
+  // linear scan of a 64-entry region cache): 32 slices x 2 probes x ~2800 slot
+  // calls is ~180k calls a frame.
   //
-  // Still probes every DISTINCT page, so it is not weaker than the per-slice
-  // version -- only the repeats within a page are elided, and readability
-  // cannot vary inside one. Consecutive slices share a page whenever the
-  // texture is under ~128 KB, which is most of them.
+  // Still probes every DISTINCT page, so it is no weaker -- readability cannot
+  // vary inside one page, and consecutive slices share a page whenever the
+  // texture is under ~128 KB.
   uint32_t last_ok_page = 0xFFFFFFFFu;
   const auto page_ok = [&](uint32_t a) {
     const uint32_t page = a & ~0xFFFu;
@@ -325,20 +290,15 @@ uint32_t GuestTextureFingerprint(const mx::hle::HleTextureSource& source,
     const auto* q = reinterpret_cast<const uint8_t*>(REX_RAW_ADDR(addr + offset));
     // EIGHT BYTES PER MULTIPLY, not one.
     //
-    // FNV-1a's multiply is a serial dependency: byte i+1 cannot start until
-    // byte i's imul retires, so a byte-at-a-time loop runs at the multiply's
-    // latency per byte no matter how wide the machine is. 2 KB per slot call
-    // over ~2800 calls is 5.7 MB a frame down that chain, which is what
-    // `stale-check 11ms` was almost entirely made of.
+    // FNV-1a's multiply is a serial dependency, so a byte-at-a-time loop runs at
+    // the multiply's latency per byte no matter how wide the machine is. 2 KB
+    // per slot call over ~2800 calls is 5.7 MB a frame down that chain, which is
+    // what `stale-check 11ms` was almost entirely made of.
     //
-    // Consuming a whole word per step keeps the same shape -- xor, multiply,
-    // in order -- with an eighth of the chain. It is a DIFFERENT hash value
-    // than before, which matters not at all: this is a change detector, its
-    // outputs live only in the in-memory cache, and nothing persists across
-    // runs. The tail is finished byte-wise so short slices still mix.
-    //
-    // Same class of defect as the one in `cpu-cost-is-fingerprint-and-histogram`
-    // (a byte-at-a-time FNV at 4.6ms/frame). This is the second instance.
+    // Consuming a whole word keeps the same shape with an eighth of the chain.
+    // It is a DIFFERENT hash value, which matters not at all: this is a change
+    // detector whose outputs live only in the in-memory cache. The tail is
+    // finished byte-wise so short slices still mix.
     uint32_t i = 0;
     for (; i + 8 <= n; i += 8) {
       uint64_t w;
@@ -353,37 +313,16 @@ uint32_t GuestTextureFingerprint(const mx::hle::HleTextureSource& source,
   };
 
   constexpr uint32_t kWholeHashLimit = 4096;
-  // COVERAGE PROPORTIONAL TO SIZE, not a fixed 32 slices.
-  //
-  // 32 x 64 bytes is 2 KB however big the texture is, so coverage collapses as
-  // size grows: 25% of an 8 KB texture, 0.1% of a 2 MB one. The note below this
-  // function already records what that costs -- "the fingerprint samples 2 KB
-  // of a 256 KB atlas, so a localised glyph write lands between its sample
-  // points and reads as unchanged. That is what broke the pause HUD once
-  // already" -- and the glyph atlas escaped it only by getting an explicit
-  // generation instead.
-  //
-  // The terrain's virtual-texture INDEX MAP is the same shape and had no such
-  // escape: 1024x1024 k_4_4_4_4, 2 MB, updated SPARSELY as pages stream in. A
-  // handful of changed entries in 2 MB lands between 32 sample points every
-  // time, so the payload decoded once while the map was still uniform
-  // (`n=1 flat=1`) and was never re-read, even after the feedback loop started
-  // driving 421 tile resolves a run.
-  //
-  // One slice per 4 KB page instead, so a page that changes at all is sampled,
-  // with the total capped at 8 KB hashed per call -- a 2 MB texture costs 512
-  // slices of 16 bytes. That is four times the old byte count on the largest
-  // textures and LESS on everything under 128 KB, because the slices shrink.
-  // STILL 32 SLICES, and that is a measured decision rather than the old
-  // default left alone. Scaling the count to one point per 4 KB (128 points on
-  // a 2 MB texture) was tried and REVERTED: stale-check went 8ms -> 23ms per
-  // interval and frame time ~118ms -> ~146ms, a 25% regression, because this
-  // runs on every one of ~2200 slot calls.
+  // STILL 32 SLICES, and that is a measured decision rather than a default left
+  // alone. Coverage does collapse as size grows -- 25% of an 8 KB texture, 0.1%
+  // of a 2 MB one -- so scaling to one point per 4 KB was tried and REVERTED:
+  // stale-check went 8ms -> 23ms per interval and frame time ~118ms -> ~146ms, a
+  // 25% regression, because this runs on every one of ~2200 slot calls.
   //
   // It bought nothing. Sampling cannot see a SPARSE write at any density worth
   // paying for -- 128 points across 2 MB is still one per 16 KB -- so the
   // texture it was meant to fix, the terrain index map, is handled at the cache
-  // insert instead by not caching a flat decode at all. Wholesale restreams,
+  // insert instead, by not caching a flat decode at all. Wholesale restreams,
   // which is what every other texture does, are caught by 32 points already.
   constexpr uint32_t kSlices = 32, kSliceBytes = 64;
   if (bytes <= kWholeHashLimit) {
@@ -399,23 +338,19 @@ uint32_t GuestTextureFingerprint(const mx::hle::HleTextureSource& source,
 }
 
 // What a payload's content_version should hold, and what it is later compared
-// against. One function so the store and the test cannot drift apart -- storing
-// a fingerprint and comparing it to a generation would invalidate that texture
-// on every single bind.
+// against. One function so the store and the test cannot drift -- storing a
+// fingerprint and comparing it to a generation would invalidate that texture on
+// every bind.
 //
-// The glyph atlas KEEPS the guest's own flush generation rather than moving to
-// the fingerprint. That fix was hard won, the guest tells us outright when the
-// atlas is repacked, and an explicit signal beats a sampled read of the same
-// memory -- the fingerprint samples 2 KB of a 256 KB atlas, so a localised
-// glyph write lands between its sample points and reads as unchanged. That is
-// what broke the pause HUD once already.
+// The glyph atlas KEEPS the guest's own flush generation: the guest tells us
+// outright when the atlas is repacked, and an explicit signal beats a sampled
+// read of the same memory -- the fingerprint samples 2 KB of a 256 KB atlas, so
+// a localised glyph write lands between its sample points and reads as
+// unchanged. That broke the pause HUD once already.
 //
-// The fingerprint covers everything else, which until now was covered by
-// nothing at all: GlyphCacheStale was gated on IsGlyphCacheFormat, so every
-// BC1/BC3/BC5/RGBA8 texture in the game -- all the rider and vehicle art -- was
-// never tested for staleness in the first place. As of the geometry test above
-// that "everything else" correctly includes the single-channel textures that
-// are NOT glyph atlases, which the format-only gate had also been excluding.
+// The fingerprint covers everything else, which until now was covered by nothing
+// at all: GlyphCacheStale was gated on IsGlyphCacheFormat, so every
+// BC1/BC3/BC5/RGBA8 texture in the game was never tested for staleness.
 uint32_t TextureContentVersion(const mx::hle::HleTextureSource& source,
                                uint8_t* base,
                                mx::hle::HostTextureFormat format) {
@@ -437,29 +372,23 @@ bool TextureContentStale(const mx::hle::HleTextureSource& source,
 }
 
 
-// The FULL-HASH PROBE that lived here is GONE, and its answer is why.
+// The FULL-HASH PROBE that lived here is GONE, and its answer is why. It hashed
+// whole atlases to ask whether the guest's bytes move under a cached texture:
+// all eleven 1024x1024 BC3 atlases read FULL 1 over a freeroam level, up to 7
+// whole-buffer reads and 3,103 binds each, every read identical. Nothing here
+// was ever stale and the missing UI art is absent at the source. Not vacuous
+// either -- 7 of 123 rows DID change.
 //
-// It hashed whole atlases to ask one question: when a texture is served from
-// cache, have the guest's bytes moved under us? Run 1533, a freeroam level:
-// all eleven 1024x1024 BC3 atlases read FULL 1 -- up to 7 whole-buffer reads
-// and 3,103 binds each, every read identical. The guest does not rewrite them,
-// so nothing here was ever stale and the missing UI art is absent at the
-// source, not lost by this cache.
-//
-// The result was not vacuous: 7 of 123 rows DID change, so the probe could
-// fire and simply had nothing to report for the class it was aimed at.
-//
-// One finding worth keeping, because it is the first hard proof of something
-// this file only guessed at:
+// One finding worth keeping, the first hard proof of something this file only
+// guessed at:
 //
 //   0x104F2000 1024x1024 fmt15 2MB -- FULL 3 distinct of 6 reads
 //                                     SAMPLED 1 distinct of 351 binds
 //
-// 2 bytes/texel at 1024x1024 is the terrain virtual-texture index map, and
-// GuestTextureFingerprint saw ONE state where the whole-buffer hash saw three.
-// The sampled fingerprint is provably blind to real writes there, exactly as
-// the note beside it predicted. It is papered over by the flat-decode retry
-// rather than fixed.
+// That is the terrain virtual-texture index map, and GuestTextureFingerprint saw
+// ONE state where the whole-buffer hash saw three. The sampled fingerprint is
+// provably blind to real writes there, and it is papered over by the flat-decode
+// retry rather than fixed.
 
 void NoteBlankDecode(uint64_t key) {
   BlankState& s = g_hleEmptyTextures[key];
@@ -467,42 +396,30 @@ void NoteBlankDecode(uint64_t key) {
   ++s.strikes;
 }
 
-// FLAT-DECODE PROBE, 2026-08-27. MEASUREMENT ONLY -- nothing acts on this, and
-// nothing should until it has said which side the flatness comes from.
+// FLAT-DECODE PROBE. MEASUREMENT ONLY -- nothing acts on this, and nothing
+// should until it has said which side the flatness comes from.
 //
-// HleTextureIsConstant asks whether EVERY byte of the base level is identical,
-// and that "every" is exactly why it missed the texture the black ground turned
-// out to hang on. ground.rdc's ResourceId::7022 -- 1024x1024 B4G4R4A4, the
-// terrain composite's tile-index map -- decodes to one value on every texel of
-// every mip EXCEPT texel (0,0). ONE differing texel, so the exact test returns
-// false, the `uniform decode` line never prints, and the texture whose flatness
-// blacks out the whole near ground reports as ordinary. A test that has to be
-// perfect to fire is a test that misses by one.
+// HleTextureIsConstant demands EVERY byte be identical, and that is why it
+// missed the texture the black ground hung on: a 1024x1024 B4G4R4A4 tile-index
+// map that decodes to one value on every texel except (0,0). A test that has to
+// be perfect to fire is a test that misses by one.
 //
-// So this measures the DOMINANT BYTE'S SHARE instead of demanding 100%, and it
-// scans the GUEST BYTES as well as the decode. The second scan is the whole
-// point and the reason this is worth adding at all:
+// So this measures the DOMINANT ELEMENT'S SHARE, and scans the GUEST BYTES as
+// well as the decode. The second scan is the whole point:
 //
-//   guest flat, decode flat  -- the game's own data. Not our bug; stop here.
+//   guest flat, decode flat   -- the game's own data. Not our bug; stop here.
 //   guest varied, decode flat -- the untile/copy/upload path lost it. Ours.
 //
-// Nothing else in the tree can tell those two apart, and the difference decides
-// whether the ground is chased in our decoder or in the guest.
-// PER TEXEL, NOT PER BYTE -- and that distinction is the whole probe.
-//
-// The first cut counted BYTES, and it could not see the one texture it was
-// written to catch. ground2.rdc's 1024x1024 B4G4R4A4 is the constant word
-// 0x0AF0 on every texel; as bytes that is `0A F0 0A F0 ...`, a dominant share of
-// exactly 0.5, nowhere near the 0.999 threshold. Run 1472 duly reported
-// `[fmt15(FMT_4_4_4_4) 1024x1024 n=2 flat=0]` for a texture the capture shows is
-// perfectly flat. A byte histogram can only see constants that are byte-uniform
-// -- 0x00, 0x80, 0xFF -- which is why every hit so far was one of those three.
-// The measurement agreed with itself and disagreed with the texture.
+// PER TEXEL, NOT PER BYTE. The first cut counted BYTES and could not see the one
+// texture it was written to catch: the constant word 0x0AF0 is `0A F0 0A F0` as
+// bytes, a dominant share of exactly 0.5. A byte histogram can only see
+// constants that are byte-uniform -- 0x00, 0x80, 0xFF -- which is why every hit
+// was one of those three.
 //
 // Boyer-Moore majority over `element_bytes`-wide elements: one pass to find the
-// candidate, one to count it. O(1) memory, so a 16 MB base level costs nothing,
-// and exact whenever the dominant element is over half -- which is the only
-// region the >= 99.9% threshold cares about.
+// candidate, one to count it. O(1) memory, and exact whenever the dominant
+// element is over half, which is the only region the 99.9% threshold cares
+// about.
 struct FlatScan {
   // Element-level: what the threshold reads.
   uint64_t dominant = 0;
@@ -529,26 +446,16 @@ FlatScan ScanFlatness(const uint8_t* data, size_t bytes, uint32_t element_bytes)
   else w = 1;
   s.element_bytes = w;
 
-  // A 256-BIT SET, not a 256-ENTRY HISTOGRAM, and it stops once every value has
-  // been seen.
-  //
-  // `distinct_bytes` is used by exactly three log lines and nothing else, and
-  // the old form counted every byte of the decoded texture into a 2 KB array:
-  // 4 million dependent read-modify-writes for a 4 MB texture. Measured in
-  // freeroam, run 1687:
-  //
-  //   TEXTURE COST 2729 slot calls -- decode 51ms, scan 76ms
-  //                | 2723 cache hits, 3 decodes over 4112 KB
-  //
-  // 76ms of scan for THREE textures, and the frames where only one decoded read
-  // `decode 0ms, scan 1ms`. So a spike frame is 127ms of decode+scan, on a
-  // ~160ms frame, for a diagnostic count.
+  // A 256-BIT SET, not a 256-ENTRY HISTOGRAM, stopping once every value has been
+  // seen. `distinct_bytes` is used by three log lines and nothing else, and the
+  // old form counted every byte into a 2 KB array -- 4 million dependent
+  // read-modify-writes for a 4 MB texture, measured at 76ms of scan for THREE
+  // decoded textures on a ~160ms frame.
   //
   // The count is still EXACT. Only the mechanism changes: 32 bytes of state the
-  // compiler can keep in registers instead of a 2 KB table, and an early exit
-  // the moment all 256 values have appeared -- which any real texture reaches
-  // within a few KB. The pathological case (a nearly-uniform surface) is
-  // precisely the one that stays cheap anyway.
+  // compiler can keep in registers, and an early exit the moment all 256 values
+  // have appeared, which any real texture reaches within a few KB. The
+  // pathological case -- a nearly-uniform surface -- stays cheap anyway.
   {
     uint64_t seen[4] = {};
     uint32_t found = 0;
@@ -569,30 +476,19 @@ FlatScan ScanFlatness(const uint8_t* data, size_t bytes, uint32_t element_bytes)
 
   // WIDTH-SPECIALISED, because the generic version could not vectorise.
   //
-  // These two passes are NOT diagnostics -- `dominant` decides residency and
-  // the flat-retry backoff -- so neither can be sampled or dropped. What could
-  // go is the way they read: a `memcpy` of a RUNTIME width into a uint64 per
-  // element, which the compiler has to emit as a call-shaped load it cannot
-  // widen. At w=1 that is one such load per byte of a 2.7 MB texture, twice.
+  // These two passes are NOT diagnostics -- `dominant` decides residency and the
+  // flat-retry backoff -- so neither can be sampled or dropped. What could go is
+  // a `memcpy` of a RUNTIME width into a uint64 per element, which the compiler
+  // has to emit as a call-shaped load it cannot widen: at w=1 that is one such
+  // load per byte of a 2.7 MB texture, twice, measured at 9ms of scan for TWO
+  // decodes on a 30ms frame.
   //
-  // Measured on the user's main PC, run mx_012, in a level:
+  // Hoisting the width into the type makes the element a plain aligned load of a
+  // fixed size, which vectorises. Same arithmetic, same exact answer.
   //
-  //   TEXTURE COST 4832 slot calls -- decode 2ms, scan 9ms
-  //                | 4827 cache hits, 2 decodes over 2763 KB
-  //
-  // 9ms of scan for TWO decodes, on a 30ms frame. The histogram fixed earlier
-  // today was the first of three passes over the same bytes; these are the
-  // other two, and they were left in place because the count they produce is
-  // load-bearing while the histogram's was not.
-  //
-  // Hoisting the width into the type makes the element a plain aligned load of
-  // a fixed size, which vectorises. Same two passes, same arithmetic, same
-  // exact answer -- Boyer-Moore majority followed by an exact recount, which is
-  // still the only way to be exact when no element holds a majority.
   // memcpy with a COMPILE-TIME size rather than a cast: well defined for any
   // alignment and no aliasing assumption, and every compiler folds it to the
-  // single load a cast would have produced. The runtime-width memcpy this
-  // replaces is the one that could not be folded.
+  // single load a cast would have produced.
   const auto scan_w = [&]<typename T>(T) {
     const auto load = [data](size_t i) {
       T v;
@@ -622,32 +518,23 @@ FlatScan ScanFlatness(const uint8_t* data, size_t bytes, uint32_t element_bytes)
   return s;
 }
 
-// The renderer's staleness key: a hash of the bytes we just decoded.
+// The renderer's staleness key: a hash of the bytes we just decoded. Separate
+// from content_version on purpose -- that one is a 2 KB SAMPLE of guest memory
+// and must stay one, so it cannot see a sparse write, and without this the fresh
+// bytes stopped at the GPU boundary because EnsureGameTexture compared the
+// sample and saw no change. Word-wise, and runs once per DECODE, not per bind.
 //
-// Separate from content_version on purpose -- see the field's comment in
-// hle_types.h. The short version: content_version is a 2 KB SAMPLE of guest
-// memory and must stay one, so it cannot see a sparse write; the flat-retry
-// backoff re-decodes anyway, and without this the fresh bytes stopped at the
-// GPU boundary because EnsureGameTexture compared the sample and saw no change.
-//
-// Word-wise so the pass is memory-bound rather than byte-at-a-time: a 2 MB
-// index map hashes in well under the decode that produced it, and this runs
-// once per DECODE, not once per bind.
-// The snapshot slot's sampler word: clamp in bits 12-13, POINT in 14, and 15
-// saying the word was filled in at all.
-//
-// The low 12 bits are the guest swizzle, which a snapshot slot deliberately
-// does NOT apply (BindTranslatedTextures keeps identity -- applying it turned
-// the rider cyan). They are carried anyway so SLOT MAP can print them and so
-// the two producers of this word agree on its layout.
+// Below: the snapshot slot's sampler word -- clamp in bits 12-13, POINT in 14,
+// and 15 saying the word was filled in at all. The low 12 bits are the guest
+// swizzle, which a snapshot slot deliberately does NOT apply (applying it turned
+// the rider cyan); they are carried so SLOT MAP can print them.
 //
 // TWO producers, and that is the point of this function. The full-snapshot
 // branch reads the fetch dwords directly; the PARTIAL-snapshot binds have no
-// fetch dwords in hand but do have `source`, which was decoded from the same
-// constant. Before this, only the first wrote the word, so every partially
-// resolved snapshot -- the terrain tile ATLAS among them, which fails the
-// coverage gate by design because an atlas is sparse -- reached the sampler
-// with a zero word and took the hardcoded clamped POINT.
+// fetch dwords in hand but do have `source`. Before this only the first wrote
+// the word, so every partially resolved snapshot -- the terrain tile ATLAS among
+// them, which fails the coverage gate by design because an atlas is sparse --
+// reached the sampler with a zero word and took the hardcoded clamped POINT.
 uint16_t PackSnapshotSamplerWord(uint32_t swizzle, uint32_t clamp_x,
                                  uint32_t clamp_y, bool linear_filter) {
   uint16_t packed = uint16_t(swizzle & 0xFFFu);
@@ -660,23 +547,20 @@ uint16_t PackSnapshotSamplerWord(uint32_t swizzle, uint32_t clamp_x,
   return packed;
 }
 
-// The PARTIAL-snapshot binds: carry the guest's FILTER and deliberately NOT
-// its clamp. Two different answers to two questions that happen to travel in
-// one word, and the asymmetry is measured rather than tidy.
+// The PARTIAL-snapshot binds: carry the guest's FILTER and deliberately NOT its
+// clamp. Two answers to two questions that happen to travel in one word, and the
+// asymmetry is measured rather than tidy.
 //
-// The terrain tile atlas at 0x1A2E3000 binds through here -- an atlas is sparse
-// by design, so it fails the coverage gate on every bind and is never a "full"
-// snapshot. Its fetch constant says `clamp 2/2 -> CLAMP/CLAMP`, and the atlas
-// is sampled at U = 1.34: clamped that pins to the right edge and reads an
-// empty tile, which is the BLACK GROUND this whole chain was dug out of.
-// Wrapped it is tile 2, which holds sand. The wrap it gets today comes from
-// this word being zero, so honouring the stated clamp here would walk the
-// ground straight back to black.
+// The terrain tile atlas binds through here -- an atlas is sparse by design, so
+// it fails the coverage gate on every bind. Its fetch constant says CLAMP/CLAMP
+// and the atlas is sampled at U = 1.34: clamped that pins to the right edge and
+// reads an empty tile, which is the BLACK GROUND. Wrapped it is tile 2, which
+// holds sand, and that wrap comes from this word being zero.
 //
 // Why the guest can say clamp and mean wrap is not settled -- the Xenos sampler
 // has more modes than the two this maps onto, and the shader's own address
-// arithmetic may already fold the wrap in. Until that IS settled, the clamp
-// stays at the default that renders correctly, and only the filter moves.
+// arithmetic may already fold the wrap in. Until it is, the clamp stays at the
+// default that renders correctly and only the filter moves.
 uint16_t PartialSnapshotSamplerWord(const mx::hle::HleTextureSource& source) {
   return PackSnapshotSamplerWord(source.swizzle, /*clamp_x=*/0, /*clamp_y=*/0,
                                  source.linear_filter);
@@ -704,13 +588,11 @@ uint32_t PayloadUploadVersion(const mx::hle::HleTexturePayload& payload) {
 // Computes it, stores it, and says out loud the first time a re-decode of one
 // address produces DIFFERENT bytes.
 //
-// That line is the measurement the last three runs could not make. `TEXTURE
-// REPEATS ... 98stale` cannot answer it: the miss reason is set to kStaleEvicted
-// both when the fingerprint changed AND when the flat-retry backoff forced a
-// re-read, so a texture the guest never touches and one it rewrites constantly
-// print the same number. This compares the decoded bytes themselves, so a
-// CONTENT CHANGE line means the guest really did write, and its absence over a
-// run means it really did not.
+// `TEXTURE REPEATS ... 98stale` cannot answer that: the miss reason is
+// kStaleEvicted both when the fingerprint changed AND when the flat-retry
+// backoff forced a re-read, so a texture the guest never touches and one it
+// rewrites constantly print the same number. This compares the decoded bytes
+// themselves.
 void SetPayloadUploadVersion(const mx::hle::HleTextureSource& source,
                              mx::hle::HleTexturePayload& payload) {
   uint32_t previous = 0;
@@ -719,9 +601,8 @@ void SetPayloadUploadVersion(const mx::hle::HleTextureSource& source,
     payload.upload_version = PayloadUploadVersion(payload);
   }
   {
-    // Its own lock rather than g_flatMutex, which is declared further down for
-    // the flat census. The rule it obeys is the same one and it is not
-    // negotiable: this runs on GUEST THREADS from every decode site, and an
+    // Its own lock rather than g_flatMutex. The rule is the same one and it is
+    // not negotiable: this runs on GUEST THREADS from every decode site, and an
     // unguarded container insert from several of them corrupted the heap once
     // already -- the fault surfaced as a bad pointer in recompiled guest code
     // nowhere near here. A diagnostic is not exempt.
@@ -777,18 +658,15 @@ void SetPayloadUploadVersion(const mx::hle::HleTextureSource& source,
   }
   // PER-LEVEL COVERAGE, for a texture that carries a mip chain.
   //
-  // The terrain's virtual-texture page table is a pyramid, and "resident" for
-  // it means "not the 0xF00A not-available sentinel". A single base-level share
-  // cannot say what is actually wrong with it: in ground-tiles-7.rdc mip 0 was
-  // 0.2% resident, mip 4 was 21.5% and mip 6 was 50%, and the visible defect --
-  // the aliased mesh on distant slopes -- came from the composite sampling a
-  // COARSE level at a texel that happened to be unwritten. One number per level
-  // is the shape of that question.
+  // The terrain's virtual-texture page table is a pyramid, and "resident" for it
+  // means "not the 0xF00A not-available sentinel". A single base-level share
+  // cannot say what is wrong with it: mip 0 was 0.2% resident, mip 4 21.5% and
+  // mip 6 50%, and the visible defect came from the composite sampling a COARSE
+  // level at an unwritten texel.
   //
-  // Counted against the BASE level's dominant element, which for this texture
-  // is the sentinel. For any other texture it is whatever value dominates, and
-  // the row is then just "how uniform is each level" -- harmless and still
-  // readable.
+  // Counted against the BASE level's dominant element, which for this texture is
+  // the sentinel. For any other texture the row is just "how uniform is each
+  // level" -- harmless and still readable.
   std::string levels;
   if (payload.level_count > 1 && scan.element_bytes) {
     PhaseTimer t(g_tex.scanUs);
@@ -811,19 +689,15 @@ void SetPayloadUploadVersion(const mx::hle::HleTextureSource& source,
 
       // THE SHAPE OF THE COARSE LEVELS, not just their ratio.
       //
-      // L5, L6 and L7 all read EXACTLY 50% resident -- 512/1024, 128/256,
-      // 32/64. Three consecutive levels at precisely one half is not a
-      // streaming curve (the levels above it are ragged: 0.3%, 0.4%, 2.0%),
-      // it is a factor of two in how pages are marked or indexed. And it
-      // matters most here, because the coarse levels are the fallback: L7 is
-      // 64 pages and should be fully resident, since it is the "always have
-      // something to sample" level. Half of it missing is what blocky tiling
-      // looks like.
+      // L5, L6 and L7 all read EXACTLY 50% resident -- 512/1024, 128/256, 32/64.
+      // Three consecutive levels at precisely one half is not a streaming curve
+      // (the levels above are ragged: 0.3%, 0.4%, 2.0%), it is a factor of two
+      // in how pages are marked or indexed. It matters most here because the
+      // coarse levels are the fallback.
       //
-      // A ratio cannot say WHICH half. Checkerboard, half-plane and
-      // alternating rows all read 50% and have completely different causes,
-      // so the smallest levels are printed verbatim -- 64 texels is one short
-      // line, and the pattern names the bug on sight.
+      // A ratio cannot say WHICH half -- checkerboard, half-plane and
+      // alternating rows all read 50% with completely different causes -- so the
+      // smallest levels are printed verbatim.
       if (total <= 64) {
         std::string raw;
         uint32_t col = 0;
@@ -873,20 +747,16 @@ struct FlatWatch {
 std::map<uint64_t, FlatWatch> g_flatRetryKeys;
 // Still uniform: nothing has changed yet, so re-read it rarely.
 constexpr uint32_t kFlatRetryFrames = 30;
-// PROVEN TO CHANGE: re-read it often. The terrain page table is rewritten by
-// the guest every frame, so at 30 frames we render from a mapping up to half a
+// PROVEN TO CHANGE: re-read it often. The terrain page table is rewritten by the
+// guest every frame, so at 30 frames we render from a mapping up to half a
 // second old.
 //
-// What makes 4 affordable is skipping the flatness scan below, not raw budget.
-// The measurement that killed "re-read on every bind" was
-//
-//     decode 359ms, scan 651ms | 50 decodes over 36880 KB
-//
-// and the SCAN is the bigger half -- ScanFlatness makes three full passes (a
-// 256-bin byte histogram, then two Boyer-Moore passes over elements). On a key
-// already known to change, that scan asks a question whose answer we have, so
-// it is pure waste. Dropping it takes the marginal cost of a re-read from
-// ~28ms/MB to ~10ms/MB, which is what buys the tighter interval.
+// What makes 4 affordable is skipping the flatness scan, not raw budget. The
+// measurement that killed "re-read on every bind" was `decode 359ms, scan 651ms
+// | 50 decodes over 36880 KB` -- the SCAN is the bigger half, since ScanFlatness
+// makes three full passes. On a key already known to change that scan asks a
+// question whose answer we have, and dropping it takes the marginal cost of a
+// re-read from ~28ms/MB to ~10ms/MB.
 constexpr uint32_t kVolatileRetryFrames = 4;
 uint64_t g_flatNotCached = 0;
 uint64_t g_flatRetriesDue = 0;
@@ -896,42 +766,33 @@ uint64_t g_flatRetriesDue = 0;
 uint64_t g_flatVolatile = 0;
 
 // THE PROBE CRASHED THE GAME AND THIS IS WHY. The census below inserts into a
-// std::map and a std::set, and once NoteDecodedTexture was called from all
-// three decode sites those inserts happened on SEVERAL GUEST THREADS at once.
-// Concurrent std::map::insert corrupts the heap, and the fault that surfaced
-// was nowhere near here: an access violation on the UI thread inside recompiled
-// guest function 0x8236EB30, reading 0x4C69746C -- ASCII "Litl", a string being
-// dereferenced as a pointer. Classic downstream heap damage. Runs 1466/1468/
-// 1469/1470 were clean and 1471, the first with three sites wired, was not.
+// std::map and a std::set, and once NoteDecodedTexture was called from all three
+// decode sites those inserts happened on SEVERAL GUEST THREADS at once.
+// Concurrent std::map::insert corrupts the heap, and the fault that surfaced was
+// nowhere near here: an access violation on the UI thread inside recompiled
+// guest code, reading 0x4C69746C -- ASCII "Litl", a string being dereferenced as
+// a pointer.
 //
-// hooks_d3d9_entry.cpp:1902 already states the rule for this codebase: "this
-// runs on guest threads and the resolve maps are unguarded, so it must not
-// insert." A diagnostic is not exempt from it.
-//
-// The lock is uncontended in practice -- a whole level run decodes ~600
-// textures -- and it covers the counters as well, so the printed rate is not a
-// torn read.
+// hooks_d3d9_entry.cpp already states the rule: "this runs on guest threads and
+// the resolve maps are unguarded, so it must not insert." A diagnostic is not
+// exempt. The lock is uncontended in practice -- a whole level run decodes ~600
+// textures -- and it covers the counters too, so the printed rate is not a torn
+// read.
 std::mutex g_flatMutex;
 
 // DECODE CENSUS BY SHAPE. The per-address lines answer "is this texture flat";
-// this answers "was it decoded AT ALL", which run 1468 could not settle. That
-// run decoded 248 textures across a full level and printed eight flat ones, and
-// there was no way to tell whether the 1024x1024 FMT_4_4_4_4 the black ground
-// hangs on was ABSENT or merely healthy. **Absence and health look identical
-// without the population** -- the same hole the guard census exists to close,
-// reopened here because the probe only ever reported its fires.
+// this answers "was it decoded AT ALL". **Absence and health look identical
+// without the population** -- one run decoded 248 textures and printed eight
+// flat ones, with no way to tell whether the 1024x1024 FMT_4_4_4_4 the black
+// ground hangs on was ABSENT or merely healthy.
 //
 // Keyed on {guest format, width, height} rather than address, because the
-// question is about a kind of texture, and one shape can live at many
-// addresses.
+// question is about a kind of texture and one shape can live at many addresses.
 //
-// The SITE is carried too, and it is not decoration. A shape that decodes with
-// real content proves the bytes are right and says nothing about who wanted
-// them: `slot` is a translated draw binding it, `standin` is the fallback
-// route, `bink` is video. Without the site, "FMT_DXT1 256x1024 n=1 flat=0" --
-// the FanPalm bark in FR_Dunes, the only 256x1024 pair in that level -- cannot
-// distinguish a real textured draw from the stand-in path picking it up, and
-// those two have opposite consequences for whether the tree renders.
+// The SITE is carried too, and it is not decoration: `slot` is a translated draw
+// binding it, `standin` the fallback route, `bink` video. Without it, a shape
+// that decodes with real content cannot distinguish a real textured draw from
+// the stand-in path picking it up, and those have opposite consequences.
 struct DecodeShape {
   uint64_t decodes = 0;
   uint64_t flat = 0;
@@ -966,9 +827,7 @@ void ReportDecodeShapes() {
   // one instrument to hide the case it was built for: a 1024x1024 FMT_4_4_4_4
   // that decodes with REAL content sorts to the bottom (flat=0, n small), gets
   // cut, and prints no FLAT DECODE line either -- so "decoded and healthy" and
-  // "never decoded at all" render identically. Same defect as the 24-address
-  // cap and as reporting only fires, committed a third time. The list is ~74
-  // entries; print it.
+  // "never decoded at all" render identically. The list is ~74 entries; print it.
   std::string top;
   for (size_t i = 0; i < ranked.size(); ++i) {
     top += fmt::format(" [fmt{}({}) {}x{} n={} flat={} via {}]",
@@ -988,17 +847,13 @@ void ReportDecodeShapes() {
 // texture is decoded. DecodeHleTexture2D is called from the Bink plane path,
 // from PrepareDrawTexture (the stand-in route) and from ResolvePixelSlotTexture
 // (the translated route), and they SHARE A CACHE -- so a texture first decoded
-// by one route is a cache hit for the others and never reaches their code at
-// all.
+// by one route is a cache hit for the others and never reaches their code.
 //
-// ground2.rdc caught it. The 1024x1024 B4G4R4A4 tile-index map is present as a
-// bound payload -- d3d12_game_bind's slot census prints its bytes -- while the
-// census in this file reported no 1024x1024 FMT_4_4_4_4 decode in the same run.
-// Both were right. The decode happened somewhere the census could not see, and
-// a census that watches one of three doors reports absence as health.
+// The 1024x1024 B4G4R4A4 tile-index map was present as a bound payload while
+// this census reported no such decode in the same run. Both were right: a census
+// that watches one of three doors reports absence as health.
 //
-// `site` names the door, because knowing WHICH route decoded a texture is half
-// of what the last three runs were missing.
+// `site` names the door.
 void NoteDecodedTexture(const mx::hle::HleTextureSource& source,
                         const mx::hle::HleTexturePayload& payload,
                         const uint8_t* guest_bytes, size_t guest_size,
@@ -1024,13 +879,11 @@ void NoteDecodedTexture(const mx::hle::HleTextureSource& source,
   if (decoded_flat.total && decoded_flat.share() >= 0.999) {
     ++shape.flat;
     ++g_flatProbe.flat;
-    // THE CAP WAS 24 AND IT HID THE CASE THIS EXISTS FOR. Run 1466 reached
-    // 24 addresses at decode 236 and then went on to render 1860 frames of a
-    // level; every texture first bound after that -- the terrain's tile-index
-    // map among them -- was dropped without a word, and the log read as
-    // though only eight flat textures existed. A limit whose effect is
-    // invisible is the same defect as a counter that cannot fire, so the cap
-    // now counts what it drops and prints that on every line.
+    // THE CAP WAS 24 AND IT HID THE CASE THIS EXISTS FOR. One run reached 24
+    // addresses at decode 236 and then rendered 1860 more frames; every texture
+    // first bound after that -- the terrain's tile-index map among them -- was
+    // dropped without a word. A limit whose effect is invisible is the same
+    // defect as a counter that cannot fire, so the cap now counts what it drops.
     static std::set<uint32_t> s_flatSeen;
     const bool flat_first_seen = s_flatSeen.insert(source.address).second;
     if (flat_first_seen && s_flatSeen.size() > 256) ++g_flatProbe.suppressed;
@@ -1093,19 +946,18 @@ const ResolvedPixelBinding* ResolvePixelProfile(uint32_t handle) {
   if (resolved.skipped_fetches) resolved.skipped_kind = resolved.fail;
   if (!resolved.decoded) {
     // Pixel shader allocations with literal constants place those values in
-    // front of the CF stream (the loaded main-pass shaders consistently begin
-    // at dword 16). Do not hardcode that observation: try a bounded set of
-    // suffixes and accept only a unique valid decode. A second valid alignment
-    // makes the blob ambiguous and leaves the draw on the colour fallback.
+    // front of the CF stream (the loaded main-pass shaders consistently begin at
+    // dword 16). Do not hardcode that: try a bounded set of suffixes and accept
+    // only a unique valid decode. A second valid alignment makes the blob
+    // ambiguous and leaves the draw on the colour fallback.
     //
-    // WATCH THIS COUNT. The acceptance test here is "DecodePixelTextureFetches
-    // returned true", and that predicate just became more permissive: a non-2D
-    // fetch is skipped now rather than rejecting the blob, so alignments that
-    // used to be disqualified by one odd fetch can come back valid. More valid
-    // alignments means more blobs landing in the `> 1` ambiguous branch below,
-    // which would turn shaders that resolve today into shaders that do not.
-    // Run 1439 had exactly ONE ambiguous blob; if that number climbs, this
-    // loop -- not the skip -- is what needs tightening.
+    // WATCH THIS COUNT. The acceptance test is "DecodePixelTextureFetches
+    // returned true", and that predicate became more permissive when a non-2D
+    // fetch started being skipped rather than rejecting the blob -- so
+    // alignments once disqualified by one odd fetch can come back valid, and
+    // more valid alignments means more blobs landing in the ambiguous branch.
+    // One run had exactly ONE ambiguous blob; if that climbs, this loop -- not
+    // the skip -- is what needs tightening.
     uint32_t valid_offsets = 0;
     std::vector<mx::hle::PixelTextureBinding> unique_bindings;
     uint32_t unique_offset = 0;
@@ -1168,17 +1020,15 @@ const ResolvedPixelBinding* ResolvePixelProfile(uint32_t handle) {
                   : fmt::format("whole {}-dword D3D9 allocation",
                                 bi->second.size()));
   if (!profile.decoded) {
-    // CAP WAS 16, and 16 is not a population. Run 1438 rejected 75 of 178
+    // CAP WAS 16, and 16 is not a population. One run rejected 75 of 178
     // distinct pixel shaders here -- 42% -- and this dump showed the first 16,
     // which reads exactly like "16 shaders are rejected". The cap now clears a
-    // level's whole shader set, and it stays a cap only so a handle-recycling
-    // run cannot get the log back by this route (see g_shaderHandleRecycled,
-    // which is neither zero nor inert).
+    // level's whole shader set, and stays a cap only so a handle-recycling run
+    // cannot get the log back by this route.
     //
-    // The REASON rides on this line too. It is already on the profile line
-    // immediately above, but pairing them meant correlating two lines per
-    // shader, and the point of the dwords is to read them against the reason
-    // that refused them.
+    // The REASON rides on this line too: it is already on the profile line
+    // above, but pairing them meant correlating two lines per shader, and the
+    // point of the dwords is to read them against the reason that refused them.
     static std::map<uint32_t, bool> s_dumped_rejected;
     if (s_dumped_rejected.size() < 256 &&
         s_dumped_rejected.emplace(handle, true).second) {
@@ -1256,19 +1106,18 @@ bool ResolvePixelBinding(uint32_t handle,
 // Texture fetch constants embedded in a shader object's state-patch list.
 //
 // SetPixelShader and SetVertexShader both walk the same three-part block. The
-// first list emits LOAD_ALU_CONSTANT packets. The SECOND list is different:
-// each entry is `(u16 byte_offset, u16 dword_count, inline payload)` and the
-// guest copies that payload to `device + 0x480 + byte_offset`. The first 0xC0
-// bytes of that device block are the 32 six-dword texture fetch constants.
+// first list emits LOAD_ALU_CONSTANT packets. The SECOND list is different: each
+// entry is `(u16 byte_offset, u16 dword_count, inline payload)` and the guest
+// copies that payload to `device + 0x480 + byte_offset`, whose first 0xC0 bytes
+// are the 32 six-dword texture fetch constants.
 //
-// This distinction is verified directly in the recompiled guest functions
-// sub_825506E8 and sub_825508A8. An earlier implementation searched the first
-// list for ALU register indexes reaching 0x4800; no shader published such an
-// entry, so the runtime correctly reported zero captured descriptors.
+// Verified directly in sub_825506E8 and sub_825508A8. An earlier implementation
+// searched the FIRST list for ALU register indexes reaching 0x4800; no shader
+// publishes such an entry, so the runtime correctly reported zero descriptors.
 //
-// Cached per pixel-shader handle rather than re-walked per draw. The pixel and
-// vertex shader patch lists are merged because either may carry state for the
-// shared device constants block used by the draw.
+// Cached per pixel-shader handle rather than re-walked per draw. The two shaders'
+// patch lists are merged because either may carry state for the shared device
+// constants block.
 struct ShaderFetchConstants {
   static constexpr uint32_t kDwords = 6;
   uint32_t words[mx::hle::kMaxSamplers * kDwords] = {};
@@ -1304,24 +1153,19 @@ bool ShaderPublishedFetch(uint32_t shader, uint32_t sampler, uint32_t out[6]) {
 
 // `ps_handle`, when given, is the pixel shader whose load table may carry this
 // sampler's descriptor. Pass the PER-DEVICE handle (PixelShaderForDeviceStrict),
-// never the thread-local one: DeviceState() is thread_local and a worker-thread
-// draw would name the wrong shader, which here would mean binding another
-// draw's texture rather than merely missing one.
-// WHY a fetch could not be found. The function used to return a bare `false`
-// for six different situations and its caller asserted one of them -- "the
-// guest never bound anything to this sampler" -- which is true for exactly ONE
-// of the six. The other five are us failing to find a binding that exists, and
-// they are indistinguishable from the outside while the result is a black
-// texel either way.
+// never the thread-local one: a worker-thread draw would name the wrong shader,
+// which here means binding another draw's texture rather than merely missing one.
 //
-// This matters at scale: a level run reports ~10,000 draws sampling black with
-// 9,995 of them on this path. If even a slice of that is rows 0/1/4/5 rather
-// than row 2, those are textures the guest bound and we lost.
+// Below: WHY a fetch could not be found. This used to return a bare `false` for
+// six different situations, and its caller asserted one of them -- "the guest
+// never bound anything to this sampler" -- which is true for exactly ONE. The
+// other five are us failing to find a binding that exists, indistinguishable
+// from the outside while the result is a black texel either way. At scale: a
+// level run reports ~10,000 draws sampling black with 9,995 on this path.
 //
-// Ordered MOST-SPECIFIC-FIRST, and every path terminates in exactly one code.
-// An earlier reason-code chain in this tree was ordered the other way, made its
-// last entry unreachable, and printed a permanent zero that read as a
-// measurement -- see the note on that in hooks_d3d9.cpp.
+// Ordered MOST-SPECIFIC-FIRST, and every path terminates in exactly one code. An
+// earlier reason-code chain in this tree was ordered the other way, made its last
+// entry unreachable, and printed a permanent zero that read as a measurement.
 enum class FetchMiss : uint32_t {
   kNoDevice,          // device pointer is 0 -- OURS
   kShadowUnreadable,  // device shadow page would fault -- OURS
@@ -1427,15 +1271,14 @@ std::string FetchMissReport() {
 
 // The milestone can sample one texture even when the guest shader uses many.
 // Pick from evidence in the live descriptors: normalized colour storage is a
-// closer approximation to the shader's visible base colour than BC5 normal
-// maps, float intermediates, or unnormalized render-target inputs. Ties retain
-// shader instruction order; no sampler number is treated as a semantic.
-// Per-guest-format tally of descriptors the HLE decoder turned down, shared by
-// both rejection sites. This replaced a flat "log the first 12" cap, which
-// could spend its whole budget on one format and leave every other one
-// invisible — the reason "unsupported texture format" has never once told us
-// which format to add. Keyed by the base format index; the value counts
-// sightings and the first of each is logged in full.
+// closer approximation to the shader's visible base colour than BC5 normal maps,
+// float intermediates, or unnormalized render-target inputs. Ties retain shader
+// instruction order; no sampler number is treated as a semantic.
+//
+// Below: per-guest-format tally of descriptors the HLE decoder turned down,
+// shared by both rejection sites. This replaced a flat "log the first 12" cap,
+// which could spend its whole budget on one format -- the reason "unsupported
+// texture format" never once told us which format to add.
 std::map<uint32_t, uint64_t> g_hleRejectedFormats;
 
 void NoteRejectedTextureFormat(const char* site, uint32_t sampler,
@@ -1443,18 +1286,16 @@ void NoteRejectedTextureFormat(const char* site, uint32_t sampler,
                                const char* why, const uint32_t fetch[6]) {
   const uint32_t fmt = source.guest_format;
   ++g_hleRejectedFormats[fmt];
-  // Logged once per (format, REASON), not once per format. The tally above
-  // stays keyed on format alone because that is what RejectedFormatSummary
-  // ranks, but the gate cannot: a format already turned down for one reason
-  // would silently swallow every later reason for the same format, and the
-  // reason is the only part that says what work would fix it.
+  // Logged once per (format, REASON), not once per format. The tally above stays
+  // keyed on format alone because that is what RejectedFormatSummary ranks, but
+  // the gate cannot: a format already turned down for one reason would swallow
+  // every later reason for the same format, and the reason is the only part that
+  // says what work would fix it.
   //
-  // This matters right now for "texture is a 3D volume". tfetch3D shaders used
-  // to be refused whole by the HLSL emitter, so their textures were never
-  // described and that reason had never once been reachable. Now that the
-  // stacked case translates, a volume is the one remaining refusal, and
-  // whether it ever fires decides whether a real Texture3D decode is worth
-  // building.
+  // This matters for "texture is a 3D volume": tfetch3D shaders used to be
+  // refused whole by the HLSL emitter, so that reason had never been reachable.
+  // Now that the stacked case translates, whether it ever fires decides whether
+  // a real Texture3D decode is worth building.
   static std::set<std::pair<uint32_t, std::string>> s_seen;
   if (!s_seen.emplace(fmt, why ? why : "?").second) return;
   REXLOG_INFO("d3d9: HLE texture reject [{}]: sampler {} format {} ({}) — {}; "
@@ -1487,7 +1328,7 @@ std::string RejectedFormatSummary() {
 // The guest's Bink frame composite, identified from the binary rather than by
 // heuristic. sub_8234D630 (XenonBinkVideo vtable [8]) clears a render target,
 // calls sub_8234C7C0, then Resolves into a texture. sub_8234C7C0 binds three
-// plane textures to samplers 0/1/2 — Y, Cr, Cb — plus an optional alpha plane
+// plane textures to samplers 0/1/2 -- Y, Cr, Cb -- plus an optional alpha plane
 // on sampler 3 whose presence selects the second pixel shader. The guest keeps
 // all three shader handles in these globals, so a draw can be matched exactly.
 constexpr uint32_t kBinkPixelShaderYuv = 0x82DD7130;
@@ -1506,17 +1347,15 @@ REXCVAR_DEFINE_BOOL(d3d9_bink_disable, false, "Debug",
                     "no YUV planes prepared, so videos render as whatever "
                     "their bound textures happen to be. Diagnostic A/B only");
 
-// The single gate for the whole Bink path: both routing sites (the draw
-// builder and the deferred rebuild) call this before touching planes, so
-// returning false here disconnects decode, upload and the plane budget in one
-// place rather than stubbing three.
+// The single gate for the whole Bink path: both routing sites call this before
+// touching planes, so returning false disconnects decode, upload and the plane
+// budget in one place rather than stubbing three.
 //
-// Disconnecting is a DIAGNOSTIC, not a fix. The path is measured healthy --
-// `BINK PLANES 1886 calls = 1886 ok` and `yuv plane gate: 1876 prepared, 0
-// refused` -- so anything that changes when it is off is a change in what the
-// video draws do to the frame, not a repair of the decoder. With the cvar set,
-// the BINK PLANES line reports 0 calls, which is how the log shows the switch
-// actually took effect rather than the path merely being quiet.
+// Disconnecting is a DIAGNOSTIC, not a fix. The path is measured healthy, so
+// anything that changes when it is off is a change in what the video draws do to
+// the frame, not a repair of the decoder. With the cvar set, the BINK PLANES
+// line reports 0 calls, which is how the log shows the switch took effect rather
+// than the path merely being quiet.
 bool IsBinkCompositeDraw(uint32_t pixel_shader, uint8_t* base) {
   if (!pixel_shader) return false;
   if (REXCVAR_GET(d3d9_bink_disable)) return false;
@@ -1583,17 +1422,17 @@ void ProbeBinkComposite(uint32_t pixel_shader, uint32_t vertex_shader,
   }
 }
 
-// Decode the Bink composite's plane set into the DrawCall. Deliberately
-// separate from PrepareDrawTexture rather than folded into it:
+// Decode the Bink composite's plane set into the DrawCall. Deliberately separate
+// from PrepareDrawTexture rather than folded into it:
 //
-//  - it must bind *several* textures, which the single-winner binding contest
-//    in ResolvePixelBindingForDraw cannot express;
+//  - it must bind *several* textures, which the single-winner binding contest in
+//    ResolvePixelBindingForDraw cannot express;
 //  - the planes are k_8, which the semantic gate correctly refuses as base
-//    colour for a mask but wrongly for a luma plane. Here the guest's own
-//    shader identity says what they are, so the gate is not consulted;
+//    colour for a mask but wrongly for a luma plane. Here the guest's own shader
+//    identity says what they are, so the gate is not consulted;
 //  - it must not touch g_hleCpuTextures. The planes are new guest memory every
 //    video frame, so caching them by payload key would grow the cache without
-//    bound; at 30 fps that is ~90 dead entries a second.
+//    bound -- ~90 dead entries a second at 30 fps.
 BinkPlaneRefusals g_binkRefusals;
 std::mutex g_binkRefusalsMu;
 
@@ -1651,25 +1490,22 @@ bool PrepareBinkPlanes(mx::hle::DrawCall& dc, uint32_t device, uint8_t* base) {
     // frame yet, so unlike the immutable path this is not memoised as empty —
     // the same descriptor will carry real pixels a frame later.
     payload->key = HleTextureKey(fetch);
-    // Crop the chroma planes to their logical extent, while the payload is
-    // still local and mutable.
+    // Crop the chroma planes to their logical extent, while the payload is still
+    // local and mutable.
     //
     // The guest allocates them with the dimensions rounded up, so half of a
     // 216-row luma arrives as a 320x112 descriptor rather than 320x108. The
     // composite shader samples every plane with the same normalized uv and
-    // leaves the half-size difference to the sampler, which is only correct
-    // when chroma is *exactly* half: with four rows of padding, uv.y = 1.0
-    // reads past the image into zeros, and zero chroma over white luma decodes
-    // through BT.601 to (0.29, 1.0, 0.08) — the saturated green line seen
-    // across the bottom edge of the video. Measured on the 640x216 overlay;
-    // the luma plane itself has no padding (137888 of 138240 bytes nonzero,
-    // under one row).
+    // leaves the half-size difference to the sampler, which is only correct when
+    // chroma is *exactly* half: with four rows of padding, uv.y = 1.0 reads past
+    // the image into zeros, and zero chroma over white luma decodes through
+    // BT.601 to (0.29, 1.0, 0.08) -- the saturated green line along the bottom
+    // edge of the video.
     //
     // Cropping rather than scaling uv in the shader keeps the sampler's
     // normalized mapping right by construction and costs no constant-buffer
-    // plumbing. Only ever shrinks, so a plane already at or under the logical
-    // size is left alone. Planes 1 and 2 are Cr and Cb; plane 0 is luma and
-    // plane 3 the alpha, both full resolution.
+    // plumbing. Only ever shrinks. Planes 1 and 2 are Cr and Cb; 0 is luma and 3
+    // the alpha, both full resolution.
     if ((s == 1 || s == 2) && dc.planes[0]) {
       const uint32_t chroma_w = (dc.planes[0]->width + 1) / 2;
       const uint32_t chroma_h = (dc.planes[0]->height + 1) / 2;
@@ -1703,14 +1539,14 @@ bool PrepareBinkPlanes(mx::hle::DrawCall& dc, uint32_t device, uint8_t* base) {
   }
   // WHICH SURFACE the composite actually targets, reported once per distinct
   // target. This is the last inference standing in the EDRAM-aliasing case: the
-  // videos were attributed to 0x2175DC60 only because that surface takes
-  // exactly 2 draws a frame, matching the 2 Bink composites. Resemblance, not
-  // evidence -- and dc.render_target_object is assigned 45 lines above this, so
-  // the binding can simply be stated instead.
+  // videos were attributed to 0x2175DC60 only because that surface takes exactly
+  // 2 draws a frame, matching the 2 Bink composites -- resemblance, not evidence
+  // -- and dc.render_target_object is assigned 45 lines above, so the binding can
+  // simply be stated.
   //
-  // The comparison it settles: the 1280x430 FE_Smoke resolve names 0x2123C1D8
-  // as its source. If the composite targets a DIFFERENT object at the same
-  // EDRAM base, the resolve is copying a surface the video was never drawn into.
+  // The comparison it settles: the 1280x430 FE_Smoke resolve names 0x2123C1D8 as
+  // its source. If the composite targets a DIFFERENT object at the same EDRAM
+  // base, the resolve is copying a surface the video was never drawn into.
   {
     static std::mutex s_tmu;
     static std::set<uint32_t> s_targets;
@@ -1745,42 +1581,29 @@ bool PrepareBinkPlanes(mx::hle::DrawCall& dc, uint32_t device, uint8_t* base) {
   return true;
 }
 
-// FINDING 2026-08-17 — THIS FUNCTION'S RESULT IS SAMPLED BY NO DRAW.
+// FINDING -- THIS FUNCTION'S RESULT IS SAMPLED BY NO DRAW.
 //
-// It picks the ONE texture a tex*col stand-in samples, by scoring the shader's
-// candidate fetches against each other. That mattered when untranslated shaders
-// were common. Measured over mx_1282..mx_1285, it no longer reaches anything:
+// It picks the ONE texture a tex*col stand-in samples, which mattered when
+// untranslated shaders were common. Measured, it no longer reaches anything:
 //
 //   stand-in gate: reached 314000, will_stand_in 56138, pixel_shader==0 56138
 //
 // The two are IDENTICAL, so every stand-in draw is a no-handle draw -- and for
-// those this function is never called at all: there is no shader on the draw
-// and none at device+0x3244 either, so ReadBoundPixelShader returns at
-// `if (!candidate)` before reaching it. Meanwhile `no-hlsl` is 0 in every run,
-// so a draw that HAS a shader always translates, and a translated draw carries
-// its textures in pixelTextures and binds them itself (d3d12_game.cpp:4059).
+// those this function is never called: ReadBoundPixelShader returns at
+// `if (!candidate)` first. Meanwhile `no-hlsl` is 0 in every run, so a draw that
+// HAS a shader always translates and binds its own textures. A consumer would
+// have to have a shader AND fail to translate; that set is empty.
 //
-// A consumer would have to have a shader (so this runs) AND fail to translate
-// (so it samples d.texture). That set is empty.
+// A grading instrument lived here briefly and confirmed the picks are often junk
+// -- a 1x1 kR16Float, a 129x129 terrain clipmap, all scored as colour sources.
+// **Real, and inert.** Removed rather than kept, because a counter that can only
+// read zero is the thing this codebase keeps being bitten by. Do not rebuild it
+// without re-checking the gate numbers above.
 //
-// A grading instrument lived here briefly and confirmed the picks are often
-// junk -- a 1x1 kR16Float, a 129x129 terrain clipmap, a 1280x720 kR32Float, all
-// scored as colour sources. **Real, and inert.** Removed rather than kept,
-// because a counter that can only ever read zero is the thing this codebase
-// keeps being bitten by. Do not rebuild it without first re-checking the gate
-// numbers above.
-//
-// The last way it could still have mattered is CLOSED, also negative.
-// d.texture selects the PSO SAMPLER VARIANT (point/linear, mip mode) at
-// d3d12_game.cpp:4390, which looked like a path a bad pick could reach even on
-// a translated draw. It cannot: the translated branch at d3d12_game.cpp:4223
-// binds its own root signature, heaps and samplers (BindTranslatedSamplers) and
-// ends in `continue` at :4301 — everything below, `++m_standInDraws` included,
-// is stand-in only. So the variant is computed from d.texture exclusively for
-// draws that never called this function.
-//
-// Net: nothing this function returns is sampled, and nothing it returns selects
-// a sampler. It is vestigial in full.
+// The last way it could have mattered is CLOSED, also negative: d.texture
+// selects the PSO SAMPLER VARIANT, but the translated branch binds its own root
+// signature, heaps and samplers and ends in `continue` -- everything below is
+// stand-in only.
 bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
                                 uint8_t* base,
                                 mx::hle::PixelTextureBinding& out) {
@@ -1827,11 +1650,9 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
          source.host_format == mx::hle::HostTextureFormat::kR32Float ||
          source.host_format == mx::hle::HostTextureFormat::kRg8 ||
          // The G-buffer formats join the list on the strongest version of the
-         // same reasoning: they are not merely unlikely to be base colour,
-         // they are render-target storage by construction -- the guest's own
-         // format table only ever asks for them with D3DUSAGE_RENDERTARGET.
-         // An unmapped copy of one is guest memory the skipped dispatch never
-         // wrote.
+         // same reasoning: they are not merely unlikely to be base colour, they
+         // are render-target storage by construction -- the guest's own format
+         // table only ever asks for them with D3DUSAGE_RENDERTARGET.
          source.host_format == mx::hle::HostTextureFormat::kRg16Float ||
          source.host_format == mx::hle::HostTextureFormat::kRg16Unorm ||
          source.host_format == mx::hle::HostTextureFormat::kRg16Snorm ||
@@ -1839,27 +1660,22 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
          source.host_format == mx::hle::HostTextureFormat::kRgba16Snorm ||
          source.host_format == mx::hle::HostTextureFormat::kRg32Float))
       continue;
-    // An 8x8 immutable texture is a lookup table, not a material. Both that
-    // this front end owns are ordered-dither matrices the guest thresholds
-    // against for stipple transparency (RenderDoc texture 1316, 8x8 BC1, and
-    // the 8x8 k_4_4_4_4 at s12 of shader 0x216A8C20), and the generic host
-    // pixel shader has no threshold step — it samples whatever wins and shows
-    // it, which is how a Bayer checkerboard ended up painted across the main
-    // menu. The tie-break below covers the case where a real texture is also
-    // present; this covers the case where it is not, and falling through to
-    // the colour-only pipeline is the honest answer. Cut measured, not
-    // guessed: across a front-end run the smallest immutable winner other
-    // than these two is 64x8.
+    // An 8x8 immutable texture is a lookup table, not a material. Both that this
+    // front end owns are ordered-dither matrices the guest thresholds against
+    // for stipple transparency, and the generic host pixel shader has no
+    // threshold step -- it samples whatever wins and shows it, which is how a
+    // Bayer checkerboard ended up painted across the main menu. The tie-break
+    // below covers the case where a real texture is also present; this covers
+    // the case where it is not. Cut measured, not guessed: the smallest
+    // immutable winner other than these two is 64x8.
     if (!mapped_render_target && uint64_t(source.width) * source.height <= 64)
       continue;
-    // A mapped render target is authoritative storage, but it is not normally
-    // the visible base colour of a material. Multi-input world shaders often
-    // combine one or more scene/intermediate targets with immutable colour
-    // atlases. Giving mapped targets absolute priority made those shaders
-    // sample a black native-mode intermediate instead of their BC1 diffuse
-    // texture. Prefer normalized immutable colour assets when both kinds are
-    // present. The observed final compositor is handled explicitly above and
-    // still selects its mapped s0 scene input.
+    // A mapped render target is authoritative storage, but not normally the
+    // visible base colour of a material. Multi-input world shaders often combine
+    // scene/intermediate targets with immutable colour atlases, and giving
+    // mapped targets absolute priority made those sample a black native-mode
+    // intermediate instead of their BC1 diffuse. The observed final compositor
+    // is handled explicitly above and still selects its mapped s0 scene input.
     int score = mapped_render_target ? 40 :
                 (candidate.unnormalized ? 0 : 200);
     switch (source.host_format) {
@@ -1915,12 +1731,11 @@ bool ResolvePixelBindingForDraw(uint32_t handle, uint32_t device,
         score += mapped_render_target ? 10 : 0;
         break;
     }
-    // Ties were previously broken by fetch program order, which is not
-    // evidence of anything, and it lost a 2048x2048 colour atlas to an 8x8
-    // ordered-dither matrix that happened to be fetched first (shader
-    // 0x216A8C20: s12 8x8 k_4_4_4_4 and s11 2048x2048 RGBA8, both scoring
-    // 400). Between two candidates the descriptor cannot otherwise separate,
-    // the larger one is the material and the smaller one is a lookup table.
+    // Ties were previously broken by fetch program order, which is not evidence
+    // of anything, and it lost a 2048x2048 colour atlas to an 8x8 ordered-dither
+    // matrix that happened to be fetched first (both scoring 400). Between two
+    // candidates the descriptor cannot otherwise separate, the larger one is the
+    // material and the smaller one is a lookup table.
     const uint64_t texels = uint64_t(source.width) * source.height;
     if (score < best_score || (score == best_score && texels <= best_texels))
       continue;
@@ -2021,10 +1836,8 @@ bool ReadBoundPixelShader(uint32_t device, uint8_t* base, uint32_t& handle,
 
 // Copy one guest allocation into `dst` at `at`, trying each address mirror in
 // turn and refusing any that is not resident for its whole extent. Returns the
-// mirror that worked, or 0.
-//
-// `base` looks unused and is not: REX_RAW_ADDR expands to reference a variable
-// of that name in scope.
+// mirror that worked, or 0. `base` looks unused and is not: REX_RAW_ADDR expands
+// to reference a variable of that name in scope.
 uint32_t CopyGuestExtent(uint32_t address, uint32_t bytes, uint8_t* base,
                          std::vector<uint8_t>& dst, size_t at) {
   if (!address || !bytes) return 0;
@@ -2051,14 +1864,12 @@ uint64_t g_mipCopyFailed = 0;
 // The base level, then the mip chain appended straight after it.
 //
 // The two are SEPARATE guest allocations at unrelated addresses, so each is
-// resolved through the mirrors independently -- they need not agree on which
-// one is mapped. Concatenating them here rather than handing the decoder two
-// buffers is what keeps DecodeHleTexture2D's signature, and its three call
-// sites, unchanged: the level plan already carries offsets into this blob.
+// resolved through the mirrors independently -- they need not agree on which one
+// is mapped. Concatenating them here rather than handing the decoder two buffers
+// keeps DecodeHleTexture2D's signature and its three call sites unchanged.
 //
-// A mip allocation that will not resolve is not fatal. The base is copied
-// regardless and the decoder truncates the chain to what it can read, so an
-// unmapped chain costs mip levels rather than the texture.
+// A mip allocation that will not resolve is not fatal: the base is copied
+// regardless and the decoder truncates the chain to what it can read.
 bool CopyTexturePhysical(const mx::hle::HleTextureSource& source, uint8_t* base,
                          std::vector<uint8_t>& out) {
   const uint32_t mip_bytes =
@@ -2077,26 +1888,23 @@ bool CopyTexturePhysical(const mx::hle::HleTextureSource& source, uint8_t* base,
 
 // Resolve the texture a translated shader reads at one compact sampler slot.
 //
-// Deliberately NOT PrepareDrawTexture's logic. That function applies a policy
-// gate — kR8, kR16, kBc5 and the float formats are decoded and then refused as
-// "not an immutable colour asset" — which is correct for the stand-in shader,
-// where a single-channel texture bound as base colour would paint the surface
-// grey. It is wrong here. The guest's own shader knows that channel is a
-// coverage mask or a normal map and says so in its arithmetic; refusing to bind
-// it leaves the shader sampling nothing.
+// Deliberately NOT PrepareDrawTexture's logic. That function refuses kR8, kR16,
+// kBc5 and the float formats as "not an immutable colour asset", which is
+// correct for the stand-in shader, where a single-channel texture bound as base
+// colour would paint the surface grey. It is wrong here: the guest's own shader
+// knows that channel is a coverage mask or a normal map and says so in its
+// arithmetic. FMT_8 is the format fonts use, which is why glyph quads came out
+// as filled blocks.
 //
-// FMT_8 is the format fonts use, which is why glyph quads came out as filled
-// blocks: the texture decoded fine and was then withheld from the shader that
-// knew what to do with it.
+// Fills exactly one of the two per-slot outputs: a resolved render target if the
+// guest bound one there, otherwise a decoded CPU payload. Returns false when
+// neither could be produced, and the caller decides whether that is fatal.
 //
-// Fills exactly one of the two per-slot outputs: a resolved render target if
-// the guest bound one there, otherwise a decoded CPU payload. Returns false
-// when neither could be produced, and the caller decides whether that is fatal.
-// Why a sampler slot could not be filled. A slot that fails sends the WHOLE
-// draw back to the tex*col stand-in, so these are the draws the guest's own
-// pixel shader was translated for and then not used on -- 26,844 of them in
-// mx_705, which is essentially every stand-in draw in that run. Six of the
-// seven exits below were previously silent, and the one that logged fired once.
+// Below: why a sampler slot could not be filled. A slot that fails sends the
+// WHOLE draw back to the tex*col stand-in, so these are the draws the guest's
+// own pixel shader was translated for and then not used on -- essentially every
+// stand-in draw in one measured run. Six of the seven exits were previously
+// silent, and the one that logged fired once.
 uint64_t g_slotFailRange = 0, g_slotFailFetch = 0, g_slotFailDescribe = 0;
 uint64_t g_slotFailCopy = 0, g_slotFailDecode = 0;
 uint64_t g_slotBoundZero = 0;   // all-zero, and bound anyway -- see below
@@ -2139,25 +1947,24 @@ void ReportSlotFailures() {
 // A texture that DECODED but is entirely zero, and a sampler the guest never
 // bound, are both bound rather than refused -- deliberately, see the notes in
 // ResolvePixelSlotTexture. Their counters used to be printed only inside
-// ReportSlotFailures, which returns early when the hard-failure total is zero.
-// In mx_736 nothing failed, so neither number was ever printed once: draws
-// painting solid black were invisible in the log. They get their own line,
-// fired off their own total.
+// ReportSlotFailures, which returns early when the hard-failure total is zero,
+// so in a run where nothing failed neither number was ever printed and draws
+// painting solid black were invisible. They get their own line, off their own
+// total.
 uint64_t g_boundZeroReported = 0;
 
 // One entry per distinct all-zero texture, so the offenders can be named rather
-// than counted. The set is small -- nine keys covered 10,890 draws in mx_706 --
-// so it is printed in full. `recovered` is the question the log has to answer:
-// a key that later decodes non-blank was a texture sampled before the guest
-// finished streaming it, which is a caching defect; one that never recovers is
-// a genuinely blank guest texture and a different investigation.
-// Distinguishes the host upload of a blank decode from the host upload of the
-// same texture once it has real contents. Both would otherwise share the
-// fetch-word key that EnsureGameTexture caches on, and the recovered texture
-// would hit the black resource uploaded before it.
-// The value an unbound Xenos sampler actually returns: one black texel. Shared
-// by every path that has to bind SOMETHING for a slot the guest did not supply,
-// so those paths cannot drift into fabricating different placeholders.
+// than counted -- nine keys covered 10,890 draws in one run, so it is printed in
+// full. `recovered` is the question the log has to answer: a key that later
+// decodes non-blank was sampled before the guest finished streaming it, which is
+// a caching defect; one that never recovers is a genuinely blank guest texture.
+//
+// The blank upload gets a MARKED key of its own, because EnsureGameTexture caches
+// on payload->key too and the recovered texture must not hit the black resource.
+//
+// UnboundTexturePayload is the value an unbound Xenos sampler actually returns:
+// one black texel, shared by every path that has to bind SOMETHING, so those
+// paths cannot drift into fabricating different placeholders.
 std::shared_ptr<mx::hle::HleTexturePayload> UnboundTexturePayload() {
   static const auto s_unbound = [] {
     auto p = std::make_shared<mx::hle::HleTexturePayload>();
@@ -2258,14 +2065,14 @@ void ReportBoundZero() {
 // once. Two open questions read straight off it: whether any swizzle component
 // is 6 or 7 -- values D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING does not define,
 // so the channel would be undefined rather than wrong -- and whether the
-// k_8_8_8_8 -> R8G8B8A8 mapping is relying on a swizzle that actually performs
-// the BGRA rotation.
-// Also censused here: TEX_FORMAT_COMP / GPUSIGN, which the describe step reads
-// but nothing acts on. Three of its four values change what a fetch returns --
-// kSigned is two's complement (an SNORM host format), kUnsignedBiased is
-// 2*c-1, and kGamma is sRGB linearized on sample -- so any of them appearing
-// means we hand the shader the wrong numbers, quietly. This says whether the
-// game uses them at all before any of it is built.
+// k_8_8_8_8 -> R8G8B8A8 mapping relies on a swizzle that performs the BGRA
+// rotation.
+//
+// Also censused: TEX_FORMAT_COMP / GPUSIGN, which the describe step reads but
+// nothing acts on. Three of its four values change what a fetch returns --
+// kSigned is two's complement, kUnsignedBiased is 2*c-1, kGamma is sRGB
+// linearized on sample -- so any of them appearing means we hand the shader the
+// wrong numbers, quietly.
 void NoteSwizzleCensus(const mx::hle::HleTextureSource& source) {
   static std::set<uint64_t> s_seen;
   const uint64_t pair = (uint64_t(source.guest_format) << 32) |
@@ -2286,16 +2093,14 @@ void NoteSwizzleCensus(const mx::hle::HleTextureSource& source) {
               source.signs ? "  <-- NOT PLAIN UNSIGNED, we ignore this" : "");
 }
 
-// How many slot binds actually carry a sign mode we do not honour, split by
-// guest format. The census above says which formats do it; this says whether it
-// is one decorative texture or the whole scene, which is the difference between
-// closing the question and building a signed decode path.
+// How many slot binds carry a sign mode we do not honour, split by guest format.
+// The census above says which formats do it; this says whether it is one
+// decorative texture or the whole scene, which is the difference between closing
+// the question and building a signed decode path.
 //
-// Float formats are excluded deliberately. A TextureSign on k_*_FLOAT is a
-// no-op -- the data is already signed float, and the reference cache only needs
-// a separate host texture when a FIXED-POINT format has no signed host
-// equivalent (cache.h:488, IsSignedVersionSeparateForFormat). Counting them
-// would inflate the number with binds that need nothing done.
+// Float formats are excluded deliberately: a TextureSign on k_*_FLOAT is a no-op,
+// and the reference cache only needs a separate host texture when a FIXED-POINT
+// format has no signed host equivalent (cache.h:488).
 bool IsFloatGuestFormat(uint32_t guest_format) {
   switch (xn::TextureFormat(guest_format)) {
     case xn::TextureFormat::k_16_FLOAT:
@@ -2310,16 +2115,14 @@ bool IsFloatGuestFormat(uint32_t guest_format) {
   }
 }
 
-// Formats whose HOST VIEW is already chosen by signedness, in
-// DescribeHleTexture2D: each is `any_component_signed ? *Snorm : *Unorm`
-// (d3d9_texture.cpp:663, :719, :723). For these, kSigned IS applied -- by
-// picking a SNORM view rather than by converting anything -- so counting them
-// as unhandled reports a defect that does not exist.
+// Formats whose HOST VIEW is already chosen by signedness in
+// DescribeHleTexture2D, each `any_component_signed ? *Snorm : *Unorm`. For these
+// kSigned IS applied -- by picking a SNORM view rather than converting anything
+// -- so counting them as unhandled reports a defect that does not exist.
 //
 // Safe because swizzled-signed implies raw-signed: SwizzleTextureSigns only
-// routes existing guest components to host channels, or substitutes literal
-// 0/1 which it calls unsigned. So a host channel can only come out signed if
-// some guest component was, which is exactly what any_component_signed tests.
+// routes existing guest components to host channels, or substitutes literal 0/1
+// which it calls unsigned.
 bool GuestFormatTakesSignedHostView(uint32_t guest_format) {
   switch (xn::TextureFormat(guest_format)) {
     case xn::TextureFormat::k_16:
@@ -2346,32 +2149,22 @@ void NoteSignedBind(const mx::hle::HleTextureSource& source) {
 // Did we read the mip chain from the RIGHT PLACE?
 //
 // A wrong offset, pitch or packed-tail displacement does not fail: it returns
-// plausible bytes from somewhere else in the allocation, and the result is only
-// visible on minified surfaces at a distance, which is exactly where nobody
-// looks closely. Neither the blank-texture counters nor the decode's own bounds
-// check can see it -- the same blind spot that let the packed base level read
-// another texture's bytes for months.
+// plausible bytes from elsewhere in the allocation, visible only on minified
+// surfaces at a distance. Neither the blank-texture counters nor the decode's
+// own bounds check can see it -- the same blind spot that let the packed base
+// level read another texture's bytes for months.
 //
-// So measure it instead. The guest's mips are a reduction of their parent, so
+// So measure it. The guest's mips are a reduction of their parent, so
 // box-filtering level n-1 down by two should land close to level n. Small mean
-// absolute difference (call it under ~12 of 255) means the addressing is right;
-// two uncorrelated images average about 85. Uncompressed formats only -- block
-// compression cannot be averaged without decoding it -- but the addressing
-// maths is parameterised by block size rather than special-cased per format, so
-// what holds here holds for BC too. The BC formats are checked in RenderDoc.
-// The mean colour of one texel or one compressed block, as an RGB triple in
-// 0..255, or false when this format is not sampled by the check.
+// absolute difference (under ~12 of 255) means the addressing is right; two
+// uncorrelated images average about 85.
 //
 // Block-compressed formats have to be included or the check is close to
-// worthless: this game's art is overwhelmingly BC1/BC3/BC5, and a check that
-// only understands kRgba8 would have reported nothing at all while the very
-// textures the mip chain was built for went unverified.
-//
-// A block is not decoded, only averaged. Every BC variant stores two endpoints
-// at a known offset and interpolates between them, so the midpoint of the
-// endpoints approximates the block's mean well enough to tell "a smaller
-// version of its parent" from "bytes belonging to something else" -- which is
-// the only question being asked.
+// worthless: this game's art is overwhelmingly BC1/BC3/BC5. A block is not
+// decoded, only averaged -- every BC variant stores two endpoints at a known
+// offset and interpolates between them, so the midpoint approximates the block's
+// mean well enough to tell "a smaller version of its parent" from "bytes
+// belonging to something else", which is the only question being asked.
 bool BlockMeanColor(mx::hle::HostTextureFormat format, const uint8_t* p,
                     uint32_t out[3]) {
   using F = mx::hle::HostTextureFormat;
@@ -2443,15 +2236,13 @@ void NoteMipLevelAgreement(const mx::hle::HleTexturePayload& payload) {
     // An absolute threshold cannot do this job. The guest does not box-filter
     // its mips, block endpoints only approximate a block's mean, and small
     // levels are a small sample -- so a perfectly correct level can score 30
-    // while another correct one scores 3. The first version of this check
-    // called half the textures SUSPECT on exactly that basis, including two
-    // 512x256 BC1 textures whose addressing maths is necessarily identical.
+    // while another correct one scores 3. The first version called half the
+    // textures SUSPECT on exactly that basis.
     //
-    // The CONTROL is what settles it, with no magic number: whatever the
-    // content does to the aligned score, it does to the misaligned one too.
-    // Aligned much lower than control means this level really is its parent
-    // reduced. The two being equal is the signature of reading someone else's
-    // bytes.
+    // The CONTROL settles it with no magic number: whatever the content does to
+    // the aligned score, it does to the misaligned one too. Aligned much lower
+    // than control means this level really is its parent reduced; the two being
+    // equal is the signature of reading someone else's bytes.
     uint64_t sum = 0, control_sum = 0, n = 0;
     for (uint32_t y = 0; y < cur.rows; ++y) {
       for (uint32_t x = 0; x < cur_cols; ++x) {
@@ -2510,12 +2301,9 @@ void NoteMipLevelAgreement(const mx::hle::HleTexturePayload& payload) {
               worst, report);
 }
 
-// The chain census, and the deliberate gaps in it.
-//
-// Called per BIND, deliberately. The first version of this hung off the decode
-// path, which only runs on a cache miss -- so in a menu-only run it printed
-// once, three seconds in, and never again. The numbers it did print (74
-// textures described, none with a chain) said nothing about the run at all.
+// The chain census, called per BIND, deliberately. The first version hung off
+// the decode path, which only runs on a cache miss -- so in a menu-only run it
+// printed once, three seconds in, and never again.
 void NoteMipCensus() {
   static std::atomic<uint64_t> s_binds{0};
   const uint64_t n = s_binds.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -2543,12 +2331,11 @@ void NoteMipCensus() {
       }
     }
   }
-  // Printed with every census tick, including when every field is zero.
-  // "This title binds no 1D textures"
-  // is a finding, and it is the finding that decides whether the wide-1D remap
-  // is worth writing -- but only if the line appears at all. A census that
-  // stays silent when it counts nothing is indistinguishable from one that was
-  // never wired up.
+  // Printed with every census tick, including when every field is zero. "This
+  // title binds no 1D textures" is a finding, and it is the finding that decides
+  // whether the wide-1D remap is worth writing -- but only if the line appears at
+  // all. A census that stays silent when it counts nothing is indistinguishable
+  // from one that was never wired up.
   {
     const mx::hle::HleOneDCensus d = mx::hle::HleOneDStats();
     REXLOG_INFO("d3d9: 1D textures: {} described (refused: tiled {}, packed "
@@ -2576,12 +2363,12 @@ void NoteMipCensus() {
       c.mip_filter_point, c.lod_bias_set, levels);
 }
 
-// Blast radius of the packed mip tail. A texture whose base is packed used to
-// be read from the origin of the tail rather than from its own offset within
-// it, so every one of these was returning another texture's bytes. Counted by
-// extent and format so the population is visible rather than inferred from the
-// one 8x8 DXT1 lookup that made it findable -- that one multiplies the menu's
-// deferred lighting, which is why the whole scene came out black.
+// Blast radius of the packed mip tail. A texture whose base is packed used to be
+// read from the origin of the tail rather than from its own offset within it, so
+// every one of these was returning another texture's bytes. Counted by extent
+// and format so the population is visible rather than inferred from the one 8x8
+// DXT1 lookup that made it findable -- that one multiplies the menu's deferred
+// lighting, which is why the whole scene came out black.
 void NotePackedBase(const mx::hle::HleTextureSource& source) {
   if (!source.packed_offset_x_blocks && !source.packed_offset_y_blocks) return;
   static std::map<uint64_t, uint64_t> s_seen;
@@ -2614,20 +2401,18 @@ void NoteUnhandledSign(uint32_t guest_format, uint32_t mode) {
 
 // `vertex` selects which stage's slot arrays the result lands in. Everything
 // else -- the fetch-constant read, the resolve-snapshot match, the blank-decode
-// retry, every counter -- is identical for the two stages, because the question
-// "what texture is bound to guest sampler N" does not depend on who is asking.
-// Splitting this into two functions would have meant two copies of 250 lines
-// that must agree.
+// retry, every counter -- is identical for the two stages, because "what texture
+// is bound to guest sampler N" does not depend on who is asking. Splitting this
+// would have meant two copies of 250 lines that must agree.
 //
 // dc.pixel_shader_handle is still read for the blank-texture key regardless of
-// stage: that key identifies the DRAW's material, and a vertex fetch of the
-// same guest memory wants the same memoisation.
-// `stage_handle` names the shader whose slot this is, for diagnostics only.
-// The vertex caller must pass it: `dc.vertex_shader_handle` is assigned in a
+// stage: that key identifies the DRAW's material.
+//
+// `stage_handle` names the shader whose slot this is, for diagnostics only. The
+// vertex caller must pass it: `dc.vertex_shader_handle` is assigned in a
 // different function that has not necessarily run yet, so reading it here
 // printed `SLOT MAP vs 0x00000000` and left every vertex shader's slots hashing
-// to the same dedupe key -- the third variant of the same mistake in one
-// session, after the renderer census and the uniform-decode line.
+// to the same dedupe key.
 bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
                              uint32_t guest_sampler, uint32_t device,
                              uint8_t* base, bool vertex,
@@ -2654,25 +2439,23 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   }
 
   // A slot the guest points at a resolve result: the renderer samples the live
-  // host target, exactly as the single-texture path already does.
-  // A destination the GPU wrote whole is a render target: its guest memory is
-  // meaningless and the snapshot is the only truthful answer, so take it before
-  // spending a decode. 25 of the 26 destinations in mx_780 are this case.
+  // host target, exactly as the single-texture path does.
   //
-  // A destination the GPU wrote only part of is the interesting one, and it is
-  // NOT a choice between a good answer and a bad one -- both sources are
-  // partial. The 2048x2048 menu atlas has three 256x256 tiles of real rendered
-  // content along its top edge and nothing else, while guest memory for it
-  // decodes to zeros. Refusing the snapshot outright, as the first version of
-  // this rule did, threw those three tiles away 2272 times and bound zeros
-  // instead. So: try memory first, and fall back to the snapshot when memory
-  // has nothing -- which also keeps the blank-retry path alive, so the day the
-  // guest fills that memory it wins on its own.
+  // A destination the GPU wrote WHOLE is a render target -- its guest memory is
+  // meaningless and the snapshot is the only truthful answer -- so take it before
+  // spending a decode.
   //
-  // "Has nothing" meant all-zero until 2026-08-14, and that read the terrain
-  // heightmap as real data for months: nothing CPU-writes it, so its memory
-  // decodes to a uniform 0xFF rather than to zeros. A UNIFORM decode counts as
-  // nothing too, but only here, where a partly-written snapshot is standing by.
+  // A destination the GPU wrote only PART of is not a choice between a good
+  // answer and a bad one; both sources are partial. The 2048x2048 menu atlas has
+  // three 256x256 tiles of real content and nothing else, while its guest memory
+  // decodes to zeros, so refusing the snapshot outright threw those tiles away
+  // 2272 times. Try memory first, fall back to the snapshot when memory has
+  // nothing -- which also keeps the blank-retry path alive.
+  //
+  // "Has nothing" meant all-zero, and that read the terrain heightmap as real
+  // data for months: nothing CPU-writes it, so its memory decodes to a uniform
+  // 0xFF rather than zeros. A UNIFORM decode counts as nothing too, but only
+  // here, where a partly-written snapshot is standing by.
   uint32_t partial_snapshot_object = 0;
   const auto& texture_state = DeviceState().texture[guest_sampler];
   // Unconditional, and BEFORE the resolve-destination branch. The material's
@@ -2693,11 +2476,10 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     if (ResolvedDestinationIsMostlyWritten(texture_state.object)) {
       if (resolve_entry) ++resolve_entry->slot_snapshot;
       // Logged HERE as well as at the decode below, because this path RETURNS.
-      // The first cut of the SLOT MAP diagnostic sat only after this point and
-      // so reported resolved=0 on every line it printed -- blind to precisely
-      // the slots that bind a snapshot, which are the ones worth seeing. A slot
-      // simply went missing from the table instead, which reads like it was
-      // never bound. See the note at the other call for why this matters.
+      // The first cut of SLOT MAP sat only after this point and so reported
+      // resolved=0 on every line -- blind to precisely the slots that bind a
+      // snapshot. A slot simply went missing from the table instead, which reads
+      // like it was never bound.
       static std::mutex s_mu;
       static std::set<uint64_t> s_seen;
       // Stage-qualified, for the reason spelled out at the function header.
@@ -2709,10 +2491,8 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
         // Bounded by the dedupe -- one line per distinct (shader, slot), which
         // is tens of shaders times a handful of slots. A tighter cap filled up
         // on early menu shaders and cut off before the material under
-        // investigation ever bound.
-        // Raised with the renderer's census cap, and for the same
-        // reason: 632 of these 1024 were spent in the menu, so a level's
-        // bindings arrive against a nearly full budget.
+        // investigation ever bound: 632 of 1024 were spent in the menu, so a
+        // level's bindings arrive against a nearly full budget.
         fresh = s_seen.size() < 4096 && s_seen.insert(key).second;
       }
       // Read regardless of whether this line is fresh: the swizzle is no
@@ -2732,11 +2512,10 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
       if (fresh) {
         // CLAMP alongside the swizzle. Both come from the same fetch dword, and
         // leaving it out made a run that had just changed the clamp behaviour
-        // unable to say what clamp it chose -- a value added without its
-        // readout, which is the gap this log exists to close. Prints the raw
-        // 3-bit guest modes AND the wrap/clamp they resolve to, because
-        // SamplerVariantFor's rule (>= 2 clamps, kRepeat 0 / kMirroredRepeat 1
-        // wrap) is the thing worth checking, not the enum value.
+        // unable to say what clamp it chose. Prints the raw 3-bit guest modes
+        // AND the wrap/clamp they resolve to, because SamplerVariantFor's rule
+        // (>= 2 clamps; kRepeat 0 / kMirroredRepeat 1 wrap) is the thing worth
+        // checking, not the enum value.
         const uint32_t cx = have_swz ? ((sfetch[0] >> 10) & 7u) : 0u;
         const uint32_t cy = have_swz ? ((sfetch[0] >> 13) & 7u) : 0u;
         const uint32_t mag = have_swz ? ((sfetch[3] >> 19) & 3u) : 0u;
@@ -2762,41 +2541,25 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
       // The renderer has no fetch constant of its own for a snapshot slot; this
       // is the only place the guest swizzle is in hand. See the field's note.
       //
-      // AND THE CLAMP MODE, packed into bits 12-13. The swizzle is 12 bits, the
-      // field is a uint16_t, and nothing reads the top nibble -- BindTranslated-
-      // Textures declares the array and only mentions it in a comment, so there
-      // is no consumer to break. That beats threading a parallel array through
-      // DrawCall, graphics_system and AddGameDraw for two bits.
+      // AND THE CLAMP MODE, packed into bits 12-13, and THE FILTER into bit 14.
+      // Nothing reads the top nibble of this uint16_t, so that beats threading a
+      // parallel array through DrawCall, graphics_system and AddGameDraw.
       //
-      // Why it is needed: BindTranslatedSamplers gave every snapshot slot a
-      // HARDCODED clamp, on the reasoning that a snapshot "is sampled 1:1" and
-      // has "no fetch constant to read a mode off". True for a full-screen
-      // post-process copy; false for the terrain ATLAS, which is sampled with
-      // computed UVs and needs REPEAT. With clamp, tile index 10 gives U =
-      // 1.283, pins to the right edge, and lands in an empty tile -- the black
-      // ground. And the fetch constant is plainly readable: it is the same one
-      // the swizzle on this line comes from.
+      // Why both are needed: BindTranslatedSamplers gave every snapshot slot a
+      // HARDCODED clamped POINT, on the reasoning that a snapshot "is sampled
+      // 1:1" and has "no fetch constant to read a mode off". True for a
+      // full-screen post-process copy; false for the terrain ATLAS, which is
+      // sampled with computed UVs. With clamp, tile index 10 gives U = 1.283,
+      // pins to the right edge and lands in an empty tile -- the black ground.
+      // With POINT, the minifying UVs get nearest-neighbour, which is the hard
+      // corduroy aliasing on every mid-distance dune. And the fetch constant is
+      // plainly readable: it is the same one the swizzle comes from.
       //
-      // dword 0 layout (xenia-edge gpu/xenos.h): type:2 sign_xyzw:8 then
-      // clamp_x:3 at bit 10 and clamp_y:3 at bit 13. SamplerVariantFor's rule
-      // is `>= 2 means clamp` (kRepeat 0 / kMirroredRepeat 1 wrap), applied
-      // here so both sites cannot drift apart on it.
-      //
-      // AND THE FILTER, bit 14, for exactly the same reason the clamp is here.
-      // BindTranslatedSamplers also hardcoded POINT for every snapshot slot,
-      // and "a snapshot is sampled 1:1" makes point and linear the same thing
-      // for a full-screen copy -- so the hardcode was invisible until an ATLAS
-      // came through it. ground-tiles-2.rdc: the terrain samples its 2048x2048
-      // tile atlas with computed, minifying UVs and gets nearest-neighbour,
-      // which is the hard corduroy aliasing on every dune in the mid-distance.
-      //
-      // dword 3: num_format:1, swizzle:12, exp_adjust:6, then mag_filter:2 at
-      // bit 19 and min_filter:2 at bit 21 (rex/graphics/xenos.h:1236-1242).
-      // kPoint is 0. The rule is d3d9_texture.cpp's, applied here so the two
-      // sites cannot drift: POINT only if EITHER filter asks for it.
-      // Unreadable fetch keeps the old hardcode -- clamped POINT -- rather than
-      // guessing; kPoint is 0, so `mag == 0 || min == 0` is "either asks for
-      // point", matching DescribeHleTexture2D's own rule.
+      // dword 0 (xenia-edge gpu/xenos.h): type:2 sign_xyzw:8, clamp_x:3 at bit
+      // 10, clamp_y:3 at 13. dword 3: num_format:1, swizzle:12, exp_adjust:6,
+      // mag_filter:2 at 19, min_filter:2 at 21; kPoint is 0. Both rules are
+      // applied here so the two sites cannot drift. An unreadable fetch keeps the
+      // old hardcode rather than guessing.
       out_swizzles[slot] =
           have_swz ? PackSnapshotSamplerWord(
                          swz, (sfetch[0] >> 10) & 7u, (sfetch[0] >> 13) & 7u,
@@ -2810,15 +2573,15 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   }
 
   uint32_t fetch[6] = {};
-  // dc.pixel_shader_handle is the handle AttachTranslatedPixelShader resolved
-  // for this DEVICE, not the thread-local one -- see the resolution above it --
-  // which is the handle whose load table may carry this sampler's descriptor.
-  // A REPLAYED DRAW BRINGS ITS OWN BINDING. The recorded command buffer
-  // writes texture fetch constants (Xenos 0x4800 + sampler*6) and the
-  // console sets textures from those, so for a replay this is the
-  // authoritative descriptor and the device shadow is not. Reading the
-  // live device instead put a rock texture on the rider; reading the
-  // RECORDING device left the palm leaf with a bush atlas.
+  // dc.pixel_shader_handle is the handle AttachTranslatedPixelShader resolved for
+  // this DEVICE, not the thread-local one, which is the handle whose load table
+  // may carry this sampler's descriptor.
+  //
+  // A REPLAYED DRAW BRINGS ITS OWN BINDING. The recorded command buffer writes
+  // texture fetch constants (Xenos 0x4800 + sampler*6) and the console sets
+  // textures from those, so for a replay that is authoritative and the device
+  // shadow is not. Reading the live device put a rock texture on the rider;
+  // reading the RECORDING device left the palm leaf with a bush atlas.
   if (fetch_override) {
     std::memcpy(fetch, fetch_override, sizeof(uint32_t) * 6);
   } else if (!ReadLiveTextureFetch(device, base, guest_sampler, fetch,
@@ -2827,20 +2590,16 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     ++g_slotFailFetchBySampler[guest_sampler];
     ReportSlotFailures();
     // The guest never bound anything to this sampler, and the shader reads it
-    // anyway. Measured over mx_710 the failures fall s5=2420 s6=304 s7=2420
-    // s8=2429 s9=2420 s13=4, with samplers 0-4 never failing once -- one shader
-    // family reading four slots this title does not bind. It is NOT the
-    // thread-local device state losing a binding, which would fail every
-    // sampler on the affected thread together rather than the same four.
+    // anyway. Measured, the failures fall s5=2420 s6=304 s7=2420 s8=2429 s9=2420
+    // s13=4 with samplers 0-4 never failing once -- one shader family reading
+    // four slots this title does not bind. NOT the thread-local device state
+    // losing a binding, which would fail every sampler on the affected thread
+    // together rather than the same four.
     //
     // Zero is what the hardware returns for a fetch constant whose type is not
-    // kTexture, so an unbound slot samples zero. Refusing instead sent the
-    // whole draw to the tex*col stand-in, discarding every OTHER slot's real
-    // shading over a slot whose value the shader may not even use -- the same
-    // trade already settled for all-zero textures, which cost 10,890 draws.
-    //
-    // This is a bound zero, not a fabricated colour: nothing here invents a
-    // plausible texture, it supplies the value an unbound fetch actually has.
+    // kTexture. Refusing instead sent the whole draw to the tex*col stand-in,
+    // discarding every OTHER slot's real shading over a slot the shader may not
+    // even use. This is a bound zero, not a fabricated colour.
     out_textures[slot] = UnboundTexturePayload();
     ++g_slotBoundUnbound;
     ReportBoundZero();
@@ -2859,10 +2618,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     // A fetch constant the reference calls invalid rather than unsupported.
     // Xenia drops the BINDING and keeps drawing -- its key stays invalid, the
     // sampler reads zero, and the guest's own shader still runs. Failing the
-    // draw here would be a strictly worse answer than the reference's:
-    // the stand-in discards every other slot's real shading over one slot the
-    // shader may not even use. Same trade as the unbound-sampler path above,
-    // for the same reason.
+    // draw here would be strictly worse. Same trade as the unbound-sampler path.
     if (source.sample_as_zero) {
       out_textures[slot] = UnboundTexturePayload();
       ++g_slotBoundUnbound;
@@ -2882,29 +2638,23 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // Six attempts to fingerprint a vegetation DRAW all over-matched (asset byte
   // sizes, a compound constant predicate, per-constant counts, a stride-16
   // corner table, the const mask, the stride-28 vertex layout). The texture is
-  // different: it is established, not guessed. treeeee.rdc event 31875 -- a
-  // bush billboard drawing into the 1280x720 scene -- sampled texture 23728,
-  // 2048x1024 BC3, and in FR_Dunes the ONLY 2048x1024 DXT4_5 assets are
-  // FR_DU_Eco_D and FR_DU_Eco_N, the impostor atlas pair. The fan palm's bark
-  // is likewise uniquely 256x1024 (DXT1 diffuse + DXN normal).
+  // established, not guessed: a bush billboard sampled a 2048x1024 BC3, and in
+  // FR_Dunes the ONLY 2048x1024 DXT4_5 assets are the impostor atlas pair. The
+  // fan palm's bark is likewise uniquely 256x1024.
   //
-  // So: does anything BIND the palm's bark while the tree is on screen? Its
-  // material decodes `via slot` every run yet no capture has ever held the
-  // texture, which is the contradiction this counts.
-  //
-  // MEASURED, run 1890, FR_Dunes driven up to a palm:
+  // So: does anything BIND the palm's bark while the tree is on screen?
+  // MEASURED, driving up to a palm:
   //     impostor atlas  63998 binds, climbing +2000 per interval
   //     palm bark           2 binds, never incrementing
-  // Two is the impostor BAKE -- diffuse and normal, once each. The bark is a
-  // trunk-only material that appears in no impostor, so two binds means the
-  // palm's 3D material NEVER reaches a scene draw. Vegetation in the scene is
-  // billboards, exclusively. This is the runtime half of the IDA result that
-  // only sub_823F82D0 (the bake) calls the 3D renderer sub_823F6960, and
-  // unlike the constant-mask censuses it cannot be blind to an entry point:
-  // it counts a texture bind, not a register read.
+  // Two is the impostor BAKE, once each for diffuse and normal. The bark is a
+  // trunk-only material in no impostor, so the palm's 3D material NEVER reaches
+  // a scene draw: vegetation in the scene is billboards, exclusively. This is
+  // the runtime half of the IDA result that only sub_823F82D0 (the bake) calls
+  // the 3D renderer, and unlike the constant-mask censuses it cannot be blind to
+  // an entry point -- it counts a texture bind, not a register read.
   //
-  // Formats: 18 = FMT_DXT1, 20 = FMT_4_5 (DXT4_5/BC3), 49 = FMT_DXN.
-  // Counts BINDS (per draw, per slot), not draws -- named as such on the line.
+  // Formats: 18 = FMT_DXT1, 20 = FMT_4_5 (DXT4_5/BC3), 49 = FMT_DXN. Counts
+  // BINDS (per draw, per slot), not draws.
   {
     static std::mutex s_vegMu;
     static uint64_t s_vegAtlas = 0, s_vegBark = 0, s_vegBinds = 0;
@@ -2933,42 +2683,27 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // WHICH guest surface does each sampler slot actually ask for?
   //
   // Traced from the rider's gear rendering green. Its material computes
-  // saturate(tex5.y + rcp(luminance(tex4))) and the saturate pins at 1, which
-  // zeroes the red channel. Red survives only if that luminance exceeds ~1.03.
+  // saturate(tex5.y + rcp(luminance(tex4))) and the saturate pins at 1, zeroing
+  // red unless that luminance exceeds ~1.03. tex4 resolves to the pre-pass band
+  // snapshot, whose six directional lights' red channels total 0.619 -- a hard
+  // ceiling requiring every dot product at 1.0 simultaneously, which opposing
+  // directions make impossible; measured 0.109.
   //
-  // tex4 resolves to the pre-pass band snapshot, whose content is written by
-  // the full-screen ambient lighting draw. That pass sums six directional
-  // lights whose colours are c149/151/153/155/157/159 -- measured, sane, and
-  // identical across captures -- and their red channels total 0.619. That is a
-  // hard ceiling with every dot product at 1.0 simultaneously, which opposing
-  // directions make impossible; the measured value is 0.109.
+  // So with that surface as tex4 the red channel can NEVER survive on any
+  // hardware with correct constants. The arithmetic does not merely say the
+  // input is dark, it says it is the WRONG SURFACE: the gained main-pass scene
+  // holds 32.6 at the same pixel, which yields a red multiplier of 0.938.
   //
-  // So with that surface as tex4 the red channel can NEVER survive, on any
-  // hardware, with correct constants. The arithmetic does not merely say the
-  // input is dark -- it says it is the WRONG SURFACE. The gained main-pass
-  // scene holds 32.6 at the same pixel, and feeding that in yields
-  // saturate(0.033 + 0.029) = 0.062, a red multiplier of 0.938: yellow gear.
+  // Binding is by guest OBJECT, so we follow whatever the guest bound. This says
+  // what that is -- the object, whether a resolve ever named it, and the fetch
+  // constant's own address and extent -- enough to tell "the guest asked for the
+  // pre-pass" from "the guest asked for the scene and we handed it the pre-pass".
   //
-  // Binding is by guest OBJECT (DeviceState().texture[sampler].object looked up
-  // in g_resolvedTextureTargets), so we follow whatever the guest bound. This
-  // says what that is: the object, whether a resolve ever named it, and the
-  // fetch constant's own address and extent -- enough to tell "the guest asked
-  // for the pre-pass" from "the guest asked for the scene and we handed it the
-  // pre-pass".
-  //
-  // The ADDRESS fallback, resolved BEFORE the log rather than after it.
-  //
-  // `resolved=` below reports only the OBJECT lookup, and this used to run
-  // afterwards -- so a slot whose guest object is not a registered resolve
-  // destination printed resolved=0 whether or not the address match then
-  // rescued it. Two very different outcomes, one field, and the field named the
-  // one that does not decide anything.
-  //
-  // That is exactly the composite's case: ps 0x215F8620 slot 0 binds object
-  // 0x7010F7F0 while three other shaders bind object 0x2123C2A4 for the SAME
-  // guest address 0x1EDA0000 -- one guest texture object aliasing another's
-  // resolve destination. Whether that slot samples the depth snapshot or a
-  // zero-decoding guest allocation was unanswerable from the log.
+  // The ADDRESS fallback is resolved BEFORE the log rather than after, because
+  // `resolved=` reports only the OBJECT lookup: a slot whose guest object is not
+  // a registered destination printed resolved=0 whether or not the address match
+  // then rescued it. That is the composite's case -- one shader binds object
+  // 0x7010F7F0 while three others bind 0x2123C2A4 for the SAME guest address.
   const ResolvedTargetByAddress* addr_match = ResolvedTargetForAddress(source);
 
   // Deduplicated per (shader, slot) and capped: one line per distinct binding,
@@ -2977,12 +2712,11 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     static std::mutex s_mu;
     static std::set<uint64_t> s_seen;
     static uint32_t s_lines = 0;
-    // Keyed on the handle of the stage this slot belongs to, and tagged with
-    // the stage. Keying both stages on `dc.pixel_shader_handle` hid the one
-    // binding under investigation: the terrain depth prepass runs the depth-only
-    // pixel stand-in and carries no pixel handle, so its VERTEX slot hashed to
-    // (0 << 8) | 0 and was deduped away against the first pixel slot 0 ever
-    // seen. Three runs went by with the terrain's heightmap address unprinted.
+    // Keyed on the handle of the stage this slot belongs to, and tagged with the
+    // stage. Keying both stages on `dc.pixel_shader_handle` hid the one binding
+    // under investigation: the terrain depth prepass runs the depth-only pixel
+    // stand-in and carries no pixel handle, so its VERTEX slot hashed to
+    // (0 << 8) | 0 and was deduped away against the first pixel slot 0 ever seen.
     const uint64_t key = (uint64_t(stage_handle) << 9) |
                          (uint64_t(vertex ? 1u : 0u) << 8) | slot;
     bool fresh = false;
@@ -3020,30 +2754,19 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // where it has to happen -- see the note in EmitTextureFetch.
   //
   // Only kUnsignedBiased rides this. kSigned would need the texture's bits
-  // reinterpreted into a signed host format, and kGamma is a curve rather than
-  // a scale; both are counted by NoteUnhandledSign and left alone rather than
-  // approximated.
+  // reinterpreted into a signed host format, and kGamma is a curve rather than a
+  // scale; both are counted by NoteUnhandledSign and left alone.
   //
-  // "the census over a full menu run finds no kGamma at all and kSigned on one
-  // FMT_4_4_4_4 texture" used to stand here, and it is wrong the way
-  // measure-with-a-level-loaded is always wrong: with a LEVEL up the counter
-  // reads `guest format 24 mode signed x20000`, and guest format 24 is k_16 --
-  // the terrain heightmap. k_16 now picks an SNORM host view the way k_16_16
-  // already did.
+  // The gate EXCLUDES formats whose host view is chosen by signedness. Two
+  // successive claims here were wrong: "no kSigned outside one FMT_4_4_4_4" (it
+  // is the largest row in the census with a level up -- k_16, the terrain
+  // heightmap), and then "so it no longer arrives here" (picking the SNORM view
+  // happens in DescribeHleTexture2D and this gate never learned about it, so
+  // fmt24 kept being counted for a mode that is correctly applied). A counter
+  // that reports a fixed defect is worse than no counter.
   //
-  // "so it no longer arrives here" ALSO stood here, and was also wrong --
-  // corrected 2026-08-29 from the logs, which is the only thing that can
-  // settle it. Picking the SNORM view happens in DescribeHleTexture2D and this
-  // gate never learned about it, so fmt24 kept arriving and kept being counted:
-  // today's mx_1761 still reads `guest format 24 mode signed x160000`, the
-  // LARGEST row in the census, for a mode that is correctly applied. A counter
-  // that reports a fixed defect is worse than no counter -- it is the whole of
-  // [[counter-that-cannot-fire]] pointed the other way -- so the gate now
-  // excludes formats whose host view is chosen by signedness.
-  //
-  // What remains in that census after this is REAL: kGamma on DXT4_5 (x140000,
-  // an sRGB curve we do not apply) and kSigned on k_4_4_4_4 (x40000, no signed
-  // BGRA4 host view exists).
+  // What remains in that census is REAL: kGamma on DXT4_5 (an sRGB curve we do
+  // not apply) and kSigned on k_4_4_4_4 (no signed BGRA4 host view exists).
   {
     // Stored as the RAW 2-bit-per-component modes, which is what
     // TextureSignScale decodes and what FillVertexTextureSigns always expected.
@@ -3071,37 +2794,29 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   }
 
   // The same memory a resolve wrote into, reached through a different texture
-  // object than the one the resolve named -- so the object test above missed
-  // it. Sample the snapshot rather than decoding guest memory the GPU wrote and
-  // the emulator never populated, which reads as zeros and paints black.
+  // object than the one the resolve named -- so the object test above missed it.
+  // Sample the snapshot rather than decoding guest memory the GPU wrote and the
+  // emulator never populated, which reads as zeros and paints black.
   //
-  // Placed after the describe because the address and extent it matches on come
-  // out of it, and before the decode because the decode is precisely what has
-  // to be skipped.
-  // Decided from the same lookup the log above reported, not a second call:
-  // one question, one answer, so the line cannot say something the binding then
-  // contradicts.
+  // After the describe, because the address and extent it matches on come out of
+  // it; before the decode, because the decode is what has to be skipped. Decided
+  // from the same lookup the log above reported, not a second call, so the line
+  // cannot say something the binding then contradicts.
   if (addr_match) {
     out_objects[slot] = addr_match->dest_object;
-    // The sampler word, which this path did not write. It was the ONLY one of
-    // the four object-binding sites that set an object and returned without a
-    // word -- the other three each pair with a PackSnapshotSamplerWord or
-    // PartialSnapshotSamplerWord on the next line -- so every bind through here
-    // reached BindTranslatedSamplers with a zero word, and a zero word has bit
-    // 15 clear, which that function reads as "no filter to honour" and answers
-    // with the clamped POINT the snapshot path has always defaulted to.
+    // The sampler word, which this path did not write. It was the ONLY one of the
+    // four object-binding sites that set an object and returned without a word,
+    // so every bind through here reached BindTranslatedSamplers with a zero word
+    // -- bit 15 clear, which that function reads as "no filter to honour" and
+    // answers with the clamped POINT the snapshot path defaults to.
     //
-    // Found by counting rather than by reading: the census added alongside this
-    // reports 43,343 of 1,302,535 snapshot slot binds (3.3%) taking POINT with
-    // NO WORD, at a dead-steady 300 per report, which is the shape of a fixed
-    // set of slots and not of noise.
+    // Found by counting rather than reading: 43,343 of 1,302,535 snapshot slot
+    // binds (3.3%) took POINT with NO WORD, at a dead-steady 300 per report,
+    // which is the shape of a fixed set of slots and not of noise.
     //
-    // PartialSnapshotSamplerWord, not PackSnapshotSamplerWord, for the same
-    // reason the other two snapshot binds use it: it carries the guest's FILTER
-    // and deliberately NOT its clamp. This is a resolve snapshot reached by
-    // address, which is the same kind of binding, and honouring the stated
-    // clamp on an atlas sampled past U=1 is what walks the ground back to black
-    // -- see the note above PartialSnapshotSamplerWord.
+    // PartialSnapshotSamplerWord, not PackSnapshotSamplerWord: this is a resolve
+    // snapshot reached by address, and honouring the stated clamp on an atlas
+    // sampled past U=1 is what walks the ground back to black.
     out_swizzles[slot] = PartialSnapshotSamplerWord(source);
     ++g_resolveAddr.matches;
     return true;
@@ -3110,16 +2825,13 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // NOTE the empty-texture set is deliberately NOT consulted here.
   //
   // It is consulted by the single-texture path, which CHOOSES one sampler to
-  // represent the draw -- there, skipping a blank candidate is right, because
-  // a blank one is a poor representative of a shader that reads several.
-  //
-  // This path does not choose. The translated shader NAMES this sampler, and
-  // the guest bound a texture to it that decodes, from readable memory, to
-  // zeros. Then zero is the value the guest's own shader samples, and black is
-  // the correct answer. Refusing it reverted the whole draw to the tex*col
-  // stand-in -- discarding every other slot's real shading to avoid a black
-  // sample that was never wrong. That cost 10,890 draws in mx_706, from just
-  // nine distinct all-zero textures, because the refusal is cached per key.
+  // represent the draw -- there, skipping a blank candidate is right. This path
+  // does not choose: the translated shader NAMES this sampler, and the guest
+  // bound a texture to it that decodes, from readable memory, to zeros. Then
+  // zero is what the guest's own shader samples and black is correct. Refusing
+  // it reverted the whole draw to the stand-in, discarding every other slot's
+  // real shading -- 10,890 draws from just nine distinct all-zero textures,
+  // because the refusal is cached per key.
   const uint64_t key = HleTextureKey(fetch);
   TexMissReason miss_reason = TexMissReason::kNotInCache;
   if (auto cached = g_hleCpuTextures.find(key);
@@ -3170,17 +2882,14 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     // Known blank and not due a re-read: the snapshot's tiles are the best
     // available answer until the retry says otherwise.
     //
-    // Gated on the BLANK SET, not on g_hleBlankPayloads. It used to require a
-    // blank payload, and that made this branch unreachable for precisely the
-    // textures it exists to serve: the blank path below returns as soon as it
-    // has a snapshot to bind, so a key with a snapshot never gets a payload
-    // recorded, so `contains` was never true, so every bind fell through and
-    // re-decoded. Measured on 0x1A2E3000 -- 2 x 16 MB every frame, 21 GB over a
-    // 100-frame run, and forcing BlankRetryDue to false changed nothing at all,
-    // which is what proved the guard rather than the backoff was the problem.
-    //
-    // The payload was never needed here in the first place: this binds an
-    // OBJECT and does not read one.
+    // Gated on the BLANK SET, not on g_hleBlankPayloads. Requiring a blank
+    // payload made this branch unreachable for precisely the textures it serves:
+    // the blank path below returns as soon as it has a snapshot, so a key with a
+    // snapshot never gets a payload recorded, so every bind fell through and
+    // re-decoded -- 2 x 16 MB every frame, 21 GB over a 100-frame run. Forcing
+    // BlankRetryDue to false changed nothing, which is what proved the guard
+    // rather than the backoff was the problem. The payload was never needed
+    // here: this binds an OBJECT and does not read one.
     if (partial_snapshot_object && g_hleEmptyTextures.count(key)) {
       out_objects[slot] = partial_snapshot_object;
       out_swizzles[slot] = PartialSnapshotSamplerWord(source);
@@ -3237,40 +2946,35 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   }
   NoteSwizzleCensus(source);
   NoteMipLevelAgreement(*payload);
-  // Still recorded, so the single-texture path above keeps skipping it as a
-  // representative and the count stays visible -- but no longer a refusal here.
   // A decode that carries no information. Two forms, and until 2026-08-14 only
-  // the first was recognised.
+  // the first was recognised:
   //
-  //   all zero  -- the long-known case: storage the guest has not filled yet.
-  //   UNIFORM   -- every byte the same non-zero value. Guest memory that the CPU
-  //                never writes at all reads back whatever is there, and for the
-  //                terrain heightmap that is 0xFF: a uniformly white 2048x2048
-  //                (gameplay-9.rdc ResourceId::733). It passes the nonzero test
-  //                as real data, so no `bound-zero` line was ever printed for it
-  //                and this fallback never fired. The vertex stage read a
-  //                constant 1.0, the terrain came out flat at world Y = 1 under
-  //                a camera at Y = 616, and the whole ground sat 615 units below
-  //                the view at far-plane depth.
+  //   all zero  -- storage the guest has not filled yet.
+  //   UNIFORM   -- every byte the same non-zero value. Guest memory the CPU never
+  //                writes reads back whatever is there, and for the terrain
+  //                heightmap that is 0xFF. It passes the nonzero test as real
+  //                data, so no `bound-zero` line was ever printed and this
+  //                fallback never fired: the vertex stage read a constant 1.0
+  //                and the whole ground sat 615 units below the view.
   //
   // The uniform form is only treated as empty when `partial_snapshot_object` is
   // set -- i.e. this surface IS a resolve destination the GPU has written part
   // of, so a better source demonstrably exists. A flat texture with no snapshot
-  // behind it is legal and is left alone; that restraint is what keeps this from
-  // becoming the blanket substitution the notes above record as a regression.
+  // behind it is legal and left alone; that restraint keeps this from becoming
+  // the blanket substitution recorded above as a regression.
+  //
+  // Still recorded either way, so the single-texture path keeps skipping it as a
+  // representative and the count stays visible.
   const bool decode_is_blank = [&] {
     PhaseTimer t(g_tex.scanUs);
     return !HleTextureHasNonzeroData(*payload);
   }();
   uint8_t uniform_value = 0;
-  // Detected UNCONDITIONALLY, acted on only below. The first cut of this
-  // computed `decode_is_uniform` as `partial_snapshot_object && ...` and put its
-  // log line inside the `if (partial_snapshot_object)` branch -- so when the
-  // question was "is partial_snapshot_object even set for this slot?", the
-  // diagnostic that would answer it could not print. mx_1148 reached freeroam
-  // with the terrain still flat and not one line to say which half had failed.
-  // Exactly the shape of [[counter-that-cannot-fire]], committed twice in one
-  // session. Measure first, gate second.
+  // Detected UNCONDITIONALLY, acted on only below. The first cut computed
+  // `decode_is_uniform` as `partial_snapshot_object && ...` and put its log line
+  // inside the `if (partial_snapshot_object)` branch -- so when the question was
+  // "is partial_snapshot_object even set for this slot?", the diagnostic that
+  // would answer it could not print. Measure first, gate second.
   const bool decode_is_uniform = !decode_is_blank && [&] {
     PhaseTimer t(g_tex.scanUs);
     return HleTextureIsConstant(*payload, &uniform_value);
@@ -3292,20 +2996,16 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // decode sites, which is the whole reason it is a function.
   NoteDecodedTexture(source, *payload, guest.data(), guest.size(),
                      guest_sampler, "slot");
-  // REVERTED 2026-08-14: `decode_is_uniform` used to be admitted here alongside
-  // the blank case, on the theory that a uniformly-0xFF decode was as empty as
-  // an all-zero one. The texture that motivated it was MISIDENTIFIED -- it was
-  // picked out of a RenderDoc resource list by size and format, and the real
-  // sampler read a different resource entirely. Every uniform decode measured
-  // since has reported no snapshot to fall back on, so the branch never once
-  // fired; it is removed rather than left in as a plausible-looking no-op.
+  // REVERTED: `decode_is_uniform` used to be admitted here alongside the blank
+  // case. The texture that motivated it was MISIDENTIFIED -- picked out of a
+  // RenderDoc resource list by size and format, while the real sampler read a
+  // different resource. Every uniform decode measured since has reported no
+  // snapshot to fall back on, so the branch never once fired.
   //
-  // The DETECTION stays, and its log line with it: a uniform decode is worth
-  // knowing about, and the line now says outright whether a fallback exists.
-  // Population is every decode that reaches this test; fires are the ones that
-  // came out uniform and get recorded as blank.
-  // STRICT: do not record the blank, so the decode is retried instead of a
-  // uniform payload being cached as if it were the texture.
+  // The DETECTION stays, and its log line with it, now saying outright whether a
+  // fallback exists. Population is every decode that reaches this test; fires are
+  // the ones that came out uniform. STRICT: do not record the blank, so the
+  // decode is retried instead of a uniform payload being cached as the texture.
   const bool blank_strict =
       mx::gpu::guard::Strict(mx::gpu::guard::Guard::kBlankTexturePayload);
   mx::gpu::guard::Note(mx::gpu::guard::Guard::kBlankTexturePayload,
@@ -3324,19 +3024,15 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     NoteBlankTexture(key, guest_sampler, source);
     ReportBoundZero();
     // Bind the zero for THIS draw -- that trade is settled -- but do not cache
-    // it. The cache key is FNV-1a over the six fetch dwords alone, so it hashes
-    // where the texture lives and what shape it is, never what it contains;
-    // inserting a blank decode under that key froze the texture black for the
-    // rest of the run, because nothing in the tree ever erases or versions an
-    // entry. A texture sampled once while the guest was still streaming into it
-    // could therefore never appear. Leaving it out means the next draw re-reads
-    // guest memory and the texture shows up the frame its upload completes.
+    // it. The cache key hashes where the texture lives and what shape it is,
+    // never what it contains, so inserting a blank decode under that key froze
+    // the texture black for the rest of the run: nothing in the tree erases or
+    // versions an entry. Leaving it out means the next draw re-reads guest
+    // memory and the texture shows up the frame its upload completes.
     //
-    // The host cache in EnsureGameTexture keys on payload->key too, so the
-    // blank upload must not sit on the key the recovered texture will use. It
-    // is given a marked key of its own; the real decode arrives under the
-    // unmarked key and uploads as a new resource rather than hitting the black
-    // one.
+    // EnsureGameTexture keys on payload->key too, so the blank upload must not
+    // sit on the key the recovered texture will use. It gets a marked key of its
+    // own.
     payload->key = key ^ kBlankTextureKeyMarker;
     g_hleBlankPayloads[key] = payload;
     out_textures[slot] = std::move(payload);
@@ -3352,28 +3048,23 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // A FLAT DECODE IS CACHED, AND MARKED FOR PERIODIC RE-READ.
   //
   // GuestTextureFingerprint SAMPLES, so a SPARSE write lands between its sample
-  // points and reads as unchanged however the sampling is tuned -- the note
-  // above that function records the same failure biting the glyph atlas, which
-  // escaped only by getting an explicit generation from the guest. The
-  // terrain's virtual-texture INDEX MAP had no such escape: it decoded once
-  // while still uniform (`n=1 flat=1`) and was never re-read, even after the
+  // points however the sampling is tuned. The terrain's virtual-texture INDEX
+  // MAP decoded once while still uniform and was never re-read, even after the
   // feedback writeback started driving ~1000 tile resolves a run.
   //
   // NOT CACHING IT AT ALL WAS TRIED AND REVERTED. A flat decode carries no
-  // information, so refusing to cache it looks free -- it is not. Run 1506:
+  // information, so refusing to cache it looks free. It is not:
   //
   //   decode 359ms, scan 651ms | 50 decodes over 36880 KB
   //   FRAMETIME 1746617us     (1.75 SECONDS a frame)
   //
   // 36 MB re-decoded and re-scanned per interval, because a 4 MB cutoff still
-  // admits the 2 MB index map and a 4 MB companion on EVERY bind. "Self-
-  // limiting" was true in principle and irrelevant in practice: it does not
-  // self-limit until the guest fills the texture, and the game has to stay
-  // playable until then.
+  // admits the 2 MB index map on EVERY bind. "Self-limiting" was true in
+  // principle and irrelevant in practice -- it does not self-limit until the
+  // guest fills the texture, and the game has to stay playable until then.
   //
-  // So: cache as normal, and record the key. The cache-hit path re-reads it
-  // once every kFlatRetryFrames instead of every bind, which is the same shape
-  // as the blank-retry backoff that already governs all-zero decodes.
+  // So: cache as normal and record the key. The cache-hit path re-reads it once
+  // every kFlatRetryFrames, the same shape as the blank-retry backoff.
   constexpr size_t kFlatRetryLimit = 4u * 1024u * 1024u;
   const size_t flat_base =
       payload->level_count > 1
@@ -3400,9 +3091,8 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
       // IS THIS ACTUALLY A GPU SURFACE WE FAILED TO CLAIM? On Xenos a render
       // target lives in EDRAM and only a RESOLVE moves GPU output into guest
       // memory, so a zero here proves the GPU never wrote these bytes and the
-      // texture is genuinely uniform -- not a surface we decoded from a stale
-      // CPU-side copy. `resolved=0` on the SLOT MAP cannot say this: it is
-      // also what an extent mismatch and a coverage refusal both print.
+      // texture is genuinely uniform. `resolved=0` on the SLOT MAP cannot say
+      // this: it is also what an extent mismatch and a coverage refusal print.
       const mx::hooks::d3d9::ResolveRangeProbe rp =
           mx::hooks::d3d9::ProbeResolveRange(source.address,
                                              uint32_t(flat_base));
@@ -3426,28 +3116,20 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   } else if (watch_it != g_flatRetryKeys.end()) {
     // KEEP WATCHING IT. Erasing here was a real bug and it cost the terrain.
     //
-    // The backoff was written for a texture that STARTS empty and later fills:
-    // recover it, then stop paying. So a decode that came back non-flat was
-    // read as "done" and the key was dropped. But a texture that was uniform
-    // and is now not uniform has just proved the opposite -- it CHANGES -- and
-    // that is precisely the texture GuestTextureFingerprint cannot track,
-    // because it samples 2 KB and the writes are sparse.
+    // The backoff was written for a texture that STARTS empty and later fills,
+    // so a decode that came back non-flat was read as "done" and the key
+    // dropped. But a texture that was uniform and is now not has just proved the
+    // opposite -- it CHANGES -- and that is precisely the texture
+    // GuestTextureFingerprint cannot track.
     //
     // The terrain's virtual-texture PAGE TABLE is exactly this shape. Measured
-    // in run 1516, in-level, with every other stage of the system working
-    // (the guest's update gate fires every frame, and the feedback we hand it
-    // carries ~530 page requests per frame):
+    // in-level with every other stage working: THREE decodes of it in sixteen
+    // thousand. We pinned whatever mapping existed early in the run and rendered
+    // every subsequent frame from it.
     //
-    //     DECODE SHAPES 76 distinct over 16000 decodes
-    //       fmt15(FMT_4_4_4_4) 1024x1024 n=3
-    //
-    // THREE decodes in sixteen thousand. We pinned whatever mapping existed
-    // early in the run and rendered every subsequent frame from it.
-    //
-    // So: once a key has been watched, it stays watched, on the same 30-frame
-    // backoff. Not caching at all is NOT the alternative -- that was measured
-    // at 1.75 SECONDS a frame, because it re-decoded on every bind. A backoff
-    // over the watched set is what already costs ~0ms today.
+    // So once a key has been watched it stays watched, on the same 30-frame
+    // backoff. Not caching at all is NOT the alternative -- that was measured at
+    // 1.75 SECONDS a frame.
     watch_it->second.last_frame = mx::hle::D3D9FrameCount();
     // Latches on: once a texture has been seen to carry content after being
     // uniform, it is volatile for good and gets the tight interval.
@@ -3458,8 +3140,8 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   return true;
 }
 
-// Overlay a pixel shader's EMBEDDED constants onto the bank read from the
-// device shadow.
+// Overlay a pixel shader's EMBEDDED constants onto the bank read from the device
+// shadow.
 //
 // The shadow at device+0x1780 is not the whole story, and reading it alone is
 // why every 3D material in this title rendered black. A shader object carries
@@ -3473,31 +3155,26 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
 //       sub_825656A0(device, v6 + 218, v6[8])// table at vs+0x368, data *(vs+0x20)
 //
 //   and sub_825656A0 walks, from `rel = *(u32*)(table + 0x14)`, a block at
-//   `table + rel` whose entry list starts at +0x14 and runs *(u32*)(+0x10)
-//   bytes:
+//   `table + rel` whose entry list starts at +0x14 and runs *(u32*)(+0x10) bytes:
 //       entry: u16 reg_index, u16 dword_count, u32 data_offset   (8 bytes)
 //       terminated by dword_count == 0
-//       source  = data_offset + data_base
-//       emitted as PM4 0xC0022F00 (LOAD_ALU_CONSTANT) with body
-//       [physical(source), 4 * reg_index, dword_count]
+//       emitted as PM4 0xC0022F00 (LOAD_ALU_CONSTANT)
 //
-// The vertex half of this was already understood -- see
-// ProbeVertexShaderConstantPatch, which recorded that the data "never passes
-// through device + 0x780". What was missed is that the PIXEL shader has the
-// same mechanism at DIFFERENT offsets, so the pixel bank was left with only the
-// registers SetPixelShaderConstantF happens to write. Measured over 264 dumped
-// shaders: 242 read constants above c217, which the shadow never contains, and
-// the 22 that read only written registers are exactly the UI shaders that
-// always looked correct.
+// The vertex half was already understood; what was missed is that the PIXEL
+// shader has the same mechanism at DIFFERENT offsets, so the pixel bank was left
+// with only the registers SetPixelShaderConstantF happens to write. Measured
+// over 264 dumped shaders: 242 read constants above c217, which the shadow never
+// contains, and the 22 that read only written registers are exactly the UI
+// shaders that always looked correct.
 //
-// `reg` is an ALU float4 constant index. The emitted packet uses `4 * reg` as
-// its dword offset from register 0x4000, so pixel constants 256..511 map to this
-// bank at reg-256. Texture fetch constants do NOT live in this list; they are
-// in the second, inline state-patch list walked by ApplyShaderFetchPatchTable.
+// `reg` is an ALU float4 constant index; the emitted packet uses `4 * reg` from
+// register 0x4000, so pixel constants 256..511 map to this bank at reg-256.
+// Texture fetch constants do NOT live in this list -- they are in the second,
+// inline state-patch list walked by ApplyShaderFetchPatchTable.
+//
 // `written`, when given, receives one byte per bank dword, non-zero where this
 // table published a value. FillMaterialGate needs it to distinguish "the shader
-// wrote a zero here and means it" from "nothing wrote this at all" -- those are
-// the same bits and opposite decisions.
+// wrote a zero here and means it" from "nothing wrote this at all".
 void ApplyShaderLoadTable(uint32_t shader, uint32_t table_at, uint32_t data_at,
                           uint8_t* base, std::vector<uint32_t>& bank,
                           std::vector<uint8_t>* written = nullptr) {
@@ -3537,23 +3214,19 @@ void ApplyShaderLoadTable(uint32_t shader, uint32_t table_at, uint32_t data_at,
       if (dst >= bank.size()) continue;
       if (!HostPageReadable(REX_RAW_ADDR(src + j * 4))) continue;
       bank[dst] = REX_LOAD_U32(src + j * 4);
-      // TRACE: the mask pass's xe_c[140..143] = pixel ALU c396..c399, bank
-      // dwords 560..575.
+      // TRACE: the mask pass's xe_c[140..143] = pixel ALU c396..c399.
       //
-      // RESULT, run 1895: PRINTS NOTHING. The load table never writes those
-      // registers, so it is not the source either. Nor is PM4 (traced
-      // separately, b028a00). They come from the straight linear copy of the
-      // guest's own shadow at device+0x1780 above -- 1024 dwords, no
-      // reindexing -- so the values are the GUEST's and we reproduce them
-      // faithfully.
+      // RESULT: PRINTS NOTHING. The load table never writes those registers, and
+      // nor does PM4 (traced separately). They come from the straight linear copy
+      // of the guest's own shadow at device+0x1780 above, so the values are the
+      // GUEST's and we reproduce them faithfully.
       //
       // That kills the hypothesis this was built for. shadows--.rdc shows
       // c140..c143 equal to c100..c103 except in .z, with c14x.z == -c12x.y
       // exactly, 4 of 4 -- which I read as a corrupted column. For an
-      // orthonormal rotation the inverse IS the transpose, so a column equal
-      // to a negated row is what correct inverse-transpose math produces. An
-      // exact algebraic identity was the evidence AGAINST corruption, not for
-      // it. The mountain-shadow defect is not in these constants.
+      // orthonormal rotation the inverse IS the transpose, so a column equal to
+      // a negated row is what correct inverse-transpose math produces. An exact
+      // algebraic identity was the evidence AGAINST corruption, not for it.
       if (dst >= 560u && dst < 576u) {
         static uint32_t s_traced = 0;
         if (s_traced++ < 64) {
@@ -3633,11 +3306,11 @@ void ApplyShaderFetchPatchTable(uint32_t shader, uint32_t table_at,
   }
 }
 
-// Both shaders publish into the SAME unified ALU constant file -- the draw
-// flush calls sub_825656A0 once for the pixel shader and once for the vertex
-// shader -- so an entry in EITHER table whose register lands in 256..511 is a
-// pixel constant. Taking only the pixel shader's table left c43 and c85 at
-// zero, which is most of a material's shading still missing.
+// Both shaders publish into the SAME unified ALU constant file -- the draw flush
+// calls sub_825656A0 once for each -- so an entry in EITHER table whose register
+// lands in 256..511 is a pixel constant. Taking only the pixel shader's table
+// left c43 and c85 at zero, which is most of a material's shading still missing.
+//
 // The fetch patches are gathered from BOTH shader objects because both binding
 // calls write the same device constants block. They are keyed by the PIXEL
 // shader handle because that is the identity the draw's texture resolver owns.
@@ -3656,12 +3329,10 @@ void ApplyPixelShaderLoadTable(
   // deliberately, which is the case that makes a "fill every zero" rule wrong.
   std::vector<uint8_t> ps_written(bank.size(), 0);
   ApplyShaderLoadTable(shader, 0x28, 0x18, base, bank, &ps_written);
-  // AFTER the load table, not before. The first cut of this ran inside
-  // OverlayNonFinite above and was overwritten for every shader whose table
-  // covers c84..c87 -- which is the terrain -- while sticking on materials
-  // whose table does not, which is why mx_1447 changed the bike and rider and
-  // left the ground exactly as dark as before. 368,313 substitutions, none of
-  // them where it was aimed.
+  // AFTER the load table, not before. The first cut ran inside OverlayNonFinite
+  // above and was overwritten for every shader whose table covers c84..c87 --
+  // which is the terrain -- while sticking on materials whose table does not.
+  // 368,313 substitutions, none of them where it was aimed.
   if (bank.size() >= 256 * 4)
     mx::gpu::alu::FillMaterialGate(bank.data(), 256, ps_written.data());
   ApplyShaderFetchPatchTable(shader, 0x28, base, fetch);
@@ -3696,10 +3367,10 @@ void ApplyPixelShaderLoadTable(
 // Attach the guest's own translated pixel shader to a draw: its source, its
 // constant bank, and one texture per sampler slot it declares.
 //
-// Extracted so it can run BEFORE the single-texture binding contest as well
-// as after it. The contest answers a different question -- which one texture
-// the tex*col stand-in should sample -- and used to gate this, which meant a
-// shader fetching no texture at all never got here.
+// Extracted so it can run BEFORE the single-texture binding contest as well as
+// after it. The contest answers a different question -- which one texture the
+// tex*col stand-in should sample -- and used to gate this, which meant a shader
+// fetching no texture at all never got here.
 void AttachTranslatedPixelShader(mx::hle::DrawCall& dc, uint32_t handle,
                                  uint32_t device, uint8_t* base) {
   using namespace mx::hle;
@@ -3796,15 +3467,14 @@ void AttachTranslatedPixelShader(mx::hle::DrawCall& dc, uint32_t handle,
       }
 
       // The VERTEX stage's textures, by exactly the same rule. A vertex shader
-      // that samples -- terrain displacement is the case here -- used to be
-      // refused the GPU path for having a sampler at all, and the interpreter
-      // it fell back to has no texture fetch, so its samples were silent zeros
-      // and the positions silently wrong.
+      // that samples -- terrain displacement -- used to be refused the GPU path
+      // for having a sampler at all, and the interpreter it fell back to has no
+      // texture fetch, so its samples were silent zeros and the positions
+      // silently wrong.
       //
-      // All-or-nothing like the pixel stage, and for the same reason: a slot
-      // left unfilled samples whatever descriptor sits at that index. Falling
-      // short here clears the count rather than the shader, which puts the draw
-      // back on the CPU path it used to take unconditionally.
+      // All-or-nothing like the pixel stage: a slot left unfilled samples
+      // whatever descriptor sits at that index. Falling short clears the count
+      // rather than the shader, which puts the draw back on the CPU path.
       constexpr uint32_t kDeviceVertexShaderAt = 0x3248;
       uint32_t vs_handle = 0;
       if (HostPageReadable(REX_RAW_ADDR(device + kDeviceVertexShaderAt)))
@@ -3884,21 +3554,18 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
                 s_attempts, RejectedFormatSummary());
   }
   // WHICH shader is bound is a separate question from WHICH ONE TEXTURE the
-  // stand-in should sample, and conflating them cost 63,207 draws in mx_709 --
-  // 27.8% of every draw attempted, the largest single cause of stand-in draws
-  // by a wide margin.
+  // stand-in should sample, and conflating them cost 63,207 draws in one run --
+  // 27.8% of every draw attempted, the largest single cause of stand-in draws.
   //
   // Both resolutions below end in ResolvePixelBindingForDraw, which gives up
-  // when `profile->bindings.empty()`. A pixel shader that fetches no texture at
-  // all has exactly that -- no bindings -- so it was reported as "no eligible
-  // pixel shader" and the draw kept the tex*col stand-in. For a TRANSLATED
-  // shader that is precisely backwards: a shader sampling nothing needs no
-  // texture, and the stand-in it fell back to is the one thing that does.
+  // when `profile->bindings.empty()`. A pixel shader that fetches no texture has
+  // exactly that, so it was reported as "no eligible pixel shader" and the draw
+  // kept the stand-in -- precisely backwards for a TRANSLATED shader, which
+  // needs no texture while the stand-in it fell back to does.
   //
-  // So resolve the handle first, from the setter or from the device field, and
-  // attach the translation on its own terms. The single-binding contest still
-  // runs below, unchanged, because the stand-in still needs a winner -- but it
-  // can no longer veto a draw that was never going to use its answer.
+  // So resolve the handle first and attach the translation on its own terms. The
+  // single-binding contest still runs below, unchanged, but can no longer veto a
+  // draw that was never going to use its answer.
   uint32_t resolved = pixel_shader;
   if (!resolved && device &&
       HostPageReadable(REX_RAW_ADDR(device + 0x3244)))
@@ -3910,59 +3577,45 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
   // whatever their first texture happens to be, which for a character material
   // is a packed normal/gloss map.
   //
-  // That fallback was WRITTEN AND NEVER CALLED. This comment described it and
-  // the code below stopped at device+0x3244, so PixelShaderForDevice sat dead
-  // in the file. Measured cost of the omission, mx_890 at the menu: 79,984 of
-  // 240,000 draws arrive with no setter handle at all; 133 of them per frame
-  // carry 144,097 vertices, and because no translated pixel shader means no GPU
-  // vertex path, they run the software interpreter and the CPU attribute decode
-  // -- 121ms of a 225ms frame, the single largest item in it.
+  // That fallback was WRITTEN AND NEVER CALLED: this comment described it while
+  // the code stopped at device+0x3244. Measured cost of the omission: 79,984 of
+  // 240,000 draws arrive with no setter handle, and because no translated pixel
+  // shader means no GPU vertex path they run the software interpreter -- 121ms
+  // of a 225ms frame.
+  //
   // Gated, because it is both the largest speedup this session and a suspected
-  // regression, and those have to be separable.
+  // regression, and those have to be separable: it took the menu 4.45 -> 9.88
+  // fps, but "unbound by sampler s0/s1/s2" appears in no earlier run and in
+  // every later one at ~69,000 draws a frame. Whether that is a wrong shader or
+  // a second missing binding is the open question, and one flag answers it.
   //
-  // It took the menu 4.45 -> 9.88 fps by giving 80,000 draws a translated pixel
-  // shader, which is what lets them onto the GPU vertex path instead of the
-  // software interpreter. But "unbound by sampler s0/s1/s2" appears in no run
-  // before mx_891 and in every run after it, at ~69,000 draws a frame: the
-  // shader this attaches declares sampler slots those draws never bound, and
-  // each one gets a 1x1 black. Whether that is a wrong shader or a second
-  // missing binding is the open question, and one flag answers it.
-  // WHOSE device is it? Recorded BEFORE the fallback runs, so it describes the
-  // draw as it arrived rather than after being patched up.
-  //
-  // The 3D layer of the menu is 133 draws a frame with no pixel shader from
-  // either source, and both offsets have been confirmed against the guest:
-  // D3DDevice_SetPixelShader writes pDevice[1].m_Constants.Fetch[29] —
-  // device+0x3244 — which is exactly what was read above. So the field is not
-  // being misread; either the shader was never set on THIS device, or the draw
-  // is carrying the wrong device pointer.
-  //
-  // The guest runs three parallel record workers, each driving its own device
-  // (dword_830B2C60[0..2]), and this file has twice been caught by state being
-  // read from the wrong one of the three. If the draw devices below do not
-  // appear among the setter devices, that is the whole defect.
+  // WHOSE device it is, is recorded BEFORE the fallback runs, so it describes
+  // the draw as it arrived. Both offsets are confirmed against the guest --
+  // D3DDevice_SetPixelShader writes pDevice[1].m_Constants.Fetch[29], which is
+  // device+0x3244 -- so either the shader was never set on THIS device, or the
+  // draw carries the wrong device pointer. The guest runs three parallel record
+  // workers each driving its own device, and this file has twice been caught by
+  // state read from the wrong one.
   if (!resolved) {
     // What ARE these draws running? Self-limiting; see ProbeVertexObjectSecondBlob.
     ProbeVertexObjectSecondBlob(device, base);
     // Does a null-pixel-shader draw bind a COLOUR target?
     //
     // The probe above establishes what these draws are: one 48-dword program
-    // that writes position and exports no interpolators at all, i.e. a
-    // depth-only pass, which is why a null pixel shader is legal for them. The
-    // renderer already has a route for that, but it opens only when NO colour
-    // target is bound:
+    // that writes position and exports no interpolators, i.e. a depth-only pass.
+    // The renderer already has a route for that, but it opens only when NO
+    // colour target is bound:
     //
     //     depthOnlyPass = !d.targetObject && d.depthObject && ...
     //
-    // If these draws carry a colour target too, they miss it, and each one is
-    // given a scratch colour target plus the tex*col stand-in -- painting
-    // colour the guest never wrote, into the scene buffer the rider's material
-    // later samples for its luminance. That would make the stand-in actively
-    // harmful here rather than merely a missing feature.
+    // If these draws carry a colour target too they miss it, and each is given a
+    // scratch colour target plus the tex*col stand-in -- painting colour the
+    // guest never wrote, into the scene buffer the rider's material later
+    // samples for its luminance.
     //
-    // Split by which targets are present, and record the colour extents seen,
-    // because "binds the 1280x640 scene band" and "binds some small offscreen
-    // target" want different answers.
+    // Split by which targets are present, and record the colour extents seen:
+    // "binds the 1280x640 scene band" and "binds some small offscreen target"
+    // want different answers.
     {
       static std::mutex s_mu;
       static uint64_t s_colour_and_depth = 0, s_depth_only = 0;
@@ -3975,17 +3628,14 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
       //     colorWrite = (om_seen & 1) == 0 || (colour_mask & 0xF) != 0
       //
       // A depth pass that binds the colour target but masks colour off is
-      // harmless -- its PSO gets RenderTargetWriteMask 0 and the stand-in
-      // writes nothing. The damaging case is narrower: colour bound and the
-      // mask permitting writes, so the stand-in paints.
+      // harmless. The damaging case is colour bound and the mask permitting
+      // writes, so the stand-in paints.
       //
-      // Read RB_COLOR_MASK from the device HERE rather than through dc.
-      // dc.colour_mask and dc.om_seen are filled further down this same
-      // function, ~34 lines AFTER the PrepareDrawTexture call this runs
-      // inside, so consulting them reports every draw in the game as
-      // "mask never observed" -- which is exactly what the first cut did, and
-      // 41844 of 41844 was the tell. Same address and same gate as the
-      // assignment below, so the two cannot drift.
+      // Read RB_COLOR_MASK from the device HERE rather than through dc:
+      // dc.colour_mask and dc.om_seen are filled ~34 lines AFTER the
+      // PrepareDrawTexture call this runs inside, so consulting them reports
+      // every draw in the game as "mask never observed" -- which is exactly what
+      // the first cut did, and 41844 of 41844 was the tell.
       constexpr uint32_t kRbColorMaskAt = 0x28DC;
       static uint64_t s_wouldPaint = 0, s_maskedOff = 0, s_maskUnreadable = 0;
       uint32_t mask = 0;
@@ -4051,36 +3701,24 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
       REXLOG_INFO("d3d9: {}", ShaderTranslationSummary());
     }
   }
-  // THE CROSS-THREAD PIXEL SHADER FALLBACK IS GONE. Deleted 2026-08-27, the
-  // second guard removed under docs/strict_mode.md.
+  // THE CROSS-THREAD PIXEL SHADER FALLBACK IS GONE -- the second guard removed
+  // under docs/strict_mode.md.
   //
-  // It called PixelShaderForDeviceStrict(device) for any draw that arrived with
-  // no shader from either per-device source, so a draw could run a program
-  // bound on another thread. Measured across both scenes it never once supplied
-  // one:
+  // It called PixelShaderForDeviceStrict(device) for any draw arriving with no
+  // shader from either per-device source, and across both scenes it never once
+  // supplied one (freeroam 0/36062, menu 0/5804). The population is not draws we
+  // are failing: every null-PS draw binds depth only, or binds colour with the
+  // write mask OFF -- WOULD PAINT 0 of 30536 and 0 of 2098.
   //
-  //   freeroam  cross-thread-ps  0/36062
-  //   menu      cross-thread-ps  0/5804
+  // It also settles the hypothesis at the probe above: NO-PS DEVICES reports ONE
+  // device on ONE thread and SETTER DEVICES lists that same device. Not the
+  // three-worker-device mix-up that was feared -- the guest genuinely called
+  // SetPixelShader(NULL).
   //
-  // and the population is not draws we are failing -- it is draws that
-  // correctly have no pixel program. NULL-PS TARGETS, both scenes: every one
-  // binds depth only, or binds colour with the write mask OFF. WOULD PAINT 0 of
-  // 30536 in freeroam, 0 of 2098 in the menu. A null pixel shader on a draw
-  // that writes no colour is a depth prepass, which is what these are.
-  //
-  // It also settles the hypothesis at the probe above: NO-PS DEVICES reports
-  // ONE device on ONE thread (0x2123DE00/t16604) and SETTER DEVICES lists that
-  // same device at 0x00000000. Not the three-worker-device mix-up that was
-  // feared -- the guest genuinely called SetPixelShader(NULL).
-  //
-  // THE 4.45 -> 9.88 FPS MENU WIN IN THE HISTORY IS NOT THIS FUNCTION. There
-  // are two: PixelShaderForDevice falls back to the last shader seen on ANY
-  // device, and PixelShaderForDeviceStrict is per-device only, "kept separate
-  // rather than changing the existing function". That speedup came from the
-  // any-device one. Strict is still called from the SQ_PROGRAM_CNTL ATDRAW
-  // diagnostic in hooks_d3d9.cpp, which prints it beside `any` precisely to
-  // show when a device never received SetPixelShader -- that caller reports,
-  // it does not bind, and it stays.
+  // THE 4.45 -> 9.88 FPS MENU WIN IS NOT THIS FUNCTION. PixelShaderForDevice
+  // falls back to the last shader seen on ANY device and Strict is per-device
+  // only; that speedup came from the any-device one. Strict is still called from
+  // the SQ_PROGRAM_CNTL ATDRAW diagnostic, which reports rather than binds.
   if (resolved) {
     // Normally reached via ReadBoundPixelShader, which is below the contest and
     // therefore never ran for these draws -- so their microcode was never
@@ -4097,14 +3735,14 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
       !ReadBoundPixelShader(device, base, pixel_shader, binding)) {
     ++s_no_shader;
     // The COUNT, not just a sample. This exit was logged only as "attempt N"
-    // with a handle, which said it happens without ever saying how often --
-    // and it turns out to be the largest single reason a draw keeps the
-    // tex*col stand-in, larger than untranslated shaders and slot-filling put
-    // together. A cap of 8 plus a sample every 2500 attempts looked like a
-    // quiet failure while it was in fact the dominant one.
+    // with a handle, which said it happens without ever saying how often -- and
+    // it turns out to be the largest single reason a draw keeps the tex*col
+    // stand-in, larger than untranslated shaders and slot-filling together. A
+    // cap of 8 plus a sample every 2500 attempts looked like a quiet failure
+    // while it was the dominant one.
     //
-    // Split by which of the two resolutions was even possible: no setter
-    // handle at all is a different defect from a setter we cannot follow.
+    // Split by which of the two resolutions was even possible: no setter handle
+    // at all is a different defect from a setter we cannot follow.
     if (!pixel_shader) ++s_no_shader_no_setter;
     if (s_no_shader <= 8 || (s_attempts % 2500) == 0) {
       const uint32_t direct =
@@ -4115,12 +3753,11 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
       // SHADER", which was true when the contest also decided whether the draw
       // could run its guest shader at all -- it no longer does, and a draw
       // reaching here may well be running a translated shader with every slot
-      // bound. Left as it was, the next reader would diagnose 80,000 lost
-      // draws that are not lost.
-      // The "rescued by the per-device record" figure is GONE with the
-      // fallback that produced it. Leaving it would print a permanent zero,
-      // which reads as a measurement of a mechanism that no longer exists --
-      // the same trap as a counter that cannot fire.
+      // bound.
+      //
+      // The "rescued by the per-device record" figure is GONE with the fallback
+      // that produced it. Leaving it would print a permanent zero, which reads
+      // as a measurement of a mechanism that no longer exists.
       REXLOG_INFO("d3d9: stand-in has no single texture to sample: {} of {} "
                   "attempts ({} with no setter handle at all); this one "
                   "setter=0x{:08X}, device+0x3244=0x{:08X}",
@@ -4129,15 +3766,14 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
     }
     return false;
   }
-  // The shader is resolved by here — `pixel_shader` may have been rewritten by
-  // ReadBoundPixelShader — so this is the first point at which the draw knows
-  // which guest program it is running. Attaching the translation here rather
-  // than at the call site keeps the "which shader is really bound" logic in one
-  // place; a draw whose shader did not translate simply carries nothing and
-  // keeps the tex*col stand-in.
-  // The contest may have rewritten `pixel_shader` to the device's own handle,
-  // which is the authoritative answer. If it differs from the one attached
-  // before the contest, attach again for the shader actually bound.
+  // The shader is resolved by here -- `pixel_shader` may have been rewritten by
+  // ReadBoundPixelShader -- so this is the first point at which the draw knows
+  // which guest program it is running. Attaching the translation here keeps the
+  // "which shader is really bound" logic in one place; a draw whose shader did
+  // not translate carries nothing and keeps the stand-in.
+  //
+  // If the contest rewrote `pixel_shader` to the device's own handle, which is
+  // authoritative, attach again for the shader actually bound.
   if (pixel_shader != resolved)
     AttachTranslatedPixelShader(dc, pixel_shader, device, base);
   dc.pixel_shader_handle = pixel_shader;
@@ -4208,8 +3844,8 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
   dc.clamp_y = uint8_t(source.clamp_y);
 
   // The address route, for the same reason as in ResolvePixelSlotTexture: this
-  // memory is a resolve destination reached through a texture object the
-  // resolve never named, so the object test above missed it.
+  // memory is a resolve destination reached through a texture object the resolve
+  // never named, so the object test above missed it.
   //
   // Both routing fields are set here rather than left to PrepareHleDraw, which
   // sets them only when its own object lookup hits. It runs after this and does
@@ -4228,13 +3864,11 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
 
   // kR8 and kR16 join this list on the same reasoning as the others: they are
   // single-channel, so binding one as visible base colour would paint the
-  // surface grey. They are decoded rather than rejected so the counters can
-  // tell "we cannot read this" apart from "we choose not to show this" — the
-  // distinction the old shared "unsupported" string destroyed.
+  // surface grey. They are decoded rather than rejected so the counters can tell
+  // "we cannot read this" apart from "we choose not to show this".
   //
-  // kRg8 (k_8_8) is two-channel and joins them: the stand-in shader has no
-  // idea what the second channel means, so binding one as base colour paints
-  // the surface in red and green. The translated path, which is where these
+  // kRg8 (k_8_8) is two-channel and joins them: the stand-in shader has no idea
+  // what the second channel means. The translated path, which is where these
   // 1273 rejections a run were actually losing draws, goes through
   // ResolvePixelSlotTexture and is deliberately not gated by this.
   if (source.host_format == HostTextureFormat::kBc5 ||
@@ -4337,12 +3971,8 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
 // The declaration-to-vfetch pairing rule, read out of
 // D3D::PatchVertexShaderToMatchVertexDeclaration (0x82564C50).
 //
-// This was the last bridge in the shader-execution path: attributes were taken
-// from PM4's decode because nothing said which declaration element feeds which
-// vfetch instruction. The function itself says, and it says it with a table.
-//
 //   this   = r3   CVertexShader*
-//   dest   = r4   the microcode being patched — where results are written
+//   dest   = r4   the microcode being patched -- where results are written
 //   decl   = r5   CVertexDeclaration*, count at +0x18, elements at +0x34
 //   strides= r6   const BYTE*, indexed by stream, stride in DWORDS
 //   variant= r7   which patched variant of the shader this is
@@ -4359,26 +3989,24 @@ bool PrepareDrawTexture(mx::hle::DrawCall& dc, uint32_t pixel_shader,
 //   key[19:16] -> usage index
 //
 // **The pairing is by semantic, not by position.** The element whose `usage`
-// (byte 9) and `usage_index` (byte 10) equal the key's is the one that patches
-// that vfetch — a linear search, first match wins. That is why the template's
-// format/offset/stride are blank: they are not defaults, they are unbound.
+// (byte 9) and `usage_index` (byte 10) equal the key's patches that vfetch -- a
+// linear search, first match wins. That is why the template's format/offset/
+// stride are blank: they are not defaults, they are unbound.
 //
 // From the matched element:
 //   fetch constant index = 95 - element.stream       (subfic r20, r5, 0x5F)
-//   format/signed/integer/swizzle from the Type dword, as kType* already say
+//   format/signed/integer/swizzle from the Type dword
 //   offset field = element.offset / 4                (rlwinm r8, r8, 6, 1, 23)
 //   stride field = strides[element.stream]           (lbzx r5, r5, r6)
 //
 // **No match leaves fetch constant 95 as well**, which is the same value stream
-// 0 produces. So a decoded fetch_slot of 95 is ambiguous between "stream 0" and
-// "unbound", and PM4's decode showing 95 everywhere never distinguished them.
-// The unbound case is identifiable by its canned format bits (0x60000) and
-// swizzle (0x9250) instead.
+// 0 produces -- so a decoded fetch_slot of 95 is ambiguous between "stream 0"
+// and "unbound". The unbound case is identifiable by its canned format bits
+// (0x60000) and swizzle (0x9250) instead.
 //
-// None of this is believed on the strength of the disassembly. The probe
-// predicts all three dwords of the patched vfetch *before* the call and
-// compares them against what D3D9 actually wrote *after* it. A rule read wrong
-// disagrees; a rule read right agrees on every dword of every vfetch.
+// None of this is believed on the strength of the disassembly: the probe
+// predicts all three dwords of the patched vfetch *before* the call and compares
+// them against what D3D9 actually wrote *after* it.
 //---------------------------------------------------------------------------
 constexpr uint32_t kUCodePtrTable  = 0x70;   // this + (variant + 0x70) * 8
 constexpr uint32_t kUCodeBlobDelta = 0x368;
@@ -4425,12 +4053,11 @@ uint64_t g_patchAgree[3] = {};     // per dword, prediction == what D3D9 wrote
 uint64_t g_patchDisagree[3] = {};
 uint64_t g_patchBadTable = 0;      // count or table offset outside anything sane
 
-// Where does D3D9 write the patched microcode? r4 is that destination, and if
-// it is the same memory the draw-time probe already reads (SH_pPhysical +
-// 0x40), then the patched code is directly readable and none of this rule needs
-// reimplementing — the prediction only ever needed to be a *check*. Measured
-// rather than assumed, because Stage B concluded that buffer held the unpatched
-// template and that conclusion has to be either confirmed or overturned.
+// Where does D3D9 write the patched microcode? r4 is that destination, and if it
+// is the same memory the draw-time probe already reads (SH_pPhysical + 0x40),
+// the patched code is directly readable and none of this rule needs
+// reimplementing. Measured rather than assumed, because Stage B concluded that
+// buffer held the unpatched template.
 uint64_t g_destIsPhys40 = 0;       // dest == unmasked SH_pPhysical + 0x40
 uint64_t g_destIsPhysOther = 0;    // inside that allocation, different offset
 uint64_t g_destElsewhere = 0;
@@ -4559,35 +4186,24 @@ uint32_t ReadPatchFetchCount(uint32_t self, uint32_t variant, uint8_t* base) {
 // Copies the patched microcode out of the destination, keyed by shader handle.
 // Must run immediately after the original: the destination is in the command
 // ring and will be overwritten.
-// Does the shader OBJECT carry its own microcode, and if so where?
 //
-// This matters because the patch hook is our only source of vertex microcode,
-// and it only fires for shaders D3D9 needs to patch. Everything else is
-// reported as "no-code": 164,648 of 401,750 draws in mx_711 (41%), which are
-// the same draws as the 82,324 of 129,004 dropped before reaching the renderer.
-// They are not a rendering fault -- they never had a program to run.
+// The shader OBJECT also carries its own microcode, which matters because the
+// patch hook only fires for shaders D3D9 needs to patch -- everything else was
+// reported as "no-code", 41% of draws in one run, the same draws as the ones
+// dropped before reaching the renderer. They never had a program to run.
 //
-// The offset is SEARCHED rather than assumed, against code already proven by
-// the patch hook's own decode. If one offset explains every shader, it is a
-// property of the layout and can be relied on; if the histogram is spread, the
-// premise is wrong and this says so instead of producing plausible garbage.
-// Same discipline as the CF-start search this file already documents.
-// Where a vertex shader's own microcode lives, and how long it is.
-//
-// Both transcribed from sub_82565550, the routine that uploads a shader: it
-// allocates ring space, copies the code in, and only THEN calls
-// PatchVertexShaderToMatchVertexDeclaration on the ring copy.
+// Both transcribed from sub_82565550, which allocates ring space, copies the
+// code in, and only THEN calls the patcher on the ring copy:
 //
 //   v17 = *(*(self + (variant+0x70)*8) + self + 876)   // size in BYTES
 //   v23 = *(*(self + (variant+0x70)*8) + self + 872) + *(self + 0x20)
 //   v24 = (((v23 >> 20) + 512) & 0x1000) + (v23 & 0x1FFFFFFF) - 0x40000000
 //   memcpy(dest, v24, v17)
 //
-// 872 is kUCodeBlobDelta and 876 is the dword after it, so the size sits at
-// blob+4 -- beside the fetch count at blob+0x1C this file already reads. The
-// code itself is at blob + *(self+0x20), through an address fixup that clears
-// the 0x40000000 segment bit. Searching a window around the blob found NOTHING
-// in 36,000 shaders, which is exactly right: the fixup moves it out of range.
+// 872 is kUCodeBlobDelta and the size sits at blob+4, beside the fetch count at
+// blob+0x1C this file already reads. The code is at blob + *(self+0x20) through
+// an address fixup that clears the 0x40000000 segment bit -- which is why
+// searching a window around the blob found NOTHING in 36,000 shaders.
 uint32_t ShaderObjectBlob(uint32_t self, uint32_t variant, uint8_t* base) {
   const uint32_t slot = self + (variant + kUCodePtrTable) * 8;
   if (!self || !HostPageReadable(REX_RAW_ADDR(slot))) return 0;
@@ -4607,9 +4223,8 @@ uint32_t ShaderObjectCodeAddress(uint32_t self, uint32_t variant,
   // *(blob), not blob. The decompilation reads
   //   v23 = *(_DWORD *)(*(...) + a3 + 872) + *(_DWORD *)(a3 + 32)
   // and that outer dereference is easy to drop, because the very similar
-  // expression in PatchVertexShaderToMatchVertexDeclaration uses the same
-  // address WITHOUT one (as the base for the fetch table). Taking blob itself
-  // put the read 0 of 28,000 shaders' first eight dwords -- caught only
+  // expression in the patcher uses the same address WITHOUT one. Taking blob
+  // itself put the read 0 of 28,000 shaders' first eight dwords -- caught only
   // because the probe checked alignment separately from content.
   if (!HostPageReadable(REX_RAW_ADDR(blob))) return 0;
   const uint32_t v23 = REX_LOAD_U32(blob) + REX_LOAD_U32(self + 0x20);
@@ -4717,11 +4332,9 @@ void CapturePatchedCode(uint32_t self, uint32_t dest, uint32_t variant,
 
   // dest first. Measured over 24 distinct shaders: the CF stream starts exactly
   // at the patch destination in 24 of 24, while the upward scan below lands
-  // early in 3 of them (off -3, -3, -85) because it takes the first offset that
-  // decodes and a false positive can precede the true start. Trying dest before
-  // scanning costs one decode and removes that whole failure mode.
-  //
-  // Still verified, not assumed — same rule as the cached offset below.
+  // early in 3 of them because it takes the first offset that decodes and a
+  // false positive can precede the true start. Trying dest first costs one
+  // decode and removes that whole failure mode. Still verified, not assumed.
   if (decodes_at(kPatchWindowBack)) {
     pc.code_off = kPatchWindowBack;
     pc.resolved = true;
@@ -4745,26 +4358,20 @@ void CapturePatchedCode(uint32_t self, uint32_t dest, uint32_t variant,
   // Does the guest state the answer the search just hunted for?
   //
   // sub_82565928's VS branch computes the program address the GPU is given as
-  // *(vs + 0x20) + *(info + 0x368), where info = vs + *(vs + 0x380 +
-  // variant*8), with the length in bytes at info + 0x36C. The patcher
-  // (0x82564C50) indexes the identical 0x380 + variant*8 field, so both agree
-  // the patched code lives in the shader's own allocation.
+  // *(vs + 0x20) + *(info + 0x368), where info = vs + *(vs + 0x380 + variant*8),
+  // with the length in bytes at info + 0x36C. The patcher indexes the identical
+  // 0x380 + variant*8 field, so both agree the patched code lives in the
+  // shader's own allocation.
   //
-  // Compared as ABSOLUTE guest addresses, which is the only common ground: the
-  // search's answer is an index into a ring window, the field's is a pointer.
-  // Reporting them any other way would compare two different coordinate
-  // systems and call the mismatch a finding.
+  // Compared as ABSOLUTE guest addresses, the only common ground: the search's
+  // answer is an index into a ring window, the field's is a pointer.
   //
-  // Measurement only. Nothing here changes what is captured — if the field is
-  // right, the search is still what runs until a separate change says so.
-  // The program length, read unconditionally — it bounds the code handed to the
-  // decoders and so is not a diagnostic. Only the reporting below is gated.
-  //
-  // The length is the canonical program's, and 2520 of 2561 captures patch into
-  // a buffer other than the shader's own allocation. Taken as applying to the
-  // patched copy anyway: patching rewrites fetch instructions in place and
-  // cannot change the instruction count. If that were wrong the bound would cut
-  // a shader short and the fetch decode would fail loudly rather than silently.
+  // Measurement only -- the search is still what runs. The LENGTH is read
+  // unconditionally, because it bounds the code handed to the decoders. It is
+  // the canonical program's, and 2520 of 2561 captures patch into a buffer other
+  // than the shader's own allocation; taken as applying to the patched copy
+  // anyway, since patching rewrites fetch instructions in place and cannot
+  // change the instruction count.
   uint32_t field_abs = 0, field_len = 0;
   {
     const uint32_t info_at = self + kVsInfoOffsetAt + variant * 8;

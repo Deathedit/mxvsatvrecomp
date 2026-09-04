@@ -4,18 +4,17 @@
 //
 // This is where HLE step 2 pays off: the PM4 path has to infer the stride by
 // dividing a buffer size by a vertex count, then guess which attribute is the
-// position and which is the colour. Here both are stated — SetStreamSource
+// position and which the colour. Here both are stated -- SetStreamSource
 // supplies the stride, and the vertex declaration names POSITION 0 and COLOR 0
 // by semantic.
 //
-// **No guest macros here.** The hook owns guest access and hands over plain
-// host pointers, so this file stays testable off the guest and cannot acquire
-// an unbounded read by accident. Every range is bounded by the buffer size the
-// hook recorded from the object D3D9 itself read.
+// **No guest macros here.** The hook owns guest access and hands over plain host
+// pointers, so this file stays testable off the guest and cannot acquire an
+// unbounded read by accident. Every range is bounded by the buffer size the hook
+// recorded from the object D3D9 itself read.
 //
-// The output is the existing mx::hle::DrawCall, so the whole downstream path —
-// NativeGraphics::SetDrawCalls, the render thread's filter loop, AddGameDraw —
-// is reused unchanged and no gfx code moves.
+// The output is the existing mx::hle::DrawCall, so the whole downstream path is
+// reused unchanged and no gfx code moves.
 
 #include <cstdint>
 #include <mutex>
@@ -59,34 +58,30 @@ struct HleDrawInputs {
   uint32_t count       = 0;   // VertexCount, or IndexCount when indexed
   int32_t  base_vertex = 0;   // DrawIndexedVertices' BaseVertexIndex
 
-  // Streams whose vertex fetch is indexed by a register other than r0.x --
-  // a value the SHADER computes. One bit per stream, from
+  // Streams whose vertex fetch is indexed by a register other than r0.x -- a
+  // value the SHADER computes. One bit per stream, from
   // HlslShader::computed_index_streams.
   //
-  // The GPU fetch path indexes these by the named register and copies the
-  // whole stream. This path cannot: it is declaration-driven, finds
-  // attributes by USAGE, and never runs the ALU that produces the index.
-  // Reading vertex N from such a stream is not an approximation, it is an
-  // unrelated row -- confident nonsense of exactly the kind that is
-  // undebuggable later. Those attributes are zero-filled and counted
-  // instead, which is what an out-of-range fetch already yields here.
+  // The GPU fetch path indexes these by the named register and copies the whole
+  // stream. This path cannot: it is declaration-driven, finds attributes by
+  // USAGE, and never runs the ALU that produces the index. Reading vertex N from
+  // such a stream is not an approximation, it is an unrelated row. Those
+  // attributes are zero-filled and counted instead, which is what an
+  // out-of-range fetch already yields here.
   uint32_t computed_index_streams = 0;
 
-  // The shader derives a fetch index FROM the vertex index, so SV_VertexID
-  // must be the guest's absolute index, not one rebased onto this draw's
-  // window.
+  // The shader derives a fetch index FROM the vertex index, so SV_VertexID must
+  // be the guest's absolute index, not one rebased onto this draw's window.
   //
-  // Rebasing (`v - lo`) is right when the vertex index only addresses a
-  // stream we windowed to match. It is wrong the moment the shader does
-  // arithmetic on it: the billboard shaders compute `instance = vid / 4`, so
-  // with a rebased id every draw addressed instances 0..N instead of its own
-  // range and all 42 foliage draws rendered the SAME billboards. Measured in
-  // the mesh: draw B's 16 live vertices were 16-for-16 identical to draw
-  // A's.
+  // Rebasing (`v - lo`) is right when the vertex index only addresses a stream
+  // we windowed to match. It is wrong the moment the shader does arithmetic on
+  // it: the billboard shaders compute `instance = vid / 4`, so with a rebased id
+  // every draw addressed instances 0..N instead of its own range and all 42
+  // foliage draws rendered the SAME billboards -- draw B's 16 live vertices were
+  // 16-for-16 identical to draw A's.
   //
   // Xenia solves it from the other side, adding a vertex index offset system
-  // constant in RemapAndConvertVertexIndices. Not rebasing needs no constant
-  // and no shader change.
+  // constant. Not rebasing needs no constant and no shader change.
   bool absolute_indices = false;
 
   // How the hardware conditions an index before it reaches the vertex fetch.
@@ -102,8 +97,7 @@ struct HleDrawInputs {
   //
   // The clamp is the important one and is why an overrun can never read past a
   // buffer on hardware: a wild index reads the LAST VALID vertex, it does not
-  // read zero. Defaults leave every step inert, so a caller that does not fill
-  // these behaves exactly as before.
+  // read zero. Defaults leave every step inert.
   uint32_t index_max     = 0xFFFFFF;  // VGT_MAX_VTX_INDX.max_indx  (0x2100)
   uint32_t index_min     = 0;         // VGT_MIN_VTX_INDX.min_indx  (0x2101)
   uint32_t index_offset  = 0;         // VGT_INDX_OFFSET            (0x2102)
@@ -118,13 +112,13 @@ struct HleDrawInputs {
   // The caller expects this draw to fetch its vertices on the GPU, where the
   // 36-byte host vertex below is never read. Set it and BuildHleDraw leaves
   // `vertices` empty and `vertex_stride` zero, skipping the per-vertex pass
-  // entirely — 26-31 ms of a menu frame, measured over 289,379 vertices.
+  // entirely -- 26-31 ms of a menu frame over 289,379 vertices.
   //
   // It is a PREDICTION, not a decision: the fetch path is only finally settled
   // once the shader's attributes have been cross-checked against the streams,
   // which happens after the draw is built. A draw that turns out not to fetch
-  // fills the gap by calling TranscodeHleVertices below, so a wrong prediction
-  // costs nothing beyond doing the work later.
+  // fills the gap by calling TranscodeHleVertices, so a wrong prediction costs
+  // nothing beyond doing the work later.
   bool defer_transcode = false;
 };
 
@@ -172,11 +166,11 @@ bool BuildHleDraw(const HleDrawInputs& in, DrawCall& out, HleSkip& skip);
 // Fill in the 36-byte host vertices for a draw built with `defer_transcode`.
 // Reads `out.first_vertex` and `out.vertex_count`, which BuildHleDraw has
 // already set, and resolves the declaration's POSITION/COLOR/TEXCOORD0 by
-// exactly the rule BuildHleDraw uses — one implementation, so the deferred and
+// exactly the rule BuildHleDraw uses -- one implementation, so the deferred and
 // eager forms cannot decode a vertex differently.
 //
-// `in` must be the same inputs the draw was built from, with its stream
-// pointers still live.
+// `in` must be the same inputs the draw was built from, with its stream pointers
+// still live.
 bool TranscodeHleVertices(const HleDrawInputs& in, DrawCall& out,
                           HleSkip& skip);
 
@@ -188,39 +182,36 @@ bool TranscodeHleVertices(const HleDrawInputs& in, DrawCall& out,
 bool FinalizeHleTopology(DrawCall& draw, HleSkip& skip);
 
 // The frame's draws, accumulated by the D3D9 draw hooks and taken by the swap
-// hook. THIS THREAD's draws — the list is thread-local.
+// hook. THIS THREAD's draws -- the list is thread-local.
 //
 // It used to be one global vector, on the grounds that "every D3D9 entry point
 // in this title arrives on one thread, which was measured rather than assumed".
 // The measurement was real and the conclusion was wrong: it was taken while the
-// guest's three parallel record workers (sub_82AC8CC8) were deadlocked in the
-// fence spin, so they recorded nothing and the traffic really did arrive on one
-// thread. Retiring the fence (hooks_frame.cpp) woke them, and the first run
-// with all four threads recording crashed inside 20 seconds — a host-side heap
-// write and two threads dereferencing 0xFFFFFFFFFFFFFFFF, which is what
-// concurrent push_back into one vector of DrawCall (two vectors and a
-// shared_ptr apiece) looks like.
+// guest's three parallel record workers were deadlocked in the fence spin, so
+// they recorded nothing. Retiring the fence woke them, and the first run with
+// all four threads recording crashed inside 20 seconds -- a host-side heap write
+// and two threads dereferencing 0xFFFFFFFFFFFFFFFF, which is what concurrent
+// push_back into one vector of DrawCall looks like.
 //
-// Per-thread lists remove the race without a lock on the hot path, and they
-// also fix a correctness bug that predates it: each worker drives its OWN D3D9
-// device (dword_830B2C60[0..2]), so one shared list interleaved three devices'
-// draws in thread-arrival order. HleMergeWorkerDraws puts that right.
+// Per-thread lists remove the race without a lock on the hot path, and also fix
+// a correctness bug that predates it: each worker drives its OWN D3D9 device, so
+// one shared list interleaved three devices' draws in thread-arrival order.
+// HleMergeWorkerDraws puts that right.
 std::vector<DrawCall>& HleFrameDraws();
 
 // The HLE layer's big lock.
 //
 // Per-thread draw lists and device state removed the two structural races, but
-// the D3D9 hooks carry roughly thirty more shared globals — mostly std::map
-// caches and diagnostic tallies keyed by shader handle — and every one of them
-// is written from the draw path. Concurrent insertion into a red-black tree
-// corrupts it, and mx_701 still died at frame 2726 with the same signature: a
-// host-side heap write and a read of 0xFFFFFFFFFFFFFFFF.
+// the D3D9 hooks carry roughly thirty more shared globals -- mostly std::map
+// caches and diagnostic tallies keyed by shader handle -- and every one is
+// written from the draw path. Concurrent insertion into a red-black tree
+// corrupts it, and a run still died at frame 2726 with the same signature.
 //
 // Serialising the hooks is the honest fix. It costs the parallelism the guest
-// intended, but we were never exploiting it — our own HLE work is nearly the
+// intended, but we were never exploiting it -- our own HLE work is nearly the
 // whole frame, so the three workers were contending on this layer anyway. Once
-// it is stable, individual caches can be made thread-local to win it back,
-// with a measurement to justify each one.
+// it is stable, individual caches can be made thread-local to win it back, with
+// a measurement to justify each one.
 std::recursive_mutex& HleGlobalMutex();
 
 // Tag this thread as parallel record worker `index` (0..2). Called from the
@@ -246,11 +237,10 @@ uint64_t& HleBuiltCount();
 uint64_t& HleVertexZeroFillCount();
 
 // Attributes this path could not read because their stream is fetched with a
-// SHADER-COMPUTED index -- see HleDrawInputs::computed_index_streams. Not a
-// failure to be fixed here: the value does not exist without running the ALU,
-// so the attribute keeps its default. Counted because the alternative was
-// reading an unrelated vertex and never knowing, and because a non-zero here
-// means those draws want the GPU fetch path rather than this one.
+// SHADER-COMPUTED index. Not a failure to be fixed here: the value does not
+// exist without running the ALU, so the attribute keeps its default. Counted
+// because the alternative was reading an unrelated vertex and never knowing, and
+// because a non-zero here means those draws want the GPU fetch path.
 uint64_t& HleComputedIndexSkips();
 
 // Primitive restart. `Draws` counts draws that contained at least one marker and
@@ -289,28 +279,25 @@ struct HleZeroFillCensusData {
 HleZeroFillCensusData& HleZeroFillCensus();
 
 //===========================================================================
-// Stage 3 — where the transform comes from.
+// Stage 3 -- where the transform comes from.
 //
-// The plan said to cross-check the HLE matrix against "the PM4 constant
-// shadow". **There is no such shadow.** `Pm4Translator::m_mvp` is dead: this
-// title emits neither SET_CONSTANT nor SET_SHADER_CONSTANTS, so
-// `DrawCall::mvp` is `BuildViewportMvp` — the viewport *inverse*, which treats
-// the guest's vertex positions as already being in window coordinates. That is
-// a claim about the geometry, not a matrix to compare against, and it is the
-// thing this stage has to test.
+// The plan said to cross-check the HLE matrix against "the PM4 constant shadow".
+// **There is no such shadow.** `Pm4Translator::m_mvp` is dead: this title emits
+// neither SET_CONSTANT nor SET_SHADER_CONSTANTS, so `DrawCall::mvp` is
+// `BuildViewportMvp` -- the viewport *inverse*, which treats the guest's vertex
+// positions as already being in window coordinates. That is a claim about the
+// geometry, not a matrix to compare against, and it is what this stage tests.
 //
 // So the cross-check is the instrument that settled the viewport question
 // before: transform real positions by each candidate and count how many land
-// inside the clip volume. A matrix that is the right one puts nearly all of
-// them there; a wrong one does not. Both readings are scored over the same
-// vertices in the same pass, so neither can be favoured by sampling.
+// inside the clip volume. Both readings are scored over the same vertices in the
+// same pass, so neither can be favoured by sampling.
 //
-// The constants are not hooked. `D3DDevice_SetVertexShaderConstantFN`
-// (0x82550320) writes them to `device + (StartRegister + 0x78) * 16` — read
-// straight off its own arithmetic — so, like the declaration at 0x2ED8 and the
-// fetch constants at 0x6F4, the device holds the live value whichever path
-// wrote it. Reading beats hooking here for the same reason it did twice
-// before: a state block would bypass the hook and not the field.
+// The constants are not hooked. D3DDevice_SetVertexShaderConstantFN writes them
+// to `device + (StartRegister + 0x78) * 16` -- read straight off its own
+// arithmetic -- so, like the declaration at 0x2ED8 and the fetch constants at
+// 0x6F4, the device holds the live value whichever path wrote it. A state block
+// would bypass the hook and not the field.
 //===========================================================================
 
 // Vec4 registers sampled from the constant file per draw. A 4x4 matrix can
@@ -318,43 +305,36 @@ HleZeroFillCensusData& HleZeroFillCensus();
 constexpr uint32_t kHleProbeRegs = 64;
 
 // Layouts a candidate can be read in. A D3D-era compiler packs a matrix into
-// four constants either way round, and picking wrong transposes the transform —
+// four constants either way round, and picking wrong transposes the transform --
 // which looks like plausible geometry in the wrong place, not like a failure.
-// HleMatrixLayout (kRowMajor / kColMajor) was declared here and never used —
-// removed 2026-08-17. The probe below scores both layouts internally and names
-// the winner in its report; it never needed the type to be public.
+// HleMatrixLayout was declared here and never used; the probe below scores both
+// layouts internally and names the winner in its report.
 
 // Score one built draw's positions against every candidate. `consts` is
 // kHleProbeRegs*4 floats already in host order; `viewport_mvp` is the control,
 // the same transform the PM4 path uses today (may be null if no viewport).
 //
-// **Measurement only.** Nothing here selects a matrix — the draw is rendered
-// with whatever HleDrawInputs::mvp carried, which this stage sets to the
-// viewport inverse so the HLE picture is comparable to the PM4 one on screen.
-// Wiring a constant-file matrix in is a separate edit, made after reading the
-// verdict, not an adaptive choice made mid-run.
-// The winner is cross-tabbed against the SHADER, and the shader is identified
-// by the CONTENT of its microcode, never by its handle.
+// **Measurement only.** Nothing here selects a matrix -- the draw is rendered
+// with whatever HleDrawInputs::mvp carried. Wiring a constant-file matrix in is
+// a separate edit, made after reading the verdict.
 //
-// `vs_content` is an FNV-1a over the microcode dwords; `vs_handle` is the guest
-// address, carried only so the report can say how many handles one shader wore.
-// Pass 0 for content when it is not known yet -- those draws are counted apart
-// rather than merged into a single bucket, because merging every unknown into
-// one key is the same error this keying exists to avoid.
+// The winner is cross-tabbed against the SHADER, and the shader is identified by
+// the CONTENT of its microcode, never by its handle. `vs_content` is an FNV-1a
+// over the microcode dwords; `vs_handle` is the guest address, carried only so
+// the report can say how many handles one shader wore. Pass 0 for content when
+// it is not known yet -- those draws are counted apart rather than merged.
 //
 // WHY NOT THE HANDLE. Handles are guest addresses and the runtime recycles them
 // onto DIFFERENT microcode within a single run -- measured at 9,968 of 10,074
-// compiles. Keying by handle therefore does two things to this table at once:
-// it splits one shader across several rows, and it merges several shaders into
-// one row. Run mx_1911 shows both, with byte-identical triples
-// (0x216030E0 / 0x216A68A0 / 0x216A7BA0, each "1681 explained, 1681/1681, 1
-// distinct winner") sitting alongside rows reading "7 distinct winners".
+// compiles. Keying by handle does two things at once: it splits one shader
+// across several rows, and it merges several shaders into one row. One run shows
+// both, with byte-identical triples sitting alongside rows reading "7 distinct
+// winners".
 //
 // That matters because the whole verdict here is a judgment about SCATTER: a
 // shader whose draws agree on one register is evidence the register belongs to
-// the shader, and one whose draws scatter means the scoring is fitting noise.
-// A handle covering three shaders manufactures exactly that scatter, so under
-// handle keying neither reading can be trusted.
+// the shader, and one whose draws scatter means the scoring is fitting noise. A
+// handle covering three shaders manufactures exactly that scatter.
 void ScoreHleTransform(const DrawCall& dc, const float* consts,
                        const float* viewport_mvp, uint64_t vs_content,
                        uint32_t vs_handle);

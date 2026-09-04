@@ -88,14 +88,12 @@ uint32_t ExecSequence(const uc::ControlFlowInstruction& cf) {
 // How many source operands each vector opcode actually reads. The SDK knows --
 // kAluVectorOpcodeInfos::GetOperandCount -- but that table is `extern const` and
 // defined inside the sealed plugin DLL, so it cannot be linked against. This is
-// transcribed from the per-opcode signatures documented in the enum itself
-// (AluVectorOpcode in ucode.h), which give the operand list for every one.
+// transcribed from the per-opcode signatures documented in the enum itself.
 //
 // Reading a source the opcode does not use is not harmless here. The position
 // export in both ground-truth shaders is a two-operand op whose unused src3
 // field still names temp register 0 -- the colour register -- so consulting all
-// three marked colour as feeding the position. That is the exact false positive
-// this table exists to prevent.
+// three marked colour as feeding the position.
 //
 // Opcodes 30 and 31 are undefined; 3 is the conservative answer for them.
 constexpr uint8_t kVectorOperandCount[32] = {
@@ -407,12 +405,12 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
 
   // Pass 1 -- find where the control flow section ends.
   //
-  // The blob carries no header saying so. CF instructions are 48-bit, packed
-  // two per three dwords, and the section runs until the first instruction the
-  // control flow jumps to. So the end is the lowest exec target address, and
-  // the bound is re-read each iteration so it shrinks as execs are seen. That
-  // is sound because a compiler never places an exec target ahead of the CF
-  // that references it.
+  // The blob carries no header saying so. CF instructions are 48-bit, packed two
+  // per three dwords, and the section runs until the first instruction the
+  // control flow jumps to. So the end is the lowest exec target address, and the
+  // bound is re-read each iteration so it shrinks as execs are seen. That is
+  // sound because a compiler never places an exec target ahead of the CF that
+  // references it.
   uint32_t max_cf_dword = dword_count - (dword_count % 3);
   bool saw_exec = false;
   for (uint32_t i = 0; i + 2 < max_cf_dword; i += 3) {
@@ -430,27 +428,26 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
 
   // Pass 2 -- walk every exec block in program order and pull out the fetches.
   //
-  // Branches are deliberately not followed and loops are not unrolled: each
-  // exec is visited exactly once. That over-approximates the attribute set for
-  // a shader with alternative paths, which is the right error for gathering a
-  // layout -- every path fetches from the same buffer. A shader with two genuine
-  // layouts would show up as two attributes at one offset with different
-  // formats, and that should be reported, not smoothed over by a heuristic.
+  // Branches are deliberately not followed and loops are not unrolled: each exec
+  // is visited exactly once. That over-approximates the attribute set for a
+  // shader with alternative paths, which is the right error for gathering a
+  // layout. A shader with two genuine layouts would show up as two attributes at
+  // one offset with different formats, and that should be reported.
   //
-  // last_full persists across exec blocks within the shader: a vfetch_full in
-  // one exec followed by minis in another is legal.
+  // last_full persists across exec blocks: a vfetch_full in one exec followed by
+  // minis in another is legal.
   uc::VertexFetchInstruction last_full{};
   bool have_full = false;
   uint32_t cf_seen = 0;
 
   // Which fetched attributes reach the position export.
   //
-  // taint[r] is a bitmask of indices into the attributes this call appends, one
-  // bit per attribute, recording which of them the value currently in GPR r was
-  // built from. A vfetch writing r resets it to just that attribute; an ALU
-  // instruction unions its source registers' masks into its destination; an
-  // export to register 62 unions them into pos_taint. kMaxAttributes is 32, so
-  // one uint32_t per register is exactly enough.
+  // taint[r] is a bitmask of indices into the attributes this call appends,
+  // recording which of them the value currently in GPR r was built from. A
+  // vfetch writing r resets it to just that attribute; an ALU instruction unions
+  // its source registers' masks into its destination; an export to register 62
+  // unions them into pos_taint. kMaxAttributes is 32, so one uint32_t per
+  // register is exactly enough.
   //
   // Only the operands the opcode actually reads count -- see
   // kVectorOperandCount, and the false positive that made it necessary.
@@ -542,8 +539,8 @@ bool DecodeVertexShaderFetches(const uint32_t* dwords, uint32_t dword_count,
         // is_index_rounded from the preceding vfetch_full, and carries its own
         // format, offset, dest and modifiers. Its stride field usually reads 0
         // and its const_index reads garbage, so consuming them unconditionally
-        // would silently yield a stride-0 attribute. (Not always zero, though:
-        // one captured shader's mini carries the same stride as its full. The
+        // would silently yield a stride-0 attribute. (Not always zero: one
+        // captured shader's mini carries the same stride as its full. The
         // inherited value is correct in both cases.)
         if (a.from_mini) {
           if (!have_full) return reject("vfetch_mini with no preceding full");
@@ -718,32 +715,27 @@ bool DecodePixelTextureFetches(const uint32_t* dwords, uint32_t dword_count,
         std::memcpy(&tf, dwords + at, sizeof(tf));
         if (tf.is_src_relative() || tf.is_dest_relative())
           return reject("relative texture fetch");
-        // NAME THE DIMENSION. This was a single static "non-2D texture
-        // fetch" for every kind, which made the population unactionable: run
-        // 1438 refused 48 of 178 pixel shaders here and the log could not say
-        // whether they wanted cube, 3D or 1D. Those are three different pieces
-        // of work -- kCube and k3DOrStacked need real sampling support, k1D is
-        // a 2D fetch with a degenerate axis -- and the fix for one is not the
-        // fix for another.
+        // NAME THE DIMENSION. This was a single static "non-2D texture fetch"
+        // for every kind, which made the population unactionable: one run
+        // refused 48 of 178 pixel shaders here and the log could not say whether
+        // they wanted cube, 3D or 1D. Those are three different pieces of work.
         //
         // Static literals, one per dimension, because `fail` is a const char**
         // with no storage of its own. No allocation, no lifetime question, and
         // the string still groups cleanly under `sort | uniq -c`.
         //
-        // Naming it is cheap and the precedent is expensive: a fetch refusal
-        // read from a too-vague message already cost this project a session
-        // (the exp_adjust "phantom", where a misread FetchOpcode refusal held
-        // ~89k draws off the GPU fetch path).
+        // The precedent is expensive: a fetch refusal read from a too-vague
+        // message already cost this project a session (the exp_adjust "phantom",
+        // where a misread FetchOpcode refusal held ~89k draws off the GPU fetch
+        // path).
         if (tf.dimension() != rex::graphics::xenos::FetchOpDimension::k2D) {
-          // SKIP IT, do not reject the blob. See the header for the
-          // measurement; the short version is that this used to discard 3-7
-          // already-decoded 2D bindings (15 in one case) because of a single
-          // fetch we cannot represent, so the draw got NO textures instead of
-          // most of them.
+          // SKIP IT, do not reject the blob. See the header for the measurement;
+          // the short version is that this used to discard 3-7 already-decoded
+          // 2D bindings (15 in one case) because of a single fetch we cannot
+          // represent, so the draw got NO textures instead of most of them.
           //
           // The skipped fetch's sampler is simply absent from the profile, so
-          // that one slot falls back to whatever an unbound sampler does today
-          // -- which is exactly what all of its siblings did before this.
+          // that one slot falls back to whatever an unbound sampler does today.
           ++skipped;
           if (!skipped_kind) {
             switch (tf.dimension()) {

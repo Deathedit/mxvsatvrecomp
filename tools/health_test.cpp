@@ -7,10 +7,9 @@
 // THE ASSERTION THAT MATTERS IS THE ZERO-OUT-OF-ZERO ONE. This module exists to
 // stop a zero that means "never had the chance to fire" from reading as
 // "healthy", and the way that fails is for kUnmeasured to quietly collapse into
-// kOk. Every primitive is therefore checked at all three populations, not only
-// at the interesting value, and the report tallies are checked as well -- a
-// verdict that is right per call and miscounted in the summary is the same
-// defect one layer along.
+// kOk. Every primitive is therefore checked at all three populations, and the
+// report tallies as well -- a verdict that is right per call and miscounted in
+// the summary is the same defect one layer along.
 
 #include <cstdio>
 #include <cstdlib>
@@ -157,10 +156,9 @@ void CheckStaleness() {
 //
 // This is the failure the module was written to prevent, committed inside the
 // module: checks materialised on first use, so one behind a gate that never
-// opened simply did not exist and nothing could say so. Run mx_1900 reported
-// "(of 11)" against twelve wired checks -- gpu_fetch.address_mismatch sits
-// behind the g_diag gate and needs 400 qualifying draws, so it silently was not
-// there. The declared list is now the denominator.
+// opened simply did not exist. One run reported "(of 11)" against twelve wired
+// checks, because gpu_fetch.address_mismatch sits behind the g_diag gate and
+// needs 400 qualifying draws. The declared list is now the denominator.
 void CheckDeclaredButNeverRun() {
   std::printf("declared checks\n");
   const std::string r = h::Report();

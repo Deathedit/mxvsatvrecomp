@@ -2,23 +2,21 @@
 
 // Turns a guest D3DVERTEXELEMENT9 array into a host input layout.
 //
-// This is the first piece of the D3D9 -> D3D12 high-level path. Every colour
-// and stride round so far has inferred the vertex layout from PM4 plus shader
+// This is the first piece of the D3D9 -> D3D12 high-level path. Every colour and
+// stride round before it inferred the vertex layout from PM4 plus shader
 // microcode, because a Xenos vfetch carries format and offset but not semantic.
 // The semantics live one layer up, in the arrays the game hands to
-// D3DDevice_CreateVertexDeclaration — 23 of them captured in
-// logs/decldump/decls.txt.
+// D3DDevice_CreateVertexDeclaration.
 //
 // **The Type dword's bit layout is not inferred here.** It was read out of
 // D3D::PatchVertexShaderToMatchVertexDeclaration (0x82564C50), which is the
 // function that consumes it: it takes each element's Type and writes the
 // matching fields of the shader's vfetch instruction. Its own arithmetic gives
-// the field positions exactly (see kTypeFormat* below), and the size table it
-// indexes is lifted verbatim from the XEX at 0x8204E188.
+// the field positions exactly, and the size table it indexes is lifted verbatim
+// from the XEX at 0x8204E188.
 //
-// Header stays free of the SDK and of d3d12.h — like shader_ucode.h — so the
-// fixture test can include it directly. Only <dxgiformat.h> comes in, which is
-// a dependency-free enum header.
+// Header stays free of the SDK and of d3d12.h -- like shader_ucode.h -- so the
+// fixture test can include it directly.
 
 #include <cstdint>
 #include <vector>
@@ -30,14 +28,14 @@ namespace mx::hle {
 // float4 clip-space position + float4 colour + float2 UV.
 //
 // The position is four components, not three, and that is load-bearing. The
-// guest vertex shader exports homogeneous clip space — PA_CL_VTE_CNTL reads
-// 0x400/0x43F at device+10572, and bits 8/9 (VTX_XY_FMT, VTX_Z_FMT), the ones
-// that would mean "already divided by W0", are clear in every sample. Handing
-// D3D12 clip space lets it clip against the near plane in hardware and do the
-// perspective divide itself. Dividing on the CPU instead cannot represent the
-// w <= 0 vertices at all — measured, 1.2 million of them — because a negative
-// w mirrors the vertex through the origin rather than putting it behind the
-// eye, and it loses perspective-correct interpolation of the UVs as well.
+// guest vertex shader exports homogeneous clip space -- PA_CL_VTE_CNTL reads
+// 0x400/0x43F, and bits 8/9 (VTX_XY_FMT, VTX_Z_FMT), the ones that would mean
+// "already divided by W0", are clear in every sample. Handing D3D12 clip space
+// lets it clip against the near plane in hardware and do the perspective divide
+// itself. Dividing on the CPU cannot represent the w <= 0 vertices at all --
+// measured, 1.2 million of them -- because a negative w mirrors the vertex
+// through the origin rather than putting it behind the eye, and it loses
+// perspective-correct interpolation of the UVs as well.
 constexpr uint32_t kHostVertexStride = 40;
 
 //===========================================================================
@@ -46,8 +44,8 @@ constexpr uint32_t kHostVertexStride = 40;
 // **12 bytes, not the PC struct's 8.** Both D3DDevice_CreateVertexDeclaration
 // (0x82550B80) and XGSetVertexDeclaration (0x82550A90) walk the array with
 // `lhzu r9, 0xC`, and PatchVertexShaderToMatchVertexDeclaration advances its
-// element cursor by 6 halfwords. Byte 11 is padding the runtime never reads —
-// the captures show it holding leftover garbage (FF, 7C, 78, 3B, 60).
+// element cursor by 6 halfwords. Byte 11 is padding the runtime never reads --
+// the captures show it holding leftover garbage.
 //===========================================================================
 struct D3D9Element {
   uint16_t stream      = 0;
@@ -94,13 +92,13 @@ const char* UsageSemanticName(uint8_t usage);
 // The Type dword.
 //
 // PatchVertexShaderToMatchVertexDeclaration builds the vfetch words like this,
-// with `t` the Type dword (decompilation at 0x82564C50, simplified):
+// with `t` the Type dword (simplified):
 //
 //   dword1 = (((t << 12) & 0x3F000) | (t & 0x300)) << 4 | dword1 & 0xBFC0CFFF;
 //
-// The preserved mask clears exactly bits [21:16], [13:12] and [30] of the
-// vfetch dword1, which by ucode.h are `format`, `fomat_comp_all`,
-// `num_format_all` and `is_mini_fetch`. Equating the two sides:
+// The preserved mask clears exactly bits [21:16], [13:12] and [30] of the vfetch
+// dword1, which by ucode.h are `format`, `fomat_comp_all`, `num_format_all` and
+// `is_mini_fetch`. Equating the two sides:
 //
 //   t[5:0]   -> format            (xenos::VertexFormat)
 //   t[8]     -> fomat_comp_all    (1 = signed)
@@ -108,13 +106,12 @@ const char* UsageSemanticName(uint8_t usage);
 //   t[21:10] -> the vfetch destination swizzle, four 3-bit components,
 //               **x in [12:10] and w in [21:19]**
 //
-// The swizzle's component order is not taken on trust from that arithmetic —
-// it is confirmed by what the 23 captures decode to, which is only consistent
-// one way round: 4-component formats give the identity 0x688 = (x,y,z,w),
-// 3-component ones give 0xA88 = (x,y,z,1), 2-component 0xB08 = (x,y,0,1),
-// 1-component 0xB20 = (x,0,0,1), and every 8_8_8_8 COLOR gives 0x60A =
-// (z,y,x,w), which is D3DCOLOR's BGRA arriving as RGBA. Component values are
-// 0-3 for xyzw, 4 for constant 0 and 5 for constant 1.
+// The swizzle's component order is not taken on trust from that arithmetic -- it
+// is confirmed by what the 23 captures decode to, which is only consistent one
+// way round: 4-component formats give the identity 0x688 = (x,y,z,w),
+// 3-component 0xA88 = (x,y,z,1), 2-component 0xB08, 1-component 0xB20, and every
+// 8_8_8_8 COLOR gives 0x60A = (z,y,x,w), which is D3DCOLOR's BGRA arriving as
+// RGBA. Component values are 0-3 for xyzw, 4 for constant 0 and 5 for 1.
 //
 // The swizzle is carried through but deliberately not applied to the host
 // format: on this path it belongs in the translated shader, exactly where D3D9
@@ -158,7 +155,7 @@ uint32_t VertexFormatSizeBytes(uint32_t format);
 //===========================================================================
 // The host layout.
 //
-// Not D3D12_INPUT_ELEMENT_DESC, so this stays out of d3d12.h — the gfx layer
+// Not D3D12_INPUT_ELEMENT_DESC, so this stays out of d3d12.h -- the gfx layer
 // converts. `stream` is carried rather than flattened: 5 of the 23 captured
 // declarations use two streams, and collapsing them to stream 0 would read the
 // second stream's offsets against the first stream's buffer.
@@ -210,24 +207,21 @@ struct LayoutError {
   // Elements OMITTED from the layout rather than fatal to it.
   //
   // The transcode reads exactly three elements -- POSITION0, COLOR0 and
-  // TEXCOORD0 (ResolveTranscodeElements in d3d9_draw.cpp) -- and the 36-byte
-  // host vertex has room for nothing else. Every other element in the
-  // declaration is described and then never looked at.
+  // TEXCOORD0 -- and the 36-byte host vertex has room for nothing else. Every
+  // other element in the declaration is described and then never looked at.
   //
-  // This build used to return false on the FIRST element it could not
-  // describe, which refused the whole declaration, which left in.layout null,
-  // which dropped every draw that used it as kNoLayout. A NORMAL in
-  // k_11_11_10 -- a packed format this decoder has no DXGI equivalent for, and
-  // the ordinary way foliage stores normals -- therefore erased geometry whose
-  // position and texcoord decode perfectly and whose normal is never read.
-  // Same all-or-nothing shape as the pixel-fetch refusal that discarded a
-  // shader's good 2D bindings over one non-2D fetch.
+  // This build used to return false on the FIRST element it could not describe,
+  // which refused the whole declaration, which left in.layout null, which
+  // dropped every draw that used it as kNoLayout. A NORMAL in k_11_11_10 -- a
+  // packed format this decoder has no DXGI equivalent for, and the ordinary way
+  // foliage stores normals -- therefore erased geometry whose position and
+  // texcoord decode perfectly and whose normal is never read. Same
+  // all-or-nothing shape as the pixel-fetch refusal that discarded a shader's
+  // good 2D bindings over one non-2D fetch.
   //
   // So: an undescribable element that is NOT POSITION0 is dropped and counted.
-  // Nothing is substituted -- the element is absent from `elements`, FindUsage
-  // returns null for it, and the transcode's existing "colour and texcoord are
-  // optional" path handles the two that matter. POSITION0 stays fatal, because
-  // it is the one element the transcode cannot do without.
+  // Nothing is substituted. POSITION0 stays fatal, because it is the one element
+  // the transcode cannot do without.
   //
   // `offered` is the denominator and is set on every call, including the ones
   // that drop nothing. A skip count without it is not a measurement.
@@ -266,7 +260,7 @@ const HleInputElement* FindUsage(const HleInputLayout& layout, uint8_t usage,
 // come back (0,0,0,1).
 //
 // The swizzle is applied here, unlike on the host-layout path where it belongs
-// in the shader — a CPU read has no shader to carry it.
+// in the shader -- a CPU read has no shader to carry it.
 //
 // False for a format the decoder cannot describe, leaving `out` untouched.
 bool ReadHleElement(const uint8_t* vertex_base, uint32_t vertex_bytes,

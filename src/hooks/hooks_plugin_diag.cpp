@@ -1,10 +1,9 @@
-// DIAGNOSTIC HOOKS — log critical functions that fail in native mode. Most
-// only log when --gpu_plugin=xenos (g_plugin_mode=true) and otherwise fall
-// straight through to the guest original; sub_8253AA40 logs in both modes.
+// DIAGNOSTIC HOOKS -- log critical functions that fail in native mode. Most only
+// log when --gpu_plugin=xenos and otherwise fall straight through to the guest
+// original; sub_8253AA40 logs in both modes.
 //
-// Note the mid-ASM hooks that skip these call sites are unconditional (see
-// midasm_stubs.cpp) — they fire in plugin mode too, so a hook being silent
-// means its call site is jumped, not that the mode is wrong.
+// Note the mid-ASM hooks that skip these call sites are unconditional, so a hook
+// being silent means its call site is jumped, not that the mode is wrong.
 
 #include "hooks/hook_common.h"
 #include "hooks/hooks_d3d9.h"  // GuestDrawCalls
@@ -26,39 +25,33 @@
 #include <utility>
 #include <vector>
 
-// force_load is GONE, 2026-08-28, cvar and implementation both. It named a
-// scene to request from the AssetDB once the loader went idle, by calling the
-// guest's own load-request API sub_82534980(AssetDB, name, flags) from the
-// LoadStateMachine hook below. It superseded an earlier force_launch that wrote
-// AssetDB+28 directly, which was the wrong lever.
+// force_load is GONE, cvar and implementation both. It named a scene to request
+// from the AssetDB once the loader went idle, by calling the guest's own
+// sub_82534980(AssetDB, name, flags) from the LoadStateMachine hook below.
 //
 // The observation behind it still stands and is still unexplained: the loader
 // reaches state 2 (IdleClearRenderBusy) and parks, because nothing in the game
 // ever calls sub_82534980. That same idle AssetDB is why UI_World never loads,
-// and it is the root of the 0x8234CE20 crash -- a bink asset in the
-// never-requested UIAnimations package resolves NULL and the guest dereferences
-// it with no check. Neither lever ever explained WHY nothing asks.
+// and it is the root of the 0x8234CE20 crash. Neither lever ever explained WHY
+// nothing asks.
 
 // Every string setting the guest reads comes from MXRegistry.bxml through one
 // function, sub_825487C8(registry, key, out, size, 0). `registry_override` takes
 // comma-separated key=value pairs and substitutes the value for a matching key
-// as it is read, which is what shipping a different MXRegistry.bxml would do —
-// tools/ has bxml decoders but no encoder, so this is the only way to change one.
-// Empty means off. Diagnostic only. See AGENTS.md "the registry chokepoint".
+// as it is read, which is what shipping a different MXRegistry.bxml would do --
+// tools/ has bxml decoders but no encoder. Empty means off. Diagnostic only.
 REXCVAR_DEFINE_STRING(registry_override, "", "Debug",
                       "Comma-separated key=value overrides for guest registry string reads");
 
-// sub_82B34998 — RendererDispatchBlock, called from LoaderTick on the Transition
-// thread.
+// sub_82B34998 -- RendererDispatchBlock, called from LoaderTick on the
+// Transition thread.
 //
-// MADE MODE-NEUTRAL 2026-08-06, and keep it that way. It used to log only under
-// the plugin and call the original silently in native, which hid the number that
-// found the frame-pacing bug: `f1` arriving here was exactly 0.00 in native and
-// varied under the plugin. **A one-sided probe was read as evidence that native
-// behaved the same.** See the sub_82B70370 hook below.
-//
-// The same warning still applies to the rest of this file: most Transition-thread
-// probes are plugin-only, so their absence from a native log means nothing.
+// MADE MODE-NEUTRAL, and keep it that way. It used to log only under the plugin
+// and call the original silently in native, which hid the number that found the
+// frame-pacing bug: `f1` arriving here was exactly 0.00 in native and varied
+// under the plugin. **A one-sided probe was read as evidence that native behaved
+// the same.** Most Transition-thread probes in this file are still plugin-only,
+// so their absence from a native log means nothing.
 REX_IMPORT(__imp__sub_82B34998, orig_RendererDispatch, void());
 extern "C" REX_FUNC(sub_82B34998) {
   const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
@@ -74,24 +67,20 @@ extern "C" REX_FUNC(sub_82B34998) {
   }
 }
 
-// sub_82B3C7D0 — accessor for dword_830BE190, with a null assert.
+// sub_82B3C7D0 -- accessor for dword_830BE190, with a null assert.
 //
 //   result = dword_830BE190;
 //   if (!dword_830BE190) sub_82AB73C0(61568);   // assert helper, line number
 //   return result;
 //
-// It was labelled "lazy-init alloc (hangs in Transition thread in native)".
-// Both halves are wrong: it allocates nothing, and a load / branch / return
-// cannot hang. The label predates the D3D9 HLE layer and was never re-derived.
+// It was labelled "lazy-init alloc (hangs in Transition thread in native)". Both
+// halves are wrong: it allocates nothing, and a load / branch / return cannot
+// hang. The label predates the D3D9 HLE layer and was never re-derived. Measured
+// as well as decompiled: called twice, returns 0x212859A0 both times, assert
+// path never taken.
 //
-// Corrected 2026-08-06 by decompiling it *and* measuring it, because reading a
-// body is how the last three stale claims in this file survived. Native run
-// mx_480: called twice, returns 0x212859A0 both times, assert path never taken.
-// It neither hangs nor is skipped.
-//
-// Kept, and made mode-neutral, for the one thing worth watching: whether
-// dword_830BE190 is ever null, which is the assert this function exists to
-// raise.
+// Kept, and mode-neutral, for the one thing worth watching: whether
+// dword_830BE190 is ever null.
 REX_IMPORT(__imp__sub_82B3C7D0, orig_GetEngineGlobal, void());
 extern "C" REX_FUNC(sub_82B3C7D0) {
   static int li = 0;
@@ -105,26 +94,23 @@ extern "C" REX_FUNC(sub_82B3C7D0) {
   }
 }
 
-// sub_82B70370 — frame pacing: QPC delta / perf frequency -> dt at a1+24, then
+// sub_82B70370 -- frame pacing: QPC delta / perf frequency -> dt at a1+24, then
 // a 5-sample smoothing pass and the running totals at a1+56/60/64.
 //
-// This was stubbed in native mode until 2026-08-06, and that stub was the reason
-// the front end never ran: it wrote a fixed 1/60 to a1+24 and nothing else, so
-// a1+60 (total elapsed time) never advanced and the dt reaching LoaderTick's
-// RendererDispatch was exactly 0.00. Unstubbing took the script VM from 28
-// dispatches to 686, script assets from 2 to 4 and Bink opens from 0 to 3 —
-// plugin mode's numbers exactly, 3/3 runs.
+// This was stubbed in native mode, and that stub was the reason the front end
+// never ran: it wrote a fixed 1/60 to a1+24 and nothing else, so a1+60 never
+// advanced and the dt reaching LoaderTick's RendererDispatch was exactly 0.00.
+// Unstubbing took the script VM from 28 dispatches to 686 and Bink opens from 0
+// to 3 -- plugin mode's numbers exactly, 3/3 runs.
 //
-// The stub's two stated hazards were both false, and neither had been checked
+// The stub's two stated hazards were both false and neither had been checked
 // against the guest code:
 //
 //   - "a1+20 drives a busy-wait". The guest's own test is
 //     `if (*(float*)(a1+20) != 3.4028235e38 && dt < target)`, and a1+20 holds
-//     0x7F7FFFFF — exactly that FLT_MAX sentinel — so the guest disables the
-//     spin itself. The one-time log below re-checks it at runtime.
-//   - "a1+32 is an unbounded store offset". It is `v9 = *(a1+32) + 9;
-//     *(float*)(4*v9 + a1) = dt;` with `if (v10 >= 5) *(a1+32) = 0` — a bounded
-//     5-entry ring at a1+36..a1+52, guarded by `if (*(a1+28))`.
+//     exactly that FLT_MAX sentinel, so the guest disables the spin itself.
+//   - "a1+32 is an unbounded store offset". It is a bounded 5-entry ring at
+//     a1+36..a1+52, guarded by `if (*(a1+28))`.
 //
 // No cvar to restore the stub. It was wrong, not a trade-off; git has it.
 REX_IMPORT(__imp__sub_82B70370, orig_Timing, void());
@@ -149,14 +135,11 @@ extern "C" REX_FUNC(sub_82B70370) {
   }
 }
 
-// sub_82B6D230 — called from LoaderTick's entity block @0x82B70E4C with f1=dt.
-// It iterates a vector — `n = (v[1] - v[0]) >> 2` elements — calling
-// sub_82B6A448(elem, dt) on each, so it is an entity update pass, not the
-// "frontier probe" it was labelled as.
-//
-// That label said execution "reaches TexManager @0x82B70E44 then dies" here.
-// It does not, and has not for a long time: ENTER and RETURNED balance 5/5 in
-// mx_473, mx_477 and mx_479. Corrected 2026-08-06.
+// sub_82B6D230 -- called from LoaderTick's entity block with f1=dt. It iterates
+// a vector calling sub_82B6A448(elem, dt) on each, so it is an entity update
+// pass, not the "frontier probe" it was labelled as. That label said execution
+// "reaches TexManager then dies" here; it does not, and ENTER and RETURNED
+// balance 5/5 across three runs.
 REX_IMPORT(__imp__sub_82B6D230, orig_EntityDt, void());
 extern "C" REX_FUNC(sub_82B6D230) {
   static int ed = 0;
@@ -169,19 +152,16 @@ extern "C" REX_FUNC(sub_82B6D230) {
 
 // sub_8253AA40 — AssetDB_LoadStateMachine (LoaderTick's gate, 12-state)
 REX_IMPORT(__imp__sub_8253AA40, orig_LoadStateMachine, void());
-// Logs in BOTH modes. The note that used to sit here — "in native this is
-// currently unreachable (mid-ASM hooks #7/#8 delete LoaderTick's vt[6] call
-// site), so its absence from the log is itself the signal" — is STALE. Every
-// mid-ASM hook in mx_config.toml is commented out, so LoaderTick's vt[6] gate
-// runs and this fires continuously: 1600 calls in a two-minute native run
-// (mx_1196, 2026-08-16). Its absence would now mean something is wrong, not
-// something is skipped.
+// Logs in BOTH modes. The note that used to sit here -- "in native this is
+// unreachable, so its absence from the log is itself the signal" -- is STALE.
+// Every mid-ASM hook in mx_config.toml is commented out, so LoaderTick's vt[6]
+// gate runs and this fires continuously (1600 calls in a two-minute native run).
+// Its absence would now mean something is wrong, not something is skipped.
 //
-// What that run showed: the machine goes 0 -> 1 -> 2 and then stays at 2 for
-// every subsequent tick. State 2 is idle-awaiting-a-request — sub_82534980 is
-// what moves it 2 -> 3, and in a front-end-only run nothing calls it. The
-// AssetDB is healthy and unasked, which is why the UI's own world (UI_World)
-// never loads and the main menu has no stadium behind it.
+// What that run showed: the machine goes 0 -> 1 -> 2 and then stays at 2.
+// State 2 is idle-awaiting-a-request -- sub_82534980 is what moves it 2 -> 3,
+// and in a front-end-only run nothing calls it. The AssetDB is healthy and
+// unasked, which is why UI_World never loads.
 extern "C" REX_FUNC(sub_8253AA40) {
   const char* tag = mx::native::g_plugin_mode ? "plugin" : "native";
   static int sm = 0;
@@ -217,15 +197,13 @@ extern "C" REX_FUNC(sub_8253AA40) {
 
   // State 6 parks. Exactly one predicate is responsible: loc_8253B504 reads
   // *(a1+110328) and, finding it zero, goes to loc_8253B560, which reads the
-  // listener at *(a1+110788) and calls its vt[2]. A zero return jumps to
-  // loc_8253B6A4 — an early return that leaves the selector at 6. The per-player
-  // loop and the `state = 7` write at loc_8253B694 are both downstream of that
-  // gate, so they are not what blocks us.
+  // listener at *(a1+110788) and calls its vt[2]. A zero return jumps to an
+  // early return that leaves the selector at 6. The per-player loop and the
+  // `state = 7` write are both downstream of that gate.
   //
-  // The listener is the same object sub_82534980 notifies via vt[0]
-  // (mx_recomp.31.cpp:22395), and it is assigned once in the AssetDB constructor
-  // sub_8253CB38 (:41688) — so it is never null, and the vt[2] branch is always
-  // the one taken. Dump it once so vt[2] can be resolved statically.
+  // The listener is the same object sub_82534980 notifies via vt[0], and it is
+  // assigned once in the AssetDB constructor -- so it is never null and the
+  // vt[2] branch is always taken. Dump it once so vt[2] can be resolved.
   if (a1 && state_out == 6) {
     static bool s_dumped = false;
     if (!s_dumped) {
@@ -252,11 +230,11 @@ extern "C" REX_FUNC(sub_8253AA40) {
 // The load-request chain
 //
 // sub_82534980 is the guest's load-request API. It has exactly one caller,
-// sub_82352AE0 (mx_recomp.15.cpp:76710), which builds the scene name from a
-// registry lookup and is itself a method with five callers. Nothing in this
-// chain has ever been observed to run in native mode — the point of these hooks
-// is to find out how far up it execution actually reaches, so entry-only logging
-// is enough for everything except sub_82534980 itself.
+// sub_82352AE0, which builds the scene name from a registry lookup and is itself
+// a method with five callers. Nothing in this chain has ever been observed to
+// run in native mode -- the point of these hooks is to find out how far up
+// execution actually reaches, so entry-only logging is enough for everything
+// except sub_82534980 itself.
 //=============================================================================
 
 namespace {
@@ -326,32 +304,28 @@ MX_CHAIN_PROBE(824FC9A0, "sub_824FC9A0")
 // The registry chokepoint
 //
 // Registry reads funnel through a family of getters that all hash the key with
-// sub_82473360 and differ only in the value type. Two matter here, both reading
-// the same registry global *(0x82D6605C):
+// sub_82473360 and differ only in the value type. Two matter, both reading the
+// same registry global *(0x82D6605C):
 //
 //   sub_825487C8(registry, key, out, size, 0)   string, non-zero if found
 //   sub_82548758(registry, key, out, 0)         int, written through `out`
 //
 // Their callers:
 //
-//   sub_82352AE0 (mx_recomp.15.cpp:76622)  key 0x8200C864 = "Location",
-//     256-byte buffer -> the name it hands to sub_82534980. This is the load
-//     path we have never seen run.
-//   sub_82536250 (mx_recomp.31.cpp:26068)  key 0x8200C870 = "PlayerMode",
-//     30-byte buffer -> mapped by sub_82533D20 to an index in the 5-entry
-//     string table at 0x82D1F810 (5 if no entry matches; sub_82536250 returns 1
-//     if the registry read itself fails).
+//   sub_82352AE0  key 0x8200C864 = "Location", 256-byte buffer -> the name it
+//     hands to sub_82534980. This is the load path we have never seen run.
+//   sub_82536250  key 0x8200C870 = "PlayerMode", 30-byte buffer -> mapped by
+//     sub_82533D20 to an index in the 5-entry string table at 0x82D1F810.
 //
-// Measured, not inferred — an earlier reading of this file guessed the keys were
-// "UISceneName"/"startMode" from .rdata spacing and the MXRegistry.bxml.xml
-// contents. The runtime dump below says otherwise, and the table is a network
-// mode vocabulary rather than a boot mode one:
+// Measured, not inferred -- an earlier reading guessed the keys were
+// "UISceneName"/"startMode" from .rdata spacing. The table is a network mode
+// vocabulary rather than a boot mode one:
 //
 //   0 SplitScreen   1 SinglePlayer   2 Online   3 LAN   4 None
 //
-// The state 6 gate wants 2 or 3, and the registry says "None". So its first term
-// is asking "are we in a network session", which offline we are legitimately not
-// — the term worth moving is the third one, the int at key 0x8204C630.
+// The state 6 gate wants 2 or 3 and the registry says "None", so its first term
+// asks "are we in a network session", which offline we legitimately are not --
+// the term worth moving is the third one, the int at key 0x8204C630.
 //=============================================================================
 
 namespace {
@@ -421,9 +395,7 @@ extern "C" REX_FUNC(sub_825487C8) {
   //
   // `lr` is the point of this line as much as the value is. Native reads exactly
   // one string key in a whole run and the plugin reads four, so the callers of
-  // the three extra ones are the boundary native stops short of — and naming
-  // them off the return address beats inferring them from which function happens
-  // to mention the key in .rdata.
+  // the three extra ones are the boundary native stops short of.
   static std::vector<std::string> s_seen;
   if (s_seen.size() < 40 && std::find(s_seen.begin(), s_seen.end(), key) == s_seen.end()) {
     s_seen.push_back(key);
@@ -489,19 +461,15 @@ extern "C" REX_FUNC(sub_82548758) {
 //
 // State 6 polls (*(AssetDB+110788))->vt[2] and takes an early return whenever it
 // answers 0, which is why the selector never reaches 7. That slot resolves to
-// sub_8253CF80 (dumped at runtime, mx_027.log), and its body is:
+// sub_8253CF80, whose body is:
 //
 //   mode = sub_82536250(*(0x830577C0));   // maps a registry string to an enum
 //   if (mode == 2 || mode == 3) return 1;
 //   if (*(0x83057900) != 0)     return 1;
 //   tmp = 0; sub_82548758(registry, <key>, &tmp, 0); return tmp;
 //
-// (`lis r11,-31995` is 0x83050000 — so the first global is the familiar AssetDB
-// pointer dword_830577C0, confirmed at runtime by GateMode logging a1=0x407F2190.)
-//
-// Note state 1 clears *(0x83057900) on the way past (`stw r25,30976(r8)` with
-// r25 = 0), so boot itself closes the second escape. These hooks report which
-// term is actually deciding.
+// Note state 1 clears *(0x83057900) on the way past, so boot itself closes the
+// second escape. These hooks report which term is actually deciding.
 //=============================================================================
 
 // sub_82536250 — registry-string -> mode enum, the gate's first term.
@@ -532,14 +500,13 @@ extern "C" REX_FUNC(sub_8253CF80) {
 }
 
 //=============================================================================
-// The front end is script-driven, not C++ virtual dispatch (2026-08-05)
+// The front end is script-driven, not C++ virtual dispatch
 //
-// Tracing the load-request chain upward through the recompiled sources runs out
-// of static call sites: four of the five functions above `sub_82352AE0` have
-// zero direct callers. They are not virtual methods either. They are entries in
-// a **name -> function binding table** at `0x8203F2E0`, 228 pairs of
-// `const char*` and code pointer, registered from `MXRavage_Xenon_00cb`
-// (0x824F1E1C). The vocabulary is a scripting API:
+// Tracing the load-request chain upward runs out of static call sites: four of
+// the five functions above `sub_82352AE0` have zero direct callers, and they are
+// not virtual methods either. They are entries in a **name -> function binding
+// table** at 0x8203F2E0, 228 pairs of `const char*` and code pointer, registered
+// from MXRavage_Xenon_00cb. The vocabulary is a scripting API:
 //
 //   [  6] LoadAssetDB          [ 10] ExecuteScriptAsset
 //   [ 40] GetUIState           [ 50] LoadUIAssetPackage
@@ -547,42 +514,33 @@ extern "C" REX_FUNC(sub_8253CF80) {
 //   [ 66] StartWorldLoad       [ 67] EnableWorld
 //   [110] SwitchToUIWorld
 //
-// `StartWorldLoad` is `sub_824CD280` — the function that reaches
-// `sub_82534980`, the load-request API. So nothing requests a scene because
-// **no script ever calls StartWorldLoad**, and the question is whether the
-// script environment runs at all.
+// `StartWorldLoad` is sub_824CD280 -- the function that reaches sub_82534980.
+// So nothing requests a scene because **no script ever calls StartWorldLoad**,
+// and the question is whether the script environment runs at all.
 //
-// These four probes answer that. They deliberately sit at different depths:
-// ExecuteScriptAsset is "does any script run", the two UI loaders are "does the
-// front end's content arrive", and StartWorldLoad is the endpoint we already
-// know is silent. Whichever is the last to fire names the break.
-//
-// Note the standing suspicion this connects to: AGENTS.md lists the binary
-// `.xenon.package` heaps as encrypted (entropy ~7.98, routine unknown). If the
-// UI scripts live in those heaps, the encryption is not a side issue — it is
-// the reason there is no menu.
+// These four probes sit at different depths: ExecuteScriptAsset is "does any
+// script run", the two UI loaders are "does the front end's content arrive", and
+// StartWorldLoad is the endpoint we know is silent. Whichever is the last to
+// fire names the break.
 //=============================================================================
 
 // The script call's Nth argument, when it is a Lua string.
 //
 // Every script probe logged only `a1`, which is the lua_State -- the SAME
 // pointer for every call in the run, so `LoadUIAssetPackage #1..#4` could not
-// say WHICH packages were asked for. That mattered the moment the garage's bink
-// asset came back null: the movie exists in UIAnimations.xenon.package, and
-// whether that package is ever requested is the whole question.
+// say WHICH packages were asked for.
 //
-// The layout is not guessed. `sub_82AA7638` (luaD_precall) is already decoded
-// at the bottom of this file and reads a StkId as `tt` at +8 and the GC pointer
-// at +0, so TValue is {Value(8), int tt} with the 4-byte pointer at the front
-// of the union -- big-endian, so offset 0 -- and a 16-byte stride. `L->base` is
-// lua_State+12 (see the lua-state-layout note). LUA_TSTRING is 4, and a Lua 5.1
-// TString on this target is next(4) tt(1) marked(1) reserved(1) pad(1) hash(4)
-// len(4) = 16 bytes of header with the characters immediately after.
+// The layout is not guessed. sub_82AA7638 (luaD_precall) is decoded at the
+// bottom of this file and reads a StkId as `tt` at +8 and the GC pointer at +0,
+// so TValue is {Value(8), int tt} with the 4-byte pointer at the front of the
+// union -- big-endian, so offset 0 -- and a 16-byte stride. `L->base` is
+// lua_State+12, LUA_TSTRING is 4, and a Lua 5.1 TString on this target is 16
+// bytes of header with the characters immediately after.
 //
 // Every read is range-checked against the real mapping. A script argument is
-// guest data of whatever type the script happened to pass, and this file has
-// already paid once for treating a plausible-looking value as a pointer: a
-// range test admitted the ASCII "Litl" and the process died dereferencing it.
+// guest data of whatever type the script passed, and this file has already paid
+// once for treating a plausible-looking value as a pointer: a range test
+// admitted the ASCII "Litl" and the process died dereferencing it.
 std::string ScriptArgString(uint8_t* base, uint32_t L, uint32_t index) {
   constexpr uint32_t kTValueStride = 16;
   constexpr uint32_t kTValueType = 8;
@@ -626,11 +584,9 @@ void ReportScriptProbe(const char* name, uint32_t a1, uint32_t lr,
                 arg, a1, lr);
   }
   // EVERY DISTINCT ARGUMENT, uncapped and independent of the rate limit above.
-  //
   // The throttle exists so a per-frame binding cannot flood the log, and it is
   // exactly wrong for this question: package loads happen in a burst during
-  // boot, so a 5-second window collapses them to one line and the rest are lost.
-  // A new name is new information and always prints; a repeat never does.
+  // boot, so a 5-second window collapses them to one line.
   if (!arg.empty()) {
     static std::mutex s_mu;
     static std::set<std::string> s_seen;
@@ -661,8 +617,8 @@ MX_SCRIPT_PROBE(sub_824D0F18, orig_SwitchToUIWorld, "SwitchToUIWorld")
 //=============================================================================
 // Engine.LoadAssetDB / Engine.LoadAssetPackage -- the OTHER load bindings.
 //
-// These are NOT LoadUIAssetPackage. UI_Helper (extracted out of
-// MXUI.xenon.package) loads the front end with two different families:
+// These are NOT LoadUIAssetPackage. UI_Helper loads the front end with two
+// different families:
 //
 //     function LoadFrontEndUIPackages( )
 //        local isUILoaded = g_UIVariables:GetVariableInt( "UILoaded" );
@@ -671,21 +627,17 @@ MX_SCRIPT_PROBE(sub_824D0F18, orig_SwitchToUIWorld, "SwitchToUIWorld")
 //           Engine.LoadAssetPackage( "UIAnimations", "Rider" );
 //           ...
 //           Engine.LoadUIAssetPackage( "FrontEndShared" );
-//           Engine.LoadUIAssetPackage( "FrontEnd" );
 //
 // Only the LoadUIAssetPackage family was probed, so a whole run looked like
-// "UIAnimations is never requested" -- and it was concluded, wrongly, from an
-// instrument that could not see the call. FrontEndShared and FrontEnd DO appear
-// in the log and sit inside the same if-block, three lines below, which is the
-// proof the block runs and the UIAnimations lines with it.
+// "UIAnimations is never requested" -- concluded, wrongly, from an instrument
+// that could not see the call. FrontEndShared and FrontEnd DO appear in the log
+// and sit inside the same if-block three lines below, which is the proof the
+// block runs and the UIAnimations lines with it.
 //
-// UIAnimations holds exactly three assets (Base_Rider_Posed_A,
-// SC_RU_HC_Anim_Gloves and RiderUI_Final_C_350), and RiderUI_Final_C_350 is the
-// movie whose null asset is the 0x8234CE20 crash. So the question is no longer
-// "is it asked for" but "what does asking return".
-//
-// Both args and the return value, because a load binding that fails quietly is
-// exactly what this looks like. LoadAssetPackage takes (db, package).
+// UIAnimations holds exactly three assets, and RiderUI_Final_C_350 is the movie
+// whose null asset is the 0x8234CE20 crash. So the question is no longer "is it
+// asked for" but "what does asking return". Both args and the return value,
+// because a load binding that fails quietly is exactly what this looks like.
 //=============================================================================
 REX_IMPORT(__imp__sub_824AF3C0, orig_LoadAssetDB, void());
 extern "C" REX_FUNC(sub_824AF3C0) {
@@ -706,40 +658,30 @@ extern "C" REX_FUNC(sub_824AF3C0) {
 //         assetMgr->vt[28](assetMgr, "Database\\", db, 1, 0,0,0);  // load it
 //     return assetMgr->vt[72](assetMgr, db, package, 0,0,0);      // load pkg
 //
-// The return value IS vt[72]'s, so hooking this one function reports whether
-// the package load succeeded without having to resolve a single vtable slot --
-// which matters, because deriving them statically already failed once: the
-// AssetDB ctor comment names "vtable off_8214518C", but off_8214518C+0x78 holds
-// an address in the MIDDLE of sub_82BA8D08, so that premise is wrong.
+// The return value IS vt[72]'s, so hooking this one function reports whether the
+// package load succeeded without having to resolve a single vtable slot -- which
+// matters, because deriving them statically already failed once: the AssetDB
+// ctor comment names "vtable off_8214518C", but off_8214518C+0x78 holds an
+// address in the MIDDLE of sub_82BA8D08.
 //
-// Everything upstream of here is confirmed good. UI_Helper asks for
-// LoadAssetDB("UIAnimations") then LoadAssetPackage("UIAnimations", "Rider"),
-// both bindings fire with exactly those arguments, and
-// UIAnimations.xenon.database declares a package "Rider" holding
-// RiderUI_Final_C_350 (bink, LZX) -- the movie whose null asset is the
-// 0x8234CE20 crash. So either the DB open under "Database\" fails, or the
+// Everything upstream is confirmed good: both bindings fire with exactly those
+// arguments, and UIAnimations.xenon.database declares a package "Rider" holding
+// RiderUI_Final_C_350. So either the DB open under "Database\" fails, or the
 // package lookup inside it does.
 //
-// Note the two load families use DIFFERENT asset-manager methods: the working
-// UI path (sub_824FB0F0 -> sub_823802D0) goes through vt[44], this one through
-// vt[36]/vt[28]/vt[72]. "The UI packages load fine" says nothing about this
-// path.
+// The two load families use DIFFERENT asset-manager methods: the working UI path
+// goes through vt[44], this one through vt[36]/vt[28]/vt[72]. "The UI packages
+// load fine" says nothing about this path.
 //=============================================================================
-// 0x82BA91C0 -- AssetManager::Find(type, name), assetMgr->vt[0x78].
+// 0x82BA91C0 -- AssetManager::Find(type, name), assetMgr->vt[0x78]. Hooked for
+// ONE reason: to capture the manager `this`, which AcquirePlayer's re-resolve
+// needs and cannot afford a plausible-but-wrong value for. It IS derivable --
+// engine = *(0x830BE400), manager = *(engine + 8) -- but that walk has already
+// been got wrong once in this file. Any call at all hands us the correct value.
 //
-// Hooked for ONE reason: to capture the manager `this`. AcquirePlayer's
-// re-resolve below needs it and cannot afford a plausible-but-wrong value.
-//
-// It IS derivable -- engine = *(0x830BE400), manager = *(engine + 8) -- but
-// that walk has already been got wrong once in this file (dword_830BE400 read
-// as an address instead of a pointer variable, printing zeros). Any call at all
-// hands us the correct value, and there are thousands before the one that
-// matters.
-//
-// The address had to come from the running game. Reading the IDB at
-// off_8214518C+0x78 gave 0x82BA8D40, which is the middle of sub_82BA8D08; the
-// live vtable holds 0x82BA91C0 there, and that same value appears as `ctr` in
-// the crash register dump. Static reads of that table are not to be trusted.
+// The address had to come from the running game: the IDB gives 0x82BA8D40 for
+// that slot, which is the middle of another function, while the live vtable
+// holds 0x82BA91C0.
 REX_IMPORT(__imp__sub_82BA91C0, orig_AssetFind, void());
 std::atomic<uint32_t> g_assetManager{0};
 
@@ -754,33 +696,28 @@ extern "C" REX_FUNC(sub_82BA91C0) {
 // THE 0x8234CE20 CRASH, FIXED AT THE POINT THE STALE NULL IS USED.
 //
 // The guest caches its bink asset at component+0x94 in BinkVideoComponent's
-// property init (sub_8234CBB8) and never re-resolves it. When the database
-// worker constructs the component before the script has asked for the package
-// that holds the movie, the lookup misses, a NULL is cached, and AcquirePlayer
-// later writes through it at +0x58. Main PC, run mx_010, every link traced in
-// one log: the worker resolved "RiderUI_Final_C_350" and missed at 20:03:21.682,
-// the script asked for the UIAnimations database 0.227s LATER, and the access
-// violation writing guest 0x58 with r3=0x21F9DB60 -- the same component --
-// landed at 20:03:58.139.
+// property init and never re-resolves it. When the database worker constructs
+// the component before the script has asked for the package holding the movie,
+// the lookup misses, a NULL is cached, and AcquirePlayer later writes through it
+// at +0x58. Traced end to end in one log: the worker missed, the script asked
+// for the database 0.227s LATER, and the access violation landed 36 seconds
+// after that.
 //
 // It is a RACE, and it has been "fixed" by winning it before: async shader
-// compilation bought the script 0.9s on this VM and the crash went away here.
-// It came straight back on a machine 4x faster. Any fix that works by being
-// early enough is a fix with an expiry date, so this one does not.
+// compilation bought the script 0.9s on this VM and the crash went away, then
+// came straight back on a machine 4x faster. Any fix that works by being early
+// enough has an expiry date.
 //
-// THE KEY FACT: the crash is 36 SECONDS after the null was cached, and the
-// package loaded 0.2s after it. So at the moment of use the asset is present
-// and simply is not looked at again. Re-resolving here asks the same question
-// the guest asked, with the same manager, name and type, at a time when the
-// answer exists.
+// THE KEY FACT: at the moment of use the asset is present and simply is not
+// looked at again. Re-resolving here asks the same question the guest asked,
+// with the same manager, name and type, at a time when the answer exists.
 //
-// WHY NOT SKIP THE CALL. That was tried (2026-08-28) and made things worse:
-// returning early left this->player null and the fault moved downstream to
-// RVA 0x10CDCFD, correlated 3-for-3. Nothing is skipped here. On the path
-// where the repair fails, the original runs exactly as it does today -- so
-// this hook can restore behaviour, never degrade it.
-//
-// Reads and writes ONE dword of guest state, the one the guest wrote itself.
+// WHY NOT SKIP THE CALL. That was tried and made things worse: returning early
+// left this->player null and the fault moved downstream, correlated 3-for-3.
+// Nothing is skipped here, and on the path where the repair fails the original
+// runs exactly as it does today -- so this hook can restore behaviour, never
+// degrade it. Reads and writes ONE dword of guest state, the one the guest
+// wrote itself.
 REX_IMPORT(__imp__sub_8234CE20, orig_AcquirePlayer, void());
 extern "C" REX_FUNC(sub_8234CE20) {
   const uint32_t self = ctx.r3.u32;
@@ -847,26 +784,20 @@ extern "C" REX_FUNC(sub_8234CE20) {
 // and the bike's own transform reads out sane. What is left is a ~2-unit
 // constant in the bike's RESTING HEIGHT, which is guest logic.
 //
-// IDA could not reach it. There are no named terrain/height/suspension
-// functions in the IDB, the terrain manager's xrefs are all the virtual-texture
-// streaming code, and a constant search for the 3000.0 height range landed in
-// the save-game string pool. Hunting it by guessing at constants is what the
-// rest of that session did.
+// IDA could not reach it -- no named terrain/height/suspension functions, the
+// terrain manager's xrefs are all VT streaming, and a constant search for the
+// height range landed in the save-game string pool.
 //
-// So do what worked for the UI render list, where static hunting produced 40+
-// candidates and none of them right: make the caller name itself. The skinned
-// vehicle shader indexes its bone palette as cb0[bone + 85/86/87], so the root
-// bone lands in vertex constant registers 85..87, and whoever writes them is
-// the vehicle's render path. From there the vehicle object and its position
-// field are one structure walk away.
+// So make the caller name itself. The skinned vehicle shader indexes its bone
+// palette as cb0[bone + 85/86/87], so the root bone lands in vertex constant
+// registers 85..87, and whoever writes them is the vehicle's render path.
 //
 // NOT HOOKED BEFORE, DELIBERATELY, and that reasoning still stands for its own
 // purpose -- hooks_d3d9.cpp reads device+0x780 rather than hooking this setter,
-// because the device holds the live value whichever path wrote it, including a
-// state-block path that bypasses every hook. That is about READING STATE. This
-// wants the CALLER, which the device field cannot give at any price. If the
-// bike's transform turns out to arrive by the state-block path, this probe sees
-// nothing -- and a silent probe here means "not this path", not "no writes".
+// because the device holds the live value whichever path wrote it. That is about
+// READING STATE. This wants the CALLER, which the device field cannot give at
+// any price. If the bike's transform arrives by the state-block path this probe
+// sees nothing -- a silent probe here means "not this path", not "no writes".
 //
 // Cheap on the hot path: one range compare before anything else happens.
 
@@ -894,14 +825,11 @@ extern "C" REX_FUNC(sub_82550320) {
   // registers while the camera at c8 reads correctly from the same shadow, so
   // the shadow is fine and these are simply not in it. Two known mechanisms
   // would do that -- shaders DMA their own ALU constants, and constants
-  // published only by Type-0 PM4 never reach the shadow -- and both mean the
-  // value has to be sourced somewhere else entirely.
+  // published only by Type-0 PM4 never reach the shadow.
   //
-  // Before chasing either, establish whether this API carries them. A count of
-  // ZERO here says the terrain never sets them this way and the shadow was
-  // never going to work; a non-zero count with a device pointer different from
-  // the bike's says the value is real but on another device, which is a much
-  // easier fix (device state is per-device here).
+  // A count of ZERO here says the terrain never sets them this way; a non-zero
+  // count with a device pointer different from the bike's says the value is real
+  // but on another device, which is a much easier fix.
   //
   // Placed BEFORE the register-85 early-out, which would otherwise reject every
   // one of these calls unseen.
@@ -986,24 +914,22 @@ extern "C" REX_FUNC(sub_824F8E20) {
   orig_AssetDbLoadPackage(ctx, base);
   // ONE-TIME: the asset manager's vtable, so the slots this path uses can be
   // hooked by ADDRESS next build. Deriving them from the AssetDB ctor comment
-  // ("vtable off_8214518C") gave a mid-function address for +0x78, so that
-  // premise is wrong and the object has to answer for itself.
+  // gave a mid-function address for +0x78, so the object has to answer for
+  // itself.
   //
-  // vt[0x1C] load-DB-from-"Database\\", vt[0x24] is-DB-loaded,
-  // vt[0x48] load-package, vt[0x78] the asset LOOKUP that returns NULL for
-  // RiderUI_Final_C_350. A real guest function lives in 0x82xxxxxx; anything
-  // else in a slot is data and must never be called.
+  // vt[0x1C] load-DB-from-"Database\\", vt[0x24] is-DB-loaded, vt[0x48]
+  // load-package, vt[0x78] the asset LOOKUP that returns NULL. A real guest
+  // function lives in 0x82xxxxxx; anything else in a slot is data and must never
+  // be called.
   {
     static bool s_dumped = false;
     if (!s_dumped) {
       s_dumped = true;
       // dword_830BE400 is a POINTER VARIABLE, not the object. IDA renders the
-      // engine as `dword_830BE400` and the manager as
-      // `*(dword_830BE400 + 8)`, which reads as an offset off the symbol's
-      // ADDRESS and is not: the engine is *(0x830BE400) and the manager is
-      // *(engine + 8). Reading 0x830BE408 directly gave 0, which is what the
-      // first version of this dump printed. SetupRenderer in hooks_loading.cpp
-      // already does it the right way.
+      // engine as `dword_830BE400` and the manager as `*(dword_830BE400 + 8)`,
+      // which reads as an offset off the symbol's ADDRESS and is not: the engine
+      // is *(0x830BE400) and the manager is *(engine + 8). Reading 0x830BE408
+      // directly gave 0, which is what the first version of this dump printed.
       const uint32_t eng = GuestRangeReadable(base, 0x830BE400u, 4)
                                ? REX_LOAD_U32(0x830BE400u)
                                : 0;
@@ -1047,23 +973,22 @@ extern "C" REX_FUNC(sub_824AF488) {
 MX_SCRIPT_PROBE(sub_824CD280, orig_StartWorldLoad, "StartWorldLoad")
 MX_SCRIPT_PROBE(rex_MXRavage_Xenon_00cb, orig_ScriptBindingRegister, "BindingRegister")
 
-// The script VM's native-call dispatcher, `sub_82AA7638`, used to be probed
-// here with MX_SCRIPT_PROBE. It answered its original question — the VM fires a
-// handful of times and goes idle, so the VM itself stops rather than looping
-// without loading a world — but it only logged the lua_State, which cannot say
-// *which* call was the last one. It now has a dedicated hook at the bottom of
-// this file that decodes the callee off the Lua stack.
+// The script VM's native-call dispatcher, sub_82AA7638, used to be probed here
+// with MX_SCRIPT_PROBE. It answered its original question -- the VM fires a
+// handful of times and goes idle, so the VM itself stops rather than looping --
+// but it only logged the lua_State, which cannot say *which* call was the last
+// one. It now has a dedicated hook at the bottom of this file.
 
 // The script layer is a Lua VM, so ask it directly whether it threw.
 //
-// `sub_82AA7638` is the call handler and carries the usual strings — it calls
-// `sub_82AA9D48(L, "stack overflow")`. `sub_82A9F4F8` is the luaL_error-style
-// reporter, used by ExecuteScriptAsset itself for argument mismatches
-// ("Error in %s expected %d..%d args, got %d"), so its r4 is a format string.
+// sub_82AA7638 is the call handler and carries the usual strings -- it calls
+// sub_82AA9D48(L, "stack overflow"). sub_82A9F4F8 is the luaL_error-style
+// reporter, used by ExecuteScriptAsset itself for argument mismatches, so its r4
+// is a format string.
 //
 // A root script that dies on its third statement looks, from outside, exactly
 // like the two-libraries-then-silence pattern that is actually observed. These
-// two hooks distinguish "stopped" from "crashed", which is the whole question.
+// two hooks distinguish "stopped" from "crashed".
 REX_IMPORT(__imp__sub_82A9F4F8, orig_LuaError, void());
 extern "C" REX_FUNC(sub_82A9F4F8) {
   static uint64_t s_count = 0;
@@ -1103,20 +1028,15 @@ extern "C" REX_FUNC(sub_824F91E8) {
 //=============================================================================
 // Does the guest ever ask for input or audio?
 //=============================================================================
-// ReXGlue's own audio and input systems come up in native mode — the log shows
-// "Input system initialized", "Audio system initialized", and the pad added at
-// index 0 — yet neither works. The untested half is the guest: nothing in any
-// log shows it calling in, because those are high-frequency kernel calls.
-// `--log_high_frequency_kernel_calls=true` changed nothing (mx_386.log has the
-// same 15 [krnl] lines as mx_385.log without it), so it does not gate these and
-// the question has to be asked directly.
+// ReXGlue's own audio and input systems come up in native mode, yet neither
+// works. The untested half is the guest: nothing in any log shows it calling in,
+// because those are high-frequency kernel calls, and
+// --log_high_frequency_kernel_calls=true changed nothing.
 //
-// These are the XDK wrappers around the import thunks, not the thunks — the
+// These are the XDK wrappers around the import thunks, not the thunks -- the
 // thunks are defined in the runtime library and cannot be redefined here, but
-// the wrappers are ordinary recompiled functions. Read out of the generated
-// sources rather than inferred: each one's body is a register shuffle followed
-// by a tail branch to the import (e.g. sub_82C08EC0 is `mr r5,r4; li r4,1;
-// b __imp__XamInputGetState`, mx_recomp.90.cpp:16730).
+// the wrappers are ordinary recompiled functions, each a register shuffle
+// followed by a tail branch to the import.
 //
 // If all five stay silent, audio and input are downstream of "there is no menu"
 // and are not a second bug.
@@ -1188,16 +1108,15 @@ extern "C" REX_FUNC(sub_82C87B98) {
 
 // Is the guest submitting real audio, or silence?
 //
-// `sub_82C87B98` is not a thin wrapper — it is the XDK mixer. It stack-allocates
-// 8064 bytes, has `sub_82C87950` fill a buffer at r1+1888, and passes that to
-// `__imp__XAudioSubmitRenderDriverFrame` (mx_recomp.94.cpp:31435). 8064-1888 =
-// 6176 bytes of room, and a 360 render-driver frame is 256 samples x 6 channels
-// x float32 = 6144, so the fill target is the frame buffer itself.
+// sub_82C87B98 is not a thin wrapper -- it is the XDK mixer. It stack-allocates
+// 8064 bytes, has sub_82C87950 fill a buffer at r1+1888, and passes that to
+// __imp__XAudioSubmitRenderDriverFrame. 8064-1888 = 6176 bytes of room, and a
+// 360 render-driver frame is 256 samples x 6 channels x float32 = 6144, so the
+// fill target is the frame buffer itself.
 //
 // Hooking the fill is the only way to see the samples: the import thunk is
-// defined in the runtime library and cannot be redefined here. This separates
-// "the SDK is dropping our audio" from "the game is playing nothing", which the
-// submit count alone cannot.
+// defined in the runtime library. This separates "the SDK is dropping our audio"
+// from "the game is playing nothing".
 REX_IMPORT(__imp__sub_82C87950, orig_AudioMixFrame, void());
 extern "C" REX_FUNC(sub_82C87950) {
   const uint32_t dst = ctx.r4.u32;
@@ -1245,9 +1164,8 @@ extern "C" REX_FUNC(sub_82B38558) {
 //=============================================================================
 // What is the last statement the native script layer runs?
 //=============================================================================
-// The VM stops about 1.6s into boot and everything downstream of it — the front
-// end, the videos, the registry reads — is idle because of that. Counting script
-// assets (2 native vs 4 plugin) is too coarse to say where it stops: two assets
+// The VM stops about 1.6s into boot and everything downstream is idle because of
+// that. Counting script assets (2 native vs 4 plugin) is too coarse: two assets
 // are libraries, and a library can load and then the caller die on its next
 // statement.
 //
@@ -1256,17 +1174,16 @@ extern "C" REX_FUNC(sub_82B38558) {
 //
 //   *(func + 8)  == 6      TValue.tt, LUA_TFUNCTION
 //   *(func + 0)            the Closure
-//   *(closure + 6)         isC — a C binding rather than Lua bytecode
+//   *(closure + 6)         isC -- a C binding rather than Lua bytecode
 //   *(closure + 16)        the C function pointer, for isC closures
 //
-// The offsets are Lua 5.1's and they are confirmed against this binary rather
-// than assumed: the function's own Lua-closure branch reads Proto fields at
-// +73 numparams, +74 is_vararg, +75 maxstacksize and +12 code, and it reports
-// "stack overflow" through sub_82AA9D48 at exactly the 20000 limit.
+// The offsets are Lua 5.1's and are confirmed against this binary rather than
+// assumed: the function's own Lua-closure branch reads Proto fields at +73
+// numparams, +74 is_vararg, +75 maxstacksize and +12 code, and it reports "stack
+// overflow" at exactly the 20000 limit.
 //
-// Every dispatch is logged up to a generous cap, so in native mode — where the
-// whole run produces a handful — the last line of the log is literally the last
-// statement the script layer reached.
+// Every dispatch is logged up to a generous cap, so in native mode the last line
+// of the log is literally the last statement the script layer reached.
 
 namespace {
 
@@ -1274,14 +1191,12 @@ namespace {
 //
 // The script layer is SWIG, not a hand-rolled binding table: the module init
 // registers `swig_type` and `swig_equals`, and sub_824A8998 is
-// SWIG_Lua_set_immutable ("This variable is immutable"). So the 228-entry table
-// is one of five populations of lua_CFunction, and a miss in it never meant
-// "not a binding" — 0x824A8AC0 reached a census line as a bare address for
-// exactly that reason. Re-read in IDA 2026-08-28:
+// SWIG_Lua_set_immutable. So the 228-entry table is one of five populations of
+// lua_CFunction, and a miss in it never meant "not a binding".
 //
-//   MXRavage_Xenon_00cb (0x824F1D80) is the module init. At 0x824F1E10 it calls
-//   sub_824A8BA0(L, "Engine"), which builds the global `Engine` table and hangs
-//   __index / __newindex / .get / .set off its metatable, and only then walks:
+//   MXRavage_Xenon_00cb (0x824F1D80) is the module init. It calls
+//   sub_824A8BA0(L, "Engine"), which builds the global `Engine` table, and then
+//   walks:
 //
 //     1. module functions    0x8203F2E0  {name, func}      via sub_824A8DC0
 //     2. module attributes   0x82D1C858  {name, get, set}  via sub_824A8CE0
@@ -1289,19 +1204,17 @@ namespace {
 //        (SWIG_Lua_class_register) and its member pass sub_824A9358
 //
 //   Populations 4 and 5 are the metamethods. They are INSTALLED, so no table
-//   holds them and no scan can ever reach them: they are the fixed list below.
+//   holds them and no scan can reach them: they are the fixed list below.
 //
 // Every SWIG array is NUL-terminated, never counted. The 228 is the measured
-// distance to the terminator at 0x8203FA00 — (0x8203FA00 - 0x8203F2E0) / 8 —
-// kept as a runaway bound rather than as the loop condition, so a table that
-// grows cannot silently truncate.
+// distance to the terminator, kept as a runaway bound rather than as the loop
+// condition, so a table that grows cannot silently truncate.
 //
 // Layouts taken field for field out of sub_824A9358 (members) and sub_824A9500
-// (bases), then checked against the live struct at 0x82D1B260: name
-// "VariableCollection", methods 0x82D1B208. That array is what
-// docs/guest_binary.md used to call "a second table around 0x82D1B21C" of
-// unestablished bounds. It is not a second module table — it is one class's
-// methods, and its bound is the terminator like every other SWIG array.
+// (bases), then checked against the live struct at 0x82D1B260. That array is
+// what docs/guest_binary.md used to call "a second table around 0x82D1B21C" of
+// unestablished bounds -- it is one class's methods, bounded by a terminator
+// like every other SWIG array.
 //
 //   swig_type_info      +16 clientdata -> swig_lua_class*
 //   swig_lua_class      +0 name  +8 constructor  +16 methods  +20 attributes
@@ -1364,11 +1277,10 @@ std::string SwigAttributeName(uint8_t* base, uint32_t table, uint32_t fn,
 }
 
 // One caveat the wider search makes worse rather than better: identical-code
-// folding means several trivial bindings share one address (0x829E8FA8 is a
-// bare `return 0` with hundreds of xrefs), and a first-match scan will hand
-// back whichever of them it reaches first. A name here is a name for the
-// ADDRESS, not proof of which binding ran — see the Traps section of
-// docs/guest_binary.md. Do not treat a folded hit as an identification.
+// folding means several trivial bindings share one address (0x829E8FA8 is a bare
+// `return 0` with hundreds of xrefs), and a first-match scan hands back whichever
+// it reaches first. A name here is a name for the ADDRESS, not proof of which
+// binding ran. Do not treat a folded hit as an identification.
 std::string BindingName(uint8_t* base, uint32_t fn) {
   if (!fn) return {};
   for (const SwigHelper& h : kSwigHelpers) {
@@ -1401,17 +1313,14 @@ std::string BindingName(uint8_t* base, uint32_t fn) {
 // ---- Who CALLED it ---------------------------------------------------------
 //
 // The dispatch lines used to report `lr` and nothing else, and that number is
-// worthless as a caller: decompiled 2026-08-16, 0x82AABA74 is the `bl` to this
-// function inside luaV_execute (sub_82AAAFD0), so lr=0x82AABA78 is the
-// interpreter's OP_CALL and EVERY script-level call in the game reports it.
-// luaD_precall has four call sites in total -- OP_CALL, OP_TAILCALL
-// (0x82AABAC0, nresults = -1), and two C entry paths -- so the only thing an lr
-// distinguishes here is "from a script" versus "from C".
+// worthless as a caller: 0x82AABA74 is the `bl` to this function inside
+// luaV_execute, so lr=0x82AABA78 is the interpreter's OP_CALL and EVERY
+// script-level call in the game reports it. luaD_precall has four call sites, so
+// the only thing an lr distinguishes is "from a script" versus "from C".
 //
 // The CallInfo can name the caller, and the offsets are not carried over from
-// the Lua 5.1 headers: sub_82AA9B70 is this title's `addinfo`, and it performs
-// exactly the sequence below, field for field, to build its "%s:%d: %s" error
-// prefix. Every load here is one the game itself does.
+// the Lua 5.1 headers: sub_82AA9B70 is this title's `addinfo` and performs
+// exactly the sequence below, field for field, to build its "%s:%d: %s" prefix.
 //
 //   L+20   ci                        ci+4   func      func+8  TValue.tt (6 = fn)
 //   *func  Closure                   +6     isC       +16     Proto (Lua only)
@@ -1419,26 +1328,23 @@ std::string BindingName(uint8_t* base, uint32_t fn) {
 //   p+32   source (TString)          getstr = TString + 16
 //
 // currentline is `lineinfo[((savedpc - code) >> 2) - 1]`, and addinfo guards it
-// with nothing but `pc >= 0` and `lineinfo != 0`. Matched rather than
-// improved on: a bounds check against p+48 would rest on an offset the game
-// never reads here, which is the kind of extrapolation this file keeps paying
-// for.
+// with nothing but `pc >= 0` and `lineinfo != 0`. Matched rather than improved
+// on: a bounds check against p+48 would rest on an offset the game never reads.
+//
 // ---- Which CHUNKS execute at all -------------------------------------------
 //
 // The binding census can only name a script that calls a C binding, so
 // "FE_Background is not in the list" was never evidence that it did not run.
-// This closes that: executing a Lua chunk means CALLING its main function, so
-// every chunk that runs at all passes through precall as a Lua callee.
+// Executing a Lua chunk means CALLING its main function, so every chunk that
+// runs at all passes through precall as a Lua callee.
 //
 // The population to compare against is the shipped manifest --
-// `assets/Database/MXUI.xenon.database` declares 539 script assets over 82
-// distinct names, readable with tools/bxml_full_decoder.py. Anything in that 82
-// and absent here never executed.
+// assets/Database/MXUI.xenon.database declares 539 script assets over 82
+// distinct names. Anything in that 82 and absent here never executed.
 //
 // Keyed by PROTO address, not by name: one chunk has many Protos and the name
-// resolution is a guest string walk, so keying by proto makes it one map lookup
-// per dispatch and one string build per distinct function per run -- the same
-// shape as the binding census. Names collapse in the report.
+// resolution is a guest string walk, so this is one map lookup per dispatch and
+// one string build per distinct function per run.
 std::mutex g_chunkCensusMu;
 std::map<uint32_t, std::string> g_chunkCensus;
 
@@ -1452,10 +1358,9 @@ std::string ProtoSource(uint8_t* base, uint32_t p) {
   // A chunk name is NOT always a name. Lua uses the loaded string itself as the
   // chunkname for a loadstring() chunk, and this title leans on that: the UI
   // instantiates every page with `FE_Background_33 = FE_Background:New()` and
-  // that whole snippet arrives here as the "source". Some carry comment text
-  // and EMBEDDED NEWLINES, which put a single log entry across many lines and
-  // break every grep the log is read with -- the first census printed 134
-  // chunks across ~70 physical lines and looked empty.
+  // that whole snippet arrives here as the "source". Some carry comment text and
+  // EMBEDDED NEWLINES, which put one log entry across many lines and break every
+  // grep the log is read with.
   for (char& c : s)
     if (c == '\n' || c == '\r' || c == '\t') c = ' ';
   if (s.size() > 72) s = s.substr(0, 69) + "...";
@@ -1479,21 +1384,17 @@ void NoteChunk(uint8_t* base, uint32_t proto) {
 // ---- Which chunks are ACTIVE -----------------------------------------------
 //
 // `first_caller` on the binding census answers "who called this binding FIRST",
-// and that is not the same question as "which chunks call bindings". A chunk
-// that only ever calls bindings some earlier chunk already touched never
-// appears in it.
+// which is not "which chunks call bindings": a chunk that only ever calls
+// bindings some earlier chunk already touched never appears in it.
 //
-// That distinction is not academic; it produced a wrong reading on 2026-08-16.
-// The first-caller list was read as "FE_Background loads and instantiates but
-// calls no binding, unlike FE_Home / FE_Home_Cameras / FE_Smoke", and that
-// asymmetry was an ARTIFACT. Playing the credits proves it: FE_Credits is
-// plainly active and on screen, and it is absent from the first-caller list too
-// -- because everything it calls (SendEvent, PlayUISound, ...) was already
-// first-seen elsewhere. Same shape as `counter-that-cannot-fire`.
+// Not academic -- it produced a wrong reading. The first-caller list was read as
+// "FE_Background loads and instantiates but calls no binding, unlike FE_Home",
+// and that asymmetry was an ARTIFACT. Playing the credits proves it: FE_Credits
+// is plainly active and on screen and is absent from the list too, because
+// everything it calls was already first-seen elsewhere.
 //
-// So count binding calls PER CALLING CHUNK. Keyed by the caller's Proto so the
-// hot path is 5 guest loads and one map lookup, with the name resolved once
-// through the chunk cache.
+// So count binding calls PER CALLING CHUNK, keyed by the caller's Proto so the
+// hot path is 5 guest loads and one map lookup.
 std::mutex g_callerCensusMu;
 std::map<uint32_t, uint64_t> g_callerCensus;  // caller Proto -> binding calls
 
@@ -1544,26 +1445,21 @@ std::string LuaCallerSite(uint8_t* base, uint32_t L) {
 // ---- Binding census --------------------------------------------------------
 //
 // The 5-second sampler below cannot answer "did this binding ever fire". A
-// one-shot call like SwitchToUIWorld [110] fires once in a run and has no
-// meaningful chance of landing on a sampling boundary, so its absence from the
-// log has never been evidence of anything. This is the census that makes the
-// absence mean something — the same mistake as `counter-that-cannot-fire` and
-// the two one-sided probes that hid the frame-pacing bug.
+// one-shot call like SwitchToUIWorld fires once in a run and has no meaningful
+// chance of landing on a sampling boundary, so its absence has never been
+// evidence of anything.
 //
 // One line the first time each distinct C binding is seen, plus a periodic
-// roll-up with counts. `std::map` keyed by guest function address so the
-// roll-up is ordered and stable between runs.
+// roll-up with counts, keyed by guest function address so the roll-up is ordered
+// and stable between runs.
 //
 // Cost: one map lookup per dispatch (~700/min in the front end). BindingName's
-// scan runs only on a miss, so at most once per distinct binding per run — it
-// now walks the class tables too, which is a few thousand guest loads on the
-// worst path (an unresolvable address) instead of 228. That is off the dispatch
-// path but NOT off the roll-up path: ReportBindingCensus names every distinct
-// binding again on each report. Bounded by how many bindings exist, so it stays
-// a log-time cost, but do not move BindingName onto the per-call path.
+// scan runs only on a miss, so at most once per distinct binding per run -- but
+// it is NOT off the roll-up path, since ReportBindingCensus names every distinct
+// binding again on each report. Do not move BindingName onto the per-call path.
 //
-// The precall fires on at least three guest threads (t11624, t17392, t20020 in
-// mx_1196), so the map needs the lock. Do not "optimise" it away.
+// The precall fires on at least three guest threads, so the map needs the lock.
+// Do not "optimise" it away.
 std::mutex g_bindingCensusMu;
 // The call site is kept from the FIRST sighting only. A binding called from two
 // places would hide the second, and that is the deliberate trade: the open
@@ -1697,10 +1593,9 @@ extern "C" REX_FUNC(sub_82AA7638) {
   // every call. `first_sight` is what catches a binding that fires once.
   //
   // The caller walk runs only on a binding's FIRST sighting, so it costs a
-  // handful of guest loads per RUN rather than per dispatch. Resolved before
-  // the lock -- it reads guest memory and takes no lock of its own, and holding
-  // the census mutex across it would put the walk on three threads' critical
-  // path for no reason.
+  // handful of guest loads per RUN. Resolved before the lock -- it reads guest
+  // memory and takes no lock of its own, and holding the census mutex across it
+  // would put the walk on three threads' critical path for no reason.
   bool first_sight = false;
   if (is_c && cfunc) {
     bool need_caller = false;

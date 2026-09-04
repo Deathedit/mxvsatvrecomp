@@ -17,15 +17,14 @@ namespace mx::gpu {
 // rebuild the bank per draw from the two sources we do model, so any register
 // published only that way is left as whatever was in the upload buffer.
 //
-// Measured 2026-08-16 across every pm4_dump_native_frame_*.txt:
+// Measured across every pm4_dump_native_frame_*.txt:
 //
 //     122 x  Type0 reg=SHADER_CONSTANT_384_X(0x4600) cnt=48
 //
-// 0x4600 is ALU dword 1536 = constant c384, and 48 dwords is 12 float4s, so
-// that one packet publishes c384..c395. Guest c394 is xe_c[138] in the rebased
-// pixel bank, and it read as NaN — which saturated a full-screen draw to white
-// and is why the legal, start and main-menu screens have no background. See the
-// `white-backdrop-is-nan-c138` note.
+// 0x4600 is ALU dword 1536 = constant c384, and 48 dwords is 12 float4s, so that
+// one packet publishes c384..c395. Guest c394 is xe_c[138] in the rebased pixel
+// bank, and it read as NaN -- which saturated a full-screen draw to white and is
+// why the legal, start and main-menu screens have no background.
 //
 // This is NOT the LOAD_ALU_CONSTANT path. That one only ever targets index
 // 0x3F0/0x7F0 (c252-255, c508-511) in this title and ApplyShaderLoadTable
@@ -43,39 +42,30 @@ void NoteType0Write(uint32_t reg_base, const uint32_t* data, uint32_t count);
 // Fill non-finite entries of `bank` from the file, for the `reg_count` float4
 // constants starting at `first_reg`. Returns how many dwords were replaced.
 //
-// Deliberately narrow: it only touches components our own sources left as NaN
-// or Inf, so a register the device shadow or the load table set correctly can
-// never be clobbered by an end-of-frame PM4 value. It also does NOT invent a
-// value — a register the PM4 stream never wrote either is left alone, which is
-// the line `hle_sanitize_constants` crossed when it zeroed non-finites and was
-// retired for it.
+// Deliberately narrow: it only touches components our own sources left as NaN or
+// Inf, so a register the device shadow or the load table set correctly can never
+// be clobbered by an end-of-frame PM4 value. It also does NOT invent a value --
+// a register the PM4 stream never wrote either is left alone, which is the line
+// `hle_sanitize_constants` crossed when it zeroed non-finites and was retired.
 //
-// SINCE 2026-08-26 it ALSO substitutes where our bank holds a finite ZERO and
-// PM4 published a non-zero value there — a case the loop above cannot reach,
-// because it opens by skipping finite values.
-//
-// THAT SECOND PASS IS NOT VALIDATED. It fired 6,705,127 times in a 1020-frame
-// menu run, did not brighten the scene it was written for, and introduced a
-// visible fault in the menu. Read `filled_zero` as a WARNING — "we overrode
-// this many zeros the guest may have meant" — not as a repair count.
-// `count_finite_zeros` enables the second pass, which MEASURES ONLY — it counts
-// components our sources left at a finite zero that Type-0 PM4 published a
-// value for, and changes nothing. Both banks, since it is now harmless.
+// `count_finite_zeros` enables a second pass that MEASURES ONLY: it counts
+// components our sources left at a finite zero that Type-0 PM4 published a value
+// for, and changes nothing. Both banks, since it is now harmless.
 //
 // It briefly SUBSTITUTED those values and that was wrong in both banks: vertex
 // sprayed a stride-6 matrix palette and tore the geometry apart, pixel still
 // flashed and never brightened. `g_file` is frame-global last-write-wins, so a
-// mid-frame draw gets the frame's final constants — fine for rare NaN repair,
-// destructive the moment it reaches an array.
+// mid-frame draw gets the frame's final constants -- fine for rare NaN repair,
+// destructive the moment it reaches an array. Read `filled_zero` as a WARNING,
+// not as a repair count.
 uint32_t OverlayNonFinite(uint32_t first_reg, uint32_t* bank,
                           uint32_t reg_count, bool count_finite_zeros);
 
 // Dwords written by PM4, dwords repaired, and how many distinct constants the
-// file has ever seen written. For the report line.
-// `zeroed` counts NaN components nothing ever published, set to the register
-// file's power-on 0.0. Reported separately from `repaired` because the two are
-// different claims: one replays a value the GPU was given, the other supplies
-// the hardware default.
+// file has ever seen written. `zeroed` counts NaN components nothing ever
+// published, set to the register file's power-on 0.0 -- reported separately from
+// `repaired` because the two are different claims: one replays a value the GPU
+// was given, the other supplies the hardware default.
 void Stats(uint64_t& written, uint64_t& repaired, uint32_t& constants_seen,
            uint64_t& zeroed, uint64_t& filled_zero);
 
@@ -89,7 +79,6 @@ std::string FilledHistogram(uint32_t top);
 // REFUSALS: the WouldFillValues report that used to sit beside this could not
 // express a zero at all, because its pass skipped `v == 0`, and it therefore
 // went on printing a stale non-zero after the file had changed underneath it.
-// It was removed on 2026-08-31 with the rest of the c32 investigation.
 std::string FileValues(const uint32_t* consts, size_t n);
 
 // One constant as floats, for callers that need the VALUE rather than a line of

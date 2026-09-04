@@ -3,22 +3,22 @@
 // A shadow of the guest's D3D9 device state, fed by the entry-point hooks.
 //
 // The point is to arrive at each draw knowing everything the draw needs, from
-// the layer that actually has it. The PM4 path reconstructs the same
-// information from command-buffer writes and shader microcode; this reads it
-// off the API calls that produced those writes.
+// the layer that actually has it. The PM4 path reconstructs the same information
+// from command-buffer writes and shader microcode; this reads it off the API
+// calls that produced those writes.
 //
 // Two rules this file exists to enforce:
 //
 //   1. **Nothing here dereferences guest memory.** It is plain host data with
-//      plain setters. The hooks read the guest — at the moment D3D9 itself is
-//      reading the same bytes, so the pointers are known good — and hand the
+//      plain setters. The hooks read the guest -- at the moment D3D9 itself is
+//      reading the same bytes, so the pointers are known good -- and hand the
 //      values over. An earlier round crashed the guest by speculatively
 //      dereferencing a device field, and the arena really is sparse.
 //
-//   2. **Every field records whether it was ever set.** State established
-//      before the hooks were reached, or simply never set by this title, must
-//      read as unknown rather than as zero. Zero is a legal blend factor and a
-//      legal shader handle; "not seen" is not.
+//   2. **Every field records whether it was ever set.** State established before
+//      the hooks were reached, or never set by this title, must read as unknown
+//      rather than as zero. Zero is a legal blend factor and a legal shader
+//      handle; "not seen" is not.
 //
 // Header stays free of the SDK, d3d12.h and dxgi, like shader_ucode.h.
 
@@ -29,36 +29,33 @@ namespace mx::hle {
 constexpr uint32_t kMaxStreams  = 4;
 // Xenos has THIRTY-TWO texture fetch constants, not sixteen. A tfetch's
 // fetch_constant_index is five bits, so a shader may name any of tf0..tf31, and
-// this was silently rejecting every fetch at or above 16 as "out of range" —
+// this was silently rejecting every fetch at or above 16 as "out of range" --
 // which surfaced as slot-fill failures that discarded an already-translated
 // pixel shader and sent the draw to the stand-in.
 //
 // Confirmed two independent ways rather than assumed:
-//   - xenia-edge registers run XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 through
-//     ..._FETCH_31_5, i.e. 32 constants of 6 dwords.
+//   - xenia-edge registers run SHADER_CONSTANT_FETCH_00_0 through _31_5, i.e.
+//     32 constants of 6 dwords.
 //   - the guest device's own layout agrees exactly. The fetch file is at
-//     device+0x480 with a 24-byte stride (ReadLiveTextureFetch), and
-//     0x480 + 32*24 = 0x780, which is precisely kDeviceVsConstFile, where the
-//     vertex constant file begins. Sixteen entries would end at 0x600 and leave
+//     device+0x480 with a 24-byte stride, and 0x480 + 32*24 = 0x780, which is
+//     precisely kDeviceVsConstFile. Sixteen entries would end at 0x600 and leave
 //     0x600..0x780 unexplained.
 //
-// CollectPixelShaderBlob already noted "the guest block itself contains all 32"
-// while keeping only the first half. Nothing else here assumes 16: every other
-// use is a bounds check or an array size, and texture_seen_mask is a uint32_t,
-// which holds exactly 32 bits.
+// Nothing else here assumes 16: every other use is a bounds check or an array
+// size, and texture_seen_mask is a uint32_t, which holds exactly 32 bits.
 constexpr uint32_t kMaxSamplers = 32;
 
 //===========================================================================
 // Vertex streams.
 //
 // D3DDevice_SetStreamSource(pDevice, StreamNumber, pStreamData, OffsetInBytes,
-// Stride) — signature read off the typed decompilation at 0x8254B7C0.
+// Stride) -- signature read off the typed decompilation at 0x8254B7C0.
 //
-// The D3DVertexBuffer carries a Xenos vertex fetch constant at +0x18 — the
-// same two dwords the PM4 path already shadows, so the two descriptions of a
-// draw can be compared field by field. Decoded the way the translator decodes
-// them (`xe_gpu_vertex_fetch_t`, xenos.h:1104): dword0 is {type[1:0],
-// address[31:2]}, dword1 is {endian[1:0], size[25:2] in dwords}.
+// The D3DVertexBuffer carries a Xenos vertex fetch constant at +0x18 -- the same
+// two dwords the PM4 path shadows, so the two descriptions of a draw can be
+// compared field by field. Decoded the way the translator decodes them
+// (xenos.h:1104): dword0 is {type[1:0], address[31:2]}, dword1 is {endian[1:0],
+// size[25:2] in dwords}.
 //
 // Captured when SetStreamSource is called, *not* at draw time: the function
 // reads those same dwords on its very next instruction, so the pointer is known
@@ -81,7 +78,7 @@ struct StreamBinding {
 //===========================================================================
 // Index buffer.
 //
-// D3DDevice_SetIndices(pDevice, pIndexData) at 0x8254B8E0 — one argument, no
+// D3DDevice_SetIndices(pDevice, pIndexData) at 0x8254B8E0 -- one argument, no
 // BaseVertexIndex, unlike the PC API.
 //
 // The 16-vs-32-bit choice is **bit 31 of the object's Common dword**, not a
@@ -113,10 +110,10 @@ struct ScissorState {
 // Render states.
 //
 // Only the eight output-merger leaves that were matched uniquely from
-// state.obj. There are around a hundred of them and most are 20-56 bytes with
-// no relocations, so a byte match on the rest would not be an identification —
-// see the caveat in AGENTS.md. These eight are what the renderer needs to stop
-// guessing at blending and depth.
+// state.obj. There are around a hundred and most are 20-56 bytes with no
+// relocations, so a byte match on the rest would not be an identification.
+// These eight are what the renderer needs to stop guessing at blending and
+// depth.
 //
 // SetRenderState_BlendFactor has **zero call sites** in this title. It is
 // carried anyway so that the "never set" case is a measured fact rather than a
@@ -140,12 +137,11 @@ const char* RenderStateName(uint32_t id);
 // Which entry point a device pointer was seen at.
 //
 // A first run found **five** distinct pointers in r3 across these functions,
-// where every earlier capture had shown one (0x40BC5F80, across 170,000
-// draws). Five pointers folded into one shadow is five sets of state
-// interleaved, which is enough on its own to explain draws whose bound stride
-// does not match their declaration. Recording which entry points touch which
-// pointer is what decides whether these are real devices, per-thread command
-// contexts, or something else — a bare count decides nothing.
+// where every earlier capture had shown one across 170,000 draws. Five pointers
+// folded into one shadow is five sets of state interleaved, which is enough on
+// its own to explain draws whose bound stride does not match their declaration.
+// Recording which entry points touch which pointer is what decides whether these
+// are real devices, per-thread command contexts, or something else.
 //===========================================================================
 enum EntryPointId : uint32_t {
   kEpDraw = 0,
@@ -201,10 +197,10 @@ struct RenderTargetBinding {
 //===========================================================================
 // The whole shadow.
 //
-// One instance. This title creates a single D3DDevice — every capture so far
-// shows the same 0x40BC5F80 in r3 across 170,000 draws — so a per-device map
-// would be structure without evidence behind it. If a second device ever
-// appears the draw hook will see a different pointer and say so.
+// One instance. This title creates a single D3DDevice -- every capture so far
+// shows the same pointer in r3 across 170,000 draws -- so a per-device map would
+// be structure without evidence behind it. If a second device ever appears the
+// draw hook will see a different pointer and say so.
 //===========================================================================
 struct D3D9DeviceState {
   // Every distinct r3 the entry points have been called with. A first run said
@@ -227,14 +223,14 @@ struct D3D9DeviceState {
   // The last NON-NULL pixel shader bound on this device.
   //
   // A null pixel shader does not mean "no pixel shader" on this hardware. The
-  // guest's PM4 emitter (sub_82565928) simply emits no pixel IM_LOAD in that
-  // case, so the GPU keeps the previously loaded pixel program active and the
-  // draw inherits it. `pixel_shader` above is overwritten by
-  // SetPixelShader(NULL) and cannot answer "which program is actually running".
+  // guest's PM4 emitter simply emits no pixel IM_LOAD in that case, so the GPU
+  // keeps the previously loaded pixel program active and the draw inherits it.
+  // `pixel_shader` above is overwritten by SetPixelShader(NULL) and cannot
+  // answer "which program is actually running".
   //
-  // Diagnostic only for now: it exists to test whether the draws that bind YUV
-  // planes with a null pixel shader are inheriting one of the two Bink
-  // composite shaders, which is what Bink detection keys on.
+  // Diagnostic only: it exists to test whether the draws that bind YUV planes
+  // with a null pixel shader are inheriting one of the two Bink composite
+  // shaders, which is what Bink detection keys on.
   uint32_t last_nonnull_pixel_shader = 0;
   bool     vs_seen = false;
   bool     ps_seen = false;
@@ -287,14 +283,10 @@ D3D9DeviceState& DeviceState();
 // D3D9 was asked for?
 //
 // If it does, the Nth ring draw is the Nth D3D9 draw, and the shader the ring
-// bound for it is the shader this handle means — which is the only remaining
-// route from a D3D9 shader handle to its microcode, every direct one having
-// been closed (the blob at +0x368 is not the code, SH_pPhysical is zeros at
-// bind time and its address is not the ring key).
-//
-// If it does not, the correspondence is not there to be used, and saying so is
-// the result. This is deliberately a *checkable* correlation rather than an
-// assumed one.
+// bound for it is the shader this handle means -- the only remaining route from
+// a D3D9 shader handle to its microcode, every direct one having been closed. If
+// it does not, the correspondence is not there to be used, and saying so is the
+// result. Deliberately a *checkable* correlation rather than an assumed one.
 //===========================================================================
 uint64_t& D3D9DrawCounter();
 
@@ -310,10 +302,9 @@ uint64_t& D3D9IndexedDrawCounter();
 // point that knows where one frame ends, and the report that needs the number
 // lives in another translation unit.
 //
-// The pair exists so the cost of running the guest's vertex shader can be
-// stated as a fraction of a frame rather than as a bare millisecond total. A
-// total says nothing on its own — 400ms of interpreter is irrelevant across
-// 600 frames and fatal across six.
+// The pair exists so the cost of running the guest's vertex shader can be stated
+// as a fraction of a frame rather than as a bare millisecond total -- 400ms of
+// interpreter is irrelevant across 600 frames and fatal across six.
 //
 // Measured swap-to-swap, so it is the frame *period* and includes whatever the
 // guest and the host renderer did in between. That is deliberate: the question
