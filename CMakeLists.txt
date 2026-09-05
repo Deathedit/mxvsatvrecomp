@@ -26,6 +26,7 @@ set(MX_SOURCES
     src/gfx/d3d12_game.cpp
     src/gfx/d3d12_game_bind.cpp
     src/gfx/d3d12_game_resource.cpp
+    src/gfx/d3d12_game_drawlist.cpp
     src/gfx/d3d12_game_frame.cpp
     src/gfx/d3d12_game_telemetry.cpp
 
