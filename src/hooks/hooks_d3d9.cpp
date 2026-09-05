@@ -2705,6 +2705,32 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
                     pa_su_sc, pa_su_sc & 1u, (pa_su_sc >> 1) & 1u,
                     (pa_su_sc >> 2) & 1u);
       }
+
+      // PA_CL_CLIP_CNTL, the register one below, at device+0x2944. Read only to
+      // answer whether DepthClipEnable needs to be draw state: every PSO now
+      // hardcodes TRUE, which is right exactly while clip_disable (bit 16) is
+      // clear. If this ever logs a value with bit 16 set, the flag has to be
+      // plumbed through DrawCall and the PSO key like the cull bits were.
+      {
+        constexpr uint32_t kPaClClipCntl = 0x2944;  // 0x2204
+        if (HostPageReadable(REX_RAW_ADDR(device + kPaClClipCntl))) {
+          const uint32_t clip = REX_LOAD_U32(device + kPaClClipCntl);
+          static std::mutex s_cmu;
+          static std::map<uint32_t, uint64_t> s_clips;
+          bool cfresh = false;
+          {
+            std::lock_guard<std::mutex> lk(s_cmu);
+            cfresh = ++s_clips[clip] == 1 && s_clips.size() <= 16;
+          }
+          if (cfresh) {
+            REXLOG_INFO("d3d9: PA_CL_CLIP_CNTL 0x{:08X}: clip_disable {} "
+                        "dx_clip_space_def {} ucp_ena 0x{:X} (clip_disable 1 "
+                        "means DepthClipEnable TRUE is wrong for this draw)",
+                        clip, (clip >> 16) & 1u, (clip >> 19) & 1u,
+                        clip & 0x3Fu);
+          }
+        }
+      }
     }
   }
 

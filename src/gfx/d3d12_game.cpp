@@ -249,6 +249,19 @@ bool D3D12Renderer::CreateGamePipeline() {
   // OpaquePSO and BlendedPSO override the rasterizer for every other mode via
   // ApplyCullBits. This line is NOT the hardcode that blacked out the menu.
   pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+  // Depth clipping. A zero-initialised D3D12_RASTERIZER_DESC leaves this FALSE,
+  // which is NOT the API's own default (D3D12_DEFAULT is TRUE) and not what
+  // Xenos does: the reference sets it from PA_CL_CLIP_CNTL::clip_disable
+  // (0x2204 bit 16), which this title leaves clear, so clipping is on.
+  //
+  // With it off, a primitive crossing the near plane is not clipped -- its
+  // depth is clamped into [0,1] and it rasterises anyway. In the helmet camera
+  // the rider straddles the near plane, and the parts in front of it projected
+  // through w near zero into two dark blades across the sky. The tell is a
+  // shaded fragment with SV_Position.z NEGATIVE, which near-plane clipping
+  // makes impossible: event 30601 of the 2026-09-05 capture debugs to
+  // z = -0.386 writing depth 0.
+  pso.RasterizerState.DepthClipEnable = TRUE;
   pso.SampleMask = UINT_MAX;
   pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
   pso.NumRenderTargets = 1;
@@ -933,6 +946,11 @@ ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
   // here is what let a closed volume containing the camera paint the menu
   // background black -- see DrawCall::pa_su_sc_mode_cntl.
   ApplyCullBits((key.flags >> 5) & 7u, pso.RasterizerState);
+  // See the note in the game PSO template above. ApplyCullBits touches only
+  // CullMode and FrontCounterClockwise, so OpaquePSO and BlendedPSO inherit
+  // this from m_gamePsoTemplate; the translated desc is zeroed separately and
+  // needs its own.
+  pso.RasterizerState.DepthClipEnable = TRUE;
   pso.SampleMask = UINT_MAX;
   pso.PrimitiveTopologyType = key.topoType;
   // MRT slot 1 when the caller bound two RTVs. NumRenderTargets and RTVFormats
