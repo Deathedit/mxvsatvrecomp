@@ -124,6 +124,19 @@ struct ShaderConstantTable {
   }
 };
 
+// Texture content-name join; see TextureNames() in hooks_d3d9_texture.cpp.
+// Published because the report that prints them lives in another TU, and
+// because they must appear on a line that prints EVERY segment: decodes are
+// rare once the cache is warm -- one reporting window showed 2287 cache hits
+// against 1 decode -- so a counter that reports every N decodes never fires,
+// and the startup burst rotates out of the log before anyone reads it.
+struct TextureNameCensus {
+  uint64_t seen = 0;   // every texture the runtime decoded
+  uint64_t named = 0;  // resolved to a .texture asset by content
+  uint64_t noKey = 0;  // no measurable level 0, so nothing to join on
+};
+extern TextureNameCensus g_texNames;
+
 struct TranslatedShader {
   std::shared_ptr<const std::string> source;  // null unless emitted AND compiled
   uint32_t input_mask = 0;

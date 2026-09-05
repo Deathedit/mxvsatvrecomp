@@ -1772,7 +1772,7 @@ uint64_t TextureContentKey(const mx::hle::HleTextureSource& source,
 
 // Counted on EVERY decode, so the denominator is every texture the runtime
 // built rather than the ones that happened to resolve.
-std::atomic<uint64_t> g_texNameSeen{0}, g_texNameHit{0}, g_texNameNoKey{0};
+TextureNameCensus g_texNames;
 
 uint32_t CopyGuestExtent(uint32_t address, uint32_t bytes, uint8_t* base,
                          std::vector<uint8_t>& dst, size_t at) {
@@ -2785,15 +2785,15 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // every copy so the denominator is every texture the runtime built -- not
   // the ones that happened to resolve, which would make the rate meaningless.
   {
-    ++g_texNameSeen;
+    ++g_texNames.seen;
     const uint64_t ckey = TextureContentKey(source, guest);
     if (!ckey) {
-      ++g_texNameNoKey;
+      ++g_texNames.noKey;
     } else {
       const auto& tn = TextureNames();
       const auto it = tn.find(ckey);
       if (it != tn.end()) {
-        ++g_texNameHit;
+        ++g_texNames.named;
         // The first few by name, because a percentage cannot be checked by eye
         // and "ATV_Alpha_Combo at 256x256 DXT4_5" can.
         static std::atomic<uint32_t> s_shown{0};
@@ -2804,14 +2804,6 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
                       ckey);
       }
     }
-    const uint64_t n = g_texNameSeen.load();
-    if ((n % 2000) == 0)
-      REXLOG_INFO("d3d9: TEXTURE NAMES -- {} decodes, {} named ({:.1f}%), {} "
-                  "had no measurable level 0. Unnamed is a render target, a "
-                  "glyph atlas, or an asset whose level 0 is shared",
-                  n, g_texNameHit.load(),
-                  g_texNameHit.load() * 100.0 / double(n),
-                  g_texNameNoKey.load());
   }
   auto payload = std::make_shared<HleTexturePayload>();
   bool decoded_ok = false;

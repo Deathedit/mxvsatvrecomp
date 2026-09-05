@@ -4888,6 +4888,17 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
         // `n=2 flat=2` cannot say whether the retry never fired or fired and
         // found the texture still flat -- completely different diagnoses.
         g_flat.notCached, g_flat.retriesDue, g_flat.volatileKeys);
+    // On this line rather than its own cadence: decodes are rare once the
+    // cache is warm, so anything keyed on a decode count never prints.
+    // Unnamed is expected for a render target, a glyph atlas, and the 94
+    // assets whose level 0 is shared with another asset.
+    REXLOG_INFO("d3d9: TEXTURE NAMES -- {} decodes, {} named ({:.1f}%), {} "
+                "with no measurable level 0",
+                g_texNames.seen, g_texNames.named,
+                g_texNames.seen
+                    ? g_texNames.named * 100.0 / double(g_texNames.seen)
+                    : 0.0,
+                g_texNames.noKey);
     // The repeat offenders, cumulative, worst first. Three textures own this
     // whole bucket; this names them and says why each one misses.
     {
