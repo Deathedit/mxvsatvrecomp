@@ -14,6 +14,10 @@
 // it belongs somewhere else.
 
 #include <cstdint>
+#include <map>
+#include <mutex>
+#include <string>
+#include <utility>
 
 #include "gpu/d3d9_draw.h"              // kMaxStreams
 #include "hooks/hooks_d3d9_internal.h"  // kDrawGapCount, kMaxTrackedDecls
@@ -154,6 +158,20 @@ struct StencilCensus {
   uint64_t plumbedEffective = 0;
 
   uint64_t bfWindowDraws = 0;
+
+  // The per-configuration breakdowns behind those totals, and the locks that
+  // guard them. In the struct because they are the same census: a total without
+  // its configurations cannot say WHICH state was set, which is the question
+  // the stencil work kept needing to answer.
+  std::mutex mu;
+  std::map<uint32_t, uint64_t> edramModes;  // edram_mode -> draws
+  std::map<std::pair<uint32_t, uint32_t>, uint64_t> configs;
+
+  std::mutex plumbedMu;
+  std::map<std::pair<uint32_t, uint32_t>, uint64_t> plumbedConfigs;
+
+  std::mutex bfWindowMu;
+  std::map<uint32_t, std::map<uint32_t, uint64_t>> bfWindow;
 };
 
 extern StencilCensus g_stencil;
@@ -166,5 +184,21 @@ struct GpuFetchCensus {
 };
 
 extern GpuFetchCensus g_gpuFetch;
+
+// ---- what the reports call ------------------------------------------------
+//
+// Three functions, all defined in hooks_d3d9.cpp beside the state they read.
+// Functions in a header are ordinary; it is loose mutable globals that are the
+// smell, which is what the structs above are for.
+
+// Change-or-heartbeat gate for a periodic row dump. The caller owns `last` and
+// `since`; returns true when the rows should print.
+bool RowDumpDue(uint64_t population, uint64_t& last, uint32_t& since);
+
+// Names a DrawGap reason code for the report.
+const char* DrawGapName(uint32_t g);
+
+// One line describing every depth surface seen, for the stencil report.
+std::string DepthSurfaceReport();
 
 }  // namespace mx::hooks::d3d9
