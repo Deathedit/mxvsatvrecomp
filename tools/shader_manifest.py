@@ -130,7 +130,7 @@ def main():
     ap.add_argument("--assets", default="out/all")
     ap.add_argument("--out", default="out/shader_manifest.json")
     ap.add_argument("--names", default="userdata/shader_names.txt")
-    ap.add_argument("--ucode", default=None,
+    ap.add_argument("--ucode", action="append", default=None,
                     help="directory of microcode blobs; enables the self-test")
     ap.add_argument("--glob", default="*.ucode.bin.*")
     args = ap.parse_args()
@@ -223,7 +223,9 @@ def main():
     # SELF-TEST. Re-derive known blobs from the assets and fail loudly if the
     # filter dropped one. A manifest that silently loses shaders looks exactly
     # like a manifest that is working.
-    blobs = sorted(glob.glob(os.path.join(args.ucode, args.glob)))
+    blobs = []
+    for d in args.ucode:
+        blobs.extend(sorted(glob.glob(os.path.join(d, args.glob))))
     found = absent = tooshort = 0
     missing = []
     for bp in blobs:
@@ -239,7 +241,7 @@ def main():
             if len(missing) < 8:
                 missing.append(os.path.basename(bp))
     total = found + absent
-    print(f"\nSELF-TEST against {args.ucode}")
+    print(f"\nSELF-TEST against {chr(44).join(args.ucode)}")
     print(f"  re-derived {found}/{total} ({found * 100.0 / max(total, 1):.1f}%), "
           f"{tooshort} under {MIN_BLOB_BYTES} bytes")
     if absent:
