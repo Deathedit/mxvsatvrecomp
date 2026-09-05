@@ -132,6 +132,23 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   // vertexStage->rawBytes and the shader reads it through the root SRV, so a
   // null `vertices` is correct rather than a malformed draw. Tested before the
   // gate, which would otherwise drop every one of them.
+  // OM ARRIVALS, counted before the early returns below so this population is
+  // the caller's. `arrived` against the caller's own count says whether a
+  // clip-disabled draw ever gets this far; `clipOff` staying 0 while the
+  // caller sees ~1000 means those draws are rejected below, not that the
+  // field was lost.
+  if (om) {
+    ++m_omDraws;
+    if (!om->depthClip) ++m_omDrawsClipOff;
+    // PARTIAL is neither 0xF nor 0: counting `!= 0xF` counts every depth-only
+    // draw and makes a 1-in-200,000 state look like a quarter of the frame.
+    if ((om->colourMask & 0xFu) != 0xFu && (om->colourMask & 0xFu) != 0u)
+      ++m_omDrawsMasked;
+    // Normalised to the default unless the draw depth-tests, so this counts
+    // draws where the zfunc can change the outcome.
+    if (om->zfunc != GameOmState{}.zfunc) ++m_omDrawsZfunc;
+    if (om->separateAlpha) ++m_omDrawsSepAlpha;
+  }
   const bool fetchGeometry = vertexStage && vertexStage->rawBytes &&
                              vertexStage->rawByteCount &&
                              vertexStage->rawFetch && vertexStage->rawFetchCount;
@@ -777,20 +794,13 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   // Interned here rather than in the caller for the same reason stencil is:
   // the table lives on the renderer, and a caller holding indices into it
   // would be holding a reference to renderer state it cannot see change.
-  if (om) {
-    d.omIndex = OmIndexFor(*om);
-    ++m_omDraws;
-    if (!om->depthClip) ++m_omDrawsClipOff;
-    // PARTIAL means neither 0xF nor 0 -- the population the mask actually
-    // changes. Counting `!= 0xF` counted every depth-only draw and made a
-    // 1-in-200,000 state look like a quarter of the frame.
-    if ((om->colourMask & 0xFu) != 0xFu && (om->colourMask & 0xFu) != 0u)
-      ++m_omDrawsMasked;
-    // Already normalised to the default unless this draw depth-tests, so this
-    // now counts draws where the zfunc can change the outcome.
-    if (om->zfunc != GameOmState{}.zfunc) ++m_omDrawsZfunc;
-    if (om->separateAlpha) ++m_omDrawsSepAlpha;
-  }
+  // The interning has to be here, because this is where `d` exists. The
+  // COUNTERS are at the top of this function instead: half the draws that
+  // reach the caller return early above, and counting here made the renderer
+  // report 0 clip-disabled draws while the caller reported 1051 -- two numbers
+  // over two different populations, which is not a contradiction, just a
+  // useless pair.
+  if (om) d.omIndex = OmIndexFor(*om);
     ++m_stencilDraws;
     // kAlways is 7 in the GUEST encoding, which is what GameStencil carries.
     if (stencil->frontFunc != 7u || stencil->backFunc != 7u)

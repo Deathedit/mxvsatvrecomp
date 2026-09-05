@@ -562,6 +562,24 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
           // register would turn clipping OFF for every draw.
           if (d->pa_cl_clip_cntl != 0xFFFFFFFFu)
             om.depthClip = ((d->pa_cl_clip_cntl >> 16) & 1u) == 0;
+          // AT THE CONSUMER, because the producer already says 2192 draws in
+          // 200,000 carry clip_disable and the renderer says none of them
+          // arrive. Those two cannot both be right, and only a count taken
+          // HERE distinguishes "the field never survived the deferred queue"
+          // from "it survived and every one of those draws was filtered before
+          // the renderer". Counted on EVERY draw so the denominator is the
+          // whole population, not the draws that happen to be interesting.
+          {
+            static std::atomic<uint64_t> s_seen{0}, s_have{0}, s_off{0};
+            const uint64_t n = ++s_seen;
+            if (d->pa_cl_clip_cntl != 0xFFFFFFFFu) ++s_have;
+            if (!om.depthClip) ++s_off;
+            if ((n % 100000) == 0)
+              REXLOG_INFO("gfx: CLIP FIELD at the consumer -- {} draws, {} "
+                          "carried a readable PA_CL_CLIP_CNTL, {} of those "
+                          "have clip_disable set",
+                          n, s_have.load(), s_off.load());
+          }
 
           D3D12Renderer::GameStencil sten;
           const bool mode_honours =
