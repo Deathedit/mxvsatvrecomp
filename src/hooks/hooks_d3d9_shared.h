@@ -132,6 +132,15 @@ struct TranslatedShader {
   uint32_t computed_index_fetches = 0;
   // The fetch variant's compiled DXBC, same contract as `dxbc`.
   std::shared_ptr<const std::vector<uint8_t>> fetch_dxbc;
+  // "<asset>::<EntryPoint>" from userdata/shader_names.txt, or null when this
+  // shader's microcode is not in the map. A BARE POINTER on purpose: it aims
+  // into a table loaded once and never erased, so it outlives every draw, and
+  // a draw reading it pays a deref rather than a refcount.
+  //
+  // Null is a real answer, not a default -- the guest patches some shaders at
+  // load, so their content cannot match the assets. Anything reporting on this
+  // must count the nulls; see the SHADER NAMES census.
+  const std::string* name = nullptr;
 };
 
 // INSIDE the texture bucket. A finer breakdown is worth having only once one

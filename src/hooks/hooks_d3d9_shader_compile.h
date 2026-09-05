@@ -22,4 +22,9 @@ extern std::atomic<uint64_t> g_shaderHandleRecycled;
 // rather than by handle, and runs far above the translation cache.
 uint64_t VertexShaderContentId(uint32_t handle);
 
+// The same for a pixel shader. Added for the SHADER NAMES census, which records
+// the code_key of every shader the name map could not reach -- a handle would
+// not do, because handles vary per run and the key is what the map is keyed on.
+uint64_t PixelShaderContentId(uint32_t handle);
+
 }  // namespace mx::hooks::d3d9

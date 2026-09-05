@@ -2230,6 +2230,30 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     const uint32_t ps_h = st.ps_seen ? st.pixel_shader : 0;
     const TranslatedShader* v = vs_h ? TranslatedVertexShader(vs_h) : nullptr;
     const TranslatedShader* p = ps_h ? TranslatedPixelShader(ps_h) : nullptr;
+    // SHADER NAMES, counted here and NOT inside the `if (v && p)` below: the
+    // question is what fraction of the frame we can name, so a draw whose
+    // shaders never translated is an unnamed draw, not an absent one.
+    {
+      const bool vn = v && v->name;
+      const bool pn = p && p->name;
+      ++g_shaderNames.draws;
+      if (vn && pn) ++g_shaderNames.bothNamed;
+      else if (vn) ++g_shaderNames.vsOnly;
+      else if (pn) ++g_shaderNames.psOnly;
+      else {
+        ++g_shaderNames.neither;
+        if (!v && !p) ++g_shaderNames.noShader;
+      }
+      // Which shaders missed, by the key the map is keyed on, so the answer is
+      // "dump these and re-run the tool" rather than a bare percentage.
+      if ((v && !v->name) || (p && !p->name)) {
+        std::lock_guard<std::mutex> lk(g_shaderNames.mu);
+        if (v && !v->name && g_shaderNames.unnamedVs.size() < 64)
+          ++g_shaderNames.unnamedVs[VertexShaderContentId(vs_h)];
+        if (p && !p->name && g_shaderNames.unnamedPs.size() < 64)
+          ++g_shaderNames.unnamedPs[PixelShaderContentId(ps_h)];
+      }
+    }
     if (v && p) {
       const uint32_t gen = dc.pixel_param_gen;  // 0 = disabled, else pos + 1
       uint32_t missing = 0;
@@ -3180,6 +3204,7 @@ uint64_t g_gpuVertexDepthOnly = 0;
 // The GPU vertex FETCH path: draws taking it, and why a draw that qualified for
 // the GPU vertex stage still could not.
 GpuFetchCensus g_gpuFetch;
+ShaderNameCensus g_shaderNames;
 uint64_t g_gpuFetchUnaligned = 0;
 // Draws whose vertex shader has no fetch variant at all, because the emitter
 // refused to translate one. This had NO counter -- the refusal was folded into

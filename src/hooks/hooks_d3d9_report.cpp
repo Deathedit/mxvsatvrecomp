@@ -462,6 +462,43 @@ void ReportUpDrawCallers() {
               rows.empty() ? " (none)" : rows);
 }
 
+// SHADER NAMES -- the step-0 coverage number: what fraction of the frame we can
+// give the guest's own name for. Percentages are OF EVERY DRAW counted, which is
+// why `neither` and `noShader` are printed rather than folded away.
+//
+// The unnamed keys are the actionable half. A shader misses because the guest
+// patched its microcode at load, so its content no longer matches the asset --
+// dump those blobs and re-run tools/shader_manifest.py to close the gap.
+void ReportShaderNames() {
+  const uint64_t n = g_shaderNames.draws;
+  if (!n) {
+    REXLOG_INFO("d3d9: SHADER NAMES -- no draws reached the census");
+    return;
+  }
+  auto pct = [n](uint64_t v) { return v * 100.0 / double(n); };
+  REXLOG_INFO("d3d9: SHADER NAMES -- {} draws: both {} ({:.1f}%), vs-only {}, "
+              "ps-only {}, neither {} (of those, {} had no translated shader "
+              "to name)",
+              n, g_shaderNames.bothNamed, pct(g_shaderNames.bothNamed),
+              g_shaderNames.vsOnly, g_shaderNames.psOnly,
+              g_shaderNames.neither, g_shaderNames.noShader);
+  std::lock_guard<std::mutex> lk(g_shaderNames.mu);
+  auto worst = [](const std::map<uint64_t, uint64_t>& m, const char* what) {
+    if (m.empty()) return;
+    std::vector<std::pair<uint64_t, uint64_t>> v;
+    for (const auto& [key, draws] : m) v.emplace_back(draws, key);
+    std::sort(v.rbegin(), v.rend());
+    std::string rows;
+    for (size_t i = 0; i < v.size() && i < 6; ++i)
+      rows += fmt::format(" [{:016X} x{}]", v[i].second, v[i].first);
+    REXLOG_INFO("d3d9: SHADER NAMES   unnamed {} ({} distinct), worst first "
+                "-- dump these and re-run tools/shader_manifest.py:{}",
+                what, m.size(), rows);
+  };
+  worst(g_shaderNames.unnamedVs, "vertex");
+  worst(g_shaderNames.unnamedPs, "pixel");
+}
+
 void ReportDrawCounts(uint8_t* base) {
   const uint64_t total = g_indexed_draws + g_draws + g_up_draws + g_indexed_up_draws;
   // Both gates, cheapest first. The draw floor keeps the clock read off the draw
@@ -485,6 +522,7 @@ void ReportDrawCounts(uint8_t* base) {
                                           std::memory_order_relaxed))
       return;
   }
+  ReportShaderNames();
   REXLOG_INFO("d3d9: draws -- DrawIndexedVertices={} DrawVertices={} "
               "DrawVerticesUP={} DrawIndexedVerticesUP={} (skipped {}) total={}",
               g_indexed_draws, g_draws, g_up_draws, g_indexed_up_draws,

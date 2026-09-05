@@ -185,6 +185,34 @@ struct GpuFetchCensus {
 
 extern GpuFetchCensus g_gpuFetch;
 
+// SHADER NAMES -- how much of the frame we can say the guest's own name for.
+//
+// Step 0 of replacing a Xenos subsystem is being able to identify a draw
+// semantically, and the names come from tools/shader_manifest.py joining
+// microcode to the .shader assets by content.
+//
+// THE DENOMINATOR IS EVERY DRAW, deliberately. Counting only draws whose
+// shaders translated would measure the shaders we already knew and report a
+// flattering number for a frame we cannot name -- the exact shape of a counter
+// whose population is not the failure's. A draw with no translated shader at
+// all is an unnamed draw here, because for this question it is.
+//
+// `unnamedVs` / `unnamedPs` hold the code_keys that missed, which is what makes
+// the miss actionable: dump those blobs, re-run the tool, and the map grows.
+struct ShaderNameCensus {
+  uint64_t draws = 0;        // every draw that reached the census
+  uint64_t bothNamed = 0;    // vertex AND pixel resolved
+  uint64_t vsOnly = 0;
+  uint64_t psOnly = 0;
+  uint64_t neither = 0;      // includes draws with no translated shader
+  uint64_t noShader = 0;     // of `neither`: nothing translated to name
+  std::mutex mu;
+  std::map<uint64_t, uint64_t> unnamedVs;  // code_key -> draws
+  std::map<uint64_t, uint64_t> unnamedPs;
+};
+
+extern ShaderNameCensus g_shaderNames;
+
 // ---- what the reports call ------------------------------------------------
 //
 // Three functions, all defined in hooks_d3d9.cpp beside the state they read.

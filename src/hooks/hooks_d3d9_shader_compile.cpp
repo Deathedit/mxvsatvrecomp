@@ -34,6 +34,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -43,6 +44,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "gpu/hle_types.h"
@@ -129,6 +131,48 @@ uint64_t ShaderSourceKey(mx::hle::HlslStage stage, const std::string& source) {
     h *= 1099511628211ull;
   }
   return h;
+}
+
+// The guest's own name for a shader, keyed on the same code_key
+// ReportHlslCoverage already computes. Built offline by
+// tools/shader_manifest.py, which joins microcode to the .shader assets by
+// content; see that file for how and for what it cannot reach.
+//
+// Loaded once. Missing or empty is not an error -- every shader simply reports
+// unnamed, and the census says so rather than the tree pretending otherwise.
+const std::unordered_map<uint64_t, std::string>& ShaderNames() {
+  static const std::unordered_map<uint64_t, std::string> names = [] {
+    std::unordered_map<uint64_t, std::string> m;
+    std::ifstream f("userdata/shader_names.txt");
+    if (!f) {
+      REXLOG_INFO("d3d9: userdata/shader_names.txt absent -- shaders will "
+                  "report unnamed. Build it with tools/shader_manifest.py");
+      return m;
+    }
+    std::string line;
+    while (std::getline(f, line)) {
+      const size_t tab = line.find('\t');
+      if (tab == std::string::npos || tab != 16) continue;
+      char* end = nullptr;
+      const uint64_t key =
+          std::strtoull(line.substr(0, tab).c_str(), &end, 16);
+      if (!end || *end) continue;
+      std::string name = line.substr(tab + 1);
+      while (!name.empty() &&
+             (name.back() == '\r' || name.back() == '\n'))
+        name.pop_back();
+      m.emplace(key, std::move(name));
+    }
+    REXLOG_INFO("d3d9: shader names loaded: {} entries", m.size());
+    return m;
+  }();
+  return names;
+}
+
+const std::string* ShaderNameFor(uint64_t code_key) {
+  const auto& m = ShaderNames();
+  const auto it = m.find(code_key);
+  return it == m.end() ? nullptr : &it->second;
 }
 
 std::string ShaderCachePath(mx::hle::HlslStage stage, uint64_t key) {
@@ -264,6 +308,12 @@ uint64_t VertexShaderContentId(uint32_t handle) {
   std::lock_guard<std::mutex> lk(g_translatedMu);
   auto it = g_hlslReportedVs.find(handle);
   return it == g_hlslReportedVs.end() ? 0 : it->second;
+}
+uint64_t PixelShaderContentId(uint32_t handle) {
+  if (!handle) return 0;
+  std::lock_guard<std::mutex> lk(g_translatedMu);
+  auto it = g_hlslReportedPs.find(handle);
+  return it == g_hlslReportedPs.end() ? 0 : it->second;
 }
 thread_local bool t_shaderCompileWorker = false;
 
@@ -702,6 +752,9 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
     for (uint32_t i = 0; i < out.sampler_count; ++i)
       kept.slot_guest[i] = out.sampler_slot_guest[i];
     kept.max_const_index = out.max_const_index;
+    // The guest's own name for this shader, resolved from the code_key already
+    // computed at the top of this function. Once per shader, never per draw.
+    kept.name = ShaderNameFor(code_key);
     // FROM `out`, THE MAIN TRANSLATION -- not from the fetch variant. These were
     // originally set only in the vfetch block below, from `fetched`, while every
     // other field here comes from `out`. That made the mask describe a DIFFERENT
