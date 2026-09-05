@@ -189,6 +189,54 @@ struct GpuVertexStage {
 // than assumed (xenos.h:677 CompareFunction kNever=0..kAlways=7 against D3D12
 // NEVER=1..ALWAYS=8, and :688 StencilOp kKeep=0..kDecrementWrap=7 against D3D12
 // KEEP=1..DECR=8).
+// The output-merger state the guest programs and the renderer used to throw
+// away. Every field here was already captured on the DrawCall and then dropped
+// between there and the pipeline -- this is plumbing, not derivation.
+//
+// Interned into an index the way GameStencil is, for the same reason: these
+// multiply the PSO key space, and interning bounds it AND reports how large it
+// really is. StencilIndexFor found 12 real states against a cap of 64; the
+// same shape here keeps steps that pile more onto the key honest.
+//
+// Guest encoding throughout, converted at the point of use.
+struct GameOmState {
+  // RB_DEPTHCONTROL bits 4-6. Every PSO hardcoded LESS_EQUAL, and a census
+  // measured 0 draws in 200,000 using anything else -- so honouring this is
+  // correctness with no expected visual change, and no expected key growth.
+  uint8_t zfunc = 3;  // 3 = LESS_EQUAL, the value that was hardcoded
+  // RB_COLOR_MASK bits 0-3. Was collapsed to a bool and widened to RGBA; the
+  // census measured that widening firing on exactly ONE draw in 200,000 (0x7,
+  // RGB without alpha). One draw is still a draw writing alpha it should not.
+  uint8_t colourMask = 0xF;
+  // RB_BLENDCONTROL0 bits 16-26. Both PSO builders fabricated the alpha
+  // equation from the COLOUR factors; the guest programs it separately.
+  //
+  // `separateAlpha` false means "alpha follows colour", which is exactly what
+  // the builders do today -- so a draw whose alpha equation matches its colour
+  // equation, or whose register could not be read, keeps the old code path and
+  // cannot change. Only a genuinely different alpha equation interns a new
+  // state, which also keeps the key space to the draws that need it.
+  bool separateAlpha = false;
+  uint8_t srcBlendAlpha = 1, destBlendAlpha = 0, blendOpAlpha = 0;
+  // PA_CL_CLIP_CNTL bit 16, inverted. False disables near/far clipping.
+  bool depthClip = true;
+
+  // Everything that varies the pipeline. All of it does, here -- unlike
+  // GameStencil there is no per-draw dynamic member to exclude.
+  uint64_t PipelineKey() const {
+    uint64_t k = uint64_t(zfunc & 7u) | (uint64_t(colourMask & 0xFu) << 3) |
+                 (uint64_t(depthClip ? 1u : 0u) << 7);
+    // Only folded in when it is actually used, so every draw following the
+    // colour equation collapses onto one state regardless of what the alpha
+    // fields happen to hold.
+    if (separateAlpha)
+      k |= (1ull << 8) | (uint64_t(srcBlendAlpha & 0x1Fu) << 9) |
+           (uint64_t(destBlendAlpha & 0x1Fu) << 14) |
+           (uint64_t(blendOpAlpha & 7u) << 19);
+    return k;
+  }
+};
+
 struct GameStencil {
   bool enable = false;
   uint8_t readMask = 0xFF;
@@ -276,7 +324,8 @@ void AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes, uint32_t vtxStride,
                  // which is the behaviour every draw had before stencil was
                  // plumbed -- so an unreadable register cannot make things
                  // worse. See GameStencil.
-                 const GameStencil* stencil = nullptr);
+                 const GameStencil* stencil = nullptr,
+                 const GameOmState* om = nullptr);
 
 // Append a resolve to this frame's list, in order with the draws around it.
 //
@@ -601,6 +650,23 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   std::unordered_map<uint64_t, uint32_t> m_stencilStateIndex;
   // Intern a stencil state and return its dense index. 0 for disabled.
   uint32_t StencilIndexFor(const GameStencil& s);
+
+  // m_omStates interns distinct output-merger states. INDEX 0 IS THE STATE THE
+  // RENDERER USED TO HARDCODE -- LESS_EQUAL, RGBA, alpha equation copied from
+  // colour, depth clip on -- so a draw resolving to index 0 renders exactly as
+  // it did before this was plumbed. That makes the no-change case provable
+  // rather than merely likely.
+  //
+  // Interned for the same reason stencil is: these multiply the PSO key space,
+  // and interning both bounds it and reports how large it really is.
+  std::vector<GameOmState> m_omStates{GameOmState{}};
+  std::unordered_map<uint64_t, uint32_t> m_omStateIndex;
+  uint32_t OmIndexFor(const GameOmState& s);
+  size_t OmStateCount() const { return m_omStates.size(); }
+  const GameOmState& OmStateAt(uint32_t i) const {
+    return m_omStates[i < m_omStates.size() ? i : 0];
+  }
+  uint64_t m_omStatesRefused = 0;
   // How many distinct states have been interned, for the report. A number that
   // keeps climbing means something varying is leaking into the key.
   size_t StencilStateCount() const { return m_stencilStates.size(); }
@@ -628,6 +694,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   std::unordered_map<uint64_t, Microsoft::WRL::ComPtr<ID3D12PipelineState>>
       m_gamePSOsByFormat;
   ID3D12PipelineState* OpaquePSO(uint32_t variant, DXGI_FORMAT rtvFormat,
+                                 uint32_t omIndex,
                                  D3D12_PRIMITIVE_TOPOLOGY_TYPE topoType,
                                  uint32_t stencilIndex = 0);
   // The host format an offscreen target takes for a given guest
@@ -658,10 +725,12 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // stencil needs its own pipeline, and reusing one built without it would
     // silently drop the stencil half.
     uint32_t stencilIndex = 0;
+    // See TranslatedKey::omIndex.
+    uint32_t omIndex = 0;
     bool operator==(const BlendKey& o) const noexcept {
       return pso_index == o.pso_index && src == o.src && dest == o.dest &&
              op == o.op && rtvFormat == o.rtvFormat && topoType == o.topoType &&
-             stencilIndex == o.stencilIndex;
+             stencilIndex == o.stencilIndex && omIndex == o.omIndex;
     }
   };
   struct BlendKeyHash {
@@ -669,7 +738,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
       return (size_t(k.pso_index) << 24) ^ (size_t(k.src) << 16) ^
              (size_t(k.dest) << 8) ^ size_t(k.op) ^
              (size_t(k.rtvFormat) << 32) ^ (size_t(k.topoType) << 44) ^
-             (size_t(k.stencilIndex) << 52);
+             (size_t(k.stencilIndex) << 52) ^ (size_t(k.omIndex) << 58);
     }
   };
   // Bounded so an unrecognised state cannot grow this without limit; past the
@@ -770,11 +839,17 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // a missed variant: the FIRST draw to build a given shader's pipeline would
     // fix its stencil state for every later draw sharing that shader.
     uint32_t stencilIndex = 0;
+    // Dense index into m_omStates, in the key for exactly the reason stencil
+    // is: zfunc, the colour mask, the alpha blend equation and depth clip are
+    // all pipeline state, so the first draw to build a shader's pipeline would
+    // otherwise fix them for every later draw sharing that shader.
+    uint32_t omIndex = 0;
     bool operator==(const TranslatedKey& o) const noexcept {
       return handle == o.handle && vsHandle == o.vsHandle && src == o.src &&
              dest == o.dest && op == o.op && flags == o.flags &&
              rtvFormat == o.rtvFormat && rtvFormat1 == o.rtvFormat1 &&
-             topoType == o.topoType && stencilIndex == o.stencilIndex;
+             topoType == o.topoType && stencilIndex == o.stencilIndex &&
+             omIndex == o.omIndex;
     }
   };
   struct TranslatedKeyHash {
@@ -783,7 +858,8 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
              (size_t(k.src) << 12) ^ (size_t(k.dest) << 6) ^
              (size_t(k.op) << 3) ^ size_t(k.flags) ^
              (size_t(k.rtvFormat) << 40) ^ (size_t(k.rtvFormat1) << 44) ^
-             (size_t(k.topoType) << 50) ^ (size_t(k.stencilIndex) << 56);
+             (size_t(k.topoType) << 50) ^ (size_t(k.stencilIndex) << 56) ^
+             (size_t(k.omIndex) << 60);
     }
   };
   std::unordered_map<TranslatedKey, TranslatedPipeline, TranslatedKeyHash>
@@ -1289,6 +1365,8 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // bit 28) and the state is 41 bits.
     GameStencil stencil;
     uint32_t stencilIndex = 0;  // 0 == no stencil
+    // Dense index into m_omStates; 0 is the previously-hardcoded state.
+    uint32_t omIndex = 0;
     bool depthClear = false;
     float clearDepth = 1.0f;
     bool clearDepthPlane = true;

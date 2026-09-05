@@ -594,6 +594,19 @@ struct DrawCall {
   uint32_t stencil_ref_mask = 0xFFFFFFFFu;  // RB_STENCILREFMASK 0x210D
   uint32_t edram_mode = 0xFFFFFFFFu;        // RB_MODECONTROL    0x2208, low 3
 
+  // PA_CL_CLIP_CNTL 0x2204. clip_disable is bit 16; when the guest sets it the
+  // near and far planes do not clip, and a hardcoded DepthClipEnable TRUE is
+  // wrong for that draw.
+  //
+  // Carried rather than pre-judged, like the three above. This register was
+  // read for logging only until the probe added with the depth-clip fix
+  // reported `clip_disable 1` in the wild -- which is what turned that
+  // hardcode from "right by observation" into a measured defect.
+  //
+  // 0xFFFFFFFF means unreadable; bit 16 of that reads as set, so consumers
+  // must test readability rather than the bit alone.
+  uint32_t pa_cl_clip_cntl = 0xFFFFFFFFu;   // PA_CL_CLIP_CNTL   0x2204
+
   // PA_SU_SC_MODE_CNTL 0x2205: cull_front +0, cull_back +1, face +2 (0 = front
   // is CCW, 1 = CW). Raw, like the three above; zero means unreadable, which
   // decodes as "cull nothing".

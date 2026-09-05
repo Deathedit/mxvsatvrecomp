@@ -2754,6 +2754,7 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
         constexpr uint32_t kPaClClipCntl = 0x2944;  // 0x2204
         if (HostPageReadable(REX_RAW_ADDR(device + kPaClClipCntl))) {
           const uint32_t clip = REX_LOAD_U32(device + kPaClClipCntl);
+          dc.pa_cl_clip_cntl = clip;
           static std::mutex s_cmu;
           static std::map<uint32_t, uint64_t> s_clips;
           bool cfresh = false;

@@ -1658,6 +1658,7 @@ void D3D12Renderer::RenderGameFrame() {
                           (d.blendEnable ? 8u : 0u) |
                           (d.gpuVertexFetch ? 16u : 0u) |
                           (PackCullBits(d.cullMode) << 5));
+      key.omIndex = d.omIndex;
       // A depth pass has no guest pixel shader to compile, so it takes the
       // stand-in. key.handle is 0 for these -- no real shader has that handle,
       // so m_translatedPsBlobs caches exactly one compilation of it for the
@@ -1958,10 +1959,11 @@ void D3D12Renderer::RenderGameFrame() {
     if (d.blendEnable) {
       pipeline = BlendedPSO(BlendKey{pso_index, d.srcBlend, d.destBlend,
                                      d.blendOp, rtvFormat, topoType,
-                                     d.stencilIndex});
+                                     d.stencilIndex, d.omIndex});
     }
     if (!pipeline)
-      pipeline = OpaquePSO(pso_index, rtvFormat, topoType, d.stencilIndex);
+      pipeline =
+          OpaquePSO(pso_index, rtvFormat, d.omIndex, topoType, d.stencilIndex);
     m_commandList->SetPipelineState(pipeline);
     // The reference value is NOT pipeline state -- it is set per draw, which is
     // why configs differing only in ref share one pipeline. Set unconditionally

@@ -513,6 +513,41 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
           // wrong: the guest leaves the bit CLEAR on about half of all draws, and
           // enabling stencil on those applies their fail/zpass/zfail ops, which
           // WRITE.
+          // OUTPUT-MERGER STATE THE RENDERER USED TO DISCARD. Every field
+          // here was already on the DrawCall; nothing new is read from the
+          // guest. The defaults reproduce the constants the PSO builders
+          // hardcoded, so a draw whose registers were unreadable, or whose
+          // state matches those constants, resolves to index 0 and takes the
+          // path it always took.
+          D3D12Renderer::GameOmState om;
+          // RB_DEPTHCONTROL bits 4-6. Gated on om_seen bit 1 like depth
+          // enable/write are, because a never-written register reads zero and
+          // zero is a legal compare function (NEVER), not "unset".
+          if (d->om_seen & 2u) om.zfunc = uint8_t((d->depth_control >> 4) & 7u);
+          // RB_COLOR_MASK bits 0-3. Same gate as the bool it refines.
+          if (d->om_seen & 1u) om.colourMask = uint8_t(d->colour_mask & 0xFu);
+          // RB_BLENDCONTROL0 bits 16-26, and ONLY when the alpha equation
+          // actually differs from the colour equation -- otherwise the state
+          // collapses onto index 0 and the builders keep deriving alpha from
+          // colour exactly as before.
+          if (d->om_seen & 4u) {
+            const uint32_t sa = (d->blend_control >> 16) & 0x1Fu;
+            const uint32_t oa = (d->blend_control >> 21) & 7u;
+            const uint32_t da = (d->blend_control >> 24) & 0x1Fu;
+            if (sa != d->src_blend || da != d->dest_blend ||
+                oa != d->blend_op) {
+              om.separateAlpha = true;
+              om.srcBlendAlpha = uint8_t(sa);
+              om.destBlendAlpha = uint8_t(da);
+              om.blendOpAlpha = uint8_t(oa);
+            }
+          }
+          // PA_CL_CLIP_CNTL bit 16. 0xFFFFFFFF is the unreadable marker and its
+          // bit 16 reads as set, so test readability first or an unread
+          // register would turn clipping OFF for every draw.
+          if (d->pa_cl_clip_cntl != 0xFFFFFFFFu)
+            om.depthClip = ((d->pa_cl_clip_cntl >> 16) & 1u) == 0;
+
           D3D12Renderer::GameStencil sten;
           const bool mode_honours =
               d->edram_mode == 4u || d->edram_mode == 5u;
@@ -641,7 +676,7 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
                                   d->guest_vp_width, d->guest_vp_height,
                                   REXCVAR_GET(d3d9_guest_viewport),
                                   REXCVAR_GET(d3d12_edram_takeover_copy),
-                                  sten.enable ? &sten : nullptr);
+                                  sten.enable ? &sten : nullptr, &om);
           // MRT slot 1 as a follow-up rather than four more arguments on a
           // call that already takes forty: it patches the draw AddGameDraw just
           // pushed, and does nothing when the guest bound only one target.

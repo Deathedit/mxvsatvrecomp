@@ -825,6 +825,51 @@ uint32_t D3D12Renderer::StencilIndexFor(const GameStencil& st) {
   return index;
 }
 
+uint32_t D3D12Renderer::OmIndexFor(const GameOmState& st) {
+  const uint64_t key = st.PipelineKey();
+  // Index 0 is the state the renderer used to hardcode. A draw that resolves to
+  // it takes exactly the path it took before this was plumbed.
+  if (key == GameOmState{}.PipelineKey()) return 0;
+  if (auto it = m_omStateIndex.find(key); it != m_omStateIndex.end())
+    return it->second;
+  // Bounded for the reason StencilIndexFor is: each new state is a new PIPELINE
+  // per (shader, format, topology, blend, stencil) it meets, and the translated
+  // cache is capped. Past the cap a draw renders with the OLD hardcoded state
+  // rather than being dropped, and it is counted.
+  constexpr size_t kMaxOmStates = 64;
+  if (m_omStates.size() >= kMaxOmStates) {
+    ++m_omStatesRefused;
+    return 0;
+  }
+  const uint32_t index = uint32_t(m_omStates.size());
+  m_omStates.push_back(st);
+  m_omStateIndex.emplace(key, index);
+  return index;
+}
+
+// Write the output-merger half of a pipeline description. Called from ALL THREE
+// builders for the reason ApplyStencil is called from both: a state applied one
+// way in the translated path and another in the opaque path would differ only
+// for some draws, which is the kind of divergence that stays invisible until it
+// is not.
+//
+// `colorWrite` stays a separate argument because it is the draw's own
+// all-or-nothing decision (flags bit 2, and depth-only draws depend on it);
+// the mask refines it rather than replacing it.
+void ApplyOmState(const D3D12Renderer::GameOmState& om, bool colorWrite,
+                  D3D12_GRAPHICS_PIPELINE_STATE_DESC& pso) {
+  // Xenos CompareFunction and D3D12_COMPARISON_FUNC share an ordering with
+  // D3D12 starting at 1 -- the same offset GuestStencilFunc relies on, and
+  // guest 3 maps to LESS_EQUAL, which is what every builder hardcoded.
+  pso.DepthStencilState.DepthFunc =
+      D3D12_COMPARISON_FUNC((om.zfunc & 7u) + 1u);
+  pso.RasterizerState.DepthClipEnable = om.depthClip ? TRUE : FALSE;
+  // RB_COLOR_MASK bits 0-3 are R,G,B,A and D3D12_COLOR_WRITE_ENABLE_* are
+  // 1,2,4,8 in the same order, so this is a pass-through, not a table.
+  pso.BlendState.RenderTarget[0].RenderTargetWriteMask =
+      colorWrite ? UINT8(om.colourMask & 0xFu) : 0;
+}
+
 ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
                                                   const std::string& hlsl,
                                                   const GameDraw& draw) {
@@ -972,7 +1017,10 @@ ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
   pso.DepthStencilState.DepthEnable = depthEnable;
   pso.DepthStencilState.DepthWriteMask =
       depthWrite ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
-  pso.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+  // zfunc, colour mask and depth clip, from the state the guest programmed
+  // rather than the three constants this used to hardcode. Index 0 reproduces
+  // those constants exactly, so an unchanged draw takes an unchanged path.
+  ApplyOmState(OmStateAt(key.omIndex), colorWrite, pso);
   // THE PATH THAT ACTUALLY MATTERS. Phases 2 and 3 wired stencil into the opaque
   // and blended builders and left this one alone, and in a level nearly every
   // draw is translated -- so the whole thing was inert. The mutation test
@@ -1007,25 +1055,40 @@ ID3D12PipelineState* D3D12Renderer::TranslatedPSO(const TranslatedKey& key,
       LogInfo(m);
     }
   }
+  // The write mask is ApplyOmState's; the blend equation below is not, because
+  // it also depends on key.flags bit 3 and on translatability.
   auto& rt = pso.BlendState.RenderTarget[0];
-  rt.RenderTargetWriteMask =
-      colorWrite ? D3D12_COLOR_WRITE_ENABLE_ALL : 0;
   if (key.flags & 8u) {
+    const GameOmState& om = OmStateAt(key.omIndex);
     D3D12_BLEND src{}, dest{}, srcA{}, destA{};
-    D3D12_BLEND_OP op{};
+    D3D12_BLEND_OP op{}, opA{};
     // A state that does not translate falls back to opaque rather than being
     // approximated — the same rule BlendedPSO follows.
     if (ToD3D12Blend(key.src, false, src) &&
-        ToD3D12Blend(key.dest, false, dest) &&
-        ToD3D12Blend(key.src, true, srcA) &&
-        ToD3D12Blend(key.dest, true, destA) && ToD3D12BlendOp(key.op, op)) {
-      rt.BlendEnable = TRUE;
-      rt.SrcBlend = src;
-      rt.DestBlend = dest;
-      rt.BlendOp = op;
-      rt.SrcBlendAlpha = srcA;
-      rt.DestBlendAlpha = destA;
-      rt.BlendOpAlpha = op;
+        ToD3D12Blend(key.dest, false, dest) && ToD3D12BlendOp(key.op, op)) {
+      // ALPHA FROM THE GUEST when it programmed a different equation, else
+      // from the colour factors, which is what this always did. Falling back
+      // rather than refusing keeps a draw whose alpha equation does not
+      // translate rendering as it did instead of turning blending off.
+      bool alpha_ok = false;
+      if (om.separateAlpha)
+        alpha_ok = ToD3D12Blend(om.srcBlendAlpha, true, srcA) &&
+                   ToD3D12Blend(om.destBlendAlpha, true, destA) &&
+                   ToD3D12BlendOp(om.blendOpAlpha, opA);
+      if (!alpha_ok) {
+        alpha_ok = ToD3D12Blend(key.src, true, srcA) &&
+                   ToD3D12Blend(key.dest, true, destA);
+        opA = op;
+      }
+      if (alpha_ok) {
+        rt.BlendEnable = TRUE;
+        rt.SrcBlend = src;
+        rt.DestBlend = dest;
+        rt.BlendOp = op;
+        rt.SrcBlendAlpha = srcA;
+        rt.DestBlendAlpha = destA;
+        rt.BlendOpAlpha = opA;
+      }
     }
   }
 
@@ -1192,7 +1255,7 @@ D3D12_PRIMITIVE_TOPOLOGY_TYPE TopologyTypeOf(D3D12_PRIMITIVE_TOPOLOGY topo) {
 // format and triangles only; these are the same descriptions with RTVFormats[0]
 // and PrimitiveTopologyType changed, built once each on demand.
 ID3D12PipelineState* D3D12Renderer::OpaquePSO(
-    uint32_t variant, DXGI_FORMAT rtvFormat,
+    uint32_t variant, DXGI_FORMAT rtvFormat, uint32_t omIndex,
     D3D12_PRIMITIVE_TOPOLOGY_TYPE topoType, uint32_t stencilIndex) {
   // m_gamePSOs is the 32 eagerly-built variants, indexed by the low five bits.
   // Cull lives in bits 5-7 and is NOT part of that array: growing it to 256
@@ -1204,14 +1267,21 @@ ID3D12PipelineState* D3D12Renderer::OpaquePSO(
   // The 32 eagerly-built pipelines carry no stencil, so a draw that wants
   // stencil can never take that shortcut however plain the rest of its state
   // is. Missing this is how a stencil variant silently renders without stencil.
-  if (stencilIndex == 0 && cullBits == 0 &&
+  //
+  // They were also built with the output-merger state this function used to
+  // hardcode -- LESS_EQUAL, RGBA, depth clip on -- so `omIndex == 0` joins the
+  // same condition for exactly the same reason. Index 0 IS that state, which is
+  // why the overwhelmingly common draw still takes the shortcut.
+  if (stencilIndex == 0 && omIndex == 0 && cullBits == 0 &&
       topoType == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE &&
       (rtvFormat == kBackBufferFormat || rtvFormat == DXGI_FORMAT_UNKNOWN))
     return m_gamePSOs[baseVariant].Get();
+  // stencilIndex and omIndex are both capped at 64, so six bits each.
   const uint64_t key = uint64_t((uint32_t(rtvFormat) << 8) |
                                 (variant & 0xFFu) |
                                 (uint32_t(topoType) << 28)) |
-                       (uint64_t(stencilIndex) << 32);
+                       (uint64_t(stencilIndex) << 32) |
+                       (uint64_t(omIndex) << 40);
   if (auto it = m_gamePSOsByFormat.find(key); it != m_gamePSOsByFormat.end())
     return it->second.Get();
   if (!m_gameVsBlob || m_gamePsBlobs[0] == nullptr)
@@ -1235,12 +1305,11 @@ ID3D12PipelineState* D3D12Renderer::OpaquePSO(
   pso.DepthStencilState.DepthEnable = depth_enable;
   pso.DepthStencilState.DepthWriteMask =
       depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
-  pso.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
   if (stencilIndex && stencilIndex < m_stencilStates.size())
     ApplyStencil(m_stencilStates[stencilIndex], pso.DepthStencilState);
   pso.BlendState.RenderTarget[0] = {};
-  pso.BlendState.RenderTarget[0].RenderTargetWriteMask =
-      color_write ? D3D12_COLOR_WRITE_ENABLE_ALL : 0;
+  // After the RenderTarget[0] reset, or the write mask it sets is cleared.
+  ApplyOmState(OmStateAt(omIndex), color_write, pso);
 
   Microsoft::WRL::ComPtr<ID3D12PipelineState> created;
   const HRESULT hr =
@@ -1312,27 +1381,37 @@ D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = m_gamePsoTemplate;
   pso.DepthStencilState.DepthEnable = depth_enable;
   pso.DepthStencilState.DepthWriteMask =
       depth_write ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
-  pso.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
   // Same helper as the opaque path, deliberately: a stencil variant built one
   // way here and another there would diverge only for blended draws, which is
   // invisible right up until it is not.
   if (key.stencilIndex && key.stencilIndex < m_stencilStates.size())
     ApplyStencil(m_stencilStates[key.stencilIndex], pso.DepthStencilState);
 
+  const GameOmState& om = OmStateAt(key.omIndex);
   auto& rt = pso.BlendState.RenderTarget[0];
   rt = {};
   rt.BlendEnable = TRUE;
   rt.SrcBlend = src;
   rt.DestBlend = dest;
   rt.BlendOp = op;
-  rt.SrcBlendAlpha = src_a;
-  rt.DestBlendAlpha = dest_a;
-  // D3DRS_BLENDOPALPHA is only consulted under SEPARATEALPHABLENDENABLE, which
-  // is hooked but not carried on the draw yet; until it is, alpha follows the
-  // colour equation, which is what D3D9 does when separate alpha is off.
-  rt.BlendOpAlpha = op;
-  rt.RenderTargetWriteMask =
-      color_write ? D3D12_COLOR_WRITE_ENABLE_ALL : 0;
+  // ALPHA FROM THE GUEST when it programmed a different equation. The comment
+  // this replaces said D3DRS_BLENDOPALPHA "is hooked but not carried on the
+  // draw yet" -- it is carried now, in RB_BLENDCONTROL0 bits 16-26, which the
+  // register read has been keeping whole in DrawCall::blend_control all along.
+  D3D12_BLEND src_a2{}, dest_a2{};
+  D3D12_BLEND_OP op_a{};
+  if (om.separateAlpha && ToD3D12Blend(om.srcBlendAlpha, true, src_a2) &&
+      ToD3D12Blend(om.destBlendAlpha, true, dest_a2) &&
+      ToD3D12BlendOp(om.blendOpAlpha, op_a)) {
+    rt.SrcBlendAlpha = src_a2;
+    rt.DestBlendAlpha = dest_a2;
+    rt.BlendOpAlpha = op_a;
+  } else {
+    rt.SrcBlendAlpha = src_a;
+    rt.DestBlendAlpha = dest_a;
+    rt.BlendOpAlpha = op;
+  }
+  ApplyOmState(om, color_write, pso);
 
   Microsoft::WRL::ComPtr<ID3D12PipelineState> created;
   const HRESULT hr =

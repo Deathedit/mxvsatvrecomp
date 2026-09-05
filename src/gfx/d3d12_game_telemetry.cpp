@@ -387,6 +387,42 @@ void D3D12Renderer::ReportGameFrameTelemetry(
                   static_cast<unsigned long long>(m_stencilViaStandIn),
                   static_cast<unsigned long long>(m_stencilNoDsv));
     LogInfo(message);
+    // OUTPUT-MERGER STATES. The number to watch when anything else is added to
+    // a PSO key: `interned` is how many distinct states the guest actually
+    // programs, against a cap of 64. Index 0 is the state the builders used to
+    // hardcode, so `interned 1` means every draw in the frame wanted exactly
+    // what they hardcoded and nothing changed -- which is the expected result
+    // for zfunc (measured 0 draws using anything but LESS_EQUAL) and nearly so
+    // for the colour mask (1 partial draw in 200,000).
+    //
+    // `refused` non-zero means the cap was hit and those draws render with the
+    // OLD hardcoded state; it must be 0.
+    //
+    // `separate-alpha` is the population that was never measured before: draws
+    // whose alpha blend equation differs from their colour equation, which both
+    // builders used to fabricate from the colour factors.
+    {
+      uint64_t sep = 0, clip_off = 0, masked = 0, zf = 0;
+      for (const auto& om : m_omStates) {
+        if (om.separateAlpha) ++sep;
+        if (!om.depthClip) ++clip_off;
+        if ((om.colourMask & 0xFu) != 0xFu) ++masked;
+        if (om.zfunc != GameOmState{}.zfunc) ++zf;
+      }
+      std::snprintf(message, sizeof(message),
+                    "  OM STATES: %llu interned of 64 (%llu refused past the "
+                    "cap -- must be 0); of those, %llu separate-alpha, %llu "
+                    "depth-clip OFF, %llu partial colour mask, %llu non-lequal "
+                    "zfunc. 1 interned means nothing differed from what the "
+                    "builders hardcoded",
+                    static_cast<unsigned long long>(m_omStates.size()),
+                    static_cast<unsigned long long>(m_omStatesRefused),
+                    static_cast<unsigned long long>(sep),
+                    static_cast<unsigned long long>(clip_off),
+                    static_cast<unsigned long long>(masked),
+                    static_cast<unsigned long long>(zf));
+      LogInfo(message);
+    }
     // DIAG: what the WHITE-SKIPPED draws were aimed at.
     for (const auto& [extent, e] : m_skipByTarget) {
       std::snprintf(message, sizeof(message),

@@ -114,7 +114,8 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
                                  uint32_t cullMode, uint32_t vtxCntl,
                                  uint32_t guestVpWidth,
                                  uint32_t guestVpHeight, bool useGuestVp,
-                                 bool edramCopy, const GameStencil* stencil) {
+                                 bool edramCopy, const GameStencil* stencil,
+                                 const GameOmState* om) {
   // PERF(per-frame-allocs): DONE. This used to create an ID3D12Resource on the
   // UPLOAD heap for each of the buffers below -- up to nine per call, once per
   // submitted draw. They are now ranges of the AllocUpload ring, and the only
@@ -773,6 +774,10 @@ void D3D12Renderer::AddGameDraw(const uint8_t* vertices, uint32_t vtxBytes,
   if (stencil && stencil->enable) {
     d.stencil = *stencil;
     d.stencilIndex = StencilIndexFor(*stencil);
+  // Interned here rather than in the caller for the same reason stencil is:
+  // the table lives on the renderer, and a caller holding indices into it
+  // would be holding a reference to renderer state it cannot see change.
+  if (om) d.omIndex = OmIndexFor(*om);
     ++m_stencilDraws;
     // kAlways is 7 in the GUEST encoding, which is what GameStencil carries.
     if (stencil->frontFunc != 7u || stencil->backFunc != 7u)
