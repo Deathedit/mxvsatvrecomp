@@ -2186,6 +2186,27 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     }
     return;
   }
+  // PsParamGen is draw state, not a vertex-shader export: Xenos writes the
+  // generated pixel parameters to the register selected by SQ_CONTEXT_MISC,
+  // independently of SQ_PROGRAM_CNTL.vs_export_count. The SDK limits it to the
+  // sixteen interpolator registers; malformed state is left disabled.
+  //
+  // MUST PRECEDE the zero-fill census below, which excludes this register by
+  // reading dc.pixel_param_gen. This sat after that census until 2026-09-05, so
+  // the exclusion read 0 on every draw and could not fire: every row of
+  // ZERO-FILLED INTERPOLATORS printed `param_gen -1` even though a third of the
+  // title's shader pairs enable it, and the census counted the PsParamGen
+  // register itself as invented output -- the exact misreading the exclusion
+  // exists to prevent.
+  {
+    SqProgramCntl pc{};
+    SqContextMisc cm{};
+    if (ReadSqProgramCntl(device, base, &pc) && pc.param_gen &&
+        ReadSqContextMisc(device, base, &cm) && cm.param_gen_pos < 16) {
+      dc.pixel_param_gen = cm.param_gen_pos + 1;
+    }
+  }
+
   // INTERPOLATOR ZERO-FILL, counted where BOTH stages are known. A slot the
   // pixel shader reads that the vertex shader never exports arrives as a literal
   // float4(0,0,0,0) -- invented output. A slot nobody reads is not, which is why
@@ -2272,19 +2293,6 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     }
   }
   ++HleBuiltCount();
-
-  // PsParamGen is draw state, not a vertex-shader export: Xenos writes the
-  // generated pixel parameters to the register selected by SQ_CONTEXT_MISC,
-  // independently of SQ_PROGRAM_CNTL.vs_export_count. The SDK limits it to the
-  // sixteen interpolator registers; malformed state is left disabled.
-  {
-    SqProgramCntl pc{};
-    SqContextMisc cm{};
-    if (ReadSqProgramCntl(device, base, &pc) && pc.param_gen &&
-        ReadSqContextMisc(device, base, &cm) && cm.param_gen_pos < 16) {
-      dc.pixel_param_gen = cm.param_gen_pos + 1;
-    }
-  }
 
   // Stage 3's measurement, on the built positions rather than raw bytes, so the
   // probe scores the numbers the renderer would receive. The single most
