@@ -54,6 +54,7 @@ set(MX_SOURCES
     src/hooks/hooks_debug_unlock.cpp
     src/hooks/guest_read_watch.cpp
     src/hooks/hooks_d3d9.cpp
+    src/hooks/hooks_d3d9_shader_compile.cpp
     src/hooks/hooks_d3d9_texture.cpp
     src/hooks/hooks_d3d9_patchrule.cpp
     src/hooks/hooks_d3d9_entry.cpp
