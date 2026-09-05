@@ -9,6 +9,8 @@
 
 #include <rex/cvar.h>
 
+#include <timeapi.h>  // timeBeginPeriod, for the frame-pacing sleep below
+
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -20,6 +22,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -91,11 +94,58 @@ extern "C" REX_FUNC(sub_82B3C7D0) {
 // The stub's two stated hazards were both false and neither had been checked
 // against the guest code:
 //
-//   - "a1+20 drives a busy-wait". The guest's own test is
-//     `if (*(float*)(a1+20) != 3.4028235e38 && dt < target)`, and a1+20 holds
-//     exactly that FLT_MAX sentinel, so the guest disables the spin itself.
+//   - "a1+20 drives a busy-wait". True of the field, but a1+20 held the FLT_MAX
+//     sentinel that disables the spin. It no longer does -- the SetupRenderer
+//     hook writes a real cap there -- so PaceFrame below sleeps the slack the
+//     spin would otherwise burn.
 //   - "a1+32 is an unbounded store offset". It is a bounded 5-entry ring at
 //     a1+36..a1+52, guarded by `if (*(a1+28))`.
+
+namespace {
+
+// Left to the guest's spin on purpose. sleep_until is accurate to roughly a
+// millisecond even at 1ms timer resolution, so sleeping the whole remainder
+// would overshoot the cap and make every frame slightly long; undershooting by
+// this much and letting the guest close the gap keeps the cap exact.
+constexpr auto kSpinSlack = std::chrono::microseconds(1200);
+
+// Sleep the frame's slack instead of spinning it away.
+//
+// The guest's cap at a1+20 is a floor on frame time, enforced at 0x82B703D4 by
+// a raw mftb loop with no yield -- on the console a few cycles a pass, here a
+// recompiled call plus a timebase query plus a divide, at whatever rate the
+// host core will run it. Sleeping until just short of that floor leaves the
+// spin nothing to do but confirm the edge, and the dt the guest goes on to
+// measure is still its own.
+void PaceFrame(uint32_t cap_bits) {
+  if (cap_bits == 0x7F7FFFFFu) return;  // the guest's own "no cap" sentinel
+  const float cap = std::bit_cast<float>(cap_bits);
+  if (!(cap > 0.0f) || cap > 1.0f) return;  // junk, or slower than 1 fps
+
+  // Windows' default timer granularity is 15.6ms and cannot express a 33ms
+  // period cleanly. Asked for once and never given back, which is what a game
+  // does.
+  static const bool s_period = [] { return timeBeginPeriod(1) == TIMERR_NOERROR; }();
+  (void)s_period;
+
+  const auto period =
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+          std::chrono::duration<float>(cap));
+  static std::chrono::steady_clock::time_point s_next{};
+  const auto now = std::chrono::steady_clock::now();
+  // First call, or a frame that overran its budget: re-base rather than try to
+  // make the time back. Catching up would run several frames uncapped, which
+  // is the condition a cap exists to prevent.
+  if (s_next.time_since_epoch().count() == 0 || now >= s_next) {
+    s_next = now + period;
+    return;
+  }
+  if (s_next - now > kSpinSlack) std::this_thread::sleep_until(s_next - kSpinSlack);
+  s_next += period;
+}
+
+}  // namespace
+
 REX_IMPORT(__imp__sub_82B70370, orig_Timing, void());
 extern "C" REX_FUNC(sub_82B70370) {
   static int tm = 0;
@@ -109,6 +159,8 @@ extern "C" REX_FUNC(sub_82B70370) {
                 REX_LOAD_U32(a1 + 20) == 0x7F7FFFFFu, REX_LOAD_U32(a1 + 28),
                 REX_LOAD_U32(a1 + 32));
   }
+  // Before the original, so the sleep is part of the delta it measures.
+  if (a1) PaceFrame(REX_LOAD_U32(a1 + 20));
   orig_Timing(ctx, base);
   if ((tm <= 5 || (tm % 1000) == 0) && a1) {
     REXLOG_INFO("native: Timing #{} dt={:.6f} total={:.3f} a1=0x{:08X}",
