@@ -40,6 +40,11 @@ FNV64_OFFSET = 1469598103934665603
 FNV64_PRIME = 1099511628211
 MASK64 = (1 << 64) - 1
 
+# The fallback key's length. Long enough to discriminate (2985 distinct
+# keys over the corpus), short enough that neither side has to agree
+# about where level 0 ends.
+PREFIX_BYTES = 4096
+
 
 def load_texture_reader():
     here = os.path.dirname(os.path.abspath(__file__))
@@ -114,7 +119,19 @@ def main():
             continue
         label = os.path.splitext(
             os.path.relpath(p, args.assets).replace(os.sep, "/"))[0]
+        # TWO KEYS, because the two sides may not agree on where level 0 ENDS.
+        # The asset's stored pitch and the fetch constant's pitch need not be
+        # the same number -- Xenos aligns a tiled pitch -- and a size-derived
+        # range is only as good as that assumption.
+        #
+        # The full hash discriminates better (3364 keys, 94 ambiguous) than a
+        # 4096-byte prefix (2985, 215), so it is preferred; the prefix cannot
+        # disagree about the end of the level and is the fallback. Both map to
+        # the same name, and the runtime counts which one hit, so a single run
+        # says which assumption holds instead of another round of guessing.
         names.setdefault(fnv64(payload), set()).add(label)
+        if len(payload) > PREFIX_BYTES:
+            names.setdefault(fnv64(payload[:PREFIX_BYTES]), set()).add(label)
 
     # SEVERAL ASSETS SHARING ONE CONTENT IS USUALLY NOT AMBIGUITY. Measured over
     # 3458 distinct level-0 contents: 2626 belong to one asset, 738 are ONE

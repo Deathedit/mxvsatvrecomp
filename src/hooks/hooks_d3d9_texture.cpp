@@ -1749,25 +1749,49 @@ const std::unordered_map<uint64_t, std::string>& TextureNames() {
   return names;
 }
 
-// FNV-1a 64 over the level-0 bytes of the blob CopyTexturePhysical built.
-// Level 0 always starts at offset 0 there; its size is its own pitch, which is
-// NOT the fetch constant's pitch for any level but this one.
+// FNV-1a 64 over level 0 of the blob CopyTexturePhysical built. Level 0 always
+// starts at offset 0 there.
 //
-// Returns 0 when the level cannot be measured, which is also the "no hash"
-// value -- a texture with no describable level 0 has no content to join on.
-uint64_t TextureContentKey(const mx::hle::HleTextureSource& source,
-                           const std::vector<uint8_t>& guest) {
-  if (source.level_count == 0 || source.bytes_per_block == 0) return 0;
-  const auto& l0 = source.levels[0];
-  const uint64_t bytes = uint64_t(l0.pitch_blocks) * source.bytes_per_block *
-                         l0.height_blocks;
-  if (bytes == 0 || bytes > guest.size()) return 0;
+// ITS PITCH IS source.pitch_blocks, NOT source.levels[0].pitch_blocks. The
+// first version of this read levels[0] and got zero on every texture in the
+// game -- 1446 decodes, 1446 "no measurable level 0" -- because
+// DecodeHleTexture2D says outright that `source.levels[0] is unused on
+// purpose` and fills its own geometry from source.pitch_blocks, the fetch
+// constant's pitch, which the hardware honours for the base level and ignores
+// for every other one. The comment was sitting on the field.
+//
+// TWO KEYS. `full` covers all of level 0 and discriminates better; `prefix`
+// covers a fixed 4096 bytes and cannot disagree with the asset about where the
+// level ENDS, which matters because the asset's stored pitch and the fetch
+// constant's pitch need not be the same number. Both are looked up; the census
+// says which one is carrying the join.
+//
+// Zero means "no key", so a texture too small or undescribable simply does not
+// join rather than joining on a degenerate hash.
+struct TextureContentKeys {
+  uint64_t full = 0;
+  uint64_t prefix = 0;
+};
+constexpr uint64_t kTexPrefixBytes = 4096;
+
+TextureContentKeys TextureContentKey(const mx::hle::HleTextureSource& source,
+                                     const std::vector<uint8_t>& guest) {
+  TextureContentKeys out;
+  if (source.bytes_per_block == 0 || source.block_height == 0) return out;
+  const uint64_t rows =
+      (uint64_t(source.height) + source.block_height - 1) / source.block_height;
+  const uint64_t bytes =
+      uint64_t(source.pitch_blocks) * source.bytes_per_block * rows;
+  if (bytes == 0 || bytes > guest.size()) return out;
   uint64_t h = 1469598103934665603ull;
   for (uint64_t i = 0; i < bytes; ++i) {
     h ^= guest[size_t(i)];
     h *= 1099511628211ull;
+    if (i + 1 == kTexPrefixBytes) out.prefix = h;
   }
-  return h;
+  out.full = h;
+  if (bytes <= kTexPrefixBytes) out.prefix = 0;  // no separate prefix to try
+  return out;
 }
 
 // Counted on EVERY decode, so the denominator is every texture the runtime
@@ -2786,22 +2810,28 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // the ones that happened to resolve, which would make the rate meaningless.
   {
     ++g_texNames.seen;
-    const uint64_t ckey = TextureContentKey(source, guest);
-    if (!ckey) {
+    const TextureContentKeys ck = TextureContentKey(source, guest);
+    if (!ck.full) {
       ++g_texNames.noKey;
     } else {
       const auto& tn = TextureNames();
-      const auto it = tn.find(ckey);
+      auto it = tn.find(ck.full);
+      bool by_prefix = false;
+      if (it == tn.end() && ck.prefix) {
+        it = tn.find(ck.prefix);
+        by_prefix = it != tn.end();
+      }
       if (it != tn.end()) {
         ++g_texNames.named;
+        if (by_prefix) ++g_texNames.byPrefix;
         // The first few by name, because a percentage cannot be checked by eye
         // and "ATV_Alpha_Combo at 256x256 DXT4_5" can.
         static std::atomic<uint32_t> s_shown{0};
         if (s_shown++ < 12)
-          REXLOG_INFO("d3d9: texture named: {} ({}x{} {}) key {:016X}",
+          REXLOG_INFO("d3d9: texture named: {} ({}x{} {}) by {} key {:016X}",
                       it->second, source.width, source.height,
                       mx::hle::GuestTextureFormatName(source.guest_format),
-                      ckey);
+                      by_prefix ? "PREFIX" : "full", it->first);
       }
     }
   }
