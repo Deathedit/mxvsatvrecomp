@@ -2347,8 +2347,22 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     static float consts[kHleProbeRegs * 4];
     if (ReadVsConstants(device, base, consts)) {
       const uint32_t vs_h = st.vs_seen ? st.vertex_shader : 0;
+      // What the shader's own asset calls its view-projection register. The
+      // probe has been SEARCHING for this; the constant table names it.
+      int32_t named_reg = -1;
+      if (const TranslatedShader* vts = vs_h ? TranslatedVertexShader(vs_h)
+                                             : nullptr) {
+        if (vts->constant_table) {
+          for (const auto& [reg, name] : vts->constant_table->constants) {
+            if (name == "gViewProjection") {
+              named_reg = int32_t(reg);
+              break;
+            }
+          }
+        }
+      }
       ScoreHleTransform(dc, consts, have_vp ? vp : nullptr,
-                        VertexShaderContentId(vs_h), vs_h);
+                        VertexShaderContentId(vs_h), vs_h, named_reg);
       // The first few register files in full. A ranking with no numbers behind
       // it cannot be checked by eye, and "c3 col-major, 94%" is worth much less
       // than seeing that c3..c6 look like a projection matrix.

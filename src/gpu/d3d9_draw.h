@@ -303,9 +303,18 @@ constexpr uint32_t kHleProbeRegs = 64;
 // Keying by handle both splits one shader across several rows and merges several
 // shaders into one. That matters because the whole verdict here is a judgment
 // about SCATTER, and a handle covering three shaders manufactures exactly that.
+// `named_reg` is the constant register the SHADER'S OWN ASSET calls
+// gViewProjection, or -1 when it is unknown. Passing it turns this from a
+// search into a CHECK: the probe has been ranking candidate registers by how
+// much geometry each puts inside the clip volume, and the answer has been
+// sitting in the .shader assets' constant table all along.
+//
+// Still measurement only. A disagreement is reported, never acted on -- and it
+// is worth having, because either the probe's scoring or the asset join is
+// wrong and the report says which shader to look at.
 void ScoreHleTransform(const DrawCall& dc, const float* consts,
                        const float* viewport_mvp, uint64_t vs_content,
-                       uint32_t vs_handle);
+                       uint32_t vs_handle, int32_t named_reg);
 
 // The verdict, written to the log. Reports the controls first so a candidate
 // that merely beats nothing is visible as such.

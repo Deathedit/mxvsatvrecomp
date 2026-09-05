@@ -760,15 +760,24 @@ const char* CandidateName(uint32_t c, char* buf, size_t n) {
 
 }  // namespace
 
+// What the shader's own asset calls its view-projection register, per shader
+// content. Recorded rather than compared per draw: the verdict is about the
+// DOMINANT winner for a shader, which is only known once the run has finished
+// scoring it.
+std::map<uint64_t, int32_t> g_shaderNamedReg;
+// Reset each report, because the rows they summarise are recomputed each time.
+uint64_t g_namedAgree = 0, g_namedDisagree = 0, g_namedControlWon = 0;
+
 void ScoreHleTransform(const DrawCall& dc, const float* consts,
                        const float* viewport_mvp, uint64_t vs_content,
-                       uint32_t vs_handle) {
+                       uint32_t vs_handle, int32_t named_reg) {
   if (!consts || dc.vertex_count == 0 || dc.vertex_stride != kHostVertexStride)
     return;
   // Whole function: the scoring lambda writes g_candExplains as it goes, so
   // guarding only the tally at the end would leave that unprotected.
   std::lock_guard<std::mutex> lk(g_probeMu);
   if (viewport_mvp) g_probeSawViewport = true;
+  if (named_reg >= 0 && vs_content) g_shaderNamedReg[vs_content] = named_reg;
 
   static const float kIdentity[16] = {1, 0, 0, 0, 0, 1, 0, 0,
                                       0, 0, 1, 0, 0, 0, 0, 1};
@@ -895,6 +904,7 @@ void ReportHleTransform() {
       g_probeSawViewport ? "" : " — NO VIEWPORT was ever set, so the viewport "
                                 "control is absent, not losing");
 
+  g_namedAgree = g_namedDisagree = g_namedControlWon = 0;
   char buf[64];
   // Controls first and unconditionally: a candidate that only beats nothing has
   // to be visible as such, and burying the controls in a sorted list hides that.
@@ -949,13 +959,43 @@ void ReportHleTransform() {
     // several rows, and a handle wearing several shaders was one row of
     // manufactured scatter.
     const size_t handles = g_shaderHandles[content].size();
+    // AGAINST THE ASSET. The probe ranks candidates by geometry; the shader's
+    // own constant table names the register outright. Printed per row so a
+    // disagreement names the shader to look at rather than being a total.
+    const auto named = g_shaderNamedReg.find(content);
+    char verdict[48] = "";
+    if (named != g_shaderNamedReg.end()) {
+      if (top == kIdentityCandidate || top == kViewportCandidate) {
+        std::snprintf(verdict, sizeof(verdict),
+                      ", asset says c%d but a CONTROL won", named->second);
+        ++g_namedControlWon;
+      } else if (int32_t(top / 2) == named->second) {
+        std::snprintf(verdict, sizeof(verdict), ", AGREES with the asset");
+        ++g_namedAgree;
+      } else {
+        std::snprintf(verdict, sizeof(verdict), ", asset says c%d -- DISAGREES",
+                      named->second);
+        ++g_namedDisagree;
+      }
+    }
     REXLOG_INFO(
         "d3d9: stage3    vs ucode {:016X} ({} handle{}): {} explained "
-        "draws, top {} on {}/{} ({}%), {} distinct winners",
+        "draws, top {} on {}/{} ({}%), {} distinct winners{}",
         content, handles, handles == 1 ? "" : "s", draws,
         CandidateName(top, buf, sizeof(buf)), top_n, draws,
-        (top_n * 100) / draws, distinct);
+        (top_n * 100) / draws, distinct, verdict);
   }
+  // THE CHECK, as one line. The probe was built to search for a register; the
+  // assets name it. Agreement means the scoring and the asset join corroborate
+  // each other, and the probe can stop being a search. A disagreement means one
+  // of the two is wrong, and the rows above say which shader to open.
+  REXLOG_INFO(
+      "d3d9: stage3    ASSET CHECK -- {} shader(s) named by their asset: {} "
+      "agree, {} DISAGREE, {} had a control win (no constant candidate "
+      "explained them). {} scored shader(s) had no asset name to check",
+      g_namedAgree + g_namedDisagree + g_namedControlWon, g_namedAgree,
+      g_namedDisagree, g_namedControlWon,
+      g_shaderDraws.size() - g_shaderNamedReg.size());
 }
 
 }  // namespace mx::hle
