@@ -51,6 +51,7 @@
 #include "gpu/hle_types.h"      // g_luminanceReadbackBits/Seq
 #include "gpu/xenos_gpu_state.h"  // mx::gpu::alu -- the PM4 ALU constant file
 #include "hooks/hooks_d3d9_shared.h"  // shared with hooks_d3d9_entry.cpp
+#include "hooks/hooks_d3d9_census.h"
 #include "hooks/hooks_d3d9_cmdbuf.h"
 #include "hooks/hooks_d3d9_shader_compile.h"
 #include "hooks/texture_dump.h"         // --texture_dump=true, logs/texdump
@@ -98,7 +99,6 @@ uint64_t g_draws = 0;
 uint64_t g_up_draws = 0;
 uint64_t g_indexed_up_draws = 0;
 uint64_t g_indexed_up_skipped = 0;
-uint64_t g_decls = 0;
 uint64_t g_patchCalls = 0;
 
 //---------------------------------------------------------------------------
@@ -111,25 +111,13 @@ uint64_t g_patchCalls = 0;
 //---------------------------------------------------------------------------
 
 // Every declaration seen by CreateVertexDeclaration, with what matters about
-// it. Ids are creation order.
-uint32_t g_declPtr[kMaxTrackedDecls] = {};
-uint32_t g_declElems[kMaxTrackedDecls] = {};
-bool g_declHasColour[kMaxTrackedDecls] = {};
-uint64_t g_declDraws[kMaxTrackedDecls] = {};
-int g_declCount = 0;
-uint64_t g_drawsNoDecl = 0;      // draws whose declaration we never saw created
-
-// The host input layout each declaration decodes to, built once at creation.
-// A declaration that fails to decode keeps `layout_ok = false` and its failure
-// reason, so the coverage report can name it rather than count it.
-mx::hle::HleInputLayout g_declLayout[kMaxTrackedDecls];
-bool g_declLayoutOk[kMaxTrackedDecls] = {};
-mx::hle::LayoutError g_declLayoutErr[kMaxTrackedDecls] = {};
+// it. Ids are creation order. Declared in hooks_d3d9_internal.h.
+DeclTable g_declTable;
 
 int KnownDeclId(uint32_t p) {
   if (!p) return -1;
-  for (int i = 0; i < g_declCount; ++i) {
-    if (g_declPtr[i] == p) return i;
+  for (int i = 0; i < g_declTable.count; ++i) {
+    if (g_declTable.ptr[i] == p) return i;
   }
   return -1;
 }
@@ -166,12 +154,12 @@ uint64_t g_declSig[kMaxTrackedDecls] = {};
 // two paths -- a fresh slot, and a slot whose address the guest reused.
 void FillDeclSlot(int id, uint32_t decl, bool has_colour, uint32_t elems,
                   const mx::hle::D3D9Element* parsed) {
-  g_declPtr[id] = decl;
-  g_declElems[id] = elems;
-  g_declHasColour[id] = has_colour;
+  g_declTable.ptr[id] = decl;
+  g_declTable.elems[id] = elems;
+  g_declTable.hasColour[id] = has_colour;
   g_declSig[id] = DeclSignature(elems, parsed);
-  g_declLayoutOk[id] = mx::hle::BuildInputLayout(parsed, elems, g_declLayout[id],
-                                                 g_declLayoutErr[id]);
+  g_declTable.layoutOk[id] = mx::hle::BuildInputLayout(parsed, elems, g_declTable.layout[id],
+                                                 g_declTable.layoutErr[id]);
 }
 
 // Called from the CreateVertexDeclaration hook, where both pointers are valid.
@@ -195,11 +183,11 @@ int RecordDeclaration(uint32_t decl, bool has_colour, uint32_t elems,
           existing, decl, elems);
     }
     FillDeclSlot(existing, decl, has_colour, elems, parsed);
-    g_declDraws[existing] = 0;   // the draw count belonged to the old one
+    g_declTable.draws[existing] = 0;   // the draw count belonged to the old one
     return existing;
   }
 
-  if (g_declCount >= kMaxTrackedDecls) {
+  if (g_declTable.count >= kMaxTrackedDecls) {
     // Loud, and once. Every draw using this declaration is about to be dropped
     // as kNoLayout, which is indistinguishable at the draw site from a game
     // that simply did not submit them.
@@ -213,7 +201,7 @@ int RecordDeclaration(uint32_t decl, bool has_colour, uint32_t elems,
     return -1;
   }
 
-  const int id = g_declCount++;
+  const int id = g_declTable.count++;
   FillDeclSlot(id, decl, has_colour, elems, parsed);
   return id;
 }
@@ -238,10 +226,8 @@ int g_currentDecl = -1;
 // the previous round mistook attribution-to-a-stale-value for attribution.
 int g_patchDecl = -1;
 
-uint64_t g_declDeviceNull = 0;      // field is 0 -- no declaration bound yet
-uint64_t g_declDeviceUnknown = 0;   // non-zero, but never seen created
-uint64_t g_declAgree = 0;           // device field == the patch hook's value
-uint64_t g_declDisagree = 0;        // it does not, i.e. the patch value is stale
+// The census about that table. Declared in hooks_d3d9_census.h.
+DeclCensus g_declCensus;
 
 //---------------------------------------------------------------------------
 // WHICH pointers are unknown, not just how many: a bare count cannot name the
@@ -253,11 +239,6 @@ uint64_t g_declDisagree = 0;        // it does not, i.e. the patch value is stal
 //---------------------------------------------------------------------------
 constexpr uint32_t kDeclCountOffset = 0x18;
 constexpr uint32_t kDeclElementsOffset = 0x34;
-
-// Declarations adopted straight off the device because we never saw them
-// created, and the attempts that could not be trusted enough to adopt.
-uint64_t g_declAdopted = 0;
-uint64_t g_declAdoptRefused = 0;
 
 constexpr uint32_t kMaxUnknownDecls = 16;
 uint32_t g_unknownPtr[kMaxUnknownDecls] = {};
@@ -291,7 +272,7 @@ int AdoptUnknownDecl(uint32_t p, uint8_t* base) {
   const int id = RecordDeclaration(p, has_colour, count, parsed);
   // Recorded but undecodable is not an adoption: leave it unknown so the draw
   // takes the same exit it always did rather than binding an empty layout.
-  if (id < 0 || !g_declLayoutOk[id]) return -1;
+  if (id < 0 || !g_declTable.layoutOk[id]) return -1;
   return id;
 }
 
@@ -338,38 +319,38 @@ void NoteDrawDeclaration(uint32_t device, uint8_t* base) {
   if (device) {
     const uint32_t p = REX_LOAD_U32(device + kDeviceVertexDeclaration);
     if (!p) {
-      ++g_declDeviceNull;
+      ++g_declCensus.deviceNull;
     } else {
       g_currentDecl = KnownDeclId(p);
       if (g_currentDecl < 0) {
-        ++g_declDeviceUnknown;
+        ++g_declCensus.deviceUnknown;
         NoteUnknownDecl(p, base);
         // Read it off the device rather than dropping the draw. On success the
-        // pointer is in the table from here on, so g_declDeviceUnknown counts
+        // pointer is in the table from here on, so g_declCensus.deviceUnknown counts
         // FIRST SIGHTINGS, not draws lost.
         g_currentDecl = AdoptUnknownDecl(p, base);
         if (g_currentDecl >= 0) {
-          ++g_declAdopted;
+          ++g_declCensus.adopted;
         } else {
-          ++g_declAdoptRefused;
+          ++g_declCensus.adoptRefused;
         }
       }
     }
   }
   if (g_currentDecl >= 0) {
     if (g_currentDecl == g_patchDecl) {
-      ++g_declAgree;
+      ++g_declCensus.agree;
     } else {
-      ++g_declDisagree;
+      ++g_declCensus.disagree;
     }
   }
 
   DeviceState().current_decl = g_currentDecl;
   if (g_currentDecl < 0) {
-    ++g_drawsNoDecl;
+    ++g_declCensus.drawsNoDecl;
     return;
   }
-  ++g_declDraws[g_currentDecl];
+  ++g_declTable.draws[g_currentDecl];
 }
 
 //---------------------------------------------------------------------------
@@ -2118,7 +2099,7 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   ReadIndexConditioning(device, base, in);
 
   const int id = g_currentDecl;
-  if (id >= 0 && g_declLayoutOk[id]) in.layout = &g_declLayout[id];
+  if (id >= 0 && g_declTable.layoutOk[id]) in.layout = &g_declTable.layout[id];
 
   // A UP draw usually has no declaration -- it uses SetFVF instead -- so fall
   // back to a layout derived from the FVF the device is holding. Only when a
@@ -2877,10 +2858,10 @@ void ScoreDraw(bool indexed, uint32_t first, uint32_t count,
   const int id = g_currentDecl;
   if (id < 0) {
     gap(kGapDeclaration);
-  } else if (!g_declLayoutOk[id]) {
+  } else if (!g_declTable.layoutOk[id]) {
     gap(kGapLayout);
   } else {
-    const auto& layout = g_declLayout[id];
+    const auto& layout = g_declTable.layout[id];
     // Only the streams this layout actually reads from matter. A declaration
     // using stream 0 alone says nothing about stream 1 being unset.
     bool used[mx::hle::kMaxStreams] = {};
@@ -5399,11 +5380,11 @@ void DumpHleDraw(bool indexed, uint64_t n, uint32_t prim, int32_t base_vertex,
   const int id = st.current_decl;
   if (id < 0) {
     f << "  declaration: NONE\n";
-  } else if (!g_declLayoutOk[id]) {
+  } else if (!g_declTable.layoutOk[id]) {
     f << "  declaration id " << id << ": DOES NOT DECODE ("
-      << mx::hle::LayoutErrorText(g_declLayoutErr[id].reason) << ")\n";
+      << mx::hle::LayoutErrorText(g_declTable.layoutErr[id].reason) << ")\n";
   } else {
-    const auto& layout = g_declLayout[id];
+    const auto& layout = g_declTable.layout[id];
     f << "  declaration id " << id << ", " << layout.elements.size()
       << " element(s):\n";
     for (const auto& e : layout.elements) {
@@ -5466,13 +5447,13 @@ void DumpHleDraw(bool indexed, uint64_t n, uint32_t prim, int32_t base_vertex,
 // The two histograms the round exists to produce.
 void ReportDeclHistogram() {
   uint64_t with = 0, without = 0;
-  for (int i = 0; i < g_declCount; ++i) {
-    (g_declHasColour[i] ? with : without) += g_declDraws[i];
+  for (int i = 0; i < g_declTable.count; ++i) {
+    (g_declTable.hasColour[i] ? with : without) += g_declTable.draws[i];
   }
   REXLOG_INFO(
       "d3d9: decl-draws -- {} declarations known; COLOUR={} NO-COLOUR={} "
       "unattributed={} patch_calls={}",
-      g_declCount, with, without, g_drawsNoDecl, g_patchCalls);
+      g_declTable.count, with, without, g_declCensus.drawsNoDecl, g_patchCalls);
   // The declaration now comes from device + 0x2ED8, per draw. These four say
   // whether that source is sound and how badly the old one lagged: `unknown`
   // must stay at 0 or the field is not what SetVertexDeclaration writes, and a
@@ -5480,16 +5461,16 @@ void ReportDeclHistogram() {
   REXLOG_INFO(
       "d3d9: decl-source -- from device+0x2ED8: null={} unknown={} [{}] | vs "
       "the patch hook: same={} stale={} | adopted {} refused {}",
-      g_declDeviceNull, g_declDeviceUnknown,
+      g_declCensus.deviceNull, g_declCensus.deviceUnknown,
       // WHAT IS STILL LOST, not what was merely unfamiliar. This checked
-      // g_declDeviceUnknown, which was right while an unknown pointer meant a
+      // g_declCensus.deviceUnknown, which was right while an unknown pointer meant a
       // dropped draw; since those are adopted off the device, an unknown pointer
       // is a FIRST SIGHTING and costs nothing. The population that still loses
       // draws is the adoption REFUSALS.
       mx::gpu::health::Tag(mx::gpu::health::Zero(
-          "decl.unknown_ptr", g_declAdoptRefused,
-          with + without + g_drawsNoDecl)),
-      g_declAgree, g_declDisagree, g_declAdopted, g_declAdoptRefused);
+          "decl.unknown_ptr", g_declCensus.adoptRefused,
+          with + without + g_declCensus.drawsNoDecl)),
+      g_declCensus.agree, g_declCensus.disagree, g_declCensus.adopted, g_declCensus.adoptRefused);
   // WHICH pointers, when there are any. A count cannot name the draw, and the
   // shape of the answer decides the next step: one address recurring every frame
   // is a specific draw to go and find, while hundreds of distinct addresses is a
@@ -5513,11 +5494,11 @@ void ReportDeclHistogram() {
   // transcode never reads. table_full and reused must both read 0.
   {
     uint32_t clean = 0, partial = 0, refused = 0, dropped_elems = 0;
-    for (int i = 0; i < g_declCount; ++i) {
-      if (!g_declLayoutOk[i]) { ++refused; continue; }
-      if (g_declLayoutErr[i].skipped) {
+    for (int i = 0; i < g_declTable.count; ++i) {
+      if (!g_declTable.layoutOk[i]) { ++refused; continue; }
+      if (g_declTable.layoutErr[i].skipped) {
         ++partial;
-        dropped_elems += g_declLayoutErr[i].skipped;
+        dropped_elems += g_declTable.layoutErr[i].skipped;
       } else {
         ++clean;
       }
@@ -5529,35 +5510,35 @@ void ReportDeclHistogram() {
     // wrong.
     namespace h = mx::gpu::health;
     const char* t_refused =
-        h::Tag(h::Zero("decl.layout_refused", refused, uint64_t(g_declCount)));
+        h::Tag(h::Zero("decl.layout_refused", refused, uint64_t(g_declTable.count)));
     const char* t_full = h::Tag(h::Zero("decl.table_full", g_declTableFull,
-                                        g_decls));
+                                        g_declCensus.created));
     const char* t_reuse = h::Tag(h::Zero("decl.addr_reused", g_declRebuilt,
-                                         g_decls));
+                                         g_declCensus.created));
     REXLOG_INFO(
         "d3d9: decl-layout -- of {} declarations: clean={} partial={} "
         "refused={} [{}] | elements dropped={} | table_full={} [{}] "
         "addr_reused={} [{}]",
-        g_declCount, clean, partial, refused, t_refused, dropped_elems,
+        g_declTable.count, clean, partial, refused, t_refused, dropped_elems,
         g_declTableFull, t_full, g_declRebuilt, t_reuse);
   }
   // One row per declaration, held back while no NEW declaration has appeared:
   // 17,987 rows over 783 reports in one run, and the only thing moving between
   // prints is each row's draw count. The two summary lines above always print
-  // and already carry g_declCount.
+  // and already carry g_declTable.count.
   static uint64_t s_lastDecls = 0;
   static uint32_t s_sinceDecls = 0;
-  if (!RowDumpDue(uint64_t(g_declCount), s_lastDecls, s_sinceDecls)) {
+  if (!RowDumpDue(uint64_t(g_declTable.count), s_lastDecls, s_sinceDecls)) {
     REXLOG_INFO("d3d9: decl-draws   rows held -- declaration set unchanged at "
                 "{} ({} report(s) so far; d3d9_diag_row_heartbeat={})",
-                g_declCount, s_sinceDecls,
+                g_declTable.count, s_sinceDecls,
                 REXCVAR_GET(d3d9_diag_row_heartbeat));
     return;
   }
-  for (int i = 0; i < g_declCount; ++i) {
+  for (int i = 0; i < g_declTable.count; ++i) {
     REXLOG_INFO("d3d9: decl-draws   id={} ptr=0x{:08X} elems={} colour={} x{}",
-                i, g_declPtr[i], g_declElems[i],
-                g_declHasColour[i] ? "yes" : "no", g_declDraws[i]);
+                i, g_declTable.ptr[i], g_declTable.elems[i],
+                g_declTable.hasColour[i] ? "yes" : "no", g_declTable.draws[i]);
   }
 }
 

@@ -345,8 +345,33 @@ int RecordDeclaration(uint32_t decl, bool has_colour, uint32_t elems,
                       const mx::hle::D3D9Element* parsed);
 void NoteDrawDeclaration(uint32_t device, uint8_t* base);
 
-extern bool g_declLayoutOk[kMaxTrackedDecls];
-extern mx::hle::LayoutError g_declLayoutErr[kMaxTrackedDecls];
+// Every declaration CreateVertexDeclaration has seen, as PARALLEL ARRAYS
+// indexed by declaration id, which is creation order.
+//
+// A TABLE, not a census. `count` is load-bearing -- it bounds every scan of the
+// arrays below, and KnownDeclId returning -1 past it is what made a draw with a
+// later declaration look like a draw with none. The tallies ABOUT this table
+// are a separate object in hooks_d3d9_census.h, because they are not the same
+// kind of thing and one shared `g_decl` prefix used to say they were.
+struct DeclTable {
+  uint32_t ptr[kMaxTrackedDecls] = {};
+  uint32_t elems[kMaxTrackedDecls] = {};
+  bool hasColour[kMaxTrackedDecls] = {};
+  uint64_t draws[kMaxTrackedDecls] = {};
+
+  // The host input layout each declaration decodes to, built once at creation.
+  // One that fails to decode keeps layoutOk false and its failure reason, so
+  // the coverage report can name it rather than count it.
+  mx::hle::HleInputLayout layout[kMaxTrackedDecls];
+  bool layoutOk[kMaxTrackedDecls] = {};
+  mx::hle::LayoutError layoutErr[kMaxTrackedDecls] = {};
+
+  int count = 0;
+};
+
+// One object rather than eight loose arrays: this replaced two externs here and
+// six file-scope globals, and the entry points reach only layoutOk/layoutErr.
+extern DeclTable g_declTable;
 // Declarations that arrived after the table was full, and declarations whose
 // address was reused by the guest for a different element list. Both used to be
 // silent; both cost draws.
@@ -447,7 +472,6 @@ extern uint64_t g_up_draws;
 // rather than folded into a total that was already non-zero.
 extern uint64_t g_indexed_up_draws;
 extern uint64_t g_indexed_up_skipped;
-extern uint64_t g_decls;
 extern uint64_t g_patchCalls;
 // ATOMIC because the glyph cache is reached from more than one thread, and the
 // guest says so itself: sub_828ADA78 wraps BuildLineGlyphs and the flush in

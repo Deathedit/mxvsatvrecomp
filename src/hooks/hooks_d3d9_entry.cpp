@@ -45,6 +45,7 @@
 #include "gpu/shader_ucode.h"
 
 #include "hooks/guest_read_watch.h"
+#include "hooks/hooks_d3d9_census.h"
 #include "hooks/hooks_d3d9_internal.h"
 #include "hooks/hooks_d3d9_pm4.h"
 
@@ -170,7 +171,7 @@ REX_IMPORT(__imp__sub_82550B80, orig_CreateVertexDeclaration, void());
 extern "C" REX_FUNC(sub_82550B80) {
   MX_D3D9_HLE_LOCK;
   const uint32_t elements = ctx.r3.u32;
-  const uint64_t n = ++g_decls;
+  const uint64_t n = ++g_declCensus.created;
 
   orig_CreateVertexDeclaration(ctx, base);
 
@@ -199,8 +200,8 @@ extern "C" REX_FUNC(sub_82550B80) {
   // Report a declaration the layout decoder cannot describe immediately and by
   // name. The whole HLE path rests on this decode; a silent miss here would
   // surface much later as geometry that looks almost right.
-  if (decl_id >= 0 && !g_declLayoutOk[decl_id]) {
-    const auto& e = g_declLayoutErr[decl_id];
+  if (decl_id >= 0 && !g_declTable.layoutOk[decl_id]) {
+    const auto& e = g_declTable.layoutErr[decl_id];
     REXLOG_WARN(
         "d3d9: declaration id {} does NOT decode — element {}: {} "
         "(detail 0x{:08X})",
@@ -208,12 +209,12 @@ extern "C" REX_FUNC(sub_82550B80) {
     DeclFile() << "  LAYOUT FAILED element " << e.failed_element << ": "
                << mx::hle::LayoutErrorText(e.reason) << " detail 0x" << std::hex
                << e.detail << std::dec << "\n";
-  } else if (decl_id >= 0 && g_declLayoutErr[decl_id].skipped) {
+  } else if (decl_id >= 0 && g_declTable.layoutErr[decl_id].skipped) {
     // The declaration decoded, but not all of it. The dropped elements are ones
     // the transcode never reads, but that is a claim about what reads them and
     // has to stay checkable. Printed WITH its denominator, once per
     // reason+detail.
-    const auto& e = g_declLayoutErr[decl_id];
+    const auto& e = g_declTable.layoutErr[decl_id];
     static std::set<uint64_t> s_seen;
     const uint64_t key =
         (uint64_t(uint32_t(e.skip_reason)) << 32) ^ e.skip_detail;
