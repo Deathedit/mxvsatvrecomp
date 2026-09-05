@@ -410,17 +410,21 @@ void D3D12Renderer::ReportGameFrameTelemetry(
         if (om.zfunc != GameOmState{}.zfunc) ++zf;
       }
       std::snprintf(message, sizeof(message),
-                    "  OM STATES: %llu interned of 64 (%llu refused past the "
-                    "cap -- must be 0); of those, %llu separate-alpha, %llu "
-                    "depth-clip OFF, %llu partial colour mask, %llu non-lequal "
-                    "zfunc. 1 interned means nothing differed from what the "
-                    "builders hardcoded",
+                    "  OM STATES: %llu interned of 64 (%llu refused -- must be "
+                    "0) [states: %llu sep-alpha, %llu clip-OFF, %llu masked, "
+                    "%llu non-lequal] -- DRAWS over %llu: %llu sep-alpha, %llu "
+                    "clip-OFF, %llu masked, %llu non-lequal zfunc",
                     static_cast<unsigned long long>(m_omStates.size()),
                     static_cast<unsigned long long>(m_omStatesRefused),
                     static_cast<unsigned long long>(sep),
                     static_cast<unsigned long long>(clip_off),
                     static_cast<unsigned long long>(masked),
-                    static_cast<unsigned long long>(zf));
+                    static_cast<unsigned long long>(zf),
+                    static_cast<unsigned long long>(m_omDraws),
+                    static_cast<unsigned long long>(m_omDrawsSepAlpha),
+                    static_cast<unsigned long long>(m_omDrawsClipOff),
+                    static_cast<unsigned long long>(m_omDrawsMasked),
+                    static_cast<unsigned long long>(m_omDrawsZfunc));
       LogInfo(message);
     }
     // DIAG: what the WHITE-SKIPPED draws were aimed at.

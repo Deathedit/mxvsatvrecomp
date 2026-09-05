@@ -2762,6 +2762,21 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
             std::lock_guard<std::mutex> lk(s_cmu);
             cfresh = ++s_clips[clip] == 1 && s_clips.size() <= 16;
           }
+          // Reported every 100,000 draws rather than once per distinct
+          // value: "0x00090000 was seen" and "0x00090000 was seen on one draw
+          // in a hundred thousand" are different findings, and only the second
+          // one explains why no clip-disabled state ever reached the renderer.
+          {
+            static std::atomic<uint64_t> s_clipDraws{0};
+            if ((++s_clipDraws % 100000) == 0) {
+              std::string rows;
+              std::lock_guard<std::mutex> lk(s_cmu);
+              for (const auto& [v, n] : s_clips)
+                rows += fmt::format(" [0x{:08X} x{}]", v, n);
+              REXLOG_INFO("d3d9: PA_CL_CLIP_CNTL census over {} draws:{}",
+                          s_clipDraws.load(), rows);
+            }
+          }
           if (cfresh) {
             REXLOG_INFO("d3d9: PA_CL_CLIP_CNTL 0x{:08X}: clip_disable {} "
                         "dx_clip_space_def {} ucp_ena 0x{:X} (clip_disable 1 "

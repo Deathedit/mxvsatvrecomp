@@ -667,6 +667,18 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     return m_omStates[i < m_omStates.size() ? i : 0];
   }
   uint64_t m_omStatesRefused = 0;
+  // DRAW-weighted, because the interned-state count answers a different
+  // question. "2 states carry a non-lequal zfunc" does not say whether two
+  // draws or two hundred thousand do, and the first version of this telemetry
+  // reported only the states -- which is how a contradiction went unresolved:
+  // the PA_CL_CLIP_CNTL probe reported clip_disable 1 in a run where zero
+  // clip-off states were interned, and there was no counter able to say
+  // whether the field simply never reached here.
+  uint64_t m_omDraws = 0;          // draws that arrived with a state at all
+  uint64_t m_omDrawsClipOff = 0;
+  uint64_t m_omDrawsMasked = 0;
+  uint64_t m_omDrawsZfunc = 0;
+  uint64_t m_omDrawsSepAlpha = 0;
   // How many distinct states have been interned, for the report. A number that
   // keeps climbing means something varying is leaking into the key.
   size_t StencilStateCount() const { return m_stencilStates.size(); }

@@ -523,9 +523,24 @@ void D3D12GraphicsSystem::RenderThreadFunc() {
           // RB_DEPTHCONTROL bits 4-6. Gated on om_seen bit 1 like depth
           // enable/write are, because a never-written register reads zero and
           // zero is a legal compare function (NEVER), not "unset".
-          if (d->om_seen & 2u) om.zfunc = uint8_t((d->depth_control >> 4) & 7u);
-          // RB_COLOR_MASK bits 0-3. Same gate as the bool it refines.
-          if (d->om_seen & 1u) om.colourMask = uint8_t(d->colour_mask & 0xFu);
+          //
+          // NORMALISED: a field that cannot affect this draw is left at its
+          // default so it does not intern a pipeline variant for nothing. The
+          // first cut skipped this and interned states for the zfunc bits of
+          // draws with depth testing OFF, and for the all-zero colour mask of
+          // depth-only draws -- 5461 and 34359 draws respectively, none of
+          // which the field could change. The existing censuses had already
+          // said so: 0 draws that actually depth-test use a non-lequal zfunc,
+          // and exactly 1 draw in 200,000 has a genuinely partial mask.
+          const bool depth_testing = (d->om_seen & 2u) && (d->depth_control & 2u);
+          if (depth_testing) om.zfunc = uint8_t((d->depth_control >> 4) & 7u);
+          // RB_COLOR_MASK bits 0-3. Only a PARTIAL mask matters here: 0xF is
+          // the default, and 0x0 is already carried as colorWrite=false, which
+          // ApplyOmState honours separately.
+          if (d->om_seen & 1u) {
+            const uint32_t m = d->colour_mask & 0xFu;
+            if (m != 0u) om.colourMask = uint8_t(m);
+          }
           // RB_BLENDCONTROL0 bits 16-26, and ONLY when the alpha equation
           // actually differs from the colour equation -- otherwise the state
           // collapses onto index 0 and the builders keep deriving alpha from
