@@ -119,17 +119,23 @@ def main():
             continue
         label = os.path.splitext(
             os.path.relpath(p, args.assets).replace(os.sep, "/"))[0]
-        # ONE KEY, over all of level 0.
+        # TWO KEYS, and the second one is not optional.
         #
-        # A 4096-byte prefix key shipped alongside this for one run, as a hedge
-        # against the asset's stored pitch and the fetch constant's pitch being
-        # different numbers -- Xenos aligns a tiled pitch, so a size-derived
-        # range depends on them agreeing. They agree: of 191 textures named in
-        # that run, across DXT1, DXN, FMT_4_5 and 16_16_16_16_FLOAT and sizes
-        # from 32x32 to 2048x1024, ZERO needed the prefix. It was removed
-        # rather than left in, because it cost 2560 extra keys and a fallback
-        # lookup to buy nothing measurable.
+        # The full level-0 hash names 21% of decodes. Of the rest, 375 of 375
+        # have a guest buffer SHORTER than the described level 0 -- the fetch
+        # constant's extent and the guest's allocation disagree, which a packed
+        # mip tail alone can cause. For those the full hash cannot be computed
+        # at all, so a fixed prefix is the only key available.
+        #
+        # This prefix shipped once before and was removed after measuring ZERO
+        # hits. That measurement was worthless: the runtime computed the prefix
+        # inside the function that gives up when level 0 exceeds the buffer, so
+        # for exactly the population needing the fallback it was never reached.
+        # A fallback that cannot fire measures the same as one that never needs
+        # to.
         names.setdefault(fnv64(payload), set()).add(label)
+        if len(payload) > PREFIX_BYTES:
+            names.setdefault(fnv64(payload[:PREFIX_BYTES]), set()).add(label)
 
     # SEVERAL ASSETS SHARING ONE CONTENT IS USUALLY NOT AMBIGUITY. Measured over
     # 3458 distinct level-0 contents: 2626 belong to one asset, 738 are ONE

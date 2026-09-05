@@ -139,6 +139,10 @@ struct TextureNameCensus {
   // extent -- a real signal -- while the rest are simply textures with no
   // describable block layout, which a render target legitimately is.
   uint64_t shortBuffer = 0;
+  // Of `named`, how many the 4096-byte prefix key found. Reported because the
+  // full key cannot reach the textures whose described extent exceeds their
+  // buffer, and that is most of what was unnamed.
+  uint64_t byPrefix = 0;
 };
 extern TextureNameCensus g_texNames;
 
