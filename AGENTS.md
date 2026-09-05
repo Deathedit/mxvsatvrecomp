@@ -186,12 +186,22 @@ Rendering is unconditional (`BuildAndQueueDraw` -> `ApplyShaderOutputs`,
 `hooks_d3d9.cpp:976`). Add `--hle_diag=true --hle_shader_exec=1` when you want
 the diagnostics, and expect them to cost.
 
-**Always run with `--force_load`**, and say so when reporting numbers. Without
-it a run never leaves the front end, and front-end geometry transcodes fine —
-`not-transcoded` reads 33% instead of the real 93.8%, and scene-only failures
-do not appear at all. `force_load` fires about 115 seconds after start, so a
-run shorter than ~2½ minutes never reaches it; ~400s gives a usable sample.
-`ST_Southwest` also works.
+**`--force_load` no longer exists**, cvar and implementation both — see the
+tombstone at `src/hooks/hooks_plugin_diag.cpp:29`. It named a scene to request
+from the AssetDB once the loader went idle, by calling the guest's own
+`sub_82534980(AssetDB, name, flags)`. Older measurements in this file are
+labelled with it because that is the run they were taken on; they are dated
+evidence, not a run line to copy.
+
+**The observation it was built on still stands and is still unexplained**: the
+loader reaches state 2 (IdleClearRenderBusy) and parks, because nothing in the
+game ever calls `sub_82534980`. That same idle AssetDB is why `UI_World` never
+loads and is the root of the `0x8234CE20` crash. Until it is fixed, a run stays
+in the front end — where geometry transcodes fine, so `not-transcoded` reads
+33% instead of the real 93.8% and scene-only failures do not appear at all.
+**Say which of the two a number came from**, because front-end-only numbers
+look healthy for the wrong reason. `registry_override=ReadyToLaunch=1` is the
+lever that currently takes the loader past the state 6 gate.
 
 ### Tests
 

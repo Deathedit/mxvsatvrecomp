@@ -1,8 +1,11 @@
 #pragma once
 
-// Helpers shared by the three D3D12Renderer translation units
-// (d3d12_device.cpp, d3d12_video.cpp, d3d12_game.cpp). Not part of the public
-// renderer interface — do not include outside src/gfx/.
+// Helpers shared by the five D3D12Renderer translation units (d3d12_device,
+// d3d12_game, d3d12_game_bind, d3d12_game_resource, d3d12_game_frame). Not
+// part of the public renderer interface -- do not include outside src/gfx/.
+//
+// d3d12_video.cpp, named here until 2026-09-05, was deleted; Bink decode moved
+// to the graphics system and the YUV upload to d3d12_game_resource.cpp.
 
 #include <d3dcompiler.h>
 #include <wrl/client.h>

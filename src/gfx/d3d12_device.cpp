@@ -2,9 +2,11 @@
 //
 // Owns everything that exists once for the lifetime of the window: the DXGI
 // factory/adapter, the device, the direct command queue, the flip-discard
-// swapchain and its RTVs, the command allocators/list, and the frame fence. The
-// video pipeline lives in d3d12_video.cpp, the game pipeline and the game render
-// target in d3d12_game.cpp.
+// swapchain and its RTVs, the command allocators/list, and the frame fence.
+// The game pipeline and PSO caches live in d3d12_game.cpp, GPU resources and
+// render targets in d3d12_game_resource.cpp, and per-frame submission in
+// d3d12_game_frame.cpp. (d3d12_video.cpp, named here until 2026-09-05, is
+// gone -- see d3d12_internal.h.)
 
 #include "gfx/d3d12_renderer.h"
 

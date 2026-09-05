@@ -1,40 +1,33 @@
 # mx.toml — ReXGlue runtime configuration
 # Loaded automatically from next to mx.exe
 
-# GPU plugin (xenos = Xenia-derived D3D12 backend)
-# Native mode: comment out or set to "none" to disable plugin
-# gpu_plugin = "xenos"
-
-# Allow invalid texture fetch constants (fixes missing textures)
+# --- SDK cvars for a GPU backend this project does not run ---
+#
+# These are declared by the SDK itself (rex/graphics/flags.h) and the runtime
+# registers them, so setting one is accepted rather than rejected. They steer
+# the SDK's own Xenia-derived Xenos backend. This project does not instantiate
+# it -- the D3D9 hooks in src/hooks drive the renderer in src/gfx directly --
+# so none of these reaches anything that draws. Kept, documented as inert,
+# because they are real cvars and a reader who finds one elsewhere should learn
+# why it did nothing rather than conclude it is unsupported.
+#
 # gpu_allow_invalid_fetch_constants = true
-
-# Full readback resolve (fixes black screen in gameplay at performance cost)
-# readback_resolve = "full"
-
-# Occlusion query settings (fixes brightness)
 # occlusion_query_enable = true
 # query_occlusion_fake_sample_count = -1
-
-# VSync
 # vsync = false
-
-# Pace the guest's swap to at most this many frames per second, the way the
-# console's vsync-blocking VdSwap did. The 360 could never exceed 60, and the
-# title's script threads, UI transitions and timers all advance once per swap --
-# so running uncapped advances that logic faster than any hardware it was ever
-# tested on (measured: 400+ fps on the legal screen). 0 lets the guest free-run.
-# frame_limit_fps = 60
-
-# Resolution scale (1 = native 1280x720)
 # resolution_scale = 1
 
-# --- Native-mode options (the settings above are GPU-plugin only) ---
-
-# Skip the Bink intro videos and go straight to game frames. The playlist runs
-# 47.4s (THQ 9.5s + Attract 37.9s) and the RenderPipeline hook stands down for
-# its whole duration, so the guest render path cannot run until it finishes.
-# Set this while iterating on rendering. Also available as --skip_intro=true.
-# skip_intro = true
+# --- This project's own cvars ---
+#
+# Frame pacing is no longer a setting. The host limiter (frame_limit_fps) was
+# removed in 25e37c8 because the guest has its own: sub_82B70370 spins until a
+# frame has taken at least engine+0x14 seconds, and the SetupRenderer hook now
+# writes that field. Two limiters on one frame meant the tighter one won and
+# neither was the console's behaviour. See guest_frame_cap_fps in
+# src/hooks/hooks_loading.cpp.
+#
+# skip_intro is gone as well -- see AGENTS.md, which records that it no longer
+# exists. So is force_load.
 
 # Override guest registry values as they are read, as comma-separated key=value
 # pairs. MXRegistry.bxml is the guest's settings store and tools/ has decoders
@@ -43,9 +36,10 @@
 #
 # ReadyToLaunch=1 is the one that matters today: it is the third term of the
 # state 6 gate, and setting it takes the loader through the whole sequence
-# (2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 11 -> 2) instead of parking at 6. Pair it
-# with force_load. Diagnostic only. See AGENTS.md "the registry chokepoint".
+# (2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 11 -> 2) instead of parking at 6.
+# Diagnostic only. See AGENTS.md "the registry chokepoint".
 # registry_override = "ReadyToLaunch=1"
+
 # Write every decoded guest texture to logs/texdump as a PNG, one per distinct
 # fetch constant (and per rewrite, for atlases the guest repacks in place), plus
 # an index.txt naming each file's format, address, sampler and size. The colour
