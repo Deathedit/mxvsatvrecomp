@@ -24,14 +24,10 @@
 #include "gpu/health.h"
 #include "hooks/hook_common.h"
 
-// timeBeginPeriod. WIN32_LEAN_AND_MEAN keeps mmsystem.h out of windows.h,
-// and timeapi.h is the narrow header for just the multimedia timer calls.
-#include <timeapi.h>
 #include "hooks/hooks_d3d9.h"
 
 #include <chrono>
 #include <mutex>
-#include <thread>
 #include <vector>
 
 #include <rex/cvar.h>
@@ -160,50 +156,15 @@ static bool FrameDiagDue(uint64_t swap_count) {
   return (swap_count % uint64_t(every)) == 0;
 }
 
-REXCVAR_DEFINE_INT32(frame_limit_fps, 60, "Debug",
-                     "Pace the guest's swap to at most this many frames per "
-                     "second, the way the console's vsync-blocking VdSwap did. "
-                     "0 lets the guest free-run");
-
-namespace {
-
-// Destructor-based so it covers the hook's several exits. Declared BEFORE
-// SwapTimer at the top of the hook, so it is destroyed AFTER it -- otherwise
-// the timer would report the pacing sleep as time the hook spent working.
-struct FramePacer {
-  ~FramePacer() {
-    const int fps = REXCVAR_GET(frame_limit_fps);
-    if (fps <= 0) return;
-    // Windows' default timer granularity is 15.6ms, which cannot express a
-    // 16.67ms period at all -- sleep_until alone would quantise 60 fps into an
-    // alternating 64/32. winmm is already linked; this asks for 1ms once and
-    // never gives it back, which is what a game does.
-    static const bool s_period = [] { return timeBeginPeriod(1) == TIMERR_NOERROR; }();
-    (void)s_period;
-    const auto period = std::chrono::nanoseconds(1000000000ll / fps);
-    static std::chrono::steady_clock::time_point s_next{};
-    const auto now = std::chrono::steady_clock::now();
-    // First swap, or a frame that overran its budget: re-base rather than try
-    // to make the time back. Catching up would mean running several frames
-    // uncapped, which is the condition this exists to prevent.
-    if (s_next.time_since_epoch().count() == 0 || now > s_next) {
-      s_next = now + period;
-      return;
-    }
-    std::this_thread::sleep_until(s_next);
-    s_next += period;
-  }
-};
-
-}  // namespace
-
+// Frame pacing is the GUEST's. sub_82B70370 spins until the frame has taken at
+// least engine+0x14 seconds, and the SetupRenderer hook writes that field --
+// see guest_frame_cap_fps in hooks_loading.cpp. The host-side sleep that used
+// to sit here is gone with it; two limiters on one frame meant the tighter one
+// won and neither was the console's behaviour.
 REX_IMPORT(__imp__sub_82566B58, orig_VdSwap, void());
 extern "C" REX_FUNC(sub_82566B58) {
   static int swap_count = 0;
   ++swap_count;
-  // Ordering matters: constructed first so it is destroyed LAST, after
-  // SwapTimer has already logged. See FramePacer's note.
-  FramePacer _frame_pacer;
   SwapTimer _swap_timer{"VdSwap hook total", swap_count};
   ReportHostPageQueryStats();
 
