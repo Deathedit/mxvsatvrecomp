@@ -177,10 +177,82 @@ constexpr const char* kRuntimeGeneratedMarker = "!runtime-generated";
 // Null name plus generated=false means "not in the map"; null name plus
 // generated=true means "nothing to name it after". The census reports those
 // separately, so resolving the marker here is what keeps it able to.
+// The constant/sampler names, keyed by the SAME label the names file resolves
+// to. Keyed by label rather than by code_key because an entry point generates
+// about eleven candidate keys and duplicating its table across all of them
+// would be eleven times the memory for one answer.
+//
+// Built offline by tools/shader_manifest.py from the D3DXSHADER_CONSTANTTABLE
+// each .shader asset carries. Absent or empty is not an error: every shader
+// simply reports no table, and the census says so.
+const std::unordered_map<std::string, ShaderConstantTable>& ShaderConstants() {
+  static const std::unordered_map<std::string, ShaderConstantTable> tables = [] {
+    std::unordered_map<std::string, ShaderConstantTable> m;
+    std::ifstream f("userdata/shader_constants.txt");
+    if (!f) {
+      REXLOG_INFO("d3d9: userdata/shader_constants.txt absent -- shaders will "
+                  "report no constant names. Build it with "
+                  "tools/shader_manifest.py");
+      return m;
+    }
+    // <label> \t C:<reg>=<name>,... \t S:<slot>=<name>,...
+    std::string line;
+    while (std::getline(f, line)) {
+      const size_t t1 = line.find('\t');
+      if (t1 == std::string::npos) continue;
+      const size_t t2 = line.find('\t', t1 + 1);
+      if (t2 == std::string::npos) continue;
+      auto parse = [](const std::string& s,
+                      std::vector<std::pair<uint32_t, std::string>>& out) {
+        // s is "C:" or "S:" followed by reg=name pairs; an empty section is
+        // normal and must not be read as a malformed line.
+        if (s.size() < 2) return;
+        size_t i = 2;
+        while (i < s.size()) {
+          const size_t eq = s.find('=', i);
+          if (eq == std::string::npos) break;
+          size_t end = s.find(',', eq);
+          if (end == std::string::npos) end = s.size();
+          char* stop = nullptr;
+          const uint32_t reg =
+              uint32_t(std::strtoul(s.substr(i, eq - i).c_str(), &stop, 10));
+          if (stop && !*stop)
+            out.emplace_back(reg, s.substr(eq + 1, end - eq - 1));
+          i = end + 1;
+        }
+      };
+      ShaderConstantTable tbl;
+      parse(line.substr(t1 + 1, t2 - t1 - 1), tbl.constants);
+      std::string tail = line.substr(t2 + 1);
+      while (!tail.empty() && (tail.back() == '\r' || tail.back() == '\n'))
+        tail.pop_back();
+      parse(tail, tbl.samplers);
+      m.emplace(line.substr(0, t1), std::move(tbl));
+    }
+    uint64_t nc = 0, ns = 0;
+    for (const auto& [k, v] : m) {
+      nc += v.constants.size();
+      ns += v.samplers.size();
+    }
+    REXLOG_INFO("d3d9: shader constant names loaded: {} tables, {} constants, "
+                "{} samplers",
+                m.size(), nc, ns);
+    return m;
+  }();
+  return tables;
+}
+
+const ShaderConstantTable* ShaderConstantsFor(const std::string& label) {
+  const auto& m = ShaderConstants();
+  const auto it = m.find(label);
+  return it == m.end() ? nullptr : &it->second;
+}
+
 void ResolveShaderName(uint64_t code_key, const std::string*& name,
-                       bool& generated) {
+                       bool& generated, const ShaderConstantTable*& table) {
   name = nullptr;
   generated = false;
+  table = nullptr;
   const auto& m = ShaderNames();
   const auto it = m.find(code_key);
   if (it == m.end()) return;
@@ -189,6 +261,7 @@ void ResolveShaderName(uint64_t code_key, const std::string*& name,
     return;
   }
   name = &it->second;
+  table = ShaderConstantsFor(it->second);
 }
 
 std::string ShaderCachePath(mx::hle::HlslStage stage, uint64_t key) {
@@ -770,7 +843,8 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
     kept.max_const_index = out.max_const_index;
     // The guest's own name for this shader, resolved from the code_key already
     // computed at the top of this function. Once per shader, never per draw.
-    ResolveShaderName(code_key, kept.name, kept.runtime_generated);
+    ResolveShaderName(code_key, kept.name, kept.runtime_generated,
+                      kept.constant_table);
     // FROM `out`, THE MAIN TRANSLATION -- not from the fetch variant. These were
     // originally set only in the vfetch block below, from `fetched`, while every
     // other field here comes from `out`. That made the mask describe a DIFFERENT

@@ -95,6 +95,35 @@ struct TexDecodeSite {
 // rather than a few kilobytes of text each. Defined here rather than beside the
 // emitter probe that fills it because ApplyShaderOutputs now reads the vertex
 // stage's input_mask to build the GPU vertex layout.
+// The guest's own names for a shader's constant registers and sampler slots,
+// out of the D3DXSHADER_CONSTANTTABLE in its .shader asset. 19,967 constants
+// and 5,124 samplers across the corpus; 294 and 180 distinct names.
+//
+// This is the difference between `xe_c[4]` and `gViewProjection`, and between
+// `s0` and `usr_sampler_diffuse_texture`. Nothing consumes it yet -- it is the
+// input the later steps need, and worth noting that the transform probe in
+// d3d9_draw.h has been SCORING CANDIDATES for a matrix register whose name is
+// sitting in here (`gViewProjection`, in 2396 of the entry points).
+//
+// Ordered vectors rather than maps: a table holds a handful of entries, no
+// lookup is on the draw path, and this way the whole thing is two allocations.
+struct ShaderConstantTable {
+  // (register or slot, name), sorted by the first.
+  std::vector<std::pair<uint32_t, std::string>> constants;
+  std::vector<std::pair<uint32_t, std::string>> samplers;
+
+  const std::string* Constant(uint32_t reg) const {
+    for (const auto& [r, n] : constants)
+      if (r == reg) return &n;
+    return nullptr;
+  }
+  const std::string* Sampler(uint32_t slot) const {
+    for (const auto& [r, n] : samplers)
+      if (r == slot) return &n;
+    return nullptr;
+  }
+};
+
 struct TranslatedShader {
   std::shared_ptr<const std::string> source;  // null unless emitted AND compiled
   uint32_t input_mask = 0;
@@ -146,6 +175,11 @@ struct TranslatedShader {
   // anywhere in the assets. There is no name to find, so a draw running one is
   // NOT a coverage failure and must not be reported as one.
   bool runtime_generated = false;
+  // The constant/sampler names for this shader, or null when the manifest has
+  // no table for it -- normal for a runtime-generated shader and for one the
+  // assets could not name. Bare pointer for the same reason `name` is: it aims
+  // into a table loaded once and never erased.
+  const ShaderConstantTable* constant_table = nullptr;
 };
 
 // INSIDE the texture bucket. A finer breakdown is worth having only once one

@@ -489,6 +489,14 @@ void ReportShaderNames() {
               g_shaderNames.psOnly, g_shaderNames.generated,
               g_shaderNames.unknown, pct(g_shaderNames.unknown),
               g_shaderNames.noShader);
+  // Constant/sampler names, over the same denominator as the line above. This
+  // is what turns xe_c[4] into gViewProjection and s0 into
+  // usr_sampler_diffuse_texture, and it is the input the texture join and any
+  // hand-written shader need.
+  REXLOG_INFO("d3d9: SHADER NAMES   constant tables: both stages {} ({:.1f}%), "
+              "vertex {}, pixel {} -- of {} draws",
+              g_shaderNames.constBoth, pct(g_shaderNames.constBoth),
+              g_shaderNames.constVs, g_shaderNames.constPs, n);
   std::lock_guard<std::mutex> lk(g_shaderNames.mu);
   auto worst = [](const std::map<uint64_t, uint64_t>& m, const char* what) {
     if (m.empty()) return;

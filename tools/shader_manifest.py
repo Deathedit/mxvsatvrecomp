@@ -139,6 +139,8 @@ def main():
     ap.add_argument("--assets", default="out/all")
     ap.add_argument("--out", default="out/shader_manifest.json")
     ap.add_argument("--names", default="userdata/shader_names.txt")
+    ap.add_argument("--constants", default="userdata/shader_constants.txt",
+                    help="the constant/sampler name table the runtime loads")
     ap.add_argument("--ucode", action="append", default=None,
                     help="directory of microcode blobs; enables the self-test")
     ap.add_argument("--glob", default="*.ucode.bin.*")
@@ -222,7 +224,33 @@ def main():
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(records, f, indent=1, sort_keys=True)
 
-    print(f"\nwrote {args.names}   ({os.path.getsize(args.names) / 1e6:.1f} MB)")
+    # The constant/sampler names, keyed by LABEL rather than by code_key. The
+    # runtime already resolves code_key -> label through the names file, so
+    # keying here too would duplicate every table across the ~11 candidate keys
+    # an entry point generates.
+    #
+    # One line per entry point:
+    #   <label> \t C:<reg>=<name>,... \t S:<slot>=<name>,...
+    # Either section may be empty; a shader with no constants is normal.
+    os.makedirs(os.path.dirname(args.constants) or ".", exist_ok=True)
+    n_const = n_samp = 0
+    with open(args.constants, "w", encoding="utf-8") as f:
+        for label in sorted(records):
+            r = records[label]
+            cs = ",".join("%s=%s" % (k, v) for k, v in
+                          sorted(r["constants"].items(), key=lambda x: int(x[0])))
+            ss = ",".join("%s=%s" % (k, v) for k, v in
+                          sorted(r["samplers"].items(), key=lambda x: int(x[0])))
+            if not cs and not ss:
+                continue
+            n_const += len(r["constants"])
+            n_samp += len(r["samplers"])
+            f.write("%s\tC:%s\tS:%s\n" % (label, cs, ss))
+
+    print(f"\nwrote {args.constants}   "
+          f"({os.path.getsize(args.constants) / 1e3:.0f} KB, "
+          f"{n_const} constants + {n_samp} samplers)")
+    print(f"wrote {args.names}   ({os.path.getsize(args.names) / 1e6:.1f} MB)")
     print(f"wrote {args.out}   ({os.path.getsize(args.out) / 1e3:.0f} KB)")
 
     if not args.ucode:

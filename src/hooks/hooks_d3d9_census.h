@@ -215,6 +215,13 @@ struct ShaderNameCensus {
   uint64_t unknown = 0;      // no named stage, and at least one is simply
                              // missing from the map -- the real gap
   uint64_t noShader = 0;     // nothing translated at all, so nothing to name
+  // Constant/sampler NAME coverage, over the same denominator. Separate from
+  // the buckets above because a shader can be named and still have no table --
+  // 4108 of 5124 entry points carry constants and only 1881 carry samplers, so
+  // "named" and "has names for its registers" are different questions.
+  uint64_t constVs = 0;
+  uint64_t constPs = 0;
+  uint64_t constBoth = 0;
   std::mutex mu;
   // A cap so a pathological run cannot grow these without bound. It is 512
   // rather than 64 because 64 SATURATED on the first real run -- the vertex

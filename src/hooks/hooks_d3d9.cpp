@@ -2237,6 +2237,11 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
       const bool vn = v && v->name;
       const bool pn = p && p->name;
       ++g_shaderNames.draws;
+      const bool vc = v && v->constant_table;
+      const bool pc = p && p->constant_table;
+      if (vc) ++g_shaderNames.constVs;
+      if (pc) ++g_shaderNames.constPs;
+      if (vc && pc) ++g_shaderNames.constBoth;
       if (vn && pn) {
         ++g_shaderNames.bothNamed;
       } else if (vn) {
