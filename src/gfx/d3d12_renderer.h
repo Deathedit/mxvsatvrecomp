@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -61,81 +61,11 @@ inline float TextureSignScale(uint8_t signs, uint32_t component) {
   }
 }
 
-class D3D12Renderer {
- public:
-  D3D12Renderer() = default;
-  ~D3D12Renderer();
-
-  D3D12Renderer(const D3D12Renderer&) = delete;
-  D3D12Renderer& operator=(const D3D12Renderer&) = delete;
-  D3D12Renderer(D3D12Renderer&&) = delete;
-  D3D12Renderer& operator=(D3D12Renderer&&) = delete;
-
-  bool Initialize(HWND hwnd);
-  void Shutdown();
-
-  void BeginFrame();
-  void EndFrame();
-
-
-// Append one translated draw to this frame's list. `mvp` is the 16-float
-// row-major transform the PM4 translator recovered; pass nullptr for identity.
-// `topology` is a D3D_PRIMITIVE_TOPOLOGY value, matching mx::hle::HostTopology.
-// This replaced SetGameDrawData, which held exactly one draw.
-
-// The guest vertex stage, when this draw runs it on the GPU. Grouped into a
-// struct rather than six more positional arguments to a call that already takes
-// thirty. All-or-nothing: a null pointer, or any member missing, keeps the draw
-// on the CPU interpreter.
-struct GpuVertexStage {
-  uint32_t handle = 0;
-  std::shared_ptr<const std::string> hlsl;
-  // The compiled DXBC matching `hlsl` (the fetch variant's bytecode when the
-  // stage is the fetch form). Null falls back to compiling `hlsl` here, which
-  // is the pre-cache behaviour and costs an FXC compile per new handle.
-  std::shared_ptr<const std::vector<uint8_t>> dxbc;
-  // One float4 per declared register per vertex, in `regs` order.
-  const uint8_t* inputs = nullptr;
-  uint32_t inputBytes = 0;
-  // The registers the shader reads, ascending. Element i of the input layout
-  // carries register regs[i] at TEXCOORD<regs[i]> — the semantic index is the
-  // register number, which is what EmitShaderHlsl declares.
-  const uint8_t* regs = nullptr;
-  uint32_t regCount = 0;
-  // The VERTEX ALU constant bank, constants 0-255 at device+0x780. A different
-  // bank from the pixel one; each stage indexes its own from 0.
-  const uint32_t* constants = nullptr;
-  uint32_t constDwords = 0;
-
-  // --- the fetch variant ----------------------------------------------------
-  //
-  // When `rawBytes` is set the shader fetches for itself: `hlsl` is the fetch
-  // form, `inputs`/`regs` are unused, and the pipeline takes an EMPTY input
-  // layout plus a root SRV over the raw buffer. The two forms are not
-  // interchangeable, so this pointer is what selects between them.
-  const uint8_t* rawBytes = nullptr;
-  uint32_t rawByteCount = 0;
-  // {base, stride, endian, pad} per emitted fetch, uploaded as the shader's
-  // xe_vf[]. 4 dwords each, matching DrawCall::RawFetch.
-  const uint32_t* rawFetch = nullptr;
-  uint32_t rawFetchCount = 0;
-
-  // --- textures this stage samples -----------------------------------------
-  //
-  // Zero for almost every draw. A vertex shader that samples is terrain
-  // displacement and similar; those used to be refused the GPU path outright and
-  // fell to an interpreter with no texture fetch at all, so their samples came
-  // back as zeros and their positions were silently wrong.
-  uint32_t samplerCount = 0;
-  uint32_t samplerArrayMask = 0;
-  const std::shared_ptr<const mx::hle::HleTexturePayload>* textures = nullptr;
-  const uint32_t* sampledObjects = nullptr;
-  const uint8_t* samplerSigns = nullptr;
-  // Per slot, for snapshot-backed slots only: the guest fetch swizzle. See
-  // DrawCall::vertex_sampled_swizzles.
-  const uint16_t* sampledSwizzles = nullptr;
-};
-
+// AT NAMESPACE SCOPE, not in the class. These two were inside the class
+// body purely by where they were written: neither takes `this` nor touches
+// a member, and every call site reached them by unqualified lookup from
+// inside another member function, which is why nothing complained. They
+// belong beside TextureSignScale above -- same shape, correct placement.
 // PA_SU_SC_MODE_CNTL -> three bits both PSO key spaces can carry.
 //
 //   bits 0-1  cull mode: 0 = none, 1 = front, 2 = back
@@ -175,6 +105,81 @@ inline void ApplyCullBits(uint32_t bits, D3D12_RASTERIZER_DESC& rs) {
   }
   rs.FrontCounterClockwise = (bits & 4u) != 0 ? TRUE : FALSE;
 }
+
+class D3D12Renderer {
+ public:
+  D3D12Renderer() = default;
+  ~D3D12Renderer();
+
+  D3D12Renderer(const D3D12Renderer&) = delete;
+  D3D12Renderer& operator=(const D3D12Renderer&) = delete;
+  D3D12Renderer(D3D12Renderer&&) = delete;
+  D3D12Renderer& operator=(D3D12Renderer&&) = delete;
+
+  bool Initialize(HWND hwnd);
+  void Shutdown();
+
+  void BeginFrame();
+  void EndFrame();
+
+
+// Append one translated draw to this frame's list. `mvp` is the 16-float
+// row-major transform the PM4 translator recovered; pass nullptr for identity.
+// `topology` is a D3D_PRIMITIVE_TOPOLOGY value, matching mx::hle::HostTopology.
+// This replaced SetGameDrawData, which held exactly one draw.
+
+// The guest vertex stage, when this draw runs it on the GPU. Grouped into a
+// struct rather than six more positional arguments to a call that already takes
+// thirty. All-or-nothing: a null pointer, or any member missing, keeps the draw
+// on the CPU interpreter.
+struct GpuVertexStage {
+  uint32_t handle = 0;
+  std::shared_ptr<const std::string> hlsl;
+  // The compiled DXBC matching `hlsl` (the fetch variant's bytecode when the
+  // stage is the fetch form). Null falls back to compiling `hlsl` here, which
+  // is the pre-cache behaviour and costs an FXC compile per new handle.
+  std::shared_ptr<const std::vector<uint8_t>> dxbc;
+  // One float4 per declared register per vertex, in `regs` order.
+  const uint8_t* inputs = nullptr;
+  uint32_t inputBytes = 0;
+  // The registers the shader reads, ascending. Element i of the input layout
+  // carries register regs[i] at TEXCOORD<regs[i]> -- the semantic index is the
+  // register number, which is what EmitShaderHlsl declares.
+  const uint8_t* regs = nullptr;
+  uint32_t regCount = 0;
+  // The VERTEX ALU constant bank, constants 0-255 at device+0x780. A different
+  // bank from the pixel one; each stage indexes its own from 0.
+  const uint32_t* constants = nullptr;
+  uint32_t constDwords = 0;
+
+  // --- the fetch variant ----------------------------------------------------
+  //
+  // When `rawBytes` is set the shader fetches for itself: `hlsl` is the fetch
+  // form, `inputs`/`regs` are unused, and the pipeline takes an EMPTY input
+  // layout plus a root SRV over the raw buffer. The two forms are not
+  // interchangeable, so this pointer is what selects between them.
+  const uint8_t* rawBytes = nullptr;
+  uint32_t rawByteCount = 0;
+  // {base, stride, endian, pad} per emitted fetch, uploaded as the shader's
+  // xe_vf[]. 4 dwords each, matching DrawCall::RawFetch.
+  const uint32_t* rawFetch = nullptr;
+  uint32_t rawFetchCount = 0;
+
+  // --- textures this stage samples -----------------------------------------
+  //
+  // Zero for almost every draw. A vertex shader that samples is terrain
+  // displacement and similar; those used to be refused the GPU path outright and
+  // fell to an interpreter with no texture fetch at all, so their samples came
+  // back as zeros and their positions were silently wrong.
+  uint32_t samplerCount = 0;
+  uint32_t samplerArrayMask = 0;
+  const std::shared_ptr<const mx::hle::HleTexturePayload>* textures = nullptr;
+  const uint32_t* sampledObjects = nullptr;
+  const uint8_t* samplerSigns = nullptr;
+  // Per slot, for snapshot-backed slots only: the guest fetch swizzle. See
+  // DrawCall::vertex_sampled_swizzles.
+  const uint16_t* sampledSwizzles = nullptr;
+};
 
 // The guest's stencil state for one draw, already decoded. A STRUCT, not eleven
 // more scalars on AddGameDraw, for the reason that signature already states
@@ -488,8 +493,8 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
       DXGI_FORMAT format = DXGI_FORMAT_R8G8B8A8_UNORM);
 
   // What distinguishes one pooled offscreen surface from another. Everything
-  // else about creating one — the heap properties, the resource desc, claiming
-  // an SRV descriptor only AFTER the resource exists, and building the view — is
+  // else about creating one -- the heap properties, the resource desc, claiming
+  // an SRV descriptor only AFTER the resource exists, and building the view -- is
   // identical for colour targets, resolve snapshots and depth surfaces, and had
   // grown two verbatim copies before this was extracted.
   struct PooledSurfaceSpec {
@@ -513,7 +518,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   // Hand a resource to the retirement list rather than releasing it inline. A
   // command list does not keep its resources alive, so the GPU may still be
   // reading one this frame; releasing inline made every later create of that
-  // size fail — 1834 failures in one run.
+  // size fail -- 1834 failures in one run.
   void RetireResource(Microsoft::WRL::ComPtr<ID3D12Resource>&& res);
   // Drop resolve snapshots that nothing has sampled for a long time, returning
   // their SRV slots to the free list. m_gameSnapshots is keyed by GUEST OBJECT
@@ -554,8 +559,8 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   HANDLE m_fenceEvent = nullptr;
   uint32_t m_rtvDescriptorSize = 0;
   uint32_t m_frameIndex = 0;
-  // The guest's aspect. It renders 1280x720 and nothing tells it otherwise —
-  // no video-mode export is hooked — so this is the shape the image must keep
+  // The guest's aspect. It renders 1280x720 and nothing tells it otherwise --
+  // no video-mode export is hooked -- so this is the shape the image must keep
   // however wide the host window is.
   static constexpr float kGuestAspect = 16.0f / 9.0f;
   // The resolution the guest actually renders, for drawing it unscaled.
@@ -805,7 +810,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   uint64_t m_gpuVertexFetchDraws = 0;
   // Draws that brought a vertex stage and could not be given one, so had to be
   // dropped: their vertices were never transformed by anything. Must stay at
-  // zero — anything else is geometry missing from the picture.
+  // zero -- anything else is geometry missing from the picture.
   uint64_t m_gpuVertexDropped = 0;
 
   // Draws whose guest scissor actually clips something, and draws whose scissor
@@ -1198,7 +1203,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
 
   // One translated draw. The CB is per-draw rather than one shared buffer so it
   // is not rewritten while the GPU may still be reading the previous frame's
-  // value — now a distinct range of the ring rather than a distinct resource.
+  // value -- now a distinct range of the ring rather than a distinct resource.
   struct GameDraw {
     UploadAlloc vb;
     UploadAlloc ib;
@@ -1295,7 +1300,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     // back together when the guest resolves the whole of it. See resolveSourceBase.
     uint32_t depthBase = 0;
     // The vertex declaration carried no COLOR element, so the {1,1,1,1} in the
-    // vertex buffer is a seed rather than data — a modulation identity for the
+    // vertex buffer is a seed rather than data -- a modulation identity for the
     // textured shader. If such a draw is not textured, that value is emitted
     // literally as opaque white and is pure fabrication. See RenderGameFrame.
     uint8_t colorSource = 0;  // mx::hle::DrawCall::ColorSource
@@ -1413,12 +1418,12 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     uint32_t vertexShaderHandle = 0;
     std::shared_ptr<const std::string> vertexShaderHlsl;
     // Precompiled bytecode for vertexShaderHlsl (fetch or inputs form,
-    // whichever `hlsl` carries) — same contract as pixelShaderDxbc.
+    // whichever `hlsl` carries) -- same contract as pixelShaderDxbc.
     std::shared_ptr<const std::vector<uint8_t>> vertexShaderDxbc;
     UploadAlloc vsvb;
     D3D12_VERTEX_BUFFER_VIEW vsvbv = {};
     UploadAlloc vscb;
-    // The registers the translated vertex shader reads, ascending — the input
+    // The registers the translated vertex shader reads, ascending -- the input
     // layout the PSO must be built with. Carried per draw and not derived from
     // the handle because the PSO cache is what turns it back into a layout.
     std::array<uint8_t, 32> vertexInputRegs = {};
@@ -1583,7 +1588,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   uint64_t m_snapshotSweepFrame = UINT64_MAX;
   // Resolve snapshots. m_snapshotFallbacks is the one that matters: a draw that
   // wanted a snapshot, found none, and fell back to sampling the source target's
-  // live surface — the old aliasing behaviour, so a large steady count means
+  // live surface -- the old aliasing behaviour, so a large steady count means
   // resolves are being dropped upstream rather than that the fix is working.
   uint64_t m_snapshotCopies = 0;
   uint64_t m_snapshotHits = 0;
@@ -1895,7 +1900,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
     bool bandDepthSynced = false;
     // Whether anything has EVER been drawn into this target. A resolve whose
     // source has never been drawn into is copying a surface that holds only its
-    // creation clear — the snapshot is then blank, and a compositor quad paints
+    // creation clear -- the snapshot is then blank, and a compositor quad paints
     // that blank over the frame.
     bool everDrawn = false;
     // Rendered into since its last CLEAR, which is not what everDrawn means:
@@ -1935,7 +1940,7 @@ void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
   };
   std::unordered_map<uint32_t, GameRenderTarget> m_gameRenderTargets;
   // Resolve snapshots, keyed by DESTINATION TEXTURE object rather than by the
-  // source target — that distinction is the entire fix. Same struct and same
+  // source target -- that distinction is the entire fix. Same struct and same
   // budget as the offscreen targets above, so exhaustion is reported through
   // the existing refusal counters.
   std::unordered_map<uint32_t, GameRenderTarget> m_gameSnapshots;
