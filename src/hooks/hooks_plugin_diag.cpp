@@ -9,6 +9,8 @@
 
 #include <rex/cvar.h>
 
+using mx::hooks::GuestString;
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -120,23 +122,6 @@ extern "C" REX_FUNC(sub_8253AA40) {
 // run in native mode -- the point of these hooks is to find out how far up
 // execution actually reaches.
 //=============================================================================
-
-namespace {
-
-// Read a NUL-terminated guest string for logging. Bounded at 260 because that is
-// the buffer size sub_82534980 copies into.
-std::string GuestString(uint8_t* base, uint32_t addr, size_t max = 260) {
-  std::string s;
-  if (!addr) return s;
-  for (size_t i = 0; i < max; ++i) {
-    uint8_t c = REX_LOAD_U8(addr + static_cast<uint32_t>(i));
-    if (!c) break;
-    s.push_back(static_cast<char>(c));
-  }
-  return s;
-}
-
-}  // namespace
 
 // sub_82534980 — AssetDB_RequestLoad(AssetDB, name, flags). Copies up to 260
 // bytes of `name` to AssetDB+29540, stores flags at +29800, and moves the
