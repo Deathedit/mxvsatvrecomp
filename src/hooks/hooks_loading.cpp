@@ -2,10 +2,10 @@
 //
 // This is the part of the boot sequence mid-ASM hooks used to carve into. **NO
 // MID-ASM HOOK IS ACTIVE ANY MORE**: mx_asm.toml is 107 of 116 lines commented
-// with nothing live, mx_config.toml has no mid-ASM section, and the stubs in
-// midasm_stubs.cpp are referenced only from commented lines. Nothing is skipped,
-// the dispatch RUNS, and it is observed by a plain function hook on
-// sub_82B34998.
+// with nothing live, mx_config.toml has no mid-ASM section, and midasm_stubs.cpp
+// -- which held the stubs they jumped to -- was deleted in 8ee7d8e once nothing
+// referenced it from a live line. Nothing is skipped, the dispatch RUNS, and it
+// is observed by a plain function hook on sub_82B34998.
 //
 // Comments below still describe hook #6's behaviour in the past tense; read them
 // as history, not as the current configuration.
@@ -16,7 +16,7 @@
 
 #include <bit>
 
-// The guest has its own frame limiter and it is switched off in our runs.
+// The guest has its own frame limiter, and the hook below switches it ON.
 //
 // sub_82B70370, the pacer LoaderTick calls first, spins while dt is below
 // engine+0x14 -- a minimum frame time in seconds, with FLT_MAX as the "no cap"
@@ -24,16 +24,22 @@
 // sentinel is SetupRenderer reading the "Game"/"VSync" setting: "30HZ" calls
 // engine->vt[0] (SetMaxFrameRate, `engine+0x14 = 1.0f/fps`) with 30.0f, "60HZ"
 // with 60.0f, and anything else -- including a missing key -- leaves the cap
-// alone. Every run logs `Timing guards +20=0x7F7FFFFF`, so the shipped data
-// reads as neither.
+// alone. The shipped data reads as neither, which is why this cvar exists.
 //
 // 30 is the rate the engine is built around: the constructor seeds all five
 // slots of the dt smoothing ring with 0.033333 and their sum with 0.166665.
 //
-// Two things to know before reading a result. The cap is a BUSY SPIN with no
-// yield, on the Transition thread. And it is a floor on frame time, so it can
-// only ever slow a frame down: where we already run slower than the cap it
-// does nothing at all, which is most of a level.
+// The log says which state a run was in, and the transition is visible across
+// three consecutive runs: mx_1984 logs `Timing guards +20=0x7F7FFFFF
+// (FLT_MAX=true)`, and mx_1985/mx_1986 log `guest frame cap engine+0x14
+// 0x7F7FFFFF -> 30 fps` followed by `+20=0x3D088889 (FLT_MAX=false)`.
+//
+// Two things to know before reading a result. The spin is no longer a busy
+// wait: PaceFrame in hooks_frame.cpp sleeps until 1.2ms short of the deadline
+// and leaves the last of it to the guest, so the loop confirms the edge instead
+// of burning a core for a frame. And the cap is a floor on frame time, so it
+// can only ever slow a frame down: where we already run slower than it, it does
+// nothing at all, which is most of a level.
 REXCVAR_DEFINE_INT32(guest_frame_cap_fps, 30, "Debug",
                      "Force the guest's own frame cap (engine+0x14) to this "
                      "rate after SetupRenderer. 0 keeps the guest's value");
@@ -165,7 +171,8 @@ extern "C" REX_FUNC(sub_82B710D0) {
     // the band's inputs were real before the narrowing.
 
     // Lazy-init at 0x82B70EE8 is `bctrl` through dword_82D5648C. When #6 was
-    // last disabled execution stalled right here (midasm_stubs.cpp:33) — but
+    // last disabled execution stalled right here (in the mid-ASM stub that
+    // midasm_stubs.cpp:33 held, before 8ee7d8e deleted the file) -- but
     // be190 is already populated by then, so the bne branches past it.
     uint32_t lazy_fn = REX_LOAD_U32(0x82D5648C);
     uint32_t be190 = REX_LOAD_U32(0x830BE190);
