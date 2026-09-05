@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <fstream>
 #include <map>
+#include <mutex>
 #include <vector>
 
 #include "gpu/d3d9_draw.h"     // HleStream, kMaxStreams
@@ -518,5 +519,18 @@ void ReportCommandBuffers();
 // buffer they bind. Defined in hooks_d3d9_entry.cpp.
 void ReportVegetationLod();
 
+// ---- The layer lock -------------------------------------------------------
+
+// Every D3D9 guest entry point takes this for its whole body, including across
+// the call to the guest original. The guest's three record workers never take a
+// lock our hooks could hold, so the only effect is that they queue through this
+// layer one at a time -- which is what the shared globals across these
+// translation units require.
+//
+// Defined here rather than in one .cpp because the entry points now span more
+// than one file, and a second #define copied into a new TU would diverge the
+// moment either was edited. There must be exactly one of these in src/.
+#define MX_D3D9_HLE_LOCK \
+  std::lock_guard<std::recursive_mutex> _hle_lock(mx::hle::HleGlobalMutex())
 
 }  // namespace mx::hooks::d3d9

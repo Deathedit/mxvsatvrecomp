@@ -109,13 +109,6 @@ extern "C" REX_FUNC(sub_8293C778) {
   g_glyphCacheGeneration.fetch_add(1, std::memory_order_release);
 }
 
-// Every hook below takes the HLE lock for its whole body, including across the
-// call to the guest original. The guest's three record workers never take a lock
-// our hooks could hold, so the only effect is that they queue through this layer
-// one at a time -- which is what the ~30 shared globals in this file require.
-#define MX_D3D9_HLE_LOCK \
-  std::lock_guard<std::recursive_mutex> _hle_lock(mx::hle::HleGlobalMutex())
-
 //=============================================================================
 // 0x82945D20 - DefineCompactedFont. THE LOADER THIS GAME ACTUALLY USES.
 //
