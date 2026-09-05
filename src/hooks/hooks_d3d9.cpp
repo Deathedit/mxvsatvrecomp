@@ -91,8 +91,6 @@ using mx::hle::kMaxElements;   // refuses to walk a runaway array
 // throttle gets noisier exactly when the game gets busier. The old draw constant
 // is kept as a FLOOR so a report cannot fire twice for the same state on a
 // machine with a coarse clock.
-constexpr uint64_t kDrawReportEvery = 2500;      // minimum draw delta
-constexpr int64_t kDrawReportPeriodMs = 2000;    // and at most this often
 
 uint64_t g_indexed_draws = 0;
 uint64_t g_draws = 0;
@@ -240,11 +238,7 @@ DeclCensus g_declCensus;
 constexpr uint32_t kDeclCountOffset = 0x18;
 constexpr uint32_t kDeclElementsOffset = 0x34;
 
-constexpr uint32_t kMaxUnknownDecls = 16;
-uint32_t g_unknownPtr[kMaxUnknownDecls] = {};
-uint64_t g_unknownPtrDraws[kMaxUnknownDecls] = {};
-uint32_t g_unknownDistinct = 0;
-uint64_t g_unknownOverflow = 0;     // draws whose pointer did not fit the table
+UnknownDeclTable g_unknownDecls;
 
 // Adopt a declaration the device holds that we never watched being created.
 // +0x34 IS THE ELEMENT ARRAY, NOT A POINTER TO IT -- taken as a pointer it reads
@@ -295,19 +289,19 @@ void ProbeUnknownDecl(uint32_t p, uint8_t* base) {
 }
 
 void NoteUnknownDecl(uint32_t p, uint8_t* base) {
-  for (uint32_t i = 0; i < g_unknownDistinct; ++i) {
-    if (g_unknownPtr[i] == p) {
-      ++g_unknownPtrDraws[i];
+  for (uint32_t i = 0; i < g_unknownDecls.distinct; ++i) {
+    if (g_unknownDecls.ptr[i] == p) {
+      ++g_unknownDecls.draws[i];
       return;
     }
   }
-  if (g_unknownDistinct >= kMaxUnknownDecls) {
-    ++g_unknownOverflow;
+  if (g_unknownDecls.distinct >= kMaxUnknownDecls) {
+    ++g_unknownDecls.overflow;
     return;
   }
-  const uint32_t i = g_unknownDistinct++;
-  g_unknownPtr[i] = p;
-  g_unknownPtrDraws[i] = 1;
+  const uint32_t i = g_unknownDecls.distinct++;
+  g_unknownDecls.ptr[i] = p;
+  g_unknownDecls.draws[i] = 1;
   // Once per distinct pointer, so a per-frame draw cannot turn this into a
   // per-frame line.
   ProbeUnknownDecl(p, base);
@@ -374,16 +368,11 @@ const char* DrawGapName(uint32_t g) {
   }
 }
 
-uint64_t g_drawGaps[kDrawGapCount] = {};
-uint64_t g_drawsComplete = 0;
-uint64_t g_drawsChecked = 0;
+DrawFitCensus g_drawFit;
 
 // Stride disagreements between the declaration and SetStreamSource. The
 // layout's own minimum stride cannot exceed the stride the game bound, or the
 // last attribute reads past the end of each vertex.
-uint64_t g_strideOk = 0;
-uint64_t g_strideTooSmall = 0;
-uint64_t g_strideMismatch = 0;   // bound stride larger than the layout needs
 constexpr int kMaxStrideReports = 8;
 int g_strideTooSmallNamed = 0;
 int g_vbTooSmallNamed = 0;
@@ -391,10 +380,6 @@ int g_vbTooSmallNamed = 0;
 // Does the buffer hold the vertices the draw asks for? The fetch constant's size
 // and the draw's vertex count come from opposite ends of the API, so agreement
 // is evidence both were read correctly.
-uint64_t g_vbFits = 0;
-uint64_t g_vbTooSmall = 0;
-uint64_t g_ibFits = 0;
-uint64_t g_ibTooSmall = 0;
 
 //---------------------------------------------------------------------------
 // Stage 0 -- why does the vertex range check fail? Two candidate causes this
@@ -412,8 +397,6 @@ uint64_t g_ibTooSmall = 0;
 // ends.** Two guesses faulted (0x4000, then 0x3484). The arena is sparse; a
 // bound picked from a different device is not a bound. The scan stops at the
 // first page that is not committed and readable.
-constexpr uint32_t kDeviceScanBytes = 0x4000;
-constexpr uint32_t kDeviceScanDwords = kDeviceScanBytes / 4;
 
 // VirtualQuery was ~100% of native frame time, at ~6ms per CALL. It reports the
 // whole contiguous run it found in mbi.BaseAddress/RegionSize with identical
@@ -574,11 +557,7 @@ void InvalidateHostPageCache() {
 
 // One bit per dword offset. Starts all-set and is intersected; anything still
 // set after many samples held the just-bound value every single time.
-bool g_fcCand0[kDeviceScanDwords];
-bool g_fcCand1[kDeviceScanDwords];
-bool g_fcPrimed = false;
-uint32_t g_fcSamples = 0;
-uint32_t g_fcReached = kDeviceScanBytes;   // lowest end-of-readable across samples
+FetchConstScan g_fcScan;
 constexpr uint32_t kFcMaxSamples = 64;
 
 // What the last SetStreamSource for stream 0 bound, kept raw so the scan can
@@ -592,22 +571,15 @@ bool g_haveBind = false;
 // arriving through a path this file does not hook, the failing draws sit at
 // large values here while the passing ones sit near zero.
 uint64_t g_drawsSinceBind[mx::hle::kMaxStreams] = {};
-uint64_t g_bindAgeFitSum[mx::hle::kMaxStreams] = {};
-uint64_t g_bindAgeFailSum[mx::hle::kMaxStreams] = {};
-uint64_t g_bindAgeFailMax[mx::hle::kMaxStreams] = {};
+PerStreamCensus g_perStream;
 
 // The vertex range check, split by stream. A bare total cannot distinguish
 // "stream 0 geometry is wrong" from "small auxiliary streams are modelled
 // wrong", and those need completely different fixes.
-uint64_t g_vbFitStream[mx::hle::kMaxStreams] = {};
 
 // Does the device's own fetch constant match what SetStreamSource recorded, and
 // where it does not, does the device's value explain a draw the snapshot could
 // not? `rescues` is how much of the shortfall reading the device would recover.
-uint64_t g_fileAgree[mx::hle::kMaxStreams] = {};
-uint64_t g_fileDiffer[mx::hle::kMaxStreams] = {};
-uint64_t g_fileRescues[mx::hle::kMaxStreams] = {};
-uint64_t g_vbFailStream[mx::hle::kMaxStreams] = {};
 
 // Indexed draws were never range-checked on the vertex side, because the range
 // depends on the index values. Reading them is **off**: three runs took an
@@ -618,15 +590,12 @@ uint64_t g_vbFailStream[mx::hle::kMaxStreams] = {};
 // Kept behind the flag until the decode is read out of D3DDevice_SetIndices the
 // way the vertex side was.
 constexpr bool kProbeIndexRange = false;
-uint64_t g_idxRangeFits = 0;
-uint64_t g_idxRangeFails = 0;
-uint64_t g_idxRangeUnread = 0;
 
 // Scan the device for dwords matching what was last bound, intersecting into
 // the candidate sets. Read-only, bounded, and every read is inside a struct
 // D3D9 is itself using on both sides of this hook.
 void SampleFetchConstantFile(uint32_t device, uint8_t* base) {
-  if (!device || !g_haveBind || g_fcSamples >= kFcMaxSamples) return;
+  if (!device || !g_haveBind || g_fcScan.samples >= kFcMaxSamples) return;
 
   // The maskings D3D9 might have applied on the way in. Trying several is the
   // point: it avoids assuming which one, and an offset only survives if it
@@ -650,32 +619,32 @@ void SampleFetchConstantFile(uint32_t device, uint8_t* base) {
     for (uint32_t k = 0; k < 4; ++k) hit0 = hit0 || v == want0[k];
     bool hit1 = false;
     for (uint32_t k = 0; k < 2; ++k) hit1 = hit1 || v == want1[k];
-    if (!g_fcPrimed) {
-      g_fcCand0[i] = hit0;
-      g_fcCand1[i] = hit1;
+    if (!g_fcScan.primed) {
+      g_fcScan.cand0[i] = hit0;
+      g_fcScan.cand1[i] = hit1;
     } else {
-      g_fcCand0[i] = g_fcCand0[i] && hit0;
-      g_fcCand1[i] = g_fcCand1[i] && hit1;
+      g_fcScan.cand0[i] = g_fcScan.cand0[i] && hit0;
+      g_fcScan.cand1[i] = g_fcScan.cand1[i] && hit1;
     }
   }
   // Anything past where this sample could read is not a candidate -- leaving it
   // set would let an offset survive on samples that never actually checked it.
   for (uint32_t i = reached / 4; i < kDeviceScanDwords; ++i) {
-    g_fcCand0[i] = false;
-    g_fcCand1[i] = false;
+    g_fcScan.cand0[i] = false;
+    g_fcScan.cand1[i] = false;
   }
-  if (reached < g_fcReached) g_fcReached = reached;
+  if (reached < g_fcScan.reached) g_fcScan.reached = reached;
 
-  g_fcPrimed = true;
-  ++g_fcSamples;
+  g_fcScan.primed = true;
+  ++g_fcScan.samples;
 
   // The scan pinned dword1 to exactly one offset, 0x77C, which retro-fits
   // SetStreamSource's own arithmetic: `subfic r11, r4, 0x11` gives
   // (0x11 - stream) * 8 + 0x6F4 = 0x77C for stream 0. dword0 had no survivor
   // because D3D9 ORs a flag bit in after masking.
-  if (g_fcSamples <= 8) {
+  if (g_fcScan.samples <= 8) {
     auto& f = DeclFile();
-    f << "FETCH FILE sample " << g_fcSamples << ": last bind d0=0x" << std::hex
+    f << "FETCH FILE sample " << g_fcScan.samples << ": last bind d0=0x" << std::hex
       << g_lastBindD0 << " d1=0x" << g_lastBindD1 << " offset=0x"
       << g_lastBindOffset << "\n           device+0x760..0x790:";
     for (uint32_t o = 0x760; o <= 0x790; o += 4) {
@@ -2850,10 +2819,10 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
 void ScoreDraw(bool indexed, uint32_t first, uint32_t count,
                uint32_t device, uint8_t* base) {
   const auto& st = DeviceState();
-  ++g_drawsChecked;
+  ++g_drawFit.checked;
   for (uint32_t s = 0; s < mx::hle::kMaxStreams; ++s) ++g_drawsSinceBind[s];
   bool complete = true;
-  auto gap = [&](uint32_t g) { ++g_drawGaps[g]; complete = false; };
+  auto gap = [&](uint32_t g) { ++g_drawFit.gaps[g]; complete = false; };
 
   const int id = g_currentDecl;
   if (id < 0) {
@@ -2878,7 +2847,7 @@ void ScoreDraw(bool indexed, uint32_t first, uint32_t count,
         // attribute would read past the end of each vertex. Either the decode is
         // wrong or the stream was bound for a different declaration. The first
         // few are named, since a bare count cannot say which.
-        ++g_strideTooSmall;
+        ++g_drawFit.strideTooSmall;
         complete = false;
         if (g_strideTooSmallNamed < kMaxStrideReports) {
           ++g_strideTooSmallNamed;
@@ -2895,9 +2864,9 @@ void ScoreDraw(bool indexed, uint32_t first, uint32_t count,
           f.flush();
         }
       } else if (b.stride != layout.min_stride[s]) {
-        ++g_strideMismatch;   // padding at the end of the vertex; legal
+        ++g_drawFit.strideMismatch;   // padding at the end of the vertex; legal
       } else {
-        ++g_strideOk;
+        ++g_drawFit.strideOk;
       }
 
       // For a non-indexed draw the vertex range is known exactly. For an indexed
@@ -2925,7 +2894,7 @@ void ScoreDraw(bool indexed, uint32_t first, uint32_t count,
         }
       }
 
-      if (indexed && !have_range) ++g_idxRangeUnread;
+      if (indexed && !have_range) ++g_drawFit.idxRangeUnread;
 
       // **The decisive comparison.** If binds are reaching the device through a
       // path this file does not hook, the device's own fetch constant will
@@ -2935,9 +2904,9 @@ void ScoreDraw(bool indexed, uint32_t first, uint32_t count,
         const uint32_t d1 = REX_LOAD_U32(device + FetchFileDword1Offset(s));
         const uint32_t live = ((d1 >> 2) & 0xFFFFFF) * 4;
         if (live == b.size_bytes) {
-          ++g_fileAgree[s];
+          ++g_perStream.fileAgree[s];
         } else {
-          ++g_fileDiffer[s];
+          ++g_perStream.fileDiffer[s];
           // Does the device's size explain a draw the snapshot could not?
           //
           // `have_range` is REQUIRED. Without it an indexed draw arrives with
@@ -2947,7 +2916,7 @@ void ScoreDraw(bool indexed, uint32_t first, uint32_t count,
           // measurement.
           if (have_range && b.stride &&
               static_cast<uint64_t>(hi_vertex) * b.stride <= live) {
-            ++g_fileRescues[s];
+            ++g_perStream.fileRescues[s];
           }
         }
       }
@@ -2956,23 +2925,23 @@ void ScoreDraw(bool indexed, uint32_t first, uint32_t count,
         const uint64_t need = static_cast<uint64_t>(hi_vertex) * b.stride;
         const bool fits = need <= b.size_bytes;
         if (indexed) {
-          (fits ? g_idxRangeFits : g_idxRangeFails) += 1;
+          (fits ? g_drawFit.idxRangeFits : g_drawFit.idxRangeFails) += 1;
         }
         // Bind age, split the same way: a stale shadow shows up as failing
         // draws sitting far from their last bind while passing ones sit near it.
         const uint64_t age = g_drawsSinceBind[s];
         if (fits) {
-          g_bindAgeFitSum[s] += age;
+          g_perStream.bindAgeFitSum[s] += age;
         } else {
-          g_bindAgeFailSum[s] += age;
-          if (age > g_bindAgeFailMax[s]) g_bindAgeFailMax[s] = age;
+          g_perStream.bindAgeFailSum[s] += age;
+          if (age > g_perStream.bindAgeFailMax[s]) g_perStream.bindAgeFailMax[s] = age;
         }
-        (fits ? g_vbFitStream[s] : g_vbFailStream[s]) += 1;
+        (fits ? g_perStream.vbFits[s] : g_perStream.vbFails[s]) += 1;
 
         if (!indexed && fits) {
-          ++g_vbFits;
+          ++g_drawFit.vbFits;
         } else if (!indexed) {
-          ++g_vbTooSmall;
+          ++g_drawFit.vbTooSmall;
           if (g_vbTooSmallNamed < kMaxStrideReports) {
             ++g_vbTooSmallNamed;
             auto& f = DeclFile();
@@ -2995,7 +2964,7 @@ void ScoreDraw(bool indexed, uint32_t first, uint32_t count,
     } else {
       const uint64_t need =
           static_cast<uint64_t>(first + count) * (st.index.is_32bit ? 4 : 2);
-      (need <= st.index.size_bytes ? g_ibFits : g_ibTooSmall) += 1;
+      (need <= st.index.size_bytes ? g_drawFit.ibFits : g_drawFit.ibTooSmall) += 1;
     }
   }
   if (!st.vs_seen) gap(kGapVertexShader);
@@ -3010,7 +2979,7 @@ void ScoreDraw(bool indexed, uint32_t first, uint32_t count,
     if (!st.render_state.Seen(r)) { gap(kGapRenderState); break; }
   }
 
-  if (complete) ++g_drawsComplete;
+  if (complete) ++g_drawFit.complete;
 }
 
 //---------------------------------------------------------------------------
@@ -5228,16 +5197,16 @@ void ProbeVertexObjectSecondBlob(uint32_t device, uint8_t* base) {
 
 void ReportCoverage(uint8_t* base) {
   const auto& st = DeviceState();
-  if (g_drawsChecked == 0) {
+  if (g_drawFit.checked == 0) {
     REXLOG_INFO("d3d9: hle -- no draws scored");
     return;
   }
   REXLOG_INFO("d3d9: hle -- {} of {} draws fully described ({}%)",
-              g_drawsComplete, g_drawsChecked,
-              (g_drawsComplete * 100) / g_drawsChecked);
+              g_drawFit.complete, g_drawFit.checked,
+              (g_drawFit.complete * 100) / g_drawFit.checked);
   for (uint32_t g = 0; g < kDrawGapCount; ++g) {
-    if (g_drawGaps[g]) {
-      REXLOG_INFO("d3d9: hle   missing: {:<28} x{}", DrawGapName(g), g_drawGaps[g]);
+    if (g_drawFit.gaps[g]) {
+      REXLOG_INFO("d3d9: hle   missing: {:<28} x{}", DrawGapName(g), g_drawFit.gaps[g]);
     }
   }
   //-------------------------------------------------------------------------
@@ -5280,38 +5249,38 @@ void ReportCoverage(uint8_t* base) {
   // Stage 0 verdict.
   //-------------------------------------------------------------------------
   for (uint32_t s = 0; s < mx::hle::kMaxStreams; ++s) {
-    const uint64_t fit = g_vbFitStream[s], fail = g_vbFailStream[s];
+    const uint64_t fit = g_perStream.vbFits[s], fail = g_perStream.vbFails[s];
     if (!fit && !fail) continue;
     REXLOG_INFO(
         "d3d9: stage0  stream {}: holds the range {}/{} | mean draws since "
         "bind: fits {} fails {} (worst {})",
-        s, fit, fit + fail, fit ? g_bindAgeFitSum[s] / fit : 0,
-        fail ? g_bindAgeFailSum[s] / fail : 0, g_bindAgeFailMax[s]);
+        s, fit, fit + fail, fit ? g_perStream.bindAgeFitSum[s] / fit : 0,
+        fail ? g_perStream.bindAgeFailSum[s] / fail : 0, g_perStream.bindAgeFailMax[s]);
   }
   for (uint32_t s = 0; s < mx::hle::kMaxStreams; ++s) {
-    if (!g_fileAgree[s] && !g_fileDiffer[s]) continue;
+    if (!g_perStream.fileAgree[s] && !g_perStream.fileDiffer[s]) continue;
     REXLOG_INFO(
         "d3d9: stage0  stream {}: device fetch constant vs our snapshot -- "
         "same {} differ {}, and the device's size explains {} of the failures",
-        s, g_fileAgree[s], g_fileDiffer[s], g_fileRescues[s]);
+        s, g_perStream.fileAgree[s], g_perStream.fileDiffer[s], g_perStream.fileRescues[s]);
   }
   REXLOG_INFO(
       "d3d9: stage0  indexed draws, by real max index: holds {}/{} (unread {})",
-      g_idxRangeFits, g_idxRangeFits + g_idxRangeFails, g_idxRangeUnread);
+      g_drawFit.idxRangeFits, g_drawFit.idxRangeFits + g_drawFit.idxRangeFails, g_drawFit.idxRangeUnread);
 
   // Offsets that held the just-bound value on every one of the samples. One
   // surviving pair is the fetch constant file; none means D3D9 does not keep
   // the value verbatim and the snapshot is the only source available.
-  if (g_fcPrimed) {
+  if (g_fcScan.primed) {
     uint32_t n0 = 0, n1 = 0;
     std::string o0, o1;
     for (uint32_t i = 0; i < kDeviceScanDwords; ++i) {
       char buf[16];
-      if (g_fcCand0[i]) {
+      if (g_fcScan.cand0[i]) {
         ++n0;
         if (n0 <= 8) { std::snprintf(buf, sizeof(buf), "0x%X ", i * 4); o0 += buf; }
       }
-      if (g_fcCand1[i]) {
+      if (g_fcScan.cand1[i]) {
         ++n1;
         if (n1 <= 8) { std::snprintf(buf, sizeof(buf), "0x%X ", i * 4); o1 += buf; }
       }
@@ -5319,7 +5288,7 @@ void ReportCoverage(uint8_t* base) {
     REXLOG_INFO(
         "d3d9: stage0  fetch constant file after {} samples (device readable to "
         "0x{:X}): dword0 offsets={} [{}] dword1 offsets={} [{}]",
-        g_fcSamples, g_fcReached, n0, o0, n1, o1);
+        g_fcScan.samples, g_fcScan.reached, n0, o0, n1, o1);
   } else {
     REXLOG_INFO("d3d9: stage0  fetch constant file: never sampled");
   }
@@ -5327,11 +5296,11 @@ void ReportCoverage(uint8_t* base) {
   REXLOG_INFO(
       "d3d9: hle   stride exact={} padded={} TOO SMALL={} (too small means the "
       "layout decode is wrong)",
-      g_strideOk, g_strideMismatch, g_strideTooSmall);
+      g_drawFit.strideOk, g_drawFit.strideMismatch, g_drawFit.strideTooSmall);
   REXLOG_INFO(
       "d3d9: hle   buffer holds the range: vb {}/{} ib {}/{} (denominator is "
       "draws checked for that buffer)",
-      g_vbFits, g_vbFits + g_vbTooSmall, g_ibFits, g_ibFits + g_ibTooSmall);
+      g_drawFit.vbFits, g_drawFit.vbFits + g_drawFit.vbTooSmall, g_drawFit.ibFits, g_drawFit.ibFits + g_drawFit.ibTooSmall);
   REXLOG_INFO(
       "d3d9: hle   vs=0x{:08X} ps=0x{:08X} ib=0x{:08X} ({} bit) vp={}x{} "
       "distinct devices={}",
@@ -5475,15 +5444,15 @@ void ReportDeclHistogram() {
   // shape of the answer decides the next step: one address recurring every frame
   // is a specific draw to go and find, while hundreds of distinct addresses is a
   // lifetime or ordering problem instead.
-  if (g_unknownDistinct) {
+  if (g_unknownDecls.distinct) {
     std::string u;
-    for (uint32_t i = 0; i < g_unknownDistinct; ++i)
-      u += fmt::format(" 0x{:08X}x{}", g_unknownPtr[i], g_unknownPtrDraws[i]);
+    for (uint32_t i = 0; i < g_unknownDecls.distinct; ++i)
+      u += fmt::format(" 0x{:08X}x{}", g_unknownDecls.ptr[i], g_unknownDecls.draws[i]);
     REXLOG_INFO("d3d9: decl-unknown -- {} distinct pointer(s){}{}",
-                g_unknownDistinct, u,
-                g_unknownOverflow
+                g_unknownDecls.distinct, u,
+                g_unknownDecls.overflow
                     ? fmt::format(" (+{} draws on pointers past the {} cap)",
-                                  g_unknownOverflow, kMaxUnknownDecls)
+                                  g_unknownDecls.overflow, kMaxUnknownDecls)
                     : "");
   }
   // LAYOUT DECODE, with its denominator. Three outcomes, never folded: clean,

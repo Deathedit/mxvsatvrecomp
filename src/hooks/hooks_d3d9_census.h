@@ -15,7 +15,21 @@
 
 #include <cstdint>
 
+#include "gpu/d3d9_draw.h"              // kMaxStreams
+#include "hooks/hooks_d3d9_internal.h"  // kDrawGapCount, kMaxTrackedDecls
+
 namespace mx::hooks::d3d9 {
+
+// ---- constants the reports read ------------------------------------------
+
+// A draw report prints on whichever comes first, so a quiet period still gets
+// one and a busy one does not print per draw.
+constexpr uint64_t kDrawReportEvery = 2500;      // minimum draw delta
+constexpr int64_t kDrawReportPeriodMs = 2000;    // and at most this often
+
+constexpr uint32_t kMaxUnknownDecls = 16;
+constexpr uint32_t kDeviceScanBytes = 0x4000;
+constexpr uint32_t kDeviceScanDwords = kDeviceScanBytes / 4;
 
 // Tallies ABOUT the declaration table, which lives in hooks_d3d9_internal.h.
 //
@@ -40,5 +54,68 @@ struct DeclCensus {
 };
 
 extern DeclCensus g_declCensus;
+
+// WHICH declaration pointers were never seen created, not just how many: a bare
+// count cannot name the draw. A table with its own overflow tally, bounded at
+// 16 distinct pointers.
+struct UnknownDeclTable {
+  uint32_t ptr[kMaxUnknownDecls] = {};
+  uint64_t draws[kMaxUnknownDecls] = {};
+  uint32_t distinct = 0;
+  uint64_t overflow = 0;  // draws whose pointer did not fit the table
+};
+
+extern UnknownDeclTable g_unknownDecls;
+
+// Does the geometry the guest bound actually fit the draw it asked for?
+//
+// One object because these are one question asked four ways -- stride, vertex
+// buffer, index buffer, index range -- and reading any one of them without the
+// others has been misleading before: `checked` is the denominator for all of
+// them, and a fit count without it says nothing.
+struct DrawFitCensus {
+  uint64_t gaps[kDrawGapCount] = {};
+  uint64_t complete = 0;
+  uint64_t checked = 0;   // the denominator. Read the rest against this.
+
+  uint64_t strideOk = 0;
+  uint64_t strideTooSmall = 0;
+  uint64_t strideMismatch = 0;  // bound stride larger than the layout needs
+
+  uint64_t vbFits = 0, vbTooSmall = 0;
+  uint64_t ibFits = 0, ibTooSmall = 0;
+  uint64_t idxRangeFits = 0, idxRangeFails = 0, idxRangeUnread = 0;
+};
+
+extern DrawFitCensus g_drawFit;
+
+// The same questions again, but PER STREAM rather than totalled -- which is the
+// point: a total hides that one stream is responsible. Every member is indexed
+// by stream, so they share a denominator and can be read across.
+struct PerStreamCensus {
+  uint64_t bindAgeFitSum[mx::hle::kMaxStreams] = {};
+  uint64_t bindAgeFailSum[mx::hle::kMaxStreams] = {};
+  uint64_t bindAgeFailMax[mx::hle::kMaxStreams] = {};
+  uint64_t vbFits[mx::hle::kMaxStreams] = {};
+  uint64_t vbFails[mx::hle::kMaxStreams] = {};
+  uint64_t fileAgree[mx::hle::kMaxStreams] = {};
+  uint64_t fileDiffer[mx::hle::kMaxStreams] = {};
+  uint64_t fileRescues[mx::hle::kMaxStreams] = {};
+};
+
+extern PerStreamCensus g_perStream;
+
+// Which device dwords could be a fetch-constant file, narrowed across samples.
+// `reached` is the lowest end-of-readable seen, so a candidate past it was
+// never actually tested rather than tested and rejected.
+struct FetchConstScan {
+  bool cand0[kDeviceScanDwords];
+  bool cand1[kDeviceScanDwords];
+  bool primed = false;
+  uint32_t samples = 0;
+  uint32_t reached = kDeviceScanBytes;
+};
+
+extern FetchConstScan g_fcScan;
 
 }  // namespace mx::hooks::d3d9
