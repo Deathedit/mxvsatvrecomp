@@ -476,12 +476,19 @@ void ReportShaderNames() {
     return;
   }
   auto pct = [n](uint64_t v) { return v * 100.0 / double(n); };
-  REXLOG_INFO("d3d9: SHADER NAMES -- {} draws: both {} ({:.1f}%), vs-only {}, "
-              "ps-only {}, neither {} (of those, {} had no translated shader "
-              "to name)",
-              n, g_shaderNames.bothNamed, pct(g_shaderNames.bothNamed),
-              g_shaderNames.vsOnly, g_shaderNames.psOnly,
-              g_shaderNames.neither, g_shaderNames.noShader);
+  // IDENTIFIED is the number that matters for step 0: every draw whose shaders
+  // are either named or positively known to have no name. `unknown` is the only
+  // bucket that represents work still to do.
+  const uint64_t identified = g_shaderNames.bothNamed + g_shaderNames.vsOnly +
+                              g_shaderNames.psOnly + g_shaderNames.generated;
+  REXLOG_INFO("d3d9: SHADER NAMES -- {} draws: IDENTIFIED {} ({:.1f}%) = both "
+              "{} ({:.1f}%) + vs-only {} + ps-only {} + runtime-generated {}; "
+              "UNKNOWN {} ({:.1f}%); no translated shader {}",
+              n, identified, pct(identified), g_shaderNames.bothNamed,
+              pct(g_shaderNames.bothNamed), g_shaderNames.vsOnly,
+              g_shaderNames.psOnly, g_shaderNames.generated,
+              g_shaderNames.unknown, pct(g_shaderNames.unknown),
+              g_shaderNames.noShader);
   std::lock_guard<std::mutex> lk(g_shaderNames.mu);
   auto worst = [](const std::map<uint64_t, uint64_t>& m, const char* what) {
     if (m.empty()) return;

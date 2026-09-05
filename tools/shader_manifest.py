@@ -66,6 +66,15 @@ MASK64 = (1 << 64) - 1
 # candidate is noise regardless of what its header looks like.
 MIN_BLOB_BYTES = 64
 
+# Shortest window that identifies rather than coincides. Microcode is highly
+# structured -- long runs of zeros, repeated instruction patterns -- so a short
+# window matches by accident in 5 MB of it.
+MIN_WINDOW_BYTES = 32
+
+# What a key maps to when the blob has no asset correspondence at all. This is
+# NOT a failure to name: there is nothing to name it after.
+GENERATED_MARKER = "!runtime-generated"
+
 
 def load_shader_reader():
     """tools/shader_reader.py already decodes entry names and constant tables."""
@@ -248,43 +257,68 @@ def main():
         print(f"  NOT DERIVED ({absent}) -- patched at load, or the filter is "
               f"too tight. First few: {', '.join(missing)}")
 
-    # A blob the assets cannot reproduce is one the guest PATCHED at load, so no
-    # hash of asset bytes will ever name it. But the dump holds the post-patch
-    # bytes, so it can still be named -- located by a window from the MIDDLE of
-    # the blob (the heads are shared, and anchoring there names the wrong entry)
-    # and attributed to the last entry name declared before the hit.
+    # CLASSIFY what the assets could not reproduce, instead of lumping it all
+    # under "unnamed". Two very different things land here:
     #
-    # Additive on purpose: the asset walk covers every entry point in the game,
-    # this covers the patched shaders that have actually been observed. Dropping
-    # it to keep the tool "pure" would lose coverage the old dump-only manifest
-    # already had.
-    added = 0
+    #   PATCHED   -- the guest rewrote part of an asset shader at load, so the
+    #                exact key misses but most of the body survives. Locatable
+    #                by a window, and genuinely nameable.
+    #   GENERATED -- built by the guest at runtime (clears, blits, depth-only
+    #                passes). No asset correspondence at all, so there is no
+    #                name to find and no corpus will ever supply one.
+    #
+    # The split is MEASURED, not a size rule. A blob counts as patched only if a
+    # window of at least HALF its length is found in an asset. Scaling with the
+    # blob is what defeats the trap that produced the first version of this: a
+    # fixed 64-byte needle is only 20 bytes on a 9-dword shader, and a 20-byte
+    # match in 5 MB of microcode is a coincidence, not an identification.
+    patched = generated = tiny = 0
     for bp in blobs:
         le = open(bp, "rb").read()
-        if len(le) < MIN_BLOB_BYTES:
-            continue
         key = code_key_be(swap32(le))
+        if len(le) < MIN_BLOB_BYTES:
+            # Too short to identify by content -- a window long enough to mean
+            # anything would be most of the shader. Skipping these left three of
+            # the twelve keys the census reported with no entry at all, which
+            # reads at runtime as "not in the map" when the truth is "nothing to
+            # find". Classified rather than dropped.
+            if key not in names:
+                names[key] = GENERATED_MARKER
+                tiny += 1
+            continue
         if key in names:
             continue
         be = swap32(le)
+        half = max(MIN_WINDOW_BYTES, (len(be) // 2) & ~3)
         mid = (len(be) // 2) & ~3
-        needle = be[mid:mid + 64]
-        for path, buf in assets.items():
-            off = buf.find(needle)
-            if off < 0:
-                continue
-            rel = os.path.relpath(path, args.assets).replace("\\", "/")
-            before = [n for o, n in sr.find_entry_names(buf) if o < off]
-            if before:
-                names[key] = f"{rel}::{before[-1]}"
-                added += 1
-            break
-    if added:
-        with open(args.names, "w", encoding="utf-8") as f:
-            for k in sorted(names):
-                f.write("%016X\t%s\n" % (k, names[k]))
-        print(f"  added {added} patched-shader keys from the dump; "
-              f"{len(names)} keys total")
+        needle = be[mid:mid + half]
+        if len(needle) < MIN_WINDOW_BYTES:
+            needle = be[:half]
+        placed = False
+        if len(needle) >= MIN_WINDOW_BYTES:
+            for path, buf in assets.items():
+                off = buf.find(needle)
+                if off < 0:
+                    continue
+                rel = os.path.relpath(path, args.assets).replace(os.sep, "/")
+                before = [n for o, n in sr.find_entry_names(buf) if o < off]
+                if before:
+                    names[key] = rel + "::" + before[-1]
+                    patched += 1
+                    placed = True
+                break
+        if not placed:
+            names[key] = GENERATED_MARKER
+            generated += 1
+
+    with open(args.names, "w", encoding="utf-8") as f:
+        for k in sorted(names):
+            f.write("%016X\t%s\n" % (k, names[k]))
+    print("  patched, located by a half-length window : %d" % patched)
+    print("  GENERATED, no asset correspondence       : %d" % generated)
+    print("  GENERATED, under %d bytes to match         : %d"
+          % (MIN_BLOB_BYTES, tiny))
+    print("  %d keys total" % len(names))
 
 
 if __name__ == "__main__":

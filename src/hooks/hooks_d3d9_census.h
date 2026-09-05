@@ -200,12 +200,21 @@ extern GpuFetchCensus g_gpuFetch;
 // `unnamedVs` / `unnamedPs` hold the code_keys that missed, which is what makes
 // the miss actionable: dump those blobs, re-run the tool, and the map grows.
 struct ShaderNameCensus {
+  // The six buckets are exclusive and sum to `draws`, so nothing hides in a
+  // remainder. `generated` and `unknown` used to be one bucket called
+  // `neither`, which conflated two opposite things: a shader the guest built at
+  // runtime has no name to find and is not a gap, while one missing from the
+  // map is. Reporting them together made step 0 look 48% short when most of
+  // that was work that does not exist.
   uint64_t draws = 0;        // every draw that reached the census
   uint64_t bothNamed = 0;    // vertex AND pixel resolved
   uint64_t vsOnly = 0;
   uint64_t psOnly = 0;
-  uint64_t neither = 0;      // includes draws with no translated shader
-  uint64_t noShader = 0;     // of `neither`: nothing translated to name
+  uint64_t generated = 0;    // no named stage, and every stage present is
+                             // positively identified as runtime-generated
+  uint64_t unknown = 0;      // no named stage, and at least one is simply
+                             // missing from the map -- the real gap
+  uint64_t noShader = 0;     // nothing translated at all, so nothing to name
   std::mutex mu;
   // A cap so a pathological run cannot grow these without bound. It is 512
   // rather than 64 because 64 SATURATED on the first real run -- the vertex

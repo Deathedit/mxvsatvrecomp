@@ -137,10 +137,15 @@ struct TranslatedShader {
   // into a table loaded once and never erased, so it outlives every draw, and
   // a draw reading it pays a deref rather than a refcount.
   //
-  // Null is a real answer, not a default -- the guest patches some shaders at
-  // load, so their content cannot match the assets. Anything reporting on this
-  // must count the nulls; see the SHADER NAMES census.
+  // Null is a real answer, not a default. Two distinct reasons produce it and
+  // `runtime_generated` separates them.
   const std::string* name = nullptr;
+  // The manifest positively identified this shader as built by the guest at
+  // runtime -- a clear, a blit, a depth-only pass -- rather than loaded from a
+  // .shader asset. Measured offline: no window of even half the blob appears
+  // anywhere in the assets. There is no name to find, so a draw running one is
+  // NOT a coverage failure and must not be reported as one.
+  bool runtime_generated = false;
 };
 
 // INSIDE the texture bucket. A finer breakdown is worth having only once one

@@ -2237,21 +2237,34 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
       const bool vn = v && v->name;
       const bool pn = p && p->name;
       ++g_shaderNames.draws;
-      if (vn && pn) ++g_shaderNames.bothNamed;
-      else if (vn) ++g_shaderNames.vsOnly;
-      else if (pn) ++g_shaderNames.psOnly;
-      else {
-        ++g_shaderNames.neither;
-        if (!v && !p) ++g_shaderNames.noShader;
+      if (vn && pn) {
+        ++g_shaderNames.bothNamed;
+      } else if (vn) {
+        ++g_shaderNames.vsOnly;
+      } else if (pn) {
+        ++g_shaderNames.psOnly;
+      } else if (!v && !p) {
+        ++g_shaderNames.noShader;
+      } else if ((!v || v->runtime_generated) &&
+                 (!p || p->runtime_generated)) {
+        // Every stage that exists is one the guest built itself. Nothing to
+        // name, so this is not a gap.
+        ++g_shaderNames.generated;
+      } else {
+        ++g_shaderNames.unknown;
       }
-      // Which shaders missed, by the key the map is keyed on, so the answer is
-      // "dump these and re-run the tool" rather than a bare percentage.
-      if ((v && !v->name) || (p && !p->name)) {
+      // Which shaders are the REAL gap, by the key the map is keyed on, so the
+      // answer is "dump these and re-run the tool". A runtime-generated shader
+      // is deliberately not recorded here: re-running the tool cannot help it,
+      // and listing it would send the next reader after work that does not
+      // exist.
+      if ((v && !v->name && !v->runtime_generated) ||
+          (p && !p->name && !p->runtime_generated)) {
         std::lock_guard<std::mutex> lk(g_shaderNames.mu);
-        if (v && !v->name &&
+        if (v && !v->name && !v->runtime_generated &&
             g_shaderNames.unnamedVs.size() < ShaderNameCensus::kMaxUnnamed)
           ++g_shaderNames.unnamedVs[VertexShaderContentId(vs_h)];
-        if (p && !p->name &&
+        if (p && !p->name && !p->runtime_generated &&
             g_shaderNames.unnamedPs.size() < ShaderNameCensus::kMaxUnnamed)
           ++g_shaderNames.unnamedPs[PixelShaderContentId(ps_h)];
       }

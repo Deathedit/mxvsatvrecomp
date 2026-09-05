@@ -169,10 +169,26 @@ const std::unordered_map<uint64_t, std::string>& ShaderNames() {
   return names;
 }
 
-const std::string* ShaderNameFor(uint64_t code_key) {
+// What the manifest writes for a blob with no asset correspondence. Kept as a
+// string in the map rather than a second file so there is one thing to load and
+// one thing to keep in step with the tool.
+constexpr const char* kRuntimeGeneratedMarker = "!runtime-generated";
+
+// Null name plus generated=false means "not in the map"; null name plus
+// generated=true means "nothing to name it after". The census reports those
+// separately, so resolving the marker here is what keeps it able to.
+void ResolveShaderName(uint64_t code_key, const std::string*& name,
+                       bool& generated) {
+  name = nullptr;
+  generated = false;
   const auto& m = ShaderNames();
   const auto it = m.find(code_key);
-  return it == m.end() ? nullptr : &it->second;
+  if (it == m.end()) return;
+  if (it->second == kRuntimeGeneratedMarker) {
+    generated = true;
+    return;
+  }
+  name = &it->second;
 }
 
 std::string ShaderCachePath(mx::hle::HlslStage stage, uint64_t key) {
@@ -754,7 +770,7 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
     kept.max_const_index = out.max_const_index;
     // The guest's own name for this shader, resolved from the code_key already
     // computed at the top of this function. Once per shader, never per draw.
-    kept.name = ShaderNameFor(code_key);
+    ResolveShaderName(code_key, kept.name, kept.runtime_generated);
     // FROM `out`, THE MAIN TRANSLATION -- not from the fetch variant. These were
     // originally set only in the vfetch block below, from `fetched`, while every
     // other field here comes from `out`. That made the mask describe a DIFFERENT
