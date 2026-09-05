@@ -19,6 +19,8 @@
 #include <map>
 #include <vector>
 
+#include "gpu/d3d9_draw.h"     // HleStream, kMaxStreams
+#include "gpu/d3d9_layout.h"   // D3D9Element, LayoutError
 #include "gpu/d3d9_state.h"
 #include "gpu/hle_types.h"
 #include "gpu/shader_ucode.h"

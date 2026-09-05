@@ -11,11 +11,6 @@
 
 #pragma once
 
-// ORDER MATTERS. hooks_d3d9_internal.h names mx::hle types (HleStream,
-// D3D9Element, LayoutError) and rex::graphics::xenos, and does not include their
-// headers itself -- in the original single TU it was included near the BOTTOM of
-// a long include block. Including it first here fails with a page of "no member
-// named ... in namespace mx::hle".
 #include <rex/cvar.h>
 #include <rex/graphics/format/ucode.h>
 
@@ -27,7 +22,6 @@
 #include "gpu/shader_hlsl.h"
 #include "gpu/shader_ucode.h"
 #include "gpu/xenos_gpu_state.h"
-
 #include "hooks/hooks_d3d9_internal.h"
 
 #include <cstdint>
