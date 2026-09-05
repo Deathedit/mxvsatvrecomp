@@ -9,11 +9,8 @@
 
 #include <rex/cvar.h>
 
-#include <timeapi.h>  // timeBeginPeriod, for the frame-pacing sleep below
-
 #include <algorithm>
 #include <atomic>
-#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -22,7 +19,6 @@
 #include <mutex>
 #include <set>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -42,147 +38,6 @@
 // tools/ has bxml decoders but no encoder. Empty means off. Diagnostic only.
 REXCVAR_DEFINE_STRING(registry_override, "", "Debug",
                       "Comma-separated key=value overrides for guest registry string reads");
-
-// sub_82B34998 -- RendererDispatchBlock, called from LoaderTick on the
-// Transition thread. `f1` arriving here is the frame delta, and it reading
-// exactly 0.00 is what found the frame-pacing bug.
-REX_IMPORT(__imp__sub_82B34998, orig_RendererDispatch, void());
-extern "C" REX_FUNC(sub_82B34998) {
-  static int rd = 0;
-  ++rd;
-  const bool loud = rd <= 20 || (rd % 500) == 0;
-  const uint32_t a1 = ctx.r3.u32;
-  const double dt = ctx.f1.f64;
-  orig_RendererDispatch(ctx, base);
-  if (loud) {
-    REXLOG_INFO("native: RendererDispatch #{} a1=0x{:08X} f1={:.6f} -> r3=0x{:08X}",
-                rd, a1, dt, ctx.r3.u32);
-  }
-}
-
-// sub_82B3C7D0 -- accessor for dword_830BE190, with a null assert.
-//
-//   result = dword_830BE190;
-//   if (!dword_830BE190) sub_82AB73C0(61568);   // assert helper, line number
-//   return result;
-//
-// It was labelled "lazy-init alloc (hangs in Transition thread in native)". Both
-// halves are wrong: it allocates nothing, and a load / branch / return cannot
-// hang. Measured as well as decompiled -- called twice, returns 0x212859A0 both
-// times, assert path never taken. Kept, and mode-neutral, for the one thing
-// worth watching: whether dword_830BE190 is ever null.
-REX_IMPORT(__imp__sub_82B3C7D0, orig_GetEngineGlobal, void());
-extern "C" REX_FUNC(sub_82B3C7D0) {
-  static int li = 0;
-  ++li;
-  orig_GetEngineGlobal(ctx, base);
-  const bool null_global = ctx.r3.u32 == 0;
-  if (li <= 5 || null_global) {
-    REXLOG_INFO("native: GetEngineGlobal(sub_82B3C7D0) #{} -> 0x{:08X}{}",
-                li, ctx.r3.u32, null_global ? "  <-- NULL, assert path" : "");
-  }
-}
-
-// sub_82B70370 -- frame pacing: QPC delta / perf frequency -> dt at a1+24, then
-// a 5-sample smoothing pass and the running totals at a1+56/60/64.
-//
-// This was stubbed once, and that stub was the reason the front end never ran:
-// it wrote a fixed 1/60 to a1+24 and nothing else, so a1+60 never advanced and
-// the dt reaching LoaderTick's RendererDispatch was exactly 0.00. Unstubbing
-// took the script VM from 28 dispatches to 686 and Bink opens from 0 to 3.
-//
-// The stub's two stated hazards were both false and neither had been checked
-// against the guest code:
-//
-//   - "a1+20 drives a busy-wait". True of the field, but a1+20 held the FLT_MAX
-//     sentinel that disables the spin. It no longer does -- the SetupRenderer
-//     hook writes a real cap there -- so PaceFrame below sleeps the slack the
-//     spin would otherwise burn.
-//   - "a1+32 is an unbounded store offset". It is a bounded 5-entry ring at
-//     a1+36..a1+52, guarded by `if (*(a1+28))`.
-
-namespace {
-
-// Left to the guest's spin on purpose. sleep_until is accurate to roughly a
-// millisecond even at 1ms timer resolution, so sleeping the whole remainder
-// would overshoot the cap and make every frame slightly long; undershooting by
-// this much and letting the guest close the gap keeps the cap exact.
-constexpr auto kSpinSlack = std::chrono::microseconds(1200);
-
-// Sleep the frame's slack instead of spinning it away.
-//
-// The guest's cap at a1+20 is a floor on frame time, enforced at 0x82B703D4 by
-// a raw mftb loop with no yield -- on the console a few cycles a pass, here a
-// recompiled call plus a timebase query plus a divide, at whatever rate the
-// host core will run it. Sleeping until just short of that floor leaves the
-// spin nothing to do but confirm the edge, and the dt the guest goes on to
-// measure is still its own.
-void PaceFrame(uint32_t cap_bits) {
-  if (cap_bits == 0x7F7FFFFFu) return;  // the guest's own "no cap" sentinel
-  const float cap = std::bit_cast<float>(cap_bits);
-  if (!(cap > 0.0f) || cap > 1.0f) return;  // junk, or slower than 1 fps
-
-  // Windows' default timer granularity is 15.6ms and cannot express a 33ms
-  // period cleanly. Asked for once and never given back, which is what a game
-  // does.
-  static const bool s_period = [] { return timeBeginPeriod(1) == TIMERR_NOERROR; }();
-  (void)s_period;
-
-  const auto period =
-      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-          std::chrono::duration<float>(cap));
-  static std::chrono::steady_clock::time_point s_next{};
-  const auto now = std::chrono::steady_clock::now();
-  // First call, or a frame that overran its budget: re-base rather than try to
-  // make the time back. Catching up would run several frames uncapped, which
-  // is the condition a cap exists to prevent.
-  if (s_next.time_since_epoch().count() == 0 || now >= s_next) {
-    s_next = now + period;
-    return;
-  }
-  if (s_next - now > kSpinSlack) std::this_thread::sleep_until(s_next - kSpinSlack);
-  s_next += period;
-}
-
-}  // namespace
-
-REX_IMPORT(__imp__sub_82B70370, orig_Timing, void());
-extern "C" REX_FUNC(sub_82B70370) {
-  static int tm = 0;
-  ++tm;
-  const uint32_t a1 = ctx.r3.u32;
-  // The guards are what make this call safe, so record them once rather than
-  // trusting the reading above to still hold.
-  if (tm == 1 && a1) {
-    REXLOG_INFO("native: Timing guards +20=0x{:08X} (FLT_MAX={}) +28=0x{:08X} +32=0x{:08X}",
-                REX_LOAD_U32(a1 + 20),
-                REX_LOAD_U32(a1 + 20) == 0x7F7FFFFFu, REX_LOAD_U32(a1 + 28),
-                REX_LOAD_U32(a1 + 32));
-  }
-  // Before the original, so the sleep is part of the delta it measures.
-  if (a1) PaceFrame(REX_LOAD_U32(a1 + 20));
-  orig_Timing(ctx, base);
-  if ((tm <= 5 || (tm % 1000) == 0) && a1) {
-    REXLOG_INFO("native: Timing #{} dt={:.6f} total={:.3f} a1=0x{:08X}",
-                tm, std::bit_cast<float>(REX_LOAD_U32(a1 + 24)),
-                std::bit_cast<float>(REX_LOAD_U32(a1 + 60)), a1);
-  }
-}
-
-// sub_82B6D230 -- called from LoaderTick's entity block with f1=dt. It iterates
-// a vector calling sub_82B6A448(elem, dt) on each, so it is an entity update
-// pass, not the "frontier probe" it was labelled as. That label said execution
-// "reaches TexManager then dies" here; it does not, and ENTER and RETURNED
-// balance 5/5 across three runs.
-REX_IMPORT(__imp__sub_82B6D230, orig_EntityDt, void());
-extern "C" REX_FUNC(sub_82B6D230) {
-  static int ed = 0;
-  ++ed;
-  bool loud = ed <= 5;
-  if (loud) REXLOG_INFO("native: sub_82B6D230 #{} ENTER", ed);
-  orig_EntityDt(ctx, base);
-  if (loud) REXLOG_INFO("native: sub_82B6D230 #{} RETURNED", ed);
-}
 
 // sub_8253AA40 — AssetDB_LoadStateMachine (LoaderTick's gate, 12-state)
 REX_IMPORT(__imp__sub_8253AA40, orig_LoadStateMachine, void());
