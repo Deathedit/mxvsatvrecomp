@@ -333,6 +333,19 @@ void ClearGameDraws();
 // the number that survived them.
 void ReportAddGameDrawsCost(uint64_t microseconds, uint32_t draws);
 
+  // The tail of RenderGameFrame: reads counters, prints every 20th drawn
+  // frame, changes nothing. Called only from RenderGameFrame.
+  //
+  // The three parameters are the per-frame full-size-target tally, accumulated
+  // in the draw loop and read only here. Passed rather than promoted to members
+  // because they are frame-scoped: as members they would need clearing at the
+  // top of every frame, and a missed clear is a slow leak that reads as a real
+  // measurement.
+  void ReportGameFrameTelemetry(
+      const std::unordered_set<uint32_t>& fullSizeTargets,
+      uint32_t fullSizeDraws,
+      const std::vector<std::pair<uint32_t, uint32_t>>& fullSizeOrder);
+
   [[nodiscard]] ID3D12Device* GetDevice() const noexcept { return m_device.Get(); }
   [[nodiscard]] ID3D12GraphicsCommandList* GetCommandList() const noexcept {
     return m_commandList.Get();

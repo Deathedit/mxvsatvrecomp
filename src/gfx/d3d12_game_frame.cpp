@@ -2007,6 +2007,27 @@ void D3D12Renderer::RenderGameFrame() {
 
   }
 
+  // Every counter this frame touched is read here and nowhere else.
+  ReportGameFrameTelemetry(fullSizeTargets, fullSizeDraws, fullSizeOrder);
+}
+
+
+// Per-frame telemetry, split out of RenderGameFrame.
+//
+// This file's own header says splitting a function body is a behaviour risk
+// rather than a move, and that rule is right -- so the claim was checked rather
+// than asserted, and it was WRONG. The block reads members and its own
+// function-local statics, AND three frame-scoped locals of RenderGameFrame:
+// fullSizeTargets, fullSizeDraws and fullSizeOrder. The compiler named all
+// three on the first build, which is exactly why this rule is worth having.
+// They are parameters now, so the dependency is written down instead of
+// implied by scope.
+// It is called from the same place, at the end of the frame, so the 20-frame
+// cadence and every value it prints are unchanged.
+void D3D12Renderer::ReportGameFrameTelemetry(
+    const std::unordered_set<uint32_t>& fullSizeTargets,
+    uint32_t fullSizeDraws,
+    const std::vector<std::pair<uint32_t, uint32_t>>& fullSizeOrder) {
   // Cumulative, every 20 frames that drew anything, with distinct live targets
   // beside the cap -- together they say whether the budget is comfortable or
   // about to be exhausted; the count alone does not. Twenty, not 100: frames
