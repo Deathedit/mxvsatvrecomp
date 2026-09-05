@@ -12,6 +12,32 @@
 
 #include "hooks/hook_common.h"
 
+#include <rex/cvar.h>
+
+#include <bit>
+
+// The guest has its own frame limiter and it is switched off in our runs.
+//
+// sub_82B70370, the pacer LoaderTick calls first, spins while dt is below
+// engine+0x14 -- a minimum frame time in seconds, with FLT_MAX as the "no cap"
+// sentinel the Engine constructor installs. The only thing that replaces the
+// sentinel is SetupRenderer reading the "Game"/"VSync" setting: "30HZ" calls
+// engine->vt[0] (SetMaxFrameRate, `engine+0x14 = 1.0f/fps`) with 30.0f, "60HZ"
+// with 60.0f, and anything else -- including a missing key -- leaves the cap
+// alone. Every run logs `Timing guards +20=0x7F7FFFFF`, so the shipped data
+// reads as neither.
+//
+// 30 is the rate the engine is built around: the constructor seeds all five
+// slots of the dt smoothing ring with 0.033333 and their sum with 0.166665.
+//
+// Two things to know before reading a result. The cap is a BUSY SPIN with no
+// yield, on the Transition thread. And it is a floor on frame time, so it can
+// only ever slow a frame down: where we already run slower than the cap it
+// does nothing at all, which is most of a level.
+REXCVAR_DEFINE_INT32(guest_frame_cap_fps, 30, "Debug",
+                     "Force the guest's own frame cap (engine+0x14) to this "
+                     "rate after SetupRenderer. 0 keeps the guest's value");
+
 //=============================================================================
 // GPU renderer shim (Path 2) -- DIAGNOSTIC HOOKS DISABLED.
 //
@@ -27,9 +53,23 @@
 
 REX_IMPORT(__imp__sub_82B71148, orig_SetupRenderer, void());
 extern "C" REX_FUNC(sub_82B71148) {
-  REXLOG_INFO("native: SetupRenderer ENTER (0x82B71148)");
+  // `mr r31, r3` at 0x82B7115C: r3 is the Engine, the object every +0x14 /
+  // +0x190 / +0x2DC store in this function writes to. Captured before the
+  // original runs, which is free to clobber r3.
+  const uint32_t engine = ctx.r3.u32;
+  REXLOG_INFO("native: SetupRenderer ENTER (0x82B71148) engine=0x{:08X}", engine);
   orig_SetupRenderer(ctx, base);
   REXLOG_INFO("native: SetupRenderer RETURNED");
+
+  const int cap_fps = REXCVAR_GET(guest_frame_cap_fps);
+  if (cap_fps > 0 && engine) {
+    const uint32_t before = REX_LOAD_U32(engine + 0x14u);
+    const float min_frame = 1.0f / static_cast<float>(cap_fps);
+    REX_STORE_U32(engine + 0x14u, std::bit_cast<uint32_t>(min_frame));
+    REXLOG_INFO("native: guest frame cap engine+0x14 0x{:08X} -> {} fps "
+                "({:.6f}s), read back 0x{:08X}",
+                before, cap_fps, min_frame, REX_LOAD_U32(engine + 0x14u));
+  }
 
   // DORMANT fallback. SetupRenderer's vt[17] writes `*(eng+8) = assetdb_block`
   // -- the 545KB block allocated and initialized alongside it. This existed
