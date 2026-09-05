@@ -20,7 +20,10 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <atomic>
+#include <cstdlib>
 #include <fstream>
+#include <unordered_map>
 
 // For the emitter coverage probe only: emitting HLSL the compiler then rejects
 // is exactly as useless as refusing to emit, so the probe compiles what it
@@ -1707,6 +1710,70 @@ bool ReadBoundPixelShader(uint32_t device, uint8_t* base, uint32_t& handle,
 // turn and refusing any that is not resident for its whole extent. Returns the
 // mirror that worked, or 0. `base` looks unused and is not: REX_RAW_ADDR expands
 // to reference a variable of that name in scope.
+// THE TEXTURE NAME, joined by CONTENT. HleTextureKey hashes the six fetch
+// dwords, so it is an address and an extent, never the picture: the same image
+// at a new address is a new key, and the key says nothing about what it shows.
+//
+// tools/texture_manifest.py hashes the raw, tiled, big-endian level 0 of every
+// .texture asset -- the guest's own representation, so neither side decodes and
+// there is nothing to disagree about. 3364 of 3458 distinct contents resolve to
+// one name; 94 are genuinely two assets sharing a level 0 and are absent.
+//
+// Level 0 alone because the runtime's mip chain is normalised and the asset's
+// is the full authored one; level 0 is what both always hold.
+const std::unordered_map<uint64_t, std::string>& TextureNames() {
+  static const std::unordered_map<uint64_t, std::string> names = [] {
+    std::unordered_map<uint64_t, std::string> m;
+    std::ifstream f("userdata/texture_names.txt");
+    if (!f) {
+      REXLOG_INFO("d3d9: userdata/texture_names.txt absent -- textures will "
+                  "report unnamed. Build it with tools/texture_manifest.py");
+      return m;
+    }
+    std::string line;
+    while (std::getline(f, line)) {
+      const size_t tab = line.find('\t');
+      if (tab != 16) continue;
+      char* end = nullptr;
+      const uint64_t key =
+          std::strtoull(line.substr(0, tab).c_str(), &end, 16);
+      if (!end || *end) continue;
+      std::string name = line.substr(tab + 1);
+      while (!name.empty() && (name.back() == '\r' || name.back() == '\n'))
+        name.pop_back();
+      m.emplace(key, std::move(name));
+    }
+    REXLOG_INFO("d3d9: texture names loaded: {} entries", m.size());
+    return m;
+  }();
+  return names;
+}
+
+// FNV-1a 64 over the level-0 bytes of the blob CopyTexturePhysical built.
+// Level 0 always starts at offset 0 there; its size is its own pitch, which is
+// NOT the fetch constant's pitch for any level but this one.
+//
+// Returns 0 when the level cannot be measured, which is also the "no hash"
+// value -- a texture with no describable level 0 has no content to join on.
+uint64_t TextureContentKey(const mx::hle::HleTextureSource& source,
+                           const std::vector<uint8_t>& guest) {
+  if (source.level_count == 0 || source.bytes_per_block == 0) return 0;
+  const auto& l0 = source.levels[0];
+  const uint64_t bytes = uint64_t(l0.pitch_blocks) * source.bytes_per_block *
+                         l0.height_blocks;
+  if (bytes == 0 || bytes > guest.size()) return 0;
+  uint64_t h = 1469598103934665603ull;
+  for (uint64_t i = 0; i < bytes; ++i) {
+    h ^= guest[size_t(i)];
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+
+// Counted on EVERY decode, so the denominator is every texture the runtime
+// built rather than the ones that happened to resolve.
+std::atomic<uint64_t> g_texNameSeen{0}, g_texNameHit{0}, g_texNameNoKey{0};
+
 uint32_t CopyGuestExtent(uint32_t address, uint32_t bytes, uint8_t* base,
                          std::vector<uint8_t>& dst, size_t at) {
   if (!address || !bytes) return 0;
@@ -2713,6 +2780,38 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     ++g_slotFailCopy;
     ReportSlotFailures();
     return false;
+  }
+  // NAME IT, from the guest bytes, before anything decodes them. Counted on
+  // every copy so the denominator is every texture the runtime built -- not
+  // the ones that happened to resolve, which would make the rate meaningless.
+  {
+    ++g_texNameSeen;
+    const uint64_t ckey = TextureContentKey(source, guest);
+    if (!ckey) {
+      ++g_texNameNoKey;
+    } else {
+      const auto& tn = TextureNames();
+      const auto it = tn.find(ckey);
+      if (it != tn.end()) {
+        ++g_texNameHit;
+        // The first few by name, because a percentage cannot be checked by eye
+        // and "ATV_Alpha_Combo at 256x256 DXT4_5" can.
+        static std::atomic<uint32_t> s_shown{0};
+        if (s_shown++ < 12)
+          REXLOG_INFO("d3d9: texture named: {} ({}x{} {}) key {:016X}",
+                      it->second, source.width, source.height,
+                      mx::hle::GuestTextureFormatName(source.guest_format),
+                      ckey);
+      }
+    }
+    const uint64_t n = g_texNameSeen.load();
+    if ((n % 2000) == 0)
+      REXLOG_INFO("d3d9: TEXTURE NAMES -- {} decodes, {} named ({:.1f}%), {} "
+                  "had no measurable level 0. Unnamed is a render target, a "
+                  "glyph atlas, or an asset whose level 0 is shared",
+                  n, g_texNameHit.load(),
+                  g_texNameHit.load() * 100.0 / double(n),
+                  g_texNameNoKey.load());
   }
   auto payload = std::make_shared<HleTexturePayload>();
   bool decoded_ok = false;
