@@ -1,11 +1,25 @@
 // D3D9 guest entry points.
 //
-// The 17 REX_FUNC hooks the recompiler routes the guest's D3D9 calls through,
-// plus the eight render-state hooks and the helpers only they use. extern "C",
-// so they reach into the layer's namespace through hooks_d3d9_internal.h.
+// The REX_FUNC hooks the recompiler routes the guest's D3D9 calls through, plus
+// the macro-generated render-state hooks and the helpers only they use.
+// extern "C", so they reach into the layer's namespace through
+// hooks_d3d9_internal.h.
 //
-// Every hook calls its original exactly once and opens with MX_D3D9_HLE_LOCK.
-// Use that macro on anything added here.
+// Deliberately no count here. This said "the 17 REX_FUNC hooks" while there
+// were 23 and nine render-state leaves, because a number in a comment goes
+// stale the first time someone adds a hook and nothing checks it. Count them if
+// you need the figure:
+//
+//   grep -c '^extern "C" REX_FUNC' src/hooks/hooks_d3d9_entry.cpp
+//
+// Two families that used to live here are now their own translation units, both
+// of them entry points and neither of them small: Resolve and Clear are in
+// hooks_d3d9_resolve.cpp, and the PM4 scanning that sat behind
+// ExecuteCommandBuffer is in hooks_d3d9_pm4.cpp.
+//
+// Every hook calls its original exactly once and opens with MX_D3D9_HLE_LOCK,
+// which is defined in hooks_d3d9_internal.h -- there is exactly one definition
+// of it in src/ and it must stay that way. Use it on anything added here.
 
 #include "gpu/health.h"
 #include "hooks/hook_common.h"

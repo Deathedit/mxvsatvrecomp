@@ -339,7 +339,9 @@ name their layer: `#include "gpu/pm4_parser.h"`.
 | `src/gfx/d3d12_game.cpp` | Pipeline + PSO caches, root signatures, guest to host format conversion |
 | `src/gfx/d3d12_game_bind.cpp` | Descriptor-table construction for the translated path (textures, samplers, vertex constants) |
 | `src/gfx/d3d12_game_resource.cpp` | GPU resources: texture upload/evict, EDRAM ownership, render/depth targets, snapshots, readback |
-| `src/gfx/d3d12_game_frame.cpp` | Per-frame submission: `RenderGameFrame`, `AddGameDraw`, present |
+| `src/gfx/d3d12_game_frame.cpp` | Per-frame submission: `RenderGameFrame` and present. CONSUMES the draw list |
+| `src/gfx/d3d12_game_drawlist.cpp` | The draw-list API: `AddGameDraw` and the five specialised appends, plus clear/drain. BUILDS the list |
+| `src/gfx/d3d12_game_telemetry.cpp` | `ReportGameFrameTelemetry` -- reads counters and prints, every 20th drawn frame |
 | `src/gpu/pm4_parser.*` | PM4 command buffer parser (Type-0/2/3, ring wrap, dump) |
 | `src/gpu/hle_types.*` | Shared HLE data model (`DrawCall`, textures, topology) + the two primitive expansions |
 | `src/gpu/xenos_gpu_state.*` | Xenos register shadow, snapshot/diff |
@@ -355,6 +357,11 @@ name their layer: `#include "gpu/pm4_parser.h"`.
 | `src/hooks/hooks_d3d9.cpp` | The D3D9 HLE layer: state shadow, draw submission, vertex apply, shader compile, reporting. The largest file in the project |
 | `src/hooks/hooks_d3d9_entry.cpp` | Every D3D9 guest entry point (26 `REX_FUNC` plus 8 macro-generated render-state leaves). The only D3D9 file with hook macros in it |
 | `src/hooks/hooks_d3d9_texture.cpp` | Texture resolution, decode and upload; glyph cache; the pixel-shader texture profile |
+| `src/hooks/hooks_d3d9_resolve.cpp` | `D3DDevice_Resolve` and `D3DDevice_Clear` -- ordered events on a render target, not draws |
+| `src/hooks/hooks_d3d9_cmdbuf.cpp` | Command-buffer record and replay: the submission path with no D3D9 draw call in it |
+| `src/hooks/hooks_d3d9_pm4.cpp` | PM4 packet decode for those buffers -- the constants they write, and the replay census |
+| `src/hooks/hooks_d3d9_shader_compile.cpp` | Xenos microcode -> HLSL: emit, FXC, the DXBC disk cache and the compile worker |
+| `src/hooks/hooks_d3d9_patchrule.cpp` | What `PatchVertexShaderToMatchVertexDeclaration` writes into a shader, worked out by capture |
 | `src/hooks/texture_dump.cpp` | Decoded-texture PNG dump (WIC). No guest ABI |
 | `src/hooks/hooks_frame.cpp` | VdSwap, XenosWait, Begin/EndFrame, GpuState |
 | `src/hooks/hooks_boot.cpp` | Bootstrap, GraphicsInit, TexManager, GpuAlloc |
