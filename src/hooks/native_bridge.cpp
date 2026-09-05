@@ -1,5 +1,10 @@
 #include "hooks/native_bridge.h"
 
+// The header only forward-declares D3D12Renderer. This is the one place
+// that calls through the pointer, so this is the one place that needs the
+// definition.
+#include "gfx/d3d12_renderer.h"
+
 namespace mx::native {
 
 namespace {

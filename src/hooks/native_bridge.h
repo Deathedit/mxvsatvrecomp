@@ -13,7 +13,16 @@
 #include <rex/hook.h>
 #include <rex/logging.h>
 
-#include "gfx/d3d12_renderer.h"
+// FORWARD DECLARED, not included. This header uses D3D12Renderer in exactly
+// three places and all three are pointers: SetRenderer, Attach, and the
+// m_renderer member. Including gfx/d3d12_renderer.h here pulled 2000 lines --
+// plus <d3d12.h> and <dxgi1_6.h> -- into every hook translation unit, because
+// hook_common.h includes this file and ten hook TUs include that.
+//
+// gpu/hle_types.h DOES have to be included: m_drawCalls is a vector<DrawCall>
+// by value, so the complete type is required.
+class D3D12Renderer;
+
 #include "gpu/hle_types.h"
 
 namespace mx::native {
