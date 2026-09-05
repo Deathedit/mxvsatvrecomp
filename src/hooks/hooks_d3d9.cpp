@@ -953,7 +953,7 @@ bool VportScaleEnabled(uint32_t device, uint8_t* base) {
   // stream says its value is 0x300; if this slot does not read 0x300 the
   // derivation is wrong. Logged once per distinct value, capped.
   static std::map<uint32_t, bool> s_vals;
-  if (REXCVAR_GET(hle_capture) && s_vals.size() < 4 &&
+  if (REXCVAR_GET(hle_diag) && s_vals.size() < 4 &&
       s_vals.emplace(vte, true).second) {
     std::string blk;
     for (int32_t d = -32; d <= 32; ++d) {
@@ -1569,7 +1569,7 @@ uint64_t g_hleDrawsAccepted = 0, g_hleDrawsRefused = 0;
 // WHERE THE REST GO: FRAME DRAWS cannot explain `guest > accepted + refused`, a
 // 6.9% gap on a level run. BuildAndQueueDraw has three exits and only the
 // BuildHleDraw skip was counted at all -- and that only printed under
-// --hle_capture. These two close it, reported unconditionally.
+// --hle_diag. These two close it, reported unconditionally.
 uint64_t g_drawNoViewport = 0;
 uint64_t g_drawShaderFailed = 0;   // ApplyShaderOutputs returned kFailed
 uint64_t g_drawShaderNoCodeFull = 0;  // kNoCode, and the pending queue was full
@@ -3820,7 +3820,7 @@ ShaderApplyResult ApplyShaderOutputs(
     }
   } report{attempt};
   // Who is short, and by how much. Printed on the same cadence and NOT behind
-  // hle_capture: the bare BUILD zero-fill total above is 304 million and says
+  // hle_diag: the bare BUILD zero-fill total above is 304 million and says
   // nothing actionable. `past-end` is the discriminator -- 1 vertex means a
   // buffer one short, thousands means the index does not address that stream.
   struct ReportZeroFill {
@@ -7284,7 +7284,7 @@ void ReportDrawCounts(uint8_t* base) {
   for (const std::string& bad : mx::gpu::health::DrainNewlyBad())
     REXLOG_WARN("health: BAD {}", bad);
   REXLOG_INFO("d3d9: HEALTH -- {}", mx::gpu::health::Report());
-  if (REXCVAR_GET(hle_capture)) ReportCoverage(base);
+  if (REXCVAR_GET(hle_diag)) ReportCoverage(base);
 }
 
 }  // namespace mx::hooks::d3d9
@@ -7300,7 +7300,7 @@ void NotePlumbedStencil(const mx::hle::DrawCall& dc) {
 // Declared in hooks_d3d9.h. The three exits that make `guest` exceed `accepted +
 // refused`, so the FRAME DRAWS gap is attributable without a debug cvar. `skips`
 // is the BuildHleDraw population, which was already counted but only ever
-// printed under --hle_capture.
+// printed under --hle_diag.
 void UnbuiltDrawReasons(uint64_t& no_viewport, uint64_t& shader_failed,
                         uint64_t& nocode_queue_full, uint64_t& skips) {
   no_viewport = mx::hooks::d3d9::g_drawNoViewport;
@@ -7315,7 +7315,7 @@ void UnbuiltDrawReasons(uint64_t& no_viewport, uint64_t& shader_failed,
 std::string UnbuiltSkipBreakdown() {
   // One run attributed the whole gap to BuildHleDraw -- 16,706 of 16,706, with
   // no-viewport and shader-failed both at zero -- so the reasons ARE the answer,
-  // and they were only printed under --hle_capture. Promoted here because the
+  // and they were only printed under --hle_diag. Promoted here because the
   // gap is a standing property of every run.
   //
   // Ranked, and zero rows omitted: with eleven possible reasons a full list is

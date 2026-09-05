@@ -177,12 +177,11 @@ description is the sole source of draws.
 The old run line here also carried `--hle_shader_exec=1` under the claim that
 **"the HLE render path does nothing without it". That was wrong.**
 `hle_shader_exec` gates only a sampled measurement, and its one use sits behind
-`hle_capture`, so passing it without `--hle_capture=true` does nothing at all —
-which is how three verification runs came to be missing every `hle-render` and
-`stageF` line. Rendering is unconditional
-(`BuildAndQueueDraw` -> `ApplyShaderOutputs`, `hooks_d3d9.cpp:976`). Add
-`--hle_capture=true --hle_shader_exec=1` when you want the diagnostics, and
-expect them to cost.
+`hle_diag`, so passing it alone does nothing at all — which is how three
+verification runs came to be missing every `hle-render` and `stageF` line.
+Rendering is unconditional (`BuildAndQueueDraw` -> `ApplyShaderOutputs`,
+`hooks_d3d9.cpp:976`). Add `--hle_diag=true --hle_shader_exec=1` when you want
+the diagnostics, and expect them to cost.
 
 **Always run with `--force_load`**, and say so when reporting numbers. Without
 it a run never leaves the front end, and front-end geometry transcodes fine —
@@ -200,9 +199,8 @@ so they describe what a plain run already does, not what you can turn on.
 | cvar | default | |
 |---|---|---|
 | `d3d9_page_cache_persist` | **on** | Keep the page-readability cache across frames instead of clearing every swap |
-| `hle_diag` | off | Per-draw and per-vertex diagnostics: transform probe, prim-type and vfetch censuses, fetch addressing self-check. They cost real frame time |
-| `hle_capture` | off | Score every draw against the state shadow and report what fraction is fully described. Capture only — submits nothing |
-| `hle_shader_exec` | 0 | Execute the bound guest vertex shader for one draw in N. Requires `hle_capture` |
+| `hle_diag` | off | Every HLE diagnostic, in one switch: transform probe, prim-type and vfetch censuses, fetch addressing self-check, and per-draw scoring against the state shadow. Observation only — nothing here changes what is submitted. They cost real frame time |
+| `hle_shader_exec` | 0 | Execute the bound guest vertex shader for one draw in N. Requires `hle_diag` |
 | `hle_shader_verts` | 8 | How many vertices per executed draw. Only with `hle_shader_exec` |
 | `d3d9_page_cache_verify` | off | Re-query the OS on every cache hit and log mismatches. Slow; correctness check |
 

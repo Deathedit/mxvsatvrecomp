@@ -40,7 +40,6 @@
 
 // Both TUs read these. REXCVAR_DECLARE expands to a storage accessor at global
 // scope; hooks_d3d9.cpp had the same two lines above its namespace.
-REXCVAR_DECLARE(bool, hle_capture);
 REXCVAR_DECLARE(bool, hle_diag);
 
 namespace mx::hooks::d3d9 {

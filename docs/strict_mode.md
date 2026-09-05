@@ -89,7 +89,7 @@ decision: all-off produces a black screen, which is one bit of information. A
 bitmask lets you binary-search which guard is holding which defect up. If we
 build a bool we have wasted the work.
 
-Sits beside the existing `hle_diag` / `hle_capture` naming.
+Sits beside the existing `hle_diag` naming.
 
 ### Phase 3 — triage
 

@@ -37,7 +37,6 @@ namespace tu = rex::graphics::texture_util;
 #include "hooks/guest_read_watch.h"
 #include "hooks/hooks_d3d9_internal.h"
 
-REXCVAR_DECLARE(bool, hle_capture);
 REXCVAR_DECLARE(bool, hle_diag);
 
 // The guest entry points below are extern "C" and cannot live in the namespace,
@@ -327,7 +326,7 @@ extern "C" REX_FUNC(sub_82564C50) {
   // this call, and the point of the test is what the *original* writes. Sampled:
   // the rule either holds on every slot or it does not hold at all.
   static std::vector<PatchPrediction> s_pred;
-  const bool probe = REXCVAR_GET(hle_capture) && (g_patchCalls % 16) == 0;
+  const bool probe = REXCVAR_GET(hle_diag) && (g_patchCalls % 16) == 0;
   if (probe) {
     PredictPatchedFetches(args[0], args[1], args[2], args[3], args[4], base,
                           s_pred);
@@ -375,7 +374,7 @@ extern "C" REX_FUNC(sub_825565C8) {
       << " start_index=" << ctx.r6.u32 << " index_count=" << ctx.r7.u32 << "\n";
     f.flush();
   }
-  if (REXCVAR_GET(hle_capture)) {
+  if (REXCVAR_GET(hle_diag)) {
     DeviceState().NoteDevice(ctx.r3.u32, mx::hle::kEpDraw);
     SampleFetchConstantFile(ctx.r3.u32, base);
     ScoreDraw(/*indexed=*/true, ctx.r6.u32, ctx.r7.u32, ctx.r3.u32, base);
@@ -418,7 +417,7 @@ extern "C" REX_FUNC(sub_825561B0) {
       << " vertex_count=" << ctx.r6.u32 << "\n";
     f.flush();
   }
-  if (REXCVAR_GET(hle_capture)) {
+  if (REXCVAR_GET(hle_diag)) {
     DeviceState().NoteDevice(ctx.r3.u32, mx::hle::kEpDraw);
     SampleFetchConstantFile(ctx.r3.u32, base);
     ScoreDraw(/*indexed=*/false, ctx.r5.u32, ctx.r6.u32, ctx.r3.u32, base);
@@ -521,7 +520,7 @@ extern "C" REX_FUNC(sub_825556C8) {
   if (!nested) {
     ++mx::hle::D3D9DrawCounter();
     NoteDrawDeclaration(device, base);
-    if (REXCVAR_GET(hle_capture)) {
+    if (REXCVAR_GET(hle_diag)) {
       DeviceState().NoteDevice(device, mx::hle::kEpDraw);
       SampleFetchConstantFile(device, base);
     }
@@ -1138,7 +1137,7 @@ extern "C" REX_FUNC(sub_82555B88) {
       << " stride=" << stride << "\n";
     f.flush();
   }
-  if (REXCVAR_GET(hle_capture)) {
+  if (REXCVAR_GET(hle_diag)) {
     DeviceState().NoteDevice(device, mx::hle::kEpDraw);
     SampleFetchConstantFile(device, base);
   }
@@ -1238,7 +1237,7 @@ extern "C" REX_FUNC(sub_82556110) {
   NoteUpDrawCaller(static_cast<uint32_t>(ctx.lr), vertex_count, 3);
   ++mx::hle::D3D9DrawCounter();
   NoteDrawDeclaration(device, base);
-  if (REXCVAR_GET(hle_capture)) {
+  if (REXCVAR_GET(hle_diag)) {
     DeviceState().NoteDevice(device, mx::hle::kEpDraw);
     SampleFetchConstantFile(device, base);
   }
@@ -1305,7 +1304,7 @@ extern "C" REX_FUNC(sub_82556110) {
 //=============================================================================
 // The state entry points.
 //
-// All pass-through, all recording only, all behind hle_capture except that the
+// All pass-through, all recording only, all behind hle_diag except that the
 // recording itself is unconditional -- a shadow that only starts filling when
 // the cvar is read would be missing everything set before the first draw.
 //
@@ -1758,12 +1757,12 @@ extern "C" REX_FUNC(sub_825508A8) {
   st.NoteDevice(device, mx::hle::kEpSetVertexShader);
   st.vertex_shader = shader;
   st.vs_seen = true;
-  const bool capture = REXCVAR_GET(hle_capture);
+  const bool capture = REXCVAR_GET(hle_diag);
   if (capture) {
     DumpVertexShaderObject(shader, base);
   }
   orig_SetVertexShader(ctx, base);
-  // Behind hle_capture like every other diagnostic here. No longer sampled
+  // Behind hle_diag like every other diagnostic here. No longer sampled
   // either side of the original call: that comparison tested whether
   // SetVertexShader itself writes c255 into the device shadow. It does not --
   // the value never goes through the shadow at all.

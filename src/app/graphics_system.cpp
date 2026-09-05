@@ -52,15 +52,6 @@ static constexpr uint32_t kSupportedStride = mx::hle::kHostVertexStride;
 // the guest's own emitter reads, which decodes more shaders than the ring ever
 // did (40/49 against 37/61, 0 ambiguous).
 
-// Capture only: no PSOs, no uploads, no shader translation, nothing submitted.
-// It gates the per-draw scoring, the coverage report and the dump — including
-// every `hle-render` and `stageF` line, which is why those are absent from a
-// run that passes hle_shader_exec without this.
-REXCVAR_DEFINE_BOOL(hle_capture, false, "Debug",
-                    "Score every D3D9 draw against the state shadow and report "
-                    "what fraction is fully described, plus the first few "
-                    "resolved draws to logs/decldump/decls.txt. Capture only — it "
-                    "submits nothing and renders nothing");
 
 // Strict mode: a bitmask of class-B guards to DISABLE, so a real bug is exposed
 // instead of being papered over with a plausible value. See docs/strict_mode.md
@@ -144,22 +135,21 @@ REXCVAR_DEFINE_BOOL(d3d9_guest_viewport, false, "Graphics",
                     "registers rather than the render target extent, when they "
                     "disagree.");
 
-// The Direct3D 9 half-pixel offset, as an A/B switch. The reference applies +0.5
-// pixels to every vertex whenever PA_SU_VTX_CNTL::PIX_CENTER is kD3DZero -- D3D9
-// pixel centres at .0 against a host that rasterises at .5 -- and its own
-// documentation says omitting it "may significantly break post-processing in
-// some games".
+// The one diagnostic switch for the HLE path. hle_capture was folded into this:
+// two flags for one question meant a run could carry half the evidence, and
+// hle_shader_exec sat behind the other one, so passing it alone did nothing --
+// which is how three verification runs came to be missing every `hle-render`
+// and `stageF` line.
 //
-// We cannot read that register: 0x2302 is not at the offset the 0x22xx block
-// rule extrapolates to, and two guesses at it were both wrong. So this is
-// settled by experiment, which is self-validating: if the guest wants .0
-// centres, turning this on corrects a half-pixel error; if it already wants .5,
-// turning it on puts everything a FULL pixel out, which is unmistakable.
+// Everything it gates observes. Nothing here changes what is built, submitted
+// or rendered; rendering is unconditional.
 REXCVAR_DEFINE_BOOL(hle_diag, false, "Debug",
                     "Per-draw and per-vertex HLE diagnostics: the transform "
-                    "probe, the prim-type and vfetch censuses, and the vertex "
-                    "fetch addressing self-check. Off by default; they cost "
-                    "real frame time");
+                    "probe, the prim-type and vfetch censuses, the vertex fetch "
+                    "addressing self-check, and per-draw scoring against the "
+                    "state shadow with the first resolved draws written to "
+                    "logs/decldump/decls.txt. Off by default; they cost real "
+                    "frame time");
 
 namespace rex {
 namespace system {

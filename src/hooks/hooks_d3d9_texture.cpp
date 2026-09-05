@@ -4119,7 +4119,7 @@ void CapturePatchedCode(uint32_t self, uint32_t dest, uint32_t variant,
     }
   }
 
-  if (pc.resolved && REXCVAR_GET(hle_capture)) {
+  if (pc.resolved && REXCVAR_GET(hle_diag)) {
     const uint32_t search_abs = start + pc.code_off * 4;
     // Two independent questions, kept apart because they have different answers.
     // Where the CF starts: dest, in 24 of 24 measured. Whether the shader

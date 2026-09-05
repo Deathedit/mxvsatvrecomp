@@ -255,7 +255,7 @@ extern "C" REX_FUNC(sub_82566B58) {
                     "draws.gap_unattributed", unattributed, gap)));
     // Measured 2026-08-27: the skips ARE the gap, 16,706 of 16,706, with every
     // other exit at zero. So the reasons are the finding and belong on the
-    // ungated line rather than behind --hle_capture.
+    // ungated line rather than behind --hle_diag.
     REXLOG_INFO("native: UNBUILT SKIPS BY REASON:{}",
                 UnbuiltSkipBreakdown());
     }
