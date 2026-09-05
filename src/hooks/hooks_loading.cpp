@@ -15,6 +15,10 @@
 #include <rex/cvar.h>
 
 #include <bit>
+#include <string>
+#include <vector>
+
+using mx::hooks::GuestString;
 
 // The guest has its own frame limiter, and the hook below switches it ON.
 //
@@ -215,4 +219,191 @@ REX_HOOK_RAW(sub_82B70DE8) {
   // forcing r3=0 would kill the Transition loop mid-load.
   if (lt <= 5 || lt % 500 == 0)
     REXLOG_INFO("native: LoaderTick #{} r3={}", lt, ctx.r3.u32);
+}
+
+//=============================================================================
+// The asset load path -- the state machine, the request chain, and the gate
+//
+// Moved verbatim from hooks_plugin_diag.cpp. This is the same subject as the
+// rest of the file: LoaderTick drives the state machine below, and the state 6
+// gate is what decides whether it advances past 6 or parks. They were three
+// blocks in a diagnostics file with the registry chokepoint wedged between two
+// of them.
+//=============================================================================
+
+// force_load is GONE, cvar and implementation both. It named a scene to request
+// from the AssetDB once the loader went idle, by calling the guest's own
+// sub_82534980(AssetDB, name, flags).
+//
+// The observation behind it still stands and is still unexplained: the loader
+// reaches state 2 (IdleClearRenderBusy) and parks, because nothing in the game
+// ever calls sub_82534980. That same idle AssetDB is why UI_World never loads,
+// and it is the root of the 0x8234CE20 crash.
+
+// sub_8253AA40 — AssetDB_LoadStateMachine (LoaderTick's gate, 12-state)
+REX_IMPORT(__imp__sub_8253AA40, orig_LoadStateMachine, void());
+// Logs in BOTH modes. The note that used to sit here -- "in native this is
+// unreachable, so its absence from the log is itself the signal" -- is STALE:
+// every mid-ASM hook in mx_config.toml is commented out, so LoaderTick's vt[6]
+// gate runs and this fires continuously. Its absence would now mean something is
+// wrong, not something is skipped.
+//
+// What that run showed: the machine goes 0 -> 1 -> 2 and then stays at 2. State
+// 2 is idle-awaiting-a-request -- sub_82534980 is what moves it 2 -> 3, and in a
+// front-end-only run nothing calls it.
+extern "C" REX_FUNC(sub_8253AA40) {
+  static int sm = 0;
+  ++sm;
+  uint32_t a1 = ctx.r3.u32;
+  // The state is *(a1+28) — a 0..11 selector. Derived from the recompiled body:
+  // mx_recomp.31.cpp:36836 `lwz r11,28(r31)` (r31 = a1, never reassigned) feeds
+  // the 12-entry jump table at :36862. The `+110796` this used to read came from
+  // pm4_pipeline.md and is a guest heap pointer, not the enum.
+  uint32_t state_in = a1 ? REX_LOAD_U32(a1 + 28) : 0xFFFFFFFF;
+  // Every store to *(a1+28) I could find is inside this function, but that was
+  // a grep of mx_recomp.31.cpp only and would miss a write through a computed
+  // pointer regardless. Settle it with data: if the state changed between our
+  // last return and this entry, something outside sub_8253AA40 wrote it.
+  static uint32_t s_prev_out = 0xFFFFFFFE;
+  if (s_prev_out != 0xFFFFFFFE && state_in != s_prev_out) {
+    REXLOG_INFO("native: EXTERNAL WRITE to AssetDB+28: {} -> {} between calls #{} and #{}",
+                s_prev_out, state_in, sm - 1, sm);
+  }
+  orig_LoadStateMachine(ctx, base);
+  uint32_t state_out = a1 ? REX_LOAD_U32(a1 + 28) : 0xFFFFFFFF;
+  s_prev_out = state_out;
+  // Log every transition, plus a periodic heartbeat — a stuck machine should be
+  // visible without diffing consecutive lines.
+  static uint32_t s_last = 0xFFFFFFFE;
+  bool changed = state_out != s_last;
+  s_last = state_out;
+  if (changed || sm <= 10 || (sm % 200) == 0) {
+    REXLOG_INFO("native: LoadStateMachine #{} state {} -> {} r3=0x{:08X}{}", sm,
+                state_in, state_out, ctx.r3.u32, changed ? "  <-- CHANGED" : "");
+  }
+
+  // State 6 parks. Exactly one predicate is responsible: loc_8253B504 reads
+  // *(a1+110328) and, finding it zero, goes to loc_8253B560, which reads the
+  // listener at *(a1+110788) and calls its vt[2]. A zero return jumps to an
+  // early return that leaves the selector at 6.
+  //
+  // The listener is the same object sub_82534980 notifies via vt[0], and it is
+  // assigned once in the AssetDB constructor -- so it is never null and the
+  // vt[2] branch is always taken. Dump it once so vt[2] can be resolved.
+  if (a1 && state_out == 6) {
+    static bool s_dumped = false;
+    if (!s_dumped) {
+      s_dumped = true;
+      uint32_t obj = REX_LOAD_U32(a1 + 110788);
+      uint32_t sib = REX_LOAD_U32(a1 + 110792);
+      uint32_t vt = obj ? REX_LOAD_U32(obj) : 0;
+      REXLOG_INFO("native: state6 gate — listener(+110788)=0x{:08X} sibling(+110792)=0x{:08X} "
+                  "vt=0x{:08X} +110328=0x{:08X}",
+                  obj, sib, vt, REX_LOAD_U32(a1 + 110328));
+      if (vt) {
+        // A real guest function pointer lives in 0x82xxxxxx. Anything else in a
+        // vtable slot is data — assetdb vt[36] reads 0x53505F45 ("SP_E") — so
+        // print the slots raw and judge them by range, never call them blind.
+        REXLOG_INFO("native: state6 gate — vt[0]=0x{:08X} vt[1]=0x{:08X} vt[2]=0x{:08X} vt[3]=0x{:08X}",
+                    REX_LOAD_U32(vt), REX_LOAD_U32(vt + 4),
+                    REX_LOAD_U32(vt + 8), REX_LOAD_U32(vt + 12));
+      }
+    }
+  }
+}
+
+//=============================================================================
+// The load-request chain
+//
+// sub_82534980 is the guest's load-request API. It has exactly one caller,
+// sub_82352AE0, which builds the scene name from a registry lookup and is itself
+// a method with five callers. Nothing in this chain has ever been observed to
+// run in native mode -- the point of these hooks is to find out how far up
+// execution actually reaches.
+//=============================================================================
+
+// sub_82534980 — AssetDB_RequestLoad(AssetDB, name, flags). Copies up to 260
+// bytes of `name` to AssetDB+29540, stores flags at +29800, and moves the
+// selector 2 -> 3.
+REX_IMPORT(__imp__sub_82534980, orig_RequestLoad, void());
+extern "C" REX_FUNC(sub_82534980) {
+  uint32_t a1 = ctx.r3.u32;
+  std::string name = GuestString(base, ctx.r4.u32);
+  uint32_t state_in = a1 ? REX_LOAD_U32(a1 + 28) : 0xFFFFFFFF;
+  REXLOG_INFO("native: RequestLoad(sub_82534980) a1=0x{:08X} name=\"{}\" flags=0x{:08X} state={}",
+              a1, name, ctx.r5.u32, state_in);
+  orig_RequestLoad(ctx, base);
+  REXLOG_INFO("native: RequestLoad returned — state {} -> {}", state_in,
+              a1 ? REX_LOAD_U32(a1 + 28) : 0xFFFFFFFF);
+}
+
+// sub_82352AE0 — the sole caller of RequestLoad; resolves the scene name from
+// the registry. Takes a `this` pointer in r3.
+REX_IMPORT(__imp__sub_82352AE0, orig_RequestLoadCaller, void());
+extern "C" REX_FUNC(sub_82352AE0) {
+  REXLOG_INFO("native: sub_82352AE0 (RequestLoad caller) ENTER this=0x{:08X}",
+              ctx.r3.u32);
+  orig_RequestLoadCaller(ctx, base);
+}
+
+// The five callers of sub_82352AE0. Entry-only — one line each is enough to see
+// where the chain stops.
+#define MX_CHAIN_PROBE(addr, sym)                                             \
+  REX_IMPORT(__imp__sub_##addr, orig_chain_##addr, void());                   \
+  extern "C" REX_FUNC(sub_##addr) {                                           \
+    static int n = 0;                                                         \
+    if (++n <= 5)                                                             \
+      REXLOG_INFO("native: chain " sym " ENTER #{} r3=0x{:08X}", n,           \
+                  ctx.r3.u32);                                                \
+    orig_chain_##addr(ctx, base);                                             \
+  }
+
+MX_CHAIN_PROBE(82367A50, "sub_82367A50")
+MX_CHAIN_PROBE(8236B470, "sub_8236B470")
+MX_CHAIN_PROBE(8236B660, "sub_8236B660")
+MX_CHAIN_PROBE(824FB1F0, "sub_824FB1F0")
+MX_CHAIN_PROBE(824FC9A0, "sub_824FC9A0")
+
+#undef MX_CHAIN_PROBE
+
+//=============================================================================
+// The state 6 gate
+//
+// State 6 polls (*(AssetDB+110788))->vt[2] and takes an early return whenever it
+// answers 0, which is why the selector never reaches 7. That slot resolves to
+// sub_8253CF80, whose body is:
+//
+//   mode = sub_82536250(*(0x830577C0));   // maps a registry string to an enum
+//   if (mode == 2 || mode == 3) return 1;
+//   if (*(0x83057900) != 0)     return 1;
+//   tmp = 0; sub_82548758(registry, <key>, &tmp, 0); return tmp;
+//
+// Note state 1 clears *(0x83057900) on the way past, so boot itself closes the
+// second escape. These hooks report which term is actually deciding.
+//=============================================================================
+
+// sub_82536250 — registry-string -> mode enum, the gate's first term.
+REX_IMPORT(__imp__sub_82536250, orig_GateMode, void());
+extern "C" REX_FUNC(sub_82536250) {
+  uint32_t a1 = ctx.r3.u32;
+  orig_GateMode(ctx, base);
+  static int n = 0;
+  if (++n <= 3 || (n % 500) == 0)
+    REXLOG_INFO("native: GateMode(sub_82536250) #{} a1=0x{:08X} -> {}",
+                n, a1, ctx.r3.u32);
+}
+
+// sub_8253CF80 — the gate itself, (*(AssetDB+110788))->vt[2].
+REX_IMPORT(__imp__sub_8253CF80, orig_Gate, void());
+extern "C" REX_FUNC(sub_8253CF80) {
+  orig_Gate(ctx, base);
+  static int n = 0;
+  static uint32_t s_last = 0xFFFFFFFF;
+  uint32_t ret = ctx.r3.u32;
+  if (++n <= 3 || ret != s_last || (n % 500) == 0) {
+    REXLOG_INFO("native: state6 gate(sub_8253CF80) #{} -> {}  assetdb(0x830577C0)=0x{:08X} "
+                "flag(0x83057900)=0x{:08X}", n, ret,
+                REX_LOAD_U32(0x830577C0), REX_LOAD_U32(0x83057900));
+    s_last = ret;
+  }
 }
