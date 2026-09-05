@@ -1015,7 +1015,7 @@ bool BuildViewportMvp(uint32_t device, uint8_t* base, float out[16],
 // to d3d9_draw.cpp, which stays free of the recompiler macros. Every range is
 // bounded by the size D3D9 itself recorded on the object.
 //---------------------------------------------------------------------------
-uint64_t g_badPrimType[64] = {};
+
 
 // (width << 32) | height -> how many SetViewport calls used it.
 std::map<uint64_t, uint64_t> g_viewportExtents;
@@ -1510,14 +1510,11 @@ uint64_t g_pendingQueued = 0, g_pendingApplied = 0, g_pendingDropped = 0;
 // last gate, counted in FinishHleDraw. NOT g_pendingQueued, which counts only
 // the DEFERRED path and is legitimately zero on a normal frame -- it looked like
 // the queue point because it sits at a push_back.
-uint64_t g_hleDrawsAccepted = 0, g_hleDrawsRefused = 0;
+DrawOutcomeCensus g_drawOutcome;
 // WHERE THE REST GO: FRAME DRAWS cannot explain `guest > accepted + refused`, a
 // 6.9% gap on a level run. BuildAndQueueDraw has three exits and only the
 // BuildHleDraw skip was counted at all -- and that only printed under
 // --hle_diag. These two close it, reported unconditionally.
-uint64_t g_drawNoViewport = 0;
-uint64_t g_drawShaderFailed = 0;   // ApplyShaderOutputs returned kFailed
-uint64_t g_drawShaderNoCodeFull = 0;  // kNoCode, and the pending queue was full
 constexpr size_t kMaxPendingHleDraws = 2048;
 
 // Vertex shader object layout, read out of sub_82565928's VS branch at
@@ -1525,7 +1522,6 @@ constexpr size_t kMaxPendingHleDraws = 2048;
 // shader twin is ps + 0x18 / ps + 0x40 / info + 0x28 / info + 0x2C (see
 // CollectPixelShaderBlob).
 
-uint64_t g_shaderConstOverlays = 0;
 
 // Overlay the constants a vertex shader carries as literal data.
 //
@@ -1582,7 +1578,7 @@ void OverlayShaderConstants(uint32_t shader, uint8_t* base,
       out[reg * 4 + i] = REX_LOAD_U32(src);
       if (written) (*written)[reg * 4 + i] = 1;
     }
-    ++g_shaderConstOverlays;
+    ++g_drawOutcome.shaderConstOverlays;
   }
 }
 
@@ -1714,18 +1710,15 @@ bool CaptureVertexConstants(uint32_t device, uint8_t* base, uint32_t shader,
 // Field layouts from registers.h:798 and :821.
 //---------------------------------------------------------------------------
 std::mutex g_stencilCensusMu;
-uint64_t g_stencilDrawsSeen = 0;        // reached the RB_DEPTHCONTROL read
-uint64_t g_stencilDrawsUnreadable = 0;  // ...and could not read it
-uint64_t g_stencilBitSet = 0;           // stencil_enable, mode ignored
-uint64_t g_stencilEffective = 0;        // stencil_enable AND edram_mode says so
+StencilCensus g_stencil;
 std::map<uint32_t, uint64_t> g_edramModes;  // edram_mode -> draws
 // (depth_control, stencilrefmask) -> draws, for stencil-effective draws only.
 std::map<std::pair<uint32_t, uint32_t>, uint64_t> g_stencilConfigs;
 
 void NoteStencilCensusUnreadable() {
   std::lock_guard<std::mutex> lk(g_stencilCensusMu);
-  ++g_stencilDrawsSeen;
-  ++g_stencilDrawsUnreadable;
+  ++g_stencil.drawsSeen;
+  ++g_stencil.drawsUnreadable;
 }
 
 // DEPTH-SURFACE ALIASING CENSUS. The colour census cannot say whether two DEPTH
@@ -1784,22 +1777,21 @@ std::string DepthSurfaceReport() {
 // It does NOT prove the register OFFSETS -- both sides trust the same two
 // constants.
 std::mutex g_plumbedStencilMu;
-uint64_t g_plumbedSeen = 0, g_plumbedUnreadable = 0, g_plumbedEffective = 0;
 std::map<std::pair<uint32_t, uint32_t>, uint64_t> g_plumbedConfigs;
 
 void NotePlumbedStencilImpl(const mx::hle::DrawCall& dc) {
   std::lock_guard<std::mutex> lk(g_plumbedStencilMu);
-  ++g_plumbedSeen;
+  ++g_stencil.plumbedSeen;
   // Either register unreadable is counted apart rather than folded into the
   // config set: an unreadable refmask would otherwise enter the map as
   // 0xFFFFFFFF and invent a nineteenth configuration out of a failed read.
   if (dc.stencil_ref_mask == 0xFFFFFFFFu || dc.edram_mode == 0xFFFFFFFFu) {
-    ++g_plumbedUnreadable;
+    ++g_stencil.plumbedUnreadable;
     return;
   }
   if (!(dc.depth_control & 1u)) return;
   if (dc.edram_mode != 4u && dc.edram_mode != 5u) return;
-  ++g_plumbedEffective;
+  ++g_stencil.plumbedEffective;
   ++g_plumbedConfigs[{dc.depth_control, dc.stencil_ref_mask}];
 }
 
@@ -1817,7 +1809,6 @@ constexpr uint32_t kBfWindowDwords = 8;
 std::mutex g_bfWindowMu;
 // offset -> value -> how many two-sided draws saw it.
 std::map<uint32_t, std::map<uint32_t, uint64_t>> g_bfWindow;
-uint64_t g_bfWindowDraws = 0;
 
 void NoteBackFaceWindow(uint32_t depth_control, uint32_t device,
                         uint8_t* base) {
@@ -1832,7 +1823,7 @@ void NoteBackFaceWindow(uint32_t depth_control, uint32_t device,
     vals[i] = REX_LOAD_U32(device + off);
   }
   std::lock_guard<std::mutex> lk(g_bfWindowMu);
-  ++g_bfWindowDraws;
+  ++g_stencil.bfWindowDraws;
   for (uint32_t i = 0; i < kBfWindowDwords; ++i)
     ++g_bfWindow[kBfWindowBase + i * 4][vals[i]];
 }
@@ -1854,11 +1845,11 @@ void NoteStencilCensus(uint32_t depth_control, uint32_t device, uint8_t* base) {
   const bool mode_honours = (edram_mode == 4u || edram_mode == 5u);
 
   std::lock_guard<std::mutex> lk(g_stencilCensusMu);
-  ++g_stencilDrawsSeen;
+  ++g_stencil.drawsSeen;
   ++g_edramModes[edram_mode];
-  if (bit) ++g_stencilBitSet;
+  if (bit) ++g_stencil.bitSet;
   if (bit && mode_honours) {
-    ++g_stencilEffective;
+    ++g_stencil.effective;
     ++g_stencilConfigs[{depth_control, refmask}];
   }
 }
@@ -1912,12 +1903,12 @@ bool FinishHleDraw(mx::hle::DrawCall& dc) {
   mx::hle::HleSkip skip = mx::hle::HleSkip::kNone;
   if (!mx::hle::FinalizeHleTopology(dc, skip)) {
     ++mx::hle::HleSkipCounts()[uint32_t(skip)];
-    ++g_hleDrawsRefused;
+    ++g_drawOutcome.refused;
     return false;
   }
   NoteShaderlessDraw(dc);
   mx::hle::HleFrameDraws().push_back(std::move(dc));
-  ++g_hleDrawsAccepted;
+  ++g_drawOutcome.accepted;
   return true;
 }
 
@@ -2148,7 +2139,7 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   // identity. Unknown is not a usable viewport.
   if (!have_vp) {
     bink_lost("no viewport");
-    ++g_drawNoViewport;
+    ++g_drawOutcome.noViewport;
     return;
   }
   if (have_vp) in.mvp = vp;
@@ -2191,7 +2182,7 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     // count says 62% of draws fail and nothing about whether that is one type
     // needing expansion or a wrong prim-type argument.
     if (skip == HleSkip::kBadTopology && prim_type < 64) {
-      ++g_badPrimType[prim_type];
+      ++g_drawOutcome.badPrimType[prim_type];
     }
     if (is_bink) {
       static uint64_t s_first = 0;
@@ -2781,12 +2772,12 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
       g_pendingHleDraws.size() >= kMaxPendingHleDraws) {
     if (applied == ShaderApplyResult::kNoCode) {
       ++g_pendingDropped;
-      ++g_drawShaderNoCodeFull;
+      ++g_drawOutcome.shaderNoCodeFull;
     } else {
       // kFailed. Previously returned with nothing incremented at all, which is
       // how a draw disappears between `guest` and `accepted` leaving `refused`
       // at zero -- the exact shape of the 6.9% gap.
-      ++g_drawShaderFailed;
+      ++g_drawOutcome.shaderFailed;
     }
     return;
   }
@@ -3161,8 +3152,7 @@ uint64_t g_gpuVertexNoVte = 0, g_gpuVertexNoPs = 0, g_gpuVertexTooManyInputs = 0
 uint64_t g_gpuVertexDepthOnly = 0;
 // The GPU vertex FETCH path: draws taking it, and why a draw that qualified for
 // the GPU vertex stage still could not.
-uint64_t g_gpuFetchDraws = 0, g_gpuFetchRectList = 0;
-uint64_t g_gpuFetchOrdinalMismatch = 0;
+GpuFetchCensus g_gpuFetch;
 uint64_t g_gpuFetchUnaligned = 0;
 // Draws whose vertex shader has no fetch variant at all, because the emitter
 // refused to translate one. This had NO counter -- the refusal was folded into
@@ -3290,7 +3280,7 @@ ShaderApplyResult ApplyShaderOutputs(
           // real value is still printed below; only the trigger changes.
           (g_gpuVertexUndeclared ? 1u : 0u) + g_gpuVertexNoVs +
           g_gpuVertexVsSamplers + g_gpuVertexTooManyInputs +
-          g_gpuFetchNoVariant + g_gpuFetchOrdinalMismatch + g_gpuFetchUnaligned +
+          g_gpuFetchNoVariant + g_gpuFetch.ordinalMismatch + g_gpuFetchUnaligned +
           g_hleShaderBadAttribute + g_hleShaderZeroFilledVertex +
           mx::hle::g_rectDegenerate.load();
       const auto now = std::chrono::steady_clock::now();
@@ -3332,9 +3322,9 @@ ShaderApplyResult ApplyShaderOutputs(
           g_gpuVertexUndeclared, g_gpuVertexNoVs,
           g_gpuVertexVsSamplers, g_gpuVertexNoVte, g_gpuVertexNoPs,
           g_gpuVertexDepthOnly,
-          g_gpuVertexTooManyInputs, g_gpuFetchDraws, g_gpuFetchNoVariant,
-          g_gpuFetchRectList,
-          g_gpuFetchOrdinalMismatch, g_gpuFetchUnaligned, g_gpuFetchClamped,
+          g_gpuVertexTooManyInputs, g_gpuFetch.draws, g_gpuFetchNoVariant,
+          g_gpuFetch.rectList,
+          g_gpuFetch.ordinalMismatch, g_gpuFetchUnaligned, g_gpuFetchClamped,
           g_hleShaderZeroFilledVertex, g_hleShaderBadAttribute,
           mx::hle::HleVertexZeroFillCount(),
           mx::hle::g_rectArrangement[0].load(),
@@ -3664,7 +3654,7 @@ ShaderApplyResult ApplyShaderOutputs(
     // which is the work being removed. Every full-screen post pass is a RECTLIST
     // but they are 3-6 vertices each, so this costs nothing.
     gpu_fetch = false;
-    ++g_gpuFetchRectList;
+    ++g_gpuFetch.rectList;
     loop_reason = kLoopRectList;
   }
   if (g_diag) {
@@ -3783,7 +3773,7 @@ ShaderApplyResult ApplyShaderOutputs(
     // pair with the wrong fetches and geometry is misaddressed with no symptom
     // at the point of the mistake.
     gpu_fetch = false;
-    ++g_gpuFetchOrdinalMismatch;
+    ++g_gpuFetch.ordinalMismatch;
   }
   if (gpu_fetch) {
     // Merge the used streams into one buffer, in first-use order, and describe
@@ -3824,7 +3814,7 @@ ShaderApplyResult ApplyShaderOutputs(
     for (size_t a = 0; a < attrs.size() && gpu_fetch; ++a) {
       if (attrs[a].fetch_slot != vs_translated->vertex_fetch_slot[a]) {
         gpu_fetch = false;
-        ++g_gpuFetchOrdinalMismatch;
+        ++g_gpuFetch.ordinalMismatch;
         break;
       }
       const uint32_t si = attr_stream[a];
@@ -4032,7 +4022,7 @@ ShaderApplyResult ApplyShaderOutputs(
     dc.vertex_shader_dxbc = vs_translated->fetch_dxbc;
     dc.vertex_constants = consts;
     ++g_gpuVertexDraws;
-    ++g_gpuFetchDraws;
+    ++g_gpuFetch.draws;
   } else if (gpu_vertex) {
     input_stride = dc.vertex_input_count * 16;
     // Zeroed, and that is the correct default rather than a convenience: the
@@ -5230,10 +5220,10 @@ void ReportCoverage(uint8_t* base) {
       }
       std::string prims;
       for (uint32_t i = 0; i < 64; ++i) {
-        if (!g_badPrimType[i]) continue;
+        if (!g_drawOutcome.badPrimType[i]) continue;
         char buf[32];
         std::snprintf(buf, sizeof(buf), "%u:%llu ", i,
-                      (unsigned long long)g_badPrimType[i]);
+                      (unsigned long long)g_drawOutcome.badPrimType[i]);
         prims += buf;
       }
       if (!prims.empty())
@@ -5653,8 +5643,8 @@ void ReportDrawCounts(uint8_t* base) {
     REXLOG_INFO("d3d9: STENCIL census -- {} draws reached the read ({} could "
                 "not); enable bit set {}, of which {} are in an edram_mode "
                 "that honours it; {} distinct configs; edram_mode:{}",
-                g_stencilDrawsSeen, g_stencilDrawsUnreadable, g_stencilBitSet,
-                g_stencilEffective, g_stencilConfigs.size(), modes);
+                g_stencil.drawsSeen, g_stencil.drawsUnreadable, g_stencil.bitSet,
+                g_stencil.effective, g_stencilConfigs.size(), modes);
     // One line per distinct configuration, so the translation work is a
     // countable list rather than an impression. Held back while the config set
     // is unchanged -- the census line above already carries the count.
@@ -5767,22 +5757,22 @@ void ReportDrawCounts(uint8_t* base) {
     // Signed: the consumer cannot legitimately see MORE than the census, so a
     // negative gap is itself a finding rather than an impossible number.
     const int64_t seen_gap =
-        int64_t(g_stencilDrawsSeen) - int64_t(g_plumbedSeen);
+        int64_t(g_stencil.drawsSeen) - int64_t(g_stencil.plumbedSeen);
     const int64_t eff_gap =
-        int64_t(g_stencilEffective) - int64_t(g_plumbedEffective);
+        int64_t(g_stencil.effective) - int64_t(g_stencil.plumbedEffective);
     REXLOG_INFO("d3d9: STENCIL PLUMBED at the CONSUMER -- {} draws carried the "
                 "fields ({} had an unreadable register [{}]), {} effective, {} "
                 "distinct configs. Counts are EXPECTED to be lower than the "
                 "census: {} draws and {} effective never reached the renderer "
                 "(cross-check FRAME DRAWS guest-minus-accepted). The KEY SET "
                 "is what must match:{}",
-                g_plumbedSeen, g_plumbedUnreadable,
+                g_stencil.plumbedSeen, g_stencil.plumbedUnreadable,
                 // A draw that carried the fields but whose register could not
                 // be read has stencil state we invented rather than observed.
                 mx::gpu::health::Tag(mx::gpu::health::Zero(
-                    "stencil.unreadable_reg", g_plumbedUnreadable,
-                    g_plumbedSeen)),
-                g_plumbedEffective,
+                    "stencil.unreadable_reg", g_stencil.plumbedUnreadable,
+                    g_stencil.plumbedSeen)),
+                g_stencil.plumbedEffective,
                 g_plumbedConfigs.size(), seen_gap, eff_gap,
                 cfgs.empty() ? " none" : cfgs);
   }
@@ -5790,7 +5780,7 @@ void ReportDrawCounts(uint8_t* base) {
   // scan and not a read of one guessed offset.
   {
     std::lock_guard<std::mutex> lk(g_bfWindowMu);
-    if (g_bfWindowDraws) {
+    if (g_stencil.bfWindowDraws) {
       // Every distinct (offset, value) pair the scan has ever seen. Both map
       // levels are add-only, so this grows exactly when the window shows
       // something new -- which is the entire question the scan asks.
@@ -5802,7 +5792,7 @@ void ReportDrawCounts(uint8_t* base) {
         REXLOG_INFO("d3d9: BACKFACE STENCIL WINDOW -- {} two-sided draws "
                     "sampled, scan held, no new offset or value ({} report(s) "
                     "so far; d3d9_diag_row_heartbeat={})",
-                    g_bfWindowDraws, s_sinceBf,
+                    g_stencil.bfWindowDraws, s_sinceBf,
                     REXCVAR_GET(d3d9_diag_row_heartbeat));
       } else {
         std::string w;
@@ -5825,7 +5815,7 @@ void ReportDrawCounts(uint8_t* base) {
                     "(0x2900 is RB_STENCILREFMASK 0x210D; looking for 0x210E, "
                     "which should be refmask-shaped 0x00rrwwss and NOT a copy of "
                     "+2900):{}",
-                    g_bfWindowDraws, w.empty() ? " none" : w);
+                    g_stencil.bfWindowDraws, w.empty() ? " none" : w);
       }
     }
   }
@@ -5842,7 +5832,7 @@ void ReportDrawCounts(uint8_t* base) {
                 "zeros PM4 could fill but we do NOT "
                 "(measurement only); shader load-table overlays {}",
                 written, seen, repaired, zeroed, filled_zero,
-                g_shaderConstOverlays);
+                g_drawOutcome.shaderConstOverlays);
     // Which constants the zero-fill hit. A short tail means the fill can be
     // narrowed to a range; a long one means the frame-global PM4 file is simply
     // the wrong authority for a mid-frame draw, and the fix is upstream.
@@ -5883,8 +5873,8 @@ void ReportDrawCounts(uint8_t* base) {
   // Checked here rather than beside the number, which is printed on the
   // per-attempt DRAW REPORTS line: health::Record takes a mutex and that site
   // runs on every draw. A periodic look is just as good for cumulative counters.
-  mx::gpu::health::Zero("gpu_fetch.ordinal_mismatch", g_gpuFetchOrdinalMismatch,
-                        g_gpuFetchDraws);
+  mx::gpu::health::Zero("gpu_fetch.ordinal_mismatch", g_gpuFetch.ordinalMismatch,
+                        g_gpuFetch.draws);
   // A check that has just turned bad says so at WARN -- once, on the transition.
   // That is the only thing in this report that is not [info], which is the
   // point: `grep "\[warning\]"` over a run means "show me what broke an
@@ -5912,9 +5902,9 @@ void NotePlumbedStencil(const mx::hle::DrawCall& dc) {
 // printed under --hle_diag.
 void UnbuiltDrawReasons(uint64_t& no_viewport, uint64_t& shader_failed,
                         uint64_t& nocode_queue_full, uint64_t& skips) {
-  no_viewport = mx::hooks::d3d9::g_drawNoViewport;
-  shader_failed = mx::hooks::d3d9::g_drawShaderFailed;
-  nocode_queue_full = mx::hooks::d3d9::g_drawShaderNoCodeFull;
+  no_viewport = mx::hooks::d3d9::g_drawOutcome.noViewport;
+  shader_failed = mx::hooks::d3d9::g_drawOutcome.shaderFailed;
+  nocode_queue_full = mx::hooks::d3d9::g_drawOutcome.shaderNoCodeFull;
   skips = 0;
   const uint64_t* counts = mx::hle::HleSkipCounts();
   for (uint32_t i = 1; i < uint32_t(mx::hle::HleSkip::kCount); ++i)
@@ -5959,10 +5949,10 @@ uint32_t ResolveGuestRange(uint8_t* base, uint32_t addr, uint32_t bytes) {
   return 0;
 }
 
-uint64_t HleDrawsAccepted() { return mx::hooks::d3d9::g_hleDrawsAccepted; }
+uint64_t HleDrawsAccepted() { return mx::hooks::d3d9::g_drawOutcome.accepted; }
 uint64_t HleDrawsRefused() {
   // Both last-gate refusals and the deferred path's own discards, because a
   // draw lost either way is a draw the renderer never issues and the caller is
   // asking "did we lose it", not "where".
-  return mx::hooks::d3d9::g_hleDrawsRefused + mx::hooks::d3d9::g_pendingDropped;
+  return mx::hooks::d3d9::g_drawOutcome.refused + mx::hooks::d3d9::g_pendingDropped;
 }

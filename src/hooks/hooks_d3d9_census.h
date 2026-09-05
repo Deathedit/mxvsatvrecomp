@@ -118,4 +118,53 @@ struct FetchConstScan {
 
 extern FetchConstScan g_fcScan;
 
+// What happened to a draw, and why it did not become one.
+//
+// accepted and refused are the totals the hooks_d3d9.h shims expose; the rest
+// are the reasons. They belong in one object because the reasons only mean
+// anything against the totals -- a refusal count is not a rate until you know
+// how many draws there were.
+struct DrawOutcomeCensus {
+  uint64_t accepted = 0;
+  uint64_t refused = 0;
+
+  uint64_t badPrimType[64] = {};   // indexed by the guest primitive type
+  uint64_t noViewport = 0;
+  uint64_t shaderFailed = 0;        // ApplyShaderOutputs returned kFailed
+  uint64_t shaderNoCodeFull = 0;    // kNoCode, and the pending queue was full
+  uint64_t shaderConstOverlays = 0;
+};
+
+extern DrawOutcomeCensus g_drawOutcome;
+
+// Stencil sizing. MEASUREMENT ONLY -- nothing branches on any of this.
+//
+// The pairs matter more than the members: drawsSeen against drawsUnreadable
+// says whether a zero is "no stencil" or "could not tell", and bitSet against
+// effective says whether the guest asking for stencil is the same as getting
+// it. Either read alone has misled before.
+struct StencilCensus {
+  uint64_t drawsSeen = 0;        // reached the RB_DEPTHCONTROL read
+  uint64_t drawsUnreadable = 0;  // ...and could not read it
+  uint64_t bitSet = 0;           // stencil_enable, mode ignored
+  uint64_t effective = 0;        // stencil_enable AND edram_mode says so
+
+  uint64_t plumbedSeen = 0;
+  uint64_t plumbedUnreadable = 0;
+  uint64_t plumbedEffective = 0;
+
+  uint64_t bfWindowDraws = 0;
+};
+
+extern StencilCensus g_stencil;
+
+// Draws that took the GPU vertex-fetch path.
+struct GpuFetchCensus {
+  uint64_t draws = 0;
+  uint64_t rectList = 0;
+  uint64_t ordinalMismatch = 0;
+};
+
+extern GpuFetchCensus g_gpuFetch;
+
 }  // namespace mx::hooks::d3d9
