@@ -5271,7 +5271,7 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
         // The readout for the flat-retry backoff. Without it a census row of
         // `n=2 flat=2` cannot say whether the retry never fired or fired and
         // found the texture still flat -- completely different diagnoses.
-        g_flatNotCached, g_flatRetriesDue, g_flatVolatile);
+        g_flat.notCached, g_flat.retriesDue, g_flat.volatileKeys);
     // The repeat offenders, cumulative, worst first. Three textures own this
     // whole bucket; this names them and says why each one misses.
     {

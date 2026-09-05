@@ -186,6 +186,16 @@ struct TexDecodeIndex {
   std::set<std::pair<uint32_t, uint64_t>> keys;
 };
 
+// One object rather than three loose counters, so a split publishes one symbol.
+//
+// Flat-decode retry backoff: keys marked, and retries actually taken. Both,
+// because `marked N retried 0` and `marked N retried M` are different bugs.
+struct FlatDecodeCensus {
+  uint64_t notCached = 0;   // was g_flatNotCached
+  uint64_t retriesDue = 0;  // was g_flatRetriesDue
+  uint64_t volatileKeys = 0;  // was g_flatVolatile -- decode sites and keys
+};
+
 enum class TexMissReason : uint8_t {
   kNotInCache,   // key never seen
   kStaleEvicted, // present, but the content fingerprint changed
@@ -198,11 +208,7 @@ extern VsWindowCensus g_vsWindow;           // 7 patch-window counters
 extern ResolveAddressCensus g_resolveAddr;  // 3 resolve-address counters
 extern ShaderPatchState g_patch;            // psBlobs / codeOffsets / patched
 extern TexDecodeIndex g_texIndex;
-// Flat-decode retry backoff: keys marked, and retries actually taken. Both,
-// because `marked N retried 0` and `marked N retried M` are different bugs.
-extern uint64_t g_flatNotCached;
-extern uint64_t g_flatRetriesDue;
-extern uint64_t g_flatVolatile;           // decode sites and keys
+extern FlatDecodeCensus g_flat;             // 3 flat-decode retry counters
 
 // ---- constants -------------------------------------------------------------
 constexpr uint32_t kHostPageSize = 4096;

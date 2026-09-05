@@ -668,12 +668,10 @@ constexpr uint32_t kFlatRetryFrames = 30;
 // | 50 decodes over 36880 KB`, and ScanFlatness makes three full passes. On a
 // key already known to change that scan asks a question whose answer we have.
 constexpr uint32_t kVolatileRetryFrames = 4;
-uint64_t g_flatNotCached = 0;
-uint64_t g_flatRetriesDue = 0;
+FlatDecodeCensus g_flat;
 // Watched keys whose re-read came back with CONTENT -- i.e. the texture really
 // does change under us, and dropping it from the watch set would pin it. See
 // the note at the cache insert for what dropping the page table cost.
-uint64_t g_flatVolatile = 0;
 
 // THE PROBE CRASHED THE GAME AND THIS IS WHY. The census below inserts into a
 // std::map and a std::set, and once NoteDecodedTexture was called from all three
@@ -2659,7 +2657,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
                                       : kFlatRetryFrames;
         if (now - fr->second.last_frame >= interval) {
           fr->second.last_frame = now;
-          ++g_flatRetriesDue;
+          ++g_flat.retriesDue;
           stale = true;
         }
       }
@@ -2867,7 +2865,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
       ScanFlatness(payload->data.data(), flat_base, source.bytes_per_block)
               .share() >= 0.999;
   if (flat_now) {
-    ++g_flatNotCached;
+    ++g_flat.notCached;
     g_flatRetryKeys[key] =
         FlatWatch{uint32_t(mx::hle::D3D9FrameCount()), false};
     static std::set<uint64_t> s_flatSeen;
@@ -2909,7 +2907,7 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
     // Latches on: once a texture has been seen to carry content after being
     // uniform, it is volatile for good and gets the tight interval.
     watch_it->second.volatile_content = true;
-    ++g_flatVolatile;
+    ++g_flat.volatileKeys;
   }
   g_hleCpuTextures.emplace(key, std::move(payload));
   return true;
