@@ -1,8 +1,11 @@
 # MX vs. ATV Alive — ReXGlue native port
 
 Static recompilation of the Xbox 360 build (`assets/default.xex`) via ReXGlue,
-with a host D3D12 renderer replacing the Xenos GPU. The `rexgpu-xenos` plugin is
-**not** used; native mode is the only supported profile.
+with a host D3D12 renderer replacing the Xenos GPU. There is one profile: the
+hooks in `src/hooks` intercept the guest's D3D9 calls and drive the host
+renderer directly. (A `rexgpu-xenos` plugin mode used to exist as an
+alternative; it was deleted in `9e99c0b`, along with the
+`d3d9_hooks_passthrough` flag.)
 
 > **Rewritten 2026-08-05, pruned again 2026-08-12.** The 08-05 rewrite cut
 > ~4,000 lines of dated investigation logs whose "Current State" described a
@@ -190,6 +193,35 @@ do not appear at all. `force_load` fires about 115 seconds after start, so a
 run shorter than ~2½ minutes never reaches it; ~400s gives a usable sample.
 `ST_Southwest` also works.
 
+### Tests
+
+```bash
+py -3 tools/run_tests.py
+```
+
+Six tests: four C++ (`d3d9_layout`, `ucode`, `d3d9_texture`, `health`) and two
+Python (`test_resolve_coverage.py`, `test_unproject_mesh.py`). **CMake
+references no test file**, so nothing else runs them — that is why the runner
+exists, and why it compiles each C++ test ad hoc against its own source list
+rather than through the build system. It finds `clang++` by globbing the VS
+tree, so it does not need a developer prompt; `test_resolve_coverage.py` needs
+`cl.exe` and re-enters through `vcvars64.bat` if it is absent.
+
+**A skip is not a pass.** The runner exits 1 if anything failed and **2** if
+something merely could not be run, because a silent skip once killed two tests
+for 25 days. Require `ran 6 of 6`, not just a zero-ish exit code.
+
+`test_resolve_coverage.py` compiles `ResolvedTargetByAddress` **out of
+`src/hooks/hooks_d3d9_internal.h` as text**, sliced between two literal
+declaration lines, so it tests the shipped header rather than a copy. Re-indent
+or reword those anchors and the test goes red with a traceback rather than an
+assertion.
+
+The `.bat` files in the repo root (`rebuild-exe-*.bat`, `run-tests.bat`,
+`launch.bat`, `codegen.bat`) are convenience wrappers only. They are gitignored
+(`*.bat`) and hardcode this machine's paths, so a fresh clone will not have
+them — the commands above are the real interface.
+
 ### Runtime cvars
 
 `mx.toml` or `--flag=value`. Defined in `src/app/graphics_system.cpp` and
@@ -201,7 +233,6 @@ so they describe what a plain run already does, not what you can turn on.
 | `d3d9_page_cache_persist` | **on** | Keep the page-readability cache across frames instead of clearing every swap |
 | `hle_diag` | off | Every HLE diagnostic, in one switch: transform probe, prim-type and vfetch censuses, fetch addressing self-check, and per-draw scoring against the state shadow. Observation only — nothing here changes what is submitted. They cost real frame time |
 | `hle_shader_exec` | 0 | Execute the bound guest vertex shader for one draw in N. Requires `hle_diag` |
-| `hle_shader_verts` | 8 | How many vertices per executed draw. Only with `hle_shader_exec` |
 | `d3d9_page_cache_verify` | off | Re-query the OS on every cache hit and log mismatches. Slow; correctness check |
 
 | `d3d9_diag_row_heartbeat` | 16 | Draw reports an unchanged population may pass before `UP CALLERS`, the per-config stencil rows and the per-declaration `decl-draws` rows dump anyway. A new call site or config still prints immediately; `0` = only on change, `1` = every report |
@@ -292,9 +323,12 @@ name their layer: `#include "gpu/pm4_parser.h"`.
 | `src/main.cpp` | Entry point (`REX_DEFINE_APP`) |
 | `src/app/mx_app.*` | `MxApp`: installs the graphics system and crash reporter, hands over the HWND |
 | `src/app/graphics_system.*` | `D3D12GraphicsSystem` + host render thread (Bink playlist → game frames); most debug cvars are defined here |
-| `src/gfx/d3d12_renderer.h` | `D3D12Renderer` interface, implemented across the three `.cpp` below |
+| `src/gfx/d3d12_renderer.h` | `D3D12Renderer` interface, implemented across the five `.cpp` below |
 | `src/gfx/d3d12_device.cpp` | Device, adapter, swapchain, RTVs, command lists, fence, Begin/EndFrame |
-| `src/gfx/d3d12_game.cpp` | Game pipeline, per-frame draw list, game RT + depth, HLE offscreen targets, compositor |
+| `src/gfx/d3d12_game.cpp` | Pipeline + PSO caches, root signatures, guest to host format conversion |
+| `src/gfx/d3d12_game_bind.cpp` | Descriptor-table construction for the translated path (textures, samplers, vertex constants) |
+| `src/gfx/d3d12_game_resource.cpp` | GPU resources: texture upload/evict, EDRAM ownership, render/depth targets, snapshots, readback |
+| `src/gfx/d3d12_game_frame.cpp` | Per-frame submission: `RenderGameFrame`, `AddGameDraw`, present |
 | `src/gpu/pm4_parser.*` | PM4 command buffer parser (Type-0/2/3, ring wrap, dump) |
 | `src/gpu/hle_types.*` | Shared HLE data model (`DrawCall`, textures, topology) + the two primitive expansions |
 | `src/gpu/xenos_gpu_state.*` | Xenos register shadow, snapshot/diff |
@@ -305,14 +339,20 @@ name their layer: `#include "gpu/pm4_parser.h"`.
 | `src/gpu/shader_ucode.*` | Xenos microcode decode: vertex fetches, pixel texture profiles |
 | `src/gpu/shader_hlsl.*` | **Xenos microcode → HLSL.** The translated shader path — what makes a draw run the guest's own shader instead of a stand-in |
 | `src/gpu/shader_alu.*` | Vertex shader ALU interpreter (the CPU fallback for untranslated draws) |
-| `src/hooks/hooks_d3d9.cpp` | The D3D9 HLE layer — the largest file in the project |
+| `src/gpu/guard_census.*` | `Note(g, fired)` guard accounting, on every opportunity so the denominator is structural. See [docs/strict_mode.md](docs/strict_mode.md) |
+| `src/gpu/health.*` | Resource-budget health checks, dumped to `logs/health.txt` |
+| `src/hooks/hooks_d3d9.cpp` | The D3D9 HLE layer: state shadow, draw submission, vertex apply, shader compile, reporting. The largest file in the project |
+| `src/hooks/hooks_d3d9_entry.cpp` | Every D3D9 guest entry point (26 `REX_FUNC` plus 8 macro-generated render-state leaves). The only D3D9 file with hook macros in it |
+| `src/hooks/hooks_d3d9_texture.cpp` | Texture resolution, decode and upload; glyph cache; the pixel-shader texture profile |
+| `src/hooks/texture_dump.cpp` | Decoded-texture PNG dump (WIC). No guest ABI |
 | `src/hooks/hooks_frame.cpp` | VdSwap, XenosWait, Begin/EndFrame, GpuState |
 | `src/hooks/hooks_boot.cpp` | Bootstrap, GraphicsInit, TexManager, GpuAlloc |
 | `src/hooks/hooks_loading.cpp` | SetupRenderer, Transition, LoaderTick |
 | `src/hooks/hooks_gameloop.cpp` | RenderPipeline |
 | `src/hooks/hooks_wait.cpp` | Two guest-wait passthroughs, nothing else |
-| `src/hooks/hooks_plugin_diag.cpp` | Registry hooks, load-state-machine probes, script-VM probes |
-| `src/hooks/midasm_stubs.cpp` | Exported mid-ASM hook targets (must stay at global namespace) |
+| `src/hooks/hooks_plugin_diag.cpp` | Registry hooks, load-state-machine probes, script-VM probes, frame pacing |
+| `src/hooks/hooks_debug_unlock.cpp` | The `dev` switches: dev menu, guest `print()` capture, debug bindings |
+| `src/hooks/guest_read_watch.cpp` | Guest-memory read watches, for tracing who consumes a written range |
 | `src/hooks/native_bridge.*` | `NativeGraphics` singleton |
 
 Input is handled entirely by ReXGlue's built-in `SDLInputDriver` at kernel level;
