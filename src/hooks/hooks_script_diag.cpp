@@ -1,7 +1,20 @@
-// DIAGNOSTIC HOOKS -- log critical functions around the guest original.
+// Script-VM probes -- the Lua/SWIG layer the front end actually runs on.
 //
-// The mid-ASM hooks that skip these call sites are unconditional, so a hook
-// being silent means its call site is jumped.
+// The front end is script-driven rather than C++ virtual dispatch: the load
+// chain runs out of static call sites because the functions are entries in a
+// name -> function binding table, registered at boot and called from Lua. That
+// makes the script VM the only place the control flow is visible, and this file
+// is where it is watched -- who dispatches, which chunks execute, which
+// bindings are reached, and what the VM reports when one fails.
+//
+// This file was hooks_plugin_diag.cpp until 2026-09-05. It was named after a
+// GPU plugin mode deleted in 9e99c0b and had accumulated four unrelated
+// subjects; frame pacing went to hooks_frame.cpp, the asset load path to
+// hooks_loading.cpp, and the registry chokepoint to hooks_registry.cpp.
+//
+// These hooks log around the guest original. The mid-ASM hooks that skip these
+// call sites are unconditional, so a hook being silent means its call site is
+// jumped.
 
 #include "hooks/hook_common.h"
 #include "hooks/hooks_d3d9.h"  // GuestDrawCalls
@@ -304,6 +317,14 @@ extern "C" REX_FUNC(sub_8234CE20) {
 // READING STATE; this wants the CALLER. If the bike's transform arrives by the
 // state-block path this probe sees nothing -- a silent probe here means "not
 // this path", not "no writes". Cheap on the hot path: one range compare first.
+//
+// IT DOES NOT TAKE MX_D3D9_HLE_LOCK, and that is deliberate. Every D3D9 entry
+// point in hooks_d3d9_entry.cpp holds that lock for its whole body because they
+// share the state shadow; this one touches none of it. It reads its own
+// arguments, compares a register range and logs. Adding the lock to make it
+// look like its neighbours would put a process-wide recursive mutex on a hot
+// setter to guard nothing -- which is also why moving this hook next to those
+// neighbours would be a mistake rather than a tidy-up.
 
 REX_IMPORT(__imp__sub_82550320, orig_SetVertexShaderConstantF, void());
 extern "C" REX_FUNC(sub_82550320) {

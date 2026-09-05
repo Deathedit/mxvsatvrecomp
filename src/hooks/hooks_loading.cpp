@@ -224,8 +224,8 @@ REX_HOOK_RAW(sub_82B70DE8) {
 //=============================================================================
 // The asset load path -- the state machine, the request chain, and the gate
 //
-// Moved verbatim from hooks_plugin_diag.cpp. This is the same subject as the
-// rest of the file: LoaderTick drives the state machine below, and the state 6
+// Moved verbatim from hooks_plugin_diag.cpp, now hooks_script_diag.cpp. This
+// is the same subject as the rest of the file: LoaderTick drives the state machine below, and the state 6
 // gate is what decides whether it advances past 6 or parks. They were three
 // blocks in a diagnostics file with the registry chokepoint wedged between two
 // of them.

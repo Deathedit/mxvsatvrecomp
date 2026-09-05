@@ -291,7 +291,8 @@ complete decoder. Segment, symbols, vtables and open flags:
 [docs/guest_binary.md](docs/guest_binary.md).
 
 Probes on `BinkOpen`, both manager `Open`s and `BinkAsset::Init` are in
-`hooks_plugin_diag.cpp` and are mode-neutral.
+`hooks_script_diag.cpp` (named `hooks_plugin_diag.cpp` at the time) and are
+mode-neutral.
 **4 native runs, 2 plugin runs, `--skip_intro=true`, no `--force_load`:**
 
 | | native 4/4 | plugin 2/2 |

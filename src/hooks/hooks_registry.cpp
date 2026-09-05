@@ -1,7 +1,8 @@
 // The registry chokepoint -- guest settings reads, and the override lever.
 //
-// Split verbatim out of hooks_plugin_diag.cpp. Self-contained: the four guest
-// addresses and the parsed-override table below are named nowhere else, so this
+// Split verbatim out of hooks_plugin_diag.cpp, now hooks_script_diag.cpp.
+// Self-contained: the four guest addresses and the parsed-override table below
+// are named nowhere else, so this
 // cut publishes no symbol at all. That is why it is its own translation unit
 // rather than a section of a larger one.
 

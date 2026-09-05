@@ -311,7 +311,7 @@ line like `Engine.Foo = …` dispatches it), plus `swig_type` `0x824A9A98` and
 **Class metamethods** — installed by `sub_824A9580`: `__index` `0x824A8E18`,
 `__newindex` `0x824A8FC8`, `__gc` `0x824A9120`.
 
-`BindingName` in `src/hooks/hooks_plugin_diag.cpp` resolves all five.
+`BindingName` in `src/hooks/hooks_script_diag.cpp` resolves all five.
 
 Registry getter call sites, identified from `lr` captured at entry:
 `0x82536294` → `sub_82536250` (the loader's own gate); `0x824AA590` →

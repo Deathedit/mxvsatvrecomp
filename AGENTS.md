@@ -187,7 +187,8 @@ Rendering is unconditional (`BuildAndQueueDraw` -> `ApplyShaderOutputs`,
 the diagnostics, and expect them to cost.
 
 **`--force_load` no longer exists**, cvar and implementation both — see the
-tombstone at `src/hooks/hooks_plugin_diag.cpp:29`. It named a scene to request
+tombstone at the top of `src/hooks/hooks_loading.cpp`'s load-path section. It
+named a scene to request
 from the AssetDB once the loader went idle, by calling the guest's own
 `sub_82534980(AssetDB, name, flags)`. Older measurements in this file are
 labelled with it because that is the run they were taken on; they are dated
@@ -360,7 +361,8 @@ name their layer: `#include "gpu/pm4_parser.h"`.
 | `src/hooks/hooks_loading.cpp` | SetupRenderer, Transition, LoaderTick |
 | `src/hooks/hooks_gameloop.cpp` | RenderPipeline |
 | `src/hooks/hooks_wait.cpp` | Two guest-wait passthroughs, nothing else |
-| `src/hooks/hooks_plugin_diag.cpp` | Registry hooks, load-state-machine probes, script-VM probes, frame pacing |
+| `src/hooks/hooks_script_diag.cpp` | Script/Lua VM probes and the SWIG binding census -- the front end runs on this, not on C++ dispatch |
+| `src/hooks/hooks_registry.cpp` | The registry chokepoint: guest settings reads and the `registry_override` lever |
 | `src/hooks/hooks_debug_unlock.cpp` | The `dev` switches: dev menu, guest `print()` capture, debug bindings |
 | `src/hooks/guest_read_watch.cpp` | Guest-memory read watches, for tracing who consumes a written range |
 | `src/hooks/native_bridge.*` | `NativeGraphics` singleton |

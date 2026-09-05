@@ -1,6 +1,7 @@
 // UNLOCKING THE GUEST'S OWN DEBUG FACILITIES.
 //
-// Split out of hooks_plugin_diag.cpp because these hooks do not observe the
+// Split out of hooks_plugin_diag.cpp -- now hooks_script_diag.cpp -- because
+// these hooks do not observe the
 // guest, they CHANGE an answer it gives itself, to switch on code the shipping
 // build compiled in and then gated off.
 //
@@ -129,7 +130,7 @@ std::chrono::steady_clock::time_point g_dbgNativeLast{};
 void NoteGuestPrint(const std::string& text);
 
 // A Lua string argument, read straight off the stack. Deliberately a local copy
-// of the reader in hooks_plugin_diag.cpp rather than a shared symbol: it is
+// of the reader in hooks_script_diag.cpp rather than a shared symbol: it is
 // twenty guarded lines, and the alternative is this file depending on the
 // internals of the one it was split out of. Every field is range-checked,
 // because the argument is guest data of whatever type the script passed.

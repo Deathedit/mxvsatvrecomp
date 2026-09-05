@@ -849,8 +849,8 @@ extern "C" REX_FUNC(sub_82AC8B68) {
 //=============================================================================
 // Engine frame timing -- pacing, and the three probes around it
 //
-// Moved verbatim from hooks_plugin_diag.cpp. PaceFrame is a behaviour change,
-// not a diagnostic, and it belongs beside the other frame-boundary hooks: this
+// Moved verbatim from hooks_plugin_diag.cpp, now hooks_script_diag.cpp.
+// PaceFrame is a behaviour change, not a diagnostic, and it belongs beside the other frame-boundary hooks: this
 // file already owns the swap, and the cap it enforces is the guest's own field
 // written by the SetupRenderer hook.
 //=============================================================================
