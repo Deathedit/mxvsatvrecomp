@@ -989,13 +989,32 @@ void ReportHleTransform() {
   // assets name it. Agreement means the scoring and the asset join corroborate
   // each other, and the probe can stop being a search. A disagreement means one
   // of the two is wrong, and the rows above say which shader to open.
+  // ONE DENOMINATOR. The agree/disagree/control counts come from the row loop
+  // above, which skips shaders with under 32 draws, while g_shaderNamedReg
+  // holds every shader that ever reported a name. Printing the first three
+  // against the second implied they covered the same set; they do not, and a
+  // named shader too small to judge would have vanished between them.
+  const size_t named = g_shaderNamedReg.size();
+  const uint64_t judged = g_namedAgree + g_namedDisagree + g_namedControlWon;
   REXLOG_INFO(
-      "d3d9: stage3    ASSET CHECK -- {} shader(s) named by their asset: {} "
-      "agree, {} DISAGREE, {} had a control win (no constant candidate "
-      "explained them). {} scored shader(s) had no asset name to check",
-      g_namedAgree + g_namedDisagree + g_namedControlWon, g_namedAgree,
-      g_namedDisagree, g_namedControlWon,
-      g_shaderDraws.size() - g_shaderNamedReg.size());
+      "d3d9: stage3    ASSET CHECK -- {} of {} scored shader(s) carry an asset "
+      "name; {} of those had enough draws to judge: {} agree, {} DISAGREE, {} "
+      "had a control win (no constant candidate explained them)",
+      named, g_shaderDraws.size(), judged, g_namedAgree, g_namedDisagree,
+      g_namedControlWon);
+  // WHY THE SAMPLE IS SMALL, so the number is not read as weak evidence when
+  // it is narrow evidence. The probe only scores draws still on the CPU
+  // transcode path (vertex_stride == kHostVertexStride), and those are largely
+  // the draws whose vertex shader did NOT translate -- which is why they are on
+  // that path at all. A shader with no translation has no constant table and no
+  // name, so the probe's population and the named population barely overlap.
+  // Validating the constant names broadly needs a check on the GPU-vertex path,
+  // not this one.
+  if (named && judged)
+    REXLOG_INFO(
+        "d3d9: stage3    ASSET CHECK -- the probe scores only CPU-transcode "
+        "draws, which mostly lack a translated vertex shader and so have no "
+        "asset name; that overlap bounds this check, not the join");
 }
 
 }  // namespace mx::hle
