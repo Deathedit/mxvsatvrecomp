@@ -2248,9 +2248,11 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
       // "dump these and re-run the tool" rather than a bare percentage.
       if ((v && !v->name) || (p && !p->name)) {
         std::lock_guard<std::mutex> lk(g_shaderNames.mu);
-        if (v && !v->name && g_shaderNames.unnamedVs.size() < 64)
+        if (v && !v->name &&
+            g_shaderNames.unnamedVs.size() < ShaderNameCensus::kMaxUnnamed)
           ++g_shaderNames.unnamedVs[VertexShaderContentId(vs_h)];
-        if (p && !p->name && g_shaderNames.unnamedPs.size() < 64)
+        if (p && !p->name &&
+            g_shaderNames.unnamedPs.size() < ShaderNameCensus::kMaxUnnamed)
           ++g_shaderNames.unnamedPs[PixelShaderContentId(ps_h)];
       }
     }

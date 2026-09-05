@@ -207,6 +207,12 @@ struct ShaderNameCensus {
   uint64_t neither = 0;      // includes draws with no translated shader
   uint64_t noShader = 0;     // of `neither`: nothing translated to name
   std::mutex mu;
+  // A cap so a pathological run cannot grow these without bound. It is 512
+  // rather than 64 because 64 SATURATED on the first real run -- the vertex
+  // side reported "64 distinct" when the true count was unknown and 64 was
+  // only a floor. The report says so explicitly when a list is at the cap; a
+  // number that quietly stops climbing is worse than no number.
+  static constexpr size_t kMaxUnnamed = 512;
   std::map<uint64_t, uint64_t> unnamedVs;  // code_key -> draws
   std::map<uint64_t, uint64_t> unnamedPs;
 };

@@ -491,9 +491,12 @@ void ReportShaderNames() {
     std::string rows;
     for (size_t i = 0; i < v.size() && i < 6; ++i)
       rows += fmt::format(" [{:016X} x{}]", v[i].second, v[i].first);
-    REXLOG_INFO("d3d9: SHADER NAMES   unnamed {} ({} distinct), worst first "
+    const bool at_cap = m.size() >= ShaderNameCensus::kMaxUnnamed;
+    REXLOG_INFO("d3d9: SHADER NAMES   unnamed {} ({} distinct{}), worst first "
                 "-- dump these and re-run tools/shader_manifest.py:{}",
-                what, m.size(), rows);
+                what, m.size(),
+                at_cap ? " -- AT CAP, so this is a FLOOR not a count" : "",
+                rows);
   };
   worst(g_shaderNames.unnamedVs, "vertex");
   worst(g_shaderNames.unnamedPs, "pixel");
