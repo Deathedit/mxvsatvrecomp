@@ -1760,38 +1760,43 @@ const std::unordered_map<uint64_t, std::string>& TextureNames() {
 // constant's pitch, which the hardware honours for the base level and ignores
 // for every other one. The comment was sitting on the field.
 //
-// TWO KEYS. `full` covers all of level 0 and discriminates better; `prefix`
-// covers a fixed 4096 bytes and cannot disagree with the asset about where the
-// level ENDS, which matters because the asset's stored pitch and the fetch
-// constant's pitch need not be the same number. Both are looked up; the census
-// says which one is carrying the join.
+// A 4096-byte prefix key shipped beside this for one run, hedging against the
+// asset's pitch and the fetch constant's pitch being different numbers. Of 191
+// textures named in that run -- DXT1, DXN, FMT_4_5, 16_16_16_16_FLOAT, 32x32
+// through 2048x1024 -- ZERO needed it. The pitches agree, and the hedge is
+// gone.
 //
-// Zero means "no key", so a texture too small or undescribable simply does not
-// join rather than joining on a degenerate hash.
-struct TextureContentKeys {
-  uint64_t full = 0;
-  uint64_t prefix = 0;
-};
-constexpr uint64_t kTexPrefixBytes = 4096;
+// Zero means "no key": the texture does not join rather than joining on a
+// degenerate hash. `why` says which of the two reasons, because 40% of decodes
+// landed here and a bare count cannot distinguish "no guest source to hash"
+// from "the size rule is still wrong".
+enum class TexKeyFail { kNone, kUndescribable, kShorterThanLevel0 };
 
-TextureContentKeys TextureContentKey(const mx::hle::HleTextureSource& source,
-                                     const std::vector<uint8_t>& guest) {
-  TextureContentKeys out;
-  if (source.bytes_per_block == 0 || source.block_height == 0) return out;
+uint64_t TextureContentKey(const mx::hle::HleTextureSource& source,
+                           const std::vector<uint8_t>& guest,
+                           TexKeyFail* why) {
+  *why = TexKeyFail::kUndescribable;
+  if (source.bytes_per_block == 0 || source.block_height == 0) return 0;
   const uint64_t rows =
       (uint64_t(source.height) + source.block_height - 1) / source.block_height;
   const uint64_t bytes =
       uint64_t(source.pitch_blocks) * source.bytes_per_block * rows;
-  if (bytes == 0 || bytes > guest.size()) return out;
+  if (bytes == 0) return 0;
+  // The buffer is SHORTER than level 0 claims to be. That is a real signal,
+  // not a nuisance: it means the guest allocation and the described extent
+  // disagree, which is the same class of thing the size rule got wrong once
+  // already.
+  if (bytes > guest.size()) {
+    *why = TexKeyFail::kShorterThanLevel0;
+    return 0;
+  }
   uint64_t h = 1469598103934665603ull;
   for (uint64_t i = 0; i < bytes; ++i) {
     h ^= guest[size_t(i)];
     h *= 1099511628211ull;
-    if (i + 1 == kTexPrefixBytes) out.prefix = h;
   }
-  out.full = h;
-  if (bytes <= kTexPrefixBytes) out.prefix = 0;  // no separate prefix to try
-  return out;
+  *why = TexKeyFail::kNone;
+  return h;
 }
 
 // Counted on EVERY decode, so the denominator is every texture the runtime
@@ -2810,28 +2815,24 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
   // the ones that happened to resolve, which would make the rate meaningless.
   {
     ++g_texNames.seen;
-    const TextureContentKeys ck = TextureContentKey(source, guest);
-    if (!ck.full) {
+    TexKeyFail why_key = TexKeyFail::kNone;
+    const uint64_t ckey = TextureContentKey(source, guest, &why_key);
+    if (!ckey) {
       ++g_texNames.noKey;
+      if (why_key == TexKeyFail::kShorterThanLevel0) ++g_texNames.shortBuffer;
     } else {
       const auto& tn = TextureNames();
-      auto it = tn.find(ck.full);
-      bool by_prefix = false;
-      if (it == tn.end() && ck.prefix) {
-        it = tn.find(ck.prefix);
-        by_prefix = it != tn.end();
-      }
+      const auto it = tn.find(ckey);
       if (it != tn.end()) {
         ++g_texNames.named;
-        if (by_prefix) ++g_texNames.byPrefix;
         // The first few by name, because a percentage cannot be checked by eye
         // and "ATV_Alpha_Combo at 256x256 DXT4_5" can.
         static std::atomic<uint32_t> s_shown{0};
         if (s_shown++ < 12)
-          REXLOG_INFO("d3d9: texture named: {} ({}x{} {}) by {} key {:016X}",
+          REXLOG_INFO("d3d9: texture named: {} ({}x{} {}) key {:016X}",
                       it->second, source.width, source.height,
                       mx::hle::GuestTextureFormatName(source.guest_format),
-                      by_prefix ? "PREFIX" : "full", it->first);
+                      ckey);
       }
     }
   }

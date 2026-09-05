@@ -4892,13 +4892,14 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
     // cache is warm, so anything keyed on a decode count never prints.
     // Unnamed is expected for a render target, a glyph atlas, and the 94
     // assets whose level 0 is shared with another asset.
-    REXLOG_INFO("d3d9: TEXTURE NAMES -- {} decodes, {} named ({:.1f}%), {} of "
-                "those needed the 4KB prefix, {} with no measurable level 0",
+    REXLOG_INFO("d3d9: TEXTURE NAMES -- {} decodes, {} named ({:.1f}%); {} had "
+                "no key ({} of them a buffer SHORTER than level 0, the rest no "
+                "block layout -- a render target has none)",
                 g_texNames.seen, g_texNames.named,
                 g_texNames.seen
                     ? g_texNames.named * 100.0 / double(g_texNames.seen)
                     : 0.0,
-                g_texNames.byPrefix, g_texNames.noKey);
+                g_texNames.noKey, g_texNames.shortBuffer);
     // The repeat offenders, cumulative, worst first. Three textures own this
     // whole bucket; this names them and says why each one misses.
     {

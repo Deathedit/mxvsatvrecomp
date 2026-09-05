@@ -134,10 +134,11 @@ struct TextureNameCensus {
   uint64_t seen = 0;   // every texture the runtime decoded
   uint64_t named = 0;  // resolved to a .texture asset by content
   uint64_t noKey = 0;  // no measurable level 0, so nothing to join on
-  // Of `named`, how many needed the 4096-byte fallback. A high share means the
-  // asset's pitch and the fetch constant's pitch disagree, and the full key is
-  // not carrying the join.
-  uint64_t byPrefix = 0;
+  // Of `noKey`, how many had a guest buffer SHORTER than the described level
+  // 0. Split out because that is a disagreement between the allocation and the
+  // extent -- a real signal -- while the rest are simply textures with no
+  // describable block layout, which a render target legitimately is.
+  uint64_t shortBuffer = 0;
 };
 extern TextureNameCensus g_texNames;
 
