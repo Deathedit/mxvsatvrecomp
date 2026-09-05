@@ -27,6 +27,7 @@ set(MX_SOURCES
     src/gfx/d3d12_game_bind.cpp
     src/gfx/d3d12_game_resource.cpp
     src/gfx/d3d12_game_frame.cpp
+    src/gfx/d3d12_game_telemetry.cpp
 
     # gpu — Xenos PM4 parse / translate / register shadow
     src/gpu/pm4_parser.cpp
