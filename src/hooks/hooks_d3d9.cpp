@@ -1903,6 +1903,13 @@ std::map<std::string, uint64_t>& NativePassDraws() {
   return m;
 }
 
+EdramReaderCensus g_edramReaders;
+
+std::map<std::string, uint64_t>& EdramReaderByPass() {
+  static std::map<std::string, uint64_t> m;
+  return m;
+}
+
 std::map<std::string, uint64_t>& ReplayMissByShader() {
   static std::map<std::string, uint64_t> m;
   return m;
@@ -2206,6 +2213,44 @@ const std::string* CensusMeshNames(const mx::hle::HleDrawInputs& in,
 
 }  // namespace
 
+// Step 6's falsifier. Measurement only -- nothing here changes a binding.
+void CensusEdramReaders(const mx::hle::DrawCall& dc) {
+  ++g_edramReaders.draws;
+  const TranslatedShader* ps =
+      dc.pixel_shader_handle ? TranslatedPixelShader(dc.pixel_shader_handle)
+                             : nullptr;
+  if (ps) ++g_edramReaders.withPixelShader;
+
+  uint32_t surface_slots = 0, placeholder = 0;
+  for (size_t k = 0; k < dc.pixel_sampled_objects.size(); ++k) {
+    if (dc.pixel_sampled_objects[k]) {
+      ++surface_slots;
+      continue;
+    }
+    // A slot with a 1x1 texture and no object is the resolve machinery having
+    // failed to fill it, not a legitimately tiny texture: the replay path
+    // already treats exactly this shape as the light-buffer miss it repairs.
+    const auto& tex = k < dc.pixel_textures.size() ? dc.pixel_textures[k]
+                                                   : nullptr;
+    if (tex && tex->width <= 1 && tex->height <= 1) ++placeholder;
+  }
+  g_edramReaders.slots += surface_slots;
+  g_edramReaders.placeholderSlots += placeholder;
+  if (!surface_slots) return;
+  ++g_edramReaders.readSurface;
+
+  // Attributed by pass, because "how many draws" does not say whether the work
+  // is bounded and "which passes" does. Runtime-generated shaders are kept
+  // apart: they have no asset name, so they cannot be converted to native and
+  // a surface read under one is a different problem from a surface read under
+  // a named pass.
+  const char* who = !ps                    ? "(no pixel shader)"
+                    : ps->runtime_generated ? "(runtime-generated shader)"
+                    : ps->name              ? ps->name->c_str()
+                                            : "(shader unnamed)";
+  ++EdramReaderByPass()[who];
+}
+
 bool FinishHleDraw(mx::hle::DrawCall& dc) {
   mx::hle::HleSkip skip = mx::hle::HleSkip::kNone;
   if (!mx::hle::FinalizeHleTopology(dc, skip)) {
@@ -2214,6 +2259,7 @@ bool FinishHleDraw(mx::hle::DrawCall& dc) {
     return false;
   }
   NoteShaderlessDraw(dc);
+  CensusEdramReaders(dc);
   mx::hle::HleFrameDraws().push_back(std::move(dc));
   ++g_drawOutcome.accepted;
   return true;
@@ -5336,6 +5382,40 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
                   top.size(), head, g_nativeShaders.named,
                   g_nativeShaders.named
                       ? head * 100.0 / double(g_nativeShaders.named)
+                      : 0.0,
+                  rows);
+    }
+
+    // Step 6's falsifier, reported beside step 5's census because the two
+    // answer one question together: step 5 says which passes can be made
+    // native, and this says which of them EDRAM is still waiting on.
+    REXLOG_INFO("d3d9: EDRAM READERS -- {} draws ({} with a translated PS); {} "
+                "({:.1f}%) sample a guest-addressed surface over {} slots; {} "
+                "slots sampled a 1x1 PLACEHOLDER the resolve could not fill",
+                g_edramReaders.draws, g_edramReaders.withPixelShader,
+                g_edramReaders.readSurface,
+                g_edramReaders.draws
+                    ? g_edramReaders.readSurface * 100.0 /
+                          double(g_edramReaders.draws)
+                    : 0.0,
+                g_edramReaders.slots, g_edramReaders.placeholderSlots);
+    {
+      std::vector<std::pair<uint64_t, const std::string*>> top;
+      for (const auto& [who, n] : EdramReaderByPass())
+        top.emplace_back(n, &who);
+      std::sort(top.begin(), top.end(),
+                [](const auto& a, const auto& b) { return a.first > b.first; });
+      std::string rows;
+      uint64_t head = 0;
+      for (size_t i = 0; i < top.size() && i < 10; ++i) {
+        rows += fmt::format(" [{} x{}]", *top[i].second, top[i].first);
+        head += top[i].first;
+      }
+      REXLOG_INFO("d3d9: EDRAM READERS   {} passes read a surface; the top 10 "
+                  "are {} of {} such draws ({:.1f}%) --{}",
+                  top.size(), head, g_edramReaders.readSurface,
+                  g_edramReaders.readSurface
+                      ? head * 100.0 / double(g_edramReaders.readSurface)
                       : 0.0,
                   rows);
     }

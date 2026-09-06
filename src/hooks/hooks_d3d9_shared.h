@@ -266,6 +266,41 @@ struct NativeShaderCensus {
   uint64_t mutated = 0;        // the mutation shader was used instead
 };
 extern NativeShaderCensus g_nativeShaders;
+
+// Step 6's FALSIFIER, measured before any of step 6 is attempted.
+//
+// The plan is explicit that EDRAM exists to serve guest-authored passes writing
+// to guest-addressed surfaces, so it can only be retired once those passes are
+// native -- and that "any pass still reading a guest-addressed surface after
+// step 5 means EDRAM cannot be retired yet; count those before starting."
+//
+// A draw reads a guest-addressed surface when any of its sampler slots resolved
+// to a SNAPSHOT rather than to a plain texture: pixel_sampled_objects[k] holds
+// the guest object a slot was resolved from, and it is set exactly when the
+// binding came out of the resolve/snapshot machinery instead of ordinary
+// texture memory.
+//
+// Counted in FinishHleDraw, which is the one point EVERY path reaches --
+// including command-buffer replay, which bypasses BuildAndQueueDraw and so is
+// missing from the mesh census entirely. That matters here: replay draws the
+// foliage and the vehicles, and the light-buffer slots the replay path
+// hand-patches are precisely the bindings this counts.
+struct EdramReaderCensus {
+  uint64_t draws = 0;            // every draw reaching FinishHleDraw
+  uint64_t withPixelShader = 0;  // of those, ones with a translated PS
+  uint64_t readSurface = 0;      // sample at least one guest-addressed surface
+  uint64_t slots = 0;            // how many such slots, summed
+  // Draws sampling a 1x1 placeholder -- a slot the resolve machinery could not
+  // fill. The replay path already reports "1x1 slots N -> snapshot, M still
+  // none"; this counts the same failure across every path, because a pass
+  // reading a 1x1 where a light buffer belongs is not reading a surface, it is
+  // reading nothing, and both belong in the step 6 picture.
+  uint64_t placeholderSlots = 0;
+};
+extern EdramReaderCensus g_edramReaders;
+// Draws that read a guest-addressed surface, by pass name. This is the list
+// step 6 has to shorten, and its head says whether the work is bounded.
+std::map<std::string, uint64_t>& EdramReaderByPass();
 // Draws per pass name, worst first in the report. Not per distinct shader:
 // the question is how much of the frame one substitute would cover.
 std::map<std::string, uint64_t>& NativePassDraws();
