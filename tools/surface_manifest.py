@@ -31,10 +31,12 @@ which is what gave it away. Worse than the misses it caused: an index block
 under 4096 bytes gets no prefix key, so those parts were not merely unmatched,
 they were UNREACHABLE.
 
-A PREFIX KEY TOO, and computed FIRST. A draw need not cover a whole buffer, and
-several parts may be packed into one. The full-block key only matches when the
-runtime hashes exactly the same extent; the prefix key survives when it does
-not. It is emitted before any size reasoning, because the last time a fallback
+TWO PREFIX KEYS TOO, 4096 and 512 bytes, computed FIRST. A draw need not cover
+a whole buffer, and several parts may be packed into one. The full-block key
+only matches when the runtime hashes exactly the same extent; a prefix key
+survives when it does not. The short one exists because 4096 cannot reach a
+part smaller than 4096, and most parts in the corpus are -- so the long prefix
+alone covered only the parts least likely to need it. It is emitted before any size reasoning, because the last time a fallback
 key was computed inside the size check it was meant to survive, it never saw
 the population that needed it and measured as dead when it was unreachable.
 
@@ -75,6 +77,11 @@ MASK64 = (1 << 64) - 1
 # Long enough to discriminate, short enough that neither side has to agree
 # about where a block ends. Same size the texture manifest uses.
 PREFIX_BYTES = 4096
+# A second, shorter prefix. 4096 cannot reach a part smaller than 4096, and a
+# part packed inside a larger guest buffer -- which is what the long prefix
+# exists for -- is usually one of those. Most parts in the corpus are under 4KB,
+# so without this the fallback covers only the parts least likely to need it.
+SHORT_PREFIX = 512
 
 
 def load_surface_reader():
@@ -175,9 +182,10 @@ def main():
                     continue
                 label = "%s::p%d%s" % (asset, i, tag)
                 add(claims, fnv64(data), label)
-                if len(data) > PREFIX_BYTES:
-                    add(claims, fnv64(data[:PREFIX_BYTES]), label)
-                    prefix_keys += 1
+                for n in (PREFIX_BYTES, SHORT_PREFIX):
+                    if len(data) > n:
+                        add(claims, fnv64(data[:n]), label)
+                        prefix_keys += 1
 
     names, joined, collapsed = resolve(claims)
 
@@ -189,8 +197,12 @@ def main():
     print("assets        %d" % len(paths))
     print("decoded       %d files, %d parts   (undecoded %d)"
           % (files, parts_n, undecoded))
-    print("unique keys   %d   (%d of them a 4KB prefix key)"
-          % (len(names), prefix_keys))
+    # `prefix_keys` counts ADDITIONS, not survivors, and both prefix sizes --
+    # so it legitimately exceeds the number of unique keys. Said plainly here
+    # because the earlier wording claimed 27829 of 15480 keys were prefixes,
+    # which is not a thing that can be true.
+    print("unique keys   %d   (%d prefix additions, 4KB and 512B, before "
+          "dedup)" % (len(names), prefix_keys))
     print("collapsed     %d key(s) claimed by several parts of ONE asset, "
           "named by the asset" % collapsed)
     print("joined        %d key(s) claimed by DIFFERENT assets, named by all "

@@ -1944,6 +1944,10 @@ uint64_t MeshFnv64(const uint8_t* p, size_t n) {
 }
 
 constexpr size_t kMeshPrefixBytes = 4096;
+// A second, shorter prefix. 4096 cannot reach a part that is itself smaller
+// than that, and a part packed INSIDE a larger buffer is exactly the case the
+// long prefix was supposed to cover. Most parts in the corpus are under 4KB.
+constexpr size_t kMeshShortPrefix = 512;
 // Below this a buffer cannot be a mesh. Counted apart rather than dropped,
 // because an excluded population that is never reported is how a coverage
 // figure ends up measured against a denominator it could never reach.
@@ -1961,10 +1965,14 @@ constexpr uint32_t kMeshMinBytes = 32;
 // stops changing; a full hash of every bound buffer on every draw is not
 // affordable and would change what is being measured.
 const std::string* MeshNameFor(const uint8_t* host, uint32_t bytes,
-                               bool* by_prefix, bool* first_miss,
-                               uint64_t* content_key) {
+                               uint32_t offset, bool* by_prefix,
+                               bool* first_miss, uint64_t* content_key) {
   struct Memo {
     uint32_t bytes;
+    // The offset is part of the identity now: the same pointer bound at two
+    // different offsets is two different meshes, and a memo keyed without it
+    // would answer the second from the first.
+    uint32_t offset;
     const std::string* name;
     bool prefix;
     // Kept so a memo HIT can still say WHICH mesh this is. Without it the
@@ -1976,7 +1984,8 @@ const std::string* MeshNameFor(const uint8_t* host, uint32_t bytes,
   *by_prefix = false;
   *first_miss = false;
   auto it = s_memo.find(host);
-  if (it != s_memo.end() && it->second.bytes == bytes) {
+  if (it != s_memo.end() && it->second.bytes == bytes &&
+      it->second.offset == offset) {
     ++g_meshNames.hashMemoHit;
     *by_prefix = it->second.prefix;
     *content_key = it->second.key;
@@ -1990,6 +1999,14 @@ const std::string* MeshNameFor(const uint8_t* host, uint32_t bytes,
   const auto& names = MeshNames();
   const std::string* found = nullptr;
   bool prefix = false;
+  // WHERE THIS DRAW'S DATA ACTUALLY STARTS. `host` is the buffer base and
+  // `offset` is SetStreamSource's OffsetInBytes, so hashing from the base is
+  // the wrong extent whenever the guest packs several parts into one buffer.
+  // Measured: HFT_Track_vtex binds 491520 bytes at offset 20480, and every
+  // such stream was unmatchable no matter what the manifest held. Same shape
+  // as hashing an index block at 2n when the guest binds 2n+4.
+  const uint8_t* at = host + (offset < bytes ? offset : 0);
+  const uint32_t at_bytes = offset < bytes ? bytes - offset : bytes;
   // Computed here rather than inside the lookup below, so that the content
   // population is counted for every buffer that reaches this point -- including
   // the ones that go on to match nothing. Counting it only on the matched path
@@ -2001,11 +2018,23 @@ const std::string* MeshNameFor(const uint8_t* host, uint32_t bytes,
   if (new_content) ++g_meshNames.contentSeen;
   // The FULL key first: it is the one a whole-block upload produces, and it is
   // the only key the manifest emits for a part under 4096 bytes.
+  // Candidates in order, most exact first. A whole-buffer match is the
+  // strongest claim and stays first; everything after it is a fallback for a
+  // buffer that holds more than the one part.
   auto f = names.find(full_key);
   if (f != names.end()) {
     found = &f->second;
-  } else if (bytes > kMeshPrefixBytes) {
-    auto p = names.find(MeshFnv64(host, kMeshPrefixBytes));
+  }
+  if (!found && at != host) {
+    auto o = names.find(MeshFnv64(at, at_bytes));
+    if (o != names.end()) found = &o->second;
+  }
+  if (!found && at_bytes > kMeshPrefixBytes) {
+    auto p = names.find(MeshFnv64(at, kMeshPrefixBytes));
+    if (p != names.end()) { found = &p->second; prefix = true; }
+  }
+  if (!found && at_bytes > kMeshShortPrefix) {
+    auto p = names.find(MeshFnv64(at, kMeshShortPrefix));
     if (p != names.end()) { found = &p->second; prefix = true; }
   }
   if (found) {
@@ -2020,7 +2049,7 @@ const std::string* MeshNameFor(const uint8_t* host, uint32_t bytes,
     // every other row.
     *first_miss = new_content;
   }
-  s_memo[host] = Memo{bytes, found, prefix, full_key};
+  s_memo[host] = Memo{bytes, offset, found, prefix, full_key};
   *by_prefix = prefix;
   return found;
 }
@@ -2064,8 +2093,9 @@ const std::string* CensusMeshNames(const mx::hle::HleDrawInputs& in,
     if (bytes < kMeshMinBytes) { ++g_meshNames.unmatchedTiny; return; }
     bool by_prefix = false, first_miss = false;
     uint64_t content_key = 0;
-    const std::string* name =
-        MeshNameFor(host, bytes, &by_prefix, &first_miss, &content_key);
+    const std::string* name = MeshNameFor(host, bytes, offset_bytes,
+                                         &by_prefix, &first_miss,
+                                         &content_key);
     (void)first_miss;
     if (!name) {
       ++g_meshNames.unmatched;
