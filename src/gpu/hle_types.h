@@ -205,12 +205,6 @@ struct DrawCall {
   // every draw and every recording, and copying a DrawCall costs a pointer
   // rather than a string.
   const std::string* mesh_name = nullptr;
-  // The vertex shader's asset name, carried for the same reason and with the
-  // same lifetime rules. A replayed draw that names no mesh is only readable
-  // if it can say what it IS -- foliage the assets keep in .tree rather than
-  // .surface is a different answer from a mesh the join lost.
-  const std::string* vs_name = nullptr;
-  bool vs_runtime_generated = false;
   std::vector<uint8_t> vertices;      // optional; filled only when a vertex fetch const is known
   std::vector<uint8_t> indices;       // packed index buffer (2 or 4 bytes per index)
   uint32_t vertex_count = 0;

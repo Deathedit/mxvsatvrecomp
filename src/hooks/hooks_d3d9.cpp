@@ -2372,22 +2372,14 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   // Measurement only. Nothing here selects geometry -- the draw is built from
   // the guest's own streams exactly as before.
   const std::string* mesh_name = nullptr;
-  const std::string* mesh_vs_name = nullptr;
-  bool mesh_vs_generated = false;
   {
     const uint32_t vs_h = st.vs_seen ? st.vertex_shader : 0;
-    const TranslatedShader* vts = vs_h ? TranslatedVertexShader(vs_h) : nullptr;
-    mesh_name = CensusMeshNames(in, vts);
-    if (vts) {
-      mesh_vs_name = vts->name;
-      mesh_vs_generated = vts->runtime_generated;
-    }
+    mesh_name =
+        CensusMeshNames(in, vs_h ? TranslatedVertexShader(vs_h) : nullptr);
   }
 
   DrawCall dc;
   dc.mesh_name = mesh_name;
-  dc.vs_name = mesh_vs_name;
-  dc.vs_runtime_generated = mesh_vs_generated;
   HleSkip skip = HleSkip::kNone;
   if (!BuildHleDraw(in, dc, skip)) {
     ++HleSkipCounts()[uint32_t(skip)];

@@ -424,13 +424,25 @@ uint32_t ReplayCmdBuf(
     if (dc.mesh_name) {
       ++g_meshNames.replayNamed;
     } else {
+      // Resolved from the RECORDED handle here, not stamped at record time.
+      // Stamping produced one row reading "(shader unnamed) x35564", which was
+      // the attribution failing rather than an answer: a null TranslatedShader
+      // leaves the name null and runtime_generated false, which is
+      // indistinguishable from a shader that genuinely has no name. The pixel
+      // side already resolves TranslatedPixelShader(dc.pixel_shader_handle)
+      // this way; the vertex side can do the same.
+      //
       // Per REPLAYED draw, not per distinct mesh: the question here is what
       // share of the frame's re-issued drawing runs unnamed geometry, and a
       // buffer replayed nine thousand times is nine thousand draws.
-      ++ReplayMissByShader()[dc.vs_runtime_generated
-                                 ? "(runtime-generated shader)"
-                             : dc.vs_name ? dc.vs_name->c_str()
-                                          : "(shader unnamed)"];
+      const TranslatedShader* vts =
+          dc.vertex_shader_handle ? TranslatedVertexShader(dc.vertex_shader_handle)
+                                  : nullptr;
+      ++ReplayMissByShader()[!dc.vertex_shader_handle ? "(no vertex shader)"
+                             : !vts                   ? "(shader not translated)"
+                             : vts->runtime_generated ? "(runtime-generated shader)"
+                             : vts->name              ? vts->name->c_str()
+                                                      : "(shader unnamed)"];
     }
     if (FinishHleDraw(dc)) {
       ++issued;
