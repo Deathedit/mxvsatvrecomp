@@ -240,6 +240,11 @@ POSITION_EXPORT_REGISTER = 62
 # Bitfield helpers
 # ---------------------------------------------------------------------------
 
+def sign5(v):
+    """Five-bit two's complement. Xenos texel offsets run -16..15."""
+    return v - 32 if v & 16 else v
+
+
 def bits(value, offset, width):
     """Unsigned field of `width` bits starting at `offset`, LSB numbered 0."""
     return (value >> offset) & ((1 << width) - 1)
@@ -694,6 +699,20 @@ class FetchInstruction(object):
 
     tf_dimension = property(lambda s: bits(s.w2, 14, 2))
 
+    # TEXEL OFFSETS, decoded because a shader cannot be reimplemented without
+    # them. bloom.shader::BlurHPS issues three tfetch2D from the SAME register
+    # and the SAME fetch constant; read without offsets that is three identical
+    # taps, which is not a blur. The taps differ only by these fields, and a
+    # native shader written from the disassembly above would have silently been
+    # a 3x-weighted copy of one texel.
+    #
+    # Word 2 packs use_reg_gradients(1) + sample_location(1) + lod_bias(7) +
+    # unused(5) + dimension(2) before them, so x starts at bit 16. Five bits
+    # each and SIGNED -- an unsigned read turns a -1 tap into +31.
+    tf_offset_x = property(lambda s: sign5(bits(s.w2, 16, 5)))
+    tf_offset_y = property(lambda s: sign5(bits(s.w2, 21, 5)))
+    tf_offset_z = property(lambda s: sign5(bits(s.w2, 26, 5)))
+
     @property
     def opcode_name(self):
         return FETCH_NAMES.get(self.opcode, "fetch_op_%d" % self.opcode)
@@ -768,6 +787,13 @@ def format_fetch(fetch):
             flags.append("reg_lod")
         if not fetch.tf_use_comp_lod:
             flags.append("no_comp_lod")
+        # Printed only when non-zero, and only the components the dimension
+        # actually has: a 2D fetch's offset_z is not a field, it is whatever
+        # those bits happen to hold.
+        used = {"1D": 1, "2D": 2, "3D": 3, "cube": 3}[dim]
+        off = [fetch.tf_offset_x, fetch.tf_offset_y, fetch.tf_offset_z][:used]
+        if any(off):
+            flags.append("offset=" + ",".join(str(v) for v in off))
         if flags:
             text += " [%s]" % " ".join(flags)
         return pred + text
