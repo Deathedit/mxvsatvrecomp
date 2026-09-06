@@ -2874,6 +2874,22 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
                       why_key == TexKeyFail::kShorterThanLevel0
                           ? " (buffer SHORTER than level 0)"
                           : "");
+        // AND THE FIRST BYTES, so the question stops being answerable only by
+        // argument. Three of the four unmatched DXT4_5 dimensions DO have
+        // assets and the size arithmetic agrees on both sides, so either the
+        // key computation differs or the content is not in any asset -- and
+        // those cannot be told apart from this side. Searching the assets for
+        // these bytes settles it, which is exactly how the shader join was
+        // settled.
+        if (source.guest_format < 64 &&
+            s_perFormat[source.guest_format] <= 2 && guest.size() >= 32) {
+          std::string hex;
+          for (size_t i = 0; i < 32; ++i)
+            hex += fmt::format("{:02X}", guest[i]);
+          REXLOG_INFO("d3d9: texture UNMATCHED {} first32 {}",
+                      mx::hle::GuestTextureFormatName(source.guest_format),
+                      hex);
+        }
       } else {
         ++g_texNames.named;
         if (source.guest_format < 64)
