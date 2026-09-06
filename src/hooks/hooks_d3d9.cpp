@@ -2452,7 +2452,6 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   }
 
   DrawCall dc;
-  dc.mesh_name = mesh_name;
   HleSkip skip = HleSkip::kNone;
   if (!BuildHleDraw(in, dc, skip)) {
     ++HleSkipCounts()[uint32_t(skip)];
@@ -2471,6 +2470,13 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
     }
     return;
   }
+  // AFTER BuildHleDraw, never before. Its first statement is `out = DrawCall{}`
+  // -- it clears the whole struct -- so a field set on `dc` beforehand is gone
+  // by the time anything reads it. That is why every recorded draw reached
+  // replay with a null mesh_name and the replay census read 0.0% named for six
+  // runs: not a fact about the guest, a field wiped two lines after it was set.
+  dc.mesh_name = mesh_name;
+
   // PsParamGen is draw state, not a vertex-shader export: Xenos writes the
   // generated pixel parameters to the register selected by SQ_CONTEXT_MISC,
   // independently of SQ_PROGRAM_CNTL.vs_export_count. The SDK limits it to the
