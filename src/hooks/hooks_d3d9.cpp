@@ -1961,8 +1961,17 @@ constexpr uint32_t kMeshMinBytes = 32;
 // stops changing; a full hash of every bound buffer on every draw is not
 // affordable and would change what is being measured.
 const std::string* MeshNameFor(const uint8_t* host, uint32_t bytes,
-                               bool* by_prefix, bool* first_miss) {
-  struct Memo { uint32_t bytes; const std::string* name; bool prefix; };
+                               bool* by_prefix, bool* first_miss,
+                               uint64_t* content_key) {
+  struct Memo {
+    uint32_t bytes;
+    const std::string* name;
+    bool prefix;
+    // Kept so a memo HIT can still say WHICH mesh this is. Without it the
+    // per-shader attribution below would only ever see a buffer's very first
+    // binding, which is the same first-sighting gate it exists to remove.
+    uint64_t key;
+  };
   static std::unordered_map<const void*, Memo> s_memo;
   *by_prefix = false;
   *first_miss = false;
@@ -1970,6 +1979,7 @@ const std::string* MeshNameFor(const uint8_t* host, uint32_t bytes,
   if (it != s_memo.end() && it->second.bytes == bytes) {
     ++g_meshNames.hashMemoHit;
     *by_prefix = it->second.prefix;
+    *content_key = it->second.key;
     return it->second.name;
   }
   ++g_meshNames.hashMemoMiss;
@@ -1985,6 +1995,7 @@ const std::string* MeshNameFor(const uint8_t* host, uint32_t bytes,
   // the ones that go on to match nothing. Counting it only on the matched path
   // would make the ratio 100% by construction.
   const uint64_t full_key = MeshFnv64(host, bytes);
+  *content_key = full_key;
   static std::unordered_set<uint64_t> s_content;
   const bool new_content = s_content.insert(full_key).second;
   if (new_content) ++g_meshNames.contentSeen;
@@ -2009,7 +2020,7 @@ const std::string* MeshNameFor(const uint8_t* host, uint32_t bytes,
     // every other row.
     *first_miss = new_content;
   }
-  s_memo[host] = Memo{bytes, found, prefix};
+  s_memo[host] = Memo{bytes, found, prefix, full_key};
   *by_prefix = prefix;
   return found;
 }
@@ -2052,10 +2063,25 @@ const std::string* CensusMeshNames(const mx::hle::HleDrawInputs& in,
     if (!host || bytes == 0) { ++g_meshNames.noHost; return; }
     if (bytes < kMeshMinBytes) { ++g_meshNames.unmatchedTiny; return; }
     bool by_prefix = false, first_miss = false;
-    const std::string* name = MeshNameFor(host, bytes, &by_prefix, &first_miss);
+    uint64_t content_key = 0;
+    const std::string* name =
+        MeshNameFor(host, bytes, &by_prefix, &first_miss, &content_key);
+    (void)first_miss;
     if (!name) {
       ++g_meshNames.unmatched;
-      if (first_miss) {
+      // PER (shader, mesh). This used to gate on `first_miss`, the first
+      // sighting of the content ANYWHERE, which meant a mesh drawn first by a
+      // depth prepass was attributed to that prepass and could never appear
+      // under the shader that actually renders it. That is exactly why the
+      // vehicle shaders show up in the REPLAY table -- which counts per draw
+      // and has no such gate -- and in neither the miss table nor the byte log.
+      // Two instruments disagreeing was the signal, and this gate was the
+      // cause.
+      //
+      // Still deduplicated, so a mesh redrawn every frame counts once per
+      // shader rather than once per binding.
+      static std::set<std::pair<std::string, uint64_t>> s_pairs;
+      {
         // Three outcomes, kept apart. A runtime-generated shader HAS no asset
         // name and a mesh drawn by one is not expected to match; reporting it
         // as "unnamed" would put it in the same row as a real failure.
@@ -2063,6 +2089,7 @@ const std::string* CensusMeshNames(const mx::hle::HleDrawInputs& in,
                           : vs->runtime_generated ? "(runtime-generated shader)"
                           : vs->name              ? vs->name->c_str()
                                                   : "(shader unnamed)";
+        if (!s_pairs.insert({who, content_key}).second) return;
         ++MeshMissByShader()[who];
         // AND THE FIRST BYTES, for a miss under a shader that HAS an asset
         // name. Those are the ones that should have matched: a vehicle or prop
