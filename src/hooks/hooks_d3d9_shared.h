@@ -148,6 +148,18 @@ struct TextureNameCensus {
   // bytes are not the guest bytes". Without it the three counters did not sum
   // to `seen` and the interesting number had to be got by subtraction.
   uint64_t unmatched = 0;
+  // Unmatched and NAMED, both broken down by guest texture format.
+  //
+  // This is what closes the question. The asset corpus is six formats -- DXT1
+  // 4779, DXT4_5 1236, DXN 623, 16_16_16_16 110, 8_8_8_8 93, 16 55 -- and
+  // nothing else. A texture in FMT_4_4_4_4 or FMT_8 cannot match because no
+  // asset is in that format, so it is not a miss, it is a texture the game
+  // generated. Counting by format separates "has no asset" from "has an asset
+  // and we failed to find it" without guessing from a sample of twelve.
+  //
+  // 64 formats; the field is six bits.
+  uint64_t unmatchedByFormat[64] = {};
+  uint64_t namedByFormat[64] = {};
 };
 extern TextureNameCensus g_texNames;
 

@@ -2848,6 +2848,8 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
       }
       if (it == tn.end()) {
         ++g_texNames.unmatched;
+        if (source.guest_format < 64)
+          ++g_texNames.unmatchedByFormat[source.guest_format];
         // WHAT they are, not just how many. A render target and a dynamic
         // glyph atlas both legitimately have no asset; a 1024x1024 DXT1 that
         // looks exactly like the ones that DO resolve would mean the join is
@@ -2864,6 +2866,8 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
                           : "");
       } else {
         ++g_texNames.named;
+        if (source.guest_format < 64)
+          ++g_texNames.namedByFormat[source.guest_format];
         if (by_prefix) ++g_texNames.byPrefix;
         // The first few by name, because a percentage cannot be checked by eye
         // and "ATV_Alpha_Combo at 256x256 DXT4_5" can.

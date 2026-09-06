@@ -4905,6 +4905,22 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
                     : 0.0,
                 g_texNames.byPrefix, g_texNames.unmatched, g_texNames.noKey,
                 g_texNames.shortBuffer);
+    // BY FORMAT, named against unmatched. A format the asset corpus does not
+    // contain cannot be matched, so its unmatched count is not a failure --
+    // it is the measure of how much of the frame the game generates rather
+    // than loads. Only a format that appears in BOTH columns is evidence of
+    // the join losing textures it should have found.
+    {
+      std::string rows;
+      for (uint32_t f = 0; f < 64; ++f) {
+        const uint64_t n = g_texNames.namedByFormat[f];
+        const uint64_t u = g_texNames.unmatchedByFormat[f];
+        if (!n && !u) continue;
+        rows += fmt::format(" [{} named {} unmatched {}]",
+                            mx::hle::GuestTextureFormatName(f), n, u);
+      }
+      REXLOG_INFO("d3d9: TEXTURE NAMES   by format --{}", rows);
+    }
     // The repeat offenders, cumulative, worst first. Three textures own this
     // whole bucket; this names them and says why each one misses.
     {
