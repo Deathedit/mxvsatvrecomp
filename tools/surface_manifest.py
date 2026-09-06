@@ -42,11 +42,21 @@ Names are `<asset>::p<N>` for a vertex block and `<asset>::p<N>:idx` for its
 indices. A key claimed by several parts OF THE SAME ASSET keeps the asset name
 and loses the part number, because that is a repeated mesh -- ATV_FRSand has
 one block shared by parts 0, 20 and 40 -- and "ATV_FRSand" is a true and useful
-answer where dropping it is not. Only a key claimed by DIFFERENT assets is real
-ambiguity, and those are dropped and reported. Resolving asset-level collisions
-by dropping them cost 1035 keys on the first run, which is the same mistake
-tools/material_table.py made when it keyed by basename and silently lost half
-the table.
+answer where dropping it is not.
+
+A key claimed by DIFFERENT assets is JOINED, not dropped. Dropping is what
+texture_manifest.py does, and for pixels it is right: two textures sharing a
+key means one of them would get the wrong name. Geometry is not like that.
+Identical bytes ARE the same mesh, shipped in two packages -- two ATV models
+sharing a frame -- so "ATV_FRSand|ATV_Gliz" is true, and dropping it is the
+only answer that is false.
+
+That distinction is not academic. Dropping cost 1440 keys and took real vehicle
+geometry with it: 6 of ATV_FRSand's 60 parts had no key at all, 5 of
+HR_MX_EarthF's 19 and 7 of HR_MX_NeptuneF's 19. The runtime missed them exactly
+as often as that predicts -- thousands of replayed draws under
+FR_SandATV_Frame, Template_MX_ATV_DynPlastic_FNL and Template_MX_FrameRefl_FNL
+matching nothing -- and it read as a join failure when it was this policy.
 
 Usage:
     py -3 tools/surface_manifest.py --assets out/all
@@ -89,24 +99,33 @@ def add(claims, key, label):
     claims.setdefault(key, set()).add(label)
 
 
+# A joined name lists at most this many assets before it is truncated. The name
+# is for a human reading a log line, and eleven ATV variants sharing one bolt
+# would otherwise produce a name longer than the line it sits on.
+MAX_JOINED = 3
+
+
 def resolve(claims):
-    """Turn claims into names, collapsing same-asset collisions to the asset."""
-    names, collisions, collapsed = {}, {}, 0
+    """Turn claims into names. Nothing is dropped; ambiguity is spelled out."""
+    names, collapsed, joined = {}, 0, 0
     for key, labels in claims.items():
         if len(labels) == 1:
             names[key] = next(iter(labels))
             continue
         # `<asset>::p<N>` and `<asset>::p<N>:idx` -- the asset is everything
         # before the first "::", and the tag is whether ":idx" is on the end.
-        assets = {l.split("::", 1)[0] for l in labels}
-        tags = {l.endswith(":idx") for l in labels}
+        assets = sorted({l.split("::", 1)[0] for l in labels})
+        tag = ":idx" if {l.endswith(":idx") for l in labels} == {True} else ""
         if len(assets) == 1:
-            asset = next(iter(assets))
-            names[key] = asset + (":idx" if tags == {True} else "")
+            names[key] = assets[0] + tag
             collapsed += 1
         else:
-            collisions[key] = labels
-    return names, collisions, collapsed
+            shown = "|".join(assets[:MAX_JOINED])
+            if len(assets) > MAX_JOINED:
+                shown += "|+%d" % (len(assets) - MAX_JOINED)
+            names[key] = shown + tag
+            joined += 1
+    return names, joined, collapsed
 
 
 def main():
@@ -160,7 +179,7 @@ def main():
                     add(claims, fnv64(data[:PREFIX_BYTES]), label)
                     prefix_keys += 1
 
-    names, collisions, collapsed = resolve(claims)
+    names, joined, collapsed = resolve(claims)
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as f:
@@ -174,13 +193,10 @@ def main():
           % (len(names), prefix_keys))
     print("collapsed     %d key(s) claimed by several parts of ONE asset, "
           "named by the asset" % collapsed)
-    print("ambiguous     %d key(s) claimed by DIFFERENT assets, dropped"
-          % len(collisions))
+    print("joined        %d key(s) claimed by DIFFERENT assets, named by all "
+          "of them" % joined)
     print("degenerate    %d block(s) of a single repeated byte, skipped"
           % degenerate)
-    if collisions:
-        for k, v in list(collisions.items())[:3]:
-            print("   e.g. %016X -> %s" % (k, sorted(v)[:3]))
     print("\nwrote %s   (%.0f KB)"
           % (args.out, os.path.getsize(args.out) / 1e3))
 
