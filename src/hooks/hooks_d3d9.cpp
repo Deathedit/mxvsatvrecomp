@@ -2046,7 +2046,8 @@ const std::string* CensusMeshNames(const mx::hle::HleDrawInputs& in,
                                    const TranslatedShader* vs) {
   ++g_meshNames.draws;
   const std::string* vertex_name = nullptr;
-  const auto offer = [&](const uint8_t* host, uint32_t bytes, bool is_index) {
+  const auto offer = [&](const uint8_t* host, uint32_t bytes, bool is_index,
+                         uint32_t offset_bytes, uint32_t stride) {
     ++g_meshNames.buffers;
     if (!host || bytes == 0) { ++g_meshNames.noHost; return; }
     if (bytes < kMeshMinBytes) { ++g_meshNames.unmatchedTiny; return; }
@@ -2063,6 +2064,30 @@ const std::string* CensusMeshNames(const mx::hle::HleDrawInputs& in,
                           : vs->name              ? vs->name->c_str()
                                                   : "(shader unnamed)";
         ++MeshMissByShader()[who];
+        // AND THE FIRST BYTES, for a miss under a shader that HAS an asset
+        // name. Those are the ones that should have matched: a vehicle or prop
+        // shader names geometry the assets are supposed to contain, and after
+        // three separate key bugs this session the question "are these bytes in
+        // any asset" needs settling from the asset side rather than argued from
+        // this one. Runtime-generated and unnamed shaders are excluded because
+        // their misses are expected and would fill the cap.
+        //
+        // offset_bytes is printed because the hash ignores it. If the guest
+        // packs several parts into one buffer, this draw's data starts there
+        // and hashing from the base is the wrong extent -- which is exactly the
+        // shape of the last two bugs.
+        if (vs && !vs->runtime_generated && vs->name && bytes >= 32) {
+          static std::atomic<uint32_t> s_shown{0};
+          if (s_shown++ < 10) {
+            std::string hex;
+            for (size_t i = 0; i < 32 && i < bytes; ++i)
+              hex += fmt::format("{:02X}", host[i]);
+            REXLOG_INFO("d3d9: MESH UNMATCHED {} -- {} bytes, offset {}, "
+                        "stride {}, {} -- first32 {}",
+                        *vs->name, bytes, offset_bytes, stride,
+                        is_index ? "indices" : "vertices", hex);
+          }
+        }
       }
       return;
     }
@@ -2084,10 +2109,11 @@ const std::string* CensusMeshNames(const mx::hle::HleDrawInputs& in,
   if (in.streams) {
     for (uint32_t s = 0; s < mx::hle::kMaxStreams; ++s) {
       if (!in.streams[s].bound) continue;
-      offer(in.streams[s].host, in.streams[s].size_bytes, false);
+      offer(in.streams[s].host, in.streams[s].size_bytes, false,
+            in.streams[s].offset_bytes, in.streams[s].stride);
     }
   }
-  if (in.index.bound) offer(in.index.host, in.index.size_bytes, true);
+  if (in.index.bound) offer(in.index.host, in.index.size_bytes, true, 0, 2);
   if (vertex_name) ++g_meshNames.drawsNamed;
   return vertex_name;
 }
