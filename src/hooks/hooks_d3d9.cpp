@@ -24,7 +24,9 @@
 #include <mutex>
 #include <thread>
 #include <set>
+#include <cstdlib>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <fstream>
 
@@ -1892,6 +1894,133 @@ void NoteShaderlessDraw(const mx::hle::DrawCall& dc) {
               bound.empty() ? " none" : bound);
 }
 
+MeshNameCensus g_meshNames;
+
+namespace {
+
+// content key -> the .surface part it came from, from tools/surface_manifest.py
+const std::unordered_map<uint64_t, std::string>& MeshNames() {
+  static const std::unordered_map<uint64_t, std::string> names = [] {
+    std::unordered_map<uint64_t, std::string> m;
+    std::ifstream f("userdata/surface_names.txt");
+    if (!f) {
+      REXLOG_INFO("d3d9: userdata/surface_names.txt absent -- meshes will "
+                  "report unnamed. Build it with tools/surface_manifest.py");
+      return m;
+    }
+    std::string line;
+    while (std::getline(f, line)) {
+      const size_t tab = line.find('\t');
+      if (tab != 16) continue;
+      char* end = nullptr;
+      const uint64_t key =
+          std::strtoull(line.substr(0, tab).c_str(), &end, 16);
+      if (!end || *end) continue;
+      std::string name = line.substr(tab + 1);
+      while (!name.empty() && (name.back() == '\r' || name.back() == '\n'))
+        name.pop_back();
+      m.emplace(key, std::move(name));
+    }
+    REXLOG_INFO("d3d9: mesh names loaded: {} entries", m.size());
+    return m;
+  }();
+  return names;
+}
+
+// Byte-wise FNV-1a 64, the same function tools/surface_manifest.py applies to
+// the asset bytes. Byte-wise, NOT dword-wise: the shader join hashes microcode
+// DWORDS and this one hashes BYTES, and mixing the two reads as a total miss
+// with nothing to say why.
+uint64_t MeshFnv64(const uint8_t* p, size_t n) {
+  uint64_t h = 1469598103934665603ull;
+  for (size_t i = 0; i < n; ++i) h = (h ^ p[i]) * 1099511628211ull;
+  return h;
+}
+
+constexpr size_t kMeshPrefixBytes = 4096;
+// Below this a buffer cannot be a mesh -- the smallest real part in the corpus
+// is 40 vertices at 28 bytes. Counted apart rather than dropped, because an
+// excluded population that is never reported is how a coverage figure ends up
+// measured against a denominator it could never reach.
+constexpr uint32_t kMeshMinBytes = 256;
+
+// Look one buffer up, memoised on (pointer, size). Guest buffers CAN be
+// rewritten in place at the same address -- the glyph atlas is -- so this memo
+// can go stale. It is measurement, and a stale name is visible as a mesh that
+// stops changing; a full hash of every bound buffer on every draw is not
+// affordable and would change what is being measured.
+const std::string* MeshNameFor(const uint8_t* host, uint32_t bytes,
+                               bool* by_prefix) {
+  struct Memo { uint32_t bytes; const std::string* name; bool prefix; };
+  static std::unordered_map<const void*, Memo> s_memo;
+  *by_prefix = false;
+  auto it = s_memo.find(host);
+  if (it != s_memo.end() && it->second.bytes == bytes) {
+    ++g_meshNames.hashMemoHit;
+    *by_prefix = it->second.prefix;
+    return it->second.name;
+  }
+  ++g_meshNames.hashMemoMiss;
+
+  const auto& names = MeshNames();
+  const std::string* found = nullptr;
+  bool prefix = false;
+  // The FULL key first: it is the one a whole-block upload produces, and it is
+  // the only key the manifest emits for a part under 4096 bytes.
+  auto f = names.find(MeshFnv64(host, bytes));
+  if (f != names.end()) {
+    found = &f->second;
+  } else if (bytes > kMeshPrefixBytes) {
+    auto p = names.find(MeshFnv64(host, kMeshPrefixBytes));
+    if (p != names.end()) { found = &p->second; prefix = true; }
+  }
+  s_memo[host] = Memo{bytes, found, prefix};
+  *by_prefix = prefix;
+  return found;
+}
+
+// Every buffer this draw brings, counted whether or not it resolves. Called
+// BEFORE BuildHleDraw so a draw that fails to translate is still an
+// opportunity -- gating the census on the thing it exists to diagnose is
+// exactly what made the Bink probe unreadable.
+//
+// WHAT THIS DENOMINATOR EXCLUDES, said here because a coverage figure whose
+// population is not stated is the failure this project keeps repeating:
+// command-buffer replay calls FinishHleDraw directly (hooks_d3d9_cmdbuf.cpp)
+// and never passes through BuildAndQueueDraw, so the palm foliage, the rider
+// and the bike -- around 123k draws a run -- are NOT counted here at all. They
+// are the draws whose geometry most needs naming. Reading `draws` as "every
+// draw in the frame" would overstate coverage by exactly that population.
+void CensusMeshNames(const mx::hle::HleDrawInputs& in) {
+  ++g_meshNames.draws;
+  const auto offer = [](const uint8_t* host, uint32_t bytes, bool is_index) {
+    ++g_meshNames.buffers;
+    if (!host || bytes == 0) { ++g_meshNames.noHost; return; }
+    if (bytes < kMeshMinBytes) { ++g_meshNames.unmatchedTiny; return; }
+    bool by_prefix = false;
+    const std::string* name = MeshNameFor(host, bytes, &by_prefix);
+    if (!name) { ++g_meshNames.unmatched; return; }
+    if (by_prefix) ++g_meshNames.byPrefix;
+    // Which SIDE matched is the whole diagnostic: vertices verbatim means the
+    // asset can be substituted, indices-only means the guest re-packs vertices
+    // on load and step 4 needs a converter.
+    if (is_index) ++g_meshNames.namedIndex; else ++g_meshNames.namedVertex;
+    static std::map<std::string, uint64_t> s_seen;
+    if (++s_seen[*name] == 1 && s_seen.size() <= 12)
+      REXLOG_INFO("d3d9: MESH NAMED {} ({} bytes, {})", *name, bytes,
+                  is_index ? "indices" : "vertices");
+  };
+  if (in.streams) {
+    for (uint32_t s = 0; s < mx::hle::kMaxStreams; ++s) {
+      if (!in.streams[s].bound) continue;
+      offer(in.streams[s].host, in.streams[s].size_bytes, false);
+    }
+  }
+  if (in.index.bound) offer(in.index.host, in.index.size_bytes, true);
+}
+
+}  // namespace
+
 bool FinishHleDraw(mx::hle::DrawCall& dc) {
   mx::hle::HleSkip skip = mx::hle::HleSkip::kNone;
   if (!mx::hle::FinalizeHleTopology(dc, skip)) {
@@ -2166,6 +2295,10 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
         VportScaleEnabled(device, base);
     if (in.defer_transcode) ++g_transcodeDeferred;
   }
+
+  // Measurement only. Nothing here selects geometry -- the draw is built from
+  // the guest's own streams exactly as before.
+  CensusMeshNames(in);
 
   DrawCall dc;
   HleSkip skip = HleSkip::kNone;
@@ -4921,6 +5054,25 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
       }
       REXLOG_INFO("d3d9: TEXTURE NAMES   by format --{}", rows);
     }
+    // GEOMETRY, the same join. `buffers` PARTITIONS into the five counters
+    // below it -- named vertex, named index, unmatched, too small to be a mesh,
+    // and unresolved -- so a reader can see the whole population without
+    // subtracting. The texture version of this line shipped reporting three of
+    // four buckets and left 666 decodes unaccounted for.
+    REXLOG_INFO("d3d9: MESH NAMES -- {} draws, {} buffers = {} vertex + {} "
+                "index named ({:.1f}%, {} by prefix) + {} MATCHED NOTHING + {} "
+                "under {}B (not a mesh) + {} unresolved; memo {}/{} hit",
+                g_meshNames.draws, g_meshNames.buffers,
+                g_meshNames.namedVertex, g_meshNames.namedIndex,
+                g_meshNames.buffers
+                    ? (g_meshNames.namedVertex + g_meshNames.namedIndex) *
+                          100.0 / double(g_meshNames.buffers)
+                    : 0.0,
+                g_meshNames.byPrefix, g_meshNames.unmatched,
+                g_meshNames.unmatchedTiny, kMeshMinBytes, g_meshNames.noHost,
+                g_meshNames.hashMemoHit,
+                g_meshNames.hashMemoHit + g_meshNames.hashMemoMiss);
+
     // The repeat offenders, cumulative, worst first. Three textures own this
     // whole bucket; this names them and says why each one misses.
     {

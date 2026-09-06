@@ -163,6 +163,45 @@ struct TextureNameCensus {
 };
 extern TextureNameCensus g_texNames;
 
+// The same join, for GEOMETRY. tools/surface_manifest.py hashes each .surface
+// part's vertex block and index block as raw big-endian bytes -- the exact
+// representation HleStream::host documents itself as holding -- so a bound
+// stream can be looked up by content, with no decode on either side to
+// disagree about.
+//
+// THIS IS THE STEP-4 FALSIFIER, and it is the measurement the plan called for
+// even though it is not the instrument the plan named. ScoreHleTransform scores
+// candidate MVP registers by how much geometry lands inside the clip volume; it
+// answers "which constant is the matrix", not "are these two vertex buffers the
+// same data". Pointing it at this question would have produced a number that
+// looked like an answer and was not.
+//
+// What it establishes: whether the guest uploads the asset's bytes verbatim. If
+// it does, asset geometry can be substituted. If the vertex side misses while
+// the index side hits, the guest is re-packing vertices on load and step 4
+// needs a converter rather than a reader.
+struct MeshNameCensus {
+  uint64_t draws = 0;         // every draw reaching the census, before any gate
+  uint64_t buffers = 0;       // (stream, index) buffers offered to the join
+  uint64_t noHost = 0;        // bound but unresolved, so nothing to hash
+  uint64_t namedVertex = 0;   // a stream matched a .surface vertex block
+  uint64_t namedIndex = 0;    // an index buffer matched a .surface index block
+  uint64_t byPrefix = 0;      // of those, how many the 4096-byte key found
+  uint64_t unmatched = 0;     // hashed and matched nothing
+  // Hashing is memoised per (pointer, size), because a full FNV over every
+  // bound buffer on every draw is the shape of cost that already cost this
+  // project 4.6ms a frame once. These say whether the memo is working, and a
+  // hit rate near zero would mean it is not.
+  uint64_t hashMemoHit = 0;
+  uint64_t hashMemoMiss = 0;
+  // Unmatched, split by whether the buffer is a plausible mesh at all. A
+  // 16-byte stream is a constant, not a mesh, and counting it as a miss would
+  // put the coverage number under a denominator that can never be reached --
+  // the mistake this project has now shipped three times.
+  uint64_t unmatchedTiny = 0;
+};
+extern MeshNameCensus g_meshNames;
+
 struct TranslatedShader {
   std::shared_ptr<const std::string> source;  // null unless emitted AND compiled
   uint32_t input_mask = 0;
