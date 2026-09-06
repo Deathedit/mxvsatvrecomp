@@ -216,6 +216,10 @@ class Emitter {
   // the fetch coordinate and the assumption is unverified. Reported rather than
   // refused -- it is the hardware's own operand form either way.
   bool cube_fetch_without_cube_op = false;
+  // Fetches carrying a non-zero offset_z, which has no host equivalent while a
+  // stacked texture's slice axis is an array index. Counted so that "nothing
+  // uses it" remains something measured rather than assumed.
+  uint32_t fetch_offset_z_dropped = 0;
   // Vertex fetches emitted into the body, in program order. The ordinal is the
   // index into xe_vf[] the host must fill, and it matches the order
   // DecodeVertexShaderFetches pushes attributes in -- both walk the same stream
@@ -1141,6 +1145,26 @@ class Emitter {
       return;
     }
 
+    // TEXEL OFFSETS. The instruction carries offset_x/y/z and this emitter used
+    // to drop them, so every offset fetch in the game sampled the coordinate
+    // unmodified. bloom.shader::BlurHPS is three tfetch2D from the same
+    // register and the same fetch constant, differing ONLY by these fields:
+    // without them its blur is a weighted copy of one texel.
+    //
+    // HALF-TEXEL UNITS, from the SDK -- `offset_x() { return data_.offset_x *
+    // 0.5f; }` (ucode.h:816). So the accessor already returns texels and the
+    // raw field is twice that. That also rules out HLSL's integer offset
+    // argument, which takes an immediate texel count: bloom's taps are at
+    // +/-1.5 texels and are not representable there. Applied to the coordinate
+    // instead, scaled into normalized space by xe_texinv.
+    //
+    // Applied AFTER the unnormalized divide below, so one expression covers
+    // both cases: a denormalized coordinate becomes raw*texinv + off*texinv,
+    // which is (raw + off) * texinv, the texel-space sum.
+    const float off_x = tf.offset_x();
+    const float off_y = tf.offset_y();
+    const float off_z = tf.offset_z();
+
     std::string coord = Temp(tf.src()) + "." + uv;
     if (tf.unnormalized_coordinates()) {
       // `tx_coord_denorm` means the guest addresses this texture in TEXELS; the
@@ -1151,6 +1175,17 @@ class Emitter {
       // by a zero extent would produce. This used to MULTIPLY by the extent.
       coord = "(" + coord + " * xe_texinv[" + std::to_string(slot) +
               (is_1d ? "].x)" : "].xy)");
+    }
+    // Now, while the coordinate is still the bare 1 or 2 normalized components
+    // and before the 1D/3D wrapping below turns it into a float2/float3.
+    if (off_x != 0.0f || off_y != 0.0f) {
+      const std::string ti = "xe_texinv[" + std::to_string(slot) + "]";
+      if (is_1d) {
+        coord = "(" + coord + " + " + std::to_string(off_x) + " * " + ti + ".x)";
+      } else {
+        coord = "(" + coord + " + float2(" + std::to_string(off_x) + ", " + std::to_string(off_y) +
+                ") * " + ti + ".xy)";
+      }
     }
     if (is_1d) {
       // A Xenos 1D texture is one row, described to the host as width x 1, so
@@ -1184,6 +1219,12 @@ class Emitter {
                    : "(" + w + " * xe_texinv[" + std::to_string(slot) + "].z)") +
               ")";
     }
+    // offset_z is NOT applied. The slice axis of a stacked texture is an array
+    // index here, not a filtered coordinate, so a half-texel offset along it
+    // has no host equivalent -- the same divergence the 3D note above records.
+    // Counted rather than ignored, so "no shader uses it" stays a measurement.
+    if (off_z != 0.0f) ++fetch_offset_z_dropped;
+
     const std::string s = std::to_string(slot);
     Line("xe_v = xe_tex" + s + SampleOp(tf) + "xe_smp" + s + ", " + coord +
          SampleLod(tf, slot) + ");");

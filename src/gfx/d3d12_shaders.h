@@ -97,9 +97,9 @@ float4 main(float4 pos : SV_POSITION, float4 col : COLOR) : SV_TARGET {
 //
 // THE GUEST SHADER, from tools/shader_code.py, three ALU and three fetches:
 //
-//     tfetch2D r1, r0, tf0 [offset=-3,0]      (BlurVPS: 0,-3)
+//     tfetch2D r1, r0, tf0 [offset=-1.5,0]    (BlurVPS: 0,-1.5)
 //     tfetch2D r2, r0, tf0                    centre
-//     tfetch2D r0, r0, tf0 [offset=+3,0]      (BlurVPS: 0,+3)
+//     tfetch2D r0, r0, tf0 [offset=+1.5,0]    (BlurVPS: 0,+1.5)
 //     mul  r0, r0, c103
 //     mad  r0, r2.xzwy, c102.xzwy, r0.xzwy
 //     mad  export0, r1, c101, r0.xwyz
@@ -123,10 +123,12 @@ float4 main(float4 pos : SV_POSITION, float4 col : COLOR) : SV_TARGET {
 // not a reimplementation, and turning it on should visibly change bloom. If it
 // does not, the substitution did not reach the GPU.
 //
-// The offsets are literals because HLSL requires an immediate in [-8,7] and
-// these are +/-3. Anything outside that range would need the coordinate
-// adjusted by xe_texinv instead, which is why the registry entry is per pass
-// rather than a general offset-aware path.
+// THE OFFSETS ARE HALF-TEXELS, from the SDK: `offset_x() { return
+// data_.offset_x * 0.5f; }` (ucode.h:816). The raw field reads +/-3, so the
+// taps are at +/-1.5 TEXELS. The first version of this shader used HLSL's
+// integer offset argument with int2(+/-3, 0), which is both the wrong distance
+// and a form that cannot express a half texel at all. Applied to the
+// coordinate instead, scaled by xe_texinv, exactly as the translator now does.
 inline constexpr const char* kNativeBloomBlurH = R"(
 cbuffer XeShaderConstants : register(b1) {
   float4 xe_c[256];
@@ -143,9 +145,10 @@ struct XePsOut { float4 c0 : SV_Target0; };
 XePsOut main(XeInterpolants xe_in, bool xe_front : SV_IsFrontFace) {
   float2 uv = xe_in.i0.xy;
   XePsOut o;
-  o.c0 = xe_tex0.Sample(xe_smp0, uv, int2(-3, 0)) * xe_c[101]
-       + xe_tex0.Sample(xe_smp0, uv, int2( 0, 0)) * xe_c[102]
-       + xe_tex0.Sample(xe_smp0, uv, int2( 3, 0)) * xe_c[103];
+  float2 t = xe_texinv[0].xy;
+  o.c0 = xe_tex0.Sample(xe_smp0, uv + float2(-1.5, 0.0) * t) * xe_c[101]
+       + xe_tex0.Sample(xe_smp0, uv)                         * xe_c[102]
+       + xe_tex0.Sample(xe_smp0, uv + float2( 1.5, 0.0) * t) * xe_c[103];
   // The translator's OUTPUT EPILOGUE, reproduced because it is not part of
   // the guest shader and a substitute that omits it is wrong on exactly the
   // targets that need it most. xe_colorscale.x is 1/32 for the signed
@@ -178,9 +181,10 @@ struct XePsOut { float4 c0 : SV_Target0; };
 XePsOut main(XeInterpolants xe_in, bool xe_front : SV_IsFrontFace) {
   float2 uv = xe_in.i0.xy;
   XePsOut o;
-  o.c0 = xe_tex0.Sample(xe_smp0, uv, int2(0, -3)) * xe_c[101]
-       + xe_tex0.Sample(xe_smp0, uv, int2(0,  0)) * xe_c[102]
-       + xe_tex0.Sample(xe_smp0, uv, int2(0,  3)) * xe_c[103];
+  float2 t = xe_texinv[0].xy;
+  o.c0 = xe_tex0.Sample(xe_smp0, uv + float2(0.0, -1.5) * t) * xe_c[101]
+       + xe_tex0.Sample(xe_smp0, uv)                         * xe_c[102]
+       + xe_tex0.Sample(xe_smp0, uv + float2(0.0,  1.5) * t) * xe_c[103];
   // The translator's OUTPUT EPILOGUE, reproduced because it is not part of
   // the guest shader and a substitute that omits it is wrong on exactly the
   // targets that need it most. xe_colorscale.x is 1/32 for the signed

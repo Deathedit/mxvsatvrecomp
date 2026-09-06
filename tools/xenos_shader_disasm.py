@@ -709,9 +709,14 @@ class FetchInstruction(object):
     # Word 2 packs use_reg_gradients(1) + sample_location(1) + lod_bias(7) +
     # unused(5) + dimension(2) before them, so x starts at bit 16. Five bits
     # each and SIGNED -- an unsigned read turns a -1 tap into +31.
-    tf_offset_x = property(lambda s: sign5(bits(s.w2, 16, 5)))
-    tf_offset_y = property(lambda s: sign5(bits(s.w2, 21, 5)))
-    tf_offset_z = property(lambda s: sign5(bits(s.w2, 26, 5)))
+    # HALF-TEXEL units, so the field is halved to give texels. The SDK is the
+    # authority here and says so outright -- ucode.h:816,
+    # `offset_x() { return data_.offset_x * 0.5f; }`. Reported raw, these read
+    # as +/-3 for bloom's blur and the taps are really +/-1.5 texels, which is
+    # both twice the distance and not expressible as an HLSL integer offset.
+    tf_offset_x = property(lambda s: sign5(bits(s.w2, 16, 5)) * 0.5)
+    tf_offset_y = property(lambda s: sign5(bits(s.w2, 21, 5)) * 0.5)
+    tf_offset_z = property(lambda s: sign5(bits(s.w2, 26, 5)) * 0.5)
 
     @property
     def opcode_name(self):
@@ -793,7 +798,7 @@ def format_fetch(fetch):
         used = {"1D": 1, "2D": 2, "3D": 3, "cube": 3}[dim]
         off = [fetch.tf_offset_x, fetch.tf_offset_y, fetch.tf_offset_z][:used]
         if any(off):
-            flags.append("offset=" + ",".join(str(v) for v in off))
+            flags.append("offset=" + ",".join("%g" % v for v in off))
         if flags:
             text += " [%s]" % " ".join(flags)
         return pred + text
