@@ -1956,10 +1956,11 @@ constexpr uint32_t kMeshMinBytes = 32;
 // stops changing; a full hash of every bound buffer on every draw is not
 // affordable and would change what is being measured.
 const std::string* MeshNameFor(const uint8_t* host, uint32_t bytes,
-                               bool* by_prefix) {
+                               bool* by_prefix, bool* first_miss) {
   struct Memo { uint32_t bytes; const std::string* name; bool prefix; };
   static std::unordered_map<const void*, Memo> s_memo;
   *by_prefix = false;
+  *first_miss = false;
   auto it = s_memo.find(host);
   if (it != s_memo.end() && it->second.bytes == bytes) {
     ++g_meshNames.hashMemoHit;
@@ -1998,6 +1999,10 @@ const std::string* MeshNameFor(const uint8_t* host, uint32_t bytes,
     if (bytes > g_meshNames.largestUnmatched)
       g_meshNames.largestUnmatched = bytes;
     if (bytes >= 64 * 1024) ++g_meshNames.unmatchedOver64K;
+    // Only on the FIRST sighting of this content, so the breakdown below counts
+    // meshes and not bindings. A mesh redrawn every frame would otherwise bury
+    // every other row.
+    *first_miss = new_content;
   }
   s_memo[host] = Memo{bytes, found, prefix};
   *by_prefix = prefix;
@@ -2016,15 +2021,42 @@ const std::string* MeshNameFor(const uint8_t* host, uint32_t bytes,
 // and the bike -- around 123k draws a run -- are NOT counted here at all. They
 // are the draws whose geometry most needs naming. Reading `draws` as "every
 // draw in the frame" would overstate coverage by exactly that population.
-void CensusMeshNames(const mx::hle::HleDrawInputs& in) {
+// Which shader drew an unmatched mesh, counted once per distinct mesh.
+//
+// This is what turns "1291 meshes matched nothing" into an answer. Shaders are
+// named by content at 99.9% (userdata/shader_names.txt), so the miss can say
+// what it IS: the HFTerrain clipmap and the Scaleform UI have no .surface asset
+// and never will, and a miss under those names is correct behaviour rather than
+// a join failure. A miss under a prop or vehicle shader is the opposite, and is
+// the only kind worth chasing.
+std::map<std::string, uint64_t>& MeshMissByShader() {
+  static std::map<std::string, uint64_t> m;
+  return m;
+}
+
+void CensusMeshNames(const mx::hle::HleDrawInputs& in,
+                     const TranslatedShader* vs) {
   ++g_meshNames.draws;
-  const auto offer = [](const uint8_t* host, uint32_t bytes, bool is_index) {
+  const auto offer = [&](const uint8_t* host, uint32_t bytes, bool is_index) {
     ++g_meshNames.buffers;
     if (!host || bytes == 0) { ++g_meshNames.noHost; return; }
     if (bytes < kMeshMinBytes) { ++g_meshNames.unmatchedTiny; return; }
-    bool by_prefix = false;
-    const std::string* name = MeshNameFor(host, bytes, &by_prefix);
-    if (!name) { ++g_meshNames.unmatched; return; }
+    bool by_prefix = false, first_miss = false;
+    const std::string* name = MeshNameFor(host, bytes, &by_prefix, &first_miss);
+    if (!name) {
+      ++g_meshNames.unmatched;
+      if (first_miss) {
+        // Three outcomes, kept apart. A runtime-generated shader HAS no asset
+        // name and a mesh drawn by one is not expected to match; reporting it
+        // as "unnamed" would put it in the same row as a real failure.
+        const char* who = !vs                   ? "(no vertex shader)"
+                          : vs->runtime_generated ? "(runtime-generated shader)"
+                          : vs->name              ? vs->name->c_str()
+                                                  : "(shader unnamed)";
+        ++MeshMissByShader()[who];
+      }
+      return;
+    }
     if (by_prefix) ++g_meshNames.byPrefix;
     // Which SIDE matched is the whole diagnostic: vertices verbatim means the
     // asset can be substituted, indices-only means the guest re-packs vertices
@@ -2323,7 +2355,10 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
 
   // Measurement only. Nothing here selects geometry -- the draw is built from
   // the guest's own streams exactly as before.
-  CensusMeshNames(in);
+  {
+    const uint32_t vs_h = st.vs_seen ? st.vertex_shader : 0;
+    CensusMeshNames(in, vs_h ? TranslatedVertexShader(vs_h) : nullptr);
+  }
 
   DrawCall dc;
   HleSkip skip = HleSkip::kNone;
@@ -5115,6 +5150,20 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
                           double(g_meshNames.distinctSeen)
                     : 0.0,
                 g_meshNames.unmatchedOver64K, g_meshNames.largestUnmatched);
+    // The misses, by the shader that drew them, worst first. Distinct meshes,
+    // not bindings.
+    {
+      std::vector<std::pair<uint64_t, const std::string*>> worst;
+      for (const auto& [who, n] : MeshMissByShader())
+        worst.emplace_back(n, &who);
+      std::sort(worst.begin(), worst.end(),
+                [](const auto& a, const auto& b) { return a.first > b.first; });
+      std::string rows;
+      for (size_t i = 0; i < worst.size() && i < 10; ++i)
+        rows += fmt::format(" [{} x{}]", *worst[i].second, worst[i].first);
+      REXLOG_INFO("d3d9: MESH NAMES   unmatched meshes by shader, {} distinct "
+                  "shaders --{}", worst.size(), rows);
+    }
 
     // The repeat offenders, cumulative, worst first. Three textures own this
     // whole bucket; this names them and says why each one misses.
