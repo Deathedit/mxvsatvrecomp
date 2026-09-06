@@ -686,8 +686,14 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
           // run, and finding one entry point among them means guessing at
           // content markers -- looking for GrassShader::PixelShaderFar by its
           // sampler count and a swizzle turned up four candidates and none of
-          // them was it. The name is already known here: ShaderNames() is in
-          // this file and is keyed by exactly the content_key below.
+          // them was it.
+          //
+          // KEYED ON code_key, THE MICROCODE. Not on content_key, which is
+          // ShaderSourceKey over the EMITTED HLSL and belongs to the DXBC
+          // cache. The two are both 64-bit hashes with near-identical names in
+          // one function, and using the wrong one is silent: every dump in the
+          // run came out "<unnamed>" while SHADER NAMES reported 99.9%
+          // identified two lines away in the same log.
           //
           // This matters for step 5. A native substitute has to be written
           // against the translated HLSL, because the translator is 1:1 with
@@ -695,7 +701,7 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
           // that comparison needs the two to be findable by the same name.
           {
             const auto& names = ShaderNames();
-            const auto it = names.find(content_key);
+            const auto it = names.find(code_key);
             f << "; pass " << (it != names.end() ? it->second : "<unnamed>")
               << std::endl;
           }
