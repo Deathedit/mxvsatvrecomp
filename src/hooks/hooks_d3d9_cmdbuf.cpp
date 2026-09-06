@@ -417,6 +417,11 @@ uint32_t ReplayCmdBuf(
         ++g_cmdBufConstUnpaired;
       }
     }
+    // Before FinishHleDraw, which has its own refusals: a replayed draw is an
+    // opportunity whether or not it survives, and gating the count on the far
+    // side would measure the refusals rather than the replays.
+    ++g_meshNames.replayDraws;
+    if (dc.mesh_name) ++g_meshNames.replayNamed;
     if (FinishHleDraw(dc)) {
       ++issued;
     } else {

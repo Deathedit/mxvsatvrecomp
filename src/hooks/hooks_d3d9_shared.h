@@ -228,6 +228,25 @@ struct MeshNameCensus {
   // the small dynamic quads that dominate the count.
   uint64_t largestUnmatched = 0;
   uint64_t unmatchedOver64K = 0;
+  // Command-buffer REPLAY, which the counters above cannot see.
+  //
+  // A recorded draw passes through the census once, when its guest bytes are
+  // still there to hash -- so replayed GEOMETRY is named, and the bike and its
+  // tires show up in the named list. What the counters above miss is the
+  // REPETITION: replay re-issues a recorded DrawCall without going through
+  // BuildAndQueueDraw, so none of those re-issues increments `draws`. These
+  // two say how much of the frame's real drawing that is, and how much of it
+  // runs geometry the assets can name.
+  //
+  // I claimed for several messages that replayed geometry was excluded from
+  // the census entirely. It is not, and the log said so all along: the named
+  // list has HR_SWP_BCK_Tire_THQ in it, which is exactly a replayed draw.
+  uint64_t replayDraws = 0;
+  uint64_t replayNamed = 0;
+  // Draws whose VERTEX stream resolved, as opposed to buffers that did. The
+  // per-buffer counters cannot be added to the replay ones -- a draw brings
+  // several buffers -- so the frame total needs a per-draw numerator.
+  uint64_t drawsNamed = 0;
 };
 extern MeshNameCensus g_meshNames;
 

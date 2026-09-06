@@ -192,6 +192,19 @@ enum class HostTopology : uint32_t {
 };
 
 struct DrawCall {
+  // The .surface part this draw's vertex stream came from, or null.
+  //
+  // Set once, where the guest bytes are still available to hash, and carried
+  // from there. Command-buffer replay re-issues a RECORDED DrawCall and has no
+  // guest stream left to look up -- the vertices were transcoded at capture --
+  // so without this the replayed draws could be counted but never named, and
+  // they are the palm foliage, the rider and the bike.
+  //
+  // A BARE POINTER on purpose, for the same reason TranslatedShader::name is
+  // one: it aims into a table loaded once and never erased, so it outlives
+  // every draw and every recording, and copying a DrawCall costs a pointer
+  // rather than a string.
+  const std::string* mesh_name = nullptr;
   std::vector<uint8_t> vertices;      // optional; filled only when a vertex fetch const is known
   std::vector<uint8_t> indices;       // packed index buffer (2 or 4 bytes per index)
   uint32_t vertex_count = 0;

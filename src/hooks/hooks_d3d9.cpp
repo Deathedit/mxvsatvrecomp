@@ -2034,9 +2034,13 @@ std::map<std::string, uint64_t>& MeshMissByShader() {
   return m;
 }
 
-void CensusMeshNames(const mx::hle::HleDrawInputs& in,
-                     const TranslatedShader* vs) {
+// Returns the name of the first VERTEX stream that resolved, for the DrawCall
+// to carry into replay. Index-buffer names are counted but not returned: the
+// question a replayed draw has to answer is which mesh it draws.
+const std::string* CensusMeshNames(const mx::hle::HleDrawInputs& in,
+                                   const TranslatedShader* vs) {
   ++g_meshNames.draws;
+  const std::string* vertex_name = nullptr;
   const auto offer = [&](const uint8_t* host, uint32_t bytes, bool is_index) {
     ++g_meshNames.buffers;
     if (!host || bytes == 0) { ++g_meshNames.noHost; return; }
@@ -2061,7 +2065,12 @@ void CensusMeshNames(const mx::hle::HleDrawInputs& in,
     // Which SIDE matched is the whole diagnostic: vertices verbatim means the
     // asset can be substituted, indices-only means the guest re-packs vertices
     // on load and step 4 needs a converter.
-    if (is_index) ++g_meshNames.namedIndex; else ++g_meshNames.namedVertex;
+    if (is_index) {
+      ++g_meshNames.namedIndex;
+    } else {
+      ++g_meshNames.namedVertex;
+      if (!vertex_name) vertex_name = name;
+    }
     static std::map<std::string, uint64_t> s_seen;
     if (++s_seen[*name] == 1 && s_seen.size() <= 12)
       REXLOG_INFO("d3d9: MESH NAMED {} ({} bytes, {})", *name, bytes,
@@ -2074,6 +2083,8 @@ void CensusMeshNames(const mx::hle::HleDrawInputs& in,
     }
   }
   if (in.index.bound) offer(in.index.host, in.index.size_bytes, true);
+  if (vertex_name) ++g_meshNames.drawsNamed;
+  return vertex_name;
 }
 
 }  // namespace
@@ -2355,12 +2366,15 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
 
   // Measurement only. Nothing here selects geometry -- the draw is built from
   // the guest's own streams exactly as before.
+  const std::string* mesh_name = nullptr;
   {
     const uint32_t vs_h = st.vs_seen ? st.vertex_shader : 0;
-    CensusMeshNames(in, vs_h ? TranslatedVertexShader(vs_h) : nullptr);
+    mesh_name =
+        CensusMeshNames(in, vs_h ? TranslatedVertexShader(vs_h) : nullptr);
   }
 
   DrawCall dc;
+  dc.mesh_name = mesh_name;
   HleSkip skip = HleSkip::kNone;
   if (!BuildHleDraw(in, dc, skip)) {
     ++HleSkipCounts()[uint32_t(skip)];
@@ -5164,6 +5178,19 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
       REXLOG_INFO("d3d9: MESH NAMES   unmatched meshes by shader, {} distinct "
                   "shaders --{}", worst.size(), rows);
     }
+    // Replay, which the per-draw counters above cannot reach. Added to them it
+    // gives the frame's real draw-weighted coverage; on its own it says how
+    // much of the recorded geometry the assets can name.
+    REXLOG_INFO("d3d9: MESH NAMES   cmdbuf replay: {} re-issued draws, {} "
+                "({:.1f}%) run geometry with an asset name. Frame total with "
+                "replay: {} of {} draws carry a named mesh",
+                g_meshNames.replayDraws, g_meshNames.replayNamed,
+                g_meshNames.replayDraws
+                    ? g_meshNames.replayNamed * 100.0 /
+                          double(g_meshNames.replayDraws)
+                    : 0.0,
+                g_meshNames.drawsNamed + g_meshNames.replayNamed,
+                g_meshNames.draws + g_meshNames.replayDraws);
 
     // The repeat offenders, cumulative, worst first. Three textures own this
     // whole bucket; this names them and says why each one misses.
