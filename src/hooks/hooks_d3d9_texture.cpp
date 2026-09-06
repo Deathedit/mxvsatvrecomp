@@ -2850,19 +2850,29 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
         ++g_texNames.unmatched;
         if (source.guest_format < 64)
           ++g_texNames.unmatchedByFormat[source.guest_format];
-        // WHAT they are, not just how many. A render target and a dynamic
-        // glyph atlas both legitimately have no asset; a 1024x1024 DXT1 that
-        // looks exactly like the ones that DO resolve would mean the join is
-        // losing real textures. Only a sample can tell those apart.
-        static std::atomic<uint32_t> s_unmatched{0};
-        if (s_unmatched++ < 12)
-          REXLOG_INFO("d3d9: texture UNMATCHED: {}x{} {} pitch_blocks {} "
-                      "src_bytes {} guest {} {}",
-                      source.width, source.height,
+        // PER FORMAT, not the first N overall. A flat cap of 12 filled up
+        // with FMT_8 and FMT_4_4_4_4 -- formats the asset corpus does not
+        // contain at all -- and never showed a single FMT_4_5, which is the
+        // one format matching SOMETIMES and therefore the only one whose
+        // misses are evidence of anything.
+        //
+        // Enough fields to separate the three candidate causes: a fetch aimed
+        // at a MIP rather than level 0 (mip_address set, level_count > 1), a
+        // sub-extent (pitch and dimensions matching no asset), or a texture
+        // the game has written into since load (nothing structural wrong, the
+        // content simply differs).
+        static std::atomic<uint32_t> s_perFormat[64];
+        if (source.guest_format < 64 &&
+            s_perFormat[source.guest_format]++ < 4)
+          REXLOG_INFO("d3d9: texture UNMATCHED {}: {}x{} pitch_blocks {} "
+                      "src_bytes {} guest {} levels {} mip_addr 0x{:08X} "
+                      "addr 0x{:08X}{}",
                       mx::hle::GuestTextureFormatName(source.guest_format),
-                      source.pitch_blocks, source.source_bytes, guest.size(),
+                      source.width, source.height, source.pitch_blocks,
+                      source.source_bytes, guest.size(), source.level_count,
+                      source.mip_address, source.address,
                       why_key == TexKeyFail::kShorterThanLevel0
-                          ? "(buffer SHORTER than level 0)"
+                          ? " (buffer SHORTER than level 0)"
                           : "");
       } else {
         ++g_texNames.named;
