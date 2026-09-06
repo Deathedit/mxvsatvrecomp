@@ -1966,6 +1966,9 @@ const std::string* MeshNameFor(const uint8_t* host, uint32_t bytes,
     return it->second.name;
   }
   ++g_meshNames.hashMemoMiss;
+  // First sight of this buffer, so this is the per-buffer population rather
+  // than the per-draw one.
+  ++g_meshNames.distinctSeen;
 
   const auto& names = MeshNames();
   const std::string* found = nullptr;
@@ -1978,6 +1981,13 @@ const std::string* MeshNameFor(const uint8_t* host, uint32_t bytes,
   } else if (bytes > kMeshPrefixBytes) {
     auto p = names.find(MeshFnv64(host, kMeshPrefixBytes));
     if (p != names.end()) { found = &p->second; prefix = true; }
+  }
+  if (found) {
+    ++g_meshNames.distinctNamed;
+  } else {
+    if (bytes > g_meshNames.largestUnmatched)
+      g_meshNames.largestUnmatched = bytes;
+    if (bytes >= 64 * 1024) ++g_meshNames.unmatchedOver64K;
   }
   s_memo[host] = Memo{bytes, found, prefix};
   *by_prefix = prefix;
@@ -5077,6 +5087,18 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
                 g_meshNames.unmatchedTiny, kMeshMinBytes, g_meshNames.noHost,
                 g_meshNames.hashMemoHit,
                 g_meshNames.hashMemoHit + g_meshNames.hashMemoMiss);
+    // The same join over DISTINCT buffers. This is the number that answers
+    // "is this mesh in the assets"; the line above answers "how much of the
+    // frame is asset geometry", and they are not the same question.
+    REXLOG_INFO("d3d9: MESH NAMES   distinct buffers: {} of {} named ({:.1f}%);"
+                " of the misses, {} were 64KB or larger and the largest was {} "
+                "bytes",
+                g_meshNames.distinctNamed, g_meshNames.distinctSeen,
+                g_meshNames.distinctSeen
+                    ? g_meshNames.distinctNamed * 100.0 /
+                          double(g_meshNames.distinctSeen)
+                    : 0.0,
+                g_meshNames.unmatchedOver64K, g_meshNames.largestUnmatched);
 
     // The repeat offenders, cumulative, worst first. Three textures own this
     // whole bucket; this names them and says why each one misses.

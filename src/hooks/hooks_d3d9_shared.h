@@ -199,6 +199,22 @@ struct MeshNameCensus {
   // put the coverage number under a denominator that can never be reached --
   // the mistake this project has now shipped three times.
   uint64_t unmatchedTiny = 0;
+  // DISTINCT buffers, counted once each at the point the memo first sees them.
+  //
+  // Everything above is draw-weighted, and draw-weighted is the wrong
+  // denominator for the question being asked. "What fraction of the frame's
+  // geometry comes from assets" is answered by the counters above; "is this
+  // mesh in the assets at all" is answered by these, and the two differ by
+  // however many times a buffer is re-bound. A UI quad redrawn six hundred
+  // times a frame moves the first number and should not move the second.
+  uint64_t distinctSeen = 0;
+  uint64_t distinctNamed = 0;
+  // The largest buffer that matched nothing, and its size. A big unmatched
+  // buffer is either real geometry the join is losing or a generated mesh --
+  // terrain, particles, Scaleform -- and the size alone separates those from
+  // the small dynamic quads that dominate the count.
+  uint64_t largestUnmatched = 0;
+  uint64_t unmatchedOver64K = 0;
 };
 extern MeshNameCensus g_meshNames;
 
