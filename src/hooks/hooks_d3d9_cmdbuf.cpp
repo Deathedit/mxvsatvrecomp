@@ -421,7 +421,17 @@ uint32_t ReplayCmdBuf(
     // opportunity whether or not it survives, and gating the count on the far
     // side would measure the refusals rather than the replays.
     ++g_meshNames.replayDraws;
-    if (dc.mesh_name) ++g_meshNames.replayNamed;
+    if (dc.mesh_name) {
+      ++g_meshNames.replayNamed;
+    } else {
+      // Per REPLAYED draw, not per distinct mesh: the question here is what
+      // share of the frame's re-issued drawing runs unnamed geometry, and a
+      // buffer replayed nine thousand times is nine thousand draws.
+      ++ReplayMissByShader()[dc.vs_runtime_generated
+                                 ? "(runtime-generated shader)"
+                             : dc.vs_name ? dc.vs_name->c_str()
+                                          : "(shader unnamed)"];
+    }
     if (FinishHleDraw(dc)) {
       ++issued;
     } else {

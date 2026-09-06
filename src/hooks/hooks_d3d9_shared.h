@@ -250,6 +250,11 @@ struct MeshNameCensus {
 };
 extern MeshNameCensus g_meshNames;
 
+// Replayed draws that carry no mesh name, by the shader that drew them. Not in
+// an anonymous namespace, unlike its record-time counterpart, because the
+// replay path is a different translation unit.
+std::map<std::string, uint64_t>& ReplayMissByShader();
+
 struct TranslatedShader {
   std::shared_ptr<const std::string> source;  // null unless emitted AND compiled
   uint32_t input_mask = 0;

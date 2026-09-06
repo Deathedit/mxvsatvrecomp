@@ -1897,6 +1897,11 @@ void NoteShaderlessDraw(const mx::hle::DrawCall& dc) {
 
 MeshNameCensus g_meshNames;
 
+std::map<std::string, uint64_t>& ReplayMissByShader() {
+  static std::map<std::string, uint64_t> m;
+  return m;
+}
+
 namespace {
 
 // content key -> the .surface part it came from, from tools/surface_manifest.py
@@ -2367,14 +2372,22 @@ void BuildAndQueueDraw(bool indexed, uint32_t prim_type, uint32_t first,
   // Measurement only. Nothing here selects geometry -- the draw is built from
   // the guest's own streams exactly as before.
   const std::string* mesh_name = nullptr;
+  const std::string* mesh_vs_name = nullptr;
+  bool mesh_vs_generated = false;
   {
     const uint32_t vs_h = st.vs_seen ? st.vertex_shader : 0;
-    mesh_name =
-        CensusMeshNames(in, vs_h ? TranslatedVertexShader(vs_h) : nullptr);
+    const TranslatedShader* vts = vs_h ? TranslatedVertexShader(vs_h) : nullptr;
+    mesh_name = CensusMeshNames(in, vts);
+    if (vts) {
+      mesh_vs_name = vts->name;
+      mesh_vs_generated = vts->runtime_generated;
+    }
   }
 
   DrawCall dc;
   dc.mesh_name = mesh_name;
+  dc.vs_name = mesh_vs_name;
+  dc.vs_runtime_generated = mesh_vs_generated;
   HleSkip skip = HleSkip::kNone;
   if (!BuildHleDraw(in, dc, skip)) {
     ++HleSkipCounts()[uint32_t(skip)];
@@ -5191,6 +5204,20 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
                     : 0.0,
                 g_meshNames.drawsNamed + g_meshNames.replayNamed,
                 g_meshNames.draws + g_meshNames.replayDraws);
+    // And what the unnamed replays ARE. Foliage the assets keep in .tree
+    // rather than .surface is a correct miss; anything else is not.
+    {
+      std::vector<std::pair<uint64_t, const std::string*>> worst;
+      for (const auto& [who, n] : ReplayMissByShader())
+        worst.emplace_back(n, &who);
+      std::sort(worst.begin(), worst.end(),
+                [](const auto& a, const auto& b) { return a.first > b.first; });
+      std::string rows;
+      for (size_t i = 0; i < worst.size() && i < 8; ++i)
+        rows += fmt::format(" [{} x{}]", *worst[i].second, worst[i].first);
+      REXLOG_INFO("d3d9: MESH NAMES   unnamed REPLAYED draws by shader, {} "
+                  "distinct --{}", worst.size(), rows);
+    }
 
     // The repeat offenders, cumulative, worst first. Three textures own this
     // whole bucket; this names them and says why each one misses.
