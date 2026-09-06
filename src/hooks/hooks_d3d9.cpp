@@ -1969,10 +1969,6 @@ const std::string* MeshNameFor(const uint8_t* host, uint32_t bytes,
                                bool* first_miss, uint64_t* content_key) {
   struct Memo {
     uint32_t bytes;
-    // The offset is part of the identity now: the same pointer bound at two
-    // different offsets is two different meshes, and a memo keyed without it
-    // would answer the second from the first.
-    uint32_t offset;
     const std::string* name;
     bool prefix;
     // Kept so a memo HIT can still say WHICH mesh this is. Without it the
@@ -1982,10 +1978,22 @@ const std::string* MeshNameFor(const uint8_t* host, uint32_t bytes,
   };
   static std::unordered_map<const void*, Memo> s_memo;
   *by_prefix = false;
+  // WHERE THIS DRAW'S DATA ACTUALLY STARTS, and the buffer's identity. `host`
+  // is the base and `offset` is SetStreamSource's OffsetInBytes, so hashing
+  // from the base is the wrong extent whenever the guest packs several parts
+  // into one buffer -- HFT_Track_vtex binds 491520 bytes at offset 20480.
+  //
+  // Keying the memo on this POINTER rather than on (host, offset) matters: the
+  // pair version made every offset of one buffer a separate entry, took the
+  // memo from 40581 entries to 69841, and re-hashed megabyte buffers for each.
+  // The data start IS the identity; two offsets into one buffer are two
+  // different windows and get two entries either way, without a second field.
+  const uint8_t* at = host + (offset < bytes ? offset : 0);
+  const uint32_t at_bytes = offset < bytes ? bytes - offset : bytes;
+
   *first_miss = false;
-  auto it = s_memo.find(host);
-  if (it != s_memo.end() && it->second.bytes == bytes &&
-      it->second.offset == offset) {
+  auto it = s_memo.find(at);
+  if (it != s_memo.end() && it->second.bytes == at_bytes) {
     ++g_meshNames.hashMemoHit;
     *by_prefix = it->second.prefix;
     *content_key = it->second.key;
@@ -1999,19 +2007,11 @@ const std::string* MeshNameFor(const uint8_t* host, uint32_t bytes,
   const auto& names = MeshNames();
   const std::string* found = nullptr;
   bool prefix = false;
-  // WHERE THIS DRAW'S DATA ACTUALLY STARTS. `host` is the buffer base and
-  // `offset` is SetStreamSource's OffsetInBytes, so hashing from the base is
-  // the wrong extent whenever the guest packs several parts into one buffer.
-  // Measured: HFT_Track_vtex binds 491520 bytes at offset 20480, and every
-  // such stream was unmatchable no matter what the manifest held. Same shape
-  // as hashing an index block at 2n when the guest binds 2n+4.
-  const uint8_t* at = host + (offset < bytes ? offset : 0);
-  const uint32_t at_bytes = offset < bytes ? bytes - offset : bytes;
   // Computed here rather than inside the lookup below, so that the content
   // population is counted for every buffer that reaches this point -- including
   // the ones that go on to match nothing. Counting it only on the matched path
   // would make the ratio 100% by construction.
-  const uint64_t full_key = MeshFnv64(host, bytes);
+  const uint64_t full_key = MeshFnv64(at, at_bytes);
   *content_key = full_key;
   static std::unordered_set<uint64_t> s_content;
   const bool new_content = s_content.insert(full_key).second;
@@ -2025,10 +2025,6 @@ const std::string* MeshNameFor(const uint8_t* host, uint32_t bytes,
   if (f != names.end()) {
     found = &f->second;
   }
-  if (!found && at != host) {
-    auto o = names.find(MeshFnv64(at, at_bytes));
-    if (o != names.end()) found = &o->second;
-  }
   if (!found && at_bytes > kMeshPrefixBytes) {
     auto p = names.find(MeshFnv64(at, kMeshPrefixBytes));
     if (p != names.end()) { found = &p->second; prefix = true; }
@@ -2041,15 +2037,22 @@ const std::string* MeshNameFor(const uint8_t* host, uint32_t bytes,
     ++g_meshNames.distinctNamed;
     if (new_content) ++g_meshNames.contentNamed;
   } else {
-    if (bytes > g_meshNames.largestUnmatched)
-      g_meshNames.largestUnmatched = bytes;
-    if (bytes >= 64 * 1024) ++g_meshNames.unmatchedOver64K;
+    // On NEW CONTENT only. Keyed on the address these counted a buffer once
+    // per binding-window, and when the offset entered the memo key that took
+    // "misses 64KB or larger" from 11 to 39519 -- the same few terrain buffers
+    // re-counted, not new geometry. The line reads as a mesh count, so it has
+    // to be one.
+    if (new_content) {
+      if (at_bytes > g_meshNames.largestUnmatched)
+        g_meshNames.largestUnmatched = at_bytes;
+      if (at_bytes >= 64 * 1024) ++g_meshNames.unmatchedOver64K;
+    }
     // Only on the FIRST sighting of this content, so the breakdown below counts
     // meshes and not bindings. A mesh redrawn every frame would otherwise bury
     // every other row.
     *first_miss = new_content;
   }
-  s_memo[host] = Memo{bytes, offset, found, prefix, full_key};
+  s_memo[at] = Memo{at_bytes, found, prefix, full_key};
   *by_prefix = prefix;
   return found;
 }
