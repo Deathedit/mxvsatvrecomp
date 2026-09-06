@@ -2109,14 +2109,28 @@ const std::string* CensusMeshNames(const mx::hle::HleDrawInputs& in,
         // vehicle shaders, which are the only reason this logging exists. The
         // texture census made this exact mistake: a cap of twelve filled with
         // formats the asset corpus does not contain and never showed FMT_4_5.
+        // TWO SIZE CLASSES, sampled separately. The first version kept two
+        // per shader and both slots filled with the SAME 64-byte stride-16
+        // buffer -- four vertices of 0.5/1.0/-1.0, a quad corner table that
+        // this file elsewhere records as hitting 79% of all draws. An ATV
+        // frame is thousands of vertices, so that buffer cannot be the mesh,
+        // and sampling it twice said nothing about the mesh that is missing.
+        //
+        // The vfetch source is NOT a separate capture point: the GPU fetch
+        // path reads the same streams[] array this census already offers
+        // (see the `const HleStream& s = streams[si]` in the gpu_fetch block),
+        // so a vehicle's real geometry IS being offered here and IS missing.
+        // It just never got a sample slot.
+        const bool big = bytes >= 4096;
         if (vs && !vs->runtime_generated && vs->name && bytes >= 32) {
-          static std::map<std::string, uint32_t> s_shown;
-          if (s_shown[*vs->name]++ < 2) {
+          static std::map<std::pair<std::string, bool>, uint32_t> s_shown;
+          if (s_shown[{*vs->name, big}]++ < 2) {
             std::string hex;
             for (size_t i = 0; i < 32 && i < bytes; ++i)
               hex += fmt::format("{:02X}", host[i]);
-            REXLOG_INFO("d3d9: MESH UNMATCHED {} -- {} bytes, offset {}, "
+            REXLOG_INFO("d3d9: MESH UNMATCHED{} {} -- {} bytes, offset {}, "
                         "stride {}, {} -- first32 {}",
+                        big ? " BIG" : "",
                         *vs->name, bytes, offset_bytes, stride,
                         is_index ? "indices" : "vertices", hex);
           }
