@@ -121,6 +121,10 @@ float XeDot3(float3 a, float3 b) {
   float3 p = XeMul3(a, b);
   return p.x + p.y + p.z;
 }
+float XeDot4(float4 a, float4 b) {
+  float4 p = XeMul(a, b);
+  return p.x + p.y + p.z + p.w;
+}
 float4 XePWLGammaToLinear(float4 g) {
   float4 low = step(64.0 / 255.0, g);
   float4 mid = step(96.0 / 255.0, g);
@@ -366,6 +370,117 @@ XePsOut main(XeInterpolants xe_in, bool xe_front : SV_IsFrontFace) {
 }
 )";
 
+
+// EngineDependencies/DL_PointLight.shader::PointLightPS -- 4920 draws, third
+// largest named pass, and #3 among the passes that read a guest-addressed
+// surface.
+//
+// The plan wanted this deferred until step 6 fixed the resolve chain, on the
+// grounds that a correct shader reading a wrong light buffer looks wrong and
+// gets rewritten. That reasoning does not apply: this pass WRITES the light
+// buffer, and what it reads is the normal buffer, the depth buffer and an
+// attenuation map. Step 6's census also showed the dependency is backwards --
+// bloom is native and still reads a guest-addressed surface, because what a
+// pass samples is decided by the resolve machinery and not by whether its
+// shader is translated.
+//
+// The literal block gives c255 = (1.0, 32.0, 0, 0): the 1.0 is the w term of a
+// dot4 and 32.0 scales the specular exponent.
+//
+// COMPONENT ORDER IS PRESERVED, not normalised. XeDot3 sums x+y+z in that
+// order and float addition is not associative, so `dot(v.zxy, v.zxy)` and
+// `dot(v, v)` can differ in the last bits. The guest's rotations are kept
+// verbatim for that reason, even where they look redundant -- this is a
+// transcription, and tidying the algebra is how a substitute stops being one.
+//
+// Reconstruction runs in the guest's rotated (w, x, y, z) order: p.x holds the
+// homogeneous w and p.yzw the position, which is why the divide reads p.yzw *
+// rcp(p.x) rather than the other way round.
+inline const std::string kNativePointLight = std::string(kNativePrelude) + R"(
+cbuffer XeShaderConstants : register(b1) {
+  float4 xe_c[256];
+  float4 xe_texinv[16];
+  float4 xe_texsign[16];
+  uint4  xe_param_gen;
+  uint4  xe_alphatest;
+  float4 xe_colorscale;
+};
+Texture2D<float4> xe_tex0 : register(t0);
+SamplerState      xe_smp0 : register(s0);
+Texture2D<float4> xe_tex1 : register(t1);
+SamplerState      xe_smp1 : register(s1);
+Texture2D<float4> xe_tex2 : register(t2);
+SamplerState      xe_smp2 : register(s2);
+struct XeInterpolants {
+  float4 pos : SV_Position;
+  float4 i0 : TEXCOORD0;
+  float4 i1 : TEXCOORD1;
+  float4 i2 : TEXCOORD2;
+  float4 i3 : TEXCOORD3;
+  float4 i4 : TEXCOORD4;
+  float4 i5 : TEXCOORD5;
+};
+struct XePsOut { float4 c0 : SV_Target0; };
+
+XePsOut main(XeInterpolants xe_in, bool xe_front : SV_IsFrontFace) {
+  const float kOne = 1.0, kSpecScale = 32.0;   // xe_c[255].xy, embedded
+
+  // No texsign decode on any of these three: the translated shader emits an
+  // empty block for each, so the bindings are plain.
+  float d = xe_tex0.SampleBias(xe_smp0, xe_in.i0.xy, xe_texinv[0].w).x;
+
+  // p.x = w, p.yzw = xyz -- the guest's own rotation, c134 is g_ScreenToAttenZ.
+  float4 p;
+  p.x = XeMul(d, xe_c[134].w) + xe_in.i2.w;
+  p.y = XeMul(d, xe_c[134].x) + xe_in.i2.x;
+  p.z = XeMul(d, xe_c[134].y) + xe_in.i2.y;
+  p.w = XeMul(d, xe_c[134].z) + xe_in.i2.z;
+
+  float3 i1 = xe_in.i1.xyz;
+  float  len2_i1 = XeDot3(i1.zxy, i1.zxy);
+  float3 pos     = XeMul3(p.yzw, rcp(p.x).xxx);
+  float  len2_pos = XeDot3(float3(pos.z, pos.x, pos.y),
+                           float3(pos.z, pos.x, pos.y));
+
+  // The attenuation map is indexed by the SQUARED distance, both coordinates
+  // the same value -- a 1D ramp stored as a 2D texture.
+  float atten = xe_tex1.SampleBias(xe_smp1, len2_pos.xx, xe_texinv[1].w).x;
+  float4 nrm  = xe_tex2.SampleBias(xe_smp2, xe_in.i0.zw, xe_texinv[2].w);
+
+  float len2_n = XeDot3(nrm.zxy, nrm.zxy);
+  float3 unit_i1  = XeMul3(rsqrt(abs(len2_i1)).xxx, i1);
+  float3 unit_n   = XeMul3(rsqrt(abs(len2_n)).xxx, nrm.xyz);
+  float  ndl      = XeDot3(unit_i1.zxy, unit_n.zxy);
+  float3 unit_pos = XeMul3(pos, rsqrt(abs(len2_pos)).xxx);
+
+  // dot4 against w = 1 adds ndl a second time, so this is 2*(N.L) -- the
+  // coefficient of the reflection R = 2(N.L)N - L built on the next line.
+  float two_ndl = XeDot4(float4(unit_i1.z, unit_i1.x, unit_i1.y, ndl),
+                         float4(unit_n.z,  unit_n.x,  unit_n.y,  kOne));
+  float3 refl = XeMul3(-unit_n, two_ndl.xxx) + unit_i1;
+
+  float spec = saturate(XeDot3(float3(-unit_pos.z, -unit_pos.x, -unit_pos.y),
+                               float3(refl.z, refl.x, refl.y)));
+  float gloss = XeMul(nrm.w, kSpecScale);
+  float spec_p = exp2(XeMul(gloss, log2(spec)));
+  float ndv = saturate(XeDot3(float3(-unit_pos.z, -unit_pos.x, -unit_pos.y),
+                              unit_n.zxy));
+
+  // c136 is g_LightColor. rgb takes the attenuation, w the specular.
+  float4 lit = XeMul(float4(atten, atten, atten, spec_p), xe_c[136]);
+
+  XePsOut o;
+  o.c0 = XeMul(lit, float4(ndv, ndv, ndv, atten));
+
+  o.c0 = XeMul(o.c0, xe_colorscale.xxxx);
+  if (xe_colorscale.y > 0.0) {
+    o.c0.rgb = min(max(o.c0.rgb, 0.0), xe_colorscale.y);
+    o.c0.a   = min(max(o.c0.a,   0.0), xe_colorscale.z);
+  }
+  return o;
+}
+)";
+
 inline const std::string* NativePixelShader(const std::string& pass_name) {
   struct Entry { const char* pass; const std::string* hlsl; };
   // Chosen from the NATIVE SHADERS census, not by inspection: bloom is only
@@ -375,6 +490,8 @@ inline const std::string* NativePixelShader(const std::string& pass_name) {
       {"EngineDependencies/bloom.shader::BlurHPS", &kNativeBloomBlurH},
       {"EngineDependencies/bloom.shader::BlurVPS", &kNativeBloomBlurV},
       {"FR_Dunes/GrassShader.shader::PixelShaderFar", &kNativeGrassFar},
+      {"EngineDependencies/DL_PointLight.shader::PointLightPS",
+       &kNativePointLight},
   };
   for (const Entry& e : kNative)
     if (pass_name == e.pass) return e.hlsl;
