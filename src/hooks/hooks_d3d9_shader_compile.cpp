@@ -681,6 +681,24 @@ void ReportHlslCoverage(mx::hle::HlslStage stage, uint32_t handle,
                       handle, (unsigned long long)content_key);
         std::ofstream f(path, std::ios::trunc | std::ios::binary);
         if (f) {
+          // THE PASS NAME, which the dump did not carry and which makes it
+          // unsearchable. 292 files named by a guest handle that varies per
+          // run, and finding one entry point among them means guessing at
+          // content markers -- looking for GrassShader::PixelShaderFar by its
+          // sampler count and a swizzle turned up four candidates and none of
+          // them was it. The name is already known here: ShaderNames() is in
+          // this file and is keyed by exactly the content_key below.
+          //
+          // This matters for step 5. A native substitute has to be written
+          // against the translated HLSL, because the translator is 1:1 with
+          // the microcode and a hand reading of the disassembly is not -- and
+          // that comparison needs the two to be findable by the same name.
+          {
+            const auto& names = ShaderNames();
+            const auto it = names.find(content_key);
+            f << "; pass " << (it != names.end() ? it->second : "<unnamed>")
+              << std::endl;
+          }
           f << "; guest "
             << (stage == mx::hle::HlslStage::kPixel ? "pixel" : "vertex")
             << " shader 0x" << std::hex << handle << std::dec
