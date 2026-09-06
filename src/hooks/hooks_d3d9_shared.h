@@ -207,8 +207,21 @@ struct MeshNameCensus {
   // mesh in the assets at all" is answered by these, and the two differ by
   // however many times a buffer is re-bound. A UI quad redrawn six hundred
   // times a frame moves the first number and should not move the second.
+  // Distinct ADDRESSES. Reported, but read it knowing what it is: a dynamic
+  // buffer cycling through a ring allocator takes a fresh pointer every time,
+  // so this population is inflated toward the draw-weighted one by exactly the
+  // geometry that is regenerated rather than loaded. 302 of 18064 on the run
+  // that prompted this.
   uint64_t distinctSeen = 0;
   uint64_t distinctNamed = 0;
+  // Distinct CONTENT, and this is the one that means "a mesh". A buffer
+  // re-bound at the same address, and the same bytes re-uploaded to a new
+  // address, both collapse to one entry here -- neither re-binding nor
+  // re-allocation can move it. The other two denominators each count one of
+  // those, which is why all three are printed rather than a single figure that
+  // would have to be trusted.
+  uint64_t contentSeen = 0;
+  uint64_t contentNamed = 0;
   // The largest buffer that matched nothing, and its size. A big unmatched
   // buffer is either real geometry the join is losing or a generated mesh --
   // terrain, particles, Scaleform -- and the size alone separates those from

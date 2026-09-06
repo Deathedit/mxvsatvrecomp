@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <fstream>
 
@@ -1973,9 +1974,17 @@ const std::string* MeshNameFor(const uint8_t* host, uint32_t bytes,
   const auto& names = MeshNames();
   const std::string* found = nullptr;
   bool prefix = false;
+  // Computed here rather than inside the lookup below, so that the content
+  // population is counted for every buffer that reaches this point -- including
+  // the ones that go on to match nothing. Counting it only on the matched path
+  // would make the ratio 100% by construction.
+  const uint64_t full_key = MeshFnv64(host, bytes);
+  static std::unordered_set<uint64_t> s_content;
+  const bool new_content = s_content.insert(full_key).second;
+  if (new_content) ++g_meshNames.contentSeen;
   // The FULL key first: it is the one a whole-block upload produces, and it is
   // the only key the manifest emits for a part under 4096 bytes.
-  auto f = names.find(MeshFnv64(host, bytes));
+  auto f = names.find(full_key);
   if (f != names.end()) {
     found = &f->second;
   } else if (bytes > kMeshPrefixBytes) {
@@ -1984,6 +1993,7 @@ const std::string* MeshNameFor(const uint8_t* host, uint32_t bytes,
   }
   if (found) {
     ++g_meshNames.distinctNamed;
+    if (new_content) ++g_meshNames.contentNamed;
   } else {
     if (bytes > g_meshNames.largestUnmatched)
       g_meshNames.largestUnmatched = bytes;
@@ -5090,9 +5100,15 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
     // The same join over DISTINCT buffers. This is the number that answers
     // "is this mesh in the assets"; the line above answers "how much of the
     // frame is asset geometry", and they are not the same question.
-    REXLOG_INFO("d3d9: MESH NAMES   distinct buffers: {} of {} named ({:.1f}%);"
-                " of the misses, {} were 64KB or larger and the largest was {} "
-                "bytes",
+    REXLOG_INFO("d3d9: MESH NAMES   by CONTENT {} of {} named ({:.1f}%) -- the "
+                "mesh count; by address {} of {} ({:.1f}%) -- inflated by ring "
+                "reallocation; of the misses {} were 64KB or larger, largest {}"
+                " bytes",
+                g_meshNames.contentNamed, g_meshNames.contentSeen,
+                g_meshNames.contentSeen
+                    ? g_meshNames.contentNamed * 100.0 /
+                          double(g_meshNames.contentSeen)
+                    : 0.0,
                 g_meshNames.distinctNamed, g_meshNames.distinctSeen,
                 g_meshNames.distinctSeen
                     ? g_meshNames.distinctNamed * 100.0 /
