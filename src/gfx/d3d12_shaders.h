@@ -92,11 +92,120 @@ float4 main(float4 pos : SV_POSITION, float4 col : COLOR) : SV_TARGET {
 // with a measured answer -- the per-pass draw census this rung adds -- and
 // picking one before reading it would be choosing by guesswork the way the
 // texture stand-in scorer did.
+// The separable bloom blur, both directions. bloom.shader::BlurHPS and
+// ::BlurVPS, 5280 draws between them on a level run.
+//
+// THE GUEST SHADER, from tools/shader_code.py, three ALU and three fetches:
+//
+//     tfetch2D r1, r0, tf0 [offset=-3,0]      (BlurVPS: 0,-3)
+//     tfetch2D r2, r0, tf0                    centre
+//     tfetch2D r0, r0, tf0 [offset=+3,0]      (BlurVPS: 0,+3)
+//     mul  r0, r0, c103
+//     mad  r0, r2.xzwy, c102.xzwy, r0.xzwy
+//     mad  export0, r1, c101, r0.xwyz
+//
+// The swizzles look alarming and are a no-op END TO END. As dst->src maps,
+// .xzwy is [0,2,3,1] and .xwyz is [0,3,1,2]; composing them gives the
+// identity, so the permutation instruction 6 applies is exactly undone by the
+// read in instruction 7. Every operand of that mad carries the same swizzle,
+// which is what makes it a permutation of the whole expression rather than a
+// channel shuffle. So the result is a plain weighted sum:
+//
+//     tap(-3)*c101 + tap(0)*c102 + tap(+3)*c103
+//
+// and c101..c103 is exactly g_avSampleWeights, which the asset's constant
+// table declares as c101 x3.
+//
+// WHY THIS IS NOT EQUIVALENT TO WHAT WE RENDER TODAY. The translator does not
+// carry tfetch texel offsets -- there is no offset argument anywhere in
+// shader_hlsl.cpp's Sample emission -- so all three taps currently read the
+// SAME texel and the blur is a weighted copy. This shader is therefore a fix,
+// not a reimplementation, and turning it on should visibly change bloom. If it
+// does not, the substitution did not reach the GPU.
+//
+// The offsets are literals because HLSL requires an immediate in [-8,7] and
+// these are +/-3. Anything outside that range would need the coordinate
+// adjusted by xe_texinv instead, which is why the registry entry is per pass
+// rather than a general offset-aware path.
+inline constexpr const char* kNativeBloomBlurH = R"(
+cbuffer XeShaderConstants : register(b1) {
+  float4 xe_c[256];
+  float4 xe_texinv[16];
+  float4 xe_texsign[16];
+  uint4  xe_param_gen;
+  uint4  xe_alphatest;
+  float4 xe_colorscale;
+};
+Texture2D<float4> xe_tex0 : register(t0);
+SamplerState      xe_smp0 : register(s0);
+struct XeInterpolants { float4 pos : SV_Position; float4 i0 : TEXCOORD0; };
+struct XePsOut { float4 c0 : SV_Target0; };
+XePsOut main(XeInterpolants xe_in, bool xe_front : SV_IsFrontFace) {
+  float2 uv = xe_in.i0.xy;
+  XePsOut o;
+  o.c0 = xe_tex0.Sample(xe_smp0, uv, int2(-3, 0)) * xe_c[101]
+       + xe_tex0.Sample(xe_smp0, uv, int2( 0, 0)) * xe_c[102]
+       + xe_tex0.Sample(xe_smp0, uv, int2( 3, 0)) * xe_c[103];
+  // The translator's OUTPUT EPILOGUE, reproduced because it is not part of
+  // the guest shader and a substitute that omits it is wrong on exactly the
+  // targets that need it most. xe_colorscale.x is 1/32 for the signed
+  // fixed-point k_16_16 targets and 1.0 elsewhere; the clamp is gated on .y
+  // being non-zero, which the renderer sets only for the guest formats whose
+  // range must be enforced. Dropping either would look right on the common
+  // path and wrong on a bloom target that happens to be fixed point.
+  o.c0 *= xe_colorscale.x;
+  if (xe_colorscale.y > 0.0) {
+    o.c0.rgb = min(max(o.c0.rgb, 0.0), xe_colorscale.y);
+    o.c0.a   = min(max(o.c0.a,   0.0), xe_colorscale.z);
+  }
+  return o;
+}
+)";
+
+inline constexpr const char* kNativeBloomBlurV = R"(
+cbuffer XeShaderConstants : register(b1) {
+  float4 xe_c[256];
+  float4 xe_texinv[16];
+  float4 xe_texsign[16];
+  uint4  xe_param_gen;
+  uint4  xe_alphatest;
+  float4 xe_colorscale;
+};
+Texture2D<float4> xe_tex0 : register(t0);
+SamplerState      xe_smp0 : register(s0);
+struct XeInterpolants { float4 pos : SV_Position; float4 i0 : TEXCOORD0; };
+struct XePsOut { float4 c0 : SV_Target0; };
+XePsOut main(XeInterpolants xe_in, bool xe_front : SV_IsFrontFace) {
+  float2 uv = xe_in.i0.xy;
+  XePsOut o;
+  o.c0 = xe_tex0.Sample(xe_smp0, uv, int2(0, -3)) * xe_c[101]
+       + xe_tex0.Sample(xe_smp0, uv, int2(0,  0)) * xe_c[102]
+       + xe_tex0.Sample(xe_smp0, uv, int2(0,  3)) * xe_c[103];
+  // The translator's OUTPUT EPILOGUE, reproduced because it is not part of
+  // the guest shader and a substitute that omits it is wrong on exactly the
+  // targets that need it most. xe_colorscale.x is 1/32 for the signed
+  // fixed-point k_16_16 targets and 1.0 elsewhere; the clamp is gated on .y
+  // being non-zero, which the renderer sets only for the guest formats whose
+  // range must be enforced. Dropping either would look right on the common
+  // path and wrong on a bloom target that happens to be fixed point.
+  o.c0 *= xe_colorscale.x;
+  if (xe_colorscale.y > 0.0) {
+    o.c0.rgb = min(max(o.c0.rgb, 0.0), xe_colorscale.y);
+    o.c0.a   = min(max(o.c0.a,   0.0), xe_colorscale.z);
+  }
+  return o;
+}
+)";
+
 inline const char* NativePixelShader(const std::string& pass_name) {
   struct Entry { const char* pass; const char* hlsl; };
-  // Deliberately empty. See above: the first pass to write is chosen from the
-  // NATIVE SHADERS census, not by inspection.
-  static constexpr Entry kNative[] = {};
+  // Chosen from the NATIVE SHADERS census, not by inspection: bloom is only
+  // 3.4% of named draws, but it is three ALU and one sampler with no light
+  // buffer, so it proves the mechanism before anything risky rides on it.
+  static constexpr Entry kNative[] = {
+      {"EngineDependencies/bloom.shader::BlurHPS", kNativeBloomBlurH},
+      {"EngineDependencies/bloom.shader::BlurVPS", kNativeBloomBlurV},
+  };
   for (const Entry& e : kNative)
     if (pass_name == e.pass) return e.hlsl;
   return nullptr;
