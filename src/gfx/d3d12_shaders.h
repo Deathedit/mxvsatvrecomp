@@ -92,6 +92,30 @@ float4 main(float4 pos : SV_POSITION, float4 col : COLOR) : SV_TARGET {
 // with a measured answer -- the per-pass draw census this rung adds -- and
 // picking one before reading it would be choosing by guesswork the way the
 // texture stand-in scorer did.
+// THE LEGACY MULTIPLY, which every native substitute needs and which is the
+// reason "native" does not mean "free of Xenos semantics".
+//
+// The translator emits XeMul, not `*`. On Xenos a multiply with either operand
+// zero or denormal returns exactly +0 rather than propagating INF or NaN --
+// D3D9 legacy behaviour -- and this project has already paid for that once:
+// it is what made the main menu render black. A substitute written with plain
+// `*` is therefore a BEHAVIOUR CHANGE, not a reimplementation, and it diverges
+// exactly where the guest relies on the quirk.
+//
+// It matters here specifically. Bloom multiplies samples from an HDR scene
+// target by weights, so an INF sample against a zero weight is reachable:
+// plain `*` gives NaN, the guest gives 0, and a NaN in a bloom tap spreads
+// across the frame. The first version of these two shaders used `*`.
+inline constexpr const char* kNativePrelude = R"(
+float XeMul(float a, float b) {
+  return (abs(a) < 1.175494351e-38 || abs(b) < 1.175494351e-38) ? 0.0 : a * b;
+}
+float4 XeMul(float4 a, float4 b) {
+  return float4(XeMul(a.x, b.x), XeMul(a.y, b.y),
+                XeMul(a.z, b.z), XeMul(a.w, b.w));
+}
+)";
+
 // The separable bloom blur, both directions. bloom.shader::BlurHPS and
 // ::BlurVPS, 5280 draws between them on a level run.
 //
@@ -129,7 +153,7 @@ float4 main(float4 pos : SV_POSITION, float4 col : COLOR) : SV_TARGET {
 // integer offset argument with int2(+/-3, 0), which is both the wrong distance
 // and a form that cannot express a half texel at all. Applied to the
 // coordinate instead, scaled by xe_texinv, exactly as the translator now does.
-inline constexpr const char* kNativeBloomBlurH = R"(
+inline const std::string kNativeBloomBlurH = std::string(kNativePrelude) + R"(
 cbuffer XeShaderConstants : register(b1) {
   float4 xe_c[256];
   float4 xe_texinv[16];
@@ -146,9 +170,9 @@ XePsOut main(XeInterpolants xe_in, bool xe_front : SV_IsFrontFace) {
   float2 uv = xe_in.i0.xy;
   XePsOut o;
   float2 t = xe_texinv[0].xy;
-  o.c0 = xe_tex0.Sample(xe_smp0, uv + float2(-1.5, 0.0) * t) * xe_c[101]
-       + xe_tex0.Sample(xe_smp0, uv)                         * xe_c[102]
-       + xe_tex0.Sample(xe_smp0, uv + float2( 1.5, 0.0) * t) * xe_c[103];
+  o.c0 = XeMul(xe_tex0.Sample(xe_smp0, uv + float2(-1.5, 0.0) * t), xe_c[101])
+       + XeMul(xe_tex0.Sample(xe_smp0, uv),                          xe_c[102])
+       + XeMul(xe_tex0.Sample(xe_smp0, uv + float2( 1.5, 0.0) * t), xe_c[103]);
   // The translator's OUTPUT EPILOGUE, reproduced because it is not part of
   // the guest shader and a substitute that omits it is wrong on exactly the
   // targets that need it most. xe_colorscale.x is 1/32 for the signed
@@ -156,7 +180,7 @@ XePsOut main(XeInterpolants xe_in, bool xe_front : SV_IsFrontFace) {
   // being non-zero, which the renderer sets only for the guest formats whose
   // range must be enforced. Dropping either would look right on the common
   // path and wrong on a bloom target that happens to be fixed point.
-  o.c0 *= xe_colorscale.x;
+  o.c0 = XeMul(o.c0, xe_colorscale.xxxx);
   if (xe_colorscale.y > 0.0) {
     o.c0.rgb = min(max(o.c0.rgb, 0.0), xe_colorscale.y);
     o.c0.a   = min(max(o.c0.a,   0.0), xe_colorscale.z);
@@ -165,7 +189,7 @@ XePsOut main(XeInterpolants xe_in, bool xe_front : SV_IsFrontFace) {
 }
 )";
 
-inline constexpr const char* kNativeBloomBlurV = R"(
+inline const std::string kNativeBloomBlurV = std::string(kNativePrelude) + R"(
 cbuffer XeShaderConstants : register(b1) {
   float4 xe_c[256];
   float4 xe_texinv[16];
@@ -182,9 +206,9 @@ XePsOut main(XeInterpolants xe_in, bool xe_front : SV_IsFrontFace) {
   float2 uv = xe_in.i0.xy;
   XePsOut o;
   float2 t = xe_texinv[0].xy;
-  o.c0 = xe_tex0.Sample(xe_smp0, uv + float2(0.0, -1.5) * t) * xe_c[101]
-       + xe_tex0.Sample(xe_smp0, uv)                         * xe_c[102]
-       + xe_tex0.Sample(xe_smp0, uv + float2(0.0,  1.5) * t) * xe_c[103];
+  o.c0 = XeMul(xe_tex0.Sample(xe_smp0, uv + float2(0.0, -1.5) * t), xe_c[101])
+       + XeMul(xe_tex0.Sample(xe_smp0, uv),                          xe_c[102])
+       + XeMul(xe_tex0.Sample(xe_smp0, uv + float2(0.0,  1.5) * t), xe_c[103]);
   // The translator's OUTPUT EPILOGUE, reproduced because it is not part of
   // the guest shader and a substitute that omits it is wrong on exactly the
   // targets that need it most. xe_colorscale.x is 1/32 for the signed
@@ -192,7 +216,7 @@ XePsOut main(XeInterpolants xe_in, bool xe_front : SV_IsFrontFace) {
   // being non-zero, which the renderer sets only for the guest formats whose
   // range must be enforced. Dropping either would look right on the common
   // path and wrong on a bloom target that happens to be fixed point.
-  o.c0 *= xe_colorscale.x;
+  o.c0 = XeMul(o.c0, xe_colorscale.xxxx);
   if (xe_colorscale.y > 0.0) {
     o.c0.rgb = min(max(o.c0.rgb, 0.0), xe_colorscale.y);
     o.c0.a   = min(max(o.c0.a,   0.0), xe_colorscale.z);
@@ -201,14 +225,14 @@ XePsOut main(XeInterpolants xe_in, bool xe_front : SV_IsFrontFace) {
 }
 )";
 
-inline const char* NativePixelShader(const std::string& pass_name) {
-  struct Entry { const char* pass; const char* hlsl; };
+inline const std::string* NativePixelShader(const std::string& pass_name) {
+  struct Entry { const char* pass; const std::string* hlsl; };
   // Chosen from the NATIVE SHADERS census, not by inspection: bloom is only
   // 3.4% of named draws, but it is three ALU and one sampler with no light
   // buffer, so it proves the mechanism before anything risky rides on it.
-  static constexpr Entry kNative[] = {
-      {"EngineDependencies/bloom.shader::BlurHPS", kNativeBloomBlurH},
-      {"EngineDependencies/bloom.shader::BlurVPS", kNativeBloomBlurV},
+  static const Entry kNative[] = {
+      {"EngineDependencies/bloom.shader::BlurHPS", &kNativeBloomBlurH},
+      {"EngineDependencies/bloom.shader::BlurVPS", &kNativeBloomBlurV},
   };
   for (const Entry& e : kNative)
     if (pass_name == e.pass) return e.hlsl;

@@ -3415,7 +3415,8 @@ void AttachTranslatedPixelShader(mx::hle::DrawCall& dc, uint32_t handle,
     if (t->name) {
       ++g_nativeShaders.named;
       ++NativePassDraws()[*t->name];
-      const char* native = mx::gfx::shaders::NativePixelShader(*t->name);
+      const std::string* native =
+          mx::gfx::shaders::NativePixelShader(*t->name);
       if (native) {
         ++g_nativeShaders.eligible;
         if (REXCVAR_GET(d3d9_native_shaders)) {
@@ -3430,8 +3431,8 @@ void AttachTranslatedPixelShader(mx::hle::DrawCall& dc, uint32_t handle,
           if (!slot)
             slot = std::make_shared<const std::string>(
                 REXCVAR_GET(d3d9_native_shader_mutate)
-                    ? mx::gfx::shaders::kNativeMutantPS
-                    : native);
+                    ? std::string(mx::gfx::shaders::kNativeMutantPS)
+                    : *native);
           dc.pixel_shader_hlsl = slot;
           dc.pixel_shader_dxbc = nullptr;
           ++g_nativeShaders.substituted;
