@@ -2076,9 +2076,15 @@ const std::string* CensusMeshNames(const mx::hle::HleDrawInputs& in,
         // packs several parts into one buffer, this draw's data starts there
         // and hashing from the base is the wrong extent -- which is exactly the
         // shape of the last two bugs.
+        // PER SHADER, not the first N overall. A flat cap of ten filled up
+        // with HFT_Helper and T_EcoLeaves -- a procedural terrain grid and
+        // foliage, both of which are SUPPOSED to miss -- and never reached the
+        // vehicle shaders, which are the only reason this logging exists. The
+        // texture census made this exact mistake: a cap of twelve filled with
+        // formats the asset corpus does not contain and never showed FMT_4_5.
         if (vs && !vs->runtime_generated && vs->name && bytes >= 32) {
-          static std::atomic<uint32_t> s_shown{0};
-          if (s_shown++ < 10) {
+          static std::map<std::string, uint32_t> s_shown;
+          if (s_shown[*vs->name]++ < 2) {
             std::string hex;
             for (size_t i = 0; i < 32 && i < bytes; ++i)
               hex += fmt::format("{:02X}", host[i]);
