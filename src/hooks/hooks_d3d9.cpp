@@ -4892,14 +4892,19 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
     // cache is warm, so anything keyed on a decode count never prints.
     // Unnamed is expected for a render target, a glyph atlas, and the 94
     // assets whose level 0 is shared with another asset.
-    REXLOG_INFO("d3d9: TEXTURE NAMES -- {} decodes, {} named ({:.1f}%), {} of "
-                "those by the 4KB prefix; {} had no key at all; {} had a buffer "
-                "SHORTER than the described level 0",
+    // The first three PARTITION `seen`; shortBuffer cuts across them and is
+    // printed apart for that reason. An earlier version reported only three of
+    // the four and they did not add up, which left 666 textures unaccounted
+    // for and invited exactly the wrong conclusion about the rest.
+    REXLOG_INFO("d3d9: TEXTURE NAMES -- {} decodes = {} named ({:.1f}%, {} by "
+                "prefix) + {} keyed but MATCHED NOTHING + {} with no key; "
+                "separately, {} had a buffer SHORTER than the described level 0",
                 g_texNames.seen, g_texNames.named,
                 g_texNames.seen
                     ? g_texNames.named * 100.0 / double(g_texNames.seen)
                     : 0.0,
-                g_texNames.byPrefix, g_texNames.noKey, g_texNames.shortBuffer);
+                g_texNames.byPrefix, g_texNames.unmatched, g_texNames.noKey,
+                g_texNames.shortBuffer);
     // The repeat offenders, cumulative, worst first. Three textures own this
     // whole bucket; this names them and says why each one misses.
     {

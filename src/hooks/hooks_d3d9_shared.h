@@ -143,6 +143,11 @@ struct TextureNameCensus {
   // full key cannot reach the textures whose described extent exceeds their
   // buffer, and that is most of what was unnamed.
   uint64_t byPrefix = 0;
+  // HAD A KEY AND MATCHED NOTHING. The bucket that was missing, and the only
+  // one that can distinguish "these textures have no asset" from "the asset
+  // bytes are not the guest bytes". Without it the three counters did not sum
+  // to `seen` and the interesting number had to be got by subtraction.
+  uint64_t unmatched = 0;
 };
 extern TextureNameCensus g_texNames;
 

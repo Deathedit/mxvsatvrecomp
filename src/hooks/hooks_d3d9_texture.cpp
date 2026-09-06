@@ -2846,7 +2846,23 @@ bool ResolvePixelSlotTexture(mx::hle::DrawCall& dc, uint32_t slot,
         it = tn.find(ck.prefix);
         by_prefix = it != tn.end();
       }
-      if (it != tn.end()) {
+      if (it == tn.end()) {
+        ++g_texNames.unmatched;
+        // WHAT they are, not just how many. A render target and a dynamic
+        // glyph atlas both legitimately have no asset; a 1024x1024 DXT1 that
+        // looks exactly like the ones that DO resolve would mean the join is
+        // losing real textures. Only a sample can tell those apart.
+        static std::atomic<uint32_t> s_unmatched{0};
+        if (s_unmatched++ < 12)
+          REXLOG_INFO("d3d9: texture UNMATCHED: {}x{} {} pitch_blocks {} "
+                      "src_bytes {} guest {} {}",
+                      source.width, source.height,
+                      mx::hle::GuestTextureFormatName(source.guest_format),
+                      source.pitch_blocks, source.source_bytes, guest.size(),
+                      why_key == TexKeyFail::kShorterThanLevel0
+                          ? "(buffer SHORTER than level 0)"
+                          : "");
+      } else {
         ++g_texNames.named;
         if (by_prefix) ++g_texNames.byPrefix;
         // The first few by name, because a percentage cannot be checked by eye
