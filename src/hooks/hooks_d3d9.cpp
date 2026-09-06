@@ -2232,10 +2232,10 @@ void CensusEdramReaders(const mx::hle::DrawCall& dc) {
     // already treats exactly this shape as the light-buffer miss it repairs.
     const auto& tex = k < dc.pixel_textures.size() ? dc.pixel_textures[k]
                                                    : nullptr;
-    if (tex && tex->width <= 1 && tex->height <= 1) ++placeholder;
+    if (tex && tex->width <= 1 && tex->height <= 1) ++placeholder;  // unbound
   }
   g_edramReaders.slots += surface_slots;
-  g_edramReaders.placeholderSlots += placeholder;
+  g_edramReaders.unboundSamplerSlots += placeholder;
   if (!surface_slots) return;
   ++g_edramReaders.readSurface;
 
@@ -5391,14 +5391,16 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
     // native, and this says which of them EDRAM is still waiting on.
     REXLOG_INFO("d3d9: EDRAM READERS -- {} draws ({} with a translated PS); {} "
                 "({:.1f}%) sample a guest-addressed surface over {} slots; {} "
-                "slots sampled a 1x1 PLACEHOLDER the resolve could not fill",
+                "slots read the 1x1 black of an UNBOUND sampler (correct -- the "
+                "guest never bound them; watch for the number moving, not its "
+                "size)",
                 g_edramReaders.draws, g_edramReaders.withPixelShader,
                 g_edramReaders.readSurface,
                 g_edramReaders.draws
                     ? g_edramReaders.readSurface * 100.0 /
                           double(g_edramReaders.draws)
                     : 0.0,
-                g_edramReaders.slots, g_edramReaders.placeholderSlots);
+                g_edramReaders.slots, g_edramReaders.unboundSamplerSlots);
     {
       std::vector<std::pair<uint64_t, const std::string*>> top;
       for (const auto& [who, n] : EdramReaderByPass())

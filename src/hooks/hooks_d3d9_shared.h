@@ -290,12 +290,20 @@ struct EdramReaderCensus {
   uint64_t withPixelShader = 0;  // of those, ones with a translated PS
   uint64_t readSurface = 0;      // sample at least one guest-addressed surface
   uint64_t slots = 0;            // how many such slots, summed
-  // Draws sampling a 1x1 placeholder -- a slot the resolve machinery could not
-  // fill. The replay path already reports "1x1 slots N -> snapshot, M still
-  // none"; this counts the same failure across every path, because a pass
-  // reading a 1x1 where a light buffer belongs is not reading a surface, it is
-  // reading nothing, and both belong in the step 6 picture.
-  uint64_t placeholderSlots = 0;
+  // Slots holding the 1x1 black texel UnboundTexturePayload() returns.
+  //
+  // NOT A FAILURE, and the first version of this counter said it was. That is
+  // what an unbound Xenos sampler reads: the guest's own fetch constant type
+  // is not kTexture, and zero is what the hardware answers. Measured and
+  // closed in August -- 31,292 misses, every one the guest's, none ours -- and
+  // this run reproduces the same sampler distribution exactly (s1, s5, s6, s7,
+  // s8, s9, s13), which is what identifies it as the same population.
+  //
+  // Kept because the number is worth watching: a SHIFT in it, or a new sampler
+  // appearing in that list, would mean something changed. Named for what it is
+  // so the next reader does not re-open a closed question, which is what the
+  // label "the resolve could not fill" invited.
+  uint64_t unboundSamplerSlots = 0;
 };
 extern EdramReaderCensus g_edramReaders;
 // Draws that read a guest-addressed surface, by pass name. This is the list
