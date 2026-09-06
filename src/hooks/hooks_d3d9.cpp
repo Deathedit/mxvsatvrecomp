@@ -1896,6 +1896,12 @@ void NoteShaderlessDraw(const mx::hle::DrawCall& dc) {
 }
 
 MeshNameCensus g_meshNames;
+NativeShaderCensus g_nativeShaders;
+
+std::map<std::string, uint64_t>& NativePassDraws() {
+  static std::map<std::string, uint64_t> m;
+  return m;
+}
 
 std::map<std::string, uint64_t>& ReplayMissByShader() {
   static std::map<std::string, uint64_t> m;
@@ -5295,6 +5301,45 @@ void FinalizePendingD3D9DrawsImpl(uint8_t* base) {
       REXLOG_INFO("d3d9: MESH NAMES   unmatched meshes by shader, {} distinct "
                   "shaders --{}", worst.size(), rows);
     }
+    // Step 5: the pass census. `named` is the population a substitute can
+    // ever address -- a runtime-generated shader has no asset name and no
+    // native version can be written for it -- so coverage is quoted against
+    // that, not against every draw.
+    REXLOG_INFO("d3d9: NATIVE SHADERS -- {} draws with a translated PS, {} "
+                "({:.1f}%) run a NAMED pass; {} eligible, {} substituted, {} "
+                "mutated",
+                g_nativeShaders.draws, g_nativeShaders.named,
+                g_nativeShaders.draws
+                    ? g_nativeShaders.named * 100.0 /
+                          double(g_nativeShaders.draws)
+                    : 0.0,
+                g_nativeShaders.eligible, g_nativeShaders.substituted,
+                g_nativeShaders.mutated);
+    // Which passes are worth writing, in the order that buys the most frame
+    // per shader. This is the deliverable of the rung: 332 pass identities is
+    // too many to work through by inspection, and the head of this list is how
+    // many of them actually matter.
+    {
+      std::vector<std::pair<uint64_t, const std::string*>> top;
+      for (const auto& [name, n] : NativePassDraws())
+        top.emplace_back(n, &name);
+      std::sort(top.begin(), top.end(),
+                [](const auto& a, const auto& b) { return a.first > b.first; });
+      std::string rows;
+      uint64_t head = 0;
+      for (size_t i = 0; i < top.size() && i < 10; ++i) {
+        rows += fmt::format(" [{} x{}]", *top[i].second, top[i].first);
+        head += top[i].first;
+      }
+      REXLOG_INFO("d3d9: NATIVE SHADERS   {} named passes; the top 10 are {} "
+                  "of {} named draws ({:.1f}%) --{}",
+                  top.size(), head, g_nativeShaders.named,
+                  g_nativeShaders.named
+                      ? head * 100.0 / double(g_nativeShaders.named)
+                      : 0.0,
+                  rows);
+    }
+
     // Replay, which the per-draw counters above cannot reach. Added to them it
     // gives the frame's real draw-weighted coverage; on its own it says how
     // much of the recorded geometry the assets can name.

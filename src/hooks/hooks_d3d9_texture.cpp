@@ -5,7 +5,25 @@
 
 #include "hooks/hook_common.h"
 
+#include "gfx/d3d12_shaders.h"
+
 #include <rex/cvar.h>
+
+// Step 5 gates, OFF by default. A substitution changes what is drawn, and the
+// plan's rule is that a derivation is switched on only once its shadow
+// measurement is clean -- so the census runs unconditionally and the swap does
+// not. Defined in this TU because this is the only one that reads them; a
+// second REXCVAR_DEFINE of the same name is last-writer-wins and the compiler
+// never sees it.
+REXCVAR_DEFINE_BOOL(d3d9_native_shaders, false, "Debug",
+                    "Substitute hand-written HLSL for a guest pixel shader "
+                    "whose pass has a native version registered. Off by "
+                    "default; the NATIVE SHADERS census runs either way");
+REXCVAR_DEFINE_BOOL(d3d9_native_shader_mutate, false, "Debug",
+                    "With d3d9_native_shaders, substitute a deliberately wrong "
+                    "shader instead. If the screen does not change, the "
+                    "substitution never reached the GPU and the counters are "
+                    "vacuous");
 
 #include <algorithm>
 #include <array>
@@ -3386,6 +3404,42 @@ void AttachTranslatedPixelShader(mx::hle::DrawCall& dc, uint32_t handle,
   if (const TranslatedShader* t = TranslatedPixelShader(handle)) {
     dc.pixel_shader_hlsl = t->source;
     dc.pixel_shader_dxbc = t->dxbc;
+    // --- step 5: native substitution, and the census that orders the work ---
+    //
+    // HERE rather than in the renderer, because this is the one place the
+    // pass's asset NAME and the HLSL that will be compiled are both in hand.
+    // Doing it renderer-side would mean threading two more names through
+    // AddGameDraw's thirty positional arguments to reach a decision that can
+    // be made in one line here.
+    ++g_nativeShaders.draws;
+    if (t->name) {
+      ++g_nativeShaders.named;
+      ++NativePassDraws()[*t->name];
+      const char* native = mx::gfx::shaders::NativePixelShader(*t->name);
+      if (native) {
+        ++g_nativeShaders.eligible;
+        if (REXCVAR_GET(d3d9_native_shaders)) {
+          // The DXBC must go with it. It is the compiled form of the
+          // TRANSLATED source and the renderer prefers it when present, so
+          // leaving it set would substitute the HLSL and then run the
+          // microcode anyway -- a substitution that reports as done and
+          // changes nothing, which is exactly the failure the mutation test
+          // below exists to catch.
+          static std::map<std::string, std::shared_ptr<const std::string>> s_src;
+          auto& slot = s_src[*t->name];
+          if (!slot)
+            slot = std::make_shared<const std::string>(
+                REXCVAR_GET(d3d9_native_shader_mutate)
+                    ? mx::gfx::shaders::kNativeMutantPS
+                    : native);
+          dc.pixel_shader_hlsl = slot;
+          dc.pixel_shader_dxbc = nullptr;
+          ++g_nativeShaders.substituted;
+          if (REXCVAR_GET(d3d9_native_shader_mutate))
+            ++g_nativeShaders.mutated;
+        }
+      }
+    }
     dc.pixel_sampler_count = t->sampler_count;
     dc.pixel_sampler_array_mask = t->sampler_array_mask;
     // The PIXEL constant bank, ALU constants 256-511 at device+0x1780. Captured

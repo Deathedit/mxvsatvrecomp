@@ -69,6 +69,48 @@ float4 main(float4 pos : SV_POSITION, float4 col : COLOR) : SV_TARGET {
 // must be a SUBSET of the vertex stage's output, and every translated vertex
 // stage emits SV_Position plus its interpolators. Naming just the one both
 // shapes always carry means this pairs with any of them and needs no variant.
+// NATIVE PIXEL SHADERS -- step 5 of the native-renderer plan.
+//
+// A substitute replaces one NAMED pass, and it is chosen by the pass's asset
+// name ("<asset>::<EntryPoint>" from userdata/shader_names.txt), never by a
+// shader handle. Handles are guest addresses the runtime recycles onto
+// different microcode within a run -- 9,968 of 10,074 compiles -- so keying on
+// one both splits a shader across rows and merges several into one.
+//
+// THE CONTRACT a substitute must satisfy, from TranslatedPSO and the b1 layout
+// in d3d12_game_drawlist.cpp:
+//
+//   * root signature m_translatedRootSig, 7 parameters
+//   * the input signature must be a SUBSET of the vertex stage's output, which
+//     is SV_Position plus i0..i7 : TEXCOORD. Naming fewer is fine; naming one
+//     the vertex stage does not emit will not link.
+//   * cbuffer b1 is xe_c[256], xe_texinv[16], xe_texsign[16], xe_param_gen,
+//     xe_alphatest, colour scale -- in that order.
+//   * textures arrive on t0.. in guest sampler-slot order, samplers on s0..
+//
+// The registry is EMPTY on purpose. Which pass to write first is a question
+// with a measured answer -- the per-pass draw census this rung adds -- and
+// picking one before reading it would be choosing by guesswork the way the
+// texture stand-in scorer did.
+inline const char* NativePixelShader(const std::string& pass_name) {
+  struct Entry { const char* pass; const char* hlsl; };
+  // Deliberately empty. See above: the first pass to write is chosen from the
+  // NATIVE SHADERS census, not by inspection.
+  static constexpr Entry kNative[] = {};
+  for (const Entry& e : kNative)
+    if (pass_name == e.pass) return e.hlsl;
+  return nullptr;
+}
+
+// A deliberately wrong substitute, for the mutation test. A census can report a
+// substitution that never reached the GPU; forcing an impossible output and
+// confirming the screen changes is what distinguishes "it ran" from "the
+// counter moved". This is what d3d9_stencil_force_never established about
+// TranslatedPSO, where the counters were vacuous.
+inline constexpr const char* kNativeMutantPS = R"(
+float4 main(float4 pos : SV_Position) : SV_TARGET { return float4(1, 0, 1, 1); }
+)";
+
 inline constexpr const char* kTranslatedDepthOnlyPS = R"(
 float4 main(float4 pos : SV_Position) : SV_TARGET { return 0; }
 )";

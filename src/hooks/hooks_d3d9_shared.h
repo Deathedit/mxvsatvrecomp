@@ -250,6 +250,26 @@ struct MeshNameCensus {
 };
 extern MeshNameCensus g_meshNames;
 
+// Step 5: which named PASS each draw runs, and whether a native substitute
+// exists for it.
+//
+// The per-pass draw count is the whole point of the first rung. Step 5 is the
+// long pole -- 332 distinct pass identities -- and the order they are written
+// in decides how much of the frame the work buys. That order should come from
+// a measurement, not from which shader looked tractable, which is how the
+// stand-in texture scorer ended up picking junk.
+struct NativeShaderCensus {
+  uint64_t draws = 0;          // draws with a translated pixel shader
+  uint64_t named = 0;          // of those, ones whose pass has an asset name
+  uint64_t eligible = 0;       // a native substitute is registered for the pass
+  uint64_t substituted = 0;    // and was actually used
+  uint64_t mutated = 0;        // the mutation shader was used instead
+};
+extern NativeShaderCensus g_nativeShaders;
+// Draws per pass name, worst first in the report. Not per distinct shader:
+// the question is how much of the frame one substitute would cover.
+std::map<std::string, uint64_t>& NativePassDraws();
+
 // Replayed draws that carry no mesh name, by the shader that drew them. Not in
 // an anonymous namespace, unlike its record-time counterpart, because the
 // replay path is a different translation unit.
