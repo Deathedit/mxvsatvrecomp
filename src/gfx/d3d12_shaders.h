@@ -114,6 +114,33 @@ float4 XeMul(float4 a, float4 b) {
   return float4(XeMul(a.x, b.x), XeMul(a.y, b.y),
                 XeMul(a.z, b.z), XeMul(a.w, b.w));
 }
+float3 XeMul3(float3 a, float3 b) {
+  return float3(XeMul(a.x, b.x), XeMul(a.y, b.y), XeMul(a.z, b.z));
+}
+float XeDot3(float3 a, float3 b) {
+  float3 p = XeMul3(a, b);
+  return p.x + p.y + p.z;
+}
+float4 XePWLGammaToLinear(float4 g) {
+  float4 low = step(64.0 / 255.0, g);
+  float4 mid = step(96.0 / 255.0, g);
+  float4 top = step(192.0 / 255.0, g);
+  float4 scale = lerp(lerp(lerp(1.0 / 1024.0, 2.0 / 1024.0, low),
+                           4.0 / 1024.0, mid), 8.0 / 1024.0, top);
+  float4 offset = lerp(lerp(lerp(0.0, -64.0, low), -256.0, mid),
+                       -1024.0, top);
+  float4 v = saturate(g) * (255.0 * 1024.0);
+  v = v * scale + offset;
+  v += trunc(v * scale);
+  return v * (1.0 / 1023.0);
+}
+float4 XeTexSign(float4 v, float4 sgn) {
+  float4 gam = saturate(sgn - 2.0);
+  float4 scl = sgn - gam * 2.0;
+  v = v * scl + (1.0 - scl);
+  if (any(gam)) v = lerp(v, XePWLGammaToLinear(v), gam);
+  return v;
+}
 )";
 
 // The separable bloom blur, both directions. bloom.shader::BlurHPS and
@@ -225,6 +252,120 @@ XePsOut main(XeInterpolants xe_in, bool xe_front : SV_IsFrontFace) {
 }
 )";
 
+
+// FR_Dunes/GrassShader.shader::PixelShaderFar -- 40264 draws, 26% of every
+// named draw on a level run, and the largest single pass in the game.
+//
+// TRANSCRIBED AGAINST THE TRANSLATED HLSL, not against the disassembly. The
+// two disagree on one instruction pair and the disassembly loses:
+//
+//     mul r2.xyz, r0.xyzz, c43.xxxx  /  maxs r0 [no write], r3.ww
+//     mul export0.xyz, r2.xyzz, r0.xyzz
+//
+// Read from the disassembly alone, `maxs r0` looks like it might write r0, in
+// which case the export would be colour * gHDRScale * the grass texture's
+// alpha -- a coverage multiply, which is what a grass shader "obviously" does.
+// It does not. The translator, which is 1:1 with the microcode, emits
+// `xe_s = XeMax(...); xe_ps = xe_s;` and then multiplies r2 by an UNCHANGED
+// r0, so the export is the colour SQUARED times gHDRScale, and r3.w reaches
+// the output only through the scalar pipe as alpha. The plausible reading was
+// the wrong one.
+//
+// THE LITERALS are shader-embedded, recovered from the asset's literal block
+// and each confirmed by the instruction that reads it:
+//
+//     c254 = (0.3, 16.0, 0.57735, 0)
+//     c255 = (0.114, 0.299, 0.587, 0.7)
+//
+// c255.xyz against r3.zxy is B*0.114 + R*0.299 + G*0.587 -- BT.601 luminance,
+// and the zxy swizzle exists precisely to line RGB up with those weights.
+// c254.z is 1/sqrt(3), a dot against normalised (1,1,1). c254.y is the
+// exponent of a pow(.,16) built from log2/exp2.
+//
+// They are written as literals here rather than read from xe_c[254]/xe_c[255]
+// DELIBERATELY: those bank slots hold whatever the guest last uploaded, and
+// this shader's values arrive because the driver uploads the asset's literal
+// block when the shader is set. Reading the bank would be equivalent while
+// that holds and silently wrong the moment it does not, with no way to see it.
+//
+// SAMPLER ORDER IS THE COMPACT SLOT, NOT THE GUEST'S. The guest fetches tf0
+// (g_GrassTexture) into r3 and tf1 (g_ColorTexture) into r4; the translator
+// remaps those onto xe_tex1 and xe_tex0 respectively. This mirrors the
+// translated HLSL exactly, because the renderer binds by compact slot.
+inline const std::string kNativeGrassFar = std::string(kNativePrelude) + R"(
+cbuffer XeShaderConstants : register(b1) {
+  float4 xe_c[256];
+  float4 xe_texinv[16];
+  float4 xe_texsign[16];
+  uint4  xe_param_gen;
+  uint4  xe_alphatest;
+  float4 xe_colorscale;
+};
+Texture2D<float4> xe_tex0 : register(t0);
+SamplerState      xe_smp0 : register(s0);
+Texture2D<float4> xe_tex1 : register(t1);
+SamplerState      xe_smp1 : register(s1);
+struct XeInterpolants {
+  float4 pos : SV_Position;
+  float4 i0 : TEXCOORD0;
+  float4 i1 : TEXCOORD1;
+  float4 i2 : TEXCOORD2;
+  float4 i3 : TEXCOORD3;
+  float4 i4 : TEXCOORD4;
+};
+struct XePsOut { float4 c0 : SV_Target0; };
+
+XePsOut main(XeInterpolants xe_in, bool xe_front : SV_IsFrontFace) {
+  const float4 kC254 = float4(0.3, 16.0, 0.57735, 0.0);
+  const float4 kC255 = float4(0.114, 0.299, 0.587, 0.7);
+
+  // The guest samples the colour map with a plain bias and the grass map at an
+  // EXPLICIT lod carried in i0.w -- a setTexLOD feeding a reg_lod fetch, so it
+  // is SampleLevel and not SampleBias. Getting that wrong would read a
+  // different mip and look like a filtering bug rather than a wrong shader.
+  float4 col = XeTexSign(
+      xe_tex0.SampleBias(xe_smp0, xe_in.i1.xy, xe_texinv[0].w), xe_texsign[0]);
+  float4 grass = XeTexSign(
+      xe_tex1.SampleLevel(xe_smp1, xe_in.i0.xy, xe_in.i0.w + xe_texinv[1].w),
+      xe_texsign[1]);
+
+  // Luminance of the grass texel, and the reciprocal length of its RGB.
+  float lum   = XeDot3(grass.zxy, kC255.xyz);
+  float inv_l = rsqrt(abs(XeDot3(grass.zxy, grass.zxy)));
+
+  // The colour map, scaled by that luminance, relative to the grass texel.
+  float3 delta = XeMul3(lum.xxx, col.xyz) - grass.xyz;
+
+  // pow(|dot(normalise(grass), 1/sqrt(3))|, 16): a sharp response to how grey
+  // the grass texel is, since the dot peaks when R, G and B are equal.
+  float3 unit = XeMul3(inv_l.xxx, grass.xyz);
+  float  p    = exp2(XeMul(kC254.y, log2(abs(XeDot3(unit.zxy, kC254.zzz)))));
+
+  float3 lit  = XeMul3(delta, p.xxx) + grass.xyz;
+  // i2.xyz is the fog colour and i2.w the fog amount; the guest spells the
+  // lerp out as (fog - lit) * amount + lit.
+  float3 fogged = XeMul3(xe_in.i2.xyz - lit, xe_in.i2.www) + lit;
+
+  // (0.7 + 0.3 * colour.a) applied as the guest does it, two instructions.
+  float  a_term = XeMul(col.w, kC254.x);
+  float3 shaded = XeMul3(fogged, kC255.www) + XeMul3(a_term.xxx, fogged);
+
+  float3 scaled = XeMul3(shaded, xe_c[43].xxx);
+
+  XePsOut o;
+  // SQUARED. See the note above: r0 is not overwritten by the maxs.
+  o.c0.xyz = XeMul3(scaled, shaded);
+  o.c0.w   = XeMul(xe_in.i1.z, grass.w);
+
+  o.c0 = XeMul(o.c0, xe_colorscale.xxxx);
+  if (xe_colorscale.y > 0.0) {
+    o.c0.rgb = min(max(o.c0.rgb, 0.0), xe_colorscale.y);
+    o.c0.a   = min(max(o.c0.a,   0.0), xe_colorscale.z);
+  }
+  return o;
+}
+)";
+
 inline const std::string* NativePixelShader(const std::string& pass_name) {
   struct Entry { const char* pass; const std::string* hlsl; };
   // Chosen from the NATIVE SHADERS census, not by inspection: bloom is only
@@ -233,6 +374,7 @@ inline const std::string* NativePixelShader(const std::string& pass_name) {
   static const Entry kNative[] = {
       {"EngineDependencies/bloom.shader::BlurHPS", &kNativeBloomBlurH},
       {"EngineDependencies/bloom.shader::BlurVPS", &kNativeBloomBlurV},
+      {"FR_Dunes/GrassShader.shader::PixelShaderFar", &kNativeGrassFar},
   };
   for (const Entry& e : kNative)
     if (pass_name == e.pass) return e.hlsl;
