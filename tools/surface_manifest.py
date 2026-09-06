@@ -21,6 +21,16 @@ so each is hashed and each is an independent join. If only one side matches,
 that is worth knowing: it says the runtime is finding the mesh but re-packing
 one of the two buffers, which is a different problem from not finding it.
 
+AN INDEX BLOCK IS HASHED AT BOTH LENGTHS, 2n and 2n+4. The guest uploads the
+whole stored block including its four trailing bytes -- measured, not assumed:
+HR_SWP_BCK_Tire_THQ part 0 binds a 31630-byte index buffer and the asset's
+2*indexCount is 31626. Hashing only 2n made every index full-key miss, so every
+index match in the first run came from the 4096-byte prefix instead -- 118
+census rows where byPrefix equalled namedIndex exactly, with no exceptions,
+which is what gave it away. Worse than the misses it caused: an index block
+under 4096 bytes gets no prefix key, so those parts were not merely unmatched,
+they were UNREACHABLE.
+
 A PREFIX KEY TOO, and computed FIRST. A draw need not cover a whole buffer, and
 several parts may be packed into one. The full-block key only matches when the
 runtime hashes exactly the same extent; the prefix key survives when it does
@@ -135,7 +145,8 @@ def main():
             vtx = blob[g["vertex_at"]:g["vertex_at"] + g["vertex_bytes"]]
             idx_at = g["vertex_at"] - p["index_bytes"]
             idx = blob[idx_at:idx_at + p["index_count"] * 2]
-            for tag, data in (("", vtx), (":idx", idx)):
+            idx_full = blob[idx_at:idx_at + p["index_bytes"]]
+            for tag, data in (("", vtx), (":idx", idx), (":idx", idx_full)):
                 if not data:
                     continue
                 # A block of one repeated byte identifies nothing; it would

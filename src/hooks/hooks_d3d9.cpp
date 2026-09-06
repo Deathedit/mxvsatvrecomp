@@ -1938,11 +1938,16 @@ uint64_t MeshFnv64(const uint8_t* p, size_t n) {
 }
 
 constexpr size_t kMeshPrefixBytes = 4096;
-// Below this a buffer cannot be a mesh -- the smallest real part in the corpus
-// is 40 vertices at 28 bytes. Counted apart rather than dropped, because an
-// excluded population that is never reported is how a coverage figure ends up
-// measured against a denominator it could never reach.
-constexpr uint32_t kMeshMinBytes = 256;
+// Below this a buffer cannot be a mesh. Counted apart rather than dropped,
+// because an excluded population that is never reported is how a coverage
+// figure ends up measured against a denominator it could never reach.
+//
+// This was 256, which was too high and excluded real geometry: UI_Vehicle_Box
+// is one part whose index block is 70 bytes, and the corpus has parts with as
+// few as five indices. The floor exists only to keep constant-sized buffers out
+// of the hash, and 32 does that. Hashing more small buffers costs nothing here
+// because the lookup is memoised per (pointer, size).
+constexpr uint32_t kMeshMinBytes = 32;
 
 // Look one buffer up, memoised on (pointer, size). Guest buffers CAN be
 // rewritten in place at the same address -- the glyph atlas is -- so this memo
